@@ -310,6 +310,8 @@ fn opening_terminal_evaluation(
 mod tests {
     use slop_algebra::{AbstractExtensionField, PrimeField32};
     use slop_challenger::{CanSampleBits, IopCtx};
+    use slop_merkle_tree::{MerkleTreeTcs, MerkleTreeTcsProof};
+    use slop_tensor::{Dimensions, Tensor};
 
     use super::*;
     use crate::{FORGEMATRIX_V4_EXTENSION_DEGREE, FORGEMATRIX_V4_FIELD_MODULUS};
@@ -355,6 +357,50 @@ mod tests {
             canonical(third),
             [7203716, 404656108, 344185242, 1401671596]
         );
+    }
+
+    #[test]
+    fn independent_poseidon_merkle_vector_is_pinned() {
+        let field = |value| ForgeMatrixV4Field::from_canonical_u32(value);
+        let root = [
+            47_251_751,
+            553_575_958,
+            1_345_488_649,
+            498_318_952,
+            809_293_257,
+            806_094_821,
+            1_113_971_194,
+            130_894_578,
+        ]
+        .map(field);
+        let commitment = [
+            1_127_114_543,
+            883_611_560,
+            1_138_804_829,
+            1_396_197_074,
+            817_678_494,
+            924_635_742,
+            440_606_442,
+            267_639_023,
+        ]
+        .map(field);
+        let values = Tensor {
+            storage: (0..10).map(field).collect::<Vec<_>>().into(),
+            dimensions: Dimensions::try_from([1, 10]).unwrap(),
+        };
+        let paths = Tensor {
+            storage: Vec::<ForgeMatrixV4Digest>::new().into(),
+            dimensions: Dimensions::try_from([1, 0]).unwrap(),
+        };
+        let proof = MerkleTreeTcsProof {
+            merkle_root: root,
+            log_tensor_height: 0,
+            width: 10,
+            paths,
+        };
+        MerkleTreeTcs::<ForgeMatrixV4IopContext>::default()
+            .verify_tensor_openings(&commitment, &[0], &values, 10, 0, &proof)
+            .unwrap();
     }
 
     fn statement() -> ForgeMatrixV4TranscriptStatement {

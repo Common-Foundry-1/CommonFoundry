@@ -1,10 +1,10 @@
-"""Independent ProductionV4 Fiat-Shamir and algebraic verification.
+"""Independent ProductionV4 Fiat-Shamir and cryptographic verification.
 
 This module parses the pinned transparent-proof topology without importing or
-calling the Common Foundry Rust verifier.  It verifies all relation sumchecks,
+calling the Common Foundry Rust verifier. It verifies all relation sumchecks,
 their terminal identities, opening-claim routing, opening-reduction sumchecks,
-and the non-Merkle BaseFold transcript checks.  Merkle authentication and the
-FRI query-fold equations remain a separate final slice.
+BaseFold Merkle authentication, FRI query folds, and terminal low-degree
+conditions.
 """
 
 from __future__ import annotations
@@ -15,7 +15,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import blake3
-from production_v4_poseidon import MODULUS, DuplexChallenger, Extension
+from production_v4_poseidon import (
+    MODULUS,
+    DuplexChallenger,
+    Extension,
+    poseidon2_permute,
+)
 from production_v4_wire import (
     BANK_BYTES,
     BANKS,
@@ -50,10 +55,18 @@ OPENING_REDUCTION_DOMAIN = b"CommonFoundry/ForgeMatrix/V4/OpeningReduction/v2"
 MASK_DOMAIN = "CMFD/FORGEMATRIX/MASKCOEFF/V2"
 LAYER_ROOTS_DOMAIN = "CMFD/FORGEMATRIX/V2/LAYER-ROOTS"
 MANIFEST_DOMAIN = "CMFD/FORGEMATRIX/V2/MANIFEST"
+FIXED_RECORD_DOMAIN = "CommonFoundry/ForgeMatrix/V4/FixedArtifactRecord/v1"
+PINNED_FIXED_RECORD_DIGEST = bytes.fromhex(
+    "2efd2c4244bbd7808547b85266987544233fbe339f445135b07843aa8893d45e"
+)
+PINNED_ARTIFACT_FORMAT_DIGEST = bytes.fromhex(
+    "1c26e090041e96e5ef805747b87cf5bd591d5d127a3b86dee5cca5945e57df44"
+)
 MODEL_BANK_HEADER_BYTES = 184
 MODEL_BANK_MAGIC = b"CMFDBNK2"
 MODEL_BANK_FORMAT_VERSION = 2
 MODEL_VALUE_CENTER = 125
+TWO_ADIC_GENERATOR_24 = 0x6AC49F88
 
 
 class TranscriptVerificationError(ValueError):
@@ -98,12 +111,23 @@ class Relation:
 
 
 @dataclass(frozen=True)
+class MerkleOpening:
+    values: tuple[tuple[int, ...], ...]
+    root: tuple[int, ...]
+    paths: tuple[tuple[tuple[int, ...], ...], ...]
+    width: int
+    log_height: int
+
+
+@dataclass(frozen=True)
 class Opening:
     sumcheck: Sumcheck
     fixed_evaluations: tuple[Extension, ...]
     dynamic_evaluations: tuple[Extension, ...]
     univariate_messages: tuple[tuple[Extension, Extension], ...]
     fri_commitments: tuple[tuple[int, ...], ...]
+    component_openings: tuple[MerkleOpening, MerkleOpening]
+    query_openings: tuple[MerkleOpening, ...]
     final_poly: Extension
     pow_witness: int
     batch_grinding_witness: int
@@ -163,6 +187,17 @@ class Reader:
         evaluation = self.extension()
         return Sumcheck(polynomials, claimed_sum, point, evaluation)
 
+    def merkle_opening(self, width: int, log_height: int) -> MerkleOpening:
+        values = tuple(
+            tuple(self.field() for _ in range(width)) for _ in range(BASEFOLD_QUERIES)
+        )
+        root = self.digest()
+        paths = tuple(
+            tuple(self.digest() for _ in range(log_height))
+            for _ in range(BASEFOLD_QUERIES)
+        )
+        return MerkleOpening(values, root, paths, width, log_height)
+
 
 def _parse_relation(reader: Reader) -> Relation:
     matrix = MatrixRelation(
@@ -197,18 +232,29 @@ def _parse_opening(data: bytes, start: int) -> Opening:
         (reader.extension(), reader.extension()) for _ in range(ROW_VARIABLES)
     )
     commitments = tuple(reader.digest() for _ in range(ROW_VARIABLES))
-    final_reader = Reader(data, end - 24, end)
-    final_poly = final_reader.extension()
-    pow_witness = final_reader.field()
-    batch_witness = final_reader.field()
-    if reader.position > end - 24:
-        raise TranscriptVerificationError("opening metadata overlaps its final fields")
+    component_openings = (
+        reader.merkle_opening(FIXED_COLUMNS, ROW_VARIABLES + BASEFOLD_LOG_BLOWUP),
+        reader.merkle_opening(DYNAMIC_COLUMNS, ROW_VARIABLES + BASEFOLD_LOG_BLOWUP),
+    )
+    query_openings = tuple(
+        reader.merkle_opening(8, ROW_VARIABLES - index)
+        for index in range(ROW_VARIABLES)
+    )
+    final_poly = reader.extension()
+    pow_witness = reader.field()
+    batch_witness = reader.field()
+    if reader.position != end:
+        raise TranscriptVerificationError(
+            "opening parser did not consume its pinned section"
+        )
     return Opening(
         sumcheck,
         fixed,
         dynamic,
         messages,
         commitments,
+        component_openings,
+        query_openings,
         final_poly,
         pow_witness,
         batch_witness,
@@ -247,6 +293,19 @@ def parse_fixed_commitments(
     if not isinstance(record, dict) or record.get("record_version") != 1:
         raise TranscriptVerificationError("fixed artifact record has the wrong version")
 
+    if set(record) != {
+        "record_version",
+        "proof_system_digest",
+        "manifest",
+        "manifest_digest",
+        "artifact_format_digest",
+        "banks",
+        "record_digest",
+    }:
+        raise TranscriptVerificationError(
+            "fixed artifact record keys are not canonical"
+        )
+
     def byte_array(name: str) -> bytes:
         value = record.get(name)
         if (
@@ -273,33 +332,104 @@ def parse_fixed_commitments(
         raise TranscriptVerificationError(
             "fixed artifact record manifest digest mismatch"
         )
+    _model_manifest(record_path, expected_manifest)
+    artifact_format_digest = byte_array("artifact_format_digest")
+    if artifact_format_digest != PINNED_ARTIFACT_FORMAT_DIGEST:
+        raise TranscriptVerificationError("fixed artifact format digest mismatch")
     bank_values = record.get("banks")
     if not isinstance(bank_values, list) or len(bank_values) != BANKS:
         raise TranscriptVerificationError(
             "fixed artifact record must contain exactly three banks"
         )
     commitments: list[tuple[int, ...]] = []
+    roots: list[tuple[int, ...]] = []
+    canonical = bytearray()
+    canonical.extend(struct.pack("<H", 1))
+    canonical.extend(expected_proof_system)
+    canonical.extend(expected_manifest)
+    canonical.extend(artifact_format_digest)
     for index, bank in enumerate(bank_values):
-        if not isinstance(bank, dict) or bank.get("bank") != index:
+        if (
+            not isinstance(bank, dict)
+            or set(bank)
+            != {
+                "bank",
+                "commitment",
+                "merkle_root",
+                "codeword_bytes",
+                "tree_bytes",
+                "codeword_blake3",
+                "tree_blake3",
+            }
+            or bank.get("bank") != index
+        ):
             raise TranscriptVerificationError(
                 "fixed artifact record bank ordering mismatch"
             )
-        values = bank.get("commitment")
-        if (
-            not isinstance(values, list)
-            or len(values) != 8
-            or any(
-                isinstance(item, bool)
-                or not isinstance(item, int)
-                or item < 0
-                or item >= MODULUS
-                for item in values
+        fields: list[tuple[int, ...]] = []
+        for name in ("commitment", "merkle_root"):
+            values = bank.get(name)
+            if (
+                not isinstance(values, list)
+                or len(values) != 8
+                or any(
+                    isinstance(item, bool)
+                    or not isinstance(item, int)
+                    or item < 0
+                    or item >= MODULUS
+                    for item in values
+                )
+            ):
+                raise TranscriptVerificationError(
+                    f"fixed artifact record bank {index} {name} is malformed"
+                )
+            value = tuple(values)
+            if not any(value):
+                raise TranscriptVerificationError(
+                    f"fixed artifact record bank {index} {name} is zero"
+                )
+            fields.append(value)
+        commitment, root = fields
+        if _poseidon_compress(root, _poseidon_hash([24, FIXED_COLUMNS])) != commitment:
+            raise TranscriptVerificationError(
+                f"fixed artifact record bank {index} commitment metadata mismatch"
             )
+        if (
+            bank.get("codeword_bytes") != 17_179_869_184
+            or bank.get("tree_bytes") != 1_073_741_792
         ):
             raise TranscriptVerificationError(
-                f"fixed artifact record bank {index} commitment is malformed"
+                f"fixed artifact record bank {index} artifact length mismatch"
             )
-        commitments.append(tuple(values))
+        codeword_digest = _record_byte_array(
+            bank.get("codeword_blake3"), f"bank {index} codeword_blake3"
+        )
+        tree_digest = _record_byte_array(
+            bank.get("tree_blake3"), f"bank {index} tree_blake3"
+        )
+        if not any(codeword_digest) or not any(tree_digest):
+            raise TranscriptVerificationError(
+                f"fixed artifact record bank {index} has a zero artifact digest"
+            )
+        canonical.extend(struct.pack("<I", index))
+        canonical.extend(struct.pack("<8I", *commitment))
+        canonical.extend(struct.pack("<8I", *root))
+        canonical.extend(struct.pack("<Q", 17_179_869_184))
+        canonical.extend(struct.pack("<Q", 1_073_741_792))
+        canonical.extend(codeword_digest)
+        canonical.extend(tree_digest)
+        commitments.append(commitment)
+        roots.append(root)
+    if len(set(commitments)) != BANKS or len(set(roots)) != BANKS:
+        raise TranscriptVerificationError(
+            "fixed artifact record reuses a commitment or Merkle root"
+        )
+    record_digest = byte_array("record_digest")
+    recomputed = blake3.blake3(
+        bytes(canonical), derive_key_context=FIXED_RECORD_DOMAIN
+    ).digest()
+    if record_digest != recomputed or record_digest != PINNED_FIXED_RECORD_DIGEST:
+        raise TranscriptVerificationError("fixed artifact record digest mismatch")
     return tuple(commitments)
 
 
@@ -750,6 +880,118 @@ def _evaluate_columns(
     )
 
 
+def _poseidon_hash(values: tuple[int, ...] | list[int]) -> tuple[int, ...]:
+    state = [0] * 16
+    for start in range(0, len(values), 8):
+        chunk = values[start : start + 8]
+        state[: len(chunk)] = chunk
+        state = poseidon2_permute(state)
+    return tuple(state[:8])
+
+
+def _poseidon_compress(
+    left: tuple[int, ...], right: tuple[int, ...]
+) -> tuple[int, ...]:
+    if len(left) != 8 or len(right) != 8:
+        raise TranscriptVerificationError("Poseidon digest width is not eight")
+    return tuple(poseidon2_permute(left + right)[:8])
+
+
+def _verify_merkle_opening(
+    commitment: tuple[int, ...], indices: list[int], opening: MerkleOpening
+) -> None:
+    if len(indices) != BASEFOLD_QUERIES:
+        raise TranscriptVerificationError("BaseFold query count is not pinned")
+    for query, (index, values, path) in enumerate(
+        zip(indices, opening.values, opening.paths)
+    ):
+        if len(values) != opening.width or len(path) != opening.log_height:
+            raise TranscriptVerificationError("BaseFold Merkle opening shape mismatch")
+        root = _poseidon_hash(values)
+        remaining = index
+        for sibling in path:
+            root = (
+                _poseidon_compress(root, sibling)
+                if remaining & 1 == 0
+                else _poseidon_compress(sibling, root)
+            )
+            remaining >>= 1
+        if root != opening.root:
+            raise TranscriptVerificationError(
+                f"BaseFold Merkle path {query} does not match its root"
+            )
+        if remaining != 0:
+            raise TranscriptVerificationError("BaseFold Merkle index exceeds its tree")
+    metadata = _poseidon_hash([opening.log_height, opening.width])
+    if _poseidon_compress(opening.root, metadata) != commitment:
+        raise TranscriptVerificationError(
+            "BaseFold Merkle root metadata does not match its commitment"
+        )
+
+
+def _reverse_bits(value: int, bits: int) -> int:
+    result = 0
+    for _ in range(bits):
+        result = (result << 1) | (value & 1)
+        value >>= 1
+    return result
+
+
+def _verify_basefold_queries(
+    fixed: tuple[int, ...],
+    dynamic: tuple[int, ...],
+    opening: Opening,
+    batching_weights: list[Extension],
+    betas: list[Extension],
+    query_indices: list[int],
+) -> None:
+    for commitment, component in zip((fixed, dynamic), opening.component_openings):
+        _verify_merkle_opening(commitment, query_indices, component)
+
+    batch_evaluations: list[Extension] = []
+    for query in range(BASEFOLD_QUERIES):
+        fixed_values = opening.component_openings[0].values[query]
+        dynamic_values = opening.component_openings[1].values[query]
+        value = sum(
+            (
+                Extension.from_base(base) * weight
+                for base, weight in zip(fixed_values + dynamic_values, batching_weights)
+            ),
+            Extension.zero(),
+        )
+        batch_evaluations.append(value)
+
+    indices = list(query_indices)
+    generator = TWO_ADIC_GENERATOR_24
+    xs = [pow(generator, _reverse_bits(index, 24), MODULUS) for index in indices]
+    for round_index, (commitment, query_opening, beta) in enumerate(
+        zip(opening.fri_commitments, opening.query_openings, betas)
+    ):
+        expected_height = ROW_VARIABLES - round_index
+        if query_opening.width != 8 or query_opening.log_height != expected_height:
+            raise TranscriptVerificationError("BaseFold FRI opening shape mismatch")
+        for query, values in enumerate(query_opening.values):
+            evaluations = (Extension(tuple(values[:4])), Extension(tuple(values[4:])))
+            index = indices[query]
+            if evaluations[index & 1] != batch_evaluations[query]:
+                raise TranscriptVerificationError(
+                    f"BaseFold query {query} round {round_index} value mismatch"
+                )
+            x = xs[query]
+            x0, x1 = (x, -x % MODULUS) if index & 1 == 0 else (-x % MODULUS, x)
+            numerator = beta - Extension.from_base(x0)
+            slope = (evaluations[1] - evaluations[0]) / Extension.from_base(x1 - x0)
+            batch_evaluations[query] = evaluations[0] + numerator * slope
+            indices[query] = index >> 1
+            xs[query] = x * x % MODULUS
+        _verify_merkle_opening(commitment, indices, query_opening)
+
+    if any(value != opening.final_poly for value in batch_evaluations):
+        raise TranscriptVerificationError(
+            "BaseFold folded query does not match the final polynomial"
+        )
+
+
 def _verify_opening(
     bank: int,
     fixed: tuple[int, ...],
@@ -856,8 +1098,18 @@ def _verify_opening(
         raise TranscriptVerificationError(
             f"bank {bank}: invalid BaseFold proof-of-work witness"
         )
-    for _ in range(BASEFOLD_QUERIES):
+    query_indices = [
         challenger.sample_bits(ROW_VARIABLES + BASEFOLD_LOG_BLOWUP)
+        for _ in range(BASEFOLD_QUERIES)
+    ]
+    _verify_basefold_queries(
+        fixed,
+        dynamic,
+        opening,
+        batching_weights,
+        betas,
+        query_indices,
+    )
 
 
 def _multilinear_evaluate_base(
@@ -993,6 +1245,6 @@ def verify_transcript_and_algebra(
         "relations_verified": relation_count,
         "opening_reductions_verified": opening_count,
         "basefold_transcripts_replayed": opening_count,
-        "basefold_merkle_and_query_folds_verified": False,
+        "basefold_merkle_and_query_folds_verified": True,
         "initial_activation_boundaries_verified": initial_values is not None,
     }

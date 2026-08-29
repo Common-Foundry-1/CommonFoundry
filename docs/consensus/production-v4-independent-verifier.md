@@ -21,6 +21,8 @@ The current slice independently verifies:
 
 When supplied the trusted fixed-artifact record, it additionally verifies:
 
+- the record's pinned digest, canonical contents, production geometry, unique
+  bank roots, and Poseidon commitment metadata;
 - the independent `GF(0x7f000001)[X]/(X^4 - 3)` implementation and the pinned
   Poseidon2 width-16/rate-8 Fiat-Shamir transcript;
 - all six matrix, shift, and cubic relation repetitions, including every
@@ -28,18 +30,19 @@ When supplied the trusted fixed-artifact record, it additionally verifies:
 - the consensus-critical opening-claim routing and padding order;
 - all three opening-reduction sumchecks and terminal identities; and
 - the BaseFold batching, FRI-message, grinding-witness, and query-challenge
-  transcript, including its non-Merkle algebraic consistency checks.
+  transcript;
+- every component and FRI Merkle authentication path, including commitment
+  metadata; and
+- every FRI query-fold equation and terminal low-degree condition.
 
 Supplying the matching `MODEL-V2.bank` also authenticates its exact header,
 payload root, all 384 per-layer roots, canonical byte range, length, and EOF,
 then verifies both public initial-activation boundary evaluations.
 
-This is not yet a complete cryptographic proof verifier. The result always
-reports `full_cryptographic_proof_verified: false` until the independent
-implementation also checks the BaseFold Merkle authentication paths,
-query-fold equations, and terminal low-degree conditions. Without
-`--model-bank`, the public initial-activation boundary checks also remain
-pending.
+With both trusted inputs supplied, a successful result reports
+`full_cryptographic_proof_verified: true`. Without `--model-bank`, the public
+initial-activation boundary checks remain pending and the full-verification
+flag stays false.
 
 ## Inputs
 

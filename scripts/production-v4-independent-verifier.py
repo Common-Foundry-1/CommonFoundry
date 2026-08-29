@@ -93,9 +93,12 @@ def main() -> int:
         claim_scope = "and candidate claims " if require_claims else ""
         print(f"ACCEPTED: public bindings {claim_scope}match; target met")
         if args.fixed_artifact_record is not None:
-            print("Independent transcript, relations, and opening reductions: ACCEPTED")
-        print("Full cryptographic proof verification: NOT YET IMPLEMENTED")
-        print("Next stage: BaseFold Merkle authentication and query-fold checks")
+            print("Independent transcript, relations, openings, and BaseFold: ACCEPTED")
+        if result["full_cryptographic_proof_verified"]:
+            print("Full cryptographic proof verification: ACCEPTED")
+        else:
+            print("Full cryptographic proof verification: INCOMPLETE")
+            print("Remaining: " + "; ".join(result["remaining_stages"]))
     return 0
 
 

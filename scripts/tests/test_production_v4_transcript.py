@@ -13,6 +13,9 @@ from production_v4_transcript import (
     Sumcheck,
     TranscriptVerificationError,
     _polynomial_evaluate,
+    _poseidon_compress,
+    _poseidon_hash,
+    _reverse_bits,
     _verify_sumcheck,
     _zero_plus_one,
 )
@@ -68,6 +71,42 @@ class SumcheckTranscriptTests(unittest.TestCase):
             TranscriptVerificationError, "inconsistent sumcheck round"
         ):
             _verify_sumcheck(mutated, DuplexChallenger(), "fixture")
+
+
+class MerklePrimitiveTests(unittest.TestCase):
+    def test_pinned_rust_poseidon_merkle_vector(self) -> None:
+        root = _poseidon_hash(list(range(10)))
+        metadata = _poseidon_hash([0, 10])
+        self.assertEqual(
+            root,
+            (
+                47_251_751,
+                553_575_958,
+                1_345_488_649,
+                498_318_952,
+                809_293_257,
+                806_094_821,
+                1_113_971_194,
+                130_894_578,
+            ),
+        )
+        self.assertEqual(
+            _poseidon_compress(root, metadata),
+            (
+                1_127_114_543,
+                883_611_560,
+                1_138_804_829,
+                1_396_197_074,
+                817_678_494,
+                924_635_742,
+                440_606_442,
+                267_639_023,
+            ),
+        )
+
+    def test_bit_reversal_is_width_bounded(self) -> None:
+        self.assertEqual(_reverse_bits(0b001, 3), 0b100)
+        self.assertEqual(_reverse_bits(0b101, 3), 0b101)
 
 
 if __name__ == "__main__":

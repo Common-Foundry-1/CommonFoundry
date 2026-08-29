@@ -438,18 +438,22 @@ def verify(
                 "six matrix, shift, and cubic relation repetitions",
                 "opening-claim routing and three opening-reduction sumchecks",
                 "BaseFold batching, FRI-message, grinding, and query transcripts",
+                "BaseFold component and FRI Merkle authentication paths",
+                "BaseFold query-fold equations and final low-degree checks",
             ]
         )
-        remaining_stages = [
-            "BaseFold component and FRI Merkle authentication paths",
-            "BaseFold query-fold equations and final low-degree checks",
-        ]
+        remaining_stages = []
         if not algebra["initial_activation_boundaries_verified"]:
             remaining_stages.insert(0, "public initial-activation boundary evaluations")
+    full_verification = (
+        algebra is not None
+        and algebra["basefold_merkle_and_query_folds_verified"]
+        and algebra["initial_activation_boundaries_verified"]
+    )
     result = {
         "schema": "CommonFoundry/ForgeMatrix/V4/IndependentVerificationResult/v1",
         "implemented_stages_accepted": True,
-        "full_cryptographic_proof_verified": False,
+        "full_cryptographic_proof_verified": full_verification,
         "candidate_claims_verified": require_candidate_claims,
         "proof": wire,
         "algebra": algebra,

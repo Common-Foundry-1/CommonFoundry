@@ -23,3 +23,12 @@ input as a normal deterministic regression test before changing a parser. The
 harnesses do not activate a mainnet proof format and do not replace the
 required independent review, load testing, or bounded network verification
 queue.
+
+Each ProductionV4 corpus must include a known-valid 12,025,320-byte proof so
+the campaign starts from the real parser depth, not only random outer headers.
+Capture complete output for the proof, block, and peer-block targets, then use
+`scripts/production-v4-fuzz-report.py` to create a canonical, no-overwrite
+campaign report. The report rejects sanitizer findings, missing completion,
+changed limits, and campaigns without the full-size seed. The mainnet gate is
+24 sanitizer-hours per target; shorter runs are useful harness smoke tests and
+are reported with `campaign_gate_met: false`.

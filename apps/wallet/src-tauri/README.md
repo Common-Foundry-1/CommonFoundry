@@ -88,14 +88,14 @@ address; use brackets around IPv6. DNS names, public addresses, paths, extra
 query parameters, zero ports, and malformed pins are rejected. Worker names
 must match `[A-Za-z0-9._-]{1,32}`.
 
-This is the CMFD Devnet pool v1 protocol over TLS 1.3, not Stratum. The pin is
+This is the CMFD Devnet pool v2 protocol over TLS 1.3, not Stratum. The pin is
 the SHA-256 digest of the exact DER leaf certificate printed by
 `cmfd-node pool-certificate` and `cmfd-node pool-serve`; verify it through a
 trusted path before connecting. Miners need only that public pin; they must
-never receive the pool's private-key DER. TLS authenticates the pinned server,
-not the worker or payout claim, so the session counters are not identity-secure.
-Pool share, block, and credited-atom values in the wallet are bounded,
-volatile, session-only, valueless, nonwithdrawable test counters. They are not
-funds or an on-chain payout balance. See
+never receive the pool's private-key DER. The pool then issues a fresh challenge
+that this wallet signs with its receive key, authenticating the payout identity
+without transmitting the private key. Pool share, block, and credited-atom
+values are stored in a bounded, durable, reorganization-aware test ledger.
+On-chain settlement is the next pool milestone. See
 [../../../docs/devnet-0.md](../../../docs/devnet-0.md) for pool operator
 commands and the complete security boundary.

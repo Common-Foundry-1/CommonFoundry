@@ -4473,6 +4473,10 @@ impl Node {
         self.wallet_signing_key.verifying_key().to_bytes().into()
     }
 
+    pub fn pool_payout_signer(&self) -> pool::PoolPayoutSigner {
+        pool::PoolPayoutSigner::new(self.wallet_signing_key.clone())
+    }
+
     pub fn set_public_peer_mode(&mut self, enabled: bool) {
         self.public_peer_mode = enabled;
     }

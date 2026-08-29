@@ -509,7 +509,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "p2p": p2p_address.to_string(),
                     "static_peers": peers.iter().map(ToString::to_string).collect::<Vec<_>>(),
                     "protocol": format!(
-                        "CMFD {} pool v1 (not Stratum)",
+                        "CMFD {} pool v2 (not Stratum)",
                         COMPILED_NETWORK_PROFILE.short_name()
                     ),
                     "tls": "TLS 1.3 with an exact certificate SHA-256 pin",

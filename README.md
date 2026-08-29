@@ -446,7 +446,7 @@ order, accepts 2 through 128 inputs, creates one wallet output, and burns the
 chosen transaction fee.
 
 The Mining page supports both continuous solo mining and the CMFD Devnet pool
-v1 protocol. Pool mode uses TLS 1.3 with an exact SHA-256 pin of the server's
+v2 protocol. Pool mode uses TLS 1.3 with an exact SHA-256 pin of the server's
 leaf certificate and accepts only numeric loopback or private-network
 endpoints in this form:
 
@@ -459,8 +459,11 @@ challenge and a separate easier share target. Workers submit only the issued
 job ID and nonce; the server independently recomputes the committed
 ForgeMatrix relation, compares its work digest with the share target, and
 submits a block only when the same digest also meets the unchanged chain
-target. Pool counters are bounded, volatile, session-only, valueless, and
-nonwithdrawable. They are neither funds nor an on-chain payout ledger.
+target. A fresh Schnorr challenge proves control of the payout key at every
+connection. Bounded share and block accounting is stored in a checksummed,
+network-bound two-slot ledger and tracks canonical and reorganized pool blocks.
+Credited Devnet atoms remain test accounting until on-chain settlement is
+enabled.
 
 Generate a test certificate and start a local pool from the repository root:
 

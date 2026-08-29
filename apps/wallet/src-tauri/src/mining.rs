@@ -193,12 +193,30 @@ impl MiningManager {
                 })?;
                 let endpoint = parse_pool_url(pool_url)?;
                 validate_worker_name(worker)?;
+                let payout_signer = self
+                    .node
+                    .lock()
+                    .map_err(|_| {
+                        manager_error(
+                            "mining_node_unavailable",
+                            "The embedded node is unavailable.",
+                            true,
+                        )
+                    })?
+                    .pool_payout_signer();
+                if payout_signer.payout() != payout {
+                    return Err(manager_error(
+                        "pool_payout_key_unavailable",
+                        "Pool mining requires this wallet's receive address so the payout identity can be authenticated.",
+                        false,
+                    ));
+                }
                 Some(
                     PoolClientConfig::devnet(
                         endpoint.address,
                         endpoint.certificate_pin,
                         worker,
-                        payout,
+                        payout_signer,
                     )
                     .map_err(|error| {
                         pool_client_error("invalid_pool_configuration", error, false)

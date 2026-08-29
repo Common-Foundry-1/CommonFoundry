@@ -21,7 +21,10 @@ use cmfd_consensus::{
     BlockChallenge, BlockProof, ConsensusPowVerifier, ForgeMatrixV2AcceleratorBatch,
     ForgeMatrixV2AcceleratorModel, ForgeMatrixV2Error, PowError, v2_reference_for_network,
 };
-use k256::schnorr::VerifyingKey;
+use k256::schnorr::{
+    Signature, SigningKey, VerifyingKey,
+    signature::{Signer, Verifier},
+};
 use rcgen::generate_simple_self_signed;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
@@ -39,7 +42,7 @@ use crate::{
     NodeError, ProofProfile, submit_shared_tip_block, unix_time_seconds,
 };
 
-pub const POOL_PROTOCOL_VERSION: u16 = 1;
+pub const POOL_PROTOCOL_VERSION: u16 = 2;
 pub const DEFAULT_POOL_ADDRESS: SocketAddr = COMPILED_NETWORK_PROFILE.pool_address();
 pub const DEFAULT_POOL_SOCKET_ADDRESS: SocketAddr = DEFAULT_POOL_ADDRESS;
 pub const DEFAULT_SHARE_LEADING_ZERO_BITS: u16 = 7;
@@ -60,6 +63,7 @@ const POOL_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const POOL_ACCEPT_POLL: Duration = Duration::from_millis(25);
 const POOL_JOB_DOMAIN: &str = "CMFD/DEVNET-POOL/JOB/V1";
 const POOL_NONCE_ORIGIN_DOMAIN: &str = "CMFD/DEVNET-POOL/NONCE-ORIGIN/V1";
+const POOL_PAYOUT_AUTH_DOMAIN: &str = "CMFD/POOL/PAYOUT-AUTH/V1";
 const POOL_LEDGER_FORMAT_VERSION: u16 = 1;
 const POOL_LEDGER_FILE_PREFIX: &str = "pool-ledger-v1";
 const POOL_LEDGER_CHECKSUM_DOMAIN: &str = "CMFD/POOL/LEDGER/V1";
@@ -101,6 +105,8 @@ pub enum PoolError {
     NetworkMismatch,
     #[error("pool consensus fingerprint mismatch")]
     FingerprintMismatch,
+    #[error("pool payout-key authentication failed")]
+    PayoutAuthentication,
     #[error("pool certificate SHA-256 pin mismatch")]
     CertificatePinMismatch,
     #[error("pool certificate and private key paths must differ")]
@@ -209,6 +215,7 @@ pub struct PoolClientConfig {
     pub certificate_sha256: [u8; 32],
     pub worker: String,
     pub payout: [u8; 32],
+    pub payout_signer: PoolPayoutSigner,
     pub expected_network_id: [u8; 32],
     pub expected_consensus_fingerprint: [u8; 32],
 }
@@ -218,17 +225,48 @@ impl PoolClientConfig {
         address: SocketAddr,
         certificate_sha256: [u8; 32],
         worker: impl Into<String>,
-        payout: [u8; 32],
+        payout_signer: PoolPayoutSigner,
     ) -> Result<Self, PoolError> {
         let params = devnet_pool_params()?;
+        let payout = payout_signer.payout();
         Ok(Self {
             address,
             certificate_sha256,
             worker: worker.into(),
             payout,
+            payout_signer,
             expected_network_id: params.network_id,
             expected_consensus_fingerprint: params.fingerprint().map_err(NodeError::from)?,
         })
+    }
+}
+
+#[derive(Clone)]
+pub struct PoolPayoutSigner {
+    key: Arc<SigningKey>,
+}
+
+impl PoolPayoutSigner {
+    pub fn new(key: SigningKey) -> Self {
+        Self { key: Arc::new(key) }
+    }
+
+    pub fn payout(&self) -> [u8; 32] {
+        self.key.verifying_key().to_bytes().into()
+    }
+
+    fn sign(&self, digest: [u8; 32]) -> Vec<u8> {
+        let signature: Signature = self.key.sign(&digest);
+        signature.to_bytes().to_vec()
+    }
+}
+
+impl fmt::Debug for PoolPayoutSigner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PoolPayoutSigner")
+            .field("payout", &hex::encode(self.payout()))
+            .finish_non_exhaustive()
     }
 }
 
@@ -503,6 +541,7 @@ enum ClientMessage {
         consensus_fingerprint: [u8; 32],
         worker: String,
         payout: [u8; 32],
+        payout_signature: Vec<u8>,
     },
     SubmitShare {
         job_id: [u8; 32],
@@ -513,6 +552,12 @@ enum ClientMessage {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum ServerMessage {
+    AuthChallenge {
+        protocol_version: u16,
+        network_id: [u8; 32],
+        consensus_fingerprint: [u8; 32],
+        nonce: [u8; 32],
+    },
     HelloAck {
         protocol_version: u16,
         network_id: [u8; 32],
@@ -1330,6 +1375,16 @@ fn handle_connection(stream: TcpStream, shared: Arc<SharedServer>) -> Result<(),
         .map_err(|error| PoolError::Tls(error.to_string()))?;
     let mut stream = StreamOwned::new(connection, stream);
     let handshake_deadline = checked_pool_deadline(Instant::now(), POOL_HANDSHAKE_TIMEOUT)?;
+    let authentication_nonce = random_nonce()?;
+    write_frame(
+        &mut stream,
+        &ServerMessage::AuthChallenge {
+            protocol_version: POOL_PROTOCOL_VERSION,
+            network_id: shared.network_id,
+            consensus_fingerprint: shared.consensus_fingerprint,
+            nonce: authentication_nonce,
+        },
+    )?;
     let hello: ClientMessage =
         read_frame_interruptible_until(&mut stream, &shared.stop, handshake_deadline)?;
     let (worker, payout) = match hello {
@@ -1339,6 +1394,7 @@ fn handle_connection(stream: TcpStream, shared: Arc<SharedServer>) -> Result<(),
             consensus_fingerprint,
             worker,
             payout,
+            payout_signature,
         } => {
             if protocol_version != POOL_PROTOCOL_VERSION {
                 send_error(
@@ -1365,8 +1421,21 @@ fn handle_connection(stream: TcpStream, shared: Arc<SharedServer>) -> Result<(),
                 return Err(PoolError::FingerprintMismatch);
             }
             validate_worker(&worker)?;
-            VerifyingKey::from_bytes(&payout)
-                .map_err(|_| PoolError::Node(NodeError::InvalidMinerDestination))?;
+            let digest = payout_auth_digest(
+                network_id,
+                consensus_fingerprint,
+                authentication_nonce,
+                &worker,
+                payout,
+            );
+            if verify_payout_authentication(payout, digest, &payout_signature).is_err() {
+                send_error(
+                    &mut stream,
+                    "payout_authentication_failed",
+                    "pool payout-key authentication failed",
+                )?;
+                return Err(PoolError::PayoutAuthentication);
+            }
             (worker, payout)
         }
         ClientMessage::SubmitShare { .. } => {
@@ -2263,6 +2332,9 @@ impl PoolClient {
         validate_worker(&config.worker)?;
         VerifyingKey::from_bytes(&config.payout)
             .map_err(|_| PoolError::Node(NodeError::InvalidMinerDestination))?;
+        if config.payout != config.payout_signer.payout() {
+            return Err(PoolError::PayoutAuthentication);
+        }
         let mut socket = TcpStream::connect_timeout(&config.address, Duration::from_secs(5))?;
         socket.set_read_timeout(Some(Duration::from_secs(5)))?;
         socket.set_write_timeout(Some(POOL_WRITE_TIMEOUT))?;
@@ -2277,6 +2349,38 @@ impl PoolClient {
                 .map_err(map_tls_io_error)?;
         }
         let mut stream = StreamOwned::new(connection, socket);
+        let authentication_nonce = match read_frame(&mut stream)? {
+            ServerMessage::AuthChallenge {
+                protocol_version,
+                network_id,
+                consensus_fingerprint,
+                nonce,
+            } => {
+                if protocol_version != POOL_PROTOCOL_VERSION {
+                    return Err(PoolError::ProtocolMismatch);
+                }
+                if network_id != config.expected_network_id {
+                    return Err(PoolError::NetworkMismatch);
+                }
+                if consensus_fingerprint != config.expected_consensus_fingerprint {
+                    return Err(PoolError::FingerprintMismatch);
+                }
+                nonce
+            }
+            ServerMessage::Error { code, .. } => return Err(server_error(code)),
+            _ => {
+                return Err(PoolError::InvalidMessage(
+                    "expected pool payout authentication challenge".to_owned(),
+                ));
+            }
+        };
+        let payout_signature = config.payout_signer.sign(payout_auth_digest(
+            config.expected_network_id,
+            config.expected_consensus_fingerprint,
+            authentication_nonce,
+            &config.worker,
+            config.payout,
+        ));
         write_frame(
             &mut stream,
             &ClientMessage::Hello {
@@ -2285,6 +2389,7 @@ impl PoolClient {
                 consensus_fingerprint: config.expected_consensus_fingerprint,
                 worker: config.worker,
                 payout: config.payout,
+                payout_signature,
             },
         )?;
         let (session_id, accounting_semantics, persistence) = match read_frame(&mut stream)? {
@@ -2392,9 +2497,9 @@ impl PoolClient {
             }
             ServerMessage::ShareResult { result } => Ok(PoolClientEvent::ShareResult(result)),
             ServerMessage::Error { code, .. } => Err(server_error(code)),
-            ServerMessage::HelloAck { .. } => Err(PoolError::InvalidMessage(
-                "duplicate hello acknowledgement".to_owned(),
-            )),
+            ServerMessage::AuthChallenge { .. } | ServerMessage::HelloAck { .. } => Err(
+                PoolError::InvalidMessage("unexpected pool handshake message".to_owned()),
+            ),
         }
     }
 }
@@ -2566,6 +2671,35 @@ fn make_job_id(
     hasher.update(&challenge.target);
     hasher.update(&share_target);
     *hasher.finalize().as_bytes()
+}
+
+fn payout_auth_digest(
+    network_id: [u8; 32],
+    consensus_fingerprint: [u8; 32],
+    challenge_nonce: [u8; 32],
+    worker: &str,
+    payout: [u8; 32],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(POOL_PAYOUT_AUTH_DOMAIN);
+    hasher.update(&POOL_PROTOCOL_VERSION.to_le_bytes());
+    hasher.update(&network_id);
+    hasher.update(&consensus_fingerprint);
+    hasher.update(&challenge_nonce);
+    hasher.update(&(worker.len() as u64).to_le_bytes());
+    hasher.update(worker.as_bytes());
+    hasher.update(&payout);
+    *hasher.finalize().as_bytes()
+}
+
+fn verify_payout_authentication(
+    payout: [u8; 32],
+    digest: [u8; 32],
+    signature: &[u8],
+) -> Result<(), PoolError> {
+    let key = VerifyingKey::from_bytes(&payout).map_err(|_| PoolError::PayoutAuthentication)?;
+    let signature = Signature::try_from(signature).map_err(|_| PoolError::PayoutAuthentication)?;
+    key.verify(&digest, &signature)
+        .map_err(|_| PoolError::PayoutAuthentication)
 }
 
 fn random_nonce() -> Result<[u8; 32], PoolError> {
@@ -2753,6 +2887,7 @@ fn server_error(code: String) -> PoolError {
         "protocol_mismatch" => PoolError::ProtocolMismatch,
         "network_mismatch" => PoolError::NetworkMismatch,
         "fingerprint_mismatch" => PoolError::FingerprintMismatch,
+        "payout_authentication_failed" => PoolError::PayoutAuthentication,
         "message_count_limit" => PoolError::MessageCountLimit,
         _ => PoolError::InvalidMessage(format!("pool server rejected request: {code}")),
     }
@@ -3082,9 +3217,15 @@ mod tests {
 
     fn client(address: SocketAddr, pin: [u8; 32], worker: &str) -> PoolClient {
         PoolClient::connect(
-            PoolClientConfig::devnet(address, pin, worker, default_miner_destination()).unwrap(),
+            PoolClientConfig::devnet(address, pin, worker, test_payout_signer()).unwrap(),
         )
         .unwrap()
+    }
+
+    fn test_payout_signer() -> PoolPayoutSigner {
+        let signer = PoolPayoutSigner::new(SigningKey::from_bytes(&[0x13; 32]).unwrap());
+        assert_eq!(signer.payout(), default_miner_destination());
+        signer
     }
 
     fn find_share(work: &PoolMiningWork, chain_valid: bool) -> u64 {
@@ -3119,7 +3260,7 @@ mod tests {
                 server.local_addr(),
                 [0x55; 32],
                 "worker",
-                default_miner_destination(),
+                test_payout_signer(),
             )
             .unwrap(),
         )
@@ -3154,26 +3295,18 @@ mod tests {
     #[test]
     fn protocol_identity_frame_count_and_worker_bounds_are_enforced() {
         let (_root, server, _node, pin) = server("identity-bounds");
-        let mut wrong_network = PoolClientConfig::devnet(
-            server.local_addr(),
-            pin,
-            "worker",
-            default_miner_destination(),
-        )
-        .unwrap();
+        let mut wrong_network =
+            PoolClientConfig::devnet(server.local_addr(), pin, "worker", test_payout_signer())
+                .unwrap();
         wrong_network.expected_network_id[0] ^= 1;
         assert!(matches!(
             PoolClient::connect(wrong_network).unwrap_err(),
             PoolError::NetworkMismatch
         ));
 
-        let mut wrong_fingerprint = PoolClientConfig::devnet(
-            server.local_addr(),
-            pin,
-            "worker",
-            default_miner_destination(),
-        )
-        .unwrap();
+        let mut wrong_fingerprint =
+            PoolClientConfig::devnet(server.local_addr(), pin, "worker", test_payout_signer())
+                .unwrap();
         wrong_fingerprint.expected_consensus_fingerprint[0] ^= 1;
         assert!(matches!(
             PoolClient::connect(wrong_fingerprint).unwrap_err(),
@@ -3184,7 +3317,7 @@ mod tests {
                 server.local_addr(),
                 pin,
                 "x".repeat(POOL_MAX_WORKER_BYTES + 1),
-                default_miner_destination(),
+                test_payout_signer(),
             )
             .and_then(PoolClient::connect)
             .unwrap_err(),
@@ -3202,6 +3335,44 @@ mod tests {
             Err(PoolError::MessageCountLimit)
         ));
         server.stop().unwrap();
+    }
+
+    #[test]
+    fn payout_authentication_binds_key_network_challenge_and_worker() {
+        let signer = test_payout_signer();
+        let other = PoolPayoutSigner::new(SigningKey::from_bytes(&[0x21; 32]).unwrap());
+        let network = [0x31; 32];
+        let fingerprint = [0x32; 32];
+        let challenge = [0x33; 32];
+        let digest =
+            payout_auth_digest(network, fingerprint, challenge, "worker-a", signer.payout());
+        let signature = signer.sign(digest);
+        verify_payout_authentication(signer.payout(), digest, &signature).unwrap();
+
+        for changed in [
+            payout_auth_digest(
+                network,
+                fingerprint,
+                [0x34; 32],
+                "worker-a",
+                signer.payout(),
+            ),
+            payout_auth_digest(network, fingerprint, challenge, "worker-b", signer.payout()),
+            payout_auth_digest(network, fingerprint, challenge, "worker-a", other.payout()),
+        ] {
+            assert!(matches!(
+                verify_payout_authentication(signer.payout(), changed, &signature),
+                Err(PoolError::PayoutAuthentication)
+            ));
+        }
+        assert!(matches!(
+            verify_payout_authentication(other.payout(), digest, &signature),
+            Err(PoolError::PayoutAuthentication)
+        ));
+        assert!(matches!(
+            verify_payout_authentication(signer.payout(), digest, &[0_u8; 63]),
+            Err(PoolError::PayoutAuthentication)
+        ));
     }
 
     #[test]

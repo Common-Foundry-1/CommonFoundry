@@ -915,23 +915,20 @@ inactive accounting records are pruned within the stated caps. These bounds are
 Devnet engineering controls, not evidence of public-network denial-of-service
 maturity.
 
-The pool ledger is deliberately bounded, volatile test instrumentation.
-Accepted/rejected shares, found blocks, and credited Devnet atoms are tracked
-by connection session and payout label in memory, then discarded on process
-restart. The default counter adds one test atom per accepted share. These
-numbers are valueless and nonwithdrawable: they are not funds, debt, custody,
-or an on-chain balance. The payout field is an untrusted label and does not
-control the miner reward output. A valid block sends that output to the pool
-server's configured destination. Distinct local wallet keys do not fix this:
-the pool has no authenticated payout identity or payout mechanism.
+The pool ledger is bounded, durable test infrastructure. Accepted and rejected
+shares, found blocks, and credited Devnet atoms are stored by session and payout
+identity in a network-bound, checksummed two-slot ledger. Write-ahead block
+records recover interrupted submissions exactly once, while active-chain
+reconciliation tracks canonical and reorganized pool blocks. The default
+counter adds one test atom per accepted share.
 
-A production pool requires unique user and operator key custody, durable
-auditable share records, reorganization-aware reward maturity and reversal,
-explicit payout construction and confirmation, withdrawal limits, optimized
-GPU miners and proof generation, bounded verification queues, share-proof DoS
-analysis, monitoring, load and fuzz testing, independent implementations, and
-external audits. The implemented pool is only a private Devnet interoperability
-path.
+Pool v2 also authenticates each payout identity. After pinned TLS connects, the
+server sends a fresh random challenge. The wallet signs a domain-separated
+digest covering the challenge, network identity, consensus fingerprint, worker
+name, and payout key. This proves control of the receive key without sharing its
+private key. The next pool milestone converts mature canonical rewards into
+explicit testnet settlement transactions; RCNet qualification then adds load,
+fuzz, interoperability, and external review gates.
 
 ## 12. Security model
 
@@ -1115,14 +1112,14 @@ Common Foundry advances through measured software, named hardware, canonical art
 | ProductionV4 proof | RTX 5090 replay / online proof / CPU self-verify | 0.471 s / 6.093 s / 0.311 s |
 | ProductionV4 proof | RTX 5070 Ti complete three-process path | 74.294 s |
 | ProductionV4 proof | RTX 5070 Ti peak replay / proving allocation | 13.730 GiB / 8.004 GiB |
-| Devnet pool | Protocol / transport | CMFD pool v1 / TLS 1.3, exact leaf pin |
+| Devnet pool | Protocol / transport | CMFD pool v2 / TLS 1.3, exact leaf pin + Schnorr payout authentication |
 | Devnet pool | Default address | `127.0.0.1:18445` |
 | Devnet pool | Maximum framed message | 16 KiB |
 | Devnet pool | Connections / messages per session | 64 / 1,000,000 |
 | Devnet pool | Valid nonce records per job | 65,536 |
-| Devnet pool | Recent session / payout-label records | 1,024 / 1,024 |
+| Devnet pool | Session / payout / block records | 1,024 / 1,024 / 65,536 |
 | Devnet pool | Default share threshold | 7 leading zero bits |
-| Devnet pool | Accounting | Bounded in-memory test counters; no payout |
+| Devnet pool | Accounting | Durable network-bound ledger with reorganization tracking |
 | Proposed PoW | V2 batch/dimension/layers | 128 / 4,096 / 384 |
 | Proposed PoW | Raw model bank | 6 GiB weights + 512 KiB base + 184-byte header |
 | Proposed proof | Aggregate soundness | At least 128 bits |

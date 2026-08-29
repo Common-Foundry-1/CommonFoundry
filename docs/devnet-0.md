@@ -133,12 +133,14 @@ validation. The node remains responsible for chain sync, mempool selection,
 durable storage, and fork choice. See
 [Standalone CUDA miner](standalone-miner.md) for launcher and failover details.
 
-The Pool mode connects to the CMFD Devnet pool v1 protocol. Enter a URL in the
+The Pool mode connects to the CMFD Devnet pool v2 protocol. Enter a URL in the
 exact form `cmfd+tls://PRIVATE_IP:PORT?pin=64_HEX` and a worker name matching
 `[A-Za-z0-9._-]{1,32}`. The endpoint must be a numeric loopback, RFC1918 IPv4,
 or IPv6 unique-local address; DNS names and public addresses are rejected.
-This is a CMFD-specific TLS 1.3 protocol, not Bitcoin Stratum. Its counters are
-only volatile Devnet telemetry, not spendable pool earnings.
+This is a CMFD-specific TLS 1.3 protocol, not Bitcoin Stratum. The embedded
+wallet signs the pool's fresh connection challenge, binding its receive key,
+worker name, network identity, and consensus fingerprint without sending the
+private key.
 
 For miner wallet hygiene, **Transactions -> Consolidate mining outputs**
 combines eligible outputs into one self-owned output. The node deterministically
@@ -255,24 +257,19 @@ Stale jobs, duplicate nonces, low-difficulty shares, malformed or oversized
 frames, excess connections, and configured job/session/ledger limits are
 rejected. Frames are capped at 16 KiB, with at most 64 concurrent sessions,
 1,000,000 messages per session, 65,536 valid nonce records per job, 1,024 recent
-session records, and 1,024 recent payout-label records. Accepted shares
-increment an in-memory test counter; the default is one credited Devnet atom
-per accepted share. The bounded session and payout views reset when the pool
-process restarts. These values are valueless, nonwithdrawable counters, not
-funds or an on-chain balance. The client payout
-field is an untrusted grouping label and does not redirect the miner reward:
-valid pool blocks send that output to the server's `--miner` destination. There
-is no ownership proof, durable or reorganization-aware payout ledger,
-withdrawal transaction, or authenticated payout identity. Per-data-directory
-wallet keys prevent ordinary wallet users from sharing one signing secret, but
-the pool still treats the payout field as an unauthenticated label and cannot
-securely distinguish owners or make payouts.
+session records, 1,024 payout identities, and 65,536 pool-block records. Every
+payout identity proves key control through a fresh Schnorr challenge. Accepted
+shares increment a durable test counter; the default is one credited Devnet
+atom per accepted share. A network-bound, checksummed two-slot ledger survives
+process restarts, recovers interrupted block credits exactly once, and labels
+pool blocks canonical, orphaned, or unresolved as fork choice changes. Valid
+pool blocks send the miner reward to the server's `--miner` destination.
+Credited test atoms are accounting units until the on-chain settlement stage is
+enabled.
 
-Before any production use, pool mining still needs unique user and pool keys,
-persistent auditable and reorganization-aware reward accounting, real on-chain
-payouts, optimized GPU mining and proof generation, share-proof and
-verification-queue denial-of-service controls, load/fuzz testing, independent
-implementations, and external audits.
+The next pool milestone adds mature-reward settlement transactions. RCNet then
+adds verification-queue stress testing, load and fuzz coverage, independent
+interoperability testing, and external review.
 
 ## Run two or three local nodes
 

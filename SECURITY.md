@@ -544,24 +544,24 @@ proof meets the original chain target and ordinary block submission validates
 it. Never accept a client-claimed digest or proof and never substitute a pool
 share target for the committed chain target.
 
-Pool resource and accounting state is intentionally bounded and in memory.
-Duplicate nonces, stale jobs, low-difficulty shares, oversized frames, excess
-connections, and configured record limits are rejected. Accepted-share,
-rejected-share, block, and credited-atom values are session-only, valueless,
-nonwithdrawable test counters that reset when the pool process restarts. The
-client payout field is only an untrusted accounting label. The block's miner
-reward output goes to the pool operator's configured destination; there is no
-secure ownership mapping, crash-safe or reorganization-aware accounting,
-withdrawal mechanism, or on-chain payout ledger. Payout labels remain
-unauthenticated, so no displayed pool counter represents money owed to a
-distinct user.
+Pool resource and accounting state is intentionally bounded. The pool v2
+handshake sends a fresh random challenge after pinned TLS connects. A miner's
+Schnorr signature binds that challenge to the exact network, consensus
+fingerprint, worker name, and payout key, proving key control without disclosing
+the private key.
 
-Production pool activation requires unique wallet and pool key custody,
-persistent auditable and reorganization-aware share/reward accounting, an
-on-chain payout mechanism, optimized GPU mining and proof generation,
-share-verification queue and denial-of-service analysis, fuzzing and load
-tests, independent implementations, and external audits. The Devnet TLS pool
-must not be exposed to the public Internet or used with valuable funds.
+Duplicate nonces, stale jobs, low-difficulty shares, oversized frames, excess
+connections, and configured record limits are rejected. Accepted shares,
+rejections, block credits, and payout identities are persisted in a
+network-bound, checksummed two-slot ledger. A write-ahead block record makes
+restart recovery exact-once, and active-chain reconciliation marks canonical,
+orphaned, and unresolved blocks. Credited Devnet atoms remain nonwithdrawable
+test accounting until settlement transactions are enabled.
+
+Production pool activation additionally requires hardened operator key custody,
+on-chain mature-reward settlement, share-verification queue and denial-of-service
+analysis, fuzzing and load tests, independent implementations, and external
+audits. The Devnet TLS pool remains private-network test infrastructure.
 
 A completed, sound proof can establish the committed function, not physical GPU
 use or VRAM residency. No such hardware claim may be used to weaken the

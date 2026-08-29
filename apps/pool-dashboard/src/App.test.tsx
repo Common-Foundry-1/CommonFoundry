@@ -119,6 +119,23 @@ describe("pool dashboard", () => {
     expect(rows[2]).toHaveTextContent("rig-02");
   });
 
+  it("directs Windows and Linux workers to the wallet package", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response(JSON.stringify(fixture), { status: 200 })),
+    );
+    const user = userEvent.setup();
+    const { container } = render(<App />);
+    await screen.findByRole("heading", { name: "ForgeMatrix Pool" });
+
+    expect(container.querySelector(".connect-steps")).toHaveTextContent("START-WALLET.bat");
+    expect(screen.getByText(/Devnet-16 wallet package/)).toBeVisible();
+    expect(screen.queryByText(/miner package/)).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("tab", { name: "Linux" }));
+    expect(container.querySelector(".connect-steps")).toHaveTextContent("./start-wallet.sh");
+  });
+
   it("offers a retry when the pool API is unavailable", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("offline", { status: 503 })));
     render(<App />);

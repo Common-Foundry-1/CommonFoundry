@@ -52,6 +52,9 @@ param(
     [ValidateRange(1, 300)]
     [int]$TemplateRefreshSeconds = 15,
 
+    [ValidateRange(1, 64)]
+    [int]$SearchBatchSize = 32,
+
     [switch]$AllowPublicPeer,
     [switch]$KeepAcceptedWork,
     [switch]$InputsPrepared,
@@ -795,8 +798,8 @@ while ($Blocks -eq 0 -or $accepted -lt $Blocks) {
             Invoke-Checked $cmfdMinerPath $snapshotArguments 'ProductionV4 template snapshot' $attemptLog
         } 'snapshot' $attemptLog
 
-        $templateWindowsWsl, $coefficientsWindowsWsl, $proofWindowsWsl = @(
-            Convert-ToWslPaths @($template, $coefficients, $proof)
+        $templateWindowsWsl, $proofWindowsWsl = @(
+            Convert-ToWslPaths @($template, $proof)
         )
         $attemptDirectoryWindowsWsl = $templateWindowsWsl.Substring(
             0,
@@ -808,73 +811,102 @@ while ($Blocks -eq 0 -or $accepted -lt $Blocks) {
         ) -Label 'ProductionV4 WSL attempt setup' | Out-Null
         $tracePrefixWsl = "$attemptWsl/trace"
         $finalActivationWsl = "$tracePrefixWsl-final-activation.bin"
-        $searchTracePrefixWsl = "$attemptWsl/search"
-        $searchFinalActivationWsl = "$searchTracePrefixWsl-final-activation.bin"
-        $searchFinalActivationWindows = Convert-FromWslPath $searchFinalActivationWsl
+        $searchFinalActivationWindows = Join-Path $attemptDirectory 'search-final-activation.bin'
+        $searchFinalActivationWsl = "$attemptDirectoryWindowsWsl/search-final-activation.bin"
         $proofWsl = "$attemptWsl/transparent-proof.bin"
 
-        $candidateTemplate = $template
-        $candidateTemplateWsl = $templateWindowsWsl
-        $candidateCoefficientsWsl = $coefficientsWindowsWsl
         $candidateNonce = $Nonce
         $attemptForgeWorkCount = [uint64]0
         $searchTimer = [Diagnostics.Stopwatch]::StartNew()
         try {
             while ($true) {
+                $remainingNonces = [uint64]::MaxValue - $candidateNonce
+                $batchCount = $SearchBatchSize
+                if ($remainingNonces -lt [uint64]($batchCount - 1)) {
+                    $batchCount = [int]($remainingNonces + 1)
+                }
+                $batchCoefficients = Join-Path $attemptDirectory "search-batch-$candidateNonce.bin"
+                $batchCoefficientsWsl = "$attemptDirectoryWindowsWsl/search-batch-$candidateNonce.bin"
+                $batchTracePrefixWsl = "$attemptWsl/search-batch-$candidateNonce"
+                $batchFinalActivationsWsl = "$batchTracePrefixWsl-final-activation.bin"
+                $batchFinalActivationsWindows = Convert-FromWslPath $batchFinalActivationsWsl
+                $prepareBatch = Invoke-NativeCaptureLogged $cmfdMinerPath @(
+                    'prepare-v4-search-batch',
+                    '--template', $template,
+                    '--start-nonce', $candidateNonce.ToString([Globalization.CultureInfo]::InvariantCulture),
+                    '--count', $batchCount.ToString([Globalization.CultureInfo]::InvariantCulture),
+                    '--fixed-record', $fixedRecordPath,
+                    '--coefficients-output', $batchCoefficients
+                ) $attemptLog
+                if ($prepareBatch.ExitCode -ne 0) {
+                    throw "ProductionV4 search-batch preparation exited with code $($prepareBatch.ExitCode)"
+                }
                 Invoke-PersistentWslWorker `
                     $replayWorker `
-                    @('RUN', 'search', $candidateCoefficientsWsl, $searchTracePrefixWsl) `
+                    @('RUNBATCH',
+                    $batchCount.ToString([Globalization.CultureInfo]::InvariantCulture),
+                    $batchCoefficientsWsl,
+                    $batchTracePrefixWsl) `
                     'CMFD_V4_REPLAY_DONE' `
                     $attemptLog
                 $inspection = Invoke-NativeCaptureLogged $cmfdMinerPath @(
-                    'inspect-v4-work',
-                    '--template', $candidateTemplate,
-                    '--final-activation', $searchFinalActivationWindows,
-                    '--fixed-record', $fixedRecordPath
+                    'inspect-v4-search-batch',
+                    '--template', $template,
+                    '--start-nonce', $candidateNonce.ToString([Globalization.CultureInfo]::InvariantCulture),
+                    '--count', $batchCount.ToString([Globalization.CultureInfo]::InvariantCulture),
+                    '--final-activations', $batchFinalActivationsWindows,
+                    '--fixed-record', $fixedRecordPath,
+                    '--winner-final-output', $searchFinalActivationWindows
                 ) $attemptLog
                 if ($inspection.ExitCode -ne 0) {
-                    throw "ProductionV4 work inspection exited with code $($inspection.ExitCode)"
+                    throw "ProductionV4 search-batch inspection exited with code $($inspection.ExitCode)"
                 }
-                $workLines = @($inspection.Output | Where-Object {
-                    $_.StartsWith('CMFD_V4_WORK ', [StringComparison]::Ordinal)
+                $batchLines = @($inspection.Output | Where-Object {
+                    $_.StartsWith('CMFD_V4_SEARCH_BATCH ', [StringComparison]::Ordinal)
                 })
-                $workMatch = if ($workLines.Count -eq 1) {
-                    [regex]::Match($workLines[0], ' qualified=(true|false) ')
+                $batchMatch = if ($batchLines.Count -eq 1) {
+                    [regex]::Match($batchLines[0], ' qualified=(true|false) ')
                 } else {
                     $null
                 }
-                if ($null -eq $workMatch -or -not $workMatch.Success) {
-                    throw 'ProductionV4 work inspection did not return one canonical result'
+                if ($null -eq $batchMatch -or -not $batchMatch.Success) {
+                    throw 'ProductionV4 search-batch inspection did not return one canonical result'
                 }
-                $attemptForgeWorkCount++
-                if ($workMatch.Groups[1].Value -ceq 'true') {
+                $attemptForgeWorkCount += [uint64]$batchCount
+                if ($batchMatch.Groups[1].Value -ceq 'true') {
+                    $nonceMatch = [regex]::Match($batchLines[0], ' nonce=([0-9]+) ')
+                    if (-not $nonceMatch.Success) {
+                        throw 'ProductionV4 search-batch winner did not identify its nonce'
+                    }
+                    $candidateNonce = [uint64]::Parse(
+                        $nonceMatch.Groups[1].Value,
+                        [Globalization.CultureInfo]::InvariantCulture
+                    )
+                    $candidateTemplate = Join-Path $attemptDirectory "template-$candidateNonce.json"
+                    $candidateCoefficients = Join-Path $attemptDirectory "replay-coefficients-$candidateNonce.bin"
+                    $bind = Invoke-NativeCaptureLogged $cmfdMinerPath @(
+                        'bind-v4-nonce',
+                        '--template', $template,
+                        '--nonce', $candidateNonce.ToString([Globalization.CultureInfo]::InvariantCulture),
+                        '--fixed-record', $fixedRecordPath,
+                        '--coefficients-output', $candidateCoefficients,
+                        '--output', $candidateTemplate
+                    ) $attemptLog
+                    if ($bind.ExitCode -ne 0) {
+                        throw "ProductionV4 winning nonce binding exited with code $($bind.ExitCode)"
+                    }
+                    $candidateTemplateWsl = "$attemptDirectoryWindowsWsl/template-$candidateNonce.json"
+                    $candidateCoefficientsWsl = "$attemptDirectoryWindowsWsl/replay-coefficients-$candidateNonce.bin"
                     break
                 }
                 if ($searchTimer.Elapsed.TotalSeconds -ge $TemplateRefreshSeconds) {
                     $outcome = 'refresh'
                     break
                 }
-                if ($candidateNonce -eq [uint64]::MaxValue) {
+                if ([uint64]$batchCount -gt ([uint64]::MaxValue - $candidateNonce)) {
                     throw 'ProductionV4 nonce space exhausted'
                 }
-                $candidateNonce++
-                $candidateTemplate = Join-Path $attemptDirectory "template-$candidateNonce.json"
-                $candidateCoefficients = Join-Path $attemptDirectory "replay-coefficients-$candidateNonce.bin"
-                $bind = Invoke-NativeCaptureLogged $cmfdMinerPath @(
-                    'bind-v4-nonce',
-                    '--template', $template,
-                    '--nonce', $candidateNonce.ToString([Globalization.CultureInfo]::InvariantCulture),
-                    '--fixed-record', $fixedRecordPath,
-                    '--coefficients-output', $candidateCoefficients,
-                    '--output', $candidateTemplate
-                ) $attemptLog
-                if ($bind.ExitCode -ne 0) {
-                    throw "ProductionV4 nonce binding exited with code $($bind.ExitCode)"
-                }
-                $candidateTemplateWindowsWsl = "$attemptDirectoryWindowsWsl/template-$candidateNonce.json"
-                $candidateCoefficientsWindowsWsl = "$attemptDirectoryWindowsWsl/replay-coefficients-$candidateNonce.bin"
-                $candidateTemplateWsl = $candidateTemplateWindowsWsl
-                $candidateCoefficientsWsl = $candidateCoefficientsWindowsWsl
+                $candidateNonce += [uint64]$batchCount
             }
         } finally {
             $searchTimer.Stop()

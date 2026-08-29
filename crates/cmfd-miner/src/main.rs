@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::{Parser, Subcommand};
 #[cfg(feature = "production-v3")]
 use cmfd_consensus::ForgeMatrixV3WinningNonceClaim;
@@ -244,6 +244,38 @@ enum Command {
         coefficients_output: PathBuf,
         #[arg(long)]
         output: PathBuf,
+    },
+    /// Prepare replay coefficients for a contiguous ProductionV4 nonce batch.
+    #[cfg(feature = "production-v4-testnet")]
+    PrepareV4SearchBatch {
+        /// Existing canonical template whose block challenge remains unchanged.
+        #[arg(long)]
+        template: PathBuf,
+        #[arg(long)]
+        start_nonce: u64,
+        #[arg(long)]
+        count: u32,
+        #[arg(long)]
+        fixed_record: PathBuf,
+        #[arg(long)]
+        coefficients_output: PathBuf,
+    },
+    /// Inspect an ordered ProductionV4 nonce batch and retain its first winner.
+    #[cfg(feature = "production-v4-testnet")]
+    InspectV4SearchBatch {
+        /// Existing canonical template whose block challenge remains unchanged.
+        #[arg(long)]
+        template: PathBuf,
+        #[arg(long)]
+        start_nonce: u64,
+        #[arg(long)]
+        count: u32,
+        #[arg(long)]
+        final_activations: PathBuf,
+        #[arg(long)]
+        fixed_record: PathBuf,
+        #[arg(long)]
+        winner_final_output: PathBuf,
     },
     /// Report whether a replay's final activation meets a frozen V4 target.
     #[cfg(feature = "production-v4-testnet")]
@@ -502,6 +534,36 @@ fn main() -> Result<()> {
             &output,
         ),
         #[cfg(feature = "production-v4-testnet")]
+        Command::PrepareV4SearchBatch {
+            template,
+            start_nonce,
+            count,
+            fixed_record,
+            coefficients_output,
+        } => prepare_v4_search_batch(
+            &template,
+            start_nonce,
+            count,
+            &fixed_record,
+            &coefficients_output,
+        ),
+        #[cfg(feature = "production-v4-testnet")]
+        Command::InspectV4SearchBatch {
+            template,
+            start_nonce,
+            count,
+            final_activations,
+            fixed_record,
+            winner_final_output,
+        } => inspect_v4_search_batch(
+            &template,
+            start_nonce,
+            count,
+            &final_activations,
+            &fixed_record,
+            &winner_final_output,
+        ),
+        #[cfg(feature = "production-v4-testnet")]
         Command::InspectV4Work {
             template,
             final_activation,
@@ -754,6 +816,184 @@ fn bind_v4_nonce(
         output.display(),
         coefficients_output.display()
     );
+    Ok(())
+}
+
+#[cfg(feature = "production-v4-testnet")]
+fn prepare_v4_search_batch(
+    template_path: &Path,
+    start_nonce: u64,
+    count: u32,
+    fixed_record_path: &Path,
+    coefficients_output: &Path,
+) -> Result<()> {
+    ensure_production_v4_test_tool()?;
+    validate_v4_search_batch_range(start_nonce, count)?;
+    ensure_existing_absolute_file(template_path, "ProductionV4 source template")?;
+    ensure_existing_absolute_file(fixed_record_path, "ProductionV4 fixed artifact record")?;
+    ensure_new_absolute_output(
+        coefficients_output,
+        "ProductionV4 search-batch replay coefficients",
+    )?;
+
+    let template_bytes = read_bounded_file(
+        template_path,
+        PRODUCTION_V4_MAX_BLOCK_BYTES,
+        "ProductionV4 source template",
+    )?;
+    let frozen: FrozenProductionV4Template = serde_json::from_slice(&template_bytes)
+        .with_context(|| format!("failed to parse {}", template_path.display()))?;
+    if canonical_json(&frozen, "ProductionV4 source template")? != template_bytes {
+        bail!("ProductionV4 source template is not canonical JSON");
+    }
+    frozen.clone().into_mining_template()?;
+    if frozen.challenge.network_id != PRODUCTION_V4_TESTNET_NETWORK_ID {
+        bail!("ProductionV4 source template belongs to another network");
+    }
+
+    let fixed_record_bytes = read_bounded_file(
+        fixed_record_path,
+        64 * 1024,
+        "ProductionV4 fixed artifact record",
+    )?;
+    let fixed_record: ForgeMatrixV4FixedArtifactRecordV1 =
+        serde_json::from_slice(&fixed_record_bytes)?;
+    fixed_record.validate()?;
+    if fixed_record.record_digest() != PRODUCTION_V4_FIXED_ARTIFACT_RECORD_DIGEST {
+        bail!("ProductionV4 fixed artifact record is not the compiled testnet record");
+    }
+
+    let coefficients_per_nonce = (PRODUCTION_V2_LAYERS as usize + 1) * 20;
+    let mut coefficients = Vec::with_capacity(coefficients_per_nonce * count as usize);
+    for lane in 0..count {
+        let nonce = start_nonce + u64::from(lane);
+        let challenge_digest = forgematrix_v4_challenge_digest(
+            &frozen.challenge,
+            nonce,
+            fixed_record.manifest_digest(),
+        );
+        coefficients.extend_from_slice(&production_v4_replay_coefficients(challenge_digest));
+    }
+    write_new_file(
+        coefficients_output,
+        &coefficients,
+        "ProductionV4 search-batch replay coefficients",
+    )?;
+    println!(
+        "Prepared ProductionV4 search batch start_nonce={start_nonce} count={count}: {}",
+        coefficients_output.display()
+    );
+    Ok(())
+}
+
+#[cfg(feature = "production-v4-testnet")]
+fn inspect_v4_search_batch(
+    template_path: &Path,
+    start_nonce: u64,
+    count: u32,
+    final_activations_path: &Path,
+    fixed_record_path: &Path,
+    winner_final_output: &Path,
+) -> Result<()> {
+    ensure_production_v4_test_tool()?;
+    validate_v4_search_batch_range(start_nonce, count)?;
+
+    ensure_existing_absolute_file(template_path, "ProductionV4 source template")?;
+    ensure_existing_absolute_file(
+        final_activations_path,
+        "ProductionV4 search-batch final activations",
+    )?;
+    ensure_existing_absolute_file(fixed_record_path, "ProductionV4 fixed artifact record")?;
+    ensure_new_absolute_output(winner_final_output, "ProductionV4 winning final activation")?;
+
+    let template_bytes = read_bounded_file(
+        template_path,
+        PRODUCTION_V4_MAX_BLOCK_BYTES,
+        "ProductionV4 source template",
+    )?;
+    let frozen: FrozenProductionV4Template = serde_json::from_slice(&template_bytes)
+        .with_context(|| format!("failed to parse {}", template_path.display()))?;
+    if canonical_json(&frozen, "ProductionV4 source template")? != template_bytes {
+        bail!("ProductionV4 source template is not canonical JSON");
+    }
+    frozen.clone().into_mining_template()?;
+    if frozen.challenge.network_id != PRODUCTION_V4_TESTNET_NETWORK_ID {
+        bail!("ProductionV4 source template belongs to another network");
+    }
+
+    let fixed_record_bytes = read_bounded_file(
+        fixed_record_path,
+        64 * 1024,
+        "ProductionV4 fixed artifact record",
+    )?;
+    let fixed_record: ForgeMatrixV4FixedArtifactRecordV1 =
+        serde_json::from_slice(&fixed_record_bytes)?;
+    fixed_record.validate()?;
+    if fixed_record.record_digest() != PRODUCTION_V4_FIXED_ARTIFACT_RECORD_DIGEST {
+        bail!("ProductionV4 fixed artifact record is not the compiled testnet record");
+    }
+
+    let expected_bytes = FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES
+        .checked_mul(count as usize)
+        .context("ProductionV4 search-batch final activation length overflow")?;
+    let final_activations = read_bounded_file(
+        final_activations_path,
+        expected_bytes,
+        "ProductionV4 search-batch final activations",
+    )?;
+    ensure!(
+        final_activations.len() == expected_bytes,
+        "ProductionV4 search-batch final activations have the wrong byte length"
+    );
+
+    for (lane, final_activation) in final_activations
+        .chunks_exact(FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES)
+        .enumerate()
+    {
+        let nonce = start_nonce + lane as u64;
+        let challenge_digest = forgematrix_v4_challenge_digest(
+            &frozen.challenge,
+            nonce,
+            fixed_record.manifest_digest(),
+        );
+        let final_activation_digest =
+            v4_final_activation_digest_from_bytes(challenge_digest, final_activation)?;
+        let work_digest = forgematrix_v4_work_digest(
+            fixed_record.manifest_digest(),
+            challenge_digest,
+            final_activation_digest,
+        );
+        if work_digest <= frozen.challenge.target {
+            write_new_file(
+                winner_final_output,
+                final_activation,
+                "ProductionV4 winning final activation",
+            )?;
+            println!(
+                "CMFD_V4_SEARCH_BATCH qualified=true start_nonce={start_nonce} count={count} nonce={nonce} lane={lane} work={} target={}",
+                hex::encode(work_digest),
+                hex::encode(frozen.challenge.target),
+            );
+            return Ok(());
+        }
+    }
+
+    println!(
+        "CMFD_V4_SEARCH_BATCH qualified=false start_nonce={start_nonce} count={count} target={}",
+        hex::encode(frozen.challenge.target),
+    );
+    Ok(())
+}
+
+#[cfg(feature = "production-v4-testnet")]
+fn validate_v4_search_batch_range(start_nonce: u64, count: u32) -> Result<()> {
+    ensure!(
+        (1..=64).contains(&count),
+        "ProductionV4 search batch count must be from 1 through 64"
+    );
+    start_nonce
+        .checked_add(u64::from(count - 1))
+        .context("ProductionV4 search batch exceeds the nonce space")?;
     Ok(())
 }
 
@@ -4617,9 +4857,24 @@ mod tests {
     #[cfg(feature = "production-v4-testnet")]
     #[test]
     fn production_v4_continuous_search_commands_require_bound_inputs() {
-        for command in ["bind-v4-nonce", "inspect-v4-work"] {
+        for command in [
+            "bind-v4-nonce",
+            "prepare-v4-search-batch",
+            "inspect-v4-search-batch",
+            "inspect-v4-work",
+        ] {
             assert!(Cli::try_parse_from(["cmfd-miner", command]).is_err());
         }
+    }
+
+    #[cfg(feature = "production-v4-testnet")]
+    #[test]
+    fn production_v4_search_batch_range_is_bounded() {
+        assert!(validate_v4_search_batch_range(0, 1).is_ok());
+        assert!(validate_v4_search_batch_range(0, 64).is_ok());
+        assert!(validate_v4_search_batch_range(0, 0).is_err());
+        assert!(validate_v4_search_batch_range(0, 65).is_err());
+        assert!(validate_v4_search_batch_range(u64::MAX, 2).is_err());
     }
 
     fn retry_test_block() -> cmfd_consensus::Block {

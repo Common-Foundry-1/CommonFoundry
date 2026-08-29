@@ -221,6 +221,71 @@ __global__ void reduce_layer(const int32_t* limb_accumulators, int8_t* limbs,
     write_centered_limbs(value, limbs, count, index);
 }
 
+__global__ void initialize_activation_batch(
+    const int8_t* base_input, int8_t* limbs, uint32_t* activations,
+    const uint32_t* coefficients, uint32_t rows, uint32_t width,
+    uint32_t batch_size) {
+    const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t cells = size_t(rows) * width;
+    const size_t total_cells = size_t(batch_size) * cells;
+    if (index >= total_cells) return;
+    const size_t lane = index / cells;
+    const size_t within_lane = index - lane * cells;
+    const uint32_t row = static_cast<uint32_t>(within_lane / width);
+    const uint32_t column = static_cast<uint32_t>(within_lane % width);
+    const uint32_t row_bits = __ffs(static_cast<int>(rows)) - 1;
+    const uint32_t column_bits = __ffs(static_cast<int>(width)) - 1;
+    const uint32_t base = canonicalize_signed(base_input[within_lane]);
+    const uint32_t* lane_coefficients =
+        coefficients + lane * size_t(PRODUCTION_LAYERS + 1) * MASK_COEFFICIENTS;
+    const uint32_t mask =
+        coordinate_mask(lane_coefficients, row, column, row_bits, column_bits);
+    uint32_t value = base + mask;
+    if (value >= KOALA_BEAR_MODULUS) value -= KOALA_BEAR_MODULUS;
+    value = cube_field(value);
+    activations[index] = value;
+    write_centered_limbs(value, limbs + lane * 4 * cells, cells, within_lane);
+}
+
+__global__ void reduce_layer_batch(
+    const int32_t* limb_accumulators, int8_t* limbs,
+    uint32_t* preactivations, uint32_t* activations,
+    const uint32_t* coefficients, const int32_t* weight_row_sums,
+    uint32_t layer, uint32_t rows, uint32_t width, uint32_t batch_size) {
+    const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t cells = size_t(rows) * width;
+    const size_t total_cells = size_t(batch_size) * cells;
+    if (index >= total_cells) return;
+    const size_t lane = index / cells;
+    const size_t within_lane = index - lane * cells;
+    const size_t lane_limb_offset = lane * 4 * cells;
+    const int64_t dot =
+        int64_t(limb_accumulators[lane_limb_offset + within_lane]) +
+        256LL * int64_t(limb_accumulators[lane_limb_offset + cells + within_lane]) +
+        65'536LL *
+            int64_t(limb_accumulators[lane_limb_offset + 2 * cells + within_lane]) +
+        16'777'216LL *
+            int64_t(limb_accumulators[lane_limb_offset + 3 * cells + within_lane]) +
+        CENTER_OFFSET * int64_t(weight_row_sums[within_lane % width]);
+    const uint32_t accumulator = canonicalize_signed(dot);
+    const uint32_t row = static_cast<uint32_t>(within_lane / width);
+    const uint32_t column = static_cast<uint32_t>(within_lane % width);
+    const uint32_t row_bits = __ffs(static_cast<int>(rows)) - 1;
+    const uint32_t column_bits = __ffs(static_cast<int>(width)) - 1;
+    const uint32_t* lane_coefficients =
+        coefficients +
+        (lane * size_t(PRODUCTION_LAYERS + 1) + size_t(layer + 1)) *
+            MASK_COEFFICIENTS;
+    const uint32_t mask =
+        coordinate_mask(lane_coefficients, row, column, row_bits, column_bits);
+    uint32_t value = accumulator + mask;
+    if (value >= KOALA_BEAR_MODULUS) value -= KOALA_BEAR_MODULUS;
+    preactivations[index] = value;
+    value = cube_field(value);
+    activations[index] = value;
+    write_centered_limbs(value, limbs + lane * 4 * cells, cells, within_lane);
+}
+
 void launch_gemm(const int8_t* activation, const int8_t* weights,
                  int32_t* accumulators, uint32_t rows, uint32_t width) {
     const cutlass::gemm::GemmCoord problem_size(static_cast<int>(rows),
@@ -267,6 +332,29 @@ std::vector<uint32_t> load_coefficients(const char* path, uint32_t layers) {
     std::vector<uint8_t> encoded(expected);
     input.read(reinterpret_cast<char*>(encoded.data()), encoded.size());
     if (!input) throw std::runtime_error("read V4 replay coefficients");
+    std::vector<uint32_t> coefficients(expected);
+    std::transform(encoded.begin(), encoded.end(), coefficients.begin(),
+                   [](uint8_t value) { return static_cast<uint32_t>(value); });
+    return coefficients;
+}
+
+std::vector<uint32_t> load_coefficient_batch(const char* path, uint32_t layers,
+                                             uint32_t batch_size) {
+    if (path == nullptr || batch_size == 0 || batch_size > 64) {
+        throw std::runtime_error("invalid V4 replay coefficient batch");
+    }
+    std::ifstream input(path, std::ios::binary | std::ios::ate);
+    if (!input) throw std::runtime_error("open V4 replay coefficient batch");
+    const size_t coefficients_per_nonce = size_t(layers + 1) * MASK_COEFFICIENTS;
+    const size_t expected = size_t(batch_size) * coefficients_per_nonce;
+    const auto actual = input.tellg();
+    if (actual < 0 || static_cast<uint64_t>(actual) != expected) {
+        throw std::runtime_error("V4 replay coefficient batch has the wrong byte length");
+    }
+    input.seekg(0, std::ios::beg);
+    std::vector<uint8_t> encoded(expected);
+    input.read(reinterpret_cast<char*>(encoded.data()), encoded.size());
+    if (!input) throw std::runtime_error("read V4 replay coefficient batch");
     std::vector<uint32_t> coefficients(expected);
     std::transform(encoded.begin(), encoded.end(), coefficients.begin(),
                    [](uint8_t value) { return static_cast<uint32_t>(value); });
@@ -704,6 +792,86 @@ void run_production_replay(ProductionModel& model, const char* coefficient_path,
     cudaFree(limbs);
 }
 
+void run_production_search_batch(ProductionModel& model, uint32_t batch_size,
+                                 const char* coefficient_path,
+                                 const char* output_prefix) {
+    if (output_prefix == nullptr || coefficient_path == nullptr || batch_size == 0 ||
+        batch_size > 64) {
+        throw std::runtime_error("invalid ProductionV4 search batch");
+    }
+    model.ensure_loaded();
+    const size_t cells = size_t(PRODUCTION_ROWS) * PRODUCTION_WIDTH;
+    const size_t batch_cells = size_t(batch_size) * cells;
+    const size_t layer_cells = size_t(PRODUCTION_WIDTH) * PRODUCTION_WIDTH;
+    const auto coefficients =
+        load_coefficient_batch(coefficient_path, PRODUCTION_LAYERS, batch_size);
+
+    int8_t* limbs = nullptr;
+    int32_t* limb_accumulators = nullptr;
+    uint32_t* preactivations = nullptr;
+    uint32_t* activations = nullptr;
+    uint32_t* device_coefficients = nullptr;
+    cuda_check(cudaMalloc(&limbs, 4 * batch_cells),
+               "allocate production search-batch activation limbs");
+    cuda_check(cudaMalloc(&limb_accumulators, 4 * batch_cells * sizeof(int32_t)),
+               "allocate production search-batch limb accumulators");
+    cuda_check(cudaMalloc(&preactivations, batch_cells * sizeof(uint32_t)),
+               "allocate production search-batch preactivations");
+    cuda_check(cudaMalloc(&activations, batch_cells * sizeof(uint32_t)),
+               "allocate production search-batch activations");
+    cuda_check(cudaMalloc(&device_coefficients, coefficients.size() * sizeof(uint32_t)),
+               "allocate production search-batch coefficients");
+    cuda_check(cudaMemcpy(device_coefficients, coefficients.data(),
+                          coefficients.size() * sizeof(uint32_t), cudaMemcpyHostToDevice),
+               "copy production search-batch coefficients");
+
+    size_t free_after = 0;
+    size_t total_bytes = 0;
+    cuda_check(cudaMemGetInfo(&free_after, &total_bytes),
+               "read search-batch allocated device memory");
+    cudaEvent_t start{};
+    cudaEvent_t stop{};
+    cuda_check(cudaEventCreate(&start), "create search-batch start event");
+    cuda_check(cudaEventCreate(&stop), "create search-batch stop event");
+    cuda_check(cudaEventRecord(start), "record search-batch start");
+    const uint32_t blocks =
+        static_cast<uint32_t>((batch_cells + THREADS - 1) / THREADS);
+    initialize_activation_batch<<<blocks, THREADS>>>(
+        model.base(), limbs, activations, device_coefficients, PRODUCTION_ROWS,
+        PRODUCTION_WIDTH, batch_size);
+    for (uint32_t layer = 0; layer < PRODUCTION_LAYERS; ++layer) {
+        launch_stacked_limb_gemm(
+            limbs, model.weights() + size_t(layer) * layer_cells,
+            limb_accumulators, batch_size * PRODUCTION_ROWS, PRODUCTION_WIDTH);
+        reduce_layer_batch<<<blocks, THREADS>>>(
+            limb_accumulators, limbs, preactivations, activations,
+            device_coefficients,
+            model.row_sums() + size_t(layer) * PRODUCTION_WIDTH, layer,
+            PRODUCTION_ROWS, PRODUCTION_WIDTH, batch_size);
+    }
+    cuda_check(cudaEventRecord(stop), "record search-batch stop");
+    cuda_check(cudaEventSynchronize(stop), "finish production search batch");
+    float elapsed_ms = 0.0F;
+    cuda_check(cudaEventElapsedTime(&elapsed_ms, start, stop),
+               "measure production search batch");
+
+    write_final_activation(output_prefix, activations, batch_cells);
+    std::printf("device_allocation_gib=%.6f\n",
+                double(model.baseline_free() - free_after) /
+                    double(size_t{1} << 30));
+    std::printf("replay_seconds=%.6f\n", double(elapsed_ms) / 1000.0);
+    std::printf("replay_mode=search_batch\n");
+    std::printf("batch_size=%u\n", batch_size);
+
+    cudaEventDestroy(stop);
+    cudaEventDestroy(start);
+    cudaFree(device_coefficients);
+    cudaFree(activations);
+    cudaFree(preactivations);
+    cudaFree(limb_accumulators);
+    cudaFree(limbs);
+}
+
 void run_production_benchmark(const char* model_path, const char* coefficient_path,
                               const char* output_prefix) {
     if (output_prefix != nullptr && (model_path == nullptr || coefficient_path == nullptr)) {
@@ -735,6 +903,19 @@ void run_persistent_server(const char* model_path) {
         if (fields.size() == 1 && fields[0] == "EVICT") {
             model.evict();
             std::printf("CMFD_V4_REPLAY_EVICTED\n");
+            std::fflush(stdout);
+            continue;
+        }
+        if (fields.size() == 4 && fields[0] == "RUNBATCH" &&
+            !fields[1].empty() && !fields[2].empty() && !fields[3].empty()) {
+            size_t consumed = 0;
+            const unsigned long parsed = std::stoul(fields[1], &consumed);
+            if (consumed != fields[1].size() || parsed == 0 || parsed > 64) {
+                throw std::runtime_error("invalid persistent replay batch size");
+            }
+            run_production_search_batch(model, static_cast<uint32_t>(parsed),
+                                        fields[2].c_str(), fields[3].c_str());
+            std::printf("CMFD_V4_REPLAY_DONE\n");
             std::fflush(stdout);
             continue;
         }

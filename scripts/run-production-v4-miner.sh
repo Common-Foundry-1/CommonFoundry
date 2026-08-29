@@ -11,6 +11,7 @@ KEEP_ACCEPTED_WORK=0
 VALIDATE_ONLY=0
 INPUTS_PREPARED=0
 TEMPLATE_REFRESH_SECONDS=15
+SEARCH_BATCH_SIZE=32
 sampler_pid=""
 proof_pid=""
 replay_pid=""
@@ -32,6 +33,7 @@ while (($#)); do
     --cuda-device) CUDA_DEVICE="${2:-}"; shift 2 ;;
     --nonce) NONCE="${2:-}"; shift 2 ;;
     --template-refresh-seconds) TEMPLATE_REFRESH_SECONDS="${2:-}"; shift 2 ;;
+    --search-batch-size) SEARCH_BATCH_SIZE="${2:-}"; shift 2 ;;
     --keep-accepted-work) KEEP_ACCEPTED_WORK=1; shift ;;
     --validate-only) VALIDATE_ONLY=1; shift ;;
     --inputs-prepared) INPUTS_PREPARED=1; shift ;;
@@ -45,8 +47,9 @@ if [[ ! "$MINER" =~ ^[0-9a-fA-F]{64}$ ]]; then
   exit 2
 fi
 if [[ ! "$BLOCKS" =~ ^[0-9]+$ || ! "$CUDA_DEVICE" =~ ^[0-9]+$ || ! "$NONCE" =~ ^[0-9]+$ ||
-      ! "$TEMPLATE_REFRESH_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
-  echo "ERROR: blocks, CUDA device, and nonce must be non-negative integers; template refresh must be positive." >&2
+      ! "$TEMPLATE_REFRESH_SECONDS" =~ ^[1-9][0-9]*$ ||
+      ! "$SEARCH_BATCH_SIZE" =~ ^[1-9][0-9]*$ || "$SEARCH_BATCH_SIZE" -gt 64 ]]; then
+  echo "ERROR: blocks, CUDA device, and nonce must be non-negative integers; template refresh and search batch size must be positive, with batch size at most 64." >&2
   exit 2
 fi
 if ((${#NONCE} > 19)) || ((${#NONCE} == 19)) && [[ "$NONCE" > "9223372036854775806" ]]; then
@@ -301,8 +304,7 @@ while ((BLOCKS == 0 || accepted < BLOCKS)); do
   coefficients="$attempt_directory/replay-coefficients.bin"
   trace_prefix="$attempt_directory/trace"
   final_activation="$trace_prefix-final-activation.bin"
-  search_trace_prefix="$attempt_directory/search"
-  search_final_activation="$search_trace_prefix-final-activation.bin"
+  search_final_activation="$attempt_directory/search-final-activation.bin"
   proof="$attempt_directory/transparent-proof.bin"
 
   start_ns="$(date +%s%N)"
@@ -311,28 +313,49 @@ while ((BLOCKS == 0 || accepted < BLOCKS)); do
   run_logged "ProductionV4 template snapshot" "$CMFD_MINER" snapshot-v4-template \
     --peer "$PEER" --allow-public-peers --miner "$MINER" --nonce "$NONCE" \
     --fixed-record "$FIXED_RECORD" --coefficients-output "$coefficients" --output "$template"
-  candidate_template="$template"
-  candidate_coefficients="$coefficients"
   candidate_nonce="$NONCE"
   attempt_forge_work_count=0
   search_start_ns="$(date +%s%N)"
   outcome=""
   while :; do
+    remaining_nonces=$((9223372036854775806 - candidate_nonce))
+    batch_count="$SEARCH_BATCH_SIZE"
+    if ((remaining_nonces < batch_count - 1)); then
+      batch_count=$((remaining_nonces + 1))
+    fi
+    batch_coefficients="$attempt_directory/search-batch-$candidate_nonce.bin"
+    batch_trace_prefix="$attempt_directory/search-batch-$candidate_nonce"
+    batch_final_activations="$batch_trace_prefix-final-activation.bin"
+    run_logged "ProductionV4 search-batch preparation" "$CMFD_MINER" \
+      prepare-v4-search-batch --template "$template" --start-nonce "$candidate_nonce" \
+      --count "$batch_count" --fixed-record "$FIXED_RECORD" \
+      --coefficients-output "$batch_coefficients"
     invoke_worker "$replay_input_fd" "$replay_output_fd" 'CMFD_V4_REPLAY_DONE' "$attempt_log" \
-      'ProductionV4 replay worker' RUN search "$candidate_coefficients" "$search_trace_prefix" \
+      'ProductionV4 replay worker' RUNBATCH "$batch_count" "$batch_coefficients" \
+      "$batch_trace_prefix" \
       || attempt_failure "ProductionV4 search replay failed"
-    if ! work_output="$("$CMFD_MINER" inspect-v4-work \
-        --template "$candidate_template" --final-activation "$search_final_activation" \
-        --fixed-record "$FIXED_RECORD" 2>&1)"; then
+    if ! work_output="$("$CMFD_MINER" inspect-v4-search-batch \
+        --template "$template" --start-nonce "$candidate_nonce" --count "$batch_count" \
+        --final-activations "$batch_final_activations" --fixed-record "$FIXED_RECORD" \
+        --winner-final-output "$search_final_activation" 2>&1)"; then
       printf '%s\n' "$work_output" >>"$attempt_log"
       attempt_failure "ProductionV4 work inspection failed"
     fi
     printf '%s\n' "$work_output" >>"$attempt_log"
-    if [[ "$(grep -c '^CMFD_V4_WORK ' <<<"$work_output")" -ne 1 ]]; then
+    if [[ "$(grep -c '^CMFD_V4_SEARCH_BATCH ' <<<"$work_output")" -ne 1 ]]; then
       attempt_failure "ProductionV4 work inspection returned a noncanonical result"
     fi
-    attempt_forge_work_count=$((attempt_forge_work_count + 1))
-    if grep -q '^CMFD_V4_WORK qualified=true ' <<<"$work_output"; then
+    attempt_forge_work_count=$((attempt_forge_work_count + batch_count))
+    if grep -q '^CMFD_V4_SEARCH_BATCH qualified=true ' <<<"$work_output"; then
+      candidate_nonce="$(sed -nE 's/^CMFD_V4_SEARCH_BATCH .* nonce=([0-9]+) .*/\1/p' <<<"$work_output")"
+      if [[ ! "$candidate_nonce" =~ ^[0-9]+$ ]]; then
+        attempt_failure "ProductionV4 search-batch winner did not identify its nonce"
+      fi
+      candidate_template="$attempt_directory/template-$candidate_nonce.json"
+      candidate_coefficients="$attempt_directory/replay-coefficients-$candidate_nonce.bin"
+      run_logged "ProductionV4 winning nonce binding" "$CMFD_MINER" bind-v4-nonce \
+        --template "$template" --nonce "$candidate_nonce" --fixed-record "$FIXED_RECORD" \
+        --coefficients-output "$candidate_coefficients" --output "$candidate_template"
       break
     fi
     search_now_ns="$(date +%s%N)"
@@ -340,15 +363,10 @@ while ((BLOCKS == 0 || accepted < BLOCKS)); do
       outcome="refresh"
       break
     fi
-    if ((candidate_nonce == 9223372036854775806)); then
+    if ((batch_count > 9223372036854775806 - candidate_nonce)); then
       attempt_failure "ProductionV4 nonce space exhausted"
     fi
-    candidate_nonce=$((candidate_nonce + 1))
-    candidate_template="$attempt_directory/template-$candidate_nonce.json"
-    candidate_coefficients="$attempt_directory/replay-coefficients-$candidate_nonce.bin"
-    run_logged "ProductionV4 nonce binding" "$CMFD_MINER" bind-v4-nonce \
-      --template "$template" --nonce "$candidate_nonce" --fixed-record "$FIXED_RECORD" \
-      --coefficients-output "$candidate_coefficients" --output "$candidate_template"
+    candidate_nonce=$((candidate_nonce + batch_count))
   done
   search_end_ns="$(date +%s%N)"
   search_elapsed_seconds="$(awk -v start="$search_start_ns" -v end="$search_end_ns" \

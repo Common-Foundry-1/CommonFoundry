@@ -105,6 +105,20 @@ The reproducer records OS, architecture, compiler versions, source commit,
 commands, inputs, outputs, and hashes. The original producer and independent
 reproducer sign the resulting manifest separately.
 
+`scripts/production-v4-reproduction.py` packages those checks into one bounded,
+fail-closed run. It authenticates the frozen specifications and core vector,
+streams SHA-256 and BLAKE3 over every generated artifact, validates the fixed
+record and complete model bank independently of the Rust verifier, and requires
+one full cryptographic proof verification before it creates a canonical report.
+The output is create-new and must be signed separately by the reproducer.
+
+Without `--attest-fresh-generation`, the report is explicitly marked
+`reproduction_complete: false`; that mode is useful for a producer baseline but
+cannot satisfy this gate. A second operator uses a clean output directory,
+passes every exact generator command through repeated `--generation-command`
+arguments, and adds `--attest-fresh-generation` only after those commands have
+completed in that environment.
+
 ## Build and test gates
 
 Safe local validation uses bounded build concurrency:

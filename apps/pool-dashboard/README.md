@@ -1,0 +1,62 @@
+# Common Foundry pool dashboard
+
+This Vite application is served by `cmfd-node pool-serve`. It is read-only: the
+browser receives pool, worker, block, and payout summaries from
+`/api/v1/pool`, while all share verification and settlement remain inside the
+pool node.
+
+Build the static dashboard:
+
+```text
+npm ci
+npm run check
+```
+
+The production files are written to `dist/`. Supply that directory together
+with the exact TLS-pinned public pool URL:
+
+```text
+--pool-dashboard-assets /srv/cmfd/dashboard
+--pool-public-url cmfd+tls://203.0.113.20:22445?pin=<certificate-sha256>
+--pool-dashboard-bind 127.0.0.1:22446
+```
+
+The dashboard listener deliberately accepts only loopback addresses. Publish
+it through an authenticated reverse proxy or tunnel if a public web dashboard
+is wanted; expose TCP port 22445 separately for miner connections.
+
+## Operator packages
+
+The binary-only Windows and native Linux packages include this built dashboard,
+the node and persistent proof workers, authenticated input bootstraps, and
+ready-to-run launchers. See
+[`docs/production-v4-pool.md`](../../docs/production-v4-pool.md) for the full
+operator guide.
+
+On native Linux, run:
+
+```bash
+chmod +x START-POOL.sh PREPARE-V4-INPUTS.sh cmfd-node cmfd-v4-replay real_bank0_relations
+./START-POOL.sh 203.0.113.20 192.168.50.20
+```
+
+The first address is the public numeric address miners use. The second is the
+Linux host's private LAN address; forward public TCP 22445 to it. The launcher
+downloads and authenticates the ProductionV4 inputs, generates the TLS
+certificate on first run, prints the pinned miner URL, starts the native
+persistent CUDA replay/proof workers, enables Devnet payouts, and serves the
+dashboard on `127.0.0.1:22446`. It also enables authenticated public pool
+clients; the node still requires the exact certificate pin and signed
+payout-key challenge from every worker.
+
+Set `CMFD_POOL_PEER` to a static peer and
+`CMFD_POOL_ALLOW_PUBLIC_PEERS=1` when the pool node should use a public peer.
+Other supported overrides are documented directly in the launcher variables.
+
+## Windows pool host
+
+Double-click `START-POOL.bat` in the Windows package. Its node runs natively on
+Windows and starts the supplied Linux CUDA workers through Ubuntu 22.04 under
+WSL2. The node, ledger, dashboard, certificate pin, share checks, and payouts
+are identical on both platforms. Both launchers enable public pool clients
+because they require an explicit public numeric address when starting.

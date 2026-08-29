@@ -16,6 +16,8 @@ use cmfd_proof_worker::{ProofWorkerError, VerifierWorkerConfig, VerifierWorkerEr
 use tauri::{App, Manager, Runtime};
 
 use crate::mining::MiningManager;
+#[cfg(feature = "production-v4-testnet")]
+use crate::mining::ProductionV4PoolSearchAssets;
 
 mod config;
 mod peers;
@@ -44,6 +46,8 @@ struct EmbeddedNode {
     peers: Arc<PeerManager>,
     services: ServiceHandles,
     log_guard: cmfd_node::logging::WorkerGuard,
+    #[cfg(feature = "production-v4-testnet")]
+    production_v4_pool_search: Option<ProductionV4PoolSearchAssets>,
 }
 
 struct PreparedNodeSecurity {
@@ -74,13 +78,25 @@ impl RuntimeState {
             peers
         );
         match start_embedded_node(app, config) {
-            Ok(started) => Self {
-                mining: Some(Arc::new(MiningManager::new(Arc::clone(&started.node)))),
-                node: NodeAvailability::Ready(started.node),
-                peers: Some(started.peers),
-                services: Mutex::new(Some(started.services)),
-                _log_guard: Some(started.log_guard),
-            },
+            Ok(started) => {
+                #[cfg(feature = "production-v4-testnet")]
+                let mining = match started.production_v4_pool_search.clone() {
+                    Some(assets) => MiningManager::new_with_production_v4_pool_search(
+                        Arc::clone(&started.node),
+                        assets,
+                    ),
+                    None => MiningManager::new(Arc::clone(&started.node)),
+                };
+                #[cfg(not(feature = "production-v4-testnet"))]
+                let mining = MiningManager::new(Arc::clone(&started.node));
+                Self {
+                    mining: Some(Arc::new(mining)),
+                    node: NodeAvailability::Ready(started.node),
+                    peers: Some(started.peers),
+                    services: Mutex::new(Some(started.services)),
+                    _log_guard: Some(started.log_guard),
+                }
+            }
             Err(error) => Self {
                 node: NodeAvailability::Failed(error),
                 mining: None,
@@ -186,6 +202,24 @@ fn start_embedded_node<R: Runtime>(
         _ => Err(NodeError::ProofVerifierProfileMismatch),
     }
     .map_err(|error| sanitize_node_startup_error(COMPILED_NETWORK_PROFILE, error))?;
+    #[cfg(feature = "production-v4-testnet")]
+    let production_v4_pool_search =
+        production_v4_artifacts
+            .as_ref()
+            .map(|artifacts| ProductionV4PoolSearchAssets {
+                replay_worker: artifacts
+                    .bank
+                    .parent()
+                    .expect("packaged ProductionV4 bank has a parent directory")
+                    .join("cmfd-v4-replay"),
+                model_bank: artifacts.bank.clone(),
+                scratch_directory: data_dir.join("production-v4-pool-search"),
+                wsl_distribution: if cfg!(windows) {
+                    Some("Ubuntu-22.04".to_owned())
+                } else {
+                    None
+                },
+            });
     let shared = Arc::new(Mutex::new(node));
     let listener = TcpListener::bind(config.p2p_bind).map_err(|_| {
         startup_error(
@@ -243,6 +277,8 @@ fn start_embedded_node<R: Runtime>(
         peers,
         services: ServiceHandles { inbound },
         log_guard,
+        #[cfg(feature = "production-v4-testnet")]
+        production_v4_pool_search,
     })
 }
 

@@ -69,6 +69,7 @@ pub const POOL_ACCOUNTING_SEMANTICS: &str = "durable authenticated Devnet accoun
 
 const POOL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const POOL_READ_TIMEOUT: Duration = Duration::from_millis(200);
+const POOL_SHARE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
 const POOL_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const POOL_ACCEPT_POLL: Duration = Duration::from_millis(25);
 const POOL_SHARE_VERIFICATION_WAIT: Duration = Duration::from_secs(5);
@@ -197,6 +198,7 @@ pub struct PoolServerConfig {
     pub max_queued_share_verifications: usize,
     pub ledger_directory: Option<PathBuf>,
     pub payout_policy: Option<PoolPayoutPolicy>,
+    pub allow_public_clients: bool,
     pub production_v4_share_verifier: Option<Arc<dyn ProductionV4PoolShareVerifier>>,
 }
 
@@ -220,6 +222,7 @@ impl PoolServerConfig {
             max_queued_share_verifications: DEFAULT_POOL_QUEUED_SHARE_VERIFICATIONS,
             ledger_directory: None,
             payout_policy: None,
+            allow_public_clients: false,
             production_v4_share_verifier: None,
         }
     }
@@ -286,6 +289,26 @@ impl PoolClientConfig {
         payout_signer: PoolPayoutSigner,
     ) -> Result<Self, PoolError> {
         let params = devnet_pool_params()?;
+        Self::new(address, certificate_sha256, worker, payout_signer, params)
+    }
+
+    pub fn compiled_network(
+        address: SocketAddr,
+        certificate_sha256: [u8; 32],
+        worker: impl Into<String>,
+        payout_signer: PoolPayoutSigner,
+    ) -> Result<Self, PoolError> {
+        let params = crate::thin_miner_network_params().map_err(PoolError::from)?;
+        Self::new(address, certificate_sha256, worker, payout_signer, params)
+    }
+
+    fn new(
+        address: SocketAddr,
+        certificate_sha256: [u8; 32],
+        worker: impl Into<String>,
+        payout_signer: PoolPayoutSigner,
+        params: cmfd_consensus::NetworkParams,
+    ) -> Result<Self, PoolError> {
         let payout = payout_signer.payout();
         Ok(Self {
             address,
@@ -403,6 +426,44 @@ pub struct PoolLedgerSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct PoolDashboardWorkerStats {
+    pub worker: String,
+    pub payout: String,
+    pub connected: bool,
+    pub accepted_shares: u64,
+    pub rejected_shares: u64,
+    pub pool_blocks: u64,
+    pub credited_devnet_atoms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PoolDashboardSnapshot {
+    pub generated_at_unix_seconds: u64,
+    pub network_name: String,
+    pub network_short_name: String,
+    pub network_notice: String,
+    pub proof_profile: String,
+    pub accepted_height: u64,
+    pub tip: String,
+    pub current_job_id: String,
+    pub share_target: String,
+    pub active_connections: usize,
+    pub connection_capacity: usize,
+    pub max_connections_per_source: usize,
+    pub active_share_verifications: usize,
+    pub queued_share_verifications: usize,
+    pub share_verification_capacity: usize,
+    pub share_verification_queue_capacity: usize,
+    pub automatic_testnet_payouts: bool,
+    pub minimum_payout_atoms: Option<u64>,
+    pub payout_fee_atoms: Option<u64>,
+    pub workers: Vec<PoolDashboardWorkerStats>,
+    pub ledger: PoolLedgerSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PoolShareResult {
     pub job_id: [u8; 32],
     pub nonce: u64,
@@ -454,16 +515,9 @@ impl fmt::Debug for PoolMiningWork {
 
 impl PoolMiningWork {
     pub fn from_job(job: PoolJob) -> Result<Self, PoolError> {
-        let params = devnet_pool_params()?;
-        if job.challenge.network_id != params.network_id {
-            return Err(PoolError::NetworkMismatch);
-        }
-        if job.share_target < job.challenge.target {
-            return Err(PoolError::InvalidMessage(
-                "share target is harder than the immutable chain target".to_owned(),
-            ));
-        }
-        let reference = v2_reference_for_network(params.network_id).map_err(PowError::from)?;
+        validate_pool_job(&job, crate::DEVNET_PROFILE.network_id)?;
+        let reference =
+            v2_reference_for_network(job.challenge.network_id).map_err(PowError::from)?;
         Ok(Self {
             job,
             verifier: ConsensusPowVerifier::v2_reference(reference),
@@ -603,6 +657,18 @@ fn devnet_pool_params() -> Result<cmfd_consensus::NetworkParams, PoolError> {
     crate::network_params_and_verifier_for_profile(crate::DEVNET_PROFILE, None, None)
         .map(|(params, _)| params)
         .map_err(PoolError::from)
+}
+
+fn validate_pool_job(job: &PoolJob, expected_network_id: [u8; 32]) -> Result<(), PoolError> {
+    if job.challenge.network_id != expected_network_id {
+        return Err(PoolError::NetworkMismatch);
+    }
+    if job.share_target < job.challenge.target {
+        return Err(PoolError::InvalidMessage(
+            "share target is harder than the immutable chain target".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1551,6 +1617,7 @@ struct SharedServer {
     test_credit_atoms_per_share: u64,
     payout_policy: Option<PoolPayoutPolicy>,
     max_connections: usize,
+    allow_public_clients: bool,
     proof_profile: ProofProfile,
     production_v4_share_verifier: Option<Arc<dyn ProductionV4PoolShareVerifier>>,
     tls: Arc<ServerConfig>,
@@ -1561,6 +1628,139 @@ pub struct PoolServerHandle {
     address: SocketAddr,
     shared: Arc<SharedServer>,
     thread: Option<JoinHandle<Result<(), PoolError>>>,
+}
+
+#[derive(Clone)]
+pub struct PoolDashboardSource {
+    shared: Arc<SharedServer>,
+}
+
+impl fmt::Debug for PoolDashboardSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PoolDashboardSource")
+            .finish_non_exhaustive()
+    }
+}
+
+impl PoolDashboardSource {
+    pub fn snapshot(&self) -> Result<PoolDashboardSnapshot, PoolError> {
+        reconcile_pool_blocks(&self.shared)?;
+        reconcile_pool_payouts(&self.shared, false)?;
+        let mut ledger = snapshot_ledger(&self.shared.ledger)?;
+        let mut workers = BTreeMap::<(String, String), PoolDashboardWorkerStats>::new();
+        for session in &ledger.sessions {
+            let key = (session.payout.clone(), session.worker.clone());
+            let worker = workers
+                .entry(key)
+                .or_insert_with(|| PoolDashboardWorkerStats {
+                    worker: session.worker.clone(),
+                    payout: session.payout.clone(),
+                    connected: false,
+                    accepted_shares: 0,
+                    rejected_shares: 0,
+                    pool_blocks: 0,
+                    credited_devnet_atoms: 0,
+                });
+            worker.connected |= session.connected;
+            worker.accepted_shares = checked_ledger_add(
+                worker.accepted_shares,
+                session.accepted_shares,
+                "dashboard worker accepted shares",
+            )?;
+            worker.rejected_shares = checked_ledger_add(
+                worker.rejected_shares,
+                session.rejected_shares,
+                "dashboard worker rejected shares",
+            )?;
+            worker.pool_blocks = checked_ledger_add(
+                worker.pool_blocks,
+                session.pool_blocks,
+                "dashboard worker blocks",
+            )?;
+            worker.credited_devnet_atoms = checked_ledger_add(
+                worker.credited_devnet_atoms,
+                session.credited_devnet_atoms,
+                "dashboard worker credit",
+            )?;
+        }
+        let mut workers = workers.into_values().collect::<Vec<_>>();
+        workers.sort_by(|left, right| {
+            right
+                .connected
+                .cmp(&left.connected)
+                .then_with(|| right.accepted_shares.cmp(&left.accepted_shares))
+                .then_with(|| left.worker.cmp(&right.worker))
+        });
+        workers.truncate(256);
+        ledger.sessions.clear();
+        ledger.payouts.sort_by(|left, right| {
+            right
+                .credited_devnet_atoms
+                .cmp(&left.credited_devnet_atoms)
+                .then_with(|| left.payout.cmp(&right.payout))
+        });
+        ledger.payouts.truncate(256);
+        ledger.blocks.sort_by(|left, right| {
+            right
+                .height
+                .cmp(&left.height)
+                .then_with(|| left.block_id.cmp(&right.block_id))
+        });
+        ledger.blocks.truncate(100);
+        ledger.payout_transactions.sort_by(|left, right| {
+            right
+                .confirmations
+                .cmp(&left.confirmations)
+                .then_with(|| left.txid.cmp(&right.txid))
+        });
+        ledger.payout_transactions.truncate(100);
+
+        let node_status = self
+            .shared
+            .node
+            .lock()
+            .map_err(|_| PoolError::SharedStatePoisoned)?
+            .status()?;
+        let current = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| PoolError::SharedStatePoisoned)?
+            .current
+            .wire
+            .clone();
+        let verification = self
+            .shared
+            .share_verification
+            .state
+            .lock()
+            .map_err(|_| PoolError::SharedStatePoisoned)?;
+        let payout_policy = self.shared.payout_policy;
+        Ok(PoolDashboardSnapshot {
+            generated_at_unix_seconds: unix_time_seconds()?,
+            network_name: node_status.network.to_owned(),
+            network_short_name: node_status.network_short_name.to_owned(),
+            network_notice: node_status.network_notice.to_owned(),
+            proof_profile: node_status.proof_profile.to_owned(),
+            accepted_height: node_status.accepted_height,
+            tip: node_status.tip,
+            current_job_id: hex::encode(current.job_id),
+            share_target: hex::encode(current.share_target),
+            active_connections: self.shared.active_connections.load(Ordering::Acquire),
+            connection_capacity: self.shared.max_connections,
+            max_connections_per_source: self.shared.source_admission.max_connections_per_source,
+            active_share_verifications: verification.active,
+            queued_share_verifications: verification.waiting,
+            share_verification_capacity: self.shared.share_verification.max_active,
+            share_verification_queue_capacity: self.shared.share_verification.max_waiting,
+            automatic_testnet_payouts: payout_policy.is_some(),
+            minimum_payout_atoms: payout_policy.map(|policy| policy.minimum_payout_atoms),
+            payout_fee_atoms: payout_policy.map(|policy| policy.fee_atoms),
+            workers,
+            ledger,
+        })
+    }
 }
 
 impl PoolServerHandle {
@@ -1576,6 +1776,12 @@ impl PoolServerHandle {
         reconcile_pool_blocks(&self.shared)?;
         reconcile_pool_payouts(&self.shared, false)?;
         snapshot_ledger(&self.shared.ledger)
+    }
+
+    pub fn dashboard_source(&self) -> PoolDashboardSource {
+        PoolDashboardSource {
+            shared: Arc::clone(&self.shared),
+        }
     }
 
     pub fn current_job(&self) -> Result<PoolJob, PoolError> {
@@ -1708,6 +1914,7 @@ pub fn spawn_pool_server(
         test_credit_atoms_per_share: config.test_credit_atoms_per_share,
         payout_policy: config.payout_policy,
         max_connections: config.max_connections,
+        allow_public_clients: config.allow_public_clients,
         proof_profile: profile.proof,
         production_v4_share_verifier: config.production_v4_share_verifier,
         tls,
@@ -1746,7 +1953,7 @@ fn pool_listener(listener: TcpListener, shared: Arc<SharedServer>) -> Result<(),
         let _ = rotate_if_tip_changed(&shared);
         match listener.accept() {
             Ok((stream, peer)) => {
-                if validate_private_address(peer).is_err()
+                if (!shared.allow_public_clients && validate_private_address(peer).is_err())
                     || shared.active_connections.load(Ordering::Acquire) >= shared.max_connections
                 {
                     drop(stream);
@@ -3043,6 +3250,7 @@ pub struct PoolClient {
     session_id: u64,
     accounting_semantics: String,
     persistence: String,
+    expected_network_id: [u8; 32],
     current_job: PoolJob,
 }
 
@@ -3115,7 +3323,6 @@ fn evaluate_production_v4_pool_share(
 
 impl PoolClient {
     pub fn connect(config: PoolClientConfig) -> Result<Self, PoolError> {
-        validate_private_address(config.address)?;
         validate_worker(&config.worker)?;
         VerifyingKey::from_bytes(&config.payout)
             .map_err(|_| PoolError::Node(NodeError::InvalidMinerDestination))?;
@@ -3215,7 +3422,7 @@ impl PoolClient {
                 ));
             }
         };
-        PoolMiningWork::from_job(current_job.clone())?;
+        validate_pool_job(&current_job, config.expected_network_id)?;
         stream.sock.set_read_timeout(Some(POOL_READ_TIMEOUT))?;
         Ok(Self {
             stream,
@@ -3223,6 +3430,7 @@ impl PoolClient {
             session_id,
             accounting_semantics,
             persistence,
+            expected_network_id: config.expected_network_id,
             current_job,
         })
     }
@@ -3263,22 +3471,43 @@ impl PoolClient {
         job_id: [u8; 32],
         nonce: u64,
     ) -> Result<PoolShareResult, PoolError> {
+        self.submit_share_until(job_id, nonce, || false)?
+            .ok_or(PoolError::ConnectionClosed)
+    }
+
+    pub fn submit_share_interruptible(
+        &mut self,
+        job_id: [u8; 32],
+        nonce: u64,
+        stop: &AtomicBool,
+    ) -> Result<Option<PoolShareResult>, PoolError> {
+        self.submit_share_until(job_id, nonce, || stop.load(Ordering::Acquire))
+    }
+
+    fn submit_share_until<F>(
+        &mut self,
+        job_id: [u8; 32],
+        nonce: u64,
+        should_cancel: F,
+    ) -> Result<Option<PoolShareResult>, PoolError>
+    where
+        F: FnMut() -> bool,
+    {
         write_frame(
             &mut self.stream,
             &ClientMessage::SubmitShare { job_id, nonce },
         )?;
-        loop {
-            match self.receive()? {
-                PoolClientEvent::Job(_) => {}
-                PoolClientEvent::ShareResult(result) => return Ok(result),
-            }
-        }
+        wait_for_share_result(
+            Instant::now() + POOL_SHARE_RESPONSE_TIMEOUT,
+            should_cancel,
+            || self.receive(),
+        )
     }
 
     pub fn receive(&mut self) -> Result<PoolClientEvent, PoolError> {
         match read_frame_stateful(&mut self.stream, &mut self.frame_reader)? {
             ServerMessage::Job { job } => {
-                PoolMiningWork::from_job(job.clone())?;
+                validate_pool_job(&job, self.expected_network_id)?;
                 self.current_job = job.clone();
                 Ok(PoolClientEvent::Job(job))
             }
@@ -3287,6 +3516,34 @@ impl PoolClient {
             ServerMessage::AuthChallenge { .. } | ServerMessage::HelloAck { .. } => Err(
                 PoolError::InvalidMessage("unexpected pool handshake message".to_owned()),
             ),
+        }
+    }
+}
+
+fn wait_for_share_result<F, C>(
+    deadline: Instant,
+    mut should_cancel: C,
+    mut receive: F,
+) -> Result<Option<PoolShareResult>, PoolError>
+where
+    F: FnMut() -> Result<PoolClientEvent, PoolError>,
+    C: FnMut() -> bool,
+{
+    loop {
+        if should_cancel() {
+            return Ok(None);
+        }
+        if Instant::now() >= deadline {
+            return Err(PoolError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "pool share response timed out",
+            )));
+        }
+        match receive() {
+            Ok(PoolClientEvent::Job(_)) => {}
+            Ok(PoolClientEvent::ShareResult(result)) => return Ok(Some(result)),
+            Err(PoolError::Io(error)) if is_timeout(&error) => {}
+            Err(error) => return Err(error),
         }
     }
 }
@@ -4108,6 +4365,26 @@ mod tests {
         signer
     }
 
+    fn share_result_fixture() -> PoolShareResult {
+        PoolShareResult {
+            job_id: [7; 32],
+            nonce: 42,
+            accepted: true,
+            block_accepted: false,
+            code: "share_accepted".to_owned(),
+            session: PoolSessionStats {
+                session_id: 3,
+                connected: true,
+                worker: "fixture".to_owned(),
+                payout: hex::encode(default_miner_destination()),
+                accepted_shares: 1,
+                rejected_shares: 0,
+                pool_blocks: 0,
+                credited_devnet_atoms: 1,
+            },
+        }
+    }
+
     fn find_share(work: &PoolMiningWork, chain_valid: bool) -> u64 {
         find_share_from(work, 0, chain_valid)
     }
@@ -4316,6 +4593,15 @@ mod tests {
         assert_eq!(ledger.rejected_shares, 1);
         assert_eq!(ledger.pool_blocks, 0);
         assert_eq!(ledger.credited_devnet_atoms, 1);
+        let dashboard = server.dashboard_source().snapshot().unwrap();
+        assert_eq!(dashboard.ledger.accepted_shares, 1);
+        assert_eq!(dashboard.ledger.rejected_shares, 1);
+        assert_eq!(dashboard.ledger.credited_devnet_atoms, 1);
+        assert_eq!(dashboard.workers.len(), 1);
+        assert_eq!(dashboard.workers[0].worker, "worker-a");
+        assert_eq!(dashboard.workers[0].accepted_shares, 1);
+        assert_eq!(dashboard.workers[0].rejected_shares, 1);
+        assert_eq!(dashboard.workers[0].credited_devnet_atoms, 1);
         server.stop().unwrap();
     }
 
@@ -4957,6 +5243,55 @@ mod tests {
                 job_id,
                 nonce: 42
             } if job_id == [7; 32]
+        ));
+    }
+
+    #[test]
+    fn share_response_wait_tolerates_poll_timeouts() {
+        let expected = share_result_fixture();
+        let mut calls = 0;
+        let result = wait_for_share_result(
+            Instant::now() + Duration::from_secs(1),
+            || false,
+            || {
+                calls += 1;
+                match calls {
+                    1 => Err(PoolError::Io(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "poll timeout",
+                    ))),
+                    2 => Err(PoolError::Io(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "poll would block",
+                    ))),
+                    _ => Ok(PoolClientEvent::ShareResult(expected.clone())),
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(result, Some(expected));
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn share_response_wait_honors_cancellation_and_deadline() {
+        let cancelled = wait_for_share_result(
+            Instant::now() + Duration::from_secs(1),
+            || true,
+            || panic!("cancelled wait must not read from the socket"),
+        )
+        .unwrap();
+        assert_eq!(cancelled, None);
+
+        let timeout = wait_for_share_result(
+            Instant::now(),
+            || false,
+            || panic!("expired wait must not read from the socket"),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            timeout,
+            PoolError::Io(error) if error.kind() == io::ErrorKind::TimedOut
         ));
     }
 

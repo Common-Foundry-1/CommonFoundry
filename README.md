@@ -445,10 +445,11 @@ require 100 confirmations before they are spendable. Consolidation selects matur
 order, accepts 2 through 128 inputs, creates one wallet output, and burns the
 chosen transaction fee.
 
-The Mining page supports both continuous solo mining and the CMFD Devnet pool
-v2 protocol. Pool mode uses TLS 1.3 with an exact SHA-256 pin of the server's
-leaf certificate and accepts only numeric loopback or private-network
-endpoints in this form:
+The Mining page supports continuous solo mining on the bounded reference
+profiles and the CMFD Devnet pool v2 protocol. Pool mode uses TLS 1.3 with an
+exact SHA-256 pin of the server's leaf certificate. Pool endpoints must be
+numeric; public numeric endpoints are supported when the pool operator
+explicitly enables public clients. The URL has this form:
 
 ```text
 cmfd+tls://127.0.0.1:18445?pin=<64-hex-certificate-sha256>
@@ -506,6 +507,18 @@ static peer link between the wallet and pool node for bidirectional block sync.
 See [docs/devnet-0.md](docs/devnet-0.md) for the full pool boundary and
 [apps/wallet/src-tauri/README.md](apps/wallet/src-tauri/README.md) for desktop
 static-peer command-line options.
+
+ProductionV4 pools can also serve the bundled live dashboard and run the CUDA
+replay/proof workers natively on Linux. See the
+[ProductionV4 pool operator guide](docs/production-v4-pool.md) for the
+self-bootstrapping Windows and Linux packages, host requirements, public TCP
+forwarding, and loopback web-proxy boundary. Public miner URLs remain exact
+certificate-pinned numeric endpoints; hostnames are not accepted. The current
+ProductionV4 Devnet pool defaults to a seven-leading-zero-bit share target, one
+bit easier than the block target. The authenticated wallet searches
+server-issued jobs with persistent batched CUDA, and the pool independently
+performs the exact GPU replay before crediting each share. The server never
+trusts a client-provided result.
 
 Each new data directory creates a distinct Schnorr test key in `wallet.key`;
 the node never returns its private bytes through RPC or desktop IPC. Stop the

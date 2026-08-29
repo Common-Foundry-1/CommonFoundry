@@ -74,16 +74,17 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
   const referenceMiningAvailable = nodeStatus?.bounded_reference_mining ?? false;
   const networkName = nodeStatus?.network_short_name ?? "Network";
   const proofProfile = nodeStatus?.proof_profile ?? "Unknown proof profile";
+  const productionV4PoolAvailable = proofProfile === "ProductionV4";
   const canStartBase = !mining.loading
     && mining.status !== null
     && wallet !== null
     && nodeStatus !== null
-    && referenceMiningAvailable
     && !isActive
     && !isBusy;
-  const canStartSolo = mode === "solo" && canStartBase;
+  const canStartSolo = mode === "solo" && canStartBase && referenceMiningAvailable;
   const canStartPool = mode === "pool"
     && canStartBase
+    && (referenceMiningAvailable || productionV4PoolAvailable)
     && poolUrlIssue === null
     && workerNameIssue === null;
 
@@ -234,7 +235,7 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
               </div>
               <div className="warning-inline pool-credit-note" role="note">
                 <ShieldAlert aria-hidden="true" size={17} />
-                <span>Pool credits are session statistics for testing; payouts are not enabled yet.</span>
+                <span>Authenticated Devnet share credits can be settled on-chain under the pool operator's published payout policy.</span>
               </div>
             </>
           ) : (
@@ -261,12 +262,16 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
             <div>
               <span className="mining-detail-icon"><Cpu aria-hidden="true" size={18} /></span>
               <div>
-                <strong>{cudaActive ? "CUDA INT8 matrix engine" : "CPU reference engine"}</strong>
-                <p>{referenceMiningAvailable
+                <strong>{productionV4PoolAvailable && poolSelected
+                  ? "CUDA ProductionV4 pool search"
+                  : (cudaActive ? "CUDA INT8 matrix engine" : "CPU reference engine")}</strong>
+                <p>{productionV4PoolAvailable && poolSelected
+                  ? "Searches server-issued jobs with persistent batched CUDA; the pool independently replays every submitted nonce before crediting it."
+                  : referenceMiningAvailable
                   ? (cudaActive
                     ? `Runs the ${nodeStatus?.proof_of_work ?? proofProfile} matrix stage on ${metricsStatus?.device ?? "the selected NVIDIA GPU"}; Rust recomputes every candidate before submission.`
                     : `Runs the ${nodeStatus?.proof_of_work ?? proofProfile} profile for ${networkName} testing.`)
-                  : "ProductionV3 is selected. This wallet will not substitute the bounded DevnetV2 reference miner."}</p>
+                  : `${proofProfile} solo mining requires the standalone production miner.`}</p>
               </div>
             </div>
             <div>
@@ -301,10 +306,10 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
           ? `Submit ForgeMatrix shares to a pinned CMFD pool endpoint for ${networkName} session accounting.`
           : "Mine directly against the embedded node and send accepted block rewards to this wallet."}</p>
 
-        {!referenceMiningAvailable ? (
+        {!referenceMiningAvailable && !(poolSelected && productionV4PoolAvailable) ? (
           <div className="warning-inline" role="status">
             <ShieldAlert aria-hidden="true" size={17} />
-            <span>{proofProfile} is selected. Wallet mining remains disabled until its production work protocol is available.</span>
+            <span>{proofProfile} solo mining uses the standalone production miner. Select Pool to connect this wallet to the ProductionV4 test pool.</span>
           </div>
         ) : null}
 
@@ -334,7 +339,7 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
             <div className="pool-protocol" role="note">
               <ShieldAlert aria-hidden="true" size={17} />
               <div>
-                <strong>Pinned private endpoint</strong>
+                <strong>Pinned numeric endpoint</strong>
                 <span>A CMFD-specific TLS job/share protocol is required. Stratum endpoints are not compatible.</span>
               </div>
             </div>
@@ -350,7 +355,7 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
                 aria-describedby="pool-url-help"
                 autoComplete="off"
                 spellCheck={false}
-                placeholder="cmfd+tls://192.168.1.20:443?pin=64_HEX"
+                placeholder="cmfd+tls://107.214.187.2:22445?pin=64_HEX"
                 onChange={(event) => setPoolUrl(event.target.value)}
               />
               <span
@@ -432,7 +437,7 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
           {buttonText}
         </button>
         <small>{poolSelected
-          ? `${networkName} · pool session statistics · ${cudaActive ? "CUDA matrix stage" : "CPU reference"}`
+          ? `${networkName} · pool session statistics · ${productionV4PoolAvailable ? "CUDA search + server-verified replay" : (cudaActive ? "CUDA matrix stage" : "CPU reference")}`
           : `${networkName} · solo mining · ${cudaActive ? "CUDA matrix stage" : "CPU reference"}`}</small>
       </aside>
     </div>

@@ -1,0 +1,285 @@
+{
+  "schema_version": 1,
+  "release": "v0.1.0-devnet.16",
+  "total_assembled_bytes": 61203808344,
+  "files": [
+    {
+      "name": "MODEL-V2.bank",
+      "relative_path": "MODEL-V2.bank",
+      "roles": [
+        "node",
+        "miner"
+      ],
+      "bytes": 6442975416,
+      "sha256": "5f9b213c3bda51b74e4ebabb26607b67385d613aa8d99af915a48ab063e17d4e",
+      "parts": [
+        {
+          "name": "V4-MODEL-V2.bank.part01",
+          "bytes": 1610743854,
+          "sha256": "3af0fd15bf0377bab42f2c59d8337f4f82e87e32c5f8c4f27ebfc21681450254"
+        },
+        {
+          "name": "V4-MODEL-V2.bank.part02",
+          "bytes": 1610743854,
+          "sha256": "9d4f2547dc632c1c5f74ace84d26ca2ce38be50bea01ed93542fc5ab56aed6cf"
+        },
+        {
+          "name": "V4-MODEL-V2.bank.part03",
+          "bytes": 1610743854,
+          "sha256": "a1bf1ac3230a54006039b3ce2add912e4c6f94065afad322bbaebee15b089602"
+        },
+        {
+          "name": "V4-MODEL-V2.bank.part04",
+          "bytes": 1610743854,
+          "sha256": "5af1c6de16f5d48032aa9b37a5d48abd5d6c6e22b24935476faddb9af2cf7069"
+        }
+      ]
+    },
+    {
+      "name": "FORGEMATRIX-V4-FIXED-BANK-0.row-major.codeword",
+      "relative_path": "fixed/FORGEMATRIX-V4-FIXED-BANK-0.row-major.codeword",
+      "roles": [
+        "miner"
+      ],
+      "bytes": 17179869184,
+      "sha256": "f21c9e146f03ac0cc7633048401370707d47bc02d9b662c5650b16b894514eb3",
+      "parts": [
+        {
+          "name": "V4-FIXED-BANK-0.row-major.codeword.part01",
+          "bytes": 1610743854,
+          "sha256": "e962a8688d3c4761e41a00ccc5730ef51b6d4b93c7e1151e8f63509fb11898e4"
+        },
+        {
+          "name": "V4-FIXED-BANK-0.row-major.codeword.part02",
+          "bytes": 1610743854,
+          "sha256": "0da3a2f0064a94a33ec72705c113667ea36fe892e32d6cafbafd00b082181c99"
+        },
+        {
+          "name": "V4-FIXED-BANK-0.row-major.codeword.part03",
+          "bytes": 1610743854,
+          "sha256": "bdf95813ae7f137a04e9c8b3884c75bb82e0179bf72d468ea93f78f102d8e292"
+        },
+        {
+          "name": "V4-FIXED-BANK-0.row-major.codeword.part04",
+          "bytes": 1610743854,
+          "sha256": "04078cc314aa5a9104bfa20c667e706fea4d32eddca6ed35beb0d2d13c2419ee"
+        },
+        {
+          "name": "V4-FIXED-BANK-0.row-major.codeword.part05",
+          "bytes": 1610743854,
+          "sha256": "b9359442dd011bee48cb6c869e012ddffa822673a0f0128b04eaef146e1ac8a8"
+        },
+        {
+          "name": "V4-FIXED-BANK-0.row-major.codeword.part06",
+          "bytes": 1610743854,
+          "sha256": "53112507b714d188c7f50f27b1c496d47abc5e15d1027a1d919822eceb7d5b13"
+        },
+        {
+          "name": "V4-FIXED-BANK-0.row-major.codeword.part07",
+          "bytes": 1610743854,
+          "sha256": "e47d38226dde2c40f3ff5800d50cf5d5c3a3d7bf66a90ed4049adac61e945d1e"
+        },
+        {
+          "name": "V4-FIXED-BANK-0.row-major.codeword.part08",
+          "bytes": 1610743854,
+          "sha256": "1668e691b9aacdb2b55bff35fb9f733850133aa1689aaba595ca1c73b0df99e0"
+        },
+        {
+          "name": "V4-FIXED-BANK-0.row-major.codeword.part09",
+          "bytes": 1610743854,
+          "sha256": "02cbd5d1217361e43ee6ff9a6441483f4a0057adb307a3b1953c0c9b89090b67"
+        },
+        {
+          "name": "V4-FIXED-BANK-0.row-major.codeword.part10",
+          "bytes": 1610743854,
+          "sha256": "52ba8fa9f06e860d5fc7265c2ce8de67fd26288fe2d35623ad72be0fc8a6fe3a"
+        },
+        {
+          "name": "V4-FIXED-BANK-0.row-major.codeword.part11",
+          "bytes": 1072430644,
+          "sha256": "9d10a7029a89af1b6364f01a74f257e8e05bc761d7bff1e05004f31d60865681"
+        }
+      ]
+    },
+    {
+      "name": "FORGEMATRIX-V4-FIXED-BANK-0.tree",
+      "relative_path": "fixed/FORGEMATRIX-V4-FIXED-BANK-0.tree",
+      "roles": [
+        "miner"
+      ],
+      "bytes": 1073741792,
+      "sha256": "6f55b1ddc9bc15426dbf23a662ab205e2f5396d92c7298c34885a22e34380085",
+      "parts": [
+        {
+          "name": "V4-FIXED-BANK-0.tree",
+          "bytes": 1073741792,
+          "sha256": "6f55b1ddc9bc15426dbf23a662ab205e2f5396d92c7298c34885a22e34380085"
+        }
+      ]
+    },
+    {
+      "name": "FORGEMATRIX-V4-FIXED-BANK-1.row-major.codeword",
+      "relative_path": "fixed/FORGEMATRIX-V4-FIXED-BANK-1.row-major.codeword",
+      "roles": [
+        "miner"
+      ],
+      "bytes": 17179869184,
+      "sha256": "29620f6804611dd800e3e105d8ee18b7b9caa7c38a3ff0e20c610cd2650c1ab6",
+      "parts": [
+        {
+          "name": "V4-FIXED-BANK-1.row-major.codeword.part01",
+          "bytes": 1610743854,
+          "sha256": "edaa1b48047645100d80f847276fc23318eada46ba3d4d0f246497a2ef22d194"
+        },
+        {
+          "name": "V4-FIXED-BANK-1.row-major.codeword.part02",
+          "bytes": 1610743854,
+          "sha256": "4ea8c3448da62e6481e5075989e2a5cb7ce097b328c554ade71ff9c9633c7506"
+        },
+        {
+          "name": "V4-FIXED-BANK-1.row-major.codeword.part03",
+          "bytes": 1610743854,
+          "sha256": "ba0fc8d8b9b43db18da09d65c44e6bc03e8831760637ffcf2b82ed29a83183aa"
+        },
+        {
+          "name": "V4-FIXED-BANK-1.row-major.codeword.part04",
+          "bytes": 1610743854,
+          "sha256": "131c00a0adb6a3f4260458d6c8069591e0feec47555620f68df5685a9ffe1630"
+        },
+        {
+          "name": "V4-FIXED-BANK-1.row-major.codeword.part05",
+          "bytes": 1610743854,
+          "sha256": "5fb4557b76f6d4d9d3c4a2ff39de58ad14fb1df14f7cc5167e8cecaaedbc4d08"
+        },
+        {
+          "name": "V4-FIXED-BANK-1.row-major.codeword.part06",
+          "bytes": 1610743854,
+          "sha256": "1726ff880868a0568525a9b8ea4b2c35f44545eee44a42e2510ea6b588196786"
+        },
+        {
+          "name": "V4-FIXED-BANK-1.row-major.codeword.part07",
+          "bytes": 1610743854,
+          "sha256": "b2e9cfcca02880fcc9387c9518cb0a1c061399e535a22a11bea088c6754c9feb"
+        },
+        {
+          "name": "V4-FIXED-BANK-1.row-major.codeword.part08",
+          "bytes": 1610743854,
+          "sha256": "cf5e44542f017484b19e7e7a9c5883afcfaa0449eeccf81aa68aa57674fc42df"
+        },
+        {
+          "name": "V4-FIXED-BANK-1.row-major.codeword.part09",
+          "bytes": 1610743854,
+          "sha256": "65ff55650e686d1907c09b3f7a88feff960534883c56bc7200f827518979f858"
+        },
+        {
+          "name": "V4-FIXED-BANK-1.row-major.codeword.part10",
+          "bytes": 1610743854,
+          "sha256": "d0b411f1a625fbe6c9655ca1435f1061443f750eed35de530f575a4c8a0d0fa0"
+        },
+        {
+          "name": "V4-FIXED-BANK-1.row-major.codeword.part11",
+          "bytes": 1072430644,
+          "sha256": "4c85b01e0df9ae786c9b35ed55e3b0515cf9353e7f751c942a88e58d9cdea2b2"
+        }
+      ]
+    },
+    {
+      "name": "FORGEMATRIX-V4-FIXED-BANK-1.tree",
+      "relative_path": "fixed/FORGEMATRIX-V4-FIXED-BANK-1.tree",
+      "roles": [
+        "miner"
+      ],
+      "bytes": 1073741792,
+      "sha256": "33bf29037d913b83c32bd7a88ca07c787ce4c9d92d8fe11d8c53c591af31b687",
+      "parts": [
+        {
+          "name": "V4-FIXED-BANK-1.tree",
+          "bytes": 1073741792,
+          "sha256": "33bf29037d913b83c32bd7a88ca07c787ce4c9d92d8fe11d8c53c591af31b687"
+        }
+      ]
+    },
+    {
+      "name": "FORGEMATRIX-V4-FIXED-BANK-2.row-major.codeword",
+      "relative_path": "fixed/FORGEMATRIX-V4-FIXED-BANK-2.row-major.codeword",
+      "roles": [
+        "miner"
+      ],
+      "bytes": 17179869184,
+      "sha256": "57f4d72ac2009553c245bb2081dec19508ec9a171cab8075e0aad95d0714cc76",
+      "parts": [
+        {
+          "name": "V4-FIXED-BANK-2.row-major.codeword.part01",
+          "bytes": 1610743854,
+          "sha256": "fa3e5669dbccb680bfd7fd7dd2e812474ea1c8487fed808265f5c28e1ed941fc"
+        },
+        {
+          "name": "V4-FIXED-BANK-2.row-major.codeword.part02",
+          "bytes": 1610743854,
+          "sha256": "6dcd1352c9d3d5e4aa34ef307ce054740781b042088e063a3129c2cc4c5e5579"
+        },
+        {
+          "name": "V4-FIXED-BANK-2.row-major.codeword.part03",
+          "bytes": 1610743854,
+          "sha256": "1db616af1aba7872d9980473bb46d44c2b21a55535bb123747cddfe426fca9fb"
+        },
+        {
+          "name": "V4-FIXED-BANK-2.row-major.codeword.part04",
+          "bytes": 1610743854,
+          "sha256": "0054fc6dae0a0d8ada96d3c29fa59f096bdf1b2b3f669bdf0fb1f419036bd0e6"
+        },
+        {
+          "name": "V4-FIXED-BANK-2.row-major.codeword.part05",
+          "bytes": 1610743854,
+          "sha256": "7e45d1680e9404d31c115ffad0d133e1a130f9b6ed467ad184d7ba415b80414e"
+        },
+        {
+          "name": "V4-FIXED-BANK-2.row-major.codeword.part06",
+          "bytes": 1610743854,
+          "sha256": "b5905fd0c1fde5990560ebd5901f389e50b4384e6882c8e222d7a6e28e0c1df8"
+        },
+        {
+          "name": "V4-FIXED-BANK-2.row-major.codeword.part07",
+          "bytes": 1610743854,
+          "sha256": "5f99253b7d1e56a1a46a213012214a290699930c73816d6ed1679d403e1d8916"
+        },
+        {
+          "name": "V4-FIXED-BANK-2.row-major.codeword.part08",
+          "bytes": 1610743854,
+          "sha256": "da990a0e39fe5a903762068052c275db27708da97066b46f3eae1e224a7e9d5a"
+        },
+        {
+          "name": "V4-FIXED-BANK-2.row-major.codeword.part09",
+          "bytes": 1610743854,
+          "sha256": "d1b744a8d8c66d7a6b112226fddbbaa629bbb29db2f1efc653344e2af7157618"
+        },
+        {
+          "name": "V4-FIXED-BANK-2.row-major.codeword.part10",
+          "bytes": 1610743854,
+          "sha256": "1791168eb262b962d0ca6ab508bb2baab5fd40c58105224055ce129b1e2ac0be"
+        },
+        {
+          "name": "V4-FIXED-BANK-2.row-major.codeword.part11",
+          "bytes": 1072430644,
+          "sha256": "77ecf4057a26747a9d4c2e6d6e69797a642177607e625f7daf9c6e7d84983547"
+        }
+      ]
+    },
+    {
+      "name": "FORGEMATRIX-V4-FIXED-BANK-2.tree",
+      "relative_path": "fixed/FORGEMATRIX-V4-FIXED-BANK-2.tree",
+      "roles": [
+        "miner"
+      ],
+      "bytes": 1073741792,
+      "sha256": "ce6e1083c99ed4f2379d3ca0ee4886dfee14e8b5072270d39f70337ce652d6e1",
+      "parts": [
+        {
+          "name": "V4-FIXED-BANK-2.tree",
+          "bytes": 1073741792,
+          "sha256": "ce6e1083c99ed4f2379d3ca0ee4886dfee14e8b5072270d39f70337ce652d6e1"
+        }
+      ]
+    }
+  ]
+}

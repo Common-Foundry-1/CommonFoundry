@@ -73,6 +73,13 @@ const nodeStatus = {
   proof_of_work: "ForgeMatrix-v2 tiny full-recompute reference",
   bounded_reference_mining: true,
 } as NodeStatus;
+const productionV4NodeStatus = {
+  ...nodeStatus,
+  network_short_name: "ProductionV4 Testnet-1",
+  proof_profile: "ProductionV4",
+  proof_of_work: "ForgeMatrix-v4 transparent BaseFold",
+  bounded_reference_mining: false,
+} as NodeStatus;
 
 describe("MiningView", () => {
   beforeEach(() => {
@@ -158,11 +165,26 @@ describe("MiningView", () => {
     expect(screen.getByText("4,321")).toBeInTheDocument();
     expect(screen.getByText("Pool height")).toBeInTheDocument();
     expect(screen.getByText("130")).toBeInTheDocument();
-    expect(screen.getByText(/Pool credits are session statistics for testing/i)).toBeInTheDocument();
-    expect(screen.getByText(/payouts are not enabled yet/i)).toBeInTheDocument();
+    expect(screen.getByText(/Authenticated Devnet share credits/i)).toBeInTheDocument();
+    expect(screen.getByText(/pool operator's published payout policy/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Solo" })).toBeDisabled();
     expect(urlInput).toBeDisabled();
     expect(workerInput).toBeDisabled();
+  });
+
+  it("enables the server-verified ProductionV4 pool path while keeping solo disabled", async () => {
+    const user = userEvent.setup();
+    render(<MiningView wallet={wallet} nodeStatus={productionV4NodeStatus} />);
+    await screen.findByRole("button", { name: "Start Solo Mining" });
+    expect(screen.getByRole("button", { name: "Start Solo Mining" })).toBeDisabled();
+
+    await user.click(screen.getByRole("button", { name: "Pool" }));
+    await user.type(screen.getByRole("textbox", { name: /Pool URL/i }), poolUrl);
+    await user.type(screen.getByRole("textbox", { name: /Worker name/i }), "v4-worker");
+
+    expect(screen.getByRole("button", { name: "Start Pool Mining" })).toBeEnabled();
+    expect(screen.getByText("CUDA ProductionV4 pool search")).toBeInTheDocument();
+    expect(screen.getByText(/persistent batched CUDA/)).toBeInTheDocument();
   });
 
   it("does not present a completed Pool session as Solo work", async () => {

@@ -134,9 +134,10 @@ durable storage, and fork choice. See
 [Standalone CUDA miner](standalone-miner.md) for launcher and failover details.
 
 The Pool mode connects to the CMFD Devnet pool v2 protocol. Enter a URL in the
-exact form `cmfd+tls://PRIVATE_IP:PORT?pin=64_HEX` and a worker name matching
-`[A-Za-z0-9._-]{1,32}`. The endpoint must be a numeric loopback, RFC1918 IPv4,
-or IPv6 unique-local address; DNS names and public addresses are rejected.
+exact form `cmfd+tls://NUMERIC_IP:PORT?pin=64_HEX` and a worker name matching
+`[A-Za-z0-9._-]{1,32}`. Loopback, private, and public numeric IP addresses are
+accepted; DNS names are rejected. A pool server refuses public source
+addresses by default and must opt in with `--allow-public-pool-clients`.
 This is a CMFD-specific TLS 1.3 protocol, not Bitcoin Stratum. The embedded
 wallet signs the pool's fresh connection challenge, binding its receive key,
 worker name, network identity, and consensus fingerprint without sending the
@@ -212,12 +213,27 @@ Set-Location C:\Source\CommonFoundry
 
 Paste the printed `$poolUrl` into **Mining -> Pool**, choose a worker name such
 as `rig-01`, and start mining. The default bind is `127.0.0.1:18445`; remote
-private-LAN testing requires an explicit private bind such as
-`192.168.50.20:18445`, and the URL must use that same reachable numeric IP.
+testing requires an explicit private bind such as `192.168.50.20:18445`.
+Miners on that LAN use the private numeric IP. A public pool forwards its public
+TCP port to that private bind and advertises the public numeric IP with the same
+certificate pin. Add `--allow-public-pool-clients` on a public pool; the native
+ProductionV4 launchers supply it automatically. Hostnames are deliberately not
+accepted.
 `--share-leading-zero-bits` may be 0 through 7 on Devnet-0 and defaults to 7;
 smaller values make test shares easier. If `--miner` is omitted, blocks pay the
 pool node data directory's wallet destination. A supplied `--miner` must be a
 64-character x-only Schnorr public key.
+
+ProductionV4 operators may add `--pool-dashboard-assets <built-dist>` and
+`--pool-public-url <exact-pinned-url>` together. The read-only dashboard binds
+to loopback by default at `127.0.0.1:22446`; use a reverse proxy or tunnel to
+publish the GUI without exposing a second unauthenticated node control surface.
+Native Linux and Windows/WSL2 launchers are documented in
+`production-v4-pool.md`. On the current ProductionV4 Devnet, the pool defaults
+to a seven-leading-zero-bit share target, one bit easier than the block target.
+The wallet searches server-issued jobs with persistent batched CUDA, and the
+pool performs the exact authenticated replay itself before accepting or
+crediting a nonce; it does not trust client-reported work.
 
 `pool-serve` owns its selected data directory and starts the TLS pool plus a P2P
 inbound listener and optional static-peer poller on the same node; it does not

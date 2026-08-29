@@ -54,6 +54,7 @@ pub mod network_profile;
 pub mod p2p;
 pub mod peer;
 pub mod pool;
+pub mod pool_dashboard;
 #[cfg(feature = "production-v4-testnet")]
 pub mod production_v4_pool;
 #[cfg(feature = "production-v3")]

@@ -27,11 +27,15 @@ use cmfd_consensus::{
 use serde::Serialize;
 
 use crate::BlockTemplate;
-use crate::pool::{PoolError, ProductionV4PoolShareEvaluation, ProductionV4PoolShareVerifier};
+use crate::pool::{
+    PoolError, PoolJob, PoolWorkSearchResult, ProductionV4PoolShareEvaluation,
+    ProductionV4PoolShareVerifier,
+};
 
 const WORKER_OUTPUT_MAX_LINES: usize = 4_096;
 const WORKER_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
 const FROZEN_TEMPLATE_FORMAT_VERSION: u16 = 1;
+pub const PRODUCTION_V4_POOL_SEARCH_MAX_BATCH_SIZE: u32 = 64;
 
 /// One exact command used to start a persistent worker. Arguments must include
 /// the worker's `--server` flag and authenticated model/artifact paths.
@@ -54,6 +58,96 @@ pub struct ProductionV4PoolVerifierConfig {
     pub worker_scratch_directory: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ProductionV4PoolSearcherConfig {
+    pub replay: ProductionV4PoolWorkerCommand,
+    pub scratch_directory: PathBuf,
+    pub worker_scratch_directory: String,
+    pub batch_size: u32,
+}
+
+pub fn production_v4_pool_searcher_config(
+    replay_worker: &Path,
+    model_bank: &Path,
+    scratch_directory: &Path,
+    batch_size: u32,
+    wsl_distribution: Option<&str>,
+) -> Result<ProductionV4PoolSearcherConfig, PoolError> {
+    let replay_worker = canonical_worker_file(replay_worker, "ProductionV4 pool search worker")?;
+    let model_bank = canonical_worker_file(model_bank, "ProductionV4 model bank")?;
+    if !scratch_directory.is_absolute() {
+        return Err(pool_replay_failure(
+            "ProductionV4 pool search scratch directory must be absolute",
+        ));
+    }
+    fs::create_dir_all(scratch_directory).map_err(replay_error)?;
+    let scratch_directory =
+        crate::plain_package_path(fs::canonicalize(scratch_directory).map_err(replay_error)?);
+
+    match wsl_distribution {
+        Some(distribution) => {
+            validate_wsl_distribution(distribution)?;
+            #[cfg(not(windows))]
+            {
+                let _ = (replay_worker, model_bank, scratch_directory);
+                Err(pool_replay_failure(
+                    "ProductionV4 WSL pool search requires Windows",
+                ))
+            }
+            #[cfg(windows)]
+            {
+                let system_root = std::env::var_os("SystemRoot")
+                    .ok_or_else(|| pool_replay_failure("SystemRoot is unavailable"))?;
+                let wsl = canonical_worker_file(
+                    &PathBuf::from(system_root).join("System32").join("wsl.exe"),
+                    "WSL launcher",
+                )?;
+                let replay_worker = wsl_path(&wsl, distribution, &replay_worker)?;
+                let model_bank = wsl_path(&wsl, distribution, &model_bank)?;
+                let worker_scratch_directory = wsl_path(&wsl, distribution, &scratch_directory)?;
+                let arguments = [
+                    "-d",
+                    distribution,
+                    "--exec",
+                    "env",
+                    "CUDA_VISIBLE_DEVICES=0",
+                    "CUDA_HOME=/usr/local/cuda-12.8",
+                    "CUDA_PATH=/usr/local/cuda-12.8",
+                    "CUDAToolkit_ROOT=/usr/local/cuda-12.8",
+                    "LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64",
+                    &replay_worker,
+                    "--server",
+                    &model_bank,
+                ]
+                .into_iter()
+                .map(Into::into)
+                .collect();
+                Ok(ProductionV4PoolSearcherConfig {
+                    replay: ProductionV4PoolWorkerCommand {
+                        program: wsl,
+                        arguments,
+                    },
+                    scratch_directory,
+                    worker_scratch_directory,
+                    batch_size,
+                })
+            }
+        }
+        None => Ok(ProductionV4PoolSearcherConfig {
+            replay: ProductionV4PoolWorkerCommand {
+                program: replay_worker,
+                arguments: vec!["--server".into(), model_bank.into_os_string()],
+            },
+            worker_scratch_directory: scratch_directory
+                .to_str()
+                .ok_or_else(|| pool_replay_failure("pool search scratch path is not UTF-8"))?
+                .to_owned(),
+            scratch_directory,
+            batch_size,
+        }),
+    }
+}
+
 #[derive(Debug)]
 pub struct ProductionV4PersistentPoolVerifier {
     scratch_directory: PathBuf,
@@ -63,9 +157,24 @@ pub struct ProductionV4PersistentPoolVerifier {
 }
 
 #[derive(Debug)]
+pub struct ProductionV4PersistentPoolSearcher {
+    scratch_directory: PathBuf,
+    worker_scratch_directory: String,
+    startup_id: [u8; 8],
+    batch_size: u32,
+    state: Mutex<SearchWorkerState>,
+}
+
+#[derive(Debug)]
 struct WorkerState {
     replay: PersistentWorker,
     proof: PersistentWorker,
+    next_attempt: u64,
+}
+
+#[derive(Debug)]
+struct SearchWorkerState {
+    replay: PersistentWorker,
     next_attempt: u64,
 }
 
@@ -270,6 +379,111 @@ impl ProductionV4PersistentPoolVerifier {
     }
 }
 
+impl ProductionV4PersistentPoolSearcher {
+    pub fn start(config: ProductionV4PoolSearcherConfig) -> Result<Self, PoolError> {
+        validate_scratch_paths(&config.scratch_directory, &config.worker_scratch_directory)?;
+        if !(1..=PRODUCTION_V4_POOL_SEARCH_MAX_BATCH_SIZE).contains(&config.batch_size) {
+            return Err(pool_replay_failure(format!(
+                "ProductionV4 pool search batch size must be between 1 and {PRODUCTION_V4_POOL_SEARCH_MAX_BATCH_SIZE}"
+            )));
+        }
+        fs::create_dir_all(&config.scratch_directory).map_err(replay_error)?;
+        let replay = PersistentWorker::start(
+            &config.replay,
+            "CMFD_V4_REPLAY_READY",
+            "ProductionV4 pool search worker",
+        )?;
+        let mut startup_id = [0_u8; 8];
+        getrandom::fill(&mut startup_id).map_err(replay_error)?;
+        Ok(Self {
+            scratch_directory: config.scratch_directory,
+            worker_scratch_directory: config.worker_scratch_directory,
+            startup_id,
+            batch_size: config.batch_size,
+            state: Mutex::new(SearchWorkerState {
+                replay,
+                next_attempt: 0,
+            }),
+        })
+    }
+
+    pub fn search(
+        &self,
+        job: &PoolJob,
+        start_nonce: u64,
+        stop: &std::sync::atomic::AtomicBool,
+    ) -> Result<PoolWorkSearchResult, PoolError> {
+        if stop.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(PoolWorkSearchResult::Cancelled {
+                attempts_completed: 0,
+                next_nonce: start_nonce,
+            });
+        }
+        validate_search_job(job)?;
+        let batch_size = bounded_batch_size(start_nonce, self.batch_size);
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| pool_replay_failure("persistent search worker lock is poisoned"))?;
+        let attempt_number = state.next_attempt;
+        state.next_attempt = state.next_attempt.wrapping_add(1);
+        let token = format!(
+            "cmfd-v4-pool-search-{}-{attempt_number:016x}",
+            hex::encode(self.startup_id)
+        );
+        let files = AttemptFiles {
+            scratch_directory: self.scratch_directory.clone(),
+            token,
+        };
+        let coefficients_path = files.path("coefficients.bin");
+        let search_prefix = files.path("search");
+        let search_final_path = files.path("search-final-activation.bin");
+        let coefficients_per_nonce = (PRODUCTION_V2_LAYERS as usize + 1) * 20;
+        let mut coefficients = Vec::with_capacity(coefficients_per_nonce * batch_size as usize);
+        for lane in 0..batch_size {
+            let nonce = start_nonce.wrapping_add(u64::from(lane));
+            let challenge_digest = forgematrix_v4_challenge_digest(
+                &job.challenge,
+                nonce,
+                PRODUCTION_V4_MODEL_MANIFEST_DIGEST,
+            );
+            coefficients.extend_from_slice(&production_v4_replay_coefficients(challenge_digest));
+        }
+        write_new_file(&coefficients_path, &coefficients)?;
+        state.replay.invoke(
+            &[
+                "RUNBATCH".to_owned(),
+                batch_size.to_string(),
+                self.worker_path(&coefficients_path)?,
+                self.worker_path(&search_prefix)?,
+            ],
+            "CMFD_V4_REPLAY_DONE",
+        )?;
+        let expected_bytes = FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES
+            .checked_mul(batch_size as usize)
+            .ok_or_else(|| pool_replay_failure("search-batch byte length overflow"))?;
+        let final_activations = read_exact_file(&search_final_path, expected_bytes)?;
+        if stop.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(PoolWorkSearchResult::Cancelled {
+                attempts_completed: u64::from(batch_size),
+                next_nonce: start_nonce.wrapping_add(u64::from(batch_size)),
+            });
+        }
+        inspect_search_batch(job, start_nonce, &final_activations)
+    }
+
+    fn worker_path(&self, local_path: &Path) -> Result<String, PoolError> {
+        let file_name = local_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| pool_replay_failure("scratch file name is not UTF-8"))?;
+        Ok(format!(
+            "{}/{file_name}",
+            self.worker_scratch_directory.trim_end_matches(['/', '\\'])
+        ))
+    }
+}
+
 impl ProductionV4PoolShareVerifier for ProductionV4PersistentPoolVerifier {
     fn evaluate(
         &self,
@@ -410,6 +624,56 @@ impl Drop for AttemptFiles {
     }
 }
 
+fn canonical_worker_file(path: &Path, label: &str) -> Result<PathBuf, PoolError> {
+    if !path.is_absolute() || !path.is_file() {
+        return Err(pool_replay_failure(format!(
+            "{label} must be an existing absolute file: {}",
+            path.display()
+        )));
+    }
+    fs::canonicalize(path)
+        .map(crate::plain_package_path)
+        .map_err(replay_error)
+}
+
+fn validate_wsl_distribution(distribution: &str) -> Result<(), PoolError> {
+    if distribution.is_empty()
+        || distribution.len() > 128
+        || !distribution
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(pool_replay_failure(
+            "ProductionV4 WSL distribution name is invalid",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn wsl_path(wsl: &Path, distribution: &str, path: &Path) -> Result<String, PoolError> {
+    let output = std::process::Command::new(wsl)
+        .args(["-d", distribution, "--exec", "wslpath", "-a", "-u"])
+        .arg(path)
+        .output()
+        .map_err(replay_error)?;
+    if !output.status.success() {
+        return Err(pool_replay_failure(format!(
+            "failed to convert {} for {distribution}",
+            path.display()
+        )));
+    }
+    let converted = String::from_utf8(output.stdout).map_err(replay_error)?;
+    let converted = converted.trim();
+    if converted.is_empty() || converted.contains(['\r', '\n', '\t']) {
+        return Err(pool_replay_failure(format!(
+            "WSL returned an invalid path for {}",
+            path.display()
+        )));
+    }
+    Ok(converted.to_owned())
+}
+
 fn validate_scratch_paths(local: &Path, worker: &str) -> Result<(), PoolError> {
     if !local.is_absolute() {
         return Err(pool_replay_failure(
@@ -426,6 +690,75 @@ fn validate_scratch_paths(local: &Path, worker: &str) -> Result<(), PoolError> {
         ));
     }
     Ok(())
+}
+
+fn validate_search_job(job: &PoolJob) -> Result<(), PoolError> {
+    if job.challenge.network_id != PRODUCTION_V4_TESTNET_NETWORK_ID {
+        return Err(pool_replay_failure(
+            "pool search received a job for another network",
+        ));
+    }
+    if job.share_target < job.challenge.target {
+        return Err(pool_replay_failure(
+            "pool share target is harder than the chain target",
+        ));
+    }
+    Ok(())
+}
+
+fn bounded_batch_size(start_nonce: u64, requested: u32) -> u32 {
+    let remaining_after_first = u64::MAX - start_nonce;
+    if remaining_after_first < u64::from(requested - 1) {
+        (remaining_after_first + 1) as u32
+    } else {
+        requested
+    }
+}
+
+fn inspect_search_batch(
+    job: &PoolJob,
+    start_nonce: u64,
+    final_activations: &[u8],
+) -> Result<PoolWorkSearchResult, PoolError> {
+    validate_search_job(job)?;
+    let mut chunks = final_activations.chunks_exact(FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES);
+    if !chunks.remainder().is_empty()
+        || chunks.len() == 0
+        || chunks.len() > PRODUCTION_V4_POOL_SEARCH_MAX_BATCH_SIZE as usize
+    {
+        return Err(pool_replay_failure(
+            "ProductionV4 search batch has the wrong byte length",
+        ));
+    }
+    let attempts_completed = chunks.len() as u64;
+    for (lane, final_activation) in chunks.by_ref().enumerate() {
+        let nonce = start_nonce.wrapping_add(lane as u64);
+        let challenge_digest = forgematrix_v4_challenge_digest(
+            &job.challenge,
+            nonce,
+            PRODUCTION_V4_MODEL_MANIFEST_DIGEST,
+        );
+        let final_activation_digest =
+            final_activation_digest_from_bytes(challenge_digest, final_activation)?;
+        let work_digest = forgematrix_v4_work_digest(
+            PRODUCTION_V4_MODEL_MANIFEST_DIGEST,
+            challenge_digest,
+            final_activation_digest,
+        );
+        if work_digest <= job.share_target {
+            return Ok(PoolWorkSearchResult::Found {
+                nonce,
+                work_digest,
+                meets_chain_target: work_digest <= job.challenge.target,
+                attempts_completed: lane as u64 + 1,
+                next_nonce: nonce.wrapping_add(1),
+            });
+        }
+    }
+    Ok(PoolWorkSearchResult::Exhausted {
+        attempts_completed,
+        next_nonce: start_nonce.wrapping_add(attempts_completed),
+    })
 }
 
 fn production_v4_replay_coefficients(challenge_digest: [u8; 32]) -> Vec<u8> {
@@ -544,5 +877,39 @@ mod tests {
         assert!(validate_scratch_paths(local, "/mnt/c/cmfd-pool-scratch").is_ok());
         assert!(validate_scratch_paths(local, "/tmp/bad\nRUN\tfull").is_err());
         assert!(validate_scratch_paths(Path::new("relative"), "/tmp/pool").is_err());
+    }
+
+    #[test]
+    fn search_batch_inspection_reports_first_qualifying_nonce() {
+        let job = PoolJob {
+            job_id: [9; 32],
+            challenge: cmfd_consensus::BlockChallenge {
+                network_id: PRODUCTION_V4_TESTNET_NETWORK_ID,
+                previous_block: [2; 32],
+                transaction_root: [3; 32],
+                height: 4,
+                timestamp: 5,
+                target: [0; 32],
+            },
+            share_target: [0xff; 32],
+        };
+        let activations = vec![0_u8; FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES * 2];
+        let result = inspect_search_batch(&job, 41, &activations).unwrap();
+        assert!(matches!(
+            result,
+            PoolWorkSearchResult::Found {
+                nonce: 41,
+                attempts_completed: 1,
+                next_nonce: 42,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn search_batch_size_stops_at_nonce_space_end() {
+        assert_eq!(bounded_batch_size(0, 32), 32);
+        assert_eq!(bounded_batch_size(u64::MAX - 2, 32), 3);
+        assert_eq!(bounded_batch_size(u64::MAX, 32), 1);
     }
 }

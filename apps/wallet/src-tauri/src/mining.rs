@@ -1,13 +1,19 @@
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+#[cfg(feature = "production-v4-testnet")]
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cmfd_node::pool::{PoolClient, PoolClientConfig, PoolError, PoolWorkSearchResult};
+#[cfg(feature = "production-v4-testnet")]
+use cmfd_node::production_v4_pool::{
+    ProductionV4PersistentPoolSearcher, production_v4_pool_searcher_config,
+};
 use cmfd_node::{
-    MiningSearchResult, MiningShareSearchResult, Node, NodeClientError, NodeError,
-    parse_miner_destination, submit_shared_tip_block,
+    COMPILED_NETWORK_PROFILE, MiningSearchResult, MiningShareSearchResult, Node, NodeClientError,
+    NodeError, ProofProfile, parse_miner_destination, submit_shared_tip_block,
 };
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +23,8 @@ const SEARCH_BATCH_ATTEMPTS: u64 = 4_096;
 const POOL_RECONNECT_INITIAL: Duration = Duration::from_millis(250);
 const POOL_RECONNECT_MAX: Duration = Duration::from_secs(4);
 const POOL_RECONNECT_POLL: Duration = Duration::from_millis(25);
+#[cfg(feature = "production-v4-testnet")]
+const PRODUCTION_V4_POOL_SEARCH_BATCH_SIZE: u32 = 32;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -91,6 +99,31 @@ pub struct MiningManager {
     node: Arc<Mutex<Node>>,
     status: Arc<Mutex<MiningStatus>>,
     control: Mutex<MinerControl>,
+    #[cfg(feature = "production-v4-testnet")]
+    production_v4_pool_search: Option<ProductionV4PoolSearchAssets>,
+}
+
+#[cfg(feature = "production-v4-testnet")]
+#[derive(Clone)]
+pub(crate) struct ProductionV4PoolSearchAssets {
+    pub replay_worker: PathBuf,
+    pub model_bank: PathBuf,
+    pub scratch_directory: PathBuf,
+    pub wsl_distribution: Option<String>,
+}
+
+#[cfg(feature = "production-v4-testnet")]
+fn start_production_v4_pool_searcher(
+    assets: ProductionV4PoolSearchAssets,
+) -> Result<ProductionV4PersistentPoolSearcher, PoolError> {
+    let config = production_v4_pool_searcher_config(
+        &assets.replay_worker,
+        &assets.model_bank,
+        &assets.scratch_directory,
+        PRODUCTION_V4_POOL_SEARCH_BATCH_SIZE,
+        assets.wsl_distribution.as_deref(),
+    )?;
+    ProductionV4PersistentPoolSearcher::start(config)
 }
 
 impl MiningManager {
@@ -125,7 +158,19 @@ impl MiningManager {
                 worker: None,
                 shutting_down: false,
             }),
+            #[cfg(feature = "production-v4-testnet")]
+            production_v4_pool_search: None,
         }
+    }
+
+    #[cfg(feature = "production-v4-testnet")]
+    pub(crate) fn new_with_production_v4_pool_search(
+        node: Arc<Mutex<Node>>,
+        assets: ProductionV4PoolSearchAssets,
+    ) -> Self {
+        let mut manager = Self::new(node);
+        manager.production_v4_pool_search = Some(assets);
+        manager
     }
 
     pub fn status(&self) -> Result<MiningStatus, NodeClientError> {
@@ -154,7 +199,9 @@ impl MiningManager {
             })?
             .status()
             .map_err(|error| error.client_error())?;
-        if !node_status.bounded_reference_mining {
+        let production_v4_pool = request.mode == MiningMode::Pool
+            && COMPILED_NETWORK_PROFILE.proof == ProofProfile::ProductionV4;
+        if !node_status.bounded_reference_mining && !production_v4_pool {
             return Err(manager_error(
                 "production_mining_unavailable",
                 format!(
@@ -212,7 +259,7 @@ impl MiningManager {
                     ));
                 }
                 Some(
-                    PoolClientConfig::devnet(
+                    PoolClientConfig::compiled_network(
                         endpoint.address,
                         endpoint.certificate_pin,
                         worker,
@@ -290,6 +337,8 @@ impl MiningManager {
         let thread_stop = Arc::clone(&stop);
         let node = Arc::clone(&self.node);
         let status = Arc::clone(&self.status);
+        #[cfg(feature = "production-v4-testnet")]
+        let production_v4_pool_search = self.production_v4_pool_search.clone();
         let worker_name = match request.mode {
             MiningMode::Solo => "cmfd-solo-miner",
             MiningMode::Pool => "cmfd-pool-miner",
@@ -297,7 +346,13 @@ impl MiningManager {
         let handle = thread::Builder::new()
             .name(worker_name.to_owned())
             .spawn(move || match pool_config {
-                Some(config) => pool_mining_loop(status, thread_stop, config),
+                Some(config) => pool_mining_loop(
+                    status,
+                    thread_stop,
+                    config,
+                    #[cfg(feature = "production-v4-testnet")]
+                    production_v4_pool_search,
+                ),
                 None => mining_loop(node, status, thread_stop, payout),
             })
             .map_err(|_| {
@@ -688,7 +743,34 @@ fn pool_mining_loop(
     status: Arc<Mutex<MiningStatus>>,
     stop: Arc<AtomicBool>,
     config: PoolClientConfig,
+    #[cfg(feature = "production-v4-testnet")] production_v4_pool_search: Option<
+        ProductionV4PoolSearchAssets,
+    >,
 ) {
+    #[cfg(feature = "production-v4-testnet")]
+    let production_v4_pool_searcher =
+        if COMPILED_NETWORK_PROFILE.proof == ProofProfile::ProductionV4 {
+            match production_v4_pool_search {
+                Some(assets) => match start_production_v4_pool_searcher(assets) {
+                    Ok(searcher) => Some(searcher),
+                    Err(error) => {
+                        fail_worker(&status, format!("ProductionV4 CUDA search failed: {error}"));
+                        return;
+                    }
+                },
+                None if cfg!(test) => None,
+                None => {
+                    fail_worker(
+                        &status,
+                        "ProductionV4 CUDA search worker is missing from this wallet package."
+                            .to_owned(),
+                    );
+                    return;
+                }
+            }
+        } else {
+            None
+        };
     let mut reconnect_delay = POOL_RECONNECT_INITIAL;
     let mut credited_atoms = 0_u64;
     let mut cuda = None;
@@ -734,6 +816,8 @@ fn pool_mining_loop(
             &mut credited_atoms,
             &mut cuda,
             &mut cuda_initialized,
+            #[cfg(feature = "production-v4-testnet")]
+            production_v4_pool_searcher.as_ref(),
         ) {
             Ok(()) => break,
             Err(error) if pool_error_is_reconnectable(&error) => {
@@ -770,7 +854,21 @@ fn mine_pool_connection(
     credited_atoms: &mut u64,
     cuda: &mut Option<CudaMiner>,
     cuda_initialized: &mut bool,
+    #[cfg(feature = "production-v4-testnet")] production_v4_pool_searcher: Option<
+        &ProductionV4PersistentPoolSearcher,
+    >,
 ) -> Result<(), PoolError> {
+    if COMPILED_NETWORK_PROFILE.proof == ProofProfile::ProductionV4 {
+        return mine_production_v4_pool_connection(
+            client,
+            status,
+            stop,
+            credited_atoms,
+            #[cfg(feature = "production-v4-testnet")]
+            production_v4_pool_searcher,
+        );
+    }
+
     let mut remote_credited_atoms = 0_u64;
     let mut cursor = PoolNonceCursor::default();
 
@@ -836,12 +934,21 @@ fn mine_pool_connection(
             PoolWorkSearchResult::Cancelled { .. } => return Ok(()),
             PoolWorkSearchResult::Exhausted { .. } => {}
             PoolWorkSearchResult::Found { nonce, .. } => {
-                let mut submitted = client.submit_share(job.job_id, nonce)?;
+                let Some(mut submitted) =
+                    client.submit_share_interruptible(job.job_id, nonce, stop)?
+                else {
+                    return Ok(());
+                };
                 while submitted.code == "verifier_busy" && !stop.load(Ordering::Acquire) {
                     if !interruptible_backoff(stop, Duration::from_millis(100)) {
                         return Ok(());
                     }
-                    submitted = client.submit_share(job.job_id, nonce)?;
+                    let Some(result) =
+                        client.submit_share_interruptible(job.job_id, nonce, stop)?
+                    else {
+                        return Ok(());
+                    };
+                    submitted = result;
                 }
                 let newly_credited = submitted
                     .session
@@ -869,6 +976,165 @@ fn mine_pool_connection(
         }
     }
     Ok(())
+}
+
+fn mine_production_v4_pool_connection(
+    client: &mut PoolClient,
+    status: &Mutex<MiningStatus>,
+    stop: &AtomicBool,
+    credited_atoms: &mut u64,
+    #[cfg(feature = "production-v4-testnet")] production_v4_pool_searcher: Option<
+        &ProductionV4PersistentPoolSearcher,
+    >,
+) -> Result<(), PoolError> {
+    let mut remote_credited_atoms = 0_u64;
+    let mut cursor = PoolNonceCursor::default();
+
+    while !stop.load(Ordering::Acquire) {
+        let job = client.current_job().clone();
+        if cursor.job_id != Some(job.job_id) {
+            cursor.job_id = Some(job.job_id);
+            cursor.next_nonce = client.current_nonce_origin();
+        }
+        if let Ok(mut current) = status.lock() {
+            current.current_height = job.challenge.height.saturating_sub(1);
+            #[cfg(feature = "production-v4-testnet")]
+            if production_v4_pool_searcher.is_some() {
+                current.engine = MiningEngine::Cuda;
+                current.device = Some("Persistent ProductionV4 CUDA batch search".to_owned());
+            } else {
+                current.device = Some("Pool-owned ProductionV4 replay verifier".to_owned());
+            }
+            #[cfg(not(feature = "production-v4-testnet"))]
+            {
+                current.device = Some("Pool-owned ProductionV4 replay verifier".to_owned());
+            }
+        }
+
+        let started = Instant::now();
+        let search = production_v4_pool_search_batch(
+            &job,
+            cursor.next_nonce,
+            stop,
+            #[cfg(feature = "production-v4-testnet")]
+            production_v4_pool_searcher,
+        )?;
+        let elapsed = started.elapsed().as_secs_f64().max(f64::EPSILON);
+        let (attempts_completed, next_nonce) = match &search {
+            PoolWorkSearchResult::Found {
+                attempts_completed,
+                next_nonce,
+                ..
+            }
+            | PoolWorkSearchResult::Exhausted {
+                attempts_completed,
+                next_nonce,
+            }
+            | PoolWorkSearchResult::Cancelled {
+                attempts_completed,
+                next_nonce,
+            } => (*attempts_completed, *next_nonce),
+        };
+        cursor.next_nonce = next_nonce;
+        if let Ok(mut current) = status.lock() {
+            current.session_attempts = current.session_attempts.saturating_add(attempts_completed);
+            current.matrix_attempts_per_second = attempts_completed as f64 / elapsed;
+        }
+
+        let nonce = match search {
+            PoolWorkSearchResult::Found { nonce, .. } => nonce,
+            PoolWorkSearchResult::Cancelled { .. } => return Ok(()),
+            PoolWorkSearchResult::Exhausted { .. } => {
+                match client.receive() {
+                    Ok(cmfd_node::pool::PoolClientEvent::Job(_)) => {}
+                    Ok(cmfd_node::pool::PoolClientEvent::ShareResult(_)) => {
+                        return Err(PoolError::InvalidMessage(
+                            "pool sent an unsolicited share result".to_owned(),
+                        ));
+                    }
+                    Err(PoolError::Io(error))
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(error) => return Err(error),
+                }
+                continue;
+            }
+        };
+        let Some(mut submitted) = client.submit_share_interruptible(job.job_id, nonce, stop)?
+        else {
+            return Ok(());
+        };
+        while matches!(
+            submitted.code.as_str(),
+            "verifier_busy" | "share_rate_limited"
+        ) && !stop.load(Ordering::Acquire)
+        {
+            if !interruptible_backoff(stop, Duration::from_millis(250)) {
+                return Ok(());
+            }
+            let Some(result) = client.submit_share_interruptible(job.job_id, nonce, stop)? else {
+                return Ok(());
+            };
+            submitted = result;
+        }
+        let newly_credited = submitted
+            .session
+            .credited_devnet_atoms
+            .saturating_sub(remote_credited_atoms);
+        remote_credited_atoms = submitted.session.credited_devnet_atoms;
+        *credited_atoms = credited_atoms.saturating_add(newly_credited);
+
+        if let Ok(mut current) = status.lock() {
+            if submitted.accepted {
+                current.shares_accepted = current.shares_accepted.saturating_add(1);
+            } else {
+                current.shares_rejected = current.shares_rejected.saturating_add(1);
+            }
+            if submitted.block_accepted {
+                current.blocks_found = current.blocks_found.saturating_add(1);
+            }
+            current.credited_atoms = credited_atoms.to_string();
+            current.current_height = client.current_job().challenge.height.saturating_sub(1);
+            current.pool_connected = true;
+            current.last_error = None;
+        }
+    }
+    Ok(())
+}
+
+fn production_v4_pool_search_batch(
+    job: &cmfd_node::pool::PoolJob,
+    start_nonce: u64,
+    stop: &AtomicBool,
+    #[cfg(feature = "production-v4-testnet")] production_v4_pool_searcher: Option<
+        &ProductionV4PersistentPoolSearcher,
+    >,
+) -> Result<PoolWorkSearchResult, PoolError> {
+    #[cfg(feature = "production-v4-testnet")]
+    if let Some(searcher) = production_v4_pool_searcher {
+        return searcher.search(job, start_nonce, stop);
+    }
+
+    if job.share_target != [0xff; 32] {
+        return Err(PoolError::InvalidMessage(
+            "ProductionV4 CUDA pool search is unavailable".to_owned(),
+        ));
+    }
+    if stop.load(Ordering::Acquire) {
+        return Ok(PoolWorkSearchResult::Cancelled {
+            attempts_completed: 0,
+            next_nonce: start_nonce,
+        });
+    }
+    Ok(PoolWorkSearchResult::Found {
+        nonce: start_nonce,
+        work_digest: [0; 32],
+        meets_chain_target: false,
+        attempts_completed: 1,
+        next_nonce: start_nonce.wrapping_add(1),
+    })
 }
 
 fn initialize_pool_cuda(
@@ -1037,18 +1303,6 @@ fn parse_pool_url(value: &str) -> Result<PoolEndpoint, NodeClientError> {
         .ok()
         .filter(|port| *port != 0)
         .ok_or_else(|| manager_error("invalid_pool_url", pool_url_requirement(), false))?;
-    let private_or_loopback = match ip {
-        IpAddr::V4(ip) => ip.is_private() || ip.is_loopback(),
-        IpAddr::V6(ip) => ip.is_loopback() || (ip.segments()[0] & 0xfe00) == 0xfc00,
-    };
-    if !private_or_loopback {
-        return Err(manager_error(
-            "invalid_pool_url",
-            pool_url_requirement(),
-            false,
-        ));
-    }
-
     Ok(PoolEndpoint {
         address: SocketAddr::new(ip, port),
         certificate_pin,
@@ -1072,7 +1326,7 @@ fn validate_worker_name(value: &str) -> Result<(), NodeClientError> {
 }
 
 fn pool_url_requirement() -> &'static str {
-    "Use cmfd+tls://PRIVATE_IP:PORT?pin=64_HEX with a private or loopback numeric IP."
+    "Use cmfd+tls://NUMERIC_IP:PORT?pin=64_HEX with an IPv4 or bracketed IPv6 address."
 }
 
 fn worker_name_requirement() -> &'static str {
@@ -1239,8 +1493,11 @@ mod tests {
             format!("cmfd+tls://10.24.1.9:18181?pin={pin}"),
             format!("cmfd+tls://172.16.0.2:65535?pin={pin}"),
             format!("cmfd+tls://192.168.50.12:1?pin={pin}"),
+            format!("cmfd+tls://107.214.187.2:22445?pin={pin}"),
+            format!("cmfd+tls://8.8.8.8:443?pin={pin}"),
             format!("cmfd+tls://[::1]:443?pin={pin}"),
             format!("cmfd+tls://[fd12:3456::9]:8443?pin={pin}"),
+            format!("cmfd+tls://[2001:db8::20]:22445?pin={pin}"),
         ] {
             assert!(
                 parse_pool_url(&valid).is_ok(),
@@ -1249,13 +1506,11 @@ mod tests {
         }
         for invalid in [
             format!("cmfd+tls://pool.example:443?pin={pin}"),
-            format!("cmfd+tls://8.8.8.8:443?pin={pin}"),
             format!("cmfd+tls://192.168.1.2:0?pin={pin}"),
             format!("cmfd+tls://192.168.1.2:65536?pin={pin}"),
             "cmfd+tls://192.168.1.2:443?pin=abcd".to_owned(),
             format!("cmfd+tls://192.168.1.2:443/path?pin={pin}"),
             format!("cmfd+tls://192.168.1.2:443?pin={pin}&extra=1"),
-            format!("cmfd+tls://[fe80::1]:443?pin={pin}"),
             format!("cmfd+tls://[fd12:::1]:443?pin={pin}"),
             format!("cmfd+tls://127.00.0.1:443?pin={pin}"),
         ] {
@@ -1273,6 +1528,40 @@ mod tests {
             let error = validate_worker_name(invalid).unwrap_err();
             assert_eq!(error.code, "invalid_pool_worker");
         }
+    }
+
+    #[cfg(feature = "production-v4-testnet")]
+    #[test]
+    fn production_v4_pool_search_requires_cuda_for_nontrivial_targets() {
+        let mut job = cmfd_node::pool::PoolJob {
+            job_id: [7; 32],
+            challenge: cmfd_consensus::BlockChallenge {
+                network_id: COMPILED_NETWORK_PROFILE.network_id,
+                previous_block: [2; 32],
+                transaction_root: [3; 32],
+                height: 4,
+                timestamp: 5,
+                target: [0; 32],
+            },
+            share_target: [0xff; 32],
+        };
+        let stop = AtomicBool::new(false);
+        assert!(matches!(
+            production_v4_pool_search_batch(&job, 41, &stop, None).unwrap(),
+            PoolWorkSearchResult::Found {
+                nonce: 41,
+                attempts_completed: 1,
+                next_nonce: 42,
+                ..
+            }
+        ));
+
+        job.share_target = [0xfe; 32];
+        assert!(matches!(
+            production_v4_pool_search_batch(&job, 42, &stop, None),
+            Err(PoolError::InvalidMessage(message))
+                if message == "ProductionV4 CUDA pool search is unavailable"
+        ));
     }
 
     #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4-testnet")))]

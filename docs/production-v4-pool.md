@@ -1,0 +1,93 @@
+# ProductionV4 test-pool operator guide
+
+The Common Foundry ProductionV4 pool package runs an authenticated Devnet pool,
+a full P2P node, persistent CUDA replay and proof workers, durable share and
+payout accounting, and a read-only web dashboard. Windows and native Linux
+packages use the same protocol and ledger rules.
+
+This is Devnet software. Credits and payouts have no monetary value.
+
+## Host requirements
+
+- One NVIDIA GPU supported by the ProductionV4 CUDA workers. The current
+  qualification host uses an RTX 5090; operators should treat other GPUs as
+  test configurations and report results.
+- 64 GB system RAM recommended.
+- At least 90 GB of free disk space for the authenticated 61 GB input set,
+  resumable download parts, the chain, and scratch files.
+- A stable broadband connection and a public numeric IPv4 or IPv6 address.
+- TCP 22445 forwarded to the pool host for miners. TCP 22444 is the P2P port.
+- Windows: Windows 11, WSL2, Ubuntu 22.04, and NVIDIA GPU support working inside
+  WSL. The supplied Windows node starts the Linux CUDA workers through WSL.
+- Linux: x86-64 Linux, Python 3, curl, an NVIDIA driver, and the CUDA 12 runtime.
+
+The first start downloads the same signed-off ProductionV4 input manifest used
+by the official miner. Downloads are resumable, use the Common Foundry download
+service with the GitHub binary release as fallback, and are checked against
+pinned byte lengths and SHA-256 hashes before the pool starts.
+
+## Windows
+
+1. Extract the ZIP to a local NTFS drive with at least 90 GB free.
+2. Confirm `wsl -d Ubuntu-22.04 --exec nvidia-smi` works in a terminal.
+3. Double-click `START-POOL.bat`.
+4. Enter the public numeric IP miners will use and this computer's private LAN
+   IP when prompted.
+5. Allow inbound TCP 22444 and 22445 in Windows Firewall and forward those ports
+   in the router when the host is behind NAT.
+
+The console prints the exact `cmfd+tls://...` miner URL after generating the
+pool certificate. Share that complete URL, including its certificate pin. Never
+share `pool-tls/pool-key.der`.
+
+Power users can pass named options through the launcher:
+
+```powershell
+.\START-POOL.bat -PublicNumericAddress 203.0.113.20 -PrivateBindAddress 192.168.1.20
+```
+
+## Native Linux
+
+Extract the archive on a Linux filesystem and run:
+
+```bash
+chmod +x START-POOL.sh PREPARE-V4-INPUTS.sh cmfd-node cmfd-v4-replay real_bank0_relations
+./START-POOL.sh 203.0.113.20 192.168.1.20
+```
+
+The first argument is the public numeric IP and the second is the host's private
+LAN IP. Omitting either value prompts for it. The optional third argument is a
+custom pool data directory.
+
+Use `CMFD_POOL_PEER=IP:22444` and `CMFD_POOL_ALLOW_PUBLIC_PEERS=1` to configure a
+static public P2P peer. Other operator overrides are listed near the top of
+`START-POOL.sh`.
+
+## Dashboard and miner connections
+
+The dashboard is available on the pool host at <http://127.0.0.1:22446>. It
+shows pool health, chain height, workers, accepted and rejected shares, blocks,
+credit, and payout status. The dashboard is deliberately loopback-only. Publish
+it through an authenticated reverse proxy or tunnel if remote viewing is
+needed; do not expose a separate node-control API.
+
+Miners connect with the exact URL printed at startup. The protocol uses TLS 1.3
+with an exact certificate SHA-256 pin and a signed payout-key challenge. It is a
+Common Foundry protocol, not Bitcoin Stratum.
+
+ProductionV4 Devnet defaults to a seven-leading-zero-bit share target, one bit
+easier than the current block target. The wallet searches server-issued jobs
+with its persistent batched CUDA worker, while the pool independently performs
+the authenticated GPU replay before accepting or crediting every submitted
+nonce. Client results are never trusted.
+
+## Persistence and backups
+
+Stop the pool before backing up `pool-data` and `pool-tls`. The TLS private key
+and node wallet key are operator secrets. Restoring both directories preserves
+the advertised certificate pin, pool identity, chain, credits, and payout
+journal. The large `inputs` directory can be downloaded and verified again.
+
+Keep the pool console running. A clean shutdown preserves the ledger. On the
+next start, authenticated inputs are reused and the persistent workers are
+prepared again before miner connections open.

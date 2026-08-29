@@ -162,6 +162,11 @@ After the identity and reproduction gates pass, RCNet-1 must demonstrate:
 - documented backup, restore, update, rollback, incident, and key-rotation
   procedures
 
+Offline block-log inspection and evidence-preserving partial-tail recovery are
+specified in [`storage-recovery.md`](storage-recovery.md). RCNet qualification
+must exercise healthy inspection, interrupted-append quarantine and recovery,
+and hard refusal of checksum and record-chain corruption.
+
 The first wallet-custody increment is specified in
 [`wallet-custody.md`](wallet-custody.md): network-bound encrypted backups,
 strict authenticated restore, encrypted live-key storage, data-directory

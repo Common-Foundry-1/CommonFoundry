@@ -61,6 +61,7 @@ pub mod pool_dashboard;
 pub mod production_v4_pool;
 #[cfg(feature = "production-v3")]
 pub mod rcnet_candidate;
+pub mod storage;
 pub mod wallet_backup;
 
 #[path = "../release_gate.rs"]

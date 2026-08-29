@@ -32,6 +32,7 @@ use cmfd_node::production_v4_pool::{
 use cmfd_node::rcnet_candidate::{
     RcnetLaunchCandidate, RcnetLaunchConfiguration, write_candidate_create_new,
 };
+use cmfd_node::storage::{inspect_block_log, repair_partial_block_log_tail};
 #[cfg(test)]
 use cmfd_node::wallet_backup::MAXIMUM_PASSPHRASE_BYTES;
 use cmfd_node::wallet_backup::{
@@ -194,6 +195,14 @@ enum Command {
         /// File containing the backup passphrase. Its bytes are never printed.
         #[arg(long)]
         passphrase_file: PathBuf,
+    },
+    /// Inspect the block log without starting network services or verifying proofs.
+    StorageInspect,
+    /// Quarantine and remove only an incomplete final block-log record.
+    StorageRepairTail {
+        /// Create-new evidence file that receives the exact removed tail bytes.
+        #[arg(long)]
+        quarantine_output: PathBuf,
     },
     /// Generate a self-signed TLS certificate and print its required SHA-256 pin.
     PoolCertificate {
@@ -373,6 +382,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         return Ok(());
     }
+    if matches!(&cli.command, Command::StorageInspect) {
+        let inspection = inspect_block_log(&cli.data_dir, COMPILED_NETWORK_PROFILE)?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "status": if inspection.is_healthy() {
+                    "healthy"
+                } else {
+                    "recoverable_partial_tail"
+                },
+                "inspection": inspection,
+            }))?
+        );
+        return Ok(());
+    }
+    if let Command::StorageRepairTail { quarantine_output } = &cli.command {
+        let repaired = repair_partial_block_log_tail(
+            &cli.data_dir,
+            COMPILED_NETWORK_PROFILE,
+            quarantine_output,
+        )?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "status": if repaired.is_some() { "repaired" } else { "no_repair_needed" },
+                "repair": repaired,
+            }))?
+        );
+        return Ok(());
+    }
     validate_production_v3_override_set(&cli)?;
     let production_v3_record = production_v3_record(&cli)?;
     let production_v4_artifacts = production_v4_artifacts(&cli)?;
@@ -524,8 +563,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string_pretty(&node.status()?)?);
             Ok(())
         }
-        Command::WalletBackup { .. } | Command::WalletRestore { .. } => {
-            unreachable!("offline wallet commands exit before node initialization")
+        Command::WalletBackup { .. }
+        | Command::WalletRestore { .. }
+        | Command::StorageInspect
+        | Command::StorageRepairTail { .. } => {
+            unreachable!("offline maintenance commands exit before node initialization")
         }
         Command::PoolCertificate {
             certificate,
@@ -1309,6 +1351,29 @@ mod tests {
             Some(PathBuf::from("private-wallet-passphrase.txt"))
         );
         assert!(matches!(cli.command, Command::Status));
+    }
+
+    #[test]
+    fn storage_maintenance_commands_are_explicit() {
+        assert!(matches!(
+            Cli::try_parse_from(["cmfd-node", "storage-inspect"])
+                .unwrap()
+                .command,
+            Command::StorageInspect
+        ));
+        let repair = Cli::try_parse_from([
+            "cmfd-node",
+            "storage-repair-tail",
+            "--quarantine-output",
+            "blocks.tail.quarantine",
+        ])
+        .unwrap();
+        assert!(matches!(
+            repair.command,
+            Command::StorageRepairTail { quarantine_output }
+                if quarantine_output == Path::new("blocks.tail.quarantine")
+        ));
+        assert!(Cli::try_parse_from(["cmfd-node", "storage-repair-tail"]).is_err());
     }
 
     #[test]

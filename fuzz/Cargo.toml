@@ -32,3 +32,17 @@ path = "fuzz_targets/bls_v3_candidate_decode.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "production_v4_proof_decode"
+path = "fuzz_targets/production_v4_proof_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "production_v4_block_decode"
+path = "fuzz_targets/production_v4_block_decode.rs"
+test = false
+doc = false
+bench = false

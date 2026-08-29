@@ -3217,9 +3217,14 @@ struct DataDirLock {
 
 impl DataDirLock {
     fn acquire(data_dir: &Path) -> Result<Self, NodeError> {
+        let data_dir_existed = data_dir.exists();
         fs::create_dir_all(data_dir)
             .map_err(|source| io_error("create data directory", data_dir, source))?;
+        if !data_dir_existed {
+            sync_parent_directory(data_dir)?;
+        }
         let path = data_dir.join(LOCK_FILE);
+        let lock_file_existed = path.exists();
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -3244,11 +3249,15 @@ impl DataDirLock {
             .map_err(|source| io_error("write lock file", &path, source))?;
         file.sync_all()
             .map_err(|source| io_error("sync lock file", &path, source))?;
+        if !lock_file_existed {
+            sync_parent_directory(&path)?;
+        }
         Ok(Self { _file: file })
     }
 }
 
 fn open_block_log(path: &Path) -> Result<File, NodeError> {
+    let existed = path.exists();
     let mut options = OpenOptions::new();
     options.create(true).append(true).read(true);
     #[cfg(windows)]
@@ -3258,9 +3267,15 @@ fn open_block_log(path: &Path) -> Result<File, NodeError> {
         const FILE_SHARE_READ: u32 = 0x0000_0001;
         options.share_mode(FILE_SHARE_READ);
     }
-    options
+    let file = options
         .open(path)
-        .map_err(|source| io_error("open block log", path, source))
+        .map_err(|source| io_error("open block log", path, source))?;
+    if !existed {
+        file.sync_all()
+            .map_err(|source| io_error("sync new block log", path, source))?;
+        sync_parent_directory(path)?;
+    }
+    Ok(file)
 }
 
 #[cfg(unix)]
@@ -7850,6 +7865,25 @@ fn io_error(operation: &'static str, path: impl AsRef<Path>, source: io::Error) 
     }
 }
 
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> Result<(), NodeError> {
+    let parent = path.parent().ok_or_else(|| {
+        io_error(
+            "locate durable file parent",
+            path,
+            io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"),
+        )
+    })?;
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| io_error("sync durable file directory", parent, source))
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> Result<(), NodeError> {
+    Ok(())
+}
+
 fn load_metadata(
     data_dir: &Path,
     fingerprint: [u8; 32],
@@ -7943,7 +7977,8 @@ fn write_metadata(
     file.write_all(&bytes)
         .map_err(|source| io_error("write network metadata", &path, source))?;
     file.sync_all()
-        .map_err(|source| io_error("sync network metadata", &path, source))
+        .map_err(|source| io_error("sync network metadata", &path, source))?;
+    sync_parent_directory(&path)
 }
 
 fn load_or_create_wallet_key(
@@ -8089,7 +8124,8 @@ fn write_wallet_key(path: &Path, key: &SigningKey) -> Result<(), NodeError> {
     file.write_all(&key.to_bytes())
         .map_err(|source| io_error("write wallet key", path, source))?;
     file.sync_all()
-        .map_err(|source| io_error("sync wallet key", path, source))
+        .map_err(|source| io_error("sync wallet key", path, source))?;
+    sync_parent_directory(path)
 }
 
 #[cfg(test)]

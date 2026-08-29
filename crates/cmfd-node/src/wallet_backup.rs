@@ -1,7 +1,5 @@
 //! Offline, authenticated wallet-key backup and restore.
 
-#[cfg(unix)]
-use std::fs::File;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -13,7 +11,7 @@ use k256::schnorr::SigningKey;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-use super::{DataDirLock, NodeError, WALLET_KEY_FILE};
+use super::{DataDirLock, NodeError, WALLET_KEY_FILE, sync_parent_directory};
 
 const BACKUP_MAGIC: [u8; 8] = *b"CMFDWLT1";
 const BACKUP_VERSION: u16 = 1;
@@ -191,26 +189,7 @@ pub(crate) fn write_private_create_new(path: &Path, bytes: &[u8]) -> Result<(), 
         .map_err(|source| io_error("write private wallet file", path, source))?;
     file.sync_all()
         .map_err(|source| io_error("sync private wallet file", path, source))?;
-    sync_parent(path)?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn sync_parent(path: &Path) -> Result<(), WalletBackupError> {
-    let parent = path.parent().ok_or_else(|| {
-        io_error(
-            "locate private wallet file parent",
-            path,
-            io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"),
-        )
-    })?;
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|source| io_error("sync private wallet file directory", parent, source))
-}
-
-#[cfg(not(unix))]
-fn sync_parent(_path: &Path) -> Result<(), WalletBackupError> {
+    sync_parent_directory(path).map_err(WalletBackupError::Node)?;
     Ok(())
 }
 

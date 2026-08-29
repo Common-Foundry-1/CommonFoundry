@@ -94,7 +94,7 @@ pub fn repair_partial_block_log_tail(
         .flush()
         .and_then(|()| evidence.sync_all())
         .map_err(|error| io_error("sync block-log tail quarantine", quarantine, error))?;
-    sync_parent(quarantine)?;
+    super::sync_parent_directory(quarantine)?;
 
     if file
         .metadata()
@@ -111,7 +111,7 @@ pub fn repair_partial_block_log_tail(
         .map_err(|error| io_error("truncate quarantined block-log tail", &path, error))?;
     file.sync_all()
         .map_err(|error| io_error("sync repaired block log", &path, error))?;
-    sync_parent(&path)?;
+    super::sync_parent_directory(&path)?;
 
     Ok(Some(StorageRepairReport {
         repaired_log_bytes: inspection.last_valid_offset,
@@ -274,25 +274,6 @@ fn scan_block_log(
             .checked_add(1)
             .ok_or_else(|| NodeError::CorruptLog("block record count overflowed".to_owned()))?;
     }
-}
-
-#[cfg(unix)]
-fn sync_parent(path: &Path) -> Result<(), NodeError> {
-    let parent = path.parent().ok_or_else(|| {
-        io_error(
-            "locate durable file parent",
-            path,
-            io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"),
-        )
-    })?;
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| io_error("sync durable file directory", parent, error))
-}
-
-#[cfg(not(unix))]
-fn sync_parent(_path: &Path) -> Result<(), NodeError> {
-    Ok(())
 }
 
 #[cfg(test)]

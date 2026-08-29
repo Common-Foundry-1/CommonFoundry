@@ -4,7 +4,9 @@ Common Foundry stores accepted blocks in an authenticated append-only
 `blocks.log`. Each V2 record has a checksum and commits to the complete digest
 of the preceding record. The node synchronizes a record before committing its
 validated state transition in memory, then deterministically rebuilds state
-from the log at startup.
+from the log at startup. On Unix, new data-directory, lock-file, block-log,
+network-metadata, wallet-key, backup, quarantine, and repaired-log directory
+entries are also synchronized so their names survive a completed operation.
 
 An interrupted append can leave an incomplete final record. Normal startup
 fails closed instead of guessing. With the node, wallet, and pool stopped, an

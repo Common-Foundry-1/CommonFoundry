@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use cmfd_consensus::forgematrix::target_with_leading_zero_bits;
 use cmfd_consensus::{
-    BlockChallenge, ConsensusPowVerifier, ForgeMatrixV2AcceleratorBatch,
+    BlockChallenge, BlockProof, ConsensusPowVerifier, ForgeMatrixV2AcceleratorBatch,
     ForgeMatrixV2AcceleratorModel, ForgeMatrixV2Error, PowError, v2_reference_for_network,
 };
 use k256::schnorr::VerifyingKey;
@@ -66,6 +66,18 @@ pub enum PoolError {
         "Production V3 pool shares are not implemented; the ProductionV3 pool service is disabled rather than accepting V2 shares"
     )]
     ProductionV3Unsupported,
+    #[error(
+        "Production V4 pool shares require a configured replay verifier; the ProductionV4 pool service is disabled rather than trusting miner claims"
+    )]
+    ProductionV4Unsupported,
+    #[error("Production V4 share replay failed: {0}")]
+    ProductionV4Replay(String),
+    #[error("Production V4 replay returned a chain-winning share without its consensus proof")]
+    ProductionV4ChainProofMissing,
+    #[error("Production V4 replay returned a proof whose work digest does not match its replay")]
+    ProductionV4ProofMismatch,
+    #[error("Production V4 replay returned a consensus proof for a non-chain-winning share")]
+    ProductionV4UnexpectedChainProof,
     #[error("pool address must be a numeric private or loopback address, received {0}")]
     PublicAddress(SocketAddr),
     #[error("pool worker name must match [A-Za-z0-9._-]{{1,{POOL_MAX_WORKER_BYTES}}}")]
@@ -132,6 +144,7 @@ pub struct PoolServerConfig {
     pub share_target: [u8; 32],
     pub test_credit_atoms_per_share: u64,
     pub max_connections: usize,
+    pub production_v4_share_verifier: Option<Arc<dyn ProductionV4PoolShareVerifier>>,
 }
 
 impl PoolServerConfig {
@@ -149,8 +162,36 @@ impl PoolServerConfig {
             share_target: target_with_leading_zero_bits(DEFAULT_SHARE_LEADING_ZERO_BITS),
             test_credit_atoms_per_share: DEFAULT_TEST_CREDIT_ATOMS_PER_SHARE,
             max_connections: POOL_MAX_CONNECTIONS,
+            production_v4_share_verifier: None,
         }
     }
+}
+
+/// Pool-owned ProductionV4 replay result.
+///
+/// Ordinary shares need only the exact work digest recomputed from the fixed
+/// model and submitted nonce. A chain-winning replay must additionally carry
+/// the complete consensus proof so the unchanged node verifier can authorize
+/// the block. Implementations are trusted only for pool credit; they never
+/// bypass block verification.
+#[derive(Debug, Clone)]
+pub struct ProductionV4PoolShareEvaluation {
+    pub work_digest: [u8; 32],
+    pub chain_proof: Option<BlockProof>,
+}
+
+/// Pool-local accelerator boundary for ProductionV4 share verification.
+///
+/// A production implementation is expected to retain an authenticated model
+/// on a pool-owned GPU, replay the nonce, derive the work digest on the CPU,
+/// and construct the full proof only when the chain target is met.
+pub trait ProductionV4PoolShareVerifier: fmt::Debug + Send + Sync {
+    fn evaluate(
+        &self,
+        challenge: &BlockChallenge,
+        nonce: u64,
+        share_target: [u8; 32],
+    ) -> Result<ProductionV4PoolShareEvaluation, PoolError>;
 }
 
 #[derive(Debug, Clone)]
@@ -524,6 +565,8 @@ struct SharedServer {
     configured_share_target: [u8; 32],
     test_credit_atoms_per_share: u64,
     max_connections: usize,
+    proof_profile: ProofProfile,
+    production_v4_share_verifier: Option<Arc<dyn ProductionV4PoolShareVerifier>>,
     tls: Arc<ServerConfig>,
     startup_nonce: [u8; 32],
 }
@@ -588,7 +631,7 @@ pub fn spawn_pool_server(
         .lock()
         .map_err(|_| PoolError::SharedStatePoisoned)?
         .network_profile();
-    ensure_pool_profile_supported(profile)?;
+    ensure_pool_profile_supported(profile, config.production_v4_share_verifier.is_some())?;
     validate_private_address(config.bind)?;
     if config.max_connections == 0 || config.max_connections > POOL_MAX_CONNECTIONS {
         return Err(PoolError::InvalidConnectionLimit);
@@ -648,6 +691,8 @@ pub fn spawn_pool_server(
         configured_share_target: config.share_target,
         test_credit_atoms_per_share: config.test_credit_atoms_per_share,
         max_connections: config.max_connections,
+        proof_profile: profile.proof,
+        production_v4_share_verifier: config.production_v4_share_verifier,
         tls,
         startup_nonce,
     });
@@ -662,11 +707,17 @@ pub fn spawn_pool_server(
     })
 }
 
-fn ensure_pool_profile_supported(profile: NetworkProfile) -> Result<(), PoolError> {
-    if matches!(profile.proof, ProofProfile::ProductionV3) {
-        return Err(PoolError::ProductionV3Unsupported);
+fn ensure_pool_profile_supported(
+    profile: NetworkProfile,
+    has_production_v4_share_verifier: bool,
+) -> Result<(), PoolError> {
+    match profile.proof {
+        ProofProfile::ProductionV3 => Err(PoolError::ProductionV3Unsupported),
+        ProofProfile::ProductionV4 if !has_production_v4_share_verifier => {
+            Err(PoolError::ProductionV4Unsupported)
+        }
+        ProofProfile::ProductionV4 | ProofProfile::DevnetV2Reference => Ok(()),
     }
-    Ok(())
 }
 
 fn pool_listener(listener: TcpListener, shared: Arc<SharedServer>) -> Result<(), PoolError> {
@@ -951,17 +1002,12 @@ fn process_share(
     if job_id != active.wire.job_id {
         return rejected_result(shared, session_id, job_id, nonce, "stale_job");
     }
-    let evaluation = active
-        .mining
-        .evaluate_share(nonce, active.wire.share_target)?;
-    if !evaluation.meets_share_target {
+    let evaluation = evaluate_pool_share(shared, &active, nonce)?;
+    if evaluation.work_digest > active.wire.share_target {
         return rejected_result(shared, session_id, job_id, nonce, "low_difficulty_share");
     }
-    let block = if evaluation.meets_chain_target {
-        let Some(block) = active
-            .mining
-            .build_block_if_chain_valid(&evaluation.proof)?
-        else {
+    let block = if let Some(proof) = &evaluation.chain_proof {
+        let Some(block) = active.mining.build_block_if_chain_valid(proof)? else {
             return rejected_result(shared, session_id, job_id, nonce, "invalid_chain_proof");
         };
         Some(block)
@@ -1381,6 +1427,63 @@ impl fmt::Debug for PoolClient {
             .field("session_id", &self.session_id)
             .field("current_job", &self.current_job)
             .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+struct VerifiedPoolShare {
+    work_digest: [u8; 32],
+    chain_proof: Option<BlockProof>,
+}
+
+fn evaluate_pool_share(
+    shared: &SharedServer,
+    active: &ActiveJob,
+    nonce: u64,
+) -> Result<VerifiedPoolShare, PoolError> {
+    match shared.proof_profile {
+        ProofProfile::DevnetV2Reference => {
+            let evaluation = active
+                .mining
+                .evaluate_share(nonce, active.wire.share_target)?;
+            Ok(VerifiedPoolShare {
+                work_digest: evaluation.work_digest,
+                chain_proof: evaluation.meets_chain_target.then_some(evaluation.proof),
+            })
+        }
+        ProofProfile::ProductionV3 => Err(PoolError::ProductionV3Unsupported),
+        ProofProfile::ProductionV4 => evaluate_production_v4_pool_share(
+            shared.production_v4_share_verifier.as_deref(),
+            &active.wire.challenge,
+            nonce,
+            active.wire.share_target,
+        ),
+    }
+}
+
+fn evaluate_production_v4_pool_share(
+    verifier: Option<&dyn ProductionV4PoolShareVerifier>,
+    challenge: &BlockChallenge,
+    nonce: u64,
+    share_target: [u8; 32],
+) -> Result<VerifiedPoolShare, PoolError> {
+    let verifier = verifier.ok_or(PoolError::ProductionV4Unsupported)?;
+    let evaluation = verifier.evaluate(challenge, nonce, share_target)?;
+    let meets_chain_target = evaluation.work_digest <= challenge.target;
+    match (meets_chain_target, evaluation.chain_proof) {
+        (true, Some(proof)) if proof.work_digest() == evaluation.work_digest => {
+            Ok(VerifiedPoolShare {
+                work_digest: evaluation.work_digest,
+                chain_proof: Some(proof),
+            })
+        }
+        (true, Some(_)) => Err(PoolError::ProductionV4ProofMismatch),
+        (true, None) => Err(PoolError::ProductionV4ChainProofMissing),
+        (false, Some(_)) => Err(PoolError::ProductionV4UnexpectedChainProof),
+        (false, None) => Ok(VerifiedPoolShare {
+            work_digest: evaluation.work_digest,
+            chain_proof: None,
+        }),
     }
 }
 
@@ -1915,13 +2018,120 @@ fn decode_hex_32(value: &str) -> Result<[u8; 32], PoolError> {
 mod tests {
     use super::*;
 
+    #[derive(Debug)]
+    struct FixedProductionV4ShareVerifier {
+        evaluation: ProductionV4PoolShareEvaluation,
+    }
+
+    impl ProductionV4PoolShareVerifier for FixedProductionV4ShareVerifier {
+        fn evaluate(
+            &self,
+            _challenge: &BlockChallenge,
+            _nonce: u64,
+            _share_target: [u8; 32],
+        ) -> Result<ProductionV4PoolShareEvaluation, PoolError> {
+            Ok(self.evaluation.clone())
+        }
+    }
+
+    fn production_v4_share_challenge() -> BlockChallenge {
+        BlockChallenge {
+            network_id: [1; 32],
+            previous_block: [2; 32],
+            transaction_root: [3; 32],
+            height: 4,
+            timestamp: 5,
+            target: [0x80; 32],
+        }
+    }
+
+    fn test_proof(work_digest: [u8; 32]) -> BlockProof {
+        BlockProof::V1Legacy(cmfd_consensus::ForgeMatrixProof {
+            algorithm_version: 1,
+            model_version: 1,
+            nonce: 7,
+            model_root: [8; 32],
+            output_digest: [9; 32],
+            work_digest,
+        })
+    }
+
     #[test]
-    fn production_v3_pool_fails_closed_without_v2_share_fallback() {
+    fn production_pool_profiles_fail_closed_without_share_verifiers() {
         assert!(matches!(
-            ensure_pool_profile_supported(crate::RCNET1_PROFILE),
+            ensure_pool_profile_supported(crate::RCNET1_PROFILE, false),
             Err(PoolError::ProductionV3Unsupported)
         ));
-        assert!(ensure_pool_profile_supported(crate::DEVNET_PROFILE).is_ok());
+        assert!(matches!(
+            ensure_pool_profile_supported(crate::PRODUCTION_V4_TESTNET_PROFILE, false),
+            Err(PoolError::ProductionV4Unsupported)
+        ));
+        assert!(ensure_pool_profile_supported(crate::PRODUCTION_V4_TESTNET_PROFILE, true).is_ok());
+        assert!(ensure_pool_profile_supported(crate::DEVNET_PROFILE, false).is_ok());
+    }
+
+    #[test]
+    fn production_v4_share_replay_boundary_is_fail_closed() {
+        let challenge = production_v4_share_challenge();
+        assert!(matches!(
+            evaluate_production_v4_pool_share(None, &challenge, 7, [0xff; 32]),
+            Err(PoolError::ProductionV4Unsupported)
+        ));
+
+        let ordinary = FixedProductionV4ShareVerifier {
+            evaluation: ProductionV4PoolShareEvaluation {
+                work_digest: [0xff; 32],
+                chain_proof: None,
+            },
+        };
+        let ordinary =
+            evaluate_production_v4_pool_share(Some(&ordinary), &challenge, 7, [0xff; 32]).unwrap();
+        assert_eq!(ordinary.work_digest, [0xff; 32]);
+        assert!(ordinary.chain_proof.is_none());
+
+        let missing = FixedProductionV4ShareVerifier {
+            evaluation: ProductionV4PoolShareEvaluation {
+                work_digest: [0; 32],
+                chain_proof: None,
+            },
+        };
+        assert!(matches!(
+            evaluate_production_v4_pool_share(Some(&missing), &challenge, 7, [0xff; 32]),
+            Err(PoolError::ProductionV4ChainProofMissing)
+        ));
+
+        let mismatched = FixedProductionV4ShareVerifier {
+            evaluation: ProductionV4PoolShareEvaluation {
+                work_digest: [0; 32],
+                chain_proof: Some(test_proof([1; 32])),
+            },
+        };
+        assert!(matches!(
+            evaluate_production_v4_pool_share(Some(&mismatched), &challenge, 7, [0xff; 32]),
+            Err(PoolError::ProductionV4ProofMismatch)
+        ));
+
+        let unexpected = FixedProductionV4ShareVerifier {
+            evaluation: ProductionV4PoolShareEvaluation {
+                work_digest: [0xff; 32],
+                chain_proof: Some(test_proof([0xff; 32])),
+            },
+        };
+        assert!(matches!(
+            evaluate_production_v4_pool_share(Some(&unexpected), &challenge, 7, [0xff; 32]),
+            Err(PoolError::ProductionV4UnexpectedChainProof)
+        ));
+
+        let winning = FixedProductionV4ShareVerifier {
+            evaluation: ProductionV4PoolShareEvaluation {
+                work_digest: [0; 32],
+                chain_proof: Some(test_proof([0; 32])),
+            },
+        };
+        let winning =
+            evaluate_production_v4_pool_share(Some(&winning), &challenge, 7, [0xff; 32]).unwrap();
+        assert_eq!(winning.work_digest, [0; 32]);
+        assert_eq!(winning.chain_proof.unwrap().work_digest(), [0; 32]);
     }
 
     #[test]

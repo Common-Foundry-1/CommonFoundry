@@ -1,9 +1,8 @@
 """Independent ProductionV4 verifier, implemented without consensus-library imports.
 
-The current implementation verifies exact proof framing, canonical field
-encodings, all public BLAKE3 bindings, pinned proof identities, and the work
-target. It deliberately reports the unimplemented algebraic stages instead of
-claiming full cryptographic verification.
+The verifier covers exact framing and bindings plus the complete relation,
+opening-reduction, Merkle, and BaseFold algebra. Full verification additionally
+requires the trusted fixed record and authenticated model bank.
 """
 
 from __future__ import annotations

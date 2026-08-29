@@ -76,3 +76,13 @@ model-manifest digests must match the candidate before any commitment is used.
 
 The sole non-standard Python dependency is the hash-pinned `blake3==1.0.8`
 package already listed in `scripts/requirements-release-integrity.txt`.
+
+## Fresh-process qualification
+
+`scripts/production-v4-verify-qualification.py` runs the verifier in a new
+process for every case and creates a canonical, no-overwrite report. It requires
+one known-valid proof to pass with the model bank and fixed record, then requires
+eight targeted mutations to fail: truncation, trailing data, a noncanonical
+field, final activation, relation round, fixed Merkle path, FRI query, and
+grinding witness. The report binds the exact verifier source files, proof,
+commands, rejection reasons, source commit, and operator identity.

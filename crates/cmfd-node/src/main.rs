@@ -1070,7 +1070,7 @@ fn production_v4_wsl_pool_workers(
             fixed_artifact_directory,
             scratch_directory,
         );
-        return Err("ProductionV4 pool WSL workers require Windows".into());
+        Err("ProductionV4 pool WSL workers require Windows".into())
     }
     #[cfg(windows)]
     {

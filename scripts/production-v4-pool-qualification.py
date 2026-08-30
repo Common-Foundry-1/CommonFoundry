@@ -15,6 +15,7 @@ from pathlib import Path
 
 
 REPORT_SCHEMA = "CommonFoundry/ProductionV4/PoolQualification/v1"
+RUST_TOOLCHAIN = "1.94.1"
 COMMIT_RE = re.compile(r"[0-9a-f]{40}\Z")
 
 
@@ -33,7 +34,7 @@ def qualification_commands(include_dashboard: bool) -> list[tuple[str, list[str]
         (
             "node_production_v4_regression_tests",
             [
-                "cargo", "test", "-p", "cmfd-node",
+                "cargo", f"+{RUST_TOOLCHAIN}", "test", "-p", "cmfd-node",
                 "--features", "production-v4-testnet",
                 "--lib",
             ],
@@ -42,7 +43,7 @@ def qualification_commands(include_dashboard: bool) -> list[tuple[str, list[str]
         (
             "node_strict_clippy",
             [
-                "cargo", "clippy", "-p", "cmfd-node",
+                "cargo", f"+{RUST_TOOLCHAIN}", "clippy", "-p", "cmfd-node",
                 "--features", "production-v4-testnet",
                 "--all-targets", "--", "-D", "warnings",
             ],
@@ -189,6 +190,7 @@ def main() -> int:
             "operator": args.operator.strip(),
             "platform": args.platform_label.strip(),
             "cargo_build_jobs": 4,
+            "rust_toolchain": RUST_TOOLCHAIN,
             "deterministic_pool_gate_met": True,
             "dashboard_gate_met": not args.rust_only,
             "full_gpu_endurance_gate_met": False,

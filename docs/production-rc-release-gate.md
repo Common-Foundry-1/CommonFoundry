@@ -195,5 +195,7 @@ python scripts/production-v4-pool-qualification.py `
 
 Run the same script natively on Linux with `python3`. `--rust-only` records a
 core-only result when the dashboard was already qualified from the same source
-commit. The report deliberately leaves `full_gpu_endurance_gate_met` false;
-only the live RCNet pool exercise can close that gate.
+commit. The harness selects the same Rust 1.94.1 toolchain as CI instead of a
+machine's moving default. The report deliberately leaves
+`full_gpu_endurance_gate_met` false; only the live RCNet pool exercise can close
+that gate.

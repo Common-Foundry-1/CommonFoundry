@@ -33,6 +33,9 @@ class PoolQualificationTests(unittest.TestCase):
         )
         expected_npm = "npm.cmd" if os.name == "nt" else "npm"
         self.assertEqual(full[2][1][0], expected_npm)
+        self.assertTrue(
+            all(command[1] == "+1.94.1" for _name, command, _cwd in core)
+        )
 
     def test_source_commit_format_is_fail_closed(self) -> None:
         root = Path(__file__).resolve().parents[2]

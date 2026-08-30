@@ -155,3 +155,10 @@ requires the exact signed flat-file inventory, streams and hashes every file,
 and cross-checks the build identity, source SBOM, and release-assembly
 provenance. It is the authentication boundary used by update and rollback
 qualification; the private repository is not distributed to clients.
+
+Planned and emergency signer changes follow
+[`production-key-operations.md`](production-key-operations.md). The
+`scripts/release-key-transition.py` harness creates a canonical transition
+record and verifies distinct old-key and new-key signatures under the dedicated
+`commonfoundry-release-key-transition` namespace before a successor policy is
+distributed.

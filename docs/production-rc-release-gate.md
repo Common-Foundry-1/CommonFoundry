@@ -162,6 +162,13 @@ After the identity and reproduction gates pass, RCNet-1 must demonstrate:
 - documented backup, restore, update, rollback, incident, and key-rotation
   procedures
 
+The operator procedures and evidence requirements are defined in
+[`incident-response.md`](incident-response.md) and
+[`production-key-operations.md`](production-key-operations.md). Source review
+can qualify the procedures; RCNet must still execute the listed drills with
+named operators, real target hosts, non-production rehearsal keys, and
+preserved evidence.
+
 Offline block-log inspection and evidence-preserving partial-tail recovery are
 specified in [`storage-recovery.md`](storage-recovery.md). RCNet qualification
 must exercise healthy inspection, interrupted-append quarantine and recovery,

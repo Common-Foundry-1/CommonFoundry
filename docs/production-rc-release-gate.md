@@ -165,7 +165,8 @@ After the identity and reproduction gates pass, RCNet-1 must demonstrate:
 Offline block-log inspection and evidence-preserving partial-tail recovery are
 specified in [`storage-recovery.md`](storage-recovery.md). RCNet qualification
 must exercise healthy inspection, interrupted-append quarantine and recovery,
-and hard refusal of checksum and record-chain corruption.
+hard refusal of checksum and record-chain corruption, exact linear-chain
+checkpoint restart, and corrupt-checkpoint fallback to full replay.
 
 Authenticated release transition testing is specified in
 [`update-rollback-qualification.md`](update-rollback-qualification.md). The
@@ -179,8 +180,8 @@ The first wallet-custody increment is specified in
 [`wallet-custody.md`](wallet-custody.md): network-bound encrypted backups,
 strict authenticated restore, encrypted live-key storage, data-directory
 locking, RCNet plaintext-key refusal, and no-overwrite semantics. The guided
-GUI migration/unlock/relock and external review items listed there remain part
-of the RCNet acceptance work.
+GUI now covers create/unlock, migration, backup, restore, lock, and relock. An
+independent custody review remains part of the RCNet acceptance work.
 
 Mainnet activation is a separate decision after the full rehearsal evidence,
 independent audits, and launch operations review are complete.

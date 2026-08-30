@@ -19,11 +19,13 @@ use crate::{
 };
 
 mod state_delta;
+mod state_snapshot;
 
 pub use state_delta::{
     DecodedReversibleStateDelta, MAX_REVERSIBLE_STATE_DELTA_BYTES, ReversibleStateDeltaCapability,
     ReversibleStateDeltaError, ValidatedReversibleStateDelta,
 };
+pub use state_snapshot::{ChainStateSnapshotError, MAX_CHAIN_STATE_SNAPSHOT_BYTES};
 
 const TX_SIGNING_DOMAIN: &str = "CMFD/TRANSACTION/SIGNING/V1";
 const TX_ID_DOMAIN: &str = "CMFD/TRANSACTION/ID/V1";
@@ -192,6 +194,62 @@ pub struct SuccessorHeaderPreflight {
 }
 
 impl SuccessorHeaderPreflight {
+    /// Fixed-width local snapshot used only by authenticated node startup
+    /// caches. These bytes are not a consensus object or proof.
+    pub const LOCAL_SNAPSHOT_BYTES: usize = 32 + 32 + 8 + 8 + 32;
+
+    pub fn encode_local_snapshot(
+        self,
+    ) -> Result<[u8; Self::LOCAL_SNAPSHOT_BYTES], ChainStateSnapshotError> {
+        let mut bytes = [0_u8; Self::LOCAL_SNAPSHOT_BYTES];
+        bytes[..32].copy_from_slice(&self.params.fingerprint()?);
+        bytes[32..64].copy_from_slice(&self.tip);
+        bytes[64..72].copy_from_slice(&self.next_height.to_le_bytes());
+        bytes[72..80].copy_from_slice(&self.median_time_past.to_le_bytes());
+        bytes[80..112].copy_from_slice(&self.expected_target);
+        Ok(bytes)
+    }
+
+    pub fn decode_local_snapshot(
+        bytes: &[u8; Self::LOCAL_SNAPSHOT_BYTES],
+        params: NetworkParams,
+    ) -> Result<Self, ChainStateSnapshotError> {
+        if bytes[..32] != params.fingerprint()? {
+            return Err(ChainStateSnapshotError::WrongNetwork);
+        }
+        let tip: [u8; 32] = bytes[32..64]
+            .try_into()
+            .map_err(|_| ChainStateSnapshotError::Truncated)?;
+        let next_height = u64::from_le_bytes(
+            bytes[64..72]
+                .try_into()
+                .map_err(|_| ChainStateSnapshotError::Truncated)?,
+        );
+        let median_time_past = u64::from_le_bytes(
+            bytes[72..80]
+                .try_into()
+                .map_err(|_| ChainStateSnapshotError::Truncated)?,
+        );
+        let expected_target: [u8; 32] = bytes[80..112]
+            .try_into()
+            .map_err(|_| ChainStateSnapshotError::Truncated)?;
+        if next_height == 0
+            || (next_height == 1) != (tip == params.genesis_hash)
+            || expected_target == [0; 32]
+        {
+            return Err(ChainStateSnapshotError::InvalidState(
+                "successor header preflight",
+            ));
+        }
+        Ok(Self {
+            params,
+            tip,
+            next_height,
+            median_time_past,
+            expected_target,
+        })
+    }
+
     pub fn preflight_block(
         self,
         block: &Block,
@@ -1538,7 +1596,7 @@ mod tests {
         key.verifying_key().to_bytes().into()
     }
 
-    fn miner_destination() -> [u8; 32] {
+    pub(super) fn miner_destination() -> [u8; 32] {
         owner(&signing_key(2))
     }
 
@@ -1549,7 +1607,7 @@ mod tests {
         }
     }
 
-    fn network_params() -> NetworkParams {
+    pub(super) fn network_params() -> NetworkParams {
         NetworkParams {
             network_id: [1; 32],
             protocol_version: crate::NETWORK_PROTOCOL_VERSION,
@@ -1609,7 +1667,7 @@ mod tests {
         }
     }
 
-    fn legacy_verifier() -> ConsensusPowVerifier {
+    pub(super) fn legacy_verifier() -> ConsensusPowVerifier {
         ConsensusPowVerifier::v1_legacy(TEST_PROFILE).unwrap()
     }
 
@@ -1713,7 +1771,7 @@ mod tests {
         }
     }
 
-    fn block_for_state(
+    pub(super) fn block_for_state(
         state: &ChainState,
         timestamp: u64,
         miner: [u8; 32],

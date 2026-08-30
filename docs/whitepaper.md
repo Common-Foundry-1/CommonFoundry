@@ -826,9 +826,7 @@ Each data directory contains:
 
 A candidate block is fully validated before mutation. The node then appends and synchronizes its record before committing the prepared state transition in memory. A storage failure latches the node unhealthy. If durable append succeeds but memory commit fails, the process stops accepting work so restart can replay disk as the source of truth.
 
-On restart, the node checks record magic, version, sizes, checksums, canonical re-encoding, network fingerprint, consensus validity, parent relations, forks, and cumulative work. It reconstructs the active branch deterministically.
-
-This append-and-replay model favors auditability. It lacks production snapshots, pruning, automatic repair, authenticated checkpoints, bounded startup time, and protection against a local attacker who can rewrite records and checksums.
+Full replay checks record magic, version, sizes, checksums, canonical re-encoding, network fingerprint, consensus validity, parent relations, forks, and cumulative work, then reconstructs the active branch deterministically. A two-slot, network-bound fast-start checkpoint now preserves the canonical state and compact index for an exact linear chain. Clean shutdown refreshes it, while startup rechecks the retained file identity and terminal record. Any missing, stale, malformed, or mismatched checkpoint returns automatically to full replay. This keeps the append-only log authoritative while making ordinary restarts faster. Side-branch snapshots, long-history measurement, background historical-log scrubbing, and a reviewed pruning policy are the next storage milestones.
 
 ### 11.3 Mempool and templates
 
@@ -991,10 +989,10 @@ The next network layer adds authenticated peer discovery, reputation and ban pol
 | Final digest | Bound inside the complete ProductionV4 proof and independently checked during candidate verification | Independent implementation and cryptographic review |
 | CUDA | Full-shape replay and KoalaBear-native BaseFold proving on RTX 5090 and physical RTX 5070 Ti 16 GB, followed by CPU self-verification | Broader GPU/driver matrix, independent implementation, sandbox hardening, and sustained fault testing |
 | P2P | ProductionV4 block accepted, independently downloaded, verified, and persisted by a second node | Authenticated public discovery/gossip and DoS defenses |
-| Storage | Checksummed append, fsync, deterministic replay | Snapshots, pruning, repair, indexing, bounded startup |
+| Storage | Checksummed append, fsync, deterministic replay, partial-tail repair, and locally authenticated linear-chain fast-start checkpoints | Side-branch snapshots, pruning, background scrubbing, and long-history bounded-startup qualification |
 | Mempool | Deterministic capped confirmed-input pool | Fee-burn inclusion/eviction economics and package policy |
 | Pool | Pinned-TLS CMFD v2 transport, authenticated payout keys, server replay, durable reorg-aware ledger, and opt-in testnet payouts | Production custody, sustained load qualification, independent interoperability, and DoS hardening |
-| Wallet | Windows and Linux GUI packages with real Devnet balance, send, receive, and coinbase maturity reporting | Production custody, backup, recovery, hardware signing |
+| Wallet | Windows and Linux GUI packages with real Devnet balance, send, receive, coinbase maturity reporting, encrypted live keys, and guided backup, migration, restore, unlock, and lock controls | Independent custody review and hardware signing |
 | Inference channel | Pricing, signed states/receipts, close/refund accounting | Quote/job transport, execution, discovery, reputation, disputes |
 | Governance | Fixed visible steward/community destinations and exact bootstrap percentages | Multisig operations, reporting, and a clear change process |
 | Review | Extensive internal tests and executable qualification | Two independent external audits |

@@ -205,6 +205,8 @@ enum Command {
         #[arg(long)]
         quarantine_output: PathBuf,
     },
+    /// Replay storage and write a locally authenticated fast-start checkpoint.
+    StorageCheckpoint,
     /// Generate a self-signed TLS certificate and print its required SHA-256 pin.
     PoolCertificate {
         /// Output path for the DER-encoded self-signed certificate.
@@ -511,6 +513,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             })?;
             if let Ok(node) = shared.lock() {
+                if let Err(error) = node.persist_startup_snapshot() {
+                    eprintln!("startup checkpoint not written: {error}");
+                }
                 node.shutdown_proof_verifier();
             }
             let rpc_result = rpc.stop();
@@ -542,6 +547,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None => node.wallet_destination(),
             };
             let block = node.mine_once(miner_destination, unix_time_seconds()?, attempts)?;
+            node.persist_startup_snapshot()?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
@@ -565,6 +571,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 wallet_passphrase.as_ref().map(|value| value.as_slice()),
             )?;
             println!("{}", serde_json::to_string_pretty(&node.status()?)?);
+            Ok(())
+        }
+        Command::StorageCheckpoint => {
+            let node = open_node(
+                &cli.data_dir,
+                production_v3_record.as_ref(),
+                production_v4_artifacts.as_ref(),
+                verifier_worker.as_ref(),
+                wallet_passphrase.as_ref().map(|value| value.as_slice()),
+            )?;
+            node.persist_startup_snapshot()?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "status": "checkpoint_written",
+                    "network": COMPILED_NETWORK_PROFILE.short_name(),
+                    "node": node.status()?,
+                }))?
+            );
             Ok(())
         }
         Command::WalletBackup { .. }
@@ -770,6 +795,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None => Ok(None),
             };
             if let Ok(node) = node.lock() {
+                if let Err(error) = node.persist_startup_snapshot() {
+                    eprintln!("startup checkpoint not written: {error}");
+                }
                 node.shutdown_proof_verifier();
             }
             let pool_result = pool.stop();

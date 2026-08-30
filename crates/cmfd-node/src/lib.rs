@@ -22,13 +22,14 @@ use cmfd_consensus::{
     ChainState, Coinbase, ConsensusPowVerifier, DEFAULT_MONETARY_POLICY,
     DecodedReversibleStateDelta, EconomicsError, FixedRewardDestinations, ForgeMatrixError,
     ForgeMatrixV2AcceleratorBatch, ForgeMatrixV2AcceleratorModel, ForgeMatrixV2Error, InputWitness,
-    MAX_BLOCK_BYTES, MAX_FUTURE_OFFSET_SECS, MAX_REVERSIBLE_STATE_DELTA_BYTES,
-    MAX_TRANSACTION_BYTES, MAX_TRANSACTION_INPUTS, NETWORK_PROTOCOL_VERSION, NetworkError,
-    NetworkParams, OutPoint, OutputLock, PowError, PreverifiedBlockProof,
-    ReversibleStateDeltaError, SuccessorHeaderPreflight, TRANSACTION_VERSION, Transaction, TxInput,
-    TxOutput, WireError, add_chain_work, chain_work_bytes, decode_block, decode_transaction,
-    encode_block, encode_transaction, max_block_bytes_for_network, merkle_root,
-    v2_reference_for_network, validate_block_preamble, validate_block_resources,
+    MAX_BLOCK_BYTES, MAX_CHAIN_STATE_SNAPSHOT_BYTES, MAX_FUTURE_OFFSET_SECS,
+    MAX_REVERSIBLE_STATE_DELTA_BYTES, MAX_TRANSACTION_BYTES, MAX_TRANSACTION_INPUTS,
+    NETWORK_PROTOCOL_VERSION, NetworkError, NetworkParams, OutPoint, OutputLock, PowError,
+    PreverifiedBlockProof, ReversibleStateDeltaError, SuccessorHeaderPreflight,
+    TRANSACTION_VERSION, Transaction, TxInput, TxOutput, WireError, add_chain_work,
+    chain_work_bytes, decode_block, decode_transaction, encode_block, encode_transaction,
+    max_block_bytes_for_network, merkle_root, v2_reference_for_network, validate_block_preamble,
+    validate_block_resources,
 };
 #[cfg(feature = "production-v3")]
 use cmfd_consensus::{
@@ -61,6 +62,7 @@ pub mod pool_dashboard;
 pub mod production_v4_pool;
 #[cfg(feature = "production-v3")]
 pub mod rcnet_candidate;
+mod startup_snapshot;
 pub mod storage;
 pub mod wallet_backup;
 
@@ -2190,6 +2192,7 @@ pub struct NodeStatus {
     /// verifier request error that triggered containment.
     pub proof_verification_teardown_failures: Option<u64>,
     pub storage_healthy: bool,
+    pub startup_snapshot_used: bool,
     pub public_peer_mode: bool,
     pub peers: Vec<PeerObservation>,
 }
@@ -3417,6 +3420,7 @@ pub struct Node {
     /// after a complete record is durably written at that exact position.
     block_log_length: u64,
     storage_faulted: bool,
+    startup_snapshot_used: bool,
     rejected_proof_ids: HashSet<[u8; 32]>,
     rejected_proof_order: VecDeque<[u8; 32]>,
     rejected_body_digests: HashSet<[u8; 32]>,
@@ -4378,17 +4382,25 @@ impl Node {
             wallet_passphrase,
         )?;
 
-        let mut state = ChainState::new(params, verifier.clone())?;
-        let mut index = BlockIndex::new(params.genesis_hash);
-        let replay = replay_log(
-            &log,
-            &log_path,
-            &mut state,
-            &mut index,
-            &verifier,
-            params,
-            external_replay.then_some(&block_preverifier),
-        )?;
+        let restored =
+            startup_snapshot::load_startup_snapshot(&data_dir, &log, &log_path, params, &verifier)?;
+        let (state, index, replay, startup_snapshot_used) = match restored {
+            Some(restored) => (restored.state, restored.index, restored.replay, true),
+            None => {
+                let mut state = ChainState::new(params, verifier.clone())?;
+                let mut index = BlockIndex::new(params.genesis_hash);
+                let replay = replay_log(
+                    &log,
+                    &log_path,
+                    &mut state,
+                    &mut index,
+                    &verifier,
+                    params,
+                    external_replay.then_some(&block_preverifier),
+                )?;
+                (state, index, replay, false)
+            }
+        };
         if metadata != MetadataState::Current {
             write_metadata(&data_dir, fingerprint, metadata)?;
         }
@@ -4404,7 +4416,7 @@ impl Node {
         #[cfg(not(feature = "production-v3"))]
         let _ = production_v3_artifacts;
 
-        Ok(Self {
+        let node = Self {
             instance_id: next_node_instance_id()?,
             data_dir,
             profile,
@@ -4425,6 +4437,7 @@ impl Node {
             last_record_digest: replay.last_record_digest,
             block_log_length: replay.log_length,
             storage_faulted: false,
+            startup_snapshot_used,
             rejected_proof_ids: HashSet::new(),
             rejected_proof_order: VecDeque::new(),
             rejected_body_digests: HashSet::new(),
@@ -4436,11 +4449,23 @@ impl Node {
             #[cfg(test)]
             completion_fault_barrier: None,
             _lock: lock,
-        })
+        };
+        if !startup_snapshot_used {
+            let _ = node.persist_startup_snapshot();
+        }
+        Ok(node)
     }
 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    /// Writes a two-slot, locally authenticated startup snapshot.
+    ///
+    /// The current format deliberately supports only a linear active-chain
+    /// log. Nodes that have retained side branches continue to use full replay.
+    pub fn persist_startup_snapshot(&self) -> Result<(), NodeError> {
+        startup_snapshot::persist_startup_snapshot(self)
     }
 
     fn latch_authenticated_storage_failure<T>(
@@ -4622,6 +4647,7 @@ impl Node {
             proof_verification_memory_limit_bytes,
             proof_verification_teardown_failures,
             storage_healthy: !self.storage_faulted,
+            startup_snapshot_used: self.startup_snapshot_used,
             public_peer_mode: self.public_peer_mode,
             peers: self.peer_observations(),
         })

@@ -17,6 +17,18 @@ SPEC.loader.exec_module(QUALIFICATION)
 
 
 class PoolQualificationTests(unittest.TestCase):
+    def test_windows_pool_scripts_resolve_the_default_data_dir_after_parameter_binding(
+        self,
+    ) -> None:
+        for name in ["run-production-v4-pool.ps1", "control-production-v4-pool.ps1"]:
+            with self.subTest(script=name):
+                script = (SCRIPTS / name).read_text(encoding="utf-8")
+                parameter_block, body = script.split("\n)\n", 1)
+                self.assertNotIn("$PSScriptRoot", parameter_block)
+                self.assertIn(
+                    "$DataDirectory = Join-Path $PSScriptRoot 'pool-data'", body
+                )
+
     def test_operator_controls_cover_both_platforms(self) -> None:
         root = Path(__file__).resolve().parents[2]
         required = [

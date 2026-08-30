@@ -4,7 +4,7 @@ param(
     [string]$PrivateBindAddress,
     [string]$ModelBank,
     [string]$FixedRecord,
-    [string]$DataDirectory = (Join-Path $PSScriptRoot 'pool-data'),
+    [string]$DataDirectory,
     [string]$WslDistribution = 'Ubuntu-22.04',
     [string]$Peer,
     [switch]$AllowPublicPeers,
@@ -18,6 +18,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+if ([string]::IsNullOrWhiteSpace($DataDirectory)) {
+    $DataDirectory = Join-Path $PSScriptRoot 'pool-data'
+}
 
 $node = Join-Path $PSScriptRoot 'cmfd-node.exe'
 $replayWorker = Join-Path $PSScriptRoot 'cmfd-v4-replay'

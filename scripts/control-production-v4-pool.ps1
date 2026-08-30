@@ -3,11 +3,14 @@ param(
     [Parameter(Mandatory = $true)]
     [ValidateSet('Status', 'Stop', 'Restart', 'InstallAutostart', 'RemoveAutostart')]
     [string]$Action,
-    [string]$DataDirectory = (Join-Path $PSScriptRoot 'pool-data'),
+    [string]$DataDirectory,
     [ValidateRange(1, 600)][int]$StopTimeoutSeconds = 180
 )
 
 $ErrorActionPreference = 'Stop'
+if ([string]::IsNullOrWhiteSpace($DataDirectory)) {
+    $DataDirectory = Join-Path $PSScriptRoot 'pool-data'
+}
 $DataDirectory = [IO.Path]::GetFullPath($DataDirectory)
 $controlDirectory = Join-Path $DataDirectory 'pool-control'
 $stateFile = Join-Path $controlDirectory 'pool-state.json'

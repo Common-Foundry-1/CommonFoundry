@@ -138,3 +138,20 @@ The command rejects a missing or extra signature, malformed signer identity,
 untrusted key, wrong namespace, modified checksum, modified asset, or changed
 source identity. Build receipts still do not replace an independent
 reproducible-build comparison.
+
+Operators and update tooling can authenticate the downloaded directory without
+access to the private source checkout:
+
+```text
+python scripts/release_integrity.py verify-download \
+  --stage <downloaded-release-directory> \
+  --allowed-signers <trusted-allowed-signers> \
+  --signer-identity <release-identity> \
+  --ssh-keygen <trusted-ssh-keygen-path>
+```
+
+This verifies the detached signature before trusting the checksum manifest,
+requires the exact signed flat-file inventory, streams and hashes every file,
+and cross-checks the build identity, source SBOM, and release-assembly
+provenance. It is the authentication boundary used by update and rollback
+qualification; the private repository is not distributed to clients.

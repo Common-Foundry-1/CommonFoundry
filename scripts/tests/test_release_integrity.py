@@ -2267,6 +2267,23 @@ class ReleaseFinalizerTests(unittest.TestCase):
         (self.stage / "a.bin").write_bytes(b"alpha")
         (self.stage / "b.txt").write_bytes(b"beta\n")
 
+    def signed_download_inputs(self) -> tuple[Path, Path, dict[str, object]]:
+        signature_path = self.stage / integrity.CHECKSUM_SIGNATURE_NAME
+        signature_path.write_bytes(b"signature")
+        allowed = self.fixture.write("target/allowed_signers", "trusted key\n")
+        verifier = self.fixture.write("target/ssh-keygen", b"verifier")
+        receipt = {
+            "allowed_signers_sha256": integrity._sha256_file(allowed),
+            "checksum_sha256": integrity._sha256_file(
+                self.stage / integrity.CHECKSUM_NAME
+            ),
+            "namespace": integrity.RELEASE_SIGNATURE_NAMESPACE,
+            "signature_sha256": integrity._sha256_file(signature_path),
+            "signer_identity": "release@example.invalid",
+            "verifier_sha256": integrity._sha256_file(verifier),
+        }
+        return allowed, verifier, receipt
+
     def test_valid_finalize_and_verify_roundtrip(self) -> None:
         self.make_valid_assets()
         result = integrity.finalize_release(
@@ -2292,6 +2309,133 @@ class ReleaseFinalizerTests(unittest.TestCase):
             json.loads(buildinfo_bytes.decode("utf-8"))["commit"],
             self.fixture.commit,
         )
+
+    @mock.patch("release_integrity.verify_release_signature")
+    def test_signed_download_verifies_without_source_access(self, verify_signature) -> None:
+        self.make_valid_assets()
+        integrity.finalize_release(
+            repo=self.fixture.root,
+            expected_commit=self.fixture.commit,
+            version="0.1.0-test",
+            stage=self.stage,
+            inventory=self.inventory,
+            source_date_epoch=self.epoch,
+        )
+        allowed, verifier, receipt = self.signed_download_inputs()
+        verify_signature.return_value = receipt
+        result = integrity.verify_signed_download(
+            stage=self.stage,
+            allowed_signers=allowed,
+            signer_identity="release@example.invalid",
+            ssh_keygen=verifier,
+        )
+        self.assertEqual(result["schema"], "CMFD_AUTHENTICATED_DOWNLOAD_V1")
+        self.assertEqual(result["commit"], self.fixture.commit)
+        self.assertEqual(result["file_count"], 5)
+
+    def test_signed_download_real_openssh_round_trip(self) -> None:
+        executable = shutil.which("ssh-keygen")
+        if executable is None:
+            self.skipTest("OpenSSH ssh-keygen is unavailable")
+        self.make_valid_assets()
+        integrity.finalize_release(
+            repo=self.fixture.root,
+            expected_commit=self.fixture.commit,
+            version="0.1.0-test",
+            stage=self.stage,
+            inventory=self.inventory,
+            source_date_epoch=self.epoch,
+        )
+        key = self.fixture.root / "target/release-key"
+        subprocess.run(
+            [
+                executable,
+                "-q",
+                "-t",
+                "ed25519",
+                "-N",
+                "",
+                "-C",
+                "release@example.invalid",
+                "-f",
+                str(key),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                executable,
+                "-Y",
+                "sign",
+                "-f",
+                str(key),
+                "-n",
+                integrity.RELEASE_SIGNATURE_NAMESPACE,
+                str(self.stage / integrity.CHECKSUM_NAME),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        allowed = self.fixture.write(
+            "target/allowed_signers",
+            "release@example.invalid "
+            + key.with_suffix(".pub").read_text(encoding="utf-8"),
+        )
+        result = integrity.verify_signed_download(
+            stage=self.stage,
+            allowed_signers=allowed,
+            signer_identity="release@example.invalid",
+            ssh_keygen=Path(executable),
+        )
+        self.assertEqual(result["commit"], self.fixture.commit)
+
+    @mock.patch("release_integrity.verify_release_signature")
+    def test_signed_download_rejects_corrupt_asset(self, verify_signature) -> None:
+        self.make_valid_assets()
+        integrity.finalize_release(
+            repo=self.fixture.root,
+            expected_commit=self.fixture.commit,
+            version="0.1.0-test",
+            stage=self.stage,
+            inventory=self.inventory,
+            source_date_epoch=self.epoch,
+        )
+        allowed, verifier, receipt = self.signed_download_inputs()
+        verify_signature.return_value = receipt
+        (self.stage / "a.bin").write_bytes(b"omega")
+        with self.assertRaisesRegex(integrity.IntegrityError, "digest is invalid"):
+            integrity.verify_signed_download(
+                stage=self.stage,
+                allowed_signers=allowed,
+                signer_identity="release@example.invalid",
+                ssh_keygen=verifier,
+            )
+
+    @mock.patch("release_integrity.verify_release_signature")
+    def test_signed_download_rejects_noncanonical_checksum(self, verify_signature) -> None:
+        self.make_valid_assets()
+        integrity.finalize_release(
+            repo=self.fixture.root,
+            expected_commit=self.fixture.commit,
+            version="0.1.0-test",
+            stage=self.stage,
+            inventory=self.inventory,
+            source_date_epoch=self.epoch,
+        )
+        checksum_path = self.stage / integrity.CHECKSUM_NAME
+        checksum_path.write_bytes(
+            b"".join(reversed(checksum_path.read_bytes().splitlines(keepends=True)))
+        )
+        allowed, verifier, receipt = self.signed_download_inputs()
+        verify_signature.return_value = receipt
+        with self.assertRaisesRegex(integrity.IntegrityError, "not sorted"):
+            integrity.verify_signed_download(
+                stage=self.stage,
+                allowed_signers=allowed,
+                signer_identity="release@example.invalid",
+                ssh_keygen=verifier,
+            )
 
     def test_two_verified_release_stages_compare_byte_for_byte(self) -> None:
         self.make_valid_assets()

@@ -3418,6 +3418,112 @@ def _read_buildinfo(path: Path) -> tuple[dict[str, object], bytes]:
     return value, data
 
 
+def _checksum_manifest(data: bytes) -> dict[str, str]:
+    try:
+        text = data.decode("utf-8", "strict")
+    except UnicodeDecodeError as error:
+        raise IntegrityError("SHA256SUMS.txt is not UTF-8") from error
+    if not data or b"\r" in data or not data.endswith(b"\n"):
+        raise IntegrityError("SHA256SUMS.txt is not canonical LF-terminated text")
+    rows: dict[str, str] = {}
+    names = []
+    for line in text.splitlines():
+        match = re.fullmatch(r"([0-9a-f]{64})  ([^\x00-\x1f\x7f]+)", line)
+        if match is None:
+            raise IntegrityError("SHA256SUMS.txt has a malformed row")
+        digest, name = match.groups()
+        safe = _safe_repo_relative(name)
+        if safe != name or "/" in safe:
+            raise IntegrityError("SHA256SUMS.txt contains a non-flat asset name")
+        if name in rows:
+            raise IntegrityError("SHA256SUMS.txt contains a duplicate asset")
+        rows[name] = digest
+        names.append(name)
+    if names != sorted(names):
+        raise IntegrityError("SHA256SUMS.txt rows are not sorted")
+    return rows
+
+
+def _authenticated_download_buildinfo(
+    *, stage_files: dict[str, Path], checksum_rows: dict[str, str]
+) -> tuple[dict[str, object], bytes]:
+    buildinfo, buildinfo_bytes = _read_buildinfo(stage_files[BUILDINFO_NAME])
+    expected_fields = {
+        "artifact_count",
+        "artifacts",
+        "commit",
+        "finalizer_sha256",
+        "inventory_sha256",
+        "schema",
+        "source_date_epoch",
+        "source_tree",
+        "version",
+    }
+    _require_exact_fields(buildinfo, expected_fields, BUILDINFO_NAME)
+    if buildinfo["schema"] != BUILDINFO_SCHEMA:
+        raise IntegrityError("BUILDINFO.json schema is unsupported")
+    commit = _full_commit(buildinfo["commit"])
+    source_tree = buildinfo["source_tree"]
+    if not isinstance(source_tree, str) or not FULL_COMMIT_RE.fullmatch(source_tree):
+        raise IntegrityError("BUILDINFO.json source tree is malformed")
+    for field in ("finalizer_sha256", "inventory_sha256"):
+        if not isinstance(buildinfo[field], str) or not HEX256_RE.fullmatch(
+            buildinfo[field]
+        ):
+            raise IntegrityError(f"BUILDINFO.json {field} is malformed")
+    epoch = buildinfo["source_date_epoch"]
+    if not isinstance(epoch, int) or isinstance(epoch, bool) or epoch < 0:
+        raise IntegrityError("BUILDINFO.json source epoch is malformed")
+    version = buildinfo["version"]
+    if not isinstance(version, str):
+        raise IntegrityError("BUILDINFO.json version is malformed")
+    _single_line("BUILDINFO.json version", version)
+    artifacts = buildinfo["artifacts"]
+    count = buildinfo["artifact_count"]
+    if (
+        not isinstance(artifacts, list)
+        or not isinstance(count, int)
+        or isinstance(count, bool)
+        or count != len(artifacts)
+        or count < 1
+        or count > MAX_ARCHIVE_MEMBERS
+    ):
+        raise IntegrityError("BUILDINFO.json artifact count is malformed")
+    expected_asset_names = set(checksum_rows) - {
+        BUILDINFO_NAME,
+        SOURCE_SBOM_NAME,
+        PROVENANCE_NAME,
+    }
+    artifact_names = []
+    for artifact in artifacts:
+        row = _require_exact_fields(
+            artifact, {"name", "sha256", "size"}, "BUILDINFO.json artifact"
+        )
+        name = row["name"]
+        digest = row["sha256"]
+        size = row["size"]
+        if not isinstance(name, str) or _safe_repo_relative(name) != name or "/" in name:
+            raise IntegrityError("BUILDINFO.json artifact name is malformed")
+        if not isinstance(digest, str) or not HEX256_RE.fullmatch(digest):
+            raise IntegrityError("BUILDINFO.json artifact digest is malformed")
+        if (
+            not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 0
+            or size > (1 << 63) - 1
+        ):
+            raise IntegrityError("BUILDINFO.json artifact size is malformed")
+        if checksum_rows.get(name) != digest:
+            raise IntegrityError("BUILDINFO.json artifact digest is not in SHA256SUMS.txt")
+        artifact_names.append(name)
+    if artifact_names != sorted(set(artifact_names)):
+        raise IntegrityError("BUILDINFO.json artifacts are not sorted and unique")
+    if set(artifact_names) != expected_asset_names:
+        raise IntegrityError("BUILDINFO.json artifact inventory is incomplete")
+    buildinfo["commit"] = commit
+    return buildinfo, buildinfo_bytes
+
+
 def verify_release_signature(
     *,
     stage: Path,
@@ -3499,6 +3605,107 @@ def verify_release_signature(
         "signature_sha256": _sha256_bytes(signature_bytes),
         "signer_identity": signer_identity,
         "verifier_sha256": verifier_sha256,
+    }
+
+
+def verify_signed_download(
+    *,
+    stage: Path,
+    allowed_signers: Path,
+    signer_identity: str,
+    ssh_keygen: Path,
+) -> dict[str, object]:
+    """Authenticate a complete binary release without requiring source access."""
+
+    stage = _regular_directory(stage, "downloaded release directory")
+    signature = verify_release_signature(
+        stage=stage,
+        allowed_signers=allowed_signers,
+        signer_identity=signer_identity,
+        ssh_keygen=ssh_keygen,
+    )
+    checksum_bytes = _read_bounded_generated_file(
+        stage / CHECKSUM_NAME, CHECKSUM_NAME, MAX_CHECKSUM_BYTES
+    )
+    if _sha256_bytes(checksum_bytes) != signature["checksum_sha256"]:
+        raise IntegrityError("release checksum changed after signature verification")
+    checksum_rows = _checksum_manifest(checksum_bytes)
+    generated = {BUILDINFO_NAME, SOURCE_SBOM_NAME, PROVENANCE_NAME}
+    if not generated.issubset(checksum_rows):
+        raise IntegrityError("signed release checksum omits required release evidence")
+    if CHECKSUM_NAME in checksum_rows or CHECKSUM_SIGNATURE_NAME in checksum_rows:
+        raise IntegrityError("signed release checksum includes recursive metadata")
+    stage_files = _stage_files(stage)
+    expected_files = set(checksum_rows) | {CHECKSUM_NAME, CHECKSUM_SIGNATURE_NAME}
+    if set(stage_files) != expected_files:
+        missing = sorted(expected_files - set(stage_files))
+        unexpected = sorted(set(stage_files) - expected_files)
+        raise IntegrityError(
+            f"signed release inventory mismatch; missing={missing}, unexpected={unexpected}"
+        )
+    file_rows = []
+    file_sizes: dict[str, int] = {}
+    for name in sorted(checksum_rows):
+        size, digest = _sha256_file_with_size(
+            stage_files[name], f"signed release file {name}"
+        )
+        if digest != checksum_rows[name]:
+            raise IntegrityError(f"signed release file digest is invalid: {name}")
+        file_sizes[name] = size
+        file_rows.append({"name": name, "sha256": digest, "size": size})
+    buildinfo, _ = _authenticated_download_buildinfo(
+        stage_files=stage_files, checksum_rows=checksum_rows
+    )
+    for artifact in buildinfo["artifacts"]:
+        if file_sizes[artifact["name"]] != artifact["size"]:
+            raise IntegrityError("BUILDINFO.json artifact size does not match its file")
+    source_sbom_bytes = _read_bounded_generated_file(
+        stage_files[SOURCE_SBOM_NAME], SOURCE_SBOM_NAME, MAX_SOURCE_SBOM_BYTES
+    )
+    try:
+        source_sbom = _json_object_bytes(source_sbom_bytes, SOURCE_SBOM_NAME)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise IntegrityError("SOURCE-SBOM.json is not valid UTF-8 JSON") from error
+    if _canonical_json(source_sbom) != source_sbom_bytes:
+        raise IntegrityError("SOURCE-SBOM.json is not canonical JSON")
+    components = source_sbom.get("components")
+    if (
+        source_sbom.get("schema") != "CMFD_SOURCE_DEPENDENCY_SBOM_V1"
+        or source_sbom.get("scope") != "source-lockfiles"
+        or source_sbom.get("commit") != buildinfo["commit"]
+        or source_sbom.get("source_tree") != buildinfo["source_tree"]
+        or source_sbom.get("version") != buildinfo["version"]
+        or not isinstance(components, list)
+        or source_sbom.get("component_count") != len(components)
+        or len(components) > MAX_SOURCE_COMPONENTS
+    ):
+        raise IntegrityError("SOURCE-SBOM.json identity is inconsistent")
+    provenance_bytes = _read_bounded_generated_file(
+        stage_files[PROVENANCE_NAME], PROVENANCE_NAME, MAX_PROVENANCE_BYTES
+    )
+    expected_provenance = _canonical_json(
+        _expected_release_provenance(
+            buildinfo=buildinfo, source_sbom_bytes=source_sbom_bytes
+        )
+    )
+    if provenance_bytes != expected_provenance:
+        raise IntegrityError("PROVENANCE.intoto.jsonl is inconsistent")
+    if _sha256_file(stage / CHECKSUM_NAME) != signature["checksum_sha256"]:
+        raise IntegrityError("release checksum changed during download verification")
+    if _sha256_file(stage / CHECKSUM_SIGNATURE_NAME) != signature["signature_sha256"]:
+        raise IntegrityError("release signature changed during download verification")
+    if _sha256_file(allowed_signers) != signature["allowed_signers_sha256"]:
+        raise IntegrityError("trusted release signer policy changed during verification")
+    if _sha256_file(ssh_keygen) != signature["verifier_sha256"]:
+        raise IntegrityError("release signature verifier changed during verification")
+    return {
+        "commit": buildinfo["commit"],
+        "file_count": len(file_rows),
+        "files": file_rows,
+        "schema": "CMFD_AUTHENTICATED_DOWNLOAD_V1",
+        "signature": signature,
+        "source_tree": buildinfo["source_tree"],
+        "version": buildinfo["version"],
     }
 
 
@@ -3895,6 +4102,14 @@ def _parser() -> argparse.ArgumentParser:
     verify_signed.add_argument("--allowed-signers", type=Path, required=True)
     verify_signed.add_argument("--signer-identity", required=True)
     verify_signed.add_argument("--ssh-keygen", type=Path, required=True)
+    verify_download = commands.add_parser(
+        "verify-download",
+        help="authenticate a complete release without a source checkout",
+    )
+    verify_download.add_argument("--stage", type=Path, required=True)
+    verify_download.add_argument("--allowed-signers", type=Path, required=True)
+    verify_download.add_argument("--signer-identity", required=True)
+    verify_download.add_argument("--ssh-keygen", type=Path, required=True)
     compare = commands.add_parser(
         "compare", help="verify and compare two independent release stages"
     )
@@ -3983,6 +4198,14 @@ def main(arguments: list[str] | None = None) -> int:
                 stage=args.stage,
                 inventory=args.inventory,
                 source_date_epoch=args.source_date_epoch,
+                allowed_signers=args.allowed_signers,
+                signer_identity=args.signer_identity,
+                ssh_keygen=args.ssh_keygen,
+            )
+            print(json.dumps(result, sort_keys=True))
+        elif args.command == "verify-download":
+            result = verify_signed_download(
+                stage=args.stage,
                 allowed_signers=args.allowed_signers,
                 signer_identity=args.signer_identity,
                 ssh_keygen=args.ssh_keygen,

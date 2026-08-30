@@ -24,7 +24,7 @@
 }
 
 * { box-sizing: border-box; }
-html { min-width: 320px; scroll-behavior: smooth; }
+html { min-width: 320px; overflow-x: clip; scroll-behavior: smooth; }
 [id] { scroll-margin-top: 90px; }
 body { min-width: 320px; min-height: 100vh; margin: 0; background: var(--mineral-100); }
 button, input { font: inherit; }
@@ -74,7 +74,7 @@ main { width: min(1480px, calc(100% - 8vw)); margin: 0 auto; }
 .hero-mark svg { width: 37px; height: 37px; color: var(--copper-600); stroke-width: 1.35; }
 .hero-mark span { font-family: Georgia, serif; font-size: .85rem; line-height: 1.25; }
 
-.forge-flow { overflow: hidden; background: var(--mineral-50); border: 1px solid var(--mineral-200); box-shadow: var(--shadow-soft); }
+.forge-flow { --forge-cycle: 5.4s; overflow: hidden; background: var(--mineral-50); border: 1px solid var(--mineral-200); box-shadow: var(--shadow-soft); }
 .forge-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; padding: 22px 26px 18px; border-bottom: 1px solid var(--mineral-200); }
 .forge-head h2 { font-size: clamp(1.65rem, 2.5vw, 2.4rem); }
 .pause-button { display: inline-flex; align-items: center; gap: 7px; min-height: 35px; padding: 0 12px; color: var(--ink-700); background: transparent; border: 1px solid var(--mineral-300); font-size: .72rem; font-weight: 800; }
@@ -85,27 +85,30 @@ main { width: min(1480px, calc(100% - 8vw)); margin: 0 auto; }
 .zone-label { display: flex; justify-content: space-between; align-items: center; gap: 8px; color: var(--ink-900); font-size: .72rem; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
 .zone-label small { color: var(--ink-500); font-size: .62rem; font-weight: 700; letter-spacing: .03em; text-transform: none; }
 .transaction-stack { position: absolute; top: 93px; left: 25px; z-index: 3; display: grid; width: min(72%, 255px); gap: 13px; }
-.transaction-chip { display: flex; align-items: center; gap: 11px; min-height: 57px; padding: 8px 12px; background: #fff; border: 1px solid var(--mineral-300); box-shadow: 0 6px 15px rgba(28,24,20,.05); animation: queue-pulse 3.8s ease-in-out infinite; }
+.transaction-chip { display: flex; align-items: center; gap: 11px; min-height: 57px; padding: 8px 12px; background: #fff; border: 1px solid var(--mineral-300); box-shadow: 0 6px 15px rgba(28,24,20,.05); animation: queue-pulse var(--forge-cycle) ease-in-out infinite; }
 .transaction-chip:nth-child(2) { margin-left: 16px; animation-delay: -1.25s; }
 .transaction-chip:nth-child(3) { margin-left: 7px; animation-delay: -2.5s; }
 .transaction-chip small { display: block; margin-bottom: 5px; color: var(--ink-500); font-size: .59rem; font-weight: 750; text-transform: uppercase; }
 .transaction-chip code { display: block; overflow: hidden; max-width: 180px; color: var(--ink-700); font-size: .68rem; text-overflow: ellipsis; white-space: nowrap; }
 .flow-node { width: 10px; height: 10px; flex: none; background: var(--copper-500); transform: rotate(45deg); }
 .flow-rail { position: absolute; top: 123px; right: 0; width: 42%; height: 155px; border-top: 1px solid #c9a590; border-right: 1px solid #c9a590; border-bottom: 1px solid #c9a590; }
-.flow-rail::after { position: absolute; top: 50%; right: -7px; width: 13px; height: 13px; content: ""; background: var(--copper-500); transform: translateY(-50%) rotate(45deg); animation: rail-travel 3.8s linear infinite; }
+.flow-rail::after { position: absolute; top: 50%; right: -7px; width: 13px; height: 13px; content: ""; background: var(--copper-500); transform: translateY(-50%) rotate(45deg); animation: rail-travel var(--forge-cycle) linear infinite; }
 .flow-rail span { position: absolute; left: -4px; width: 7px; height: 7px; background: #c9a590; border-radius: 50%; }
 .flow-rail span:nth-child(1) { top: -4px; }.flow-rail span:nth-child(2) { top: calc(50% - 4px); }.flow-rail span:nth-child(3) { bottom: -4px; }
 .forge-zone { background: #f2eee8; }
 .forge-machine { position: absolute; top: 60px; right: 0; bottom: 67px; left: 0; overflow: hidden; }
-.hammer-wrap { position: absolute; top: -43px; left: 23%; z-index: 5; width: 61%; height: 215px; transform-origin: 74% 17%; animation: hammer-strike 3.8s cubic-bezier(.6,.02,.5,1) infinite; }
+.forge-input { position: absolute; top: 50%; left: -16px; z-index: 3; width: 14px; height: 14px; background: var(--copper-500); box-shadow: 0 0 16px rgba(221,92,28,.42); transform: translateY(-50%) rotate(45deg); animation: forge-intake var(--forge-cycle) ease-in-out infinite; }
+.hammer-wrap { position: absolute; top: -34px; left: 36%; z-index: 5; width: 62%; height: 210px; transform-origin: 88% 14%; will-change: transform; animation: hammer-strike var(--forge-cycle) cubic-bezier(.55,.02,.42,1) infinite; }
 .hammer { width: 100%; height: 100%; object-fit: contain; filter: drop-shadow(0 11px 10px rgba(22,20,18,.18)); }
 .anvil { position: absolute; right: 13%; bottom: 2px; z-index: 2; width: 73%; height: 165px; object-fit: contain; object-position: center bottom; filter: drop-shadow(0 12px 11px rgba(22,20,18,.14)); }
-.block-blank { position: absolute; bottom: 91px; left: 50%; z-index: 4; display: grid; width: 58px; height: 58px; place-items: center; color: #fff; background: var(--graphite-900); border: 2px solid #de7240; transform: translateX(-50%) rotate(45deg); animation: block-forged 3.8s ease-in-out infinite; }
+.block-blank { position: absolute; bottom: 91px; left: 50%; z-index: 4; display: grid; width: 58px; height: 58px; place-items: center; color: #fff; background: var(--graphite-900); border: 2px solid #de7240; transform: translateX(-50%) rotate(45deg); animation: block-forged var(--forge-cycle) ease-in-out infinite; }
 .block-blank svg, .block-blank span { transform: rotate(-45deg); }
 .block-blank span { position: absolute; bottom: 3px; font-size: .47rem; font-weight: 800; }
+.forged-output { position: absolute; bottom: 105px; left: 50%; z-index: 7; display: grid; width: 38px; height: 38px; place-items: center; color: #fff; background: var(--graphite-900); border: 2px solid #ff8a4c; box-shadow: 0 0 22px rgba(221,92,28,.48); opacity: 0; transform: translateX(-50%) rotate(45deg); animation: forged-transfer var(--forge-cycle) ease-in-out infinite; }
+.forged-output svg { transform: rotate(-45deg); }
 .impact { position: absolute; bottom: 132px; left: 50%; z-index: 6; width: 10px; height: 10px; transform: translateX(-50%); }
-.impact::before { position: absolute; inset: -20px; content: ""; border: 2px solid rgba(221,92,28,.8); border-radius: 50%; animation: impact-ring 3.8s ease-out infinite; }
-.impact i { position: absolute; width: 3px; height: 23px; background: var(--copper-500); transform-origin: 50% 28px; animation: spark 3.8s ease-out infinite; }
+.impact::before { position: absolute; inset: -20px; content: ""; border: 2px solid rgba(221,92,28,.8); border-radius: 50%; animation: impact-ring var(--forge-cycle) ease-out infinite; }
+.impact i { position: absolute; width: 3px; height: 23px; background: var(--copper-500); transform-origin: 50% 28px; animation: spark var(--forge-cycle) ease-out infinite; }
 .impact i:nth-child(1) { transform: rotate(-66deg); }.impact i:nth-child(2) { transform: rotate(-28deg); }.impact i:nth-child(3) { transform: rotate(35deg); }.impact i:nth-child(4) { transform: rotate(71deg); }
 .forge-caption { position: absolute; right: 22px; bottom: 18px; left: 22px; display: flex; justify-content: space-between; gap: 14px; color: var(--ink-500); font-size: .59rem; line-height: 1.45; }
 .forge-caption strong { color: var(--ink-700); text-transform: uppercase; letter-spacing: .06em; }
@@ -117,7 +120,7 @@ main { width: min(1480px, calc(100% - 8vw)); margin: 0 auto; }
 .chain-block strong { margin-bottom: 5px; font-family: Georgia, serif; font-size: .86rem; font-weight: 600; }
 .chain-block code { color: var(--ink-500); font-size: .6rem; }
 .chain-block > span { color: var(--ink-500); font-size: .6rem; }
-.chain-block.block-1 { animation: chain-accept 3.8s ease-in-out infinite; }
+.chain-block.block-1 { animation: chain-accept var(--forge-cycle) ease-in-out infinite; }
 .chain-line { position: absolute; top: 110px; bottom: 56px; left: 37px; width: 1px; background: #c9a590; }
 .is-paused *, .is-paused *::before, .is-paused *::after { animation-play-state: paused !important; }
 
@@ -202,12 +205,14 @@ footer code { font-size: .6rem; }
 
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes queue-pulse { 0%,100% { transform: translateX(0); } 48% { transform: translateX(5px); } 54% { transform: translateX(0); } }
-@keyframes rail-travel { 0%,22% { right: calc(100% - 7px); opacity: 0; } 30% { opacity: 1; } 58% { right: -7px; opacity: 1; } 64%,100% { right: -7px; opacity: 0; } }
-@keyframes hammer-strike { 0%,45%,100% { transform: rotate(-16deg) translate(-5px,-6px); } 59%,62% { transform: rotate(10deg) translate(8px,54px); } 69% { transform: rotate(-9deg) translate(0,10px); } }
-@keyframes impact-ring { 0%,56%,100% { opacity: 0; transform: scale(.2); } 60% { opacity: 1; transform: scale(.45); } 76% { opacity: 0; transform: scale(1.5); } }
-@keyframes spark { 0%,56%,100% { opacity: 0; height: 3px; } 60% { opacity: 1; height: 22px; } 75% { opacity: 0; height: 30px; } }
-@keyframes block-forged { 0%,53%,100% { border-color: #de7240; box-shadow: 0 0 0 rgba(221,92,28,0); } 61% { border-color: #ffab78; box-shadow: 0 0 24px rgba(221,92,28,.65); } 80% { border-color: #de7240; box-shadow: 0 0 0 rgba(221,92,28,0); } }
-@keyframes chain-accept { 0%,64% { border-left-color: #c7bbb2; transform: translateX(6px); opacity: .7; } 76%,100% { border-left-color: var(--copper-500); transform: translateX(0); opacity: 1; } }
+@keyframes rail-travel { 0%,10% { right: calc(100% - 7px); opacity: 0; } 18% { opacity: 1; } 34% { right: -7px; opacity: 1; } 40%,100% { right: -7px; opacity: 0; } }
+@keyframes forge-intake { 0%,31% { left: -16px; opacity: 0; } 35% { opacity: 1; } 49% { left: calc(50% - 7px); opacity: 1; } 53%,100% { left: calc(50% - 7px); opacity: 0; } }
+@keyframes hammer-strike { 0%,45%,100% { transform: translate(-5px,30px) rotate(25deg); } 50% { transform: translate(-8px,24px) rotate(31deg); } 60%,63% { transform: translate(2px,25px) rotate(-7deg); } 70% { transform: translate(0,18px) rotate(10deg); } 82% { transform: translate(-5px,30px) rotate(25deg); } }
+@keyframes impact-ring { 0%,57%,100% { opacity: 0; transform: scale(.2); } 61% { opacity: 1; transform: scale(.45); } 74% { opacity: 0; transform: scale(1.65); } }
+@keyframes spark { 0%,57%,100% { opacity: 0; height: 3px; } 61% { opacity: 1; height: 24px; } 73% { opacity: 0; height: 32px; } }
+@keyframes block-forged { 0%,55%,100% { border-color: #de7240; box-shadow: 0 0 0 rgba(221,92,28,0); } 62% { border-color: #ffb085; box-shadow: 0 0 30px rgba(221,92,28,.78); } 76% { border-color: #de7240; box-shadow: 0 0 0 rgba(221,92,28,0); } }
+@keyframes forged-transfer { 0%,64% { left: 50%; opacity: 0; transform: translateX(-50%) rotate(45deg) scale(.65); } 68% { opacity: 1; transform: translateX(-50%) rotate(45deg) scale(1); } 84% { left: calc(100% + 24px); opacity: 1; transform: translateX(-50%) rotate(45deg) scale(.88); } 88%,100% { left: calc(100% + 24px); opacity: 0; transform: translateX(-50%) rotate(45deg) scale(.88); } }
+@keyframes chain-accept { 0%,76% { border-left-color: #c7bbb2; transform: translateX(8px); opacity: .66; } 86%,100% { border-left-color: var(--copper-500); transform: translateX(0); opacity: 1; } }
 
 @media (max-width: 1120px) {
   .topbar { grid-template-columns: 210px minmax(280px,1fr) auto; }

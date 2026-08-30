@@ -21,7 +21,7 @@ export const ForgeFlow = memo(function ForgeFlow({ mempool, blocks }: ForgeFlowP
     <section className={`forge-flow ${paused ? "is-paused" : ""}`} aria-label="Live transaction forging visualization">
       <div className="forge-head">
         <div><span className="eyebrow">Live protocol view</span><h2>From intent to immutable history.</h2></div>
-        <button type="button" className="pause-button" onClick={() => setPaused((value) => !value)}>
+        <button type="button" className="pause-button" aria-pressed={paused} onClick={() => setPaused((value) => !value)}>
           {paused ? <Play size={15} /> : <Pause size={15} />} {paused ? "Resume" : "Pause"}
         </button>
       </div>
@@ -43,9 +43,11 @@ export const ForgeFlow = memo(function ForgeFlow({ mempool, blocks }: ForgeFlowP
         <div className="flow-zone forge-zone">
           <div className="zone-label"><span>Forge</span><small>Proof-bound</small></div>
           <div className="forge-machine" aria-hidden="true">
+            <span className="forge-input" />
             <div className="hammer-wrap"><img className="hammer" src={hammer} alt="" /></div>
             <div className="impact"><i /><i /><i /><i /></div>
             <div className="block-blank"><Box size={22} /><span>{newest ? `#${newest.height}` : "Next"}</span></div>
+            <div className="forged-output"><Box size={16} /></div>
             <img className="anvil" src={anvil} alt="" />
           </div>
           <div className="forge-caption"><strong>Challenge + proof</strong><span>Consensus makes every accepted block independently verifiable.</span></div>

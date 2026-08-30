@@ -51,6 +51,7 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+pub mod explorer;
 pub mod logging;
 pub mod network_info;
 pub mod network_profile;
@@ -7332,6 +7333,35 @@ fn route_rpc_request(request: RpcRequest, node: &mut Node) -> RpcResponse {
             Ok(value) => RpcResponse::json(200, "OK", value),
             Err(error) => RpcResponse::json_error(500, "Internal Server Error", error),
         },
+        ("GET", "/v1/explorer") => match node.explorer_snapshot() {
+            Ok(snapshot) => match serde_json::to_value(snapshot) {
+                Ok(value) => RpcResponse::json(200, "OK", value),
+                Err(error) => RpcResponse::json_error(500, "Internal Server Error", error),
+            },
+            Err(error) => RpcResponse::node_error(error),
+        },
+        ("GET", target) if target.starts_with("/v1/explorer/block/") => {
+            let query = &target[19..];
+            match node.explorer_block(query) {
+                Ok(Some(block)) => match serde_json::to_value(block) {
+                    Ok(value) => RpcResponse::json(200, "OK", value),
+                    Err(error) => RpcResponse::json_error(500, "Internal Server Error", error),
+                },
+                Ok(None) => RpcResponse::json_error(404, "Not Found", "block not found"),
+                Err(error) => RpcResponse::node_error(error),
+            }
+        }
+        ("GET", target) if target.starts_with("/v1/explorer/transaction/") => {
+            let query = &target[25..];
+            match node.explorer_transaction(query) {
+                Ok(Some(transaction)) => match serde_json::to_value(transaction) {
+                    Ok(value) => RpcResponse::json(200, "OK", value),
+                    Err(error) => RpcResponse::json_error(500, "Internal Server Error", error),
+                },
+                Ok(None) => RpcResponse::json_error(404, "Not Found", "transaction not found"),
+                Err(error) => RpcResponse::node_error(error),
+            }
+        }
         ("GET", "/v1/wallet") => match node.wallet_snapshot() {
             Ok(snapshot) => match serde_json::to_value(snapshot) {
                 Ok(value) => RpcResponse::json(200, "OK", value),

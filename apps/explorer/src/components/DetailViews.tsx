@@ -1,0 +1,24 @@
+import { ArrowLeft, Box, CheckCircle2, Clock3, Copy, Database, Hash, Network } from "lucide-react";
+import { formatAge, formatAtoms, formatBytes, shortHash } from "../format";
+import type { ExplorerBlockDetail, ExplorerTransaction } from "../types";
+
+const CopyValue = ({ value }: { value: string }) => <button className="copy-value" type="button" onClick={() => navigator.clipboard.writeText(value)} title="Copy value"><code>{value}</code><Copy size={14} /></button>;
+
+export function BlockDetail({ block, onBack, onTransaction }: { block: ExplorerBlockDetail; onBack: () => void; onTransaction: (tx: ExplorerTransaction) => void }) {
+  return <main className="detail-main">
+    <button className="back-button" type="button" onClick={onBack}><ArrowLeft size={15} /> Explorer overview</button>
+    <section className="detail-hero"><div><p className="eyebrow">Canonical block</p><h1>Block #{block.height}</h1><p>Accepted {formatAge(block.timestamp)} · {block.confirmations} confirmation{block.confirmations === 1 ? "" : "s"}</p></div><span className="verified"><CheckCircle2 /> Verified by consensus</span></section>
+    <div className="detail-grid"><section className="data-section detail-fields"><div className="section-heading"><div><p className="eyebrow">Block identity</p><h2>Header and proof</h2></div><Box /></div>
+      <dl><Field icon={<Hash />} label="Block ID"><CopyValue value={block.block_id} /></Field><Field icon={<Network />} label="Previous block"><CopyValue value={block.previous_block} /></Field><Field icon={<Database />} label="Transaction root"><CopyValue value={block.transaction_root} /></Field><Field icon={<Clock3 />} label="Timestamp"><span>{new Date(block.timestamp * 1000).toLocaleString()}</span></Field><Field label="Nonce"><code>{block.nonce}</code></Field><Field label="Work digest"><CopyValue value={block.work_digest} /></Field><Field label="Target"><CopyValue value={block.target} /></Field></dl>
+    </section><aside className="block-summary"><p className="eyebrow">At a glance</p><h2>Forged and final.</h2><div><span>Transactions<strong>{block.transactions}</strong></span><span>Encoded size<strong>{formatBytes(block.encoded_bytes)}</strong></span><span>Coinbase<strong>{formatAtoms(block.coinbase_atoms)}</strong></span><span>Coinbase outputs<strong>{block.coinbase_outputs}</strong></span></div></aside></div>
+    <section className="data-section detail-transactions"><div className="section-heading"><div><p className="eyebrow">Block contents</p><h2>Transactions</h2></div><span>{block.transactions_detail.length} displayed</span></div><div className="transaction-list">{block.transactions_detail.length ? block.transactions_detail.map((tx) => <button type="button" key={tx.txid} onClick={() => onTransaction(tx)}><span className="status-mark confirmed" /><div><code>{shortHash(tx.txid, 18, 12)}</code><small>{tx.inputs} inputs → {tx.outputs} outputs · {formatBytes(tx.encoded_bytes)}</small></div><span><strong>{formatAtoms(tx.output_atoms)}</strong><small>{tx.fee_burned_atoms === null ? "Fee committed in block" : `${formatAtoms(tx.fee_burned_atoms)} fee`}</small></span></button>) : <p className="empty-state">This block contains only its coinbase transaction.</p>}</div></section>
+  </main>;
+}
+
+export function TransactionDetail({ transaction, onBack }: { transaction: ExplorerTransaction; onBack: () => void }) {
+  return <main className="detail-main"><button className="back-button" type="button" onClick={onBack}><ArrowLeft size={15} /> Explorer overview</button><section className="detail-hero"><div><p className="eyebrow">{transaction.status === "confirmed" ? "Confirmed transaction" : "Mempool transaction"}</p><h1>Transaction</h1><p>{transaction.inputs} inputs · {transaction.outputs} outputs · {formatBytes(transaction.encoded_bytes)}</p></div><span className={`verified ${transaction.status}`}><CheckCircle2 /> {transaction.status === "confirmed" ? "Canonical" : "Awaiting block"}</span></section><section className="data-section detail-fields single"><div className="section-heading"><div><p className="eyebrow">Transaction identity</p><h2>Transfer record</h2></div><Network /></div><dl><Field icon={<Hash />} label="Transaction ID"><CopyValue value={transaction.txid} /></Field>{transaction.block_id && <Field icon={<Box />} label="Block"><span>#{transaction.block_height} · {shortHash(transaction.block_id, 14, 10)}</span></Field>}<Field label="Output total"><strong>{formatAtoms(transaction.output_atoms)}</strong></Field><Field label="Fee burned"><span>{transaction.fee_burned_atoms === null ? "Committed in canonical block" : formatAtoms(transaction.fee_burned_atoms)}</span></Field><Field label="Encoded size"><span>{formatBytes(transaction.encoded_bytes)}</span></Field></dl></section></main>;
+}
+
+function Field({ icon, label, children }: { icon?: React.ReactNode; label: string; children: React.ReactNode }) {
+  return <div><dt>{icon}{label}</dt><dd>{children}</dd></div>;
+}

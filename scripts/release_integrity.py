@@ -33,6 +33,7 @@ except ImportError:  # Production runtime inspection reports the actionable erro
 
 RECEIPT_SCHEMA = "CMFD_NATIVE_BUILD_RECEIPT_V1"
 BUILDINFO_SCHEMA = "CMFD_RELEASE_BUILDINFO_V1"
+REPRODUCIBLE_COMPARISON_SCHEMA = "CMFD_REPRODUCIBLE_RELEASE_COMPARISON_V1"
 BUILDINFO_NAME = "BUILDINFO.json"
 CHECKSUM_NAME = "SHA256SUMS.txt"
 CHECKSUM_SIGNATURE_NAME = "SHA256SUMS.txt.sig"
@@ -3420,6 +3421,77 @@ def verify_signed_release(
     return {"release": release, "signature": signature}
 
 
+def compare_reproducible_releases(
+    *,
+    repo: Path,
+    expected_commit: str,
+    version: str,
+    first_stage: Path,
+    second_stage: Path,
+    inventory: Path,
+    source_date_epoch: str | int | None,
+) -> dict[str, object]:
+    """Require two independently staged releases to be byte-identical."""
+
+    first_stage = _regular_directory(first_stage, "first independent release stage")
+    second_stage = _regular_directory(second_stage, "second independent release stage")
+    if os.path.samefile(first_stage, second_stage):
+        raise IntegrityError("independent release stages must be different directories")
+    common = {
+        "repo": repo,
+        "expected_commit": expected_commit,
+        "version": version,
+        "inventory": inventory,
+        "source_date_epoch": source_date_epoch,
+    }
+    first_release = verify_release(stage=first_stage, **common)
+    second_release = verify_release(stage=second_stage, **common)
+    first_files = _stage_files(first_stage)
+    second_files = _stage_files(second_stage)
+    if set(first_files) != set(second_files):
+        raise IntegrityError("independent release file inventories differ")
+    rows = []
+    generated = {BUILDINFO_NAME, CHECKSUM_NAME}
+    ordered_names = sorted(
+        first_files, key=lambda candidate: (candidate in generated, candidate)
+    )
+    for name in ordered_names:
+        with _stable_regular_handle(
+            first_files[name], f"first independent release file {name}"
+        ) as (_, first_handle, first_stat):
+            with _stable_regular_handle(
+                second_files[name], f"second independent release file {name}"
+            ) as (_, second_handle, second_stat):
+                if first_stat.st_size != second_stat.st_size:
+                    raise IntegrityError(
+                        f"independent release file differs in size: {name}"
+                    )
+                digest = hashlib.sha256()
+                while True:
+                    first_chunk = first_handle.read(1024 * 1024)
+                    second_chunk = second_handle.read(1024 * 1024)
+                    if first_chunk != second_chunk:
+                        raise IntegrityError(
+                            f"independent release file differs in content: {name}"
+                        )
+                    if not first_chunk:
+                        break
+                    digest.update(first_chunk)
+        rows.append(
+            {"name": name, "sha256": digest.hexdigest(), "size": first_stat.st_size}
+        )
+    if first_release != second_release:
+        raise IntegrityError("independent release build metadata differs")
+    return {
+        "commit": first_release["commit"],
+        "file_count": len(rows),
+        "files": rows,
+        "reproducible": True,
+        "schema": REPRODUCIBLE_COMPARISON_SCHEMA,
+        "version": first_release["version"],
+    }
+
+
 def finalize_release(
     *,
     repo: Path,
@@ -3563,6 +3635,15 @@ def _parser() -> argparse.ArgumentParser:
     verify_signed.add_argument("--allowed-signers", type=Path, required=True)
     verify_signed.add_argument("--signer-identity", required=True)
     verify_signed.add_argument("--ssh-keygen", type=Path, required=True)
+    compare = commands.add_parser(
+        "compare", help="verify and compare two independent release stages"
+    )
+    _add_repo_arguments(compare)
+    compare.add_argument("--version", required=True)
+    compare.add_argument("--first-stage", type=Path, required=True)
+    compare.add_argument("--second-stage", type=Path, required=True)
+    compare.add_argument("--inventory", type=Path, required=True)
+    compare.add_argument("--source-date-epoch")
     return parser
 
 
@@ -3645,6 +3726,17 @@ def main(arguments: list[str] | None = None) -> int:
                 allowed_signers=args.allowed_signers,
                 signer_identity=args.signer_identity,
                 ssh_keygen=args.ssh_keygen,
+            )
+            print(json.dumps(result, sort_keys=True))
+        elif args.command == "compare":
+            result = compare_reproducible_releases(
+                repo=args.repo,
+                expected_commit=args.expected_commit,
+                version=args.version,
+                first_stage=args.first_stage,
+                second_stage=args.second_stage,
+                inventory=args.inventory,
+                source_date_epoch=args.source_date_epoch,
             )
             print(json.dumps(result, sort_keys=True))
         else:  # pragma: no cover - argparse guarantees a known command.

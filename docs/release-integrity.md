@@ -87,7 +87,23 @@ python scripts/release_integrity.py verify --repo . --expected-commit <commit> -
 
 These commands neither upload nor publish anything. Final download
 authentication still requires the independently verified final checksum file
-to be signed and associated with the signed release tag. Keep the private
+to be signed and associated with the signed release tag. Before signing, build
+the release on two independent machines and require a byte-for-byte match:
+
+```text
+python scripts/release_integrity.py compare \
+  --repo . --expected-commit <commit> --version <version> \
+  --first-stage <first-asset-directory> \
+  --second-stage <second-asset-directory> \
+  --inventory <tracked-inventory>
+```
+
+Both directories are fully reverified against the same clean source commit and
+tracked inventory before every file is stream-compared with bounded memory. A
+difference in generated metadata, file inventory, file size, or file content
+fails the comparison and identifies the differing class or file.
+
+After that gate passes, keep the private
 Ed25519 release key offline and outside every checkout. Sign the exact generated
 checksum file with the fixed namespace:
 

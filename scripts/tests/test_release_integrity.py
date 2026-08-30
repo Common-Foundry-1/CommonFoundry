@@ -2239,6 +2239,82 @@ class ReleaseFinalizerTests(unittest.TestCase):
             self.fixture.commit,
         )
 
+    def test_two_verified_release_stages_compare_byte_for_byte(self) -> None:
+        self.make_valid_assets()
+        integrity.finalize_release(
+            repo=self.fixture.root,
+            expected_commit=self.fixture.commit,
+            version="0.1.0-test",
+            stage=self.stage,
+            inventory=self.inventory,
+            source_date_epoch=self.epoch,
+        )
+        second_stage = self.fixture.root / "target/second-release-assets"
+        shutil.copytree(self.stage, second_stage)
+        report = integrity.compare_reproducible_releases(
+            repo=self.fixture.root,
+            expected_commit=self.fixture.commit,
+            version="0.1.0-test",
+            first_stage=self.stage,
+            second_stage=second_stage,
+            inventory=self.inventory,
+            source_date_epoch=self.epoch,
+        )
+        self.assertTrue(report["reproducible"])
+        self.assertEqual(report["file_count"], 4)
+        self.assertEqual(
+            report["schema"], integrity.REPRODUCIBLE_COMPARISON_SCHEMA
+        )
+
+    def test_two_valid_but_different_release_stages_are_rejected(self) -> None:
+        self.make_valid_assets()
+        second_stage = self.fixture.root / "target/second-release-assets"
+        second_stage.mkdir(parents=True)
+        (second_stage / "a.bin").write_bytes(b"omega")
+        (second_stage / "b.txt").write_bytes(b"beta\n")
+        for stage in (self.stage, second_stage):
+            integrity.finalize_release(
+                repo=self.fixture.root,
+                expected_commit=self.fixture.commit,
+                version="0.1.0-test",
+                stage=stage,
+                inventory=self.inventory,
+                source_date_epoch=self.epoch,
+            )
+        with self.assertRaisesRegex(integrity.IntegrityError, "content: a.bin"):
+            integrity.compare_reproducible_releases(
+                repo=self.fixture.root,
+                expected_commit=self.fixture.commit,
+                version="0.1.0-test",
+                first_stage=self.stage,
+                second_stage=second_stage,
+                inventory=self.inventory,
+                source_date_epoch=self.epoch,
+            )
+
+    def test_release_stage_cannot_be_compared_to_itself(self) -> None:
+        self.make_valid_assets()
+        integrity.finalize_release(
+            repo=self.fixture.root,
+            expected_commit=self.fixture.commit,
+            version="0.1.0-test",
+            stage=self.stage,
+            inventory=self.inventory,
+            source_date_epoch=self.epoch,
+        )
+        with self.assertRaisesRegex(
+            integrity.IntegrityError, "different directories"
+        ):
+            integrity.compare_reproducible_releases(
+                repo=self.fixture.root,
+                expected_commit=self.fixture.commit,
+                version="0.1.0-test",
+                first_stage=self.stage,
+                second_stage=self.stage,
+                inventory=self.inventory,
+                source_date_epoch=self.epoch,
+            )
+
     @mock.patch("release_integrity.verify_release_signature")
     def test_signed_verify_requires_and_checks_detached_signature(self, verify_signature) -> None:
         self.make_valid_assets()

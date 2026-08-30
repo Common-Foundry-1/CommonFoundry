@@ -46,6 +46,24 @@ Power users can pass named options through the launcher:
 .\START-POOL.bat -PublicNumericAddress 203.0.113.20 -PrivateBindAddress 192.168.1.20
 ```
 
+The package includes local operator controls. They authenticate the saved
+process identity before acting and request a graceful ledger-preserving stop;
+they never force-kill a process:
+
+```text
+POOL-STATUS.bat
+STOP-POOL.bat
+RESTART-POOL.bat
+INSTALL-POOL-AUTOSTART.bat
+REMOVE-POOL-AUTOSTART.bat
+```
+
+Autostart is installed for the current Windows user and opens the pool console
+visibly after that user signs in. Saved settings are reused, so no address
+prompt is shown after the first successful start. Pass
+`-DataDirectory D:\path\to\pool-data` to any control when using a custom data
+directory.
+
 ## Native Linux
 
 Extract the archive on a Linux filesystem and run:
@@ -62,6 +80,27 @@ custom pool data directory.
 Use `CMFD_POOL_PEER=IP:22444` and `CMFD_POOL_ALLOW_PUBLIC_PEERS=1` to configure a
 static public P2P peer. Other operator overrides are listed near the top of
 `START-POOL.sh`.
+
+Linux controls use the same graceful authenticated request path:
+
+```bash
+./POOL-STATUS.sh
+./STOP-POOL.sh
+./RESTART-POOL.sh
+```
+
+To install or remove a current-user systemd service:
+
+```bash
+./INSTALL-POOL-SERVICE.sh
+./REMOVE-POOL-SERVICE.sh
+```
+
+The service starts immediately and is enabled for future user sessions. An
+administrator can run `loginctl enable-linger USERNAME` when the pool must
+start at boot before that user logs in. Use `systemctl --user status
+commonfoundry-production-v4-pool` and `journalctl --user -u
+commonfoundry-production-v4-pool` for service diagnostics.
 
 ## Dashboard and miner connections
 
@@ -88,6 +127,9 @@ and node wallet key are operator secrets. Restoring both directories preserves
 the advertised certificate pin, pool identity, chain, credits, and payout
 journal. The large `inputs` directory can be downloaded and verified again.
 
-Keep the pool console running. A clean shutdown preserves the ledger. On the
-next start, authenticated inputs are reused and the persistent workers are
-prepared again before miner connections open.
+Each start writes a timestamped log under `pool-data/logs`; the status command
+prints the active log path. A clean shutdown preserves the ledger. On the next
+start, authenticated inputs and saved operator settings are reused, and the
+persistent workers are prepared again before miner connections open. If a host
+loses power, stale process state is discarded only after its saved process ID
+and start identity are shown not to be running.

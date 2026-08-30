@@ -17,26 +17,43 @@ SPEC.loader.exec_module(QUALIFICATION)
 
 
 class PoolQualificationTests(unittest.TestCase):
+    def test_operator_controls_cover_both_platforms(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        required = [
+            "scripts/control-production-v4-pool.ps1",
+            "scripts/control-production-v4-pool.py",
+            "packaging/production-v4-pool/windows/POOL-STATUS.bat",
+            "packaging/production-v4-pool/windows/STOP-POOL.bat",
+            "packaging/production-v4-pool/windows/RESTART-POOL.bat",
+            "packaging/production-v4-pool/windows/INSTALL-POOL-AUTOSTART.bat",
+            "packaging/production-v4-pool/linux/POOL-STATUS.sh",
+            "packaging/production-v4-pool/linux/STOP-POOL.sh",
+            "packaging/production-v4-pool/linux/RESTART-POOL.sh",
+            "packaging/production-v4-pool/linux/INSTALL-POOL-SERVICE.sh",
+        ]
+        self.assertTrue(all((root / path).is_file() for path in required))
+
     def test_core_gate_is_exact_and_dashboard_is_optional(self) -> None:
         core = QUALIFICATION.qualification_commands(False)
         full = QUALIFICATION.qualification_commands(True)
         self.assertEqual(
             [name for name, _command, _cwd in core],
             [
+                "pool_control_tests",
                 "node_production_v4_regression_tests",
                 "node_strict_clippy",
             ],
         )
         self.assertEqual(
-            [name for name, _command, _cwd in full[2:]],
+            [name for name, _command, _cwd in full[3:]],
             ["pool_dashboard_tests", "pool_dashboard_build"],
         )
         expected_npm = "npm.cmd" if os.name == "nt" else "npm"
-        self.assertEqual(full[2][1][0], expected_npm)
+        self.assertEqual(full[3][1][0], expected_npm)
         self.assertTrue(
             all(
                 command[1] == f"+{QUALIFICATION.rust_toolchain()}"
-                for _name, command, _cwd in core
+                for _name, command, _cwd in core[1:]
             )
         )
 

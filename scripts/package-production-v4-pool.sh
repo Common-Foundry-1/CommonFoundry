@@ -92,6 +92,10 @@ copy_common "$windows_stage"
 cp -- "$windows_node" "$windows_stage/cmfd-node.exe"
 cp -- "$project_root/packaging/production-v4-pool/windows/START-POOL.bat" "$windows_stage/START-POOL.bat"
 cp -- "$project_root/scripts/run-production-v4-pool.ps1" "$windows_stage/START-POOL.ps1"
+cp -- "$project_root/scripts/control-production-v4-pool.ps1" "$windows_stage/POOL-CONTROL.ps1"
+for control in POOL-CONTROL POOL-STATUS STOP-POOL RESTART-POOL INSTALL-POOL-AUTOSTART REMOVE-POOL-AUTOSTART; do
+  cp -- "$project_root/packaging/production-v4-pool/windows/$control.bat" "$windows_stage/$control.bat"
+done
 cp -- "$project_root/packaging/production-v4-testnet/windows/PREPARE-V4-INPUTS.ps1" "$windows_stage/PREPARE-V4-INPUTS.ps1"
 write_package_hashes "$windows_stage"
 
@@ -100,11 +104,21 @@ mkdir -- "$linux_stage"
 copy_common "$linux_stage"
 cp -- "$linux_node" "$linux_stage/cmfd-node"
 cp -- "$project_root/scripts/run-production-v4-pool.sh" "$linux_stage/START-POOL.sh"
+cp -- "$project_root/scripts/control-production-v4-pool.py" "$linux_stage/POOL-CONTROL.py"
+for control in POOL-STATUS STOP-POOL RESTART-POOL INSTALL-POOL-SERVICE REMOVE-POOL-SERVICE; do
+  cp -- "$project_root/packaging/production-v4-pool/linux/$control.sh" "$linux_stage/$control.sh"
+done
 cp -- "$project_root/packaging/production-v4-testnet/linux/PREPARE-V4-INPUTS.sh" "$linux_stage/PREPARE-V4-INPUTS.sh"
 chmod 755 \
   "$linux_stage/cmfd-node" \
   "$linux_stage/cmfd-v4-replay" \
   "$linux_stage/real_bank0_relations" \
+  "$linux_stage/POOL-CONTROL.py" \
+  "$linux_stage/POOL-STATUS.sh" \
+  "$linux_stage/STOP-POOL.sh" \
+  "$linux_stage/RESTART-POOL.sh" \
+  "$linux_stage/INSTALL-POOL-SERVICE.sh" \
+  "$linux_stage/REMOVE-POOL-SERVICE.sh" \
   "$linux_stage/START-POOL.sh" \
   "$linux_stage/PREPARE-V4-INPUTS.sh"
 write_package_hashes "$linux_stage"

@@ -459,6 +459,117 @@ fn interrupt_stops_pool_and_p2p_then_releases_ports_and_data_lock() {
     assert_eq!(after, before);
 }
 
+fn wait_for_failure_with_timeout(child: &mut Child, timeout: Duration, expected_error: &str) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            let (stdout, stderr) = child_output(child);
+            assert!(
+                !status.success() && stderr.contains(expected_error),
+                "node exited with {status}; stdout={stdout:?}; stderr={stderr:?}"
+            );
+            return;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            let status = child.wait().unwrap();
+            let (stdout, stderr) = child_output(child);
+            panic!(
+                "node did not reject the request within {timeout:?}; killed with {status}; stdout={stdout:?}; stderr={stderr:?}"
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn authenticated_local_request_stops_pool_and_releases_resources() {
+    let _serial = PROCESS_TEST_SERIAL.lock().unwrap();
+    let data_dir = TestDir::new("requested-pool-stop");
+    fs::create_dir_all(data_dir.path()).unwrap();
+    let certificate = data_dir.path().join("pool.crt.der");
+    let private_key = data_dir.path().join("pool.key.der");
+    let shutdown_request = data_dir.path().join("pool.shutdown");
+    let mut generate = command(data_dir.path());
+    generate
+        .arg("pool-certificate")
+        .arg("--certificate")
+        .arg(&certificate)
+        .arg("--private-key")
+        .arg(&private_key);
+    assert_success(run_checked(generate).status);
+
+    let (pool_address, p2p_address) = two_free_addresses();
+    let mut pool = command(data_dir.path());
+    pool.arg("pool-serve")
+        .arg("--bind")
+        .arg(pool_address.to_string())
+        .arg("--p2p-bind")
+        .arg(p2p_address.to_string())
+        .arg("--certificate")
+        .arg(&certificate)
+        .arg("--private-key")
+        .arg(&private_key)
+        .arg("--share-leading-zero-bits")
+        .arg("0")
+        .arg("--shutdown-request-file")
+        .arg(&shutdown_request);
+    let mut child = spawn_service(pool);
+    let pool_connection = connect_to_listener(&mut child, pool_address);
+    fs::write(&shutdown_request, b"CMFD_POOL_SHUTDOWN_V1\n").unwrap();
+    wait_for_success_with_timeout(&mut child, PROMPT_SHUTDOWN_TIMEOUT);
+    drop(pool_connection);
+
+    assert_reusable(pool_address);
+    assert_reusable(p2p_address);
+}
+
+#[test]
+fn malformed_local_request_fails_closed_and_releases_resources() {
+    let _serial = PROCESS_TEST_SERIAL.lock().unwrap();
+    let data_dir = TestDir::new("malformed-pool-stop");
+    fs::create_dir_all(data_dir.path()).unwrap();
+    let certificate = data_dir.path().join("pool.crt.der");
+    let private_key = data_dir.path().join("pool.key.der");
+    let shutdown_request = data_dir.path().join("pool.shutdown");
+    let mut generate = command(data_dir.path());
+    generate
+        .arg("pool-certificate")
+        .arg("--certificate")
+        .arg(&certificate)
+        .arg("--private-key")
+        .arg(&private_key);
+    assert_success(run_checked(generate).status);
+
+    let (pool_address, p2p_address) = two_free_addresses();
+    let mut pool = command(data_dir.path());
+    pool.arg("pool-serve")
+        .arg("--bind")
+        .arg(pool_address.to_string())
+        .arg("--p2p-bind")
+        .arg(p2p_address.to_string())
+        .arg("--certificate")
+        .arg(&certificate)
+        .arg("--private-key")
+        .arg(&private_key)
+        .arg("--share-leading-zero-bits")
+        .arg("0")
+        .arg("--shutdown-request-file")
+        .arg(&shutdown_request);
+    let mut child = spawn_service(pool);
+    let pool_connection = connect_to_listener(&mut child, pool_address);
+    fs::write(&shutdown_request, b"CMFD_POOL_SHUTDOWN_V0\n").unwrap();
+    wait_for_failure_with_timeout(
+        &mut child,
+        PROMPT_SHUTDOWN_TIMEOUT,
+        "shutdown request file is malformed",
+    );
+    drop(pool_connection);
+
+    assert_reusable(pool_address);
+    assert_reusable(p2p_address);
+}
+
 #[test]
 fn interrupt_stops_a_static_peer_session_stalled_after_connect() {
     let _serial = PROCESS_TEST_SERIAL.lock().unwrap();

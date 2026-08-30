@@ -41,6 +41,17 @@ def qualification_commands(include_dashboard: bool) -> list[tuple[str, list[str]
     toolchain = rust_toolchain()
     commands = [
         (
+            "pool_control_tests",
+            [
+                sys.executable,
+                "-m",
+                "unittest",
+                "scripts.tests.test_production_v4_pool_controls",
+                "scripts.tests.test_production_v4_pool_qualification",
+            ],
+            root,
+        ),
+        (
             "node_production_v4_regression_tests",
             [
                 "cargo", f"+{toolchain}", "test", "-p", "cmfd-node",

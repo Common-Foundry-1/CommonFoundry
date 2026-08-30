@@ -1,4 +1,4 @@
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 #[cfg(feature = "production-v3")]
 use std::net::Ipv4Addr;
 use std::net::{SocketAddr, TcpListener};
@@ -49,6 +49,7 @@ use cmfd_proof_worker::{ProductionV3VerifierRecord, VerifierWorkerConfig};
 use serde_json::json;
 
 const SERVICE_SUPERVISION_POLL: Duration = Duration::from_millis(50);
+const POOL_SHUTDOWN_REQUEST_BYTES: &[u8] = b"CMFD_POOL_SHUTDOWN_V1\n";
 
 #[cfg(feature = "production-v3")]
 fn parse_hex32(value: &str) -> Result<[u8; 32], String> {
@@ -279,6 +280,9 @@ enum Command {
         /// Loopback-only address for the read-only pool dashboard.
         #[arg(long, default_value_t = DEFAULT_POOL_DASHBOARD_ADDRESS)]
         pool_dashboard_bind: SocketAddr,
+        /// Absolute create-new request file used by local operator controls for graceful shutdown.
+        #[arg(long)]
+        shutdown_request_file: Option<PathBuf>,
     },
 }
 
@@ -612,9 +616,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             pool_dashboard_assets,
             pool_public_url,
             pool_dashboard_bind,
+            shutdown_request_file,
         } => {
             require_pool_mining_profile()?;
-            let shutdown = install_shutdown_handler()?;
+            let shutdown =
+                install_shutdown_handler()?.with_request_file(shutdown_request_file.as_deref())?;
             if share_leading_zero_bits >= 8 {
                 return Err(format!(
                     "pool share-leading-zero-bits must be between 0 and 7 on {}",
@@ -786,9 +792,76 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 struct ShutdownSignal {
     receiver: Receiver<()>,
+    request_file: Option<PathBuf>,
 }
 
 impl ShutdownSignal {
+    fn with_request_file(mut self, path: Option<&Path>) -> io::Result<Self> {
+        let Some(path) = path else {
+            return Ok(self);
+        };
+        if !path.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "shutdown request file must be absolute",
+            ));
+        }
+        let parent = path.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "shutdown request file has no parent directory",
+            )
+        })?;
+        if !parent.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "shutdown request parent directory is missing",
+            ));
+        }
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "shutdown request file already exists",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        self.request_file = Some(path.to_path_buf());
+        Ok(self)
+    }
+
+    fn request_file_exists(&self) -> io::Result<bool> {
+        let Some(path) = self.request_file.as_deref() else {
+            return Ok(false);
+        };
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if !metadata.file_type().is_file()
+            || metadata.len() != POOL_SHUTDOWN_REQUEST_BYTES.len() as u64
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "shutdown request file is malformed",
+            ));
+        }
+        let mut bytes = Vec::with_capacity(POOL_SHUTDOWN_REQUEST_BYTES.len());
+        std::fs::File::open(path)?
+            .take(POOL_SHUTDOWN_REQUEST_BYTES.len() as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes != POOL_SHUTDOWN_REQUEST_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "shutdown request file is malformed",
+            ));
+        }
+        Ok(true)
+    }
+
     fn wait_for_service_exit(
         self,
         mut exited: impl FnMut() -> Option<&'static str>,
@@ -800,6 +873,9 @@ impl ShutdownSignal {
                     return Err("shutdown signal channel disconnected".into());
                 }
                 Err(TryRecvError::Empty) => {}
+            }
+            if self.request_file_exists()? {
+                return Ok(None);
             }
             if let Some(service) = exited() {
                 return Ok(Some(service));
@@ -823,7 +899,10 @@ fn install_shutdown_handler() -> Result<ShutdownSignal, ctrlc::Error> {
     ctrlc::set_handler(move || {
         let _ = sender.try_send(());
     })?;
-    Ok(ShutdownSignal { receiver })
+    Ok(ShutdownSignal {
+        receiver,
+        request_file: None,
+    })
 }
 
 fn verifier_worker_config(
@@ -1406,9 +1485,12 @@ mod tests {
     #[test]
     fn shutdown_wait_reports_an_unexpected_service_exit() {
         let (_sender, receiver) = sync_channel(1);
-        let reason = ShutdownSignal { receiver }
-            .wait_for_service_exit(|| Some("RPC"))
-            .unwrap();
+        let reason = ShutdownSignal {
+            receiver,
+            request_file: None,
+        }
+        .wait_for_service_exit(|| Some("RPC"))
+        .unwrap();
         assert_eq!(reason, Some("RPC"));
     }
 
@@ -1416,9 +1498,12 @@ mod tests {
     fn shutdown_signal_wins_when_service_exit_is_also_observed() {
         let (sender, receiver) = sync_channel(1);
         sender.send(()).unwrap();
-        let reason = ShutdownSignal { receiver }
-            .wait_for_service_exit(|| Some("RPC"))
-            .unwrap();
+        let reason = ShutdownSignal {
+            receiver,
+            request_file: None,
+        }
+        .wait_for_service_exit(|| Some("RPC"))
+        .unwrap();
         assert_eq!(reason, None);
     }
 }

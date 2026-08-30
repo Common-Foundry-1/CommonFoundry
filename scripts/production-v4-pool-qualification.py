@@ -23,6 +23,14 @@ class QualificationError(RuntimeError):
     """Raised when the deterministic pool gate cannot be accepted."""
 
 
+def rust_toolchain() -> str:
+    if os.name == "nt":
+        return f"{RUST_TOOLCHAIN}-x86_64-pc-windows-msvc"
+    if sys.platform.startswith("linux"):
+        return f"{RUST_TOOLCHAIN}-x86_64-unknown-linux-gnu"
+    raise QualificationError(f"unsupported qualification platform: {sys.platform}")
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
@@ -30,11 +38,12 @@ def _utc_now() -> str:
 def qualification_commands(include_dashboard: bool) -> list[tuple[str, list[str], Path]]:
     root = Path(__file__).resolve().parents[1]
     npm = "npm.cmd" if os.name == "nt" else "npm"
+    toolchain = rust_toolchain()
     commands = [
         (
             "node_production_v4_regression_tests",
             [
-                "cargo", f"+{RUST_TOOLCHAIN}", "test", "-p", "cmfd-node",
+                "cargo", f"+{toolchain}", "test", "-p", "cmfd-node",
                 "--features", "production-v4-testnet",
                 "--lib",
             ],
@@ -43,7 +52,7 @@ def qualification_commands(include_dashboard: bool) -> list[tuple[str, list[str]
         (
             "node_strict_clippy",
             [
-                "cargo", f"+{RUST_TOOLCHAIN}", "clippy", "-p", "cmfd-node",
+                "cargo", f"+{toolchain}", "clippy", "-p", "cmfd-node",
                 "--features", "production-v4-testnet",
                 "--all-targets", "--", "-D", "warnings",
             ],
@@ -190,7 +199,7 @@ def main() -> int:
             "operator": args.operator.strip(),
             "platform": args.platform_label.strip(),
             "cargo_build_jobs": 4,
-            "rust_toolchain": RUST_TOOLCHAIN,
+            "rust_toolchain": rust_toolchain(),
             "deterministic_pool_gate_met": True,
             "dashboard_gate_met": not args.rust_only,
             "full_gpu_endurance_gate_met": False,

@@ -1,4 +1,4 @@
-//! Small, authenticated Devnet-0 pool protocol.
+//! Small Devnet pool protocol with certificate-pinned transport.
 //!
 //! This is deliberately not Stratum. The server sends an immutable
 //! [`BlockChallenge`] and a separate, easier share target. A worker submits
@@ -65,7 +65,7 @@ pub const POOL_MAX_LEDGER_BLOCKS: usize = 65_536;
 pub const POOL_MAX_LEDGER_PAYOUT_TRANSACTIONS: usize = 65_536;
 pub const DEFAULT_POOL_MINIMUM_PAYOUT_ATOMS: u64 = 100;
 pub const DEFAULT_POOL_PAYOUT_FEE_ATOMS: u64 = 1;
-pub const POOL_ACCOUNTING_SEMANTICS: &str = "durable authenticated Devnet accounting; on-chain settlement is active only when enabled by the pool operator";
+pub const POOL_ACCOUNTING_SEMANTICS: &str = "durable Devnet share accounting; on-chain settlement is active only when enabled by the pool operator";
 
 const POOL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const POOL_READ_TIMEOUT: Duration = Duration::from_millis(200);
@@ -199,6 +199,7 @@ pub struct PoolServerConfig {
     pub ledger_directory: Option<PathBuf>,
     pub payout_policy: Option<PoolPayoutPolicy>,
     pub allow_public_clients: bool,
+    pub allow_address_only_payouts: bool,
     pub production_v4_share_verifier: Option<Arc<dyn ProductionV4PoolShareVerifier>>,
 }
 
@@ -223,6 +224,7 @@ impl PoolServerConfig {
             ledger_directory: None,
             payout_policy: None,
             allow_public_clients: false,
+            allow_address_only_payouts: false,
             production_v4_share_verifier: None,
         }
     }
@@ -276,7 +278,7 @@ pub struct PoolClientConfig {
     pub certificate_sha256: [u8; 32],
     pub worker: String,
     pub payout: [u8; 32],
-    pub payout_signer: PoolPayoutSigner,
+    pub payout_signer: Option<PoolPayoutSigner>,
     pub expected_network_id: [u8; 32],
     pub expected_consensus_fingerprint: [u8; 32],
 }
@@ -302,6 +304,47 @@ impl PoolClientConfig {
         Self::new(address, certificate_sha256, worker, payout_signer, params)
     }
 
+    pub fn compiled_network_address_only(
+        address: SocketAddr,
+        certificate_sha256: [u8; 32],
+        worker: impl Into<String>,
+        payout: [u8; 32],
+    ) -> Result<Self, PoolError> {
+        let params = crate::thin_miner_network_params().map_err(PoolError::from)?;
+        Self::address_only(address, certificate_sha256, worker, payout, params)
+    }
+
+    #[cfg(test)]
+    fn devnet_address_only(
+        address: SocketAddr,
+        certificate_sha256: [u8; 32],
+        worker: impl Into<String>,
+        payout: [u8; 32],
+    ) -> Result<Self, PoolError> {
+        let params = devnet_pool_params()?;
+        Self::address_only(address, certificate_sha256, worker, payout, params)
+    }
+
+    fn address_only(
+        address: SocketAddr,
+        certificate_sha256: [u8; 32],
+        worker: impl Into<String>,
+        payout: [u8; 32],
+        params: cmfd_consensus::NetworkParams,
+    ) -> Result<Self, PoolError> {
+        VerifyingKey::from_bytes(&payout)
+            .map_err(|_| PoolError::Node(NodeError::InvalidMinerDestination))?;
+        Ok(Self {
+            address,
+            certificate_sha256,
+            worker: worker.into(),
+            payout,
+            payout_signer: None,
+            expected_network_id: params.network_id,
+            expected_consensus_fingerprint: params.fingerprint().map_err(NodeError::from)?,
+        })
+    }
+
     fn new(
         address: SocketAddr,
         certificate_sha256: [u8; 32],
@@ -315,7 +358,7 @@ impl PoolClientConfig {
             certificate_sha256,
             worker: worker.into(),
             payout,
-            payout_signer,
+            payout_signer: Some(payout_signer),
             expected_network_id: params.network_id,
             expected_consensus_fingerprint: params.fingerprint().map_err(NodeError::from)?,
         })
@@ -1618,6 +1661,7 @@ struct SharedServer {
     payout_policy: Option<PoolPayoutPolicy>,
     max_connections: usize,
     allow_public_clients: bool,
+    allow_address_only_payouts: bool,
     proof_profile: ProofProfile,
     production_v4_share_verifier: Option<Arc<dyn ProductionV4PoolShareVerifier>>,
     tls: Arc<ServerConfig>,
@@ -1915,6 +1959,7 @@ pub fn spawn_pool_server(
         payout_policy: config.payout_policy,
         max_connections: config.max_connections,
         allow_public_clients: config.allow_public_clients,
+        allow_address_only_payouts: config.allow_address_only_payouts,
         proof_profile: profile.proof,
         production_v4_share_verifier: config.production_v4_share_verifier,
         tls,
@@ -2177,14 +2222,27 @@ fn handle_connection(stream: TcpStream, shared: Arc<SharedServer>) -> Result<(),
                 return Err(PoolError::FingerprintMismatch);
             }
             validate_worker(&worker)?;
-            let digest = payout_auth_digest(
-                network_id,
-                consensus_fingerprint,
-                authentication_nonce,
-                &worker,
-                payout,
-            );
-            if verify_payout_authentication(payout, digest, &payout_signature).is_err() {
+            if VerifyingKey::from_bytes(&payout).is_err() {
+                send_error(
+                    &mut stream,
+                    "payout_authentication_failed",
+                    "pool payout address is invalid",
+                )?;
+                return Err(PoolError::PayoutAuthentication);
+            }
+            let authenticated = if payout_signature.is_empty() {
+                shared.allow_address_only_payouts
+            } else {
+                let digest = payout_auth_digest(
+                    network_id,
+                    consensus_fingerprint,
+                    authentication_nonce,
+                    &worker,
+                    payout,
+                );
+                verify_payout_authentication(payout, digest, &payout_signature).is_ok()
+            };
+            if !authenticated {
                 send_error(
                     &mut stream,
                     "payout_authentication_failed",
@@ -3326,7 +3384,9 @@ impl PoolClient {
         validate_worker(&config.worker)?;
         VerifyingKey::from_bytes(&config.payout)
             .map_err(|_| PoolError::Node(NodeError::InvalidMinerDestination))?;
-        if config.payout != config.payout_signer.payout() {
+        if let Some(signer) = &config.payout_signer
+            && config.payout != signer.payout()
+        {
             return Err(PoolError::PayoutAuthentication);
         }
         let mut socket = TcpStream::connect_timeout(&config.address, Duration::from_secs(5))?;
@@ -3368,13 +3428,18 @@ impl PoolClient {
                 ));
             }
         };
-        let payout_signature = config.payout_signer.sign(payout_auth_digest(
-            config.expected_network_id,
-            config.expected_consensus_fingerprint,
-            authentication_nonce,
-            &config.worker,
-            config.payout,
-        ));
+        let payout_signature = config
+            .payout_signer
+            .as_ref()
+            .map_or_else(Vec::new, |signer| {
+                signer.sign(payout_auth_digest(
+                    config.expected_network_id,
+                    config.expected_consensus_fingerprint,
+                    authentication_nonce,
+                    &config.worker,
+                    config.payout,
+                ))
+            });
         write_frame(
             &mut stream,
             &ClientMessage::Hello {
@@ -4256,18 +4321,26 @@ mod tests {
     }
 
     fn server(label: &str) -> (TestRoot, PoolServerHandle, Arc<Mutex<Node>>, [u8; 32]) {
+        server_with_address_only(label, false)
+    }
+
+    fn server_with_address_only(
+        label: &str,
+        allow_address_only_payouts: bool,
+    ) -> (TestRoot, PoolServerHandle, Arc<Mutex<Node>>, [u8; 32]) {
         let root = TestRoot::new(label);
         let data = root.path().join("node");
         let node = Arc::new(Mutex::new(
             Node::open_with_profile(data, crate::DEVNET_PROFILE).unwrap(),
         ));
         let (certificate, key, pin) = certificate(&root);
-        let config = PoolServerConfig::devnet(
+        let mut config = PoolServerConfig::devnet(
             "127.0.0.1:0".parse().unwrap(),
             fs::read(certificate).unwrap(),
             fs::read(key).unwrap(),
             default_miner_destination(),
         );
+        config.allow_address_only_payouts = allow_address_only_payouts;
         let server = spawn_pool_server(Arc::clone(&node), config).unwrap();
         (root, server, node, pin)
     }
@@ -4357,6 +4430,43 @@ mod tests {
             PoolClientConfig::devnet(address, pin, worker, test_payout_signer()).unwrap(),
         )
         .unwrap()
+    }
+
+    fn address_only_client_config(
+        address: SocketAddr,
+        pin: [u8; 32],
+        worker: &str,
+    ) -> PoolClientConfig {
+        PoolClientConfig::devnet_address_only(address, pin, worker, default_miner_destination())
+            .unwrap()
+    }
+
+    #[test]
+    fn address_only_payout_requires_explicit_pool_opt_in() {
+        let (_root, server, _node, pin) = server("address-only-disabled");
+        let error = PoolClient::connect(address_only_client_config(
+            server.local_addr(),
+            pin,
+            "address-only",
+        ))
+        .unwrap_err();
+        assert!(matches!(error, PoolError::PayoutAuthentication));
+        server.stop().unwrap();
+    }
+
+    #[test]
+    fn address_only_payout_connects_when_pool_opts_in() {
+        let (_root, server, _node, pin) = server_with_address_only("address-only-enabled", true);
+        let address = server.local_addr();
+        let address_only =
+            PoolClient::connect(address_only_client_config(address, pin, "address-only")).unwrap();
+        assert_eq!(address_only.current_job().challenge.height, 1);
+        drop(address_only);
+
+        let authenticated = client(address, pin, "authenticated");
+        assert_eq!(authenticated.current_job().challenge.height, 1);
+        drop(authenticated);
+        server.stop().unwrap();
     }
 
     fn test_payout_signer() -> PoolPayoutSigner {
@@ -4571,11 +4681,7 @@ mod tests {
     fn share_only_credit_duplicate_rejection_and_session_ledger_are_real() {
         let (_root, server, _node, pin) = server("share-ledger");
         let mut client = client(server.local_addr(), pin, "worker-a");
-        assert!(
-            client
-                .accounting_semantics()
-                .contains("authenticated Devnet accounting")
-        );
+        assert_eq!(client.accounting_semantics(), POOL_ACCOUNTING_SEMANTICS);
         assert!(client.persistence().contains("memory-only"));
         let work = client.current_work().unwrap();
         assert!(work.job().share_target > work.job().challenge.target);

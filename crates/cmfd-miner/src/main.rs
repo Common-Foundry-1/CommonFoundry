@@ -7,7 +7,7 @@ use std::fs::{self, OpenOptions};
 use std::io::BufReader;
 #[cfg(any(feature = "production-v3-testnet", feature = "production-v4"))]
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::net::{SocketAddr, TcpListener};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 #[cfg(any(feature = "production-v3-testnet", feature = "production-v4"))]
 use std::sync::atomic::AtomicU64;
@@ -62,6 +62,14 @@ use cmfd_node::p2p::{
 use cmfd_node::peer::{
     BlockSubmissionStatus, MiningTemplate, PeerAddressPolicy, PeerLimits, StaticPeerConfig,
 };
+#[cfg(feature = "production-v4")]
+use cmfd_node::pool::{
+    PoolClient, PoolClientConfig, PoolClientEvent, PoolError, PoolWorkSearchResult,
+};
+#[cfg(feature = "production-v4")]
+use cmfd_node::production_v4_pool::{
+    ProductionV4PersistentPoolSearcher, production_v4_pool_searcher_config,
+};
 use cmfd_node::{
     COMPILED_NETWORK_PROFILE, MiningShareSearchResult, MiningWork, Node, NodeError, ProofProfile,
     parse_miner_destination, submit_shared_tip_block, unix_time_seconds,
@@ -99,6 +107,12 @@ const PEER_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 /// Covers the external verifier's bounded 900-second authenticated restart
 /// while still placing a hard ceiling on retaining one exact candidate.
 const FOUND_BLOCK_RETRY_BUDGET: Duration = Duration::from_secs(20 * 60);
+#[cfg(feature = "production-v4")]
+const PRODUCTION_V4_POOL_SEARCH_BATCH_SIZE: u32 = 32;
+#[cfg(feature = "production-v4")]
+const POOL_RECONNECT_INITIAL: Duration = Duration::from_millis(250);
+#[cfg(feature = "production-v4")]
+const POOL_RECONNECT_MAX: Duration = Duration::from_secs(4);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -168,6 +182,34 @@ enum Command {
         #[cfg(feature = "production-v3")]
         #[command(flatten)]
         production_v3: ProductionV3Cli,
+    },
+    /// Mine ProductionV4 shares to a certificate-pinned pool using a payout address.
+    #[cfg(feature = "production-v4")]
+    Pool {
+        /// Complete cmfd+tls://NUMERIC_IP:PORT?pin=64_HEX pool URL.
+        #[arg(long)]
+        pool: String,
+        /// 32-byte x-only payout address as 64 hexadecimal characters.
+        #[arg(long)]
+        miner: String,
+        /// Pool worker name: 1-32 letters, numbers, dots, underscores, or hyphens.
+        #[arg(long)]
+        worker: String,
+        /// Absolute path to the pinned ProductionV4 model bank.
+        #[arg(long)]
+        production_v4_bank: PathBuf,
+        /// Absolute native path to the persistent ProductionV4 CUDA replay worker.
+        #[arg(long)]
+        production_v4_replay_worker: PathBuf,
+        /// Absolute native scratch directory shared with the replay worker.
+        #[arg(long)]
+        production_v4_scratch: PathBuf,
+        /// Run the replay worker through this WSL distribution.
+        #[arg(long)]
+        production_v4_wsl_distribution: Option<String>,
+        /// Seconds between mining-stat reports.
+        #[arg(long, default_value_t = DEFAULT_STATS_SECONDS)]
+        stats_seconds: u64,
     },
     /// Freeze one exact ProductionV3 node template and its qualification seed.
     #[cfg(feature = "production-v3-testnet")]
@@ -476,6 +518,26 @@ fn main() -> Result<()> {
             #[cfg(feature = "production-v3")]
             production_v3,
         }),
+        #[cfg(feature = "production-v4")]
+        Command::Pool {
+            pool,
+            miner,
+            worker,
+            production_v4_bank,
+            production_v4_replay_worker,
+            production_v4_scratch,
+            production_v4_wsl_distribution,
+            stats_seconds,
+        } => run_production_v4_pool_miner(ProductionV4PoolMinerOptions {
+            pool,
+            miner,
+            worker,
+            model_bank: production_v4_bank,
+            replay_worker: production_v4_replay_worker,
+            scratch_directory: production_v4_scratch,
+            wsl_distribution: production_v4_wsl_distribution,
+            stats_seconds,
+        }),
         #[cfg(feature = "production-v3-testnet")]
         Command::SnapshotQualifiedTemplate {
             peer,
@@ -612,6 +674,339 @@ fn main() -> Result<()> {
             production_v3,
         }),
     }
+}
+
+#[cfg(feature = "production-v4")]
+struct ProductionV4PoolMinerOptions {
+    pool: String,
+    miner: String,
+    worker: String,
+    model_bank: PathBuf,
+    replay_worker: PathBuf,
+    scratch_directory: PathBuf,
+    wsl_distribution: Option<String>,
+    stats_seconds: u64,
+}
+
+#[cfg(feature = "production-v4")]
+struct PoolMinerStatistics {
+    started_at: Instant,
+    last_report: Instant,
+    attempts: u64,
+    last_attempts: u64,
+    accepted: u64,
+    rejected: u64,
+    blocks: u64,
+    credited_atoms: u64,
+    telemetry_warning_printed: bool,
+}
+
+#[cfg(feature = "production-v4")]
+impl PoolMinerStatistics {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            last_report: Instant::now(),
+            attempts: 0,
+            last_attempts: 0,
+            accepted: 0,
+            rejected: 0,
+            blocks: 0,
+            credited_atoms: 0,
+            telemetry_warning_printed: false,
+        }
+    }
+
+    fn report_if_due(&mut self, height: u64, interval: Duration) {
+        if self.last_report.elapsed() < interval {
+            return;
+        }
+        let report_at = Instant::now();
+        let elapsed = report_at
+            .duration_since(self.last_report)
+            .as_secs_f64()
+            .max(f64::EPSILON);
+        let rate = self.attempts.saturating_sub(self.last_attempts) as f64 / elapsed;
+        let telemetry = match query_nvidia_smi() {
+            Ok(telemetry) => telemetry.get(&0).cloned(),
+            Err(error) => {
+                if !self.telemetry_warning_printed {
+                    println!("NVIDIA telemetry unavailable ({error}); mining will continue.");
+                    self.telemetry_warning_printed = true;
+                }
+                None
+            }
+        };
+        let power = telemetry.as_ref().and_then(|value| value.power_watts);
+        let efficiency = power
+            .filter(|value| *value > 0.0)
+            .map(|value| rate * 3_600_000.0 / value);
+        let temperature = telemetry
+            .as_ref()
+            .and_then(|value| value.temperature_celsius);
+        println!(
+            "MINER STATS | height {height} | hashrate {rate:.2} FW/s | accepted {} | rejected {} | blocks {} | credit {} atoms | power {} | efficiency {} | temp {} | uptime {}",
+            self.accepted,
+            self.rejected,
+            self.blocks,
+            self.credited_atoms,
+            format_metric(power, "W"),
+            format_metric(efficiency, "FW/kWh"),
+            format_metric(temperature, "C"),
+            format_duration(self.started_at.elapsed()),
+        );
+        self.last_attempts = self.attempts;
+        self.last_report = report_at;
+    }
+}
+
+#[cfg(feature = "production-v4")]
+fn run_production_v4_pool_miner(options: ProductionV4PoolMinerOptions) -> Result<()> {
+    if COMPILED_NETWORK_PROFILE.proof != ProofProfile::ProductionV4 {
+        bail!("pool mining requires a ProductionV4 network build");
+    }
+    if options.stats_seconds == 0 {
+        bail!("stats-seconds must be at least 1");
+    }
+    let (address, certificate_pin) = parse_pinned_pool_url(&options.pool)?;
+    let payout = parse_miner_destination(&options.miner).map_err(anyhow::Error::from)?;
+    let client_config = PoolClientConfig::compiled_network_address_only(
+        address,
+        certificate_pin,
+        options.worker.clone(),
+        payout,
+    )?;
+    let searcher = ProductionV4PersistentPoolSearcher::start(production_v4_pool_searcher_config(
+        &options.replay_worker,
+        &options.model_bank,
+        &options.scratch_directory,
+        PRODUCTION_V4_POOL_SEARCH_BATCH_SIZE,
+        options.wsl_distribution.as_deref(),
+    )?)?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let handler_stop = Arc::clone(&stop);
+    ctrlc::set_handler(move || handler_stop.store(true, Ordering::Release))?;
+    let mut statistics = PoolMinerStatistics::new();
+    let report_interval = Duration::from_secs(options.stats_seconds);
+    let mut reconnect_delay = POOL_RECONNECT_INITIAL;
+
+    println!("Pool: {}", options.pool);
+    println!("Payout: {}", options.miner);
+    println!("Worker: {}", options.worker);
+    while !stop.load(Ordering::Acquire) {
+        let mut client = match PoolClient::connect(client_config.clone()) {
+            Ok(client) => client,
+            Err(PoolError::PayoutAuthentication) => {
+                bail!(
+                    "this pool does not allow address-only mining; the pool operator must enable address-only payouts"
+                );
+            }
+            Err(error) if pool_error_is_reconnectable(&error) => {
+                println!("Pool unavailable ({error}); retrying...");
+                if !pool_interruptible_sleep(&stop, reconnect_delay) {
+                    break;
+                }
+                reconnect_delay =
+                    std::cmp::min(reconnect_delay.saturating_mul(2), POOL_RECONNECT_MAX);
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        reconnect_delay = POOL_RECONNECT_INITIAL;
+        println!(
+            "Connected to pool at height {}.",
+            client.current_job().challenge.height.saturating_sub(1)
+        );
+        match mine_production_v4_pool_session(
+            &mut client,
+            &searcher,
+            &stop,
+            &mut statistics,
+            report_interval,
+        ) {
+            Ok(()) => break,
+            Err(error) if pool_error_is_reconnectable(&error) => {
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                println!("Pool connection lost ({error}); reconnecting...");
+                if !pool_interruptible_sleep(&stop, reconnect_delay) {
+                    break;
+                }
+                reconnect_delay =
+                    std::cmp::min(reconnect_delay.saturating_mul(2), POOL_RECONNECT_MAX);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    println!("Pool miner stopped.");
+    Ok(())
+}
+
+#[cfg(feature = "production-v4")]
+fn mine_production_v4_pool_session(
+    client: &mut PoolClient,
+    searcher: &ProductionV4PersistentPoolSearcher,
+    stop: &AtomicBool,
+    statistics: &mut PoolMinerStatistics,
+    report_interval: Duration,
+) -> Result<(), PoolError> {
+    let mut job_id = None;
+    let mut next_nonce = 0_u64;
+    let mut remote_credited_atoms = 0_u64;
+    while !stop.load(Ordering::Acquire) {
+        let job = client.current_job().clone();
+        if job_id != Some(job.job_id) {
+            job_id = Some(job.job_id);
+            next_nonce = client.initial_nonce_for_job(&job);
+        }
+        let result = searcher.search(&job, next_nonce, stop)?;
+        let (attempts_completed, following_nonce) = match &result {
+            PoolWorkSearchResult::Found {
+                attempts_completed,
+                next_nonce,
+                ..
+            }
+            | PoolWorkSearchResult::Exhausted {
+                attempts_completed,
+                next_nonce,
+            }
+            | PoolWorkSearchResult::Cancelled {
+                attempts_completed,
+                next_nonce,
+            } => (*attempts_completed, *next_nonce),
+        };
+        statistics.attempts = statistics.attempts.saturating_add(attempts_completed);
+        next_nonce = following_nonce;
+        statistics.report_if_due(
+            client.current_job().challenge.height.saturating_sub(1),
+            report_interval,
+        );
+
+        let nonce = match result {
+            PoolWorkSearchResult::Found { nonce, .. } => nonce,
+            PoolWorkSearchResult::Cancelled { .. } => return Ok(()),
+            PoolWorkSearchResult::Exhausted { .. } => {
+                match client.receive() {
+                    Ok(PoolClientEvent::Job(_)) => {}
+                    Ok(PoolClientEvent::ShareResult(_)) => {
+                        return Err(PoolError::InvalidMessage(
+                            "pool sent an unsolicited share result".to_owned(),
+                        ));
+                    }
+                    Err(PoolError::Io(error))
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(error) => return Err(error),
+                }
+                continue;
+            }
+        };
+
+        let Some(mut submitted) = client.submit_share_interruptible(job.job_id, nonce, stop)?
+        else {
+            return Ok(());
+        };
+        while matches!(
+            submitted.code.as_str(),
+            "verifier_busy" | "share_rate_limited"
+        ) && !stop.load(Ordering::Acquire)
+        {
+            if !pool_interruptible_sleep(stop, Duration::from_millis(250)) {
+                return Ok(());
+            }
+            let Some(result) = client.submit_share_interruptible(job.job_id, nonce, stop)? else {
+                return Ok(());
+            };
+            submitted = result;
+        }
+        if submitted.accepted {
+            statistics.accepted = statistics.accepted.saturating_add(1);
+        } else {
+            statistics.rejected = statistics.rejected.saturating_add(1);
+        }
+        if submitted.block_accepted {
+            statistics.blocks = statistics.blocks.saturating_add(1);
+        }
+        let newly_credited = submitted
+            .session
+            .credited_devnet_atoms
+            .saturating_sub(remote_credited_atoms);
+        remote_credited_atoms = submitted.session.credited_devnet_atoms;
+        statistics.credited_atoms = statistics.credited_atoms.saturating_add(newly_credited);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "production-v4")]
+fn parse_pinned_pool_url(value: &str) -> Result<(SocketAddr, [u8; 32])> {
+    let requirement = "pool URL must be cmfd+tls://NUMERIC_IP:PORT?pin=64_HEX";
+    let remainder = value
+        .strip_prefix("cmfd+tls://")
+        .ok_or_else(|| anyhow!(requirement))?;
+    let (authority, pin_text) = remainder
+        .split_once("?pin=")
+        .ok_or_else(|| anyhow!(requirement))?;
+    if pin_text.len() != 64 || !pin_text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!(requirement);
+    }
+    let certificate_pin: [u8; 32] = hex::decode(pin_text)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| anyhow!(requirement))?;
+    let (ip, port_text) = if let Some(bracketed) = authority.strip_prefix('[') {
+        let (host, port) = bracketed
+            .split_once("]:")
+            .ok_or_else(|| anyhow!(requirement))?;
+        (IpAddr::V6(host.parse::<Ipv6Addr>()?), port)
+    } else {
+        let (host, port) = authority
+            .rsplit_once(':')
+            .ok_or_else(|| anyhow!(requirement))?;
+        if host.split('.').any(|octet| {
+            octet.is_empty()
+                || (octet.len() > 1 && octet.starts_with('0'))
+                || !octet.bytes().all(|byte| byte.is_ascii_digit())
+        }) {
+            bail!(requirement);
+        }
+        (IpAddr::V4(host.parse::<Ipv4Addr>()?), port)
+    };
+    if port_text.is_empty()
+        || port_text.len() > 5
+        || !port_text.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        bail!(requirement);
+    }
+    let port = port_text
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port != 0)
+        .ok_or_else(|| anyhow!(requirement))?;
+    Ok((SocketAddr::new(ip, port), certificate_pin))
+}
+
+#[cfg(feature = "production-v4")]
+fn pool_error_is_reconnectable(error: &PoolError) -> bool {
+    matches!(
+        error,
+        PoolError::Io(_) | PoolError::ConnectionClosed | PoolError::MessageCountLimit
+    )
+}
+
+#[cfg(feature = "production-v4")]
+fn pool_interruptible_sleep(stop: &AtomicBool, duration: Duration) -> bool {
+    let deadline = Instant::now() + duration;
+    while !stop.load(Ordering::Acquire) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return true;
+        }
+        thread::sleep(std::cmp::min(remaining, Duration::from_millis(25)));
+    }
+    false
 }
 
 #[cfg(feature = "production-v3-testnet")]
@@ -4788,6 +5183,34 @@ mod tests {
     use std::sync::atomic::AtomicU64;
 
     use super::*;
+
+    #[cfg(feature = "production-v4")]
+    #[test]
+    fn parses_certificate_pinned_numeric_pool_urls() {
+        let pin = "ab".repeat(32);
+        let (ipv4, parsed_pin) =
+            parse_pinned_pool_url(&format!("cmfd+tls://203.0.113.20:22445?pin={pin}")).unwrap();
+        assert_eq!(ipv4, "203.0.113.20:22445".parse().unwrap());
+        assert_eq!(parsed_pin, [0xab; 32]);
+
+        let (ipv6, _) =
+            parse_pinned_pool_url(&format!("cmfd+tls://[2001:db8::1]:22445?pin={pin}")).unwrap();
+        assert_eq!(ipv6, "[2001:db8::1]:22445".parse().unwrap());
+    }
+
+    #[cfg(feature = "production-v4")]
+    #[test]
+    fn rejects_unpinned_or_nonnumeric_pool_urls() {
+        let pin = "ab".repeat(32);
+        for value in [
+            "cmfd+tls://203.0.113.20:22445",
+            &format!("cmfd+tls://pool.example:22445?pin={pin}"),
+            &format!("cmfd+tls://203.0.113.20:0?pin={pin}"),
+            "https://203.0.113.20:22445",
+        ] {
+            assert!(parse_pinned_pool_url(value).is_err(), "accepted {value}");
+        }
+    }
 
     #[cfg(feature = "production-v4")]
     #[test]

@@ -282,4 +282,5 @@ exec "$node" \
   --pool-public-url "$public_url" \
   --pool-dashboard-bind "$dashboard_bind" \
   --shutdown-request-file "$shutdown_request_file" \
-  --allow-public-pool-clients
+  --allow-public-pool-clients \
+  --allow-address-only-payouts

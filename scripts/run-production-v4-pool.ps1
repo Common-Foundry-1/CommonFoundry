@@ -202,7 +202,8 @@ $arguments = @(
     '--pool-public-url', $publicUrl,
     '--pool-dashboard-bind', $DashboardBind,
     '--shutdown-request-file', $shutdownRequestFile,
-    '--allow-public-pool-clients'
+    '--allow-public-pool-clients',
+    '--allow-address-only-payouts'
 )
 $arguments += @('--production-v4-pool-wsl-distribution', $WslDistribution)
 if ($Peer) {

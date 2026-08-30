@@ -1,6 +1,6 @@
 # ProductionV4 test-pool operator guide
 
-The Common Foundry ProductionV4 pool package runs an authenticated Devnet pool,
+The Common Foundry ProductionV4 pool package runs a certificate-pinned Devnet pool,
 a full P2P node, persistent CUDA replay and proof workers, durable share and
 payout accounting, and a read-only web dashboard. Windows and native Linux
 packages use the same protocol and ledger rules.
@@ -111,8 +111,10 @@ it through an authenticated reverse proxy or tunnel if remote viewing is
 needed; do not expose a separate node-control API.
 
 Miners connect with the exact URL printed at startup. The protocol uses TLS 1.3
-with an exact certificate SHA-256 pin and a signed payout-key challenge. It is a
-Common Foundry protocol, not Bitcoin Stratum.
+with an exact certificate SHA-256 pin. The standalone miner identifies its
+payout with the wallet receive address configured in `START-POOL-MINING.bat`;
+the wallet miner may additionally authenticate that address with its signing
+key. It is a Common Foundry protocol, not Bitcoin Stratum.
 
 ProductionV4 Devnet defaults to a seven-leading-zero-bit share target, one bit
 easier than the current block target. The wallet searches server-issued jobs

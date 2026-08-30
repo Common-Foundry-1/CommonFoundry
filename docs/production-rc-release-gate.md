@@ -167,6 +167,14 @@ specified in [`storage-recovery.md`](storage-recovery.md). RCNet qualification
 must exercise healthy inspection, interrupted-append quarantine and recovery,
 and hard refusal of checksum and record-chain corruption.
 
+Authenticated release transition testing is specified in
+[`update-rollback-qualification.md`](update-rollback-qualification.md). The
+harness authenticates both binary-only releases before execution, proves
+interrupted-update retention, candidate restart, rollback, and reapply, and
+reauthenticates both inputs before emitting evidence. CI qualifies the harness;
+the RCNet gate still requires real signed-package runs on clean Windows and
+Linux hosts.
+
 The first wallet-custody increment is specified in
 [`wallet-custody.md`](wallet-custody.md): network-bound encrypted backups,
 strict authenticated restore, encrypted live-key storage, data-directory

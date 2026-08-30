@@ -176,3 +176,24 @@ of the RCNet acceptance work.
 
 Mainnet activation is a separate decision after the full rehearsal evidence,
 independent audits, and launch operations review are complete.
+
+## Deterministic pool qualification
+
+Before the full-GPU RCNet endurance exercise, run the pool protocol,
+accounting, worker-boundary, strict-lint, dashboard-test, and dashboard-build
+gate in one clean source checkout:
+
+```powershell
+$commit = git rev-parse HEAD
+python scripts/production-v4-pool-qualification.py `
+  --source-commit $commit `
+  --operator '<operator>' `
+  --platform-label windows-x86_64 `
+  --log-directory D:\CommonFoundry-RC1\reports\pool-windows-logs `
+  --output D:\CommonFoundry-RC1\reports\pool-windows.json
+```
+
+Run the same script natively on Linux with `python3`. `--rust-only` records a
+core-only result when the dashboard was already qualified from the same source
+commit. The report deliberately leaves `full_gpu_endurance_gate_met` false;
+only the live RCNet pool exercise can close that gate.

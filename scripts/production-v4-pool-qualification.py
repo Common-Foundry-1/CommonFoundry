@@ -28,6 +28,7 @@ def _utc_now() -> str:
 
 def qualification_commands(include_dashboard: bool) -> list[tuple[str, list[str], Path]]:
     root = Path(__file__).resolve().parents[1]
+    npm = "npm.cmd" if os.name == "nt" else "npm"
     commands = [
         (
             "node_production_v4_regression_tests",
@@ -52,8 +53,8 @@ def qualification_commands(include_dashboard: bool) -> list[tuple[str, list[str]
         dashboard = root / "apps" / "pool-dashboard"
         commands.extend(
             [
-                ("pool_dashboard_tests", ["npm", "test"], dashboard),
-                ("pool_dashboard_build", ["npm", "run", "build"], dashboard),
+                ("pool_dashboard_tests", [npm, "test"], dashboard),
+                ("pool_dashboard_build", [npm, "run", "build"], dashboard),
             ]
         )
     return commands

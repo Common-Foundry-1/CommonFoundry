@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -30,6 +31,8 @@ class PoolQualificationTests(unittest.TestCase):
             [name for name, _command, _cwd in full[2:]],
             ["pool_dashboard_tests", "pool_dashboard_build"],
         )
+        expected_npm = "npm.cmd" if os.name == "nt" else "npm"
+        self.assertEqual(full[2][1][0], expected_npm)
 
     def test_source_commit_format_is_fail_closed(self) -> None:
         root = Path(__file__).resolve().parents[2]

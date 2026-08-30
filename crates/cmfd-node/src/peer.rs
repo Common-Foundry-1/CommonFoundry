@@ -180,7 +180,9 @@ pub enum PeerMessage {
     GetTransaction {
         txid: [u8; 32],
     },
-    /// A decoded canonical candidate. Receiving it never mutates the mempool.
+    /// A decoded canonical candidate. Pull responses are surfaced to the
+    /// caller; unsolicited relay candidates are admitted only through the
+    /// receiving node's normal mempool policy.
     Transaction(Transaction),
     GetMiningTemplate {
         payout: [u8; 32],

@@ -67,6 +67,7 @@ const CLEAN_SESSION_CREDIT: u16 = 10;
 const TRANSIENT_FAILURE_PENALTY: u16 = 5;
 const UNKNOWN_REQUEST_PENALTY: u16 = 10;
 const INVALID_BLOCK_PENALTY: u16 = 25;
+const INVALID_TRANSACTION_PENALTY: u16 = 25;
 const PROTOCOL_VIOLATION_PENALTY: u16 = 50;
 const RESOURCE_ABUSE_PENALTY: u16 = PEER_BAN_SCORE;
 const DYNAMIC_PEER_RETRY_INTERVAL: Duration = Duration::from_secs(10);
@@ -209,6 +210,7 @@ pub struct RelayReport {
     pub offered_blocks: usize,
     pub accepted_blocks: usize,
     pub already_known: usize,
+    pub offered_transactions: usize,
     pub peer_height: u64,
     pub peer_tip: [u8; 32],
 }
@@ -1455,11 +1457,40 @@ fn perform_relay_blocks_to_peer_once_inner_with_policy(
         }
     }
 
+    // Static peers are normally outbound-only from wallets behind NAT. Ask
+    // what the peer already knows, then advertise a bounded prefix of our
+    // remaining mempool through the same canonical transaction frame used by
+    // pull synchronization. The receiver still applies its ordinary atomic
+    // mempool policy; this path never bypasses validation.
+    connection.send(PeerMessage::GetMempool)?;
+    let remote_transactions: HashSet<_> = expect_transaction_inventory(connection.receive()?)?
+        .into_iter()
+        .collect();
+    let transactions = {
+        let node = lock_node(&shared)?;
+        node.mempool_entries()
+            .filter(|entry| !remote_transactions.contains(&entry.txid))
+            .take(MAX_TRANSACTIONS_PER_SYNC)
+            .map(|entry| (entry.txid, entry.transaction.clone()))
+            .collect::<Vec<_>>()
+    };
+    for (txid, transaction) in &transactions {
+        let actual = transaction.txid();
+        if actual != *txid {
+            return Err(P2pError::WrongTransaction {
+                requested: *txid,
+                actual,
+            });
+        }
+        connection.send(PeerMessage::Transaction(transaction.clone()))?;
+    }
+
     Ok(RelayReport {
         remote_hello,
         offered_blocks: block_ids.len(),
         accepted_blocks,
         already_known,
+        offered_transactions: transactions.len(),
         peer_height,
         peer_tip,
     })
@@ -1658,6 +1689,26 @@ fn perform_respond_to_peer_inner_with_policy(
                 }
                 connection.send(PeerMessage::Transaction(transaction))?;
             }
+            PeerMessage::Transaction(transaction) => {
+                let admission = {
+                    let mut node = lock_node(&shared)?;
+                    node.submit_transaction(transaction)
+                };
+                match admission {
+                    Ok(_) | Err(NodeError::DuplicateMempoolTransaction(_)) => {}
+                    Err(NodeError::MempoolTransactionLimit | NodeError::MempoolByteLimit) => {}
+                    Err(error) if error.client_error().status < 500 => {
+                        if options.security.record_failure(
+                            remote_address.ip(),
+                            INVALID_TRANSACTION_PENALTY,
+                            "deterministically rejected transaction",
+                        )? {
+                            return Err(P2pError::PeerTemporarilyBanned(remote_address.ip()));
+                        }
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
             PeerMessage::GetMiningTemplate { payout } => {
                 let template = {
                     let node = lock_node(&shared)?;
@@ -1717,7 +1768,7 @@ fn perform_respond_to_peer_inner_with_policy(
             PeerMessage::GetPeers { listen_port } => {
                 let Some(discovery) = options.discovery.as_ref() else {
                     return Err(P2pError::UnexpectedMessage {
-                        expected: "GetHeaders, GetBlock, GetMempool, GetTransaction, GetMiningTemplate, or SubmitBlock",
+                        expected: "GetHeaders, GetBlock, GetMempool, GetTransaction, Transaction, GetMiningTemplate, or SubmitBlock",
                         actual: "GetPeers",
                     });
                 };
@@ -1728,7 +1779,7 @@ fn perform_respond_to_peer_inner_with_policy(
             }
             other => {
                 return Err(P2pError::UnexpectedMessage {
-                    expected: "GetHeaders, GetBlock, GetMempool, GetTransaction, GetMiningTemplate, SubmitBlock, or GetPeers",
+                    expected: "GetHeaders, GetBlock, GetMempool, GetTransaction, Transaction, GetMiningTemplate, SubmitBlock, or GetPeers",
                     actual: message_name(&other),
                 });
             }
@@ -3563,6 +3614,103 @@ mod tests {
         drop(source);
         drop(target);
         clean_test_dir(&source_path);
+        clean_test_dir(&target_path);
+    }
+
+    #[test]
+    fn outbound_relay_propagates_wallet_transaction_to_static_peer() {
+        let wallet_path = test_dir("transaction-relay-wallet");
+        let seed_path = test_dir("transaction-relay-seed");
+        let wallet = open_shared(&wallet_path);
+        let seed = open_shared(&seed_path);
+        let funding = wallet
+            .lock()
+            .unwrap()
+            .mine_once(
+                default_miner_destination(),
+                unix_time_seconds().unwrap(),
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        let transaction = {
+            let node = wallet.lock().unwrap();
+            spend_community_output(&node, &funding, 10)
+        };
+        let txid = transaction.txid();
+        wallet
+            .lock()
+            .unwrap()
+            .submit_transaction(transaction)
+            .unwrap();
+        let (listener, address) = start_listener(Arc::clone(&seed), TARGET_NONCE);
+
+        let report = relay_blocks_to_peer_once_inner_with_policy(
+            Arc::clone(&wallet),
+            address,
+            test_limits(),
+            PeerAddressPolicy::PrivateOnly,
+            Some(SOURCE_NONCE),
+            None,
+        )
+        .unwrap();
+        assert_eq!(report.offered_blocks, 1);
+        assert_eq!(report.offered_transactions, 1);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while seed.lock().unwrap().mempool_entries().len() != 1 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let seed_txids: Vec<_> = seed
+            .lock()
+            .unwrap()
+            .mempool_entries()
+            .map(|entry| entry.txid)
+            .collect();
+        assert_eq!(seed_txids, vec![txid]);
+
+        let second = relay_blocks_to_peer_once_inner_with_policy(
+            Arc::clone(&wallet),
+            address,
+            test_limits(),
+            PeerAddressPolicy::PrivateOnly,
+            Some(SOURCE_NONCE),
+            None,
+        )
+        .unwrap();
+        assert_eq!(second.offered_blocks, 0);
+        assert_eq!(second.offered_transactions, 0);
+
+        listener.stop().unwrap();
+        drop(wallet);
+        drop(seed);
+        clean_test_dir(&wallet_path);
+        clean_test_dir(&seed_path);
+    }
+
+    #[test]
+    fn invalid_relayed_transaction_is_not_admitted() {
+        let target_path = test_dir("invalid-relayed-transaction");
+        let target = open_shared(&target_path);
+        let (listener, address) = start_listener(Arc::clone(&target), TARGET_NONCE);
+        let mut hello = target.lock().unwrap().peer_hello();
+        hello.node_nonce = SOURCE_NONCE;
+        let invalid = invalid_transaction(hello.network_id, 0);
+        let session = PeerSession::new(hello, test_limits()).unwrap();
+        let mut client = PeerConnection::connect(address, session).unwrap();
+        client.send_hello().unwrap();
+        assert!(matches!(client.receive().unwrap(), PeerMessage::Hello(_)));
+
+        client.send(PeerMessage::Transaction(invalid)).unwrap();
+        client.send(PeerMessage::GetMempool).unwrap();
+        assert_eq!(
+            client.receive().unwrap(),
+            PeerMessage::TransactionInventory { txids: Vec::new() }
+        );
+        assert_eq!(target.lock().unwrap().mempool_entries().len(), 0);
+
+        drop(client);
+        listener.stop().unwrap();
+        drop(target);
         clean_test_dir(&target_path);
     }
 

@@ -21,6 +21,16 @@ export interface PeerSettings {
   max_peers: number;
 }
 
+export interface WalletCustodyStatus {
+  network: string;
+  storage: "missing" | "plaintext" | "encrypted";
+  unlocked: boolean;
+  requires_migration: boolean;
+  can_restore: boolean;
+  data_directory: string;
+  destination: string | null;
+}
+
 export interface ProofAdmissionClassTelemetry {
   active: number;
   queued: number;

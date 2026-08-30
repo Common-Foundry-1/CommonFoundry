@@ -7,6 +7,7 @@ import type {
   PeerSettings,
   WalletSendRequest,
   WalletSendResult,
+  WalletCustodyStatus,
   WalletSnapshot,
 } from "../types";
 import { invoke } from "@tauri-apps/api/core";
@@ -48,6 +49,12 @@ export interface NodeTransport {
   sendWalletTransaction(payload: WalletSendRequest): Promise<WalletSendResult>;
   consolidateWallet(payload: ConsolidationRequest): Promise<ConsolidationResult>;
   mineDevnetBlock(miner: string, attempts?: number): Promise<MineResult>;
+  getWalletCustodyStatus(): Promise<WalletCustodyStatus>;
+  unlockWallet(passphrase: string): Promise<WalletCustodyStatus>;
+  lockWallet(): Promise<WalletCustodyStatus>;
+  backupWallet(path: string, passphrase: string): Promise<WalletCustodyStatus>;
+  migrateWalletEncryption(path: string, passphrase: string): Promise<WalletCustodyStatus>;
+  restoreWallet(path: string, passphrase: string): Promise<WalletCustodyStatus>;
 }
 
 export type NativeInvoke = <T>(
@@ -112,7 +119,21 @@ export const httpNodeTransport: NodeTransport = {
       body: new Uint8Array(),
     });
   },
+  getWalletCustodyStatus: () => custodyUnavailable(),
+  unlockWallet: () => custodyUnavailable(),
+  lockWallet: () => custodyUnavailable(),
+  backupWallet: () => custodyUnavailable(),
+  migrateWalletEncryption: () => custodyUnavailable(),
+  restoreWallet: () => custodyUnavailable(),
 };
+
+function custodyUnavailable<T>(): Promise<T> {
+  return Promise.reject(new NodeApiError(
+    "Wallet security controls are available in the desktop wallet.",
+    501,
+    "wallet_custody_unavailable",
+  ));
+}
 
 function abortError(): DOMException {
   return new DOMException("The node request was aborted", "AbortError");
@@ -217,6 +238,34 @@ export function createTauriNodeTransport(invoke: NativeInvoke): NodeTransport {
       "mine_devnet_block",
       { request: { miner, attempts } },
     ),
+    getWalletCustodyStatus: () => nativeCall<WalletCustodyStatus>(
+      invoke,
+      "get_wallet_custody_status",
+    ),
+    unlockWallet: (passphrase) => nativeCall<WalletCustodyStatus>(
+      invoke,
+      "unlock_wallet",
+      { request: { passphrase } },
+    ),
+    lockWallet: () => nativeCall<WalletCustodyStatus>(
+      invoke,
+      "lock_wallet",
+    ),
+    backupWallet: (path, passphrase) => nativeCall<WalletCustodyStatus>(
+      invoke,
+      "backup_wallet",
+      { request: { path, passphrase } },
+    ),
+    migrateWalletEncryption: (path, passphrase) => nativeCall<WalletCustodyStatus>(
+      invoke,
+      "migrate_wallet_encryption",
+      { request: { path, passphrase } },
+    ),
+    restoreWallet: (path, passphrase) => nativeCall<WalletCustodyStatus>(
+      invoke,
+      "restore_wallet",
+      { request: { path, passphrase } },
+    ),
   };
 }
 
@@ -261,4 +310,31 @@ export function mineDevnetBlock(
   attempts = 1_000_000,
 ): Promise<MineResult> {
   return transport.mineDevnetBlock(miner, attempts);
+}
+
+export function getWalletCustodyStatus(): Promise<WalletCustodyStatus> {
+  return transport.getWalletCustodyStatus();
+}
+
+export function unlockWallet(passphrase: string): Promise<WalletCustodyStatus> {
+  return transport.unlockWallet(passphrase);
+}
+
+export function lockWallet(): Promise<WalletCustodyStatus> {
+  return transport.lockWallet();
+}
+
+export function backupWallet(path: string, passphrase: string): Promise<WalletCustodyStatus> {
+  return transport.backupWallet(path, passphrase);
+}
+
+export function migrateWalletEncryption(
+  path: string,
+  passphrase: string,
+): Promise<WalletCustodyStatus> {
+  return transport.migrateWalletEncryption(path, passphrase);
+}
+
+export function restoreWallet(path: string, passphrase: string): Promise<WalletCustodyStatus> {
+  return transport.restoreWallet(path, passphrase);
 }

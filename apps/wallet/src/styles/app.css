@@ -259,6 +259,12 @@
   border: 1px solid var(--mineral-300);
 }
 
+.topbar-settings.needs-attention {
+  color: var(--copper-600);
+  background: var(--amber-100);
+  border-color: #e7b895;
+}
+
 .devnet-warning {
   min-height: 38px;
   display: flex;
@@ -273,6 +279,25 @@
 
 .devnet-warning strong {
   font-weight: 800;
+}
+
+.custody-banner {
+  min-height: 40px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 8px 34px;
+  color: #76411f;
+  text-align: left;
+  background: #fff8ee;
+  border: 0;
+  border-bottom: 1px solid #ead9c7;
+  font-size: 11px;
+}
+
+.custody-banner:hover {
+  background: #fff3e1;
 }
 
 .offline-banner {
@@ -1947,6 +1972,86 @@
   margin: 20px 23px 14px;
 }
 
+.wallet-security-dialog {
+  width: min(590px, 100%);
+}
+
+.custody-summary {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 20px 23px 0;
+  padding: 13px;
+  background: var(--mineral-100);
+  border: 1px solid var(--mineral-200);
+  border-radius: 6px;
+}
+
+.custody-summary > div {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.custody-summary strong {
+  color: var(--ink-900);
+  font-size: 12px;
+}
+
+.custody-summary span:last-child {
+  color: var(--ink-500);
+  font-size: 10px;
+}
+
+.custody-icon {
+  width: 39px;
+  height: 39px;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--copper-600);
+  background: #fff;
+  border: 1px solid var(--mineral-300);
+  border-radius: 50%;
+}
+
+.custody-icon.custody-encrypted {
+  color: #277250;
+  background: #eef8f2;
+  border-color: #cae7d5;
+}
+
+.custody-action-switch {
+  display: flex;
+  gap: 8px;
+  margin: 14px 23px 0;
+}
+
+.custody-action-switch button {
+  min-height: 32px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 12px;
+  color: var(--ink-600);
+  background: transparent;
+  border: 1px solid var(--mineral-300);
+  border-radius: 5px;
+  font-size: 10px;
+  font-weight: 750;
+}
+
+.custody-action-switch button.is-active {
+  color: #fff;
+  background: var(--ink-800);
+  border-color: var(--ink-800);
+}
+
+.custody-error {
+  margin: 14px 23px 0;
+}
+
 .dialog-description {
   margin: 0;
   color: var(--ink-500);
@@ -2445,7 +2550,7 @@
     font-size: 9px;
   }
 
-  .topbar-settings {
+  .topbar-node-settings {
     display: none;
   }
 

@@ -8078,7 +8078,8 @@ fn wallet_backup_error_to_node(error: wallet_backup::WalletBackupError) -> NodeE
         wallet_backup::WalletBackupError::InvalidWalletKey
         | wallet_backup::WalletBackupError::InvalidBackup
         | wallet_backup::WalletBackupError::WrongNetwork
-        | wallet_backup::WalletBackupError::DestinationMismatch => NodeError::InvalidWalletKey,
+        | wallet_backup::WalletBackupError::DestinationMismatch
+        | wallet_backup::WalletBackupError::AlreadyEncrypted => NodeError::InvalidWalletKey,
     }
 }
 

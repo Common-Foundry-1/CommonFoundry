@@ -69,6 +69,12 @@ pub fn run() -> i32 {
             commands::get_mining_status,
             commands::start_mining,
             commands::stop_mining,
+            commands::get_wallet_custody_status,
+            commands::unlock_wallet,
+            commands::lock_wallet,
+            commands::backup_wallet,
+            commands::migrate_wallet_encryption,
+            commands::restore_wallet,
         ])
         .build(tauri::generate_context!())
     {

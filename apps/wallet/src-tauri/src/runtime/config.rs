@@ -64,6 +64,19 @@ impl ProductionV3RuntimeOptions {
 pub(crate) const DEFAULT_BOOTSTRAP_PEER: SocketAddr = COMPILED_NETWORK_PROFILE.bootstrap_peer();
 
 impl NodeRuntimeConfig {
+    #[cfg(test)]
+    pub(super) fn default_for_test() -> Self {
+        Self {
+            p2p_bind: COMPILED_NETWORK_PROFILE.p2p_address(),
+            peers: vec![COMPILED_NETWORK_PROFILE.bootstrap_peer()],
+            allow_public_peers: true,
+            peers_explicit: false,
+            verbose: 0,
+            wallet_passphrase_file: None,
+            production_v3: ProductionV3RuntimeOptions::default(),
+        }
+    }
+
     pub(crate) fn from_process_args() -> Result<ProcessCommand, ConfigError> {
         let mut args = Vec::new();
         for argument in std::env::args_os().skip(1) {

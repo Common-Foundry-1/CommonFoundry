@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use cmfd_node::{
@@ -6,9 +7,57 @@ use cmfd_node::{
     WalletSnapshot,
 };
 use tauri::State;
+use zeroize::Zeroizing;
 
 use crate::mining::{MiningStartRequest, MiningStatus};
-use crate::runtime::{PeerSettings, RuntimeState, UpdatePeerSettingsRequest, startup_error};
+use crate::runtime::{
+    PeerSettings, RuntimeHandle, RuntimeState, UpdatePeerSettingsRequest, WalletCustodyStatus,
+    startup_error,
+};
+
+#[derive(serde::Deserialize)]
+pub struct WalletPassphraseRequest {
+    passphrase: String,
+}
+
+#[derive(serde::Deserialize)]
+pub struct WalletFileRequest {
+    path: String,
+    passphrase: String,
+}
+
+async fn with_runtime<T, F>(handle: RuntimeHandle, operation: F) -> Result<T, NodeClientError>
+where
+    T: Send + 'static,
+    F: FnOnce(RuntimeHandle) -> Result<T, NodeClientError> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(move || operation(handle))
+        .await
+        .map_err(|_| {
+            startup_error(
+                "wallet_custody_worker_failed",
+                "The wallet security worker stopped unexpectedly. Reopen the wallet.",
+                true,
+            )
+        })?
+}
+
+fn request_passphrase(passphrase: String) -> Result<Zeroizing<Vec<u8>>, NodeClientError> {
+    let passphrase = Zeroizing::new(passphrase.into_bytes());
+    if (cmfd_node::wallet_backup::MINIMUM_PASSPHRASE_BYTES
+        ..=cmfd_node::wallet_backup::MAXIMUM_PASSPHRASE_BYTES)
+        .contains(&passphrase.len())
+    {
+        Ok(passphrase)
+    } else {
+        Err(NodeClientError {
+            code: "wallet_passphrase_invalid",
+            status: 400,
+            retryable: false,
+            message: "Wallet passphrases must contain between 12 and 1024 bytes.".to_owned(),
+        })
+    }
+}
 
 async fn with_node<T, F>(node: Arc<Mutex<Node>>, operation: F) -> Result<T, NodeClientError>
 where
@@ -135,4 +184,66 @@ pub async fn stop_mining(state: State<'_, RuntimeState>) -> Result<MiningStatus,
                 true,
             )
         })?
+}
+
+#[tauri::command]
+pub async fn get_wallet_custody_status(
+    state: State<'_, RuntimeState>,
+) -> Result<WalletCustodyStatus, NodeClientError> {
+    state.handle().custody_status()
+}
+
+#[tauri::command]
+pub async fn unlock_wallet(
+    state: State<'_, RuntimeState>,
+    request: WalletPassphraseRequest,
+) -> Result<WalletCustodyStatus, NodeClientError> {
+    let passphrase = request_passphrase(request.passphrase)?;
+    with_runtime(state.handle(), move |runtime| runtime.unlock(&passphrase)).await
+}
+
+#[tauri::command]
+pub async fn lock_wallet(
+    state: State<'_, RuntimeState>,
+) -> Result<WalletCustodyStatus, NodeClientError> {
+    with_runtime(state.handle(), |runtime| runtime.lock()).await
+}
+
+#[tauri::command]
+pub async fn backup_wallet(
+    state: State<'_, RuntimeState>,
+    request: WalletFileRequest,
+) -> Result<WalletCustodyStatus, NodeClientError> {
+    let path = PathBuf::from(request.path);
+    let passphrase = request_passphrase(request.passphrase)?;
+    with_runtime(state.handle(), move |runtime| {
+        runtime.backup(&path, &passphrase)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn migrate_wallet_encryption(
+    state: State<'_, RuntimeState>,
+    request: WalletFileRequest,
+) -> Result<WalletCustodyStatus, NodeClientError> {
+    let path = PathBuf::from(request.path);
+    let passphrase = request_passphrase(request.passphrase)?;
+    with_runtime(state.handle(), move |runtime| {
+        runtime.migrate(&path, &passphrase)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn restore_wallet(
+    state: State<'_, RuntimeState>,
+    request: WalletFileRequest,
+) -> Result<WalletCustodyStatus, NodeClientError> {
+    let path = PathBuf::from(request.path);
+    let passphrase = request_passphrase(request.passphrase)?;
+    with_runtime(state.handle(), move |runtime| {
+        runtime.restore(&path, &passphrase)
+    })
+    .await
 }

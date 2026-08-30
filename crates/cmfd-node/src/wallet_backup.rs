@@ -39,6 +39,13 @@ pub struct WalletBackupInfo {
     pub bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalletKeyStorage {
+    Missing,
+    Plaintext,
+    Encrypted,
+}
+
 #[derive(Debug, Error)]
 pub enum WalletBackupError {
     #[error(transparent)]
@@ -64,6 +71,8 @@ pub enum WalletBackupError {
     AuthenticationFailed,
     #[error("wallet backup key does not match its authenticated destination")]
     DestinationMismatch,
+    #[error("wallet key is already encrypted")]
+    AlreadyEncrypted,
 }
 
 fn io_error(operation: &'static str, path: &Path, source: io::Error) -> WalletBackupError {
@@ -79,6 +88,25 @@ fn validate_passphrase(passphrase: &[u8]) -> Result<(), WalletBackupError> {
         Ok(())
     } else {
         Err(WalletBackupError::InvalidPassphrase)
+    }
+}
+
+pub fn inspect_wallet_key_storage(data_dir: &Path) -> Result<WalletKeyStorage, WalletBackupError> {
+    let path = data_dir.join(WALLET_KEY_FILE);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            return Ok(WalletKeyStorage::Missing);
+        }
+        Err(source) => return Err(io_error("inspect wallet key", &path, source)),
+    };
+    if !metadata.file_type().is_file() {
+        return Err(WalletBackupError::InvalidWalletKey);
+    }
+    match metadata.len() as usize {
+        SECRET_BYTES => Ok(WalletKeyStorage::Plaintext),
+        ENCRYPTED_WALLET_KEY_BYTES => Ok(WalletKeyStorage::Encrypted),
+        _ => Err(WalletBackupError::InvalidWalletKey),
     }
 }
 
@@ -368,6 +396,57 @@ pub fn restore_encrypted_wallet_backup(
     Ok(info)
 }
 
+pub fn migrate_plaintext_wallet_key(
+    data_dir: &Path,
+    backup_output: &Path,
+    network_id: [u8; 32],
+    passphrase: &[u8],
+) -> Result<WalletBackupInfo, WalletBackupError> {
+    validate_passphrase(passphrase)?;
+    let _data_dir_lock = DataDirLock::acquire(data_dir)?;
+    match inspect_wallet_key_storage(data_dir)? {
+        WalletKeyStorage::Plaintext => {}
+        WalletKeyStorage::Encrypted => return Err(WalletBackupError::AlreadyEncrypted),
+        WalletKeyStorage::Missing => return Err(WalletBackupError::InvalidWalletKey),
+    }
+
+    let (secret, _) = read_wallet_secret(data_dir, network_id, passphrase)?;
+    let (backup, info) = encrypt_wallet_key_bytes(&secret, network_id, passphrase)?;
+    let (encrypted_live_key, live_info) =
+        encrypt_wallet_key_bytes(&secret, network_id, passphrase)?;
+    if live_info.destination != info.destination {
+        return Err(WalletBackupError::DestinationMismatch);
+    }
+
+    // The separately randomized backup is durable before the live key changes.
+    write_private_create_new(backup_output, &backup)?;
+
+    let wallet_path = data_dir.join(WALLET_KEY_FILE);
+    let mut suffix = [0_u8; 8];
+    getrandom::fill(&mut suffix).map_err(|source| {
+        io_error(
+            "generate wallet migration path",
+            &wallet_path,
+            io::Error::other(source.to_string()),
+        )
+    })?;
+    let temporary_path = data_dir.join(format!(
+        ".{WALLET_KEY_FILE}.migration-{}",
+        hex::encode(suffix)
+    ));
+    write_private_create_new(&temporary_path, &encrypted_live_key)?;
+    if let Err(source) = fs::rename(&temporary_path, &wallet_path) {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(io_error(
+            "replace plaintext wallet key",
+            &wallet_path,
+            source,
+        ));
+    }
+    sync_parent_directory(&wallet_path).map_err(WalletBackupError::Node)?;
+    Ok(info)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -557,6 +636,56 @@ mod tests {
             Err(WalletBackupError::Node(NodeError::DataDirLocked(_)))
         ));
         drop(held_lock);
+        let _ = fs::remove_dir_all(source);
+    }
+
+    #[test]
+    fn plaintext_migration_creates_an_independent_backup_before_encrypting_live_key() {
+        let source = test_dir("migration-source");
+        let restored = test_dir("migration-restored");
+        let backup = source.with_extension("migration.cmfd-wallet-backup");
+        let destination = write_test_key(&source, 0x79);
+        let network_id = [0x92; 32];
+        let passphrase = b"correct horse battery staple";
+        assert_eq!(
+            inspect_wallet_key_storage(&source).unwrap(),
+            WalletKeyStorage::Plaintext
+        );
+
+        let migrated =
+            migrate_plaintext_wallet_key(&source, &backup, network_id, passphrase).unwrap();
+        assert_eq!(migrated.destination, destination);
+        assert_eq!(
+            inspect_wallet_key_storage(&source).unwrap(),
+            WalletKeyStorage::Encrypted
+        );
+        let live_bytes = fs::read(source.join(WALLET_KEY_FILE)).unwrap();
+        let backup_bytes = fs::read(&backup).unwrap();
+        assert_ne!(live_bytes, backup_bytes);
+        let (_, live_info) = decrypt_wallet_key_bytes(&live_bytes, network_id, passphrase).unwrap();
+        let (_, backup_info) =
+            decrypt_wallet_key_bytes(&backup_bytes, network_id, passphrase).unwrap();
+        assert_eq!(live_info.destination, destination);
+        assert_eq!(backup_info.destination, destination);
+
+        restore_encrypted_wallet_backup(&backup, &restored, network_id, passphrase).unwrap();
+        assert!(matches!(
+            migrate_plaintext_wallet_key(&source, &backup, network_id, passphrase),
+            Err(WalletBackupError::AlreadyEncrypted)
+        ));
+        let _ = fs::remove_file(backup);
+        let _ = fs::remove_dir_all(source);
+        let _ = fs::remove_dir_all(restored);
+    }
+
+    #[test]
+    fn wallet_storage_inspection_rejects_non_files() {
+        let source = test_dir("inspection-source");
+        fs::create_dir_all(source.join(WALLET_KEY_FILE)).unwrap();
+        assert!(matches!(
+            inspect_wallet_key_storage(&source),
+            Err(WalletBackupError::InvalidWalletKey)
+        ));
         let _ = fs::remove_dir_all(source);
     }
 }

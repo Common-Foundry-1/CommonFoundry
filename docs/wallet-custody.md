@@ -47,5 +47,21 @@ they are not silently rewritten. RCNet refuses plaintext live keys and requires
 the passphrase option when creating or opening its wallet. The decrypted key
 exists only in process memory while the wallet is running.
 
-A guided GUI migration/unlock/relock experience and external custody review
-remain required before a mainnet wallet release.
+The desktop wallet also provides **Wallet security** from its shield button. It
+supports the same fail-closed operations without putting a passphrase in a
+process command line:
+
+- create a new encrypted wallet or unlock an existing one;
+- migrate a Devnet plaintext key by creating a separate encrypted backup first,
+  then atomically replacing the live key;
+- create a new no-overwrite authenticated backup;
+- restore into a keyless wallet data directory; and
+- lock the wallet, stop its embedded services, and release the decrypted
+  signing key from memory.
+
+The interface never persists a passphrase in browser storage or wallet
+settings. Backup, migration, and restore paths must be absolute. Backup and
+migration leave the wallet locked so the operator explicitly unlocks it after
+moving the backup to its intended offline location.
+
+An external custody review remains required before a mainnet wallet release.

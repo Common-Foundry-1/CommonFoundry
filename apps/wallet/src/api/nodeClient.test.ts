@@ -16,6 +16,12 @@ describe("Tauri node transport", () => {
     await transport.sendWalletTransaction({ recipient: "11".repeat(32), amount: "1", fee: "0.00000001" });
     await transport.consolidateWallet({ fee: "0.00000001", max_inputs: 12 });
     await transport.mineDevnetBlock("22".repeat(32), 50);
+    await transport.getWalletCustodyStatus();
+    await transport.unlockWallet("correct horse battery staple");
+    await transport.lockWallet();
+    await transport.backupWallet("C:\\offline\\wallet.cmfd-backup", "correct horse battery staple");
+    await transport.migrateWalletEncryption("C:\\offline\\wallet.cmfd-backup", "correct horse battery staple");
+    await transport.restoreWallet("C:\\offline\\wallet.cmfd-backup", "correct horse battery staple");
 
     expect(invokeMock.mock.calls).toEqual([
       ["get_node_status", undefined],
@@ -26,6 +32,12 @@ describe("Tauri node transport", () => {
       ["send_wallet_transaction", { request: { recipient: "11".repeat(32), amount: "1", fee: "0.00000001" } }],
       ["consolidate_wallet", { request: { fee: "0.00000001", max_inputs: 12 } }],
       ["mine_devnet_block", { request: { miner: "22".repeat(32), attempts: 50 } }],
+      ["get_wallet_custody_status", undefined],
+      ["unlock_wallet", { request: { passphrase: "correct horse battery staple" } }],
+      ["lock_wallet", undefined],
+      ["backup_wallet", { request: { path: "C:\\offline\\wallet.cmfd-backup", passphrase: "correct horse battery staple" } }],
+      ["migrate_wallet_encryption", { request: { path: "C:\\offline\\wallet.cmfd-backup", passphrase: "correct horse battery staple" } }],
+      ["restore_wallet", { request: { path: "C:\\offline\\wallet.cmfd-backup", passphrase: "correct horse battery staple" } }],
     ]);
   });
 

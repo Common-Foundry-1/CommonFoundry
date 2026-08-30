@@ -1,6 +1,6 @@
-import { AlertTriangle, RefreshCw, Settings2, X } from "lucide-react";
-import { useCallback, useState } from "react";
-import { usesEmbeddedNode } from "./api/nodeClient";
+import { AlertTriangle, RefreshCw, Settings2, ShieldCheck, X } from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
+import { getWalletCustodyStatus, usesEmbeddedNode } from "./api/nodeClient";
 import { ConsolidationDialog } from "./components/ConsolidationDialog";
 import { MobileNav } from "./components/MobileNav";
 import { MiningView } from "./components/MiningView";
@@ -10,7 +10,9 @@ import { ReceiveDialog } from "./components/ReceiveDialog";
 import { SendDialog } from "./components/SendDialog";
 import { Sidebar, type ViewName } from "./components/Sidebar";
 import { TransactionsView } from "./components/TransactionsView";
+import { WalletSecurityDialog } from "./components/WalletSecurityDialog";
 import { useWalletData } from "./hooks/useWalletData";
+import type { WalletCustodyStatus } from "./types";
 
 const TITLES: Record<ViewName, { eyebrow: string; title: string }> = {
   overview: { eyebrow: "Common Foundry Wallet", title: "Overview" },
@@ -24,6 +26,9 @@ export function App() {
   const [sendOpen, setSendOpen] = useState(false);
   const [receiveOpen, setReceiveOpen] = useState(false);
   const [consolidateOpen, setConsolidateOpen] = useState(false);
+  const [securityOpen, setSecurityOpen] = useState(false);
+  const [custody, setCustody] = useState<WalletCustodyStatus | null>(null);
+  const [custodyError, setCustodyError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const data = useWalletData();
   const networkShortName = data.status?.network_short_name ?? "Network";
@@ -42,6 +47,24 @@ export function App() {
     setNotice(message);
     window.setTimeout(() => setNotice((current) => (current === message ? null : current)), 4_500);
   }, []);
+
+  const refreshCustody = useCallback(async () => {
+    if (!usesEmbeddedNode) return;
+    try {
+      const next = await getWalletCustodyStatus();
+      setCustody(next);
+      setCustodyError(null);
+    } catch (cause) {
+      setCustodyError(cause instanceof Error ? cause.message : "Wallet security status is unavailable.");
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshCustody();
+  }, [refreshCustody]);
+
+  const custodyRequired = usesEmbeddedNode && custody !== null && !custody.unlocked;
+  const custodyNeedsAttention = usesEmbeddedNode && (custody?.requires_migration || custodyRequired);
 
   return (
     <div className="app-shell">
@@ -65,7 +88,18 @@ export function App() {
               <span />
               {data.error ? "Node offline" : `${networkShortName} Connected`}
             </div>
-            <button className="icon-button topbar-settings" type="button" onClick={() => setView("network")} aria-label="Open node settings">
+            {usesEmbeddedNode ? (
+              <button
+                className={`icon-button topbar-settings${custodyNeedsAttention ? " needs-attention" : ""}`}
+                type="button"
+                onClick={() => setSecurityOpen(true)}
+                aria-label="Open wallet security"
+                title="Wallet security"
+              >
+                <ShieldCheck aria-hidden="true" size={18} />
+              </button>
+            ) : null}
+            <button className="icon-button topbar-settings topbar-node-settings" type="button" onClick={() => setView("network")} aria-label="Open node settings">
               <Settings2 aria-hidden="true" size={18} />
             </button>
           </div>
@@ -78,6 +112,13 @@ export function App() {
             {` · ${data.status?.network_notice ?? "Network status unavailable"}`}
           </span>
         </div>
+
+        {custody?.requires_migration ? (
+          <button className="custody-banner" type="button" onClick={() => setSecurityOpen(true)}>
+            <ShieldCheck aria-hidden="true" size={17} />
+            <span><strong>Protect this wallet</strong> · Create an authenticated backup and encrypt the local signing key.</span>
+          </button>
+        ) : null}
 
         {data.error ? (
           <div className="offline-banner" role="alert">
@@ -161,6 +202,21 @@ export function App() {
         onClose={closeConsolidation}
         onCompleted={showNotice}
         onRefresh={data.refresh}
+      />
+      <WalletSecurityDialog
+        open={securityOpen || custodyRequired}
+        required={custodyRequired}
+        status={custody}
+        statusError={custodyError}
+        onClose={() => setSecurityOpen(false)}
+        onStatusChange={(next) => {
+          setCustody(next);
+          setCustodyError(null);
+        }}
+        onCompleted={showNotice}
+        onRefresh={async () => {
+          await Promise.allSettled([data.refresh(), refreshCustody()]);
+        }}
       />
 
       {notice ? (

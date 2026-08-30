@@ -35,8 +35,13 @@ RECEIPT_SCHEMA = "CMFD_NATIVE_BUILD_RECEIPT_V1"
 BUILDINFO_SCHEMA = "CMFD_RELEASE_BUILDINFO_V1"
 BUILDINFO_NAME = "BUILDINFO.json"
 CHECKSUM_NAME = "SHA256SUMS.txt"
+CHECKSUM_SIGNATURE_NAME = "SHA256SUMS.txt.sig"
+RELEASE_SIGNATURE_NAMESPACE = "commonfoundry-release"
 MAX_RECEIPT_BYTES = 64 * 1024
 MAX_BUILDINFO_BYTES = 4 * 1024 * 1024
+MAX_CHECKSUM_BYTES = 4 * 1024 * 1024
+MAX_RELEASE_SIGNATURE_BYTES = 64 * 1024
+MAX_ALLOWED_SIGNERS_BYTES = 1024 * 1024
 MAX_DEB_BYTES = 512 * 1024 * 1024
 MAX_DEB_MEMBERS = 100_000
 MAX_RELEASE_GATE_JSON_BYTES = 1024 * 1024
@@ -53,6 +58,7 @@ TAR_BLOCK_BYTES = 512
 TAR_RECORD_BYTES = 10_240
 FULL_COMMIT_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 HEX256_RE = re.compile(r"[0-9a-f]{64}\Z")
+SIGNER_IDENTITY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9@._+-]{0,127}\Z")
 PRODUCTION_RC_NETWORK_INFO_NAME = "NETWORK-INFO.json"
 PRODUCTION_RC_LAUNCH_CANDIDATE_NAME = "RCNET-LAUNCH-CANDIDATE.json"
 PRODUCTION_V3_ACTIVATION_NAME = "PRODUCTION-V3-ACTIVATION.json"
@@ -3127,7 +3133,7 @@ def _inventory_names(path: Path) -> tuple[list[str], bytes]:
     if not names or names != sorted(set(names)):
         raise IntegrityError("release inventory must be non-empty, sorted, and unique")
     for name in names:
-        if name in (BUILDINFO_NAME, CHECKSUM_NAME):
+        if name in (BUILDINFO_NAME, CHECKSUM_NAME, CHECKSUM_SIGNATURE_NAME):
             raise IntegrityError(f"release inventory must not list generated {name}")
         safe = _safe_repo_relative(name)
         if "/" in safe:
@@ -3215,7 +3221,91 @@ def _read_buildinfo(path: Path) -> tuple[dict[str, object], bytes]:
     return value, data
 
 
-def verify_release(
+def verify_release_signature(
+    *,
+    stage: Path,
+    allowed_signers: Path,
+    signer_identity: str,
+    ssh_keygen: Path,
+) -> dict[str, object]:
+    """Verify the canonical checksum file with an explicitly trusted SSH signer."""
+
+    stage = _regular_directory(stage, "release staging path")
+    if not SIGNER_IDENTITY_RE.fullmatch(signer_identity):
+        raise IntegrityError("release signer identity is malformed")
+    verifier = _regular_file(ssh_keygen, "OpenSSH signature verifier")
+    allowed = _regular_file(allowed_signers, "trusted release signer policy")
+    signature = _regular_file(
+        stage / CHECKSUM_SIGNATURE_NAME, "release checksum signature"
+    )
+    with _stable_regular_handle(
+        stage / CHECKSUM_NAME, "release checksum file"
+    ) as (_, checksum_handle, checksum_stat):
+        if checksum_stat.st_size > MAX_CHECKSUM_BYTES:
+            raise IntegrityError("release checksum file exceeds its size limit")
+        checksum = checksum_handle.read(MAX_CHECKSUM_BYTES + 1)
+    with _stable_regular_handle(signature, "release checksum signature") as (
+        _,
+        signature_handle,
+        signature_stat,
+    ):
+        if signature_stat.st_size > MAX_RELEASE_SIGNATURE_BYTES:
+            raise IntegrityError("release checksum signature exceeds its size limit")
+        signature_bytes = signature_handle.read(MAX_RELEASE_SIGNATURE_BYTES + 1)
+    with _stable_regular_handle(allowed, "trusted release signer policy") as (
+        _,
+        allowed_handle,
+        allowed_stat,
+    ):
+        if allowed_stat.st_size > MAX_ALLOWED_SIGNERS_BYTES:
+            raise IntegrityError("trusted release signer policy exceeds its size limit")
+        allowed_bytes = allowed_handle.read(MAX_ALLOWED_SIGNERS_BYTES + 1)
+    verifier_sha256 = _sha256_file(verifier)
+    try:
+        with tempfile.TemporaryDirectory(prefix="cmfd-release-signature-") as directory:
+            verification_directory = Path(directory)
+            allowed_copy = verification_directory / "allowed_signers"
+            signature_copy = verification_directory / CHECKSUM_SIGNATURE_NAME
+            _write_new(allowed_copy, allowed_bytes)
+            _write_new(signature_copy, signature_bytes)
+            completed = subprocess.run(
+                [
+                    str(verifier),
+                    "-Y",
+                    "verify",
+                    "-f",
+                    str(allowed_copy),
+                    "-I",
+                    signer_identity,
+                    "-n",
+                    RELEASE_SIGNATURE_NAMESPACE,
+                    "-s",
+                    str(signature_copy),
+                ],
+                cwd=stage,
+                input=checksum,
+                check=False,
+                capture_output=True,
+                timeout=30,
+            )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise IntegrityError("release signature verifier could not run") from error
+    if _sha256_file(verifier) != verifier_sha256:
+        raise IntegrityError("release signature verifier changed during verification")
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", "replace").strip()
+        raise IntegrityError(f"release checksum signature is invalid: {detail}")
+    return {
+        "allowed_signers_sha256": _sha256_bytes(allowed_bytes),
+        "checksum_sha256": _sha256_bytes(checksum),
+        "namespace": RELEASE_SIGNATURE_NAMESPACE,
+        "signature_sha256": _sha256_bytes(signature_bytes),
+        "signer_identity": signer_identity,
+        "verifier_sha256": verifier_sha256,
+    }
+
+
+def _verify_release(
     *,
     repo: Path,
     expected_commit: str,
@@ -3223,7 +3313,8 @@ def verify_release(
     stage: Path,
     inventory: Path,
     source_date_epoch: str | int | None,
-) -> dict[str, object]:
+    required_generated_files: frozenset[str] = frozenset(),
+) -> tuple[dict[str, object], str]:
     repo = repo.resolve(strict=True)
     commit = _assert_clean_exact_repo(repo, expected_commit)
     epoch = _source_date_epoch(repo, source_date_epoch)
@@ -3234,7 +3325,13 @@ def verify_release(
         version=version, commit=commit, stage_files=stage_files
     )
     validate_production_rc_source_versions(repo=repo, version=version)
-    expected_names = set(names) | {BUILDINFO_NAME, CHECKSUM_NAME}
+    if not required_generated_files.issubset({CHECKSUM_SIGNATURE_NAME}):
+        raise IntegrityError("unsupported generated release file requirement")
+    expected_names = set(names) | {
+        BUILDINFO_NAME,
+        CHECKSUM_NAME,
+        *required_generated_files,
+    }
     if set(stage_files) != expected_names:
         missing = sorted(expected_names - set(stage_files))
         unexpected = sorted(set(stage_files) - expected_names)
@@ -3255,13 +3352,72 @@ def verify_release(
         raise IntegrityError(
             "BUILDINFO.json does not match source, inventory, or artifacts"
         )
-    checksum_bytes = stage_files[CHECKSUM_NAME].read_bytes()
+    with _stable_regular_handle(
+        stage_files[CHECKSUM_NAME], "release checksum file"
+    ) as (_, checksum_handle, checksum_stat):
+        if checksum_stat.st_size > MAX_CHECKSUM_BYTES:
+            raise IntegrityError("release checksum file exceeds its size limit")
+        checksum_bytes = checksum_handle.read(MAX_CHECKSUM_BYTES + 1)
     expected_checksums = _checksum_bytes(assets, buildinfo_bytes)
     if checksum_bytes != expected_checksums:
         raise IntegrityError(
             "SHA256SUMS.txt is noncanonical or does not match the artifacts"
         )
-    return expected_info
+    return expected_info, _sha256_bytes(checksum_bytes)
+
+
+def verify_release(
+    *,
+    repo: Path,
+    expected_commit: str,
+    version: str,
+    stage: Path,
+    inventory: Path,
+    source_date_epoch: str | int | None,
+    required_generated_files: frozenset[str] = frozenset(),
+) -> dict[str, object]:
+    release, _ = _verify_release(
+        repo=repo,
+        expected_commit=expected_commit,
+        version=version,
+        stage=stage,
+        inventory=inventory,
+        source_date_epoch=source_date_epoch,
+        required_generated_files=required_generated_files,
+    )
+    return release
+
+
+def verify_signed_release(
+    *,
+    repo: Path,
+    expected_commit: str,
+    version: str,
+    stage: Path,
+    inventory: Path,
+    source_date_epoch: str | int | None,
+    allowed_signers: Path,
+    signer_identity: str,
+    ssh_keygen: Path,
+) -> dict[str, object]:
+    release, checksum_sha256 = _verify_release(
+        repo=repo,
+        expected_commit=expected_commit,
+        version=version,
+        stage=stage,
+        inventory=inventory,
+        source_date_epoch=source_date_epoch,
+        required_generated_files=frozenset({CHECKSUM_SIGNATURE_NAME}),
+    )
+    signature = verify_release_signature(
+        stage=stage,
+        allowed_signers=allowed_signers,
+        signer_identity=signer_identity,
+        ssh_keygen=ssh_keygen,
+    )
+    if signature["checksum_sha256"] != checksum_sha256:
+        raise IntegrityError("release checksum changed during signed verification")
+    return {"release": release, "signature": signature}
 
 
 def finalize_release(
@@ -3400,6 +3556,13 @@ def _parser() -> argparse.ArgumentParser:
         "verify", help="re-verify canonical release metadata and assets"
     )
     _add_release_common(verify)
+    verify_signed = commands.add_parser(
+        "verify-signed", help="verify release metadata, assets, and trusted signature"
+    )
+    _add_release_common(verify_signed)
+    verify_signed.add_argument("--allowed-signers", type=Path, required=True)
+    verify_signed.add_argument("--signer-identity", required=True)
+    verify_signed.add_argument("--ssh-keygen", type=Path, required=True)
     return parser
 
 
@@ -3469,6 +3632,19 @@ def main(arguments: list[str] | None = None) -> int:
                 stage=args.stage,
                 inventory=args.inventory,
                 source_date_epoch=args.source_date_epoch,
+            )
+            print(json.dumps(result, sort_keys=True))
+        elif args.command == "verify-signed":
+            result = verify_signed_release(
+                repo=args.repo,
+                expected_commit=args.expected_commit,
+                version=args.version,
+                stage=args.stage,
+                inventory=args.inventory,
+                source_date_epoch=args.source_date_epoch,
+                allowed_signers=args.allowed_signers,
+                signer_identity=args.signer_identity,
+                ssh_keygen=args.ssh_keygen,
             )
             print(json.dumps(result, sort_keys=True))
         else:  # pragma: no cover - argparse guarantees a known command.

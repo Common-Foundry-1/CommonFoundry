@@ -6,6 +6,7 @@ import gzip
 import io
 import json
 import os
+import shutil
 import stat
 import struct
 import subprocess
@@ -112,6 +113,115 @@ class GitFixture:
     @property
     def commit(self) -> str:
         return self.git("rev-parse", "HEAD")
+
+
+class ReleaseSignatureTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.stage = self.root / "stage"
+        self.stage.mkdir()
+        (self.stage / integrity.CHECKSUM_NAME).write_bytes(b"00  artifact.zip\n")
+        (self.stage / integrity.CHECKSUM_SIGNATURE_NAME).write_bytes(b"signature")
+        self.allowed = self.root / "allowed_signers"
+        self.allowed.write_text(
+            "release@example.invalid ssh-ed25519 AAAAfixture\n", encoding="utf-8"
+        )
+        self.verifier = self.root / "ssh-keygen"
+        self.verifier.write_bytes(b"verifier")
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    @mock.patch("release_integrity.subprocess.run")
+    def test_signature_verification_is_bound_to_policy_and_namespace(self, run) -> None:
+        run.return_value = subprocess.CompletedProcess([], 0, b"Good signature\n", b"")
+        receipt = integrity.verify_release_signature(
+            stage=self.stage,
+            allowed_signers=self.allowed,
+            signer_identity="release@example.invalid",
+            ssh_keygen=self.verifier,
+        )
+        command = run.call_args.args[0]
+        self.assertEqual(command[1:3], ["-Y", "verify"])
+        self.assertIn(integrity.RELEASE_SIGNATURE_NAMESPACE, command)
+        self.assertEqual(run.call_args.kwargs["input"], b"00  artifact.zip\n")
+        self.assertEqual(receipt["signer_identity"], "release@example.invalid")
+
+    @mock.patch("release_integrity.subprocess.run")
+    def test_bad_signature_and_identity_fail_closed(self, run) -> None:
+        run.return_value = subprocess.CompletedProcess([], 255, b"", b"bad signature")
+        with self.assertRaisesRegex(integrity.IntegrityError, "invalid"):
+            integrity.verify_release_signature(
+                stage=self.stage,
+                allowed_signers=self.allowed,
+                signer_identity="release@example.invalid",
+                ssh_keygen=self.verifier,
+            )
+        with self.assertRaisesRegex(integrity.IntegrityError, "identity"):
+            integrity.verify_release_signature(
+                stage=self.stage,
+                allowed_signers=self.allowed,
+                signer_identity="bad identity",
+                ssh_keygen=self.verifier,
+            )
+
+    def test_ephemeral_openssh_signature_round_trip(self) -> None:
+        executable = shutil.which("ssh-keygen")
+        if executable is None:
+            self.skipTest("OpenSSH ssh-keygen is unavailable")
+        signature = self.stage / integrity.CHECKSUM_SIGNATURE_NAME
+        signature.unlink()
+        key = self.root / "release-key"
+        subprocess.run(
+            [
+                executable,
+                "-q",
+                "-t",
+                "ed25519",
+                "-N",
+                "",
+                "-C",
+                "release@example.invalid",
+                "-f",
+                str(key),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                executable,
+                "-Y",
+                "sign",
+                "-f",
+                str(key),
+                "-n",
+                integrity.RELEASE_SIGNATURE_NAMESPACE,
+                str(self.stage / integrity.CHECKSUM_NAME),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        public_key = key.with_suffix(".pub").read_text(encoding="utf-8").strip()
+        self.allowed.write_text(
+            f"release@example.invalid {public_key}\n", encoding="utf-8"
+        )
+        receipt = integrity.verify_release_signature(
+            stage=self.stage,
+            allowed_signers=self.allowed,
+            signer_identity="release@example.invalid",
+            ssh_keygen=Path(executable),
+        )
+        self.assertEqual(receipt["namespace"], integrity.RELEASE_SIGNATURE_NAMESPACE)
+        (self.stage / integrity.CHECKSUM_NAME).write_bytes(b"11  artifact.zip\n")
+        with self.assertRaisesRegex(integrity.IntegrityError, "invalid"):
+            integrity.verify_release_signature(
+                stage=self.stage,
+                allowed_signers=self.allowed,
+                signer_identity="release@example.invalid",
+                ssh_keygen=Path(executable),
+            )
 
 
 class NativeBuildReceiptTests(unittest.TestCase):
@@ -2128,6 +2238,86 @@ class ReleaseFinalizerTests(unittest.TestCase):
             json.loads(buildinfo_bytes.decode("utf-8"))["commit"],
             self.fixture.commit,
         )
+
+    @mock.patch("release_integrity.verify_release_signature")
+    def test_signed_verify_requires_and_checks_detached_signature(self, verify_signature) -> None:
+        self.make_valid_assets()
+        integrity.finalize_release(
+            repo=self.fixture.root,
+            expected_commit=self.fixture.commit,
+            version="0.1.0-test",
+            stage=self.stage,
+            inventory=self.inventory,
+            source_date_epoch=self.epoch,
+        )
+        allowed = self.fixture.write("target/allowed_signers", "trusted key\n")
+        verifier = self.fixture.write("target/ssh-keygen", b"verifier")
+        with self.assertRaisesRegex(integrity.IntegrityError, "missing"):
+            integrity.verify_signed_release(
+                repo=self.fixture.root,
+                expected_commit=self.fixture.commit,
+                version="0.1.0-test",
+                stage=self.stage,
+                inventory=self.inventory,
+                source_date_epoch=self.epoch,
+                allowed_signers=allowed,
+                signer_identity="release@example.invalid",
+                ssh_keygen=verifier,
+            )
+        (self.stage / integrity.CHECKSUM_SIGNATURE_NAME).write_bytes(b"signature")
+        checksum_sha256 = integrity._sha256_bytes(
+            (self.stage / integrity.CHECKSUM_NAME).read_bytes()
+        )
+        verify_signature.return_value = {
+            "checksum_sha256": checksum_sha256,
+            "signer_identity": "release@example.invalid",
+        }
+        result = integrity.verify_signed_release(
+            repo=self.fixture.root,
+            expected_commit=self.fixture.commit,
+            version="0.1.0-test",
+            stage=self.stage,
+            inventory=self.inventory,
+            source_date_epoch=self.epoch,
+            allowed_signers=allowed,
+            signer_identity="release@example.invalid",
+            ssh_keygen=verifier,
+        )
+        self.assertEqual(
+            result["signature"]["signer_identity"], "release@example.invalid"
+        )
+        verify_signature.assert_called_once()
+
+    @mock.patch("release_integrity.verify_release_signature")
+    def test_signed_verify_rejects_checksum_swap_between_phases(self, verify_signature) -> None:
+        self.make_valid_assets()
+        integrity.finalize_release(
+            repo=self.fixture.root,
+            expected_commit=self.fixture.commit,
+            version="0.1.0-test",
+            stage=self.stage,
+            inventory=self.inventory,
+            source_date_epoch=self.epoch,
+        )
+        (self.stage / integrity.CHECKSUM_SIGNATURE_NAME).write_bytes(b"signature")
+        allowed = self.fixture.write("target/allowed_signers", "trusted key\n")
+        verifier = self.fixture.write("target/ssh-keygen", b"verifier")
+        verify_signature.return_value = {
+            "checksum_sha256": "0" * 64,
+            "signer_identity": "release@example.invalid",
+        }
+        with self.assertRaisesRegex(integrity.IntegrityError, "changed"):
+            integrity.verify_signed_release(
+                repo=self.fixture.root,
+                expected_commit=self.fixture.commit,
+                version="0.1.0-test",
+                stage=self.stage,
+                inventory=self.inventory,
+                source_date_epoch=self.epoch,
+                allowed_signers=allowed,
+                signer_identity="release@example.invalid",
+                ssh_keygen=verifier,
+            )
 
     def test_dirty_source_is_rejected(self) -> None:
         self.make_valid_assets()

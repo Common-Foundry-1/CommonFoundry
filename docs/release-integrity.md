@@ -87,5 +87,29 @@ python scripts/release_integrity.py verify --repo . --expected-commit <commit> -
 
 These commands neither upload nor publish anything. Final download
 authentication still requires the independently verified final checksum file
-to be signed and associated with the signed release tag. The build receipts do
-not replace that signature or an independent reproducible-build comparison.
+to be signed and associated with the signed release tag. Keep the private
+Ed25519 release key offline and outside every checkout. Sign the exact generated
+checksum file with the fixed namespace:
+
+```text
+ssh-keygen -Y sign -f <offline-release-key> -n commonfoundry-release SHA256SUMS.txt
+```
+
+Place the resulting `SHA256SUMS.txt.sig` beside the staged checksum file. The
+trusted signer policy is an externally distributed OpenSSH allowed-signers file
+containing the expected public key and identity. Verify the complete release,
+including the exact inventory and signature, before publication:
+
+```text
+python scripts/release_integrity.py verify-signed \
+  --repo . --expected-commit <commit> --version <version> \
+  --stage <asset-directory> --inventory <tracked-inventory> \
+  --allowed-signers <trusted-allowed-signers> \
+  --signer-identity <release-identity> \
+  --ssh-keygen <trusted-ssh-keygen-path>
+```
+
+The command rejects a missing or extra signature, malformed signer identity,
+untrusted key, wrong namespace, modified checksum, modified asset, or changed
+source identity. Build receipts still do not replace an independent
+reproducible-build comparison.

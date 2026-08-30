@@ -76,9 +76,9 @@ atomically replacing the Tauri output. CI uploads only the final AppImage and
 `.deb`; raw AppDir and Debian staging trees are not release artifacts.
 
 The final flat asset directory is constrained by the tracked
-`packaging/releases/v0.1.0-devnet.14.inventory`. `BUILDINFO.json` and
-`SHA256SUMS.txt` are generated and therefore are intentionally absent from that
-inventory:
+`packaging/releases/v0.1.0-devnet.14.inventory`. `BUILDINFO.json`,
+`SOURCE-SBOM.json`, `PROVENANCE.intoto.jsonl`, and `SHA256SUMS.txt` are generated
+and therefore are intentionally absent from that inventory:
 
 ```text
 python scripts/release_integrity.py finalize --repo . --expected-commit <commit> --version 0.1.0-devnet.14 --stage <asset-directory> --inventory packaging/releases/v0.1.0-devnet.14.inventory
@@ -102,6 +102,15 @@ Both directories are fully reverified against the same clean source commit and
 tracked inventory before every file is stream-compared with bounded memory. A
 difference in generated metadata, file inventory, file size, or file content
 fails the comparison and identifies the differing class or file.
+
+`SOURCE-SBOM.json` is a canonical inventory of every package pinned by the
+tracked Cargo and wallet/pool npm lockfiles. It records source-lock scope
+explicitly: it is not a claim that every locked development dependency is
+reachable from every shipped binary. `PROVENANCE.intoto.jsonl` is an in-toto
+Statement binding the staged artifacts to the exact Git commit and tree,
+tracked inventory, source SBOM, source epoch, and finalizer identity. Its custom
+predicate records release assembly; it does not claim a SLSA build level or
+replace authenticated provenance emitted by an independent build platform.
 
 After that gate passes, keep the private
 Ed25519 release key offline and outside every checkout. Sign the exact generated

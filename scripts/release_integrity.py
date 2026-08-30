@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import tomllib
 import zipfile
 import zlib
 from pathlib import Path, PurePosixPath
@@ -35,11 +36,17 @@ RECEIPT_SCHEMA = "CMFD_NATIVE_BUILD_RECEIPT_V1"
 BUILDINFO_SCHEMA = "CMFD_RELEASE_BUILDINFO_V1"
 REPRODUCIBLE_COMPARISON_SCHEMA = "CMFD_REPRODUCIBLE_RELEASE_COMPARISON_V1"
 BUILDINFO_NAME = "BUILDINFO.json"
+SOURCE_SBOM_NAME = "SOURCE-SBOM.json"
+PROVENANCE_NAME = "PROVENANCE.intoto.jsonl"
 CHECKSUM_NAME = "SHA256SUMS.txt"
 CHECKSUM_SIGNATURE_NAME = "SHA256SUMS.txt.sig"
 RELEASE_SIGNATURE_NAMESPACE = "commonfoundry-release"
 MAX_RECEIPT_BYTES = 64 * 1024
 MAX_BUILDINFO_BYTES = 4 * 1024 * 1024
+MAX_SOURCE_LOCK_BYTES = 16 * 1024 * 1024
+MAX_SOURCE_COMPONENTS = 100_000
+MAX_SOURCE_SBOM_BYTES = 32 * 1024 * 1024
+MAX_PROVENANCE_BYTES = 4 * 1024 * 1024
 MAX_CHECKSUM_BYTES = 4 * 1024 * 1024
 MAX_RELEASE_SIGNATURE_BYTES = 64 * 1024
 MAX_ALLOWED_SIGNERS_BYTES = 1024 * 1024
@@ -107,6 +114,11 @@ PRODUCTION_RC_VERSION_FILES = (
     "crates/cmfd-node/Cargo.toml",
     "crates/cmfd-proof-worker/Cargo.toml",
 )
+SOURCE_LOCK_FILES = (
+    "Cargo.lock",
+    "apps/pool-dashboard/package-lock.json",
+    "apps/wallet/package-lock.json",
+)
 SOURCE_ASSET_TOKEN_RE = re.compile(
     r"(?:^|[-_.])(source|sources|src)(?:[-_.]|$)", re.IGNORECASE
 )
@@ -162,6 +174,14 @@ def is_production_rc_label(label: str) -> bool:
 def reject_production_rc_source_assets(stage_files: dict[str, Path]) -> None:
     """Keep reviewed binary stages from accidentally carrying source bundles."""
     for name in stage_files:
+        if name in {
+            BUILDINFO_NAME,
+            SOURCE_SBOM_NAME,
+            PROVENANCE_NAME,
+            CHECKSUM_NAME,
+            CHECKSUM_SIGNATURE_NAME,
+        }:
+            continue
         normalized = name.strip().lower()
         if (
             SOURCE_ASSET_TOKEN_RE.search(normalized)
@@ -3134,7 +3154,13 @@ def _inventory_names(path: Path) -> tuple[list[str], bytes]:
     if not names or names != sorted(set(names)):
         raise IntegrityError("release inventory must be non-empty, sorted, and unique")
     for name in names:
-        if name in (BUILDINFO_NAME, CHECKSUM_NAME, CHECKSUM_SIGNATURE_NAME):
+        if name in (
+            BUILDINFO_NAME,
+            SOURCE_SBOM_NAME,
+            PROVENANCE_NAME,
+            CHECKSUM_NAME,
+            CHECKSUM_SIGNATURE_NAME,
+        ):
             raise IntegrityError(f"release inventory must not list generated {name}")
         safe = _safe_repo_relative(name)
         if "/" in safe:
@@ -3172,6 +3198,165 @@ def _canonical_json(value: object) -> bytes:
     ).encode("utf-8")
 
 
+def _source_lock_blobs(repo: Path) -> dict[str, bytes]:
+    blobs = {}
+    for relative in SOURCE_LOCK_FILES:
+        data = _tracked_blob(repo, relative)
+        if len(data) > MAX_SOURCE_LOCK_BYTES:
+            raise IntegrityError(f"source lockfile exceeds its size limit: {relative}")
+        blobs[relative] = data
+    return blobs
+
+
+def _npm_package_name(location: str, package: dict[str, object]) -> str:
+    declared = package.get("name")
+    if isinstance(declared, str) and declared:
+        return _single_line("npm package name", declared)
+    marker = "node_modules/"
+    if marker not in location:
+        raise IntegrityError(f"npm lockfile package has no name: {location}")
+    return _single_line("npm package name", location.rsplit(marker, 1)[1])
+
+
+def _expected_source_sbom(
+    *, repo: Path, commit: str, version: str
+) -> dict[str, object]:
+    blobs = _source_lock_blobs(repo)
+    try:
+        cargo = tomllib.loads(blobs["Cargo.lock"].decode("utf-8", "strict"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise IntegrityError("Cargo.lock is not valid UTF-8 TOML") from error
+    packages = cargo.get("package")
+    if not isinstance(packages, list):
+        raise IntegrityError("Cargo.lock has no package inventory")
+    components: list[dict[str, object]] = []
+    for package in packages:
+        if not isinstance(package, dict):
+            raise IntegrityError("Cargo.lock package inventory is malformed")
+        name = package.get("name")
+        locked_version = package.get("version")
+        if not isinstance(name, str) or not isinstance(locked_version, str):
+            raise IntegrityError("Cargo.lock package identity is malformed")
+        component: dict[str, object] = {
+            "ecosystem": "cargo",
+            "name": _single_line("Cargo package name", name),
+            "version": _single_line("Cargo package version", locked_version),
+        }
+        source = package.get("source")
+        checksum = package.get("checksum")
+        if source is not None:
+            if not isinstance(source, str):
+                raise IntegrityError("Cargo.lock package source is malformed")
+            component["source"] = _single_line("Cargo package source", source)
+        if checksum is not None:
+            if not isinstance(checksum, str) or not HEX256_RE.fullmatch(checksum):
+                raise IntegrityError("Cargo.lock package checksum is malformed")
+            component["sha256"] = checksum
+        if isinstance(source, str) and source.startswith("registry+") and checksum is None:
+            raise IntegrityError("Cargo registry package lacks a checksum")
+        components.append(component)
+    for relative in SOURCE_LOCK_FILES[1:]:
+        try:
+            lock = json.loads(blobs[relative].decode("utf-8", "strict"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise IntegrityError(f"npm lockfile is not valid UTF-8 JSON: {relative}") from error
+        npm_packages = lock.get("packages") if isinstance(lock, dict) else None
+        if (
+            not isinstance(lock, dict)
+            or lock.get("lockfileVersion") != 3
+            or not isinstance(npm_packages, dict)
+        ):
+            raise IntegrityError(f"npm lockfile does not use package-lock v3: {relative}")
+        for location, package in npm_packages.items():
+            if location == "":
+                continue
+            if not isinstance(location, str) or not isinstance(package, dict):
+                raise IntegrityError(f"npm package inventory is malformed: {relative}")
+            locked_version = package.get("version")
+            integrity = package.get("integrity")
+            if not isinstance(locked_version, str) or not isinstance(integrity, str):
+                raise IntegrityError(f"npm package identity is incomplete: {relative}")
+            if len(integrity) > 4096:
+                raise IntegrityError(f"npm package integrity is too long: {relative}")
+            development = package.get("dev", False)
+            if not isinstance(development, bool):
+                raise IntegrityError(f"npm package development flag is malformed: {relative}")
+            components.append(
+                {
+                    "development": development,
+                    "ecosystem": "npm",
+                    "integrity": _single_line("npm package integrity", integrity),
+                    "lockfile": relative,
+                    "location": _single_line("npm package location", location),
+                    "name": _npm_package_name(location, package),
+                    "version": _single_line("npm package version", locked_version),
+                }
+            )
+    if not components or len(components) > MAX_SOURCE_COMPONENTS:
+        raise IntegrityError("source dependency inventory has an invalid component count")
+    components.sort(
+        key=lambda component: (
+            component["ecosystem"],
+            component["name"],
+            component["version"],
+            component.get("lockfile", ""),
+            component.get("location", ""),
+            component.get("source", ""),
+        )
+    )
+    manifests = [
+        {"path": relative, "sha256": _sha256_bytes(blobs[relative])}
+        for relative in SOURCE_LOCK_FILES
+    ]
+    return {
+        "commit": commit,
+        "component_count": len(components),
+        "components": components,
+        "manifests": manifests,
+        "schema": "CMFD_SOURCE_DEPENDENCY_SBOM_V1",
+        "scope": "source-lockfiles",
+        "source_tree": _run_git(repo, "rev-parse", "HEAD^{tree}").lower(),
+        "version": _single_line("version", version),
+    }
+
+
+def _expected_release_provenance(
+    *, buildinfo: dict[str, object], source_sbom_bytes: bytes
+) -> dict[str, object]:
+    artifacts = buildinfo["artifacts"]
+    if not isinstance(artifacts, list):
+        raise IntegrityError("release artifact inventory is malformed")
+    subjects = [
+        {"digest": {"sha256": artifact["sha256"]}, "name": artifact["name"]}
+        for artifact in artifacts
+    ]
+    return {
+        "_type": "https://in-toto.io/Statement/v1",
+        "predicate": {
+            "inventorySha256": buildinfo["inventory_sha256"],
+            "source": {
+                "digest": {
+                    "gitCommit": buildinfo["commit"],
+                    "gitTree": buildinfo["source_tree"],
+                },
+                "uri": "git+https://github.com/Common-Foundry-1/CommonFoundry.git",
+            },
+            "sourceDateEpoch": buildinfo["source_date_epoch"],
+            "sourceSbom": {
+                "digest": {"sha256": _sha256_bytes(source_sbom_bytes)},
+                "name": SOURCE_SBOM_NAME,
+            },
+            "tool": {
+                "digest": {"sha256": buildinfo["finalizer_sha256"]},
+                "name": "scripts/release_integrity.py",
+            },
+            "version": buildinfo["version"],
+        },
+        "predicateType": "https://commonfoundry.org/attestations/release-assembly/v1",
+        "subject": subjects,
+    }
+
+
 def _expected_buildinfo(
     *,
     repo: Path,
@@ -3202,10 +3387,21 @@ def _expected_buildinfo(
     }
 
 
-def _checksum_bytes(assets: dict[str, Path], buildinfo_bytes: bytes) -> bytes:
+def _checksum_bytes(
+    assets: dict[str, Path], generated_files: dict[str, bytes]
+) -> bytes:
     rows = {name: _sha256_file(path) for name, path in assets.items()}
-    rows[BUILDINFO_NAME] = _sha256_bytes(buildinfo_bytes)
+    rows.update(
+        {name: _sha256_bytes(data) for name, data in generated_files.items()}
+    )
     return ("".join(f"{rows[name]}  {name}\n" for name in sorted(rows))).encode("utf-8")
+
+
+def _read_bounded_generated_file(path: Path, label: str, maximum: int) -> bytes:
+    with _stable_regular_handle(path, label) as (_, handle, opened):
+        if opened.st_size > maximum:
+            raise IntegrityError(f"{label} exceeds its size limit")
+        return handle.read(maximum + 1)
 
 
 def _read_buildinfo(path: Path) -> tuple[dict[str, object], bytes]:
@@ -3330,6 +3526,8 @@ def _verify_release(
         raise IntegrityError("unsupported generated release file requirement")
     expected_names = set(names) | {
         BUILDINFO_NAME,
+        SOURCE_SBOM_NAME,
+        PROVENANCE_NAME,
         CHECKSUM_NAME,
         *required_generated_files,
     }
@@ -3353,13 +3551,40 @@ def _verify_release(
         raise IntegrityError(
             "BUILDINFO.json does not match source, inventory, or artifacts"
         )
+    source_sbom_bytes = _canonical_json(
+        _expected_source_sbom(repo=repo, commit=commit, version=version)
+    )
+    actual_source_sbom = _read_bounded_generated_file(
+        stage_files[SOURCE_SBOM_NAME], SOURCE_SBOM_NAME, MAX_SOURCE_SBOM_BYTES
+    )
+    if actual_source_sbom != source_sbom_bytes:
+        raise IntegrityError("SOURCE-SBOM.json does not match the tracked lockfiles")
+    provenance_bytes = _canonical_json(
+        _expected_release_provenance(
+            buildinfo=expected_info, source_sbom_bytes=source_sbom_bytes
+        )
+    )
+    actual_provenance = _read_bounded_generated_file(
+        stage_files[PROVENANCE_NAME], PROVENANCE_NAME, MAX_PROVENANCE_BYTES
+    )
+    if actual_provenance != provenance_bytes:
+        raise IntegrityError(
+            "PROVENANCE.intoto.jsonl does not match the release assembly"
+        )
     with _stable_regular_handle(
         stage_files[CHECKSUM_NAME], "release checksum file"
     ) as (_, checksum_handle, checksum_stat):
         if checksum_stat.st_size > MAX_CHECKSUM_BYTES:
             raise IntegrityError("release checksum file exceeds its size limit")
         checksum_bytes = checksum_handle.read(MAX_CHECKSUM_BYTES + 1)
-    expected_checksums = _checksum_bytes(assets, buildinfo_bytes)
+    expected_checksums = _checksum_bytes(
+        assets,
+        {
+            BUILDINFO_NAME: buildinfo_bytes,
+            PROVENANCE_NAME: provenance_bytes,
+            SOURCE_SBOM_NAME: source_sbom_bytes,
+        },
+    )
     if checksum_bytes != expected_checksums:
         raise IntegrityError(
             "SHA256SUMS.txt is noncanonical or does not match the artifacts"
@@ -3451,7 +3676,12 @@ def compare_reproducible_releases(
     if set(first_files) != set(second_files):
         raise IntegrityError("independent release file inventories differ")
     rows = []
-    generated = {BUILDINFO_NAME, CHECKSUM_NAME}
+    generated = {
+        BUILDINFO_NAME,
+        SOURCE_SBOM_NAME,
+        PROVENANCE_NAME,
+        CHECKSUM_NAME,
+    }
     ordered_names = sorted(
         first_files, key=lambda candidate: (candidate in generated, candidate)
     )
@@ -3511,7 +3741,14 @@ def finalize_release(
         version=version, commit=commit, stage_files=stage_files
     )
     validate_production_rc_source_versions(repo=repo, version=version)
-    if BUILDINFO_NAME in stage_files or CHECKSUM_NAME in stage_files:
+    generated_names = {
+        BUILDINFO_NAME,
+        SOURCE_SBOM_NAME,
+        PROVENANCE_NAME,
+        CHECKSUM_NAME,
+        CHECKSUM_SIGNATURE_NAME,
+    }
+    if generated_names.intersection(stage_files):
         raise IntegrityError("generated release metadata already exists")
     if set(stage_files) != set(names):
         missing = sorted(set(names) - set(stage_files))
@@ -3529,12 +3766,35 @@ def finalize_release(
         assets=assets,
     )
     buildinfo_bytes = _canonical_json(buildinfo)
-    checksum_bytes = _checksum_bytes(assets, buildinfo_bytes)
-    _write_new(stage / BUILDINFO_NAME, buildinfo_bytes)
+    source_sbom_bytes = _canonical_json(
+        _expected_source_sbom(repo=repo, commit=commit, version=version)
+    )
+    if len(source_sbom_bytes) > MAX_SOURCE_SBOM_BYTES:
+        raise IntegrityError("SOURCE-SBOM.json exceeds its size limit")
+    provenance_bytes = _canonical_json(
+        _expected_release_provenance(
+            buildinfo=buildinfo, source_sbom_bytes=source_sbom_bytes
+        )
+    )
+    if len(provenance_bytes) > MAX_PROVENANCE_BYTES:
+        raise IntegrityError("PROVENANCE.intoto.jsonl exceeds its size limit")
+    generated_files = {
+        BUILDINFO_NAME: buildinfo_bytes,
+        PROVENANCE_NAME: provenance_bytes,
+        SOURCE_SBOM_NAME: source_sbom_bytes,
+    }
+    checksum_bytes = _checksum_bytes(assets, generated_files)
+    written: list[Path] = []
     try:
+        for name, data in generated_files.items():
+            path = stage / name
+            _write_new(path, data)
+            written.append(path)
         _write_new(stage / CHECKSUM_NAME, checksum_bytes)
+        written.append(stage / CHECKSUM_NAME)
     except Exception:
-        (stage / BUILDINFO_NAME).unlink(missing_ok=True)
+        for path in written:
+            path.unlink(missing_ok=True)
         raise
     return verify_release(
         repo=repo,

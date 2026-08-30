@@ -83,11 +83,56 @@ class GitFixture:
         self.write("scripts/build-opencl-miner.ps1", "Write-Output opencl\n")
         self.write("scripts/release_integrity.py", "# release finalizer fixture\n")
         self.write("packaging/releases/test.inventory", "a.bin\nb.txt\n")
+        self.write(
+            "Cargo.lock",
+            """# fixture lockfile
+version = 4
+
+[[package]]
+name = "fixture"
+version = "0.1.0"
+
+[[package]]
+name = "serde"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1111111111111111111111111111111111111111111111111111111111111111"
+""",
+        )
+        package_lock = json.dumps(
+            {
+                "lockfileVersion": 3,
+                "name": "fixture",
+                "packages": {
+                    "": {"name": "fixture", "version": "0.1.0"},
+                    "node_modules/react": {
+                        "integrity": "sha512-Zml4dHVyZQ==",
+                        "version": "19.0.0",
+                    },
+                },
+                "requires": True,
+                "version": "0.1.0",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ) + "\n"
+        self.write("apps/wallet/package-lock.json", package_lock)
+        self.write("apps/pool-dashboard/package-lock.json", package_lock)
         self.git("init", "--quiet")
         self.git("config", "user.name", "Release Test")
         self.git("config", "user.email", "release-test@example.invalid")
         self.git("config", "core.autocrlf", "false")
-        self.git("add", "--", ".gitignore", "README.md", "gpu", "packaging", "scripts")
+        self.git(
+            "add",
+            "--",
+            ".gitignore",
+            "Cargo.lock",
+            "README.md",
+            "apps",
+            "gpu",
+            "packaging",
+            "scripts",
+        )
         self.git("commit", "--quiet", "-m", "fixture")
 
     def close(self) -> None:
@@ -1522,6 +1567,15 @@ class ProductionRcGateTests(unittest.TestCase):
                 version="1.0.0-rc1", commit=self.commit, stage_files=stage_files
             )
 
+    def test_production_rc_allows_generated_source_sbom(self) -> None:
+        stage_files = self.valid_stage_files()
+        sbom = self.root / integrity.SOURCE_SBOM_NAME
+        sbom.write_bytes(b"{}\n")
+        stage_files[sbom.name] = sbom
+        integrity.validate_production_rc_artifacts(
+            version="1.0.0-rc1", commit=self.commit, stage_files=stage_files
+        )
+
     def test_devnet_or_v2_compiled_identity_is_rejected(self) -> None:
         stage_files = self.valid_stage_files()
         network_info = stage_files[integrity.PRODUCTION_RC_NETWORK_INFO_NAME]
@@ -2261,10 +2315,59 @@ class ReleaseFinalizerTests(unittest.TestCase):
             source_date_epoch=self.epoch,
         )
         self.assertTrue(report["reproducible"])
-        self.assertEqual(report["file_count"], 4)
+        self.assertEqual(report["file_count"], 6)
         self.assertEqual(
             report["schema"], integrity.REPRODUCIBLE_COMPARISON_SCHEMA
         )
+
+    def test_finalized_sbom_and_provenance_bind_source_and_artifacts(self) -> None:
+        self.make_valid_assets()
+        integrity.finalize_release(
+            repo=self.fixture.root,
+            expected_commit=self.fixture.commit,
+            version="0.1.0-test",
+            stage=self.stage,
+            inventory=self.inventory,
+            source_date_epoch=self.epoch,
+        )
+        sbom = json.loads(
+            (self.stage / integrity.SOURCE_SBOM_NAME).read_text(encoding="utf-8")
+        )
+        provenance = json.loads(
+            (self.stage / integrity.PROVENANCE_NAME).read_text(encoding="utf-8")
+        )
+        self.assertEqual(sbom["component_count"], 4)
+        self.assertEqual(sbom["commit"], self.fixture.commit)
+        self.assertEqual(provenance["_type"], "https://in-toto.io/Statement/v1")
+        self.assertEqual(
+            {subject["name"] for subject in provenance["subject"]},
+            {"a.bin", "b.txt"},
+        )
+        self.assertEqual(
+            provenance["predicate"]["sourceSbom"]["digest"]["sha256"],
+            integrity._sha256_file(self.stage / integrity.SOURCE_SBOM_NAME),
+        )
+
+    def test_altered_source_sbom_is_rejected(self) -> None:
+        self.make_valid_assets()
+        integrity.finalize_release(
+            repo=self.fixture.root,
+            expected_commit=self.fixture.commit,
+            version="0.1.0-test",
+            stage=self.stage,
+            inventory=self.inventory,
+            source_date_epoch=self.epoch,
+        )
+        (self.stage / integrity.SOURCE_SBOM_NAME).write_bytes(b"{}\n")
+        with self.assertRaisesRegex(integrity.IntegrityError, "SOURCE-SBOM"):
+            integrity.verify_release(
+                repo=self.fixture.root,
+                expected_commit=self.fixture.commit,
+                version="0.1.0-test",
+                stage=self.stage,
+                inventory=self.inventory,
+                source_date_epoch=self.epoch,
+            )
 
     def test_two_valid_but_different_release_stages_are_rejected(self) -> None:
         self.make_valid_assets()

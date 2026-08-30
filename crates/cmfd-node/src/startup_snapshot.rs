@@ -476,7 +476,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_linear_snapshot_restores_without_full_replay() {
+    fn accepted_linear_block_refreshes_snapshot_without_shutdown() {
         let path = test_dir("restore");
         let now = unix_time_seconds().unwrap();
         let expected_tip = {
@@ -485,7 +485,6 @@ mod tests {
             let block = node
                 .mine_once(node.wallet_destination(), now, DEFAULT_MINING_ATTEMPTS)
                 .unwrap();
-            node.persist_startup_snapshot().unwrap();
             block.block_id()
         };
 

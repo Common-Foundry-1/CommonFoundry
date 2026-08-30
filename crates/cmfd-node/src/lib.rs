@@ -6090,11 +6090,18 @@ impl Node {
                 self.chain_revision = next_revision;
                 self.last_record_digest = record_digest;
                 self.block_log_length = final_length;
-                if self.state.tip() != previous_tip {
+                let canonical_tip_changed = self.state.tip() != previous_tip;
+                if canonical_tip_changed {
                     self.revalidate_mempool(&confirmed_txids);
                 }
                 if let Some(guard) = commit_guard.take() {
                     guard.finish(RemoteProofRequestState::Completed);
+                }
+                // Keep the authenticated fast-start state current while the
+                // node is running. A snapshot failure is non-authoritative:
+                // startup safely falls back to replaying the block log.
+                if canonical_tip_changed {
+                    let _ = self.persist_startup_snapshot();
                 }
                 Ok(outcome.fees)
             }

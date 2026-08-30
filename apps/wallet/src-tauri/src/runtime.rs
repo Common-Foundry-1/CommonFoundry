@@ -1,7 +1,10 @@
 use std::fs;
 use std::net::TcpListener;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 
 use cmfd_node::p2p::{InboundPeerHandle, spawn_inbound_listener_with_policy};
@@ -38,6 +41,7 @@ const STATIC_PEER_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 enum NodeAvailability {
+    Starting,
     Ready(Arc<Mutex<Node>>),
     Failed(NodeClientError),
 }
@@ -71,6 +75,7 @@ struct RuntimeParts {
 pub(crate) struct RuntimeHandle {
     inner: Arc<Mutex<RuntimeParts>>,
     operation: Arc<Mutex<()>>,
+    stopping: Arc<AtomicBool>,
     config: NodeRuntimeConfig,
     data_dir: Result<PathBuf, NodeClientError>,
 }
@@ -94,6 +99,15 @@ pub(crate) struct WalletCustodyStatus {
 }
 
 impl RuntimeParts {
+    fn starting() -> Self {
+        Self {
+            node: NodeAvailability::Starting,
+            mining: None,
+            peers: None,
+            services: None,
+        }
+    }
+
     fn ready(started: EmbeddedNode) -> Self {
         #[cfg(feature = "production-v4")]
         let mining = match started.production_v4_pool_search.clone() {
@@ -148,38 +162,77 @@ impl RuntimeState {
             .as_ref()
             .ok()
             .map(|path| cmfd_node::logging::init_tracing(path, config.verbose));
-        let started = data_dir
-            .as_ref()
-            .map_err(Clone::clone)
-            .and_then(|data_dir| {
-                let wallet_passphrase = config
-                    .wallet_passphrase_file
-                    .as_deref()
-                    .map(read_wallet_passphrase_file)
-                    .transpose()
-                    .map_err(|error| {
-                        startup_error(
-                            "wallet_passphrase_file",
-                            format!("The wallet passphrase file could not be used: {error}"),
-                            false,
+        let handle = RuntimeHandle {
+            inner: Arc::new(Mutex::new(match &data_dir {
+                Ok(_) => RuntimeParts::starting(),
+                Err(error) => RuntimeParts::failed(error.clone()),
+            })),
+            operation: Arc::new(Mutex::new(())),
+            stopping: Arc::new(AtomicBool::new(false)),
+            config: config.clone(),
+            data_dir: data_dir.clone(),
+        };
+        if let Ok(startup_data_dir) = data_dir {
+            let startup_inner = Arc::clone(&handle.inner);
+            let startup_stopping = Arc::clone(&handle.stopping);
+            let spawn = thread::Builder::new()
+                .name("cmfd-wallet-startup".to_owned())
+                .spawn(move || {
+                    let started = catch_unwind(AssertUnwindSafe(|| {
+                        let wallet_passphrase = config
+                            .wallet_passphrase_file
+                            .as_deref()
+                            .map(read_wallet_passphrase_file)
+                            .transpose()
+                            .map_err(|error| {
+                                startup_error(
+                                    "wallet_passphrase_file",
+                                    format!(
+                                        "The wallet passphrase file could not be used: {error}"
+                                    ),
+                                    false,
+                                )
+                            })?;
+                        start_embedded_node(
+                            &startup_data_dir,
+                            &config,
+                            wallet_passphrase.as_ref().map(|value| value.as_slice()),
                         )
-                    })?;
-                start_embedded_node(
-                    data_dir,
-                    &config,
-                    wallet_passphrase.as_ref().map(|value| value.as_slice()),
-                )
-            });
+                    }))
+                    .unwrap_or_else(|_| {
+                        Err(startup_error(
+                            "node_startup_panicked",
+                            "The embedded node stopped unexpectedly during startup. Reopen the wallet and inspect its log if this repeats.",
+                            true,
+                        ))
+                    });
+
+                    if let Ok(mut runtime) = startup_inner.lock() {
+                        if startup_stopping.load(Ordering::Acquire) {
+                            if let Ok(started) = started {
+                                let mut stopped = RuntimeParts::ready(started);
+                                stop_runtime_parts(&mut stopped);
+                            }
+                        } else {
+                            *runtime = match started {
+                                Ok(started) => RuntimeParts::ready(started),
+                                Err(error) => RuntimeParts::failed(error),
+                            };
+                        }
+                    }
+                });
+            if spawn.is_err()
+                && let Ok(mut runtime) = handle.inner.lock()
+            {
+                *runtime = RuntimeParts::failed(startup_error(
+                    "node_startup_unavailable",
+                    "The embedded node startup worker could not be created. Reopen the wallet and try again.",
+                    true,
+                ));
+            }
+        }
         Self {
-            handle: RuntimeHandle {
-                inner: Arc::new(Mutex::new(match started {
-                    Ok(started) => RuntimeParts::ready(started),
-                    Err(error) => RuntimeParts::failed(error),
-                })),
-                operation: Arc::new(Mutex::new(())),
-                config,
-                data_dir,
-            },
+            handle,
             _log_guard: log_guard,
         }
     }
@@ -191,6 +244,7 @@ impl RuntimeState {
             .lock()
             .map_err(|_| runtime_state_error())?;
         match &runtime.node {
+            NodeAvailability::Starting => Err(node_starting_error()),
             NodeAvailability::Ready(node) => Ok(Arc::clone(node)),
             NodeAvailability::Failed(error) => Err(error.clone()),
         }
@@ -203,6 +257,7 @@ impl RuntimeState {
             .lock()
             .map_err(|_| runtime_state_error())?;
         runtime.mining.clone().ok_or_else(|| match &runtime.node {
+            NodeAvailability::Starting => node_starting_error(),
             NodeAvailability::Failed(error) => error.clone(),
             NodeAvailability::Ready(_) => startup_error(
                 "mining_manager_unavailable",
@@ -219,6 +274,7 @@ impl RuntimeState {
             .lock()
             .map_err(|_| runtime_state_error())?;
         runtime.peers.clone().ok_or_else(|| match &runtime.node {
+            NodeAvailability::Starting => node_starting_error(),
             NodeAvailability::Failed(error) => error.clone(),
             NodeAvailability::Ready(_) => startup_error(
                 "peer_manager_unavailable",
@@ -229,6 +285,7 @@ impl RuntimeState {
     }
 
     pub fn stop_services(&self) {
+        self.handle.stopping.store(true, Ordering::Release);
         if let Ok(mut runtime) = self.handle.inner.lock() {
             stop_runtime_parts(&mut runtime);
         }
@@ -244,12 +301,27 @@ impl RuntimeState {
             handle: RuntimeHandle {
                 inner: Arc::new(Mutex::new(RuntimeParts::failed(error))),
                 operation: Arc::new(Mutex::new(())),
+                stopping: Arc::new(AtomicBool::new(false)),
                 config: NodeRuntimeConfig::default_for_test(),
                 data_dir: Err(startup_error(
                     "data_directory_unavailable",
                     "test data directory unavailable",
                     false,
                 )),
+            },
+            _log_guard: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn starting_for_test() -> Self {
+        Self {
+            handle: RuntimeHandle {
+                inner: Arc::new(Mutex::new(RuntimeParts::starting())),
+                operation: Arc::new(Mutex::new(())),
+                stopping: Arc::new(AtomicBool::new(false)),
+                config: NodeRuntimeConfig::default_for_test(),
+                data_dir: Ok(PathBuf::from("test-wallet-data")),
             },
             _log_guard: None,
         }
@@ -267,6 +339,7 @@ impl RuntimeHandle {
         let storage = inspect_wallet_key_storage(data_dir).map_err(custody_error)?;
         let runtime = self.inner.lock().map_err(|_| runtime_state_error())?;
         let destination = match &runtime.node {
+            NodeAvailability::Starting => return Err(node_starting_error()),
             NodeAvailability::Ready(node) => Some(hex::encode(
                 node.lock()
                     .map_err(|_| runtime_state_error())?
@@ -296,6 +369,12 @@ impl RuntimeHandle {
             &self.inner.lock().map_err(|_| runtime_state_error())?.node,
             NodeAvailability::Ready(_)
         );
+        if matches!(
+            &self.inner.lock().map_err(|_| runtime_state_error())?.node,
+            NodeAvailability::Starting
+        ) {
+            return Err(node_starting_error());
+        }
         if already_unlocked {
             return Err(startup_error(
                 "wallet_already_unlocked",
@@ -394,6 +473,9 @@ impl RuntimeHandle {
 
     fn stop_and_mark_locked(&self) -> Result<(), NodeClientError> {
         let mut runtime = self.inner.lock().map_err(|_| runtime_state_error())?;
+        if matches!(runtime.node, NodeAvailability::Starting) {
+            return Err(node_starting_error());
+        }
         stop_runtime_parts(&mut runtime);
         *runtime = RuntimeParts::failed(wallet_locked_error());
         Ok(())
@@ -522,6 +604,14 @@ fn wallet_locked_error() -> NodeClientError {
         retryable: false,
         message: "Wallet locked. Unlock it from Wallet security to start the node.".to_owned(),
     }
+}
+
+fn node_starting_error() -> NodeClientError {
+    startup_error(
+        "node_starting",
+        "Opening wallet: authenticating proof inputs and replaying local chain history.",
+        true,
+    )
 }
 
 fn runtime_state_error() -> NodeClientError {
@@ -1063,6 +1153,20 @@ mod tests {
             Ok(_) => panic!("failed startup unexpectedly exposed a node"),
             Err(error) => assert_eq!(error, expected),
         }
+        state.stop_services();
+        state.stop_services();
+    }
+
+    #[test]
+    fn startup_in_progress_is_retryable_and_shutdown_is_idempotent() {
+        let state = RuntimeState::starting_for_test();
+
+        let error = match state.node() {
+            Ok(_) => panic!("starting runtime unexpectedly exposed a node"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "node_starting");
+        assert!(error.retryable);
         state.stop_services();
         state.stop_services();
     }

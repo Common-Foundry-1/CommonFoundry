@@ -9,6 +9,7 @@ import { Overview } from "./components/Overview";
 import { ReceiveDialog } from "./components/ReceiveDialog";
 import { SendDialog } from "./components/SendDialog";
 import { Sidebar, type ViewName } from "./components/Sidebar";
+import { StartupScreen } from "./components/StartupScreen";
 import { TransactionsView } from "./components/TransactionsView";
 import { WalletSecurityDialog } from "./components/WalletSecurityDialog";
 import { useWalletData } from "./hooks/useWalletData";
@@ -60,11 +61,15 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    void refreshCustody();
-  }, [refreshCustody]);
+    if (!data.starting) void refreshCustody();
+  }, [data.starting, refreshCustody]);
 
   const custodyRequired = usesEmbeddedNode && custody !== null && !custody.unlocked;
   const custodyNeedsAttention = usesEmbeddedNode && (custody?.requires_migration || custodyRequired);
+
+  if (data.starting || (data.loading && data.status === null && data.error === null)) {
+    return <StartupScreen />;
+  }
 
   return (
     <div className="app-shell">

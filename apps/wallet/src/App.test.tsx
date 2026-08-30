@@ -105,6 +105,18 @@ describe("Common Foundry wallet", () => {
     vi.unstubAllGlobals();
   });
 
+  it("shows immediate startup feedback while the embedded node is opening", () => {
+    vi.mocked(fetch).mockImplementation(() => new Promise<Response>(() => {}));
+    render(<App />);
+
+    expect(screen.getByRole("heading", { name: "Opening your wallet" })).toBeInTheDocument();
+    expect(screen.getByRole("progressbar", { name: "Wallet startup progress" })).toHaveAttribute(
+      "aria-valuetext",
+      "Authenticating and loading",
+    );
+    expect(screen.getByText(/Your wallet is working/)).toBeInTheDocument();
+  });
+
   it("renders live wallet and node values without inventing market data", async () => {
     render(<App />);
 

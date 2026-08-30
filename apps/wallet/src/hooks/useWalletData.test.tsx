@@ -89,4 +89,24 @@ describe("useWalletData", () => {
     expect(signal?.aborted).toBe(true);
     await act(async () => Promise.resolve());
   });
+
+  it("keeps startup feedback active while the embedded node is opening", async () => {
+    const starting = Object.assign(new Error("Opening wallet"), { code: "node_starting" });
+    apiMocks.getNodeStatus.mockRejectedValueOnce(starting).mockResolvedValue(status);
+    apiMocks.getWalletSnapshot.mockResolvedValue(wallet);
+    apiMocks.getMempool.mockResolvedValue(mempool);
+
+    const { result } = renderHook(() => useWalletData(4_000));
+    await act(async () => Promise.resolve());
+
+    expect(result.current.starting).toBe(true);
+    expect(result.current.loading).toBe(true);
+    expect(result.current.error).toBeNull();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(4_000);
+    });
+    expect(result.current.starting).toBe(false);
+    expect(result.current.status).toBe(status);
+  });
 });

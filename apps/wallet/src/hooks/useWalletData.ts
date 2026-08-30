@@ -7,6 +7,7 @@ interface WalletDataState {
   wallet: WalletSnapshot | null;
   mempool: MempoolSnapshot | null;
   loading: boolean;
+  starting: boolean;
   refreshing: boolean;
   error: string | null;
   lastUpdated: Date | null;
@@ -17,6 +18,7 @@ const INITIAL_STATE: WalletDataState = {
   wallet: null,
   mempool: null,
   loading: true,
+  starting: true,
   refreshing: false,
   error: null,
   lastUpdated: null,
@@ -47,17 +49,27 @@ export function useWalletData(refreshInterval = 4_000) {
           wallet,
           mempool,
           loading: false,
+          starting: false,
           refreshing: false,
           error: null,
           lastUpdated: new Date(),
         });
       } catch (error) {
         if (controller.signal.aborted) return;
+        const starting = error !== null
+          && typeof error === "object"
+          && "code" in error
+          && error.code === "node_starting";
         setState((current) => ({
           ...current,
-          loading: false,
+          loading: starting,
+          starting,
           refreshing: false,
-          error: error instanceof Error ? error.message : "Unable to reach the local node",
+          error: starting
+            ? null
+            : error instanceof Error
+              ? error.message
+              : "Unable to reach the local node",
         }));
       } finally {
         if (requestRef.current === controller) {

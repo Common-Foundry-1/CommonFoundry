@@ -43,8 +43,9 @@ arbitrary corruption, or replace offline backups.
 ## Fast-start checkpoints
 
 After a full successful replay, the node writes a two-slot, network-bound
-startup checkpoint for an exact linear active-chain log. A clean node or pool
-shutdown refreshes it; an operator can also request one explicitly:
+startup checkpoint for an exact linear active-chain log. Every accepted
+canonical block refreshes it, as does a clean node or pool shutdown; an
+operator can also request one explicitly:
 
 ```text
 cmfd-node --data-dir <node-data> storage-checkpoint
@@ -54,10 +55,10 @@ The checkpoint contains the canonical chain state and compact fork index,
 binds the immutable network fingerprint, exact block-log length, terminal
 record digest, and every cached record locator, and has a domain-separated
 BLAKE3 integrity digest. Startup rechecks the retained log's file identity and
-the complete terminal record before using it. A missing, stale, truncated,
-corrupt, wrong-network, or non-linear checkpoint is ignored and the node falls
-back to full deterministic replay. The status field
-`startup_snapshot_used` reports which path opened the node.
+the complete terminal record before using it. When a checkpoint is not
+eligible, the node reconstructs the same state through full deterministic
+replay. The status field `startup_snapshot_used` reports which path opened the
+node.
 
 This is a local crash-safe cache, not a consensus state root. It does not
 protect against an attacker able to replace both node storage and the cache,

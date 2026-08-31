@@ -2000,8 +2000,9 @@ impl fmt::Debug for PoolDashboardSource {
 
 impl PoolDashboardSource {
     pub fn snapshot(&self) -> Result<PoolDashboardSnapshot, PoolError> {
-        reconcile_pool_blocks(&self.shared)?;
-        reconcile_pool_payouts(&self.shared, false)?;
+        // The pool listener reconciles blocks and payouts whenever the active
+        // tip changes. Keep this read-only path cheap so dashboard polling
+        // cannot queue behind a full chain-wide reconciliation.
         let generated_at_unix_seconds = unix_time_seconds()?;
         let (session_stales, earning_history_started_at, earning_events) = {
             let ledger = self

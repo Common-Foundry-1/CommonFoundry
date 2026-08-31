@@ -79,6 +79,8 @@ for name in (
     "share_leading_zero_bits",
     "minimum_payout_atoms",
     "payout_fee_atoms",
+    "operator_fee_bps",
+    "pplns_window_shares",
     "peer",
     "allow_public_peers",
 ):
@@ -125,8 +127,10 @@ dashboard_bind="${CMFD_POOL_DASHBOARD_BIND:-${saved[4]:-127.0.0.1:22446}}"
 share_bits="${CMFD_POOL_SHARE_BITS:-${saved[5]:-7}}"
 minimum_payout_atoms="${CMFD_POOL_MINIMUM_PAYOUT_ATOMS:-${saved[6]:-100}}"
 payout_fee_atoms="${CMFD_POOL_PAYOUT_FEE_ATOMS:-${saved[7]:-1}}"
-pool_peer="${CMFD_POOL_PEER:-${saved[8]:-}}"
-allow_public_peers="${CMFD_POOL_ALLOW_PUBLIC_PEERS:-${saved[9]:-0}}"
+operator_fee_bps="${CMFD_POOL_OPERATOR_FEE_BPS:-${saved[8]:-300}}"
+pplns_window_shares="${CMFD_POOL_PPLNS_WINDOW_SHARES:-${saved[9]:-0}}"
+pool_peer="${CMFD_POOL_PEER:-${saved[10]:-}}"
+allow_public_peers="${CMFD_POOL_ALLOW_PUBLIC_PEERS:-${saved[11]:-0}}"
 certificate="$tls_dir/pool-cert.der"
 private_key="$tls_dir/pool-key.der"
 prepare_inputs="$bundle_dir/PREPARE-V4-INPUTS.sh"
@@ -160,6 +164,14 @@ if [ ! -f "$dashboard_assets/index.html" ]; then
 fi
 if [ "$private_bind_ip" = "0.0.0.0" ] || [ "$private_bind_ip" = "::" ]; then
   echo "PRIVATE_BIND_IP must be the host's private LAN address, not a wildcard." >&2
+  exit 1
+fi
+if [[ ! "$operator_fee_bps" =~ ^[0-9]+$ ]] || (( operator_fee_bps > 10000 )); then
+  echo "CMFD_POOL_OPERATOR_FEE_BPS must be an integer from 0 through 10000." >&2
+  exit 1
+fi
+if [[ ! "$pplns_window_shares" =~ ^[0-9]+$ ]] || (( pplns_window_shares > 65536 )); then
+  echo "CMFD_POOL_PPLNS_WINDOW_SHARES must be 0 (automatic) or an integer through 65536." >&2
   exit 1
 fi
 echo "Preparing authenticated ProductionV4 pool inputs. The first run downloads about 61 GB."
@@ -200,7 +212,8 @@ fi
 
 python3 - "$settings_file" \
   "$public_host" "$private_bind_ip" "$pool_port" "$p2p_bind" "$dashboard_bind" \
-  "$share_bits" "$minimum_payout_atoms" "$payout_fee_atoms" "$pool_peer" "$allow_public_peers" <<'PY'
+  "$share_bits" "$minimum_payout_atoms" "$payout_fee_atoms" "$operator_fee_bps" \
+  "$pplns_window_shares" "$pool_peer" "$allow_public_peers" <<'PY'
 import json
 import os
 import sys
@@ -216,6 +229,8 @@ names = (
     "share_leading_zero_bits",
     "minimum_payout_atoms",
     "payout_fee_atoms",
+    "operator_fee_bps",
+    "pplns_window_shares",
     "peer",
     "allow_public_peers",
 )
@@ -260,6 +275,11 @@ exec > >(tee -a "$log_file") 2>&1
 
 echo "Pool URL: $public_url"
 echo "Dashboard: http://$dashboard_bind/"
+if [ "$pplns_window_shares" = "0" ]; then
+  echo "PPLNS: ${operator_fee_bps} basis-point operator fee; automatic one-block share window"
+else
+  echo "PPLNS: ${operator_fee_bps} basis-point operator fee; ${pplns_window_shares}-share window"
+fi
 echo "Log: $log_file"
 exec "$node" \
   --data-dir "$data_dir" \
@@ -278,6 +298,8 @@ exec "$node" \
   --enable-testnet-payouts \
   --pool-minimum-payout-atoms "$minimum_payout_atoms" \
   --pool-payout-fee-atoms "$payout_fee_atoms" \
+  --pool-operator-fee-bps "$operator_fee_bps" \
+  --pool-pplns-window-shares "$pplns_window_shares" \
   --pool-dashboard-assets "$dashboard_assets" \
   --pool-public-url "$public_url" \
   --pool-dashboard-bind "$dashboard_bind" \

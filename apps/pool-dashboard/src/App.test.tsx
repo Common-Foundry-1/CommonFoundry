@@ -28,6 +28,9 @@ const fixture: DashboardDocument = {
     automatic_testnet_payouts: true,
     minimum_payout_atoms: 100_000_000,
     payout_fee_atoms: 1_000,
+    operator_fee_bps: 300,
+    configured_pplns_window_shares: 0,
+    effective_pplns_window_shares: 128,
     workers: [
       {
         worker: "rig-02",
@@ -55,6 +58,10 @@ const fixture: DashboardDocument = {
       rejected_shares: 1,
       pool_blocks: 1,
       credited_devnet_atoms: 130_000_000,
+      operator_fee_atoms: 0,
+      pplns_window_shares: 128,
+      pplns_pending_blocks: 1,
+      pplns_distributed_blocks: 0,
       canonical_pool_blocks: 1,
       orphaned_pool_blocks: 0,
       sessions: [],
@@ -67,6 +74,12 @@ const fixture: DashboardDocument = {
           payout: "78".repeat(32),
           state: "canonical",
           confirmations: 2,
+          miner_reward_atoms: 134_020_618,
+          operator_fee_bps: 300,
+          operator_fee_atoms: 4_020_618,
+          distributable_atoms: 130_000_000,
+          pplns_window_shares: 128,
+          pplns_distributed: false,
         },
       ],
       payout_transactions: [],
@@ -99,6 +112,8 @@ describe("pool dashboard", () => {
     expect(screen.getByText("rig-01")).toBeVisible();
     expect(screen.getByText("rig-02")).toBeVisible();
     expect(screen.getByText("Height 212")).toBeVisible();
+    expect(screen.getByText("3.00%")).toBeVisible();
+    expect(screen.getByText("Maturing 2/100")).toBeVisible();
   });
 
   it("sorts the worker table by name", async () => {

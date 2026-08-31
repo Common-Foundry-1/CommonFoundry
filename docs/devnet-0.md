@@ -281,13 +281,16 @@ rejected. Frames are capped at 16 KiB, with at most 64 concurrent sessions,
 1,000,000 messages per session, 65,536 valid nonce records per job, 1,024 recent
 session records, 1,024 payout identities, 65,536 pool-block records, and 65,536
 payout-transaction records. Every payout identity proves key control through a
-fresh Schnorr challenge. Accepted
-shares increment a durable fixed-price test counter; the default is one
-credited Devnet atom per accepted share. A network-bound, checksummed two-slot
-ledger survives process restarts, migrates authenticated v1 accounting,
-recovers interrupted block credits exactly once, and labels pool blocks
-canonical, orphaned, or unresolved as fork choice changes. Valid pool blocks
-send the miner reward to the server's `--miner` destination.
+fresh Schnorr challenge. Accepted shares enter a durable exact-work-weighted
+PPLNS history. A found block freezes its discovery-time rolling window, actual
+miner reward, and operator fee; the default window is one expected block of
+share work and the default fee is 300 basis points. After 100 confirmations,
+the fee is retained by the pool wallet and every remaining atom is distributed
+deterministically across the frozen window. A network-bound, checksummed
+two-slot ledger survives process restarts, migrates authenticated v1
+accounting, recovers interrupted block accounting exactly once, and labels pool
+blocks canonical, orphaned, or unresolved as fork choice changes. Valid pool
+blocks send the miner reward to the server's `--miner` destination.
 
 `--enable-testnet-payouts` activates mature-reward settlement and requires
 `--miner` to be this pool node's wallet destination. The default threshold is

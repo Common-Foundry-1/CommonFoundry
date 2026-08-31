@@ -8,6 +8,7 @@ import {
   Copy,
   Cpu,
   ExternalLink,
+  Percent,
   Pickaxe,
   RefreshCw,
   ShieldCheck,
@@ -24,6 +25,7 @@ type Platform = "windows" | "linux";
 
 const REFRESH_FALLBACK_SECONDS = 10;
 const ATOMS_PER_CMFD = 100_000_000;
+const COINBASE_MATURITY = 100;
 
 function formatCount(value: number) {
   return new Intl.NumberFormat("en-US").format(value);
@@ -222,7 +224,7 @@ export function App() {
             <p className="eyebrow">Common Foundry · {pool.network_short_name}</p>
             <h1 id="pool-title">ForgeMatrix Pool</h1>
             <p className="hero-copy">
-              ProductionV4 mining with authenticated shares and automatic Devnet payouts.
+              ProductionV4 mining with authenticated shares, fair PPLNS accounting, and automatic Devnet payouts.
             </p>
           </div>
           <div className="hero-status">
@@ -252,6 +254,12 @@ export function App() {
           <Stat icon={<CircleCheck />} label="Accepted shares" value={formatCount(ledger.accepted_shares)} detail="durably accounted" />
           <Stat icon={<CircleAlert />} label="Rejected shares" value={formatCount(ledger.rejected_shares)} detail="visible to operators" tone={ledger.rejected_shares > 0 ? "warn" : undefined} />
           <Stat icon={<Blocks />} label="Pool blocks" value={formatCount(ledger.canonical_pool_blocks)} detail={`${formatCount(ledger.orphaned_pool_blocks)} orphaned`} />
+          <Stat
+            icon={<Percent />}
+            label="Operator fee"
+            value={pool.operator_fee_bps === null ? "N/A" : `${(pool.operator_fee_bps / 100).toFixed(2)}%`}
+            detail={`${formatAtoms(ledger.operator_fee_atoms)} from matured blocks`}
+          />
           <Stat icon={<WalletCards />} label="Confirmed payouts" value={formatAtoms(confirmedPayouts)} detail={pool.automatic_testnet_payouts ? "automatic settlement on" : "settlement paused"} />
         </section>
 
@@ -348,13 +356,17 @@ export function App() {
         </div>
 
         <section className="data-section lower-section" id="blocks" aria-labelledby="blocks-title">
-          <SectionHeading eyebrow="Canonical chain" title="Pool blocks" detail={`Tip ${shortHex(pool.tip)}`} />
+          <SectionHeading
+            eyebrow="Canonical chain"
+            title="Pool blocks"
+            detail={`PPLNS window ${formatCount(pool.effective_pplns_window_shares ?? ledger.pplns_window_shares)} shares · Tip ${shortHex(pool.tip)}`}
+          />
           {ledger.blocks.length === 0 ? (
             <EmptyTable>The pool has not found a block yet.</EmptyTable>
           ) : (
             <div className="table-scroll">
               <table>
-                <thead><tr><th>Height</th><th>Block</th><th>State</th><th className="numeric">Confirmations</th></tr></thead>
+                <thead><tr><th>Height</th><th>Block</th><th>State</th><th className="numeric">Confirmations</th><th className="numeric">Miner reward</th><th className="numeric">Operator fee</th><th className="numeric">PPLNS distribution</th></tr></thead>
                 <tbody>
                   {ledger.blocks.map((block) => (
                     <tr key={block.block_id}>
@@ -362,6 +374,19 @@ export function App() {
                       <td><code title={block.block_id}>{shortHex(block.block_id)}</code></td>
                       <td><span className={`state-badge state-${block.state}`}>{humanState(block.state)}</span></td>
                       <td className="numeric">{formatCount(block.confirmations)}</td>
+                      <td className="numeric">{block.miner_reward_atoms === null ? "—" : formatAtoms(block.miner_reward_atoms)}</td>
+                      <td className="numeric">
+                        {block.operator_fee_atoms === null
+                          ? "—"
+                          : `${formatAtoms(block.operator_fee_atoms)} (${((block.operator_fee_bps ?? 0) / 100).toFixed(2)}%)`}
+                      </td>
+                      <td className="numeric strong-cell">
+                        {block.pplns_distributed
+                          ? formatAtoms(block.distributable_atoms ?? 0)
+                          : block.state === "canonical"
+                            ? `Maturing ${Math.min(block.confirmations, COINBASE_MATURITY)}/${COINBASE_MATURITY}`
+                            : "—"}
+                      </td>
                     </tr>
                   ))}
                 </tbody>

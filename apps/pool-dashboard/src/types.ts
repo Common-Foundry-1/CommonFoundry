@@ -26,6 +26,12 @@ export interface PoolBlock {
   payout: string;
   state: string;
   confirmations: number;
+  miner_reward_atoms: number | null;
+  operator_fee_bps: number | null;
+  operator_fee_atoms: number | null;
+  distributable_atoms: number | null;
+  pplns_window_shares: number | null;
+  pplns_distributed: boolean;
 }
 
 export interface PoolPayoutTransaction {
@@ -44,6 +50,10 @@ export interface PoolLedger {
   rejected_shares: number;
   pool_blocks: number;
   credited_devnet_atoms: number;
+  operator_fee_atoms: number;
+  pplns_window_shares: number;
+  pplns_pending_blocks: number;
+  pplns_distributed_blocks: number;
   canonical_pool_blocks: number;
   orphaned_pool_blocks: number;
   sessions: unknown[];
@@ -72,6 +82,9 @@ export interface PoolSnapshot {
   automatic_testnet_payouts: boolean;
   minimum_payout_atoms: number | null;
   payout_fee_atoms: number | null;
+  operator_fee_bps: number | null;
+  configured_pplns_window_shares: number | null;
+  effective_pplns_window_shares: number | null;
   workers: PoolWorker[];
   ledger: PoolLedger;
 }

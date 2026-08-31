@@ -921,10 +921,14 @@ baseline.
 
 The pool ledger is bounded, durable test infrastructure. Accepted and rejected
 shares, found blocks, and credited Devnet atoms are stored by session and payout
-identity in a network-bound, checksummed two-slot ledger. Write-ahead block
-records recover interrupted submissions exactly once, while active-chain
-reconciliation tracks canonical and reorganized pool blocks. The default
-fixed-price test policy adds one Devnet atom per accepted share.
+identity in a network-bound, checksummed two-slot ledger. Its PPLNS policy
+records exact share work and freezes each block's rolling window at discovery.
+The default window represents one expected block of share work. Once the
+coinbase reaches 100 confirmations, a configurable operator fee—3% by
+default—is retained and every remaining atom is allocated deterministically
+across that frozen window. Write-ahead records make maturation idempotent across
+restarts, while active-chain reconciliation tracks canonical and reorganized
+pool blocks.
 
 Pool v2 also authenticates each payout identity. After pinned TLS connects, the
 server sends a fresh random challenge. The wallet signs a domain-separated

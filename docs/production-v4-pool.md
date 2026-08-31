@@ -1,7 +1,7 @@
 # ProductionV4 test-pool operator guide
 
 The Common Foundry ProductionV4 pool package runs a certificate-pinned Devnet pool,
-a full P2P node, persistent CUDA replay and proof workers, durable share and
+a full P2P node, persistent CUDA replay and proof workers, durable PPLNS and
 payout accounting, and a read-only web dashboard. Windows and native Linux
 packages use the same protocol and ledger rules.
 
@@ -46,6 +46,18 @@ Power users can pass named options through the launcher:
 .\START-POOL.bat -PublicNumericAddress 203.0.113.20 -PrivateBindAddress 192.168.1.20
 ```
 
+The default operator fee is 3% (`300` basis points). To change it for blocks
+found after the next start, pass `-OperatorFeeBps`; for example, 1.5% is:
+
+```powershell
+.\START-POOL.bat -OperatorFeeBps 150
+```
+
+`-PplnsWindowShares 0` is the default and automatically selects a rolling
+window equal to one expected block of share work. An operator may instead set
+an explicit window from 1 through 65,536 shares. Both values are saved after a
+successful start and reused by restart and autostart controls.
+
 The package includes local operator controls. They authenticate the saved
 process identity before acting and request a graceful ledger-preserving stop;
 they never force-kill a process:
@@ -81,6 +93,12 @@ Use `CMFD_POOL_PEER=IP:22444` and `CMFD_POOL_ALLOW_PUBLIC_PEERS=1` to configure 
 static public P2P peer. Other operator overrides are listed near the top of
 `START-POOL.sh`.
 
+Set `CMFD_POOL_OPERATOR_FEE_BPS` to change the 300-basis-point default and
+`CMFD_POOL_PPLNS_WINDOW_SHARES` to change the window. Zero keeps the automatic
+one-expected-block window. These settings apply to blocks found after the pool
+starts; every discovered block permanently records the fee and window that
+were active when it was found.
+
 Linux controls use the same graceful authenticated request path:
 
 ```bash
@@ -105,7 +123,8 @@ commonfoundry-production-v4-pool` for service diagnostics.
 ## Dashboard and miner connections
 
 The dashboard is available on the pool host at <http://127.0.0.1:22446>. It
-shows pool health, chain height, workers, accepted and rejected shares, blocks,
+shows pool health, chain height, workers, accepted and rejected shares, PPLNS
+window size, per-block reward and fee accounting, matured operator fees,
 credit, and payout status. The dashboard is deliberately loopback-only. Publish
 it through an authenticated reverse proxy or tunnel if remote viewing is
 needed; do not expose a separate node-control API.
@@ -121,6 +140,27 @@ easier than the current block target. The wallet searches server-issued jobs
 with its persistent batched CUDA worker, while the pool independently performs
 the authenticated GPU replay before accepting or crediting every submitted
 nonce. Client results are never trusted.
+
+## PPLNS rewards and operator fee
+
+Every accepted share records its exact work from the server-controlled share
+target. When the pool finds a block, the winning share is added in discovery
+order and the last N shares are frozen for that block. The default automatic N
+is the ceiling of block work divided by share work, equivalent to one expected
+block of shares; mixed-difficulty windows remain fair because allocation is
+weighted by exact work rather than raw share count.
+
+The pool waits for the coinbase maturity of 100 confirmations before crediting
+the block. At maturity it deducts the fee frozen with that block—3% by default—
+and distributes every remaining atom across the frozen window. Integer rounding
+uses deterministic largest remainders, so the operator fee plus all miner
+allocations always equals the block's actual miner reward. Orphaned blocks do
+not create rewards, and the durable journal prevents a restart from applying a
+mature block twice.
+
+The operator fee remains in the pool wallet as operator revenue. It is separate
+from `PayoutFeeAtoms` / `CMFD_POOL_PAYOUT_FEE_ATOMS`, which is the network fee
+burned by each miner payout transaction.
 
 ## Persistence and backups
 

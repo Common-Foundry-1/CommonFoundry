@@ -5,7 +5,7 @@
 //! only the server-issued job identifier and a nonce; the server recomputes
 //! the exact ForgeMatrix evaluation before crediting anything.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
@@ -18,14 +18,15 @@ use std::time::{Duration, Instant};
 
 use cmfd_consensus::forgematrix::target_with_leading_zero_bits;
 use cmfd_consensus::{
-    BlockChallenge, BlockProof, ConsensusPowVerifier, ForgeMatrixV2AcceleratorBatch,
-    ForgeMatrixV2AcceleratorModel, ForgeMatrixV2Error, OutputLock, PowError, Transaction,
-    v2_reference_for_network,
+    BlockChallenge, BlockProof, COINBASE_MATURITY, ConsensusPowVerifier,
+    ForgeMatrixV2AcceleratorBatch, ForgeMatrixV2AcceleratorModel, ForgeMatrixV2Error, OutputLock,
+    PowError, Transaction, block_work, v2_reference_for_network,
 };
 use k256::schnorr::{
     Signature, SigningKey, VerifyingKey,
     signature::{Signer, Verifier},
 };
+use primitive_types::U512;
 use rcgen::generate_simple_self_signed;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
@@ -65,7 +66,10 @@ pub const POOL_MAX_LEDGER_BLOCKS: usize = 65_536;
 pub const POOL_MAX_LEDGER_PAYOUT_TRANSACTIONS: usize = 65_536;
 pub const DEFAULT_POOL_MINIMUM_PAYOUT_ATOMS: u64 = 100;
 pub const DEFAULT_POOL_PAYOUT_FEE_ATOMS: u64 = 1;
-pub const POOL_ACCOUNTING_SEMANTICS: &str = "durable Devnet share accounting; on-chain settlement is active only when enabled by the pool operator";
+pub const DEFAULT_POOL_OPERATOR_FEE_BPS: u16 = 300;
+pub const DEFAULT_PPLNS_WINDOW_SHARES: usize = 0;
+pub const POOL_MAX_PPLNS_WINDOW_SHARES: usize = 65_536;
+pub const POOL_ACCOUNTING_SEMANTICS: &str = "durable PPLNS accounting; each mature pool block is distributed over its discovery-time rolling share window after the disclosed operator fee";
 
 const POOL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const POOL_READ_TIMEOUT: Duration = Duration::from_millis(200);
@@ -127,6 +131,14 @@ pub enum PoolError {
     InvalidShareVerificationQueueLimit,
     #[error("pool payout policy requires nonzero minimum and fee amounts")]
     InvalidPayoutPolicy,
+    #[error("pool operator fee must not exceed 10000 basis points")]
+    InvalidOperatorFee,
+    #[error(
+        "PPLNS window must be automatic or between 1 and {POOL_MAX_PPLNS_WINDOW_SHARES} shares"
+    )]
+    InvalidPplnsWindow,
+    #[error("PPLNS work calculation failed: {0}")]
+    PplnsWork(String),
     #[error("pool settlement requires the block-reward destination to be this node's wallet")]
     PayoutWalletMismatch,
     #[error("pool message count exceeds {POOL_MAX_MESSAGES_PER_SESSION}")]
@@ -198,6 +210,7 @@ pub struct PoolServerConfig {
     pub max_queued_share_verifications: usize,
     pub ledger_directory: Option<PathBuf>,
     pub payout_policy: Option<PoolPayoutPolicy>,
+    pub pplns_policy: Option<PoolPplnsPolicy>,
     pub allow_public_clients: bool,
     pub allow_address_only_payouts: bool,
     pub production_v4_share_verifier: Option<Arc<dyn ProductionV4PoolShareVerifier>>,
@@ -223,9 +236,26 @@ impl PoolServerConfig {
             max_queued_share_verifications: DEFAULT_POOL_QUEUED_SHARE_VERIFICATIONS,
             ledger_directory: None,
             payout_policy: None,
+            pplns_policy: None,
             allow_public_clients: false,
             allow_address_only_payouts: false,
             production_v4_share_verifier: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolPplnsPolicy {
+    pub operator_fee_bps: u16,
+    /// Zero selects an automatic window equal to one block of expected share work.
+    pub window_shares: usize,
+}
+
+impl Default for PoolPplnsPolicy {
+    fn default() -> Self {
+        Self {
+            operator_fee_bps: DEFAULT_POOL_OPERATOR_FEE_BPS,
+            window_shares: DEFAULT_PPLNS_WINDOW_SHARES,
         }
     }
 }
@@ -448,6 +478,12 @@ pub struct PoolBlockStats {
     pub payout: String,
     pub state: String,
     pub confirmations: u64,
+    pub miner_reward_atoms: Option<u64>,
+    pub operator_fee_bps: Option<u16>,
+    pub operator_fee_atoms: Option<u64>,
+    pub distributable_atoms: Option<u64>,
+    pub pplns_window_shares: Option<usize>,
+    pub pplns_distributed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -459,6 +495,10 @@ pub struct PoolLedgerSnapshot {
     pub rejected_shares: u64,
     pub pool_blocks: u64,
     pub credited_devnet_atoms: u64,
+    pub operator_fee_atoms: u64,
+    pub pplns_window_shares: usize,
+    pub pplns_pending_blocks: u64,
+    pub pplns_distributed_blocks: u64,
     pub canonical_pool_blocks: u64,
     pub orphaned_pool_blocks: u64,
     pub sessions: Vec<PoolSessionStats>,
@@ -501,6 +541,9 @@ pub struct PoolDashboardSnapshot {
     pub automatic_testnet_payouts: bool,
     pub minimum_payout_atoms: Option<u64>,
     pub payout_fee_atoms: Option<u64>,
+    pub operator_fee_bps: Option<u16>,
+    pub configured_pplns_window_shares: Option<usize>,
+    pub effective_pplns_window_shares: Option<usize>,
     pub workers: Vec<PoolDashboardWorkerStats>,
     pub ledger: PoolLedgerSnapshot,
 }
@@ -782,6 +825,9 @@ struct Ledger {
     payouts: BTreeMap<[u8; 32], PayoutRecord>,
     blocks: BTreeMap<[u8; 32], BlockRecord>,
     payout_transactions: BTreeMap<[u8; 32], PayoutTransactionRecord>,
+    pplns_shares: VecDeque<PplnsShareRecord>,
+    pplns_blocks: BTreeMap<[u8; 32], PplnsBlockRecord>,
+    operator_fee_atoms: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -836,6 +882,40 @@ struct BlockRecord {
     atoms: u64,
     state: PoolBlockState,
     confirmations: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PplnsShareRecord {
+    session_id: u64,
+    payout: [u8; 32],
+    work: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_block_id: Option<[u8; 32]>,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PplnsAllocationRecord {
+    session_id: u64,
+    payout: [u8; 32],
+    atoms: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PplnsBlockRecord {
+    miner_reward_atoms: u64,
+    operator_fee_bps: u16,
+    share_work: Vec<u8>,
+    window_target_work: Vec<u8>,
+    configured_window_shares: usize,
+    operator_fee_atoms: u64,
+    distributable_atoms: u64,
+    window_share_count: usize,
+    window_work: Vec<u8>,
+    allocations: Vec<PplnsAllocationRecord>,
+    distributed: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -906,6 +986,12 @@ struct StoredLedgerPayloadV1 {
     payouts: Vec<StoredPayoutRecordV1>,
     blocks: Vec<StoredBlockRecordV1>,
     payout_transactions: Vec<StoredPayoutTransactionRecordV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pplns_shares: Vec<PplnsShareRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pplns_blocks: Vec<StoredPplnsBlockRecordV1>,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    operator_fee_atoms: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -934,6 +1020,13 @@ struct StoredBlockRecordV1 {
 struct StoredPayoutTransactionRecordV1 {
     txid: [u8; 32],
     record: PayoutTransactionRecord,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredPplnsBlockRecordV1 {
+    block_id: [u8; 32],
+    record: PplnsBlockRecord,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1207,6 +1300,9 @@ impl LedgerStore {
             payouts: stored.payload.payouts,
             blocks: stored.payload.blocks,
             payout_transactions: Vec::new(),
+            pplns_shares: Vec::new(),
+            pplns_blocks: Vec::new(),
+            operator_fee_atoms: 0,
         };
         let mut ledger = ledger_from_payload(stored.generation, payload)?;
         for session in ledger.sessions.values_mut() {
@@ -1254,6 +1350,16 @@ fn ledger_payload(ledger: &Ledger) -> StoredLedgerPayloadV1 {
                 record: record.clone(),
             })
             .collect(),
+        pplns_shares: ledger.pplns_shares.iter().cloned().collect(),
+        pplns_blocks: ledger
+            .pplns_blocks
+            .iter()
+            .map(|(block_id, record)| StoredPplnsBlockRecordV1 {
+                block_id: *block_id,
+                record: record.clone(),
+            })
+            .collect(),
+        operator_fee_atoms: ledger.operator_fee_atoms,
     }
 }
 
@@ -1296,6 +1402,14 @@ fn ledger_from_payload(
             ));
         }
     }
+    let mut pplns_blocks = BTreeMap::new();
+    for entry in payload.pplns_blocks {
+        if pplns_blocks.insert(entry.block_id, entry.record).is_some() {
+            return Err(PoolError::LedgerCorrupt(
+                "duplicate stored PPLNS block identifier".to_owned(),
+            ));
+        }
+    }
     let ledger = Ledger {
         generation,
         accepted_shares: payload.accepted_shares,
@@ -1306,6 +1420,9 @@ fn ledger_from_payload(
         payouts,
         blocks,
         payout_transactions,
+        pplns_shares: payload.pplns_shares.into(),
+        pplns_blocks,
+        operator_fee_atoms: payload.operator_fee_atoms,
     };
     validate_ledger(&ledger)?;
     Ok(ledger)
@@ -1326,6 +1443,10 @@ fn ledger_payload_checksum(
     hasher.update(&(bytes.len() as u64).to_le_bytes());
     hasher.update(&bytes);
     Ok(*hasher.finalize().as_bytes())
+}
+
+const fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 fn legacy_ledger_payload_checksum(
@@ -1350,8 +1471,92 @@ fn validate_ledger(ledger: &Ledger) -> Result<(), PoolError> {
         || ledger.payouts.len() > POOL_MAX_LEDGER_PAYOUTS
         || ledger.blocks.len() > POOL_MAX_LEDGER_BLOCKS
         || ledger.payout_transactions.len() > POOL_MAX_LEDGER_PAYOUT_TRANSACTIONS
+        || ledger.pplns_shares.len() > POOL_MAX_PPLNS_WINDOW_SHARES
+        || ledger.pplns_blocks.len() > POOL_MAX_LEDGER_BLOCKS
     {
         return Err(PoolError::LedgerCapacity);
+    }
+    for share in &ledger.pplns_shares {
+        VerifyingKey::from_bytes(&share.payout).map_err(|_| {
+            PoolError::LedgerCorrupt("stored PPLNS share payout is invalid".to_owned())
+        })?;
+        decode_work(&share.work, "stored PPLNS share work")?;
+        if share.pending_block_id.is_some_and(|block_id| {
+            ledger
+                .blocks
+                .get(&block_id)
+                .is_none_or(|block| block.state != PoolBlockState::Pending)
+                || !ledger.pplns_blocks.contains_key(&block_id)
+        }) {
+            return Err(PoolError::LedgerCorrupt(
+                "stored pending PPLNS share has no pending block".to_owned(),
+            ));
+        }
+    }
+    let mut distributed_operator_fee_atoms = 0_u64;
+    for (block_id, pplns) in &ledger.pplns_blocks {
+        if !ledger.blocks.contains_key(block_id)
+            || pplns.miner_reward_atoms == 0
+            || pplns.operator_fee_bps > 10_000
+            || (pplns.configured_window_shares != 0
+                && !(1..=POOL_MAX_PPLNS_WINDOW_SHARES).contains(&pplns.configured_window_shares))
+        {
+            return Err(PoolError::LedgerCorrupt(
+                "stored PPLNS block policy is invalid".to_owned(),
+            ));
+        }
+        decode_work(&pplns.share_work, "stored PPLNS share work")?;
+        decode_work(&pplns.window_target_work, "stored PPLNS window target work")?;
+        let reward_total = pplns
+            .operator_fee_atoms
+            .checked_add(pplns.distributable_atoms)
+            .ok_or_else(|| PoolError::LedgerCorrupt("PPLNS reward overflow".to_owned()))?;
+        if reward_total != pplns.miner_reward_atoms {
+            return Err(PoolError::LedgerCorrupt(
+                "stored PPLNS reward split is inconsistent".to_owned(),
+            ));
+        }
+        if pplns.window_share_count == 0 {
+            if !pplns.allocations.is_empty() || pplns.distributed {
+                return Err(PoolError::LedgerCorrupt(
+                    "stored PPLNS block has no share window".to_owned(),
+                ));
+            }
+        } else {
+            decode_work(&pplns.window_work, "stored PPLNS window work")?;
+            let mut keys = HashSet::new();
+            let allocated = pplns
+                .allocations
+                .iter()
+                .try_fold(0_u64, |total, allocation| {
+                    if allocation.atoms == 0
+                        || !keys.insert((allocation.payout, allocation.session_id))
+                        || VerifyingKey::from_bytes(&allocation.payout).is_err()
+                    {
+                        return Err(PoolError::LedgerCorrupt(
+                            "stored PPLNS allocation is invalid".to_owned(),
+                        ));
+                    }
+                    checked_ledger_add(total, allocation.atoms, "PPLNS allocation total")
+                })?;
+            if allocated != pplns.distributable_atoms {
+                return Err(PoolError::LedgerCorrupt(
+                    "stored PPLNS allocations do not equal the distributable reward".to_owned(),
+                ));
+            }
+        }
+        if pplns.distributed {
+            distributed_operator_fee_atoms = checked_ledger_add(
+                distributed_operator_fee_atoms,
+                pplns.operator_fee_atoms,
+                "distributed operator fees",
+            )?;
+        }
+    }
+    if distributed_operator_fee_atoms != ledger.operator_fee_atoms {
+        return Err(PoolError::LedgerCorrupt(
+            "stored operator-fee total does not match distributed PPLNS blocks".to_owned(),
+        ));
     }
     let payout_totals =
         ledger
@@ -1659,6 +1864,7 @@ struct SharedServer {
     configured_share_target: [u8; 32],
     test_credit_atoms_per_share: u64,
     payout_policy: Option<PoolPayoutPolicy>,
+    pplns_policy: Option<PoolPplnsPolicy>,
     max_connections: usize,
     allow_public_clients: bool,
     allow_address_only_payouts: bool,
@@ -1781,6 +1987,16 @@ impl PoolDashboardSource {
             .lock()
             .map_err(|_| PoolError::SharedStatePoisoned)?;
         let payout_policy = self.shared.payout_policy;
+        let pplns_policy = self.shared.pplns_policy;
+        let effective_pplns_window_shares = pplns_policy
+            .map(|policy| {
+                effective_pplns_window_shares(
+                    policy,
+                    current.challenge.target,
+                    current.share_target,
+                )
+            })
+            .transpose()?;
         Ok(PoolDashboardSnapshot {
             generated_at_unix_seconds: unix_time_seconds()?,
             network_name: node_status.network.to_owned(),
@@ -1801,6 +2017,10 @@ impl PoolDashboardSource {
             automatic_testnet_payouts: payout_policy.is_some(),
             minimum_payout_atoms: payout_policy.map(|policy| policy.minimum_payout_atoms),
             payout_fee_atoms: payout_policy.map(|policy| policy.fee_atoms),
+            operator_fee_bps: pplns_policy.map(|policy| policy.operator_fee_bps),
+            configured_pplns_window_shares: pplns_policy
+                .and_then(|policy| (policy.window_shares != 0).then_some(policy.window_shares)),
+            effective_pplns_window_shares,
             workers,
             ledger,
         })
@@ -1895,6 +2115,14 @@ pub fn spawn_pool_server(
             return Err(PoolError::PayoutWalletMismatch);
         }
     }
+    if let Some(policy) = config.pplns_policy {
+        if policy.operator_fee_bps > 10_000 {
+            return Err(PoolError::InvalidOperatorFee);
+        }
+        if policy.window_shares > POOL_MAX_PPLNS_WINDOW_SHARES {
+            return Err(PoolError::InvalidPplnsWindow);
+        }
+    }
     VerifyingKey::from_bytes(&config.block_destination)
         .map_err(|_| PoolError::Node(NodeError::InvalidMinerDestination))?;
     let tls = Arc::new(server_tls_config(
@@ -1957,6 +2185,7 @@ pub fn spawn_pool_server(
         configured_share_target: config.share_target,
         test_credit_atoms_per_share: config.test_credit_atoms_per_share,
         payout_policy: config.payout_policy,
+        pplns_policy: config.pplns_policy,
         max_connections: config.max_connections,
         allow_public_clients: config.allow_public_clients,
         allow_address_only_payouts: config.allow_address_only_payouts,
@@ -2416,10 +2645,12 @@ fn process_share(
     };
 
     let Some(block) = block else {
-        let session = credit_accepted_share(
+        let session = record_accepted_share(
             &shared.ledger,
             session_id,
             shared.test_credit_atoms_per_share,
+            shared.pplns_policy,
+            active.wire.share_target,
         )?;
         drop(node);
         return Ok(PoolShareResult {
@@ -2436,12 +2667,21 @@ fn process_share(
         block_id: block.block_id(),
         parent: block.challenge.previous_block,
         height: block.challenge.height,
+        miner_reward_atoms: block
+            .coinbase
+            .outputs
+            .first()
+            .ok_or_else(|| PoolError::LedgerCorrupt("pool block has no miner reward".to_owned()))?
+            .value,
+        share_target: active.wire.share_target,
+        block_target: active.wire.challenge.target,
     };
     reserve_pending_pool_block(
         &shared.ledger,
         session_id,
         block_credit,
         shared.test_credit_atoms_per_share,
+        shared.pplns_policy,
     )?;
 
     // A ProductionV3 proof and side-branch reconstruction can take seconds.
@@ -2699,7 +2939,14 @@ fn reconcile_pool_blocks_with_recovery(
                 if record.state == PoolBlockState::Pending {
                     *state != PoolBlockState::Unknown || recover_missing_pending
                 } else {
-                    record.state != *state || record.confirmations != *confirmations
+                    record.state != *state
+                        || record.confirmations != *confirmations
+                        || (*state == PoolBlockState::Canonical
+                            && *confirmations >= COINBASE_MATURITY
+                            && ledger
+                                .pplns_blocks
+                                .get(block_id)
+                                .is_some_and(|pplns| !pplns.distributed))
                 }
             })
         })
@@ -2716,16 +2963,21 @@ fn reconcile_pool_blocks_with_recovery(
                 if state == PoolBlockState::Unknown {
                     if recover_missing_pending {
                         ledger.blocks.remove(&block_id);
+                        remove_pending_pplns_share(ledger, block_id);
+                        ledger.pplns_blocks.remove(&block_id);
                     }
                     continue;
                 }
-                apply_accepted_share_credit(ledger, record.session_id, record.atoms, true)?;
+                finalize_pending_block_accounting(ledger, block_id)?;
             }
             let record = ledger.blocks.get_mut(&block_id).ok_or_else(|| {
                 PoolError::LedgerCorrupt("pool block disappeared during reconciliation".to_owned())
             })?;
             record.state = state;
             record.confirmations = confirmations;
+            if state == PoolBlockState::Canonical && confirmations >= COINBASE_MATURITY {
+                distribute_mature_pplns_block(ledger, block_id)?;
+            }
         }
         Ok(())
     })
@@ -2981,8 +3233,33 @@ struct PoolBlockCredit {
     block_id: [u8; 32],
     parent: [u8; 32],
     height: u64,
+    miner_reward_atoms: u64,
+    share_target: [u8; 32],
+    block_target: [u8; 32],
 }
 
+fn record_accepted_share(
+    ledger: &DurableLedger,
+    session_id: u64,
+    legacy_atoms: u64,
+    pplns_policy: Option<PoolPplnsPolicy>,
+    share_target: [u8; 32],
+) -> Result<PoolSessionStats, PoolError> {
+    ledger.transaction(|ledger| {
+        if pplns_policy.is_some() {
+            append_pplns_share(ledger, session_id, share_target)?;
+            apply_accepted_share_credit(ledger, session_id, 0, false)?;
+        } else {
+            apply_accepted_share_credit(ledger, session_id, legacy_atoms, false)?;
+        }
+        session_snapshot(
+            session_id,
+            ledger.sessions.get(&session_id).expect("checked above"),
+        )
+    })
+}
+
+#[cfg(test)]
 fn credit_accepted_share(
     ledger: &DurableLedger,
     session_id: u64,
@@ -3002,6 +3279,7 @@ fn reserve_pending_pool_block(
     session_id: u64,
     block: PoolBlockCredit,
     atoms: u64,
+    pplns_policy: Option<PoolPplnsPolicy>,
 ) -> Result<(), PoolError> {
     ledger.transaction(|ledger| {
         let payout = ledger
@@ -3021,7 +3299,7 @@ fn reserve_pending_pool_block(
                     height: block.height,
                     session_id,
                     payout,
-                    atoms,
+                    atoms: if pplns_policy.is_some() { 0 } else { atoms },
                     state: PoolBlockState::Pending,
                     confirmations: 0,
                 },
@@ -3031,6 +3309,49 @@ fn reserve_pending_pool_block(
             return Err(PoolError::LedgerCorrupt(
                 "pool block was reserved twice".to_owned(),
             ));
+        }
+        if let Some(policy) = pplns_policy {
+            let operator_fee_atoms =
+                operator_fee_atoms(block.miner_reward_atoms, policy.operator_fee_bps);
+            let distributable_atoms = block
+                .miner_reward_atoms
+                .checked_sub(operator_fee_atoms)
+                .ok_or_else(|| {
+                    PoolError::LedgerCorrupt("operator fee exceeds reward".to_owned())
+                })?;
+            let configured_window_shares =
+                effective_pplns_window_shares(policy, block.block_target, block.share_target)?;
+            let share_work = encode_work(target_work(block.share_target)?);
+            append_pplns_share_work(ledger, session_id, share_work.clone(), Some(block.block_id))?;
+            let (window_share_count, window_work, allocations) = pplns_allocations(
+                &ledger.pplns_shares,
+                configured_window_shares,
+                distributable_atoms,
+            )?;
+            if ledger
+                .pplns_blocks
+                .insert(
+                    block.block_id,
+                    PplnsBlockRecord {
+                        miner_reward_atoms: block.miner_reward_atoms,
+                        operator_fee_bps: policy.operator_fee_bps,
+                        share_work,
+                        window_target_work: encode_work(target_work(block.block_target)?),
+                        configured_window_shares,
+                        operator_fee_atoms,
+                        distributable_atoms,
+                        window_share_count,
+                        window_work: encode_work(window_work),
+                        allocations,
+                        distributed: false,
+                    },
+                )
+                .is_some()
+            {
+                return Err(PoolError::LedgerCorrupt(
+                    "pool PPLNS block was reserved twice".to_owned(),
+                ));
+            }
         }
         Ok(())
     })
@@ -3044,6 +3365,8 @@ fn discard_pending_pool_block(ledger: &DurableLedger, block_id: [u8; 32]) -> Res
             .is_some_and(|record| record.state == PoolBlockState::Pending)
         {
             ledger.blocks.remove(&block_id);
+            remove_pending_pplns_share(ledger, block_id);
+            ledger.pplns_blocks.remove(&block_id);
         }
         Ok(())
     })
@@ -3066,7 +3389,7 @@ fn finalize_pending_pool_block(
             .get(&block_id)
             .ok_or_else(|| PoolError::LedgerCorrupt("pending pool block is missing".to_owned()))?;
         if record.state == PoolBlockState::Pending {
-            apply_accepted_share_credit(ledger, record.session_id, record.atoms, true)?;
+            finalize_pending_block_accounting(ledger, block_id)?;
         }
         let stored = ledger
             .blocks
@@ -3074,6 +3397,9 @@ fn finalize_pending_pool_block(
             .ok_or_else(|| PoolError::LedgerCorrupt("pending pool block is missing".to_owned()))?;
         stored.state = state;
         stored.confirmations = confirmations;
+        if state == PoolBlockState::Canonical && confirmations >= COINBASE_MATURITY {
+            distribute_mature_pplns_block(ledger, block_id)?;
+        }
         session_snapshot(
             record.session_id,
             ledger
@@ -3108,6 +3434,289 @@ fn pool_block_session_snapshot(
             .get(&record.session_id)
             .ok_or_else(|| PoolError::InvalidMessage("unknown session".to_owned()))?,
     )
+}
+
+fn target_work(target: [u8; 32]) -> Result<U512, PoolError> {
+    block_work(target).map_err(|error| PoolError::PplnsWork(error.to_string()))
+}
+
+fn encode_work(work: U512) -> Vec<u8> {
+    work.to_big_endian().to_vec()
+}
+
+fn decode_work(bytes: &[u8], label: &str) -> Result<U512, PoolError> {
+    if bytes.len() != 64 {
+        return Err(PoolError::LedgerCorrupt(format!(
+            "{label} must contain exactly 64 bytes"
+        )));
+    }
+    let work = U512::from_big_endian(bytes);
+    if work.is_zero() {
+        return Err(PoolError::LedgerCorrupt(format!("{label} is zero")));
+    }
+    Ok(work)
+}
+
+fn effective_pplns_window_shares(
+    policy: PoolPplnsPolicy,
+    block_target: [u8; 32],
+    share_target: [u8; 32],
+) -> Result<usize, PoolError> {
+    if policy.window_shares != 0 {
+        return Ok(policy.window_shares);
+    }
+    let block_work = target_work(block_target)?;
+    let share_work = target_work(share_target)?;
+    let expected = (block_work + share_work - U512::one()) / share_work;
+    if expected.is_zero() || expected > U512::from(POOL_MAX_PPLNS_WINDOW_SHARES) {
+        return Err(PoolError::InvalidPplnsWindow);
+    }
+    Ok(expected.low_u64() as usize)
+}
+
+fn operator_fee_atoms(reward_atoms: u64, operator_fee_bps: u16) -> u64 {
+    (u128::from(reward_atoms) * u128::from(operator_fee_bps) / 10_000) as u64
+}
+
+fn append_pplns_share(
+    ledger: &mut Ledger,
+    session_id: u64,
+    share_target: [u8; 32],
+) -> Result<(), PoolError> {
+    append_pplns_share_work(
+        ledger,
+        session_id,
+        encode_work(target_work(share_target)?),
+        None,
+    )
+}
+
+fn append_pplns_share_work(
+    ledger: &mut Ledger,
+    session_id: u64,
+    work: Vec<u8>,
+    pending_block_id: Option<[u8; 32]>,
+) -> Result<(), PoolError> {
+    decode_work(&work, "PPLNS share work")?;
+    let payout = ledger
+        .sessions
+        .get(&session_id)
+        .ok_or_else(|| PoolError::InvalidMessage("unknown session".to_owned()))?
+        .payout;
+    ledger.pplns_shares.push_back(PplnsShareRecord {
+        session_id,
+        payout,
+        work,
+        pending_block_id,
+    });
+    while ledger.pplns_shares.len() > POOL_MAX_PPLNS_WINDOW_SHARES {
+        ledger.pplns_shares.pop_front();
+    }
+    Ok(())
+}
+
+fn remove_pending_pplns_share(ledger: &mut Ledger, block_id: [u8; 32]) {
+    ledger
+        .pplns_shares
+        .retain(|share| share.pending_block_id != Some(block_id));
+}
+
+fn pplns_allocations(
+    shares: &VecDeque<PplnsShareRecord>,
+    window_shares: usize,
+    distributable_atoms: u64,
+) -> Result<(usize, U512, Vec<PplnsAllocationRecord>), PoolError> {
+    let selected = shares.iter().rev().take(window_shares).collect::<Vec<_>>();
+    if selected.is_empty() {
+        return Err(PoolError::LedgerCorrupt(
+            "PPLNS block has no accepted shares".to_owned(),
+        ));
+    }
+    let mut weights = BTreeMap::<[u8; 32], BTreeMap<u64, U512>>::new();
+    let mut total_work = U512::zero();
+    for share in &selected {
+        let work = decode_work(&share.work, "PPLNS share work")?;
+        total_work = total_work
+            .checked_add(work)
+            .ok_or_else(|| PoolError::LedgerCorrupt("PPLNS window work overflow".to_owned()))?;
+        let weight = weights
+            .entry(share.payout)
+            .or_default()
+            .entry(share.session_id)
+            .or_default();
+        *weight = weight.checked_add(work).ok_or_else(|| {
+            PoolError::LedgerCorrupt("PPLNS participant work overflow".to_owned())
+        })?;
+    }
+    if distributable_atoms == 0 {
+        return Ok((selected.len(), total_work, Vec::new()));
+    }
+
+    let mut payout_candidates = weights
+        .iter()
+        .map(|(payout, sessions)| {
+            let payout_work = sessions.values().try_fold(U512::zero(), |total, work| {
+                total.checked_add(*work).ok_or_else(|| {
+                    PoolError::LedgerCorrupt("PPLNS payout work overflow".to_owned())
+                })
+            })?;
+            let weighted_reward = U512::from(distributable_atoms) * payout_work;
+            let atoms = (weighted_reward / total_work).low_u64();
+            let remainder = weighted_reward % total_work;
+            Ok::<_, PoolError>((*payout, payout_work, atoms, remainder))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let allocated = payout_candidates
+        .iter()
+        .try_fold(0_u64, |total, candidate| {
+            checked_ledger_add(total, candidate.2, "PPLNS rounded allocation")
+        })?;
+    let remainder_atoms = distributable_atoms.checked_sub(allocated).ok_or_else(|| {
+        PoolError::LedgerCorrupt("PPLNS rounded allocation exceeds reward".to_owned())
+    })? as usize;
+    payout_candidates
+        .sort_by(|left, right| right.3.cmp(&left.3).then_with(|| left.0.cmp(&right.0)));
+    if remainder_atoms > payout_candidates.len() {
+        return Err(PoolError::LedgerCorrupt(
+            "PPLNS remainder exceeds payout count".to_owned(),
+        ));
+    }
+    for candidate in payout_candidates.iter_mut().take(remainder_atoms) {
+        candidate.2 = checked_ledger_add(candidate.2, 1, "PPLNS remainder allocation")?;
+    }
+    let mut allocations = Vec::new();
+    for (payout, payout_work, payout_atoms, _) in payout_candidates {
+        if payout_atoms == 0 {
+            continue;
+        }
+        let sessions = &weights[&payout];
+        let mut session_candidates = sessions
+            .iter()
+            .map(|(session_id, work)| {
+                let weighted_reward = U512::from(payout_atoms) * *work;
+                (
+                    *session_id,
+                    (weighted_reward / payout_work).low_u64(),
+                    weighted_reward % payout_work,
+                )
+            })
+            .collect::<Vec<_>>();
+        let session_allocated = session_candidates
+            .iter()
+            .try_fold(0_u64, |total, candidate| {
+                checked_ledger_add(total, candidate.1, "PPLNS session allocation")
+            })?;
+        let session_remainder = payout_atoms.checked_sub(session_allocated).ok_or_else(|| {
+            PoolError::LedgerCorrupt("PPLNS session allocation exceeds payout".to_owned())
+        })? as usize;
+        session_candidates
+            .sort_by(|left, right| right.2.cmp(&left.2).then_with(|| left.0.cmp(&right.0)));
+        if session_remainder > session_candidates.len() {
+            return Err(PoolError::LedgerCorrupt(
+                "PPLNS remainder exceeds session count".to_owned(),
+            ));
+        }
+        for candidate in session_candidates.iter_mut().take(session_remainder) {
+            candidate.1 = checked_ledger_add(candidate.1, 1, "PPLNS session remainder")?;
+        }
+        allocations.extend(
+            session_candidates
+                .into_iter()
+                .filter_map(|(session_id, atoms, _)| {
+                    (atoms != 0).then_some(PplnsAllocationRecord {
+                        session_id,
+                        payout,
+                        atoms,
+                    })
+                }),
+        );
+    }
+    allocations.sort_by_key(|allocation| (allocation.payout, allocation.session_id));
+    Ok((selected.len(), total_work, allocations))
+}
+
+fn finalize_pending_block_accounting(
+    ledger: &mut Ledger,
+    block_id: [u8; 32],
+) -> Result<(), PoolError> {
+    let block = *ledger
+        .blocks
+        .get(&block_id)
+        .ok_or_else(|| PoolError::LedgerCorrupt("pending pool block is missing".to_owned()))?;
+    let Some(pplns) = ledger.pplns_blocks.get(&block_id) else {
+        return apply_accepted_share_credit(ledger, block.session_id, block.atoms, true);
+    };
+    if pplns.window_share_count == 0 {
+        return Err(PoolError::LedgerCorrupt(
+            "pending PPLNS block has no frozen share window".to_owned(),
+        ));
+    }
+    if let Some(share) = ledger
+        .pplns_shares
+        .iter_mut()
+        .find(|share| share.pending_block_id == Some(block_id))
+    {
+        share.pending_block_id = None;
+    } else if block.state == PoolBlockState::Pending {
+        return Err(PoolError::LedgerCorrupt(
+            "pending PPLNS block share is missing".to_owned(),
+        ));
+    }
+    apply_accepted_share_credit(ledger, block.session_id, 0, true)?;
+    Ok(())
+}
+
+fn distribute_mature_pplns_block(ledger: &mut Ledger, block_id: [u8; 32]) -> Result<(), PoolError> {
+    let Some(pplns) = ledger.pplns_blocks.get(&block_id) else {
+        return Ok(());
+    };
+    if pplns.distributed {
+        return Ok(());
+    }
+    if pplns.window_share_count == 0 {
+        return Err(PoolError::LedgerCorrupt(
+            "mature PPLNS block has no frozen share window".to_owned(),
+        ));
+    }
+    let operator_fee = pplns.operator_fee_atoms;
+    let distributable = pplns.distributable_atoms;
+    let allocations = pplns.allocations.clone();
+    ledger.operator_fee_atoms = checked_ledger_add(
+        ledger.operator_fee_atoms,
+        operator_fee,
+        "operator fee atoms",
+    )?;
+    ledger.credited_devnet_atoms = checked_ledger_add(
+        ledger.credited_devnet_atoms,
+        distributable,
+        "PPLNS credited atoms",
+    )?;
+    for allocation in allocations {
+        if let Some(session) = ledger.sessions.get_mut(&allocation.session_id)
+            && session.payout == allocation.payout
+        {
+            session.credited_devnet_atoms = checked_ledger_add(
+                session.credited_devnet_atoms,
+                allocation.atoms,
+                "session PPLNS credit",
+            )?;
+        }
+        let payout = ledger.payouts.entry(allocation.payout).or_default();
+        if ledger.sessions.contains_key(&allocation.session_id) {
+            payout.last_session_id = allocation.session_id;
+        }
+        payout.credited_devnet_atoms = checked_ledger_add(
+            payout.credited_devnet_atoms,
+            allocation.atoms,
+            "payout PPLNS credit",
+        )?;
+    }
+    ledger
+        .pplns_blocks
+        .get_mut(&block_id)
+        .expect("checked above")
+        .distributed = true;
+    Ok(())
 }
 
 fn apply_accepted_share_credit(
@@ -3247,13 +3856,22 @@ fn snapshot_ledger(ledger: &DurableLedger) -> Result<PoolLedgerSnapshot, PoolErr
     let blocks = ledger
         .blocks
         .iter()
-        .map(|(block_id, record)| PoolBlockStats {
-            block_id: hex::encode(block_id),
-            parent: hex::encode(record.parent),
-            height: record.height,
-            payout: hex::encode(record.payout),
-            state: record.state.label().to_owned(),
-            confirmations: record.confirmations,
+        .map(|(block_id, record)| {
+            let pplns = ledger.pplns_blocks.get(block_id);
+            PoolBlockStats {
+                block_id: hex::encode(block_id),
+                parent: hex::encode(record.parent),
+                height: record.height,
+                payout: hex::encode(record.payout),
+                state: record.state.label().to_owned(),
+                confirmations: record.confirmations,
+                miner_reward_atoms: pplns.map(|record| record.miner_reward_atoms),
+                operator_fee_bps: pplns.map(|record| record.operator_fee_bps),
+                operator_fee_atoms: pplns.map(|record| record.operator_fee_atoms),
+                distributable_atoms: pplns.map(|record| record.distributable_atoms),
+                pplns_window_shares: pplns.map(|record| record.window_share_count),
+                pplns_distributed: pplns.is_some_and(|record| record.distributed),
+            }
         })
         .collect::<Vec<_>>();
     let payout_transactions = ledger
@@ -3285,6 +3903,18 @@ fn snapshot_ledger(ledger: &DurableLedger) -> Result<PoolLedgerSnapshot, PoolErr
         rejected_shares: ledger.rejected_shares,
         pool_blocks: ledger.pool_blocks,
         credited_devnet_atoms: ledger.credited_devnet_atoms,
+        operator_fee_atoms: ledger.operator_fee_atoms,
+        pplns_window_shares: ledger.pplns_shares.len(),
+        pplns_pending_blocks: ledger
+            .pplns_blocks
+            .values()
+            .filter(|record| !record.distributed)
+            .count() as u64,
+        pplns_distributed_blocks: ledger
+            .pplns_blocks
+            .values()
+            .filter(|record| record.distributed)
+            .count() as u64,
         canonical_pool_blocks,
         orphaned_pool_blocks,
         sessions,
@@ -4884,12 +5514,389 @@ mod tests {
             Err(PoolError::InvalidShareVerificationLimit)
         ));
 
+        let mut fee = config();
+        fee.pplns_policy = Some(PoolPplnsPolicy {
+            operator_fee_bps: 10_001,
+            window_shares: 0,
+        });
+        assert!(matches!(
+            spawn_pool_server(Arc::clone(&node), fee),
+            Err(PoolError::InvalidOperatorFee)
+        ));
+
+        let mut window = config();
+        window.pplns_policy = Some(PoolPplnsPolicy {
+            operator_fee_bps: 300,
+            window_shares: POOL_MAX_PPLNS_WINDOW_SHARES + 1,
+        });
+        assert!(matches!(
+            spawn_pool_server(Arc::clone(&node), window),
+            Err(PoolError::InvalidPplnsWindow)
+        ));
+
         let mut queued = config();
         queued.max_queued_share_verifications = POOL_MAX_QUEUED_SHARE_VERIFICATIONS + 1;
         assert!(matches!(
             spawn_pool_server(node, queued),
             Err(PoolError::InvalidShareVerificationQueueLimit)
         ));
+    }
+
+    #[test]
+    fn pplns_waits_for_maturity_and_deducts_the_frozen_operator_fee() {
+        let ledger = DurableLedger::open(None, [0x41; 32], [0x42; 32]).unwrap();
+        let first = PoolPayoutSigner::new(SigningKey::from_bytes(&[0x51; 32]).unwrap()).payout();
+        let second = PoolPayoutSigner::new(SigningKey::from_bytes(&[0x52; 32]).unwrap()).payout();
+        let third = PoolPayoutSigner::new(SigningKey::from_bytes(&[0x53; 32]).unwrap()).payout();
+        register_session(&ledger, 1, "first".to_owned(), first).unwrap();
+        register_session(&ledger, 2, "second".to_owned(), second).unwrap();
+        register_session(&ledger, 3, "third".to_owned(), third).unwrap();
+        let policy = PoolPplnsPolicy {
+            operator_fee_bps: 300,
+            window_shares: 4,
+        };
+        record_accepted_share(&ledger, 1, 1, Some(policy), [0xff; 32]).unwrap();
+        record_accepted_share(&ledger, 1, 1, Some(policy), [0xff; 32]).unwrap();
+        record_accepted_share(&ledger, 2, 1, Some(policy), [0xff; 32]).unwrap();
+        let block = PoolBlockCredit {
+            block_id: [0x61; 32],
+            parent: [0x62; 32],
+            height: 7,
+            miner_reward_atoms: 101,
+            share_target: [0xff; 32],
+            block_target: [0x3f; 32],
+        };
+        reserve_pending_pool_block(&ledger, 3, block, 1, Some(policy)).unwrap();
+        finalize_pending_pool_block(&ledger, block.block_id, PoolBlockState::Canonical, 1).unwrap();
+        let immature = snapshot_ledger(&ledger).unwrap();
+        assert_eq!(immature.credited_devnet_atoms, 0);
+        assert_eq!(immature.operator_fee_atoms, 0);
+        assert!(!immature.blocks[0].pplns_distributed);
+
+        finalize_pending_pool_block(
+            &ledger,
+            block.block_id,
+            PoolBlockState::Canonical,
+            COINBASE_MATURITY - 1,
+        )
+        .unwrap();
+        assert_eq!(snapshot_ledger(&ledger).unwrap().credited_devnet_atoms, 0);
+        finalize_pending_pool_block(
+            &ledger,
+            block.block_id,
+            PoolBlockState::Canonical,
+            COINBASE_MATURITY,
+        )
+        .unwrap();
+        let mature = snapshot_ledger(&ledger).unwrap();
+        assert_eq!(mature.credited_devnet_atoms, 98);
+        assert_eq!(mature.operator_fee_atoms, 3);
+        assert_eq!(mature.pplns_distributed_blocks, 1);
+        assert!(mature.blocks[0].pplns_distributed);
+        assert_eq!(mature.blocks[0].operator_fee_bps, Some(300));
+        assert_eq!(mature.blocks[0].pplns_window_shares, Some(4));
+        let first_credit = mature
+            .payouts
+            .iter()
+            .find(|payout| payout.payout == hex::encode(first))
+            .unwrap()
+            .credited_devnet_atoms;
+        let second_credit = mature
+            .payouts
+            .iter()
+            .find(|payout| payout.payout == hex::encode(second))
+            .unwrap()
+            .credited_devnet_atoms;
+        let third_credit = mature
+            .payouts
+            .iter()
+            .find(|payout| payout.payout == hex::encode(third))
+            .unwrap()
+            .credited_devnet_atoms;
+        assert_eq!(first_credit, 49);
+        assert_eq!(second_credit + third_credit, 49);
+        assert!([24, 25].contains(&second_credit));
+        assert!([24, 25].contains(&third_credit));
+
+        finalize_pending_pool_block(
+            &ledger,
+            block.block_id,
+            PoolBlockState::Canonical,
+            COINBASE_MATURITY + 1,
+        )
+        .unwrap();
+        assert_eq!(snapshot_ledger(&ledger).unwrap().credited_devnet_atoms, 98);
+    }
+
+    #[test]
+    fn automatic_pplns_window_tracks_expected_share_work() {
+        let policy = PoolPplnsPolicy::default();
+        assert_eq!(
+            effective_pplns_window_shares(policy, [0x3f; 32], [0xff; 32]).unwrap(),
+            4
+        );
+        assert_eq!(operator_fee_atoms(101, policy.operator_fee_bps), 3);
+    }
+
+    #[test]
+    fn pplns_payout_rounding_is_invariant_to_session_splitting() {
+        let first_payout = [1_u8; 32];
+        let second_payout = [2_u8; 32];
+        let shares = VecDeque::from([
+            PplnsShareRecord {
+                session_id: 1,
+                payout: first_payout,
+                work: encode_work(U512::one()),
+                pending_block_id: None,
+            },
+            PplnsShareRecord {
+                session_id: 2,
+                payout: first_payout,
+                work: encode_work(U512::one()),
+                pending_block_id: None,
+            },
+            PplnsShareRecord {
+                session_id: 3,
+                payout: second_payout,
+                work: encode_work(U512::one()),
+                pending_block_id: None,
+            },
+        ]);
+        let (_, _, allocations) = pplns_allocations(&shares, 3, 5).unwrap();
+        let first_atoms = allocations
+            .iter()
+            .filter(|allocation| allocation.payout == first_payout)
+            .map(|allocation| allocation.atoms)
+            .sum::<u64>();
+        let second_atoms = allocations
+            .iter()
+            .filter(|allocation| allocation.payout == second_payout)
+            .map(|allocation| allocation.atoms)
+            .sum::<u64>();
+        assert_eq!((first_atoms, second_atoms), (3, 2));
+    }
+
+    #[test]
+    fn pplns_orphaned_before_maturity_never_credits_the_window() {
+        let ledger = DurableLedger::open(None, [0x71; 32], [0x72; 32]).unwrap();
+        let payout = default_miner_destination();
+        register_session(&ledger, 1, "worker".to_owned(), payout).unwrap();
+        let policy = PoolPplnsPolicy {
+            operator_fee_bps: 300,
+            window_shares: 1,
+        };
+        let block = PoolBlockCredit {
+            block_id: [0x73; 32],
+            parent: [0x74; 32],
+            height: 8,
+            miner_reward_atoms: 1_000,
+            share_target: [0xff; 32],
+            block_target: [0x7f; 32],
+        };
+        reserve_pending_pool_block(&ledger, 1, block, 1, Some(policy)).unwrap();
+        finalize_pending_pool_block(&ledger, block.block_id, PoolBlockState::Orphaned, 0).unwrap();
+
+        let snapshot = snapshot_ledger(&ledger).unwrap();
+        assert_eq!(snapshot.pool_blocks, 1);
+        assert_eq!(snapshot.credited_devnet_atoms, 0);
+        assert_eq!(snapshot.operator_fee_atoms, 0);
+        assert_eq!(snapshot.pplns_distributed_blocks, 0);
+        assert!(!snapshot.blocks[0].pplns_distributed);
+    }
+
+    #[test]
+    fn durable_pplns_restart_distributes_a_mature_block_exactly_once() {
+        let root = TestRoot::new("durable-pplns-restart");
+        let directory = root.path().join("ledger");
+        let network_id = [0x75; 32];
+        let fingerprint = [0x76; 32];
+        let payout = default_miner_destination();
+        let policy = PoolPplnsPolicy {
+            operator_fee_bps: 300,
+            window_shares: 1,
+        };
+        let block = PoolBlockCredit {
+            block_id: [0x77; 32],
+            parent: [0x78; 32],
+            height: 9,
+            miner_reward_atoms: 1_000,
+            share_target: [0xff; 32],
+            block_target: [0x7f; 32],
+        };
+        {
+            let ledger =
+                DurableLedger::open(Some(directory.clone()), network_id, fingerprint).unwrap();
+            register_session(&ledger, 1, "worker".to_owned(), payout).unwrap();
+            reserve_pending_pool_block(&ledger, 1, block, 1, Some(policy)).unwrap();
+            finalize_pending_pool_block(
+                &ledger,
+                block.block_id,
+                PoolBlockState::Canonical,
+                COINBASE_MATURITY - 1,
+            )
+            .unwrap();
+            assert_eq!(snapshot_ledger(&ledger).unwrap().credited_devnet_atoms, 0);
+        }
+
+        {
+            let ledger =
+                DurableLedger::open(Some(directory.clone()), network_id, fingerprint).unwrap();
+            finalize_pending_pool_block(
+                &ledger,
+                block.block_id,
+                PoolBlockState::Canonical,
+                COINBASE_MATURITY,
+            )
+            .unwrap();
+            finalize_pending_pool_block(
+                &ledger,
+                block.block_id,
+                PoolBlockState::Canonical,
+                COINBASE_MATURITY + 1,
+            )
+            .unwrap();
+        }
+
+        let ledger = DurableLedger::open(Some(directory), network_id, fingerprint).unwrap();
+        let snapshot = snapshot_ledger(&ledger).unwrap();
+        assert_eq!(snapshot.credited_devnet_atoms, 970);
+        assert_eq!(snapshot.operator_fee_atoms, 30);
+        assert_eq!(snapshot.payouts[0].credited_devnet_atoms, 970);
+        assert_eq!(snapshot.pplns_distributed_blocks, 1);
+    }
+
+    #[test]
+    fn pplns_fee_changes_apply_only_to_blocks_found_after_the_change() {
+        let ledger = DurableLedger::open(None, [0x79; 32], [0x7a; 32]).unwrap();
+        let payout = default_miner_destination();
+        register_session(&ledger, 1, "worker".to_owned(), payout).unwrap();
+        let first_policy = PoolPplnsPolicy {
+            operator_fee_bps: 300,
+            window_shares: 1,
+        };
+        let second_policy = PoolPplnsPolicy {
+            operator_fee_bps: 500,
+            window_shares: 1,
+        };
+        let first = PoolBlockCredit {
+            block_id: [0x7b; 32],
+            parent: [0x7c; 32],
+            height: 10,
+            miner_reward_atoms: 300,
+            share_target: [0xff; 32],
+            block_target: [0x7f; 32],
+        };
+        let second = PoolBlockCredit {
+            block_id: [0x7d; 32],
+            parent: first.block_id,
+            height: 11,
+            miner_reward_atoms: 500,
+            share_target: [0xff; 32],
+            block_target: [0x7f; 32],
+        };
+        reserve_pending_pool_block(&ledger, 1, first, 1, Some(first_policy)).unwrap();
+        finalize_pending_pool_block(
+            &ledger,
+            first.block_id,
+            PoolBlockState::Canonical,
+            COINBASE_MATURITY,
+        )
+        .unwrap();
+        reserve_pending_pool_block(&ledger, 1, second, 1, Some(second_policy)).unwrap();
+        finalize_pending_pool_block(
+            &ledger,
+            second.block_id,
+            PoolBlockState::Canonical,
+            COINBASE_MATURITY,
+        )
+        .unwrap();
+
+        let snapshot = snapshot_ledger(&ledger).unwrap();
+        assert_eq!(snapshot.operator_fee_atoms, 34);
+        assert_eq!(snapshot.credited_devnet_atoms, 766);
+        assert_eq!(snapshot.blocks[0].operator_fee_bps, Some(300));
+        assert_eq!(snapshot.blocks[1].operator_fee_bps, Some(500));
+    }
+
+    #[test]
+    fn pplns_window_is_frozen_before_later_shares_arrive() {
+        let ledger = DurableLedger::open(None, [0x81; 32], [0x82; 32]).unwrap();
+        let finder = PoolPayoutSigner::new(SigningKey::from_bytes(&[0x83; 32]).unwrap()).payout();
+        let later = PoolPayoutSigner::new(SigningKey::from_bytes(&[0x84; 32]).unwrap()).payout();
+        register_session(&ledger, 1, "finder".to_owned(), finder).unwrap();
+        register_session(&ledger, 2, "later".to_owned(), later).unwrap();
+        let policy = PoolPplnsPolicy {
+            operator_fee_bps: 300,
+            window_shares: 1,
+        };
+        let block = PoolBlockCredit {
+            block_id: [0x85; 32],
+            parent: [0x86; 32],
+            height: 12,
+            miner_reward_atoms: 100,
+            share_target: [0xff; 32],
+            block_target: [0x7f; 32],
+        };
+        reserve_pending_pool_block(&ledger, 1, block, 1, Some(policy)).unwrap();
+        record_accepted_share(&ledger, 2, 1, Some(policy), [0xff; 32]).unwrap();
+        finalize_pending_pool_block(
+            &ledger,
+            block.block_id,
+            PoolBlockState::Canonical,
+            COINBASE_MATURITY,
+        )
+        .unwrap();
+
+        let snapshot = snapshot_ledger(&ledger).unwrap();
+        let finder_credit = snapshot
+            .payouts
+            .iter()
+            .find(|record| record.payout == hex::encode(finder))
+            .unwrap()
+            .credited_devnet_atoms;
+        let later_credit = snapshot
+            .payouts
+            .iter()
+            .find(|record| record.payout == hex::encode(later))
+            .unwrap()
+            .credited_devnet_atoms;
+        assert_eq!(finder_credit, 97);
+        assert_eq!(later_credit, 0);
+    }
+
+    #[test]
+    fn adding_empty_pplns_fields_preserves_previous_v2_payload_bytes() {
+        #[derive(Serialize)]
+        struct PreviousStoredLedgerPayloadV2<'a> {
+            accepted_shares: u64,
+            rejected_shares: u64,
+            pool_blocks: u64,
+            credited_devnet_atoms: u64,
+            sessions: &'a [StoredSessionRecordV1],
+            payouts: &'a [StoredPayoutRecordV1],
+            blocks: &'a [StoredBlockRecordV1],
+            payout_transactions: &'a [StoredPayoutTransactionRecordV1],
+        }
+
+        let ledger = DurableLedger::open(None, [0x7e; 32], [0x7f; 32]).unwrap();
+        let payout = default_miner_destination();
+        register_session(&ledger, 1, "worker".to_owned(), payout).unwrap();
+        credit_accepted_share(&ledger, 1, 7).unwrap();
+        let current = ledger_payload(&ledger.state.lock().unwrap());
+        let previous = PreviousStoredLedgerPayloadV2 {
+            accepted_shares: current.accepted_shares,
+            rejected_shares: current.rejected_shares,
+            pool_blocks: current.pool_blocks,
+            credited_devnet_atoms: current.credited_devnet_atoms,
+            sessions: &current.sessions,
+            payouts: &current.payouts,
+            blocks: &current.blocks,
+            payout_transactions: &current.payout_transactions,
+        };
+        assert_eq!(
+            serde_json::to_vec(&current).unwrap(),
+            serde_json::to_vec(&previous).unwrap()
+        );
     }
 
     #[test]
@@ -4903,12 +5910,15 @@ mod tests {
             block_id: [0x53; 32],
             parent: [0x54; 32],
             height: 7,
+            miner_reward_atoms: 11,
+            share_target: [0xff; 32],
+            block_target: [0x7f; 32],
         };
         {
             let ledger =
                 DurableLedger::open(Some(directory.clone()), network_id, fingerprint).unwrap();
             register_session(&ledger, 1, "worker".to_owned(), payout).unwrap();
-            reserve_pending_pool_block(&ledger, 1, block, 11).unwrap();
+            reserve_pending_pool_block(&ledger, 1, block, 11, None).unwrap();
             let pending = snapshot_ledger(&ledger).unwrap();
             assert_eq!(pending.accepted_shares, 0);
             assert_eq!(pending.pool_blocks, 0);

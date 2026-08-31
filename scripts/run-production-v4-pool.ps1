@@ -14,6 +14,8 @@ param(
     [uint16]$ShareLeadingZeroBits = 7,
     [uint64]$MinimumPayoutAtoms = 100,
     [uint64]$PayoutFeeAtoms = 1,
+    [ValidateRange(0, 10000)][uint16]$OperatorFeeBps = 300,
+    [ValidateRange(0, 65536)][uint32]$PplnsWindowShares = 0,
     [switch]$IgnoreSavedSettings
 )
 
@@ -87,6 +89,8 @@ if (-not $IgnoreSavedSettings -and (Test-Path -LiteralPath $settingsFile -PathTy
     if (-not $PSBoundParameters.ContainsKey('ShareLeadingZeroBits')) { $ShareLeadingZeroBits = [uint16]$saved.share_leading_zero_bits }
     if (-not $PSBoundParameters.ContainsKey('MinimumPayoutAtoms')) { $MinimumPayoutAtoms = [uint64]$saved.minimum_payout_atoms }
     if (-not $PSBoundParameters.ContainsKey('PayoutFeeAtoms')) { $PayoutFeeAtoms = [uint64]$saved.payout_fee_atoms }
+    if (-not $PSBoundParameters.ContainsKey('OperatorFeeBps') -and $saved.PSObject.Properties.Name -contains 'operator_fee_bps') { $OperatorFeeBps = [uint16]$saved.operator_fee_bps }
+    if (-not $PSBoundParameters.ContainsKey('PplnsWindowShares') -and $saved.PSObject.Properties.Name -contains 'pplns_window_shares') { $PplnsWindowShares = [uint32]$saved.pplns_window_shares }
 }
 if (Test-Path -LiteralPath $stateFile -PathType Leaf) {
     $existingState = Get-Content -LiteralPath $stateFile -Raw | ConvertFrom-Json
@@ -198,6 +202,8 @@ $arguments = @(
     '--enable-testnet-payouts',
     '--pool-minimum-payout-atoms', $MinimumPayoutAtoms,
     '--pool-payout-fee-atoms', $PayoutFeeAtoms,
+    '--pool-operator-fee-bps', $OperatorFeeBps,
+    '--pool-pplns-window-shares', $PplnsWindowShares,
     '--pool-dashboard-assets', $dashboardAssets,
     '--pool-public-url', $publicUrl,
     '--pool-dashboard-bind', $DashboardBind,
@@ -214,6 +220,7 @@ if ($AllowPublicPeers) {
 }
 Write-Host "Pool URL: $publicUrl"
 Write-Host "Dashboard: http://$DashboardBind/"
+Write-Host ("PPLNS: {0:N2}% operator fee; {1}" -f ($OperatorFeeBps / 100), $(if ($PplnsWindowShares -eq 0) { 'automatic one-block share window' } else { "$PplnsWindowShares-share window" }))
 $settings = [ordered]@{
     schema = 'CommonFoundry/ProductionV4/PoolSettings/v1'
     public_numeric_address = $PublicNumericAddress
@@ -229,6 +236,8 @@ $settings = [ordered]@{
     share_leading_zero_bits = $ShareLeadingZeroBits
     minimum_payout_atoms = $MinimumPayoutAtoms
     payout_fee_atoms = $PayoutFeeAtoms
+    operator_fee_bps = $OperatorFeeBps
+    pplns_window_shares = $PplnsWindowShares
 }
 Write-AtomicJson -Path $settingsFile -Value $settings
 $process = Get-Process -Id $PID

@@ -1,7 +1,7 @@
 # Common Foundry pool dashboard
 
 This Vite application is served by `cmfd-node pool-serve`. It is read-only: the
-browser receives pool, worker, block, and payout summaries from
+browser receives pool, worker, PPLNS block accounting, operator-fee, and payout summaries from
 `/api/v1/pool`, while all share verification and settlement remain inside the
 pool node.
 
@@ -51,6 +51,8 @@ payout-key challenge from every worker.
 
 Set `CMFD_POOL_PEER` to a static peer and
 `CMFD_POOL_ALLOW_PUBLIC_PEERS=1` when the pool node should use a public peer.
+`CMFD_POOL_OPERATOR_FEE_BPS` changes the default 300-basis-point operator fee,
+and `CMFD_POOL_PPLNS_WINDOW_SHARES` changes the automatic rolling window.
 Other supported overrides are documented directly in the launcher variables.
 
 ## Windows pool host

@@ -15,9 +15,10 @@ use cmfd_node::p2p::{
 use cmfd_node::peer::{PeerAddressPolicy, PeerLimits, StaticPeerConfig};
 use cmfd_node::pool::{
     DEFAULT_POOL_CONCURRENT_SHARE_VERIFICATIONS, DEFAULT_POOL_CONNECTIONS_PER_SOURCE,
-    DEFAULT_POOL_MINIMUM_PAYOUT_ATOMS, DEFAULT_POOL_PAYOUT_FEE_ATOMS,
-    DEFAULT_POOL_QUEUED_SHARE_VERIFICATIONS, DEFAULT_POOL_SOCKET_ADDRESS,
-    DEFAULT_SHARE_LEADING_ZERO_BITS, PoolPayoutPolicy, PoolServerConfig, certificate_sha256,
+    DEFAULT_POOL_MINIMUM_PAYOUT_ATOMS, DEFAULT_POOL_OPERATOR_FEE_BPS,
+    DEFAULT_POOL_PAYOUT_FEE_ATOMS, DEFAULT_POOL_QUEUED_SHARE_VERIFICATIONS,
+    DEFAULT_POOL_SOCKET_ADDRESS, DEFAULT_PPLNS_WINDOW_SHARES, DEFAULT_SHARE_LEADING_ZERO_BITS,
+    PoolPayoutPolicy, PoolPplnsPolicy, PoolServerConfig, certificate_sha256,
     generate_pool_certificate, spawn_pool_server,
 };
 use cmfd_node::pool_dashboard::{
@@ -267,6 +268,12 @@ enum Command {
         /// Burned fee, in atoms, for each pool payout transaction.
         #[arg(long, default_value_t = DEFAULT_POOL_PAYOUT_FEE_ATOMS)]
         pool_payout_fee_atoms: u64,
+        /// Operator fee in basis points, deducted from each mature pool block before PPLNS distribution.
+        #[arg(long, default_value_t = DEFAULT_POOL_OPERATOR_FEE_BPS)]
+        pool_operator_fee_bps: u16,
+        /// Fixed PPLNS share count; zero automatically uses one block of expected share work.
+        #[arg(long, default_value_t = DEFAULT_PPLNS_WINDOW_SHARES)]
+        pool_pplns_window_shares: usize,
         /// Maximum simultaneous pool connections accepted from one source IP.
         #[arg(long, default_value_t = DEFAULT_POOL_CONNECTIONS_PER_SOURCE)]
         pool_max_connections_per_source: usize,
@@ -639,6 +646,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             enable_testnet_payouts,
             pool_minimum_payout_atoms,
             pool_payout_fee_atoms,
+            pool_operator_fee_bps,
+            pool_pplns_window_shares,
             pool_max_connections_per_source,
             pool_max_concurrent_share_verifications,
             pool_max_queued_share_verifications,
@@ -725,6 +734,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             config.max_queued_share_verifications = pool_max_queued_share_verifications;
             config.allow_public_clients = allow_public_pool_clients;
             config.allow_address_only_payouts = allow_address_only_payouts;
+            config.pplns_policy = Some(PoolPplnsPolicy {
+                operator_fee_bps: pool_operator_fee_bps,
+                window_shares: pool_pplns_window_shares,
+            });
             if enable_testnet_payouts {
                 config.payout_policy = Some(PoolPayoutPolicy {
                     minimum_payout_atoms: pool_minimum_payout_atoms,
@@ -770,6 +783,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "address_only_payouts": allow_address_only_payouts,
                     "minimum_payout_atoms": pool_minimum_payout_atoms,
                     "payout_fee_atoms": pool_payout_fee_atoms,
+                    "operator_fee_bps": pool_operator_fee_bps,
+                    "pplns_window_shares": if pool_pplns_window_shares == 0 { json!("automatic") } else { json!(pool_pplns_window_shares) },
                     "max_connections_per_source": pool_max_connections_per_source,
                     "max_concurrent_share_verifications": pool_max_concurrent_share_verifications,
                     "max_queued_share_verifications": pool_max_queued_share_verifications,
@@ -1394,6 +1409,8 @@ mod tests {
             bind,
             p2p_bind,
             pool_dashboard_bind,
+            pool_operator_fee_bps,
+            pool_pplns_window_shares,
             ..
         } = cli.command
         else {
@@ -1402,6 +1419,8 @@ mod tests {
         assert_eq!(bind, COMPILED_NETWORK_PROFILE.pool_address());
         assert_eq!(p2p_bind, COMPILED_NETWORK_PROFILE.p2p_address());
         assert_eq!(pool_dashboard_bind, DEFAULT_POOL_DASHBOARD_ADDRESS);
+        assert_eq!(pool_operator_fee_bps, 300);
+        assert_eq!(pool_pplns_window_shares, 0);
     }
 
     #[test]

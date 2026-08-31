@@ -2,8 +2,9 @@
 
 The Common Foundry ProductionV4 pool package runs a certificate-pinned Devnet pool,
 a full P2P node, persistent CUDA replay and proof workers, durable PPLNS and
-payout accounting, and a read-only web dashboard. Windows and native Linux
-packages use the same protocol and ledger rules.
+payout accounting, a read-only public-statistics dashboard, and a separate
+loopback-only operator console. Windows and native Linux packages use the same
+protocol and ledger rules.
 
 This is Devnet software. Credits and payouts have no monetary value.
 
@@ -76,6 +77,12 @@ prompt is shown after the first successful start. Pass
 `-DataDirectory D:\path\to\pool-data` to any control when using a custom data
 directory.
 
+Double-click `OPEN-OPERATOR-DASHBOARD.bat` to open the local operator console at
+<http://127.0.0.1:22448>. Keep its small console window open while using the web
+controls. The page can start, gracefully stop, or restart the pool, view the
+latest log, and update the operator fee and PPLNS window used after the next
+start. Guarded stop and restart controls require an explicit confirmation.
+
 ## Native Linux
 
 Extract the archive on a Linux filesystem and run:
@@ -120,6 +127,10 @@ start at boot before that user logs in. Use `systemctl --user status
 commonfoundry-production-v4-pool` and `journalctl --user -u
 commonfoundry-production-v4-pool` for service diagnostics.
 
+Run `./OPEN-OPERATOR-DASHBOARD.sh` to open the same local operator console on
+Linux. Press Ctrl+C in its terminal to close only the operator console; the
+pool process continues running.
+
 ## Dashboard and miner connections
 
 The dashboard is available on the pool host at <http://127.0.0.1:22446>. It
@@ -127,7 +138,16 @@ shows pool health, chain height, workers, accepted and rejected shares, PPLNS
 window size, per-block reward and fee accounting, matured operator fees,
 credit, and payout status. The dashboard is deliberately loopback-only. Publish
 it through an authenticated reverse proxy or tunnel if remote viewing is
-needed; do not expose a separate node-control API.
+needed.
+
+The operator console is separately available at <http://127.0.0.1:22448> after
+running the supplied operator-dashboard launcher. It binds exclusively to
+`127.0.0.1`, validates the browser host and origin, and requires an in-memory
+same-origin request token for every mutation. It does not emit CORS permissions
+and must not be reverse proxied or exposed to the internet. Settings writes are
+atomic, preserve all other saved pool configuration, and only change future
+blocks after a restart. Stop and restart always use the pool's authenticated,
+ledger-preserving graceful-shutdown request; they never force-kill the pool.
 
 Miners connect with the exact URL printed at startup. The protocol uses TLS 1.3
 with an exact certificate SHA-256 pin. The standalone miner identifies its

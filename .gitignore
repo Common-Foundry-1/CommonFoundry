@@ -4,6 +4,8 @@
 /apps/wallet/dist/
 /apps/pool-dashboard/node_modules/
 /apps/pool-dashboard/dist/
+/apps/pool-operator-dashboard/node_modules/
+/apps/pool-operator-dashboard/dist/
 /apps/explorer/node_modules/
 /apps/explorer/dist/
 /apps/wallet/src-tauri/target/

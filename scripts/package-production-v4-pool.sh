@@ -13,6 +13,7 @@ windows_node="${3:-$project_root/target/release/cmfd-node.exe}"
 linux_node="${4:-$project_root/target-linux/release/cmfd-node}"
 prover_directory="${5:-$project_root/tools/production-v4-prover/target/release}"
 dashboard="$project_root/apps/pool-dashboard/dist"
+operator_dashboard="$project_root/apps/pool-operator-dashboard/dist"
 shared="$project_root/packaging/production-v4-pool/shared"
 release_integrity="$project_root/scripts/release_integrity.py"
 
@@ -34,6 +35,7 @@ for file in \
   "$prover_directory/cmfd-v4-replay" \
   "$prover_directory/real_bank0_relations" \
   "$dashboard/index.html" \
+  "$operator_dashboard/index.html" \
   "$shared/V4-INPUT-CHUNKS.json" \
   "$shared/production-v4-testnet-1-inputs.json" \
   "$shared/FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json"; do
@@ -64,6 +66,9 @@ copy_common() {
   local stage="$1"
   mkdir -p -- "$stage/dashboard"
   cp -R -- "$dashboard/." "$stage/dashboard/"
+  mkdir -p -- "$stage/operator-dashboard"
+  cp -R -- "$operator_dashboard/." "$stage/operator-dashboard/"
+  cp -- "$project_root/scripts/production-v4-pool-operator.py" "$stage/POOL-OPERATOR.py"
   cp -- "$project_root/scripts/production-v4-inputs.py" "$stage/production-v4-inputs.py"
   cp -- "$shared/V4-INPUT-CHUNKS.json" "$stage/V4-INPUT-CHUNKS.json"
   cp -- "$shared/production-v4-testnet-1-inputs.json" "$stage/production-v4-testnet-1-inputs.json"
@@ -91,6 +96,7 @@ mkdir -- "$windows_stage"
 copy_common "$windows_stage"
 cp -- "$windows_node" "$windows_stage/cmfd-node.exe"
 cp -- "$project_root/packaging/production-v4-pool/windows/START-POOL.bat" "$windows_stage/START-POOL.bat"
+cp -- "$project_root/packaging/production-v4-pool/windows/OPEN-OPERATOR-DASHBOARD.bat" "$windows_stage/OPEN-OPERATOR-DASHBOARD.bat"
 cp -- "$project_root/scripts/run-production-v4-pool.ps1" "$windows_stage/START-POOL.ps1"
 cp -- "$project_root/scripts/control-production-v4-pool.ps1" "$windows_stage/POOL-CONTROL.ps1"
 for control in POOL-CONTROL POOL-STATUS STOP-POOL RESTART-POOL INSTALL-POOL-AUTOSTART REMOVE-POOL-AUTOSTART; do
@@ -104,6 +110,7 @@ mkdir -- "$linux_stage"
 copy_common "$linux_stage"
 cp -- "$linux_node" "$linux_stage/cmfd-node"
 cp -- "$project_root/scripts/run-production-v4-pool.sh" "$linux_stage/START-POOL.sh"
+cp -- "$project_root/packaging/production-v4-pool/linux/OPEN-OPERATOR-DASHBOARD.sh" "$linux_stage/OPEN-OPERATOR-DASHBOARD.sh"
 cp -- "$project_root/scripts/control-production-v4-pool.py" "$linux_stage/POOL-CONTROL.py"
 for control in POOL-STATUS STOP-POOL RESTART-POOL INSTALL-POOL-SERVICE REMOVE-POOL-SERVICE; do
   cp -- "$project_root/packaging/production-v4-pool/linux/$control.sh" "$linux_stage/$control.sh"
@@ -114,6 +121,8 @@ chmod 755 \
   "$linux_stage/cmfd-v4-replay" \
   "$linux_stage/real_bank0_relations" \
   "$linux_stage/POOL-CONTROL.py" \
+  "$linux_stage/POOL-OPERATOR.py" \
+  "$linux_stage/OPEN-OPERATOR-DASHBOARD.sh" \
   "$linux_stage/POOL-STATUS.sh" \
   "$linux_stage/STOP-POOL.sh" \
   "$linux_stage/RESTART-POOL.sh" \

@@ -34,6 +34,8 @@ class PoolQualificationTests(unittest.TestCase):
         required = [
             "scripts/control-production-v4-pool.ps1",
             "scripts/control-production-v4-pool.py",
+            "scripts/production-v4-pool-operator.py",
+            "packaging/production-v4-pool/windows/OPEN-OPERATOR-DASHBOARD.bat",
             "packaging/production-v4-pool/windows/POOL-STATUS.bat",
             "packaging/production-v4-pool/windows/STOP-POOL.bat",
             "packaging/production-v4-pool/windows/RESTART-POOL.bat",
@@ -42,6 +44,7 @@ class PoolQualificationTests(unittest.TestCase):
             "packaging/production-v4-pool/linux/STOP-POOL.sh",
             "packaging/production-v4-pool/linux/RESTART-POOL.sh",
             "packaging/production-v4-pool/linux/INSTALL-POOL-SERVICE.sh",
+            "packaging/production-v4-pool/linux/OPEN-OPERATOR-DASHBOARD.sh",
         ]
         self.assertTrue(all((root / path).is_file() for path in required))
 
@@ -58,10 +61,16 @@ class PoolQualificationTests(unittest.TestCase):
         )
         self.assertEqual(
             [name for name, _command, _cwd in full[3:]],
-            ["pool_dashboard_tests", "pool_dashboard_build"],
+            [
+                "pool_dashboard_tests",
+                "pool_dashboard_build",
+                "pool_operator_dashboard_tests",
+                "pool_operator_dashboard_build",
+            ],
         )
         expected_npm = "npm.cmd" if os.name == "nt" else "npm"
         self.assertEqual(full[3][1][0], expected_npm)
+        self.assertEqual(full[5][1][0], expected_npm)
         self.assertTrue(
             all(
                 command[1] == f"+{QUALIFICATION.rust_toolchain()}"

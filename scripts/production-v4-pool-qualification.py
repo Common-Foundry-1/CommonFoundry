@@ -47,6 +47,7 @@ def qualification_commands(include_dashboard: bool) -> list[tuple[str, list[str]
                 "-m",
                 "unittest",
                 "scripts.tests.test_production_v4_pool_controls",
+                "scripts.tests.test_production_v4_pool_operator",
                 "scripts.tests.test_production_v4_pool_qualification",
             ],
             root,
@@ -72,10 +73,13 @@ def qualification_commands(include_dashboard: bool) -> list[tuple[str, list[str]
     ]
     if include_dashboard:
         dashboard = root / "apps" / "pool-dashboard"
+        operator_dashboard = root / "apps" / "pool-operator-dashboard"
         commands.extend(
             [
                 ("pool_dashboard_tests", [npm, "test"], dashboard),
                 ("pool_dashboard_build", [npm, "run", "build"], dashboard),
+                ("pool_operator_dashboard_tests", [npm, "test"], operator_dashboard),
+                ("pool_operator_dashboard_build", [npm, "run", "build"], operator_dashboard),
             ]
         )
     return commands

@@ -48,6 +48,11 @@ function formatAtoms(value: number | null | undefined): string {
   return new Intl.NumberFormat(undefined, { maximumFractionDigits: 8 }).format(value / 100_000_000);
 }
 
+function formatWorkRate(value: number | null | undefined): string {
+  if (!value || value <= 0) return "—";
+  return `${new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 }).format(value)} FW/s`;
+}
+
 function formatDuration(seconds: number | null): string {
   if (seconds == null) return "—";
   const days = Math.floor(seconds / 86_400);
@@ -361,8 +366,11 @@ export function App() {
         <div className="main-workspace">
           <section className="metrics-rail" aria-label="Pool accounting summary">
             <Metric icon={<Users />} label="Connected workers" value={formatNumber(pool?.active_connections)} note={`${formatNumber(pool?.workers.filter((worker) => worker.connected).length)} active identities`} />
+            <Metric icon={<Gauge />} label="Pool work rate" value={formatWorkRate(pool?.reported_work_rate_fw_per_second)} note={`${formatWorkRate(pool?.reported_average_work_rate_fw_per_second)} average · miner reported`} />
             <Metric icon={<Check />} label="Accepted shares" value={formatNumber(ledger?.accepted_shares)} note="Durable PPLNS work" />
-            <Metric icon={<X />} label="Rejected shares" value={formatNumber(ledger?.rejected_shares)} note="Total validation rejects" />
+            <Metric icon={<X />} label="Rejected shares" value={formatNumber(ledger?.rejected_shares)} note={`${formatNumber(ledger?.stale_shares)} stale`} />
+            <Metric icon={<CircleDollarSign />} label="Earned · 24h" value={formatAtoms(pool?.credited_atoms_last_24h)} note="Actual miner credit" />
+            <Metric icon={<Activity />} label="Estimated · 24h" value={pool?.estimated_24h_credited_atoms == null ? "Collecting data" : formatAtoms(pool.estimated_24h_credited_atoms)} note={pool?.estimated_24h_credited_atoms == null ? "15m minimum observation" : "Observed pool pace"} />
             <Metric icon={<FileClock />} label="Pending PPLNS blocks" value={formatNumber(ledger?.pplns_pending_blocks)} note="Waiting for maturity" />
             <Metric icon={<Boxes />} label="Distributed blocks" value={formatNumber(ledger?.pplns_distributed_blocks)} note={`${formatNumber(ledger?.pool_blocks)} found total`} />
             <Metric icon={<CircleDollarSign />} label="Operator earnings" value={formatAtoms(ledger?.operator_fee_atoms)} note="CMFD matured" />

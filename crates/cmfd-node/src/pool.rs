@@ -64,6 +64,7 @@ pub const POOL_MAX_LEDGER_SESSIONS: usize = 1_024;
 pub const POOL_MAX_LEDGER_PAYOUTS: usize = 1_024;
 pub const POOL_MAX_LEDGER_BLOCKS: usize = 65_536;
 pub const POOL_MAX_LEDGER_PAYOUT_TRANSACTIONS: usize = 65_536;
+pub const POOL_MAX_EARNING_EVENTS: usize = 65_536;
 pub const DEFAULT_POOL_MINIMUM_PAYOUT_ATOMS: u64 = 100;
 pub const DEFAULT_POOL_PAYOUT_FEE_ATOMS: u64 = 1;
 pub const DEFAULT_POOL_OPERATOR_FEE_BPS: u16 = 300;
@@ -73,6 +74,10 @@ pub const POOL_ACCOUNTING_SEMANTICS: &str = "durable PPLNS accounting; each matu
 
 const POOL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const POOL_READ_TIMEOUT: Duration = Duration::from_millis(200);
+const POOL_WORK_RATE_FRESHNESS: Duration = Duration::from_secs(120);
+const POOL_EARNING_HISTORY_SECONDS: u64 = 7 * 24 * 60 * 60;
+const POOL_EARNING_WINDOW_SECONDS: u64 = 24 * 60 * 60;
+const POOL_MIN_PACE_SAMPLE_SECONDS: u64 = 15 * 60;
 const POOL_SHARE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
 const POOL_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const POOL_ACCEPT_POLL: Duration = Duration::from_millis(25);
@@ -451,6 +456,7 @@ pub struct PoolPayoutStats {
     pub payout: String,
     pub accepted_shares: u64,
     pub rejected_shares: u64,
+    pub stale_shares: u64,
     pub pool_blocks: u64,
     pub credited_devnet_atoms: u64,
     pub reserved_payout_atoms: u64,
@@ -493,6 +499,7 @@ pub struct PoolLedgerSnapshot {
     pub persistence: String,
     pub accepted_shares: u64,
     pub rejected_shares: u64,
+    pub stale_shares: u64,
     pub pool_blocks: u64,
     pub credited_devnet_atoms: u64,
     pub operator_fee_atoms: u64,
@@ -507,7 +514,7 @@ pub struct PoolLedgerSnapshot {
     pub payout_transactions: Vec<PoolPayoutTransactionStats>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PoolDashboardWorkerStats {
     pub worker: String,
@@ -515,11 +522,17 @@ pub struct PoolDashboardWorkerStats {
     pub connected: bool,
     pub accepted_shares: u64,
     pub rejected_shares: u64,
+    pub stale_shares: u64,
     pub pool_blocks: u64,
     pub credited_devnet_atoms: u64,
+    pub reported_work_rate_fw_per_second: f64,
+    pub reported_average_work_rate_fw_per_second: f64,
+    pub telemetry_age_seconds: Option<u64>,
+    pub earned_atoms_last_24h: u64,
+    pub estimated_24h_earnings_atoms: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PoolDashboardSnapshot {
     pub generated_at_unix_seconds: u64,
@@ -544,6 +557,11 @@ pub struct PoolDashboardSnapshot {
     pub operator_fee_bps: Option<u16>,
     pub configured_pplns_window_shares: Option<usize>,
     pub effective_pplns_window_shares: Option<usize>,
+    pub reported_work_rate_fw_per_second: f64,
+    pub reported_average_work_rate_fw_per_second: f64,
+    pub credited_atoms_last_24h: u64,
+    pub estimated_24h_credited_atoms: Option<u64>,
+    pub earnings_observation_seconds: u64,
     pub workers: Vec<PoolDashboardWorkerStats>,
     pub ledger: PoolLedgerSnapshot,
 }
@@ -772,6 +790,10 @@ enum ClientMessage {
         job_id: [u8; 32],
         nonce: u64,
     },
+    WorkProgress {
+        completed_work: u64,
+        search_micros: u64,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -819,6 +841,7 @@ struct Ledger {
     generation: u64,
     accepted_shares: u64,
     rejected_shares: u64,
+    stale_shares: u64,
     pool_blocks: u64,
     credited_devnet_atoms: u64,
     sessions: BTreeMap<u64, SessionRecord>,
@@ -828,6 +851,8 @@ struct Ledger {
     pplns_shares: VecDeque<PplnsShareRecord>,
     pplns_blocks: BTreeMap<[u8; 32], PplnsBlockRecord>,
     operator_fee_atoms: u64,
+    earning_history_started_at_unix_seconds: u64,
+    earning_events: VecDeque<EarningRecord>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -838,6 +863,8 @@ struct SessionRecord {
     payout: [u8; 32],
     accepted_shares: u64,
     rejected_shares: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    stale_shares: u64,
     pool_blocks: u64,
     credited_devnet_atoms: u64,
 }
@@ -847,6 +874,8 @@ struct SessionRecord {
 struct PayoutRecord {
     accepted_shares: u64,
     rejected_shares: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    stale_shares: u64,
     pool_blocks: u64,
     credited_devnet_atoms: u64,
     last_session_id: u64,
@@ -889,16 +918,20 @@ struct BlockRecord {
 struct PplnsShareRecord {
     session_id: u64,
     payout: [u8; 32],
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    worker: String,
     work: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pending_block_id: Option<[u8; 32]>,
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PplnsAllocationRecord {
     session_id: u64,
     payout: [u8; 32],
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    worker: String,
     atoms: u64,
 }
 
@@ -916,6 +949,16 @@ struct PplnsBlockRecord {
     window_work: Vec<u8>,
     allocations: Vec<PplnsAllocationRecord>,
     distributed: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EarningRecord {
+    credited_at_unix_seconds: u64,
+    session_id: u64,
+    worker: String,
+    payout: [u8; 32],
+    atoms: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -980,6 +1023,8 @@ struct StoredLedgerV1 {
 struct StoredLedgerPayloadV1 {
     accepted_shares: u64,
     rejected_shares: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    stale_shares: u64,
     pool_blocks: u64,
     credited_devnet_atoms: u64,
     sessions: Vec<StoredSessionRecordV1>,
@@ -992,6 +1037,10 @@ struct StoredLedgerPayloadV1 {
     pplns_blocks: Vec<StoredPplnsBlockRecordV1>,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     operator_fee_atoms: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    earning_history_started_at_unix_seconds: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    earning_events: Vec<EarningRecord>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1294,6 +1343,7 @@ impl LedgerStore {
         let payload = StoredLedgerPayloadV1 {
             accepted_shares: stored.payload.accepted_shares,
             rejected_shares: stored.payload.rejected_shares,
+            stale_shares: 0,
             pool_blocks: stored.payload.pool_blocks,
             credited_devnet_atoms: stored.payload.credited_devnet_atoms,
             sessions: stored.payload.sessions,
@@ -1303,6 +1353,8 @@ impl LedgerStore {
             pplns_shares: Vec::new(),
             pplns_blocks: Vec::new(),
             operator_fee_atoms: 0,
+            earning_history_started_at_unix_seconds: 0,
+            earning_events: Vec::new(),
         };
         let mut ledger = ledger_from_payload(stored.generation, payload)?;
         for session in ledger.sessions.values_mut() {
@@ -1316,6 +1368,7 @@ fn ledger_payload(ledger: &Ledger) -> StoredLedgerPayloadV1 {
     StoredLedgerPayloadV1 {
         accepted_shares: ledger.accepted_shares,
         rejected_shares: ledger.rejected_shares,
+        stale_shares: ledger.stale_shares,
         pool_blocks: ledger.pool_blocks,
         credited_devnet_atoms: ledger.credited_devnet_atoms,
         sessions: ledger
@@ -1360,6 +1413,8 @@ fn ledger_payload(ledger: &Ledger) -> StoredLedgerPayloadV1 {
             })
             .collect(),
         operator_fee_atoms: ledger.operator_fee_atoms,
+        earning_history_started_at_unix_seconds: ledger.earning_history_started_at_unix_seconds,
+        earning_events: ledger.earning_events.iter().cloned().collect(),
     }
 }
 
@@ -1414,6 +1469,7 @@ fn ledger_from_payload(
         generation,
         accepted_shares: payload.accepted_shares,
         rejected_shares: payload.rejected_shares,
+        stale_shares: payload.stale_shares,
         pool_blocks: payload.pool_blocks,
         credited_devnet_atoms: payload.credited_devnet_atoms,
         sessions,
@@ -1423,6 +1479,8 @@ fn ledger_from_payload(
         pplns_shares: payload.pplns_shares.into(),
         pplns_blocks,
         operator_fee_atoms: payload.operator_fee_atoms,
+        earning_history_started_at_unix_seconds: payload.earning_history_started_at_unix_seconds,
+        earning_events: payload.earning_events.into(),
     };
     validate_ledger(&ledger)?;
     Ok(ledger)
@@ -1473,6 +1531,7 @@ fn validate_ledger(ledger: &Ledger) -> Result<(), PoolError> {
         || ledger.payout_transactions.len() > POOL_MAX_LEDGER_PAYOUT_TRANSACTIONS
         || ledger.pplns_shares.len() > POOL_MAX_PPLNS_WINDOW_SHARES
         || ledger.pplns_blocks.len() > POOL_MAX_LEDGER_BLOCKS
+        || ledger.earning_events.len() > POOL_MAX_EARNING_EVENTS
     {
         return Err(PoolError::LedgerCapacity);
     }
@@ -1480,6 +1539,9 @@ fn validate_ledger(ledger: &Ledger) -> Result<(), PoolError> {
         VerifyingKey::from_bytes(&share.payout).map_err(|_| {
             PoolError::LedgerCorrupt("stored PPLNS share payout is invalid".to_owned())
         })?;
+        if !share.worker.is_empty() {
+            validate_worker(&share.worker)?;
+        }
         decode_work(&share.work, "stored PPLNS share work")?;
         if share.pending_block_id.is_some_and(|block_id| {
             ledger
@@ -1532,6 +1594,8 @@ fn validate_ledger(ledger: &Ledger) -> Result<(), PoolError> {
                     if allocation.atoms == 0
                         || !keys.insert((allocation.payout, allocation.session_id))
                         || VerifyingKey::from_bytes(&allocation.payout).is_err()
+                        || (!allocation.worker.is_empty()
+                            && validate_worker(&allocation.worker).is_err())
                     {
                         return Err(PoolError::LedgerCorrupt(
                             "stored PPLNS allocation is invalid".to_owned(),
@@ -1558,41 +1622,42 @@ fn validate_ledger(ledger: &Ledger) -> Result<(), PoolError> {
             "stored operator-fee total does not match distributed PPLNS blocks".to_owned(),
         ));
     }
-    let payout_totals =
-        ledger
-            .payouts
-            .values()
-            .try_fold((0_u64, 0_u64, 0_u64, 0_u64), |totals, record| {
-                Ok::<_, PoolError>((
-                    totals
-                        .0
-                        .checked_add(record.accepted_shares)
-                        .ok_or_else(|| {
-                            PoolError::LedgerCorrupt("accepted-share total overflow".to_owned())
-                        })?,
-                    totals
-                        .1
-                        .checked_add(record.rejected_shares)
-                        .ok_or_else(|| {
-                            PoolError::LedgerCorrupt("rejected-share total overflow".to_owned())
-                        })?,
-                    totals.2.checked_add(record.pool_blocks).ok_or_else(|| {
-                        PoolError::LedgerCorrupt("pool-block total overflow".to_owned())
+    let payout_totals = ledger.payouts.values().try_fold(
+        (0_u64, 0_u64, 0_u64, 0_u64, 0_u64),
+        |totals, record| {
+            Ok::<_, PoolError>((
+                totals
+                    .0
+                    .checked_add(record.accepted_shares)
+                    .ok_or_else(|| {
+                        PoolError::LedgerCorrupt("accepted-share total overflow".to_owned())
                     })?,
-                    totals
-                        .3
-                        .checked_add(record.credited_devnet_atoms)
-                        .ok_or_else(|| {
-                            PoolError::LedgerCorrupt("credit total overflow".to_owned())
-                        })?,
-                ))
-            })?;
+                totals
+                    .1
+                    .checked_add(record.rejected_shares)
+                    .ok_or_else(|| {
+                        PoolError::LedgerCorrupt("rejected-share total overflow".to_owned())
+                    })?,
+                totals.2.checked_add(record.pool_blocks).ok_or_else(|| {
+                    PoolError::LedgerCorrupt("pool-block total overflow".to_owned())
+                })?,
+                totals
+                    .3
+                    .checked_add(record.credited_devnet_atoms)
+                    .ok_or_else(|| PoolError::LedgerCorrupt("credit total overflow".to_owned()))?,
+                totals.4.checked_add(record.stale_shares).ok_or_else(|| {
+                    PoolError::LedgerCorrupt("stale-share total overflow".to_owned())
+                })?,
+            ))
+        },
+    )?;
     if payout_totals
         != (
             ledger.accepted_shares,
             ledger.rejected_shares,
             ledger.pool_blocks,
             ledger.credited_devnet_atoms,
+            ledger.stale_shares,
         )
         || ledger
             .blocks
@@ -1607,6 +1672,11 @@ fn validate_ledger(ledger: &Ledger) -> Result<(), PoolError> {
     }
     for session in ledger.sessions.values() {
         validate_worker(&session.worker)?;
+        if session.stale_shares > session.rejected_shares {
+            return Err(PoolError::LedgerCorrupt(
+                "stored session stale shares exceed rejected shares".to_owned(),
+            ));
+        }
         VerifyingKey::from_bytes(&session.payout).map_err(|_| {
             PoolError::LedgerCorrupt("stored session payout key is invalid".to_owned())
         })?;
@@ -1614,6 +1684,31 @@ fn validate_ledger(ledger: &Ledger) -> Result<(), PoolError> {
     for payout in ledger.payouts.keys() {
         VerifyingKey::from_bytes(payout)
             .map_err(|_| PoolError::LedgerCorrupt("stored payout key is invalid".to_owned()))?;
+    }
+    if ledger.stale_shares > ledger.rejected_shares
+        || ledger
+            .payouts
+            .values()
+            .any(|record| record.stale_shares > record.rejected_shares)
+    {
+        return Err(PoolError::LedgerCorrupt(
+            "stored stale shares exceed rejected shares".to_owned(),
+        ));
+    }
+    for earning in &ledger.earning_events {
+        if earning.credited_at_unix_seconds == 0
+            || earning.atoms == 0
+            || ledger.earning_history_started_at_unix_seconds == 0
+            || earning.credited_at_unix_seconds < ledger.earning_history_started_at_unix_seconds
+        {
+            return Err(PoolError::LedgerCorrupt(
+                "stored earning history is invalid".to_owned(),
+            ));
+        }
+        validate_worker(&earning.worker)?;
+        VerifyingKey::from_bytes(&earning.payout).map_err(|_| {
+            PoolError::LedgerCorrupt("stored earning payout key is invalid".to_owned())
+        })?;
     }
     let mut reserved_by_payout = BTreeMap::<[u8; 32], u64>::new();
     for (txid, record) in &ledger.payout_transactions {
@@ -1854,6 +1949,7 @@ struct SharedServer {
     stop: AtomicBool,
     active_connections: AtomicUsize,
     active_sockets: Mutex<HashMap<u64, TcpStream>>,
+    worker_telemetry: Mutex<HashMap<u64, WorkerTelemetry>>,
     source_admission: PoolSourceAdmission,
     share_verification: ShareVerificationGate,
     next_connection_id: AtomicU64,
@@ -1872,6 +1968,15 @@ struct SharedServer {
     production_v4_share_verifier: Option<Arc<dyn ProductionV4PoolShareVerifier>>,
     tls: Arc<ServerConfig>,
     startup_nonce: [u8; 32],
+}
+
+#[derive(Clone, Copy)]
+struct WorkerTelemetry {
+    completed_work: u64,
+    search_micros: u64,
+    work_rate_fw_per_second: f64,
+    average_work_rate_fw_per_second: f64,
+    updated_at: Instant,
 }
 
 pub struct PoolServerHandle {
@@ -1897,7 +2002,31 @@ impl PoolDashboardSource {
     pub fn snapshot(&self) -> Result<PoolDashboardSnapshot, PoolError> {
         reconcile_pool_blocks(&self.shared)?;
         reconcile_pool_payouts(&self.shared, false)?;
+        let generated_at_unix_seconds = unix_time_seconds()?;
+        let (session_stales, earning_history_started_at, earning_events) = {
+            let ledger = self
+                .shared
+                .ledger
+                .state
+                .lock()
+                .map_err(|_| PoolError::SharedStatePoisoned)?;
+            (
+                ledger
+                    .sessions
+                    .iter()
+                    .map(|(session_id, record)| (*session_id, record.stale_shares))
+                    .collect::<BTreeMap<_, _>>(),
+                ledger.earning_history_started_at_unix_seconds,
+                ledger.earning_events.iter().cloned().collect::<Vec<_>>(),
+            )
+        };
         let mut ledger = snapshot_ledger(&self.shared.ledger)?;
+        let telemetry = self
+            .shared
+            .worker_telemetry
+            .lock()
+            .map_err(|_| PoolError::SharedStatePoisoned)?;
+        let telemetry_now = Instant::now();
         let mut workers = BTreeMap::<(String, String), PoolDashboardWorkerStats>::new();
         for session in &ledger.sessions {
             let key = (session.payout.clone(), session.worker.clone());
@@ -1909,8 +2038,14 @@ impl PoolDashboardSource {
                     connected: false,
                     accepted_shares: 0,
                     rejected_shares: 0,
+                    stale_shares: 0,
                     pool_blocks: 0,
                     credited_devnet_atoms: 0,
+                    reported_work_rate_fw_per_second: 0.0,
+                    reported_average_work_rate_fw_per_second: 0.0,
+                    telemetry_age_seconds: None,
+                    earned_atoms_last_24h: 0,
+                    estimated_24h_earnings_atoms: None,
                 });
             worker.connected |= session.connected;
             worker.accepted_shares = checked_ledger_add(
@@ -1923,6 +2058,14 @@ impl PoolDashboardSource {
                 session.rejected_shares,
                 "dashboard worker rejected shares",
             )?;
+            worker.stale_shares = checked_ledger_add(
+                worker.stale_shares,
+                session_stales
+                    .get(&session.session_id)
+                    .copied()
+                    .unwrap_or_default(),
+                "dashboard worker stale shares",
+            )?;
             worker.pool_blocks = checked_ledger_add(
                 worker.pool_blocks,
                 session.pool_blocks,
@@ -1933,8 +2076,96 @@ impl PoolDashboardSource {
                 session.credited_devnet_atoms,
                 "dashboard worker credit",
             )?;
+            if session.connected
+                && let Some(sample) = telemetry.get(&session.session_id)
+                && telemetry_now.saturating_duration_since(sample.updated_at)
+                    <= POOL_WORK_RATE_FRESHNESS
+            {
+                let age = telemetry_now
+                    .saturating_duration_since(sample.updated_at)
+                    .as_secs();
+                worker.reported_work_rate_fw_per_second += sample.work_rate_fw_per_second;
+                worker.reported_average_work_rate_fw_per_second +=
+                    sample.average_work_rate_fw_per_second;
+                worker.telemetry_age_seconds = Some(
+                    worker
+                        .telemetry_age_seconds
+                        .map_or(age, |current| current.min(age)),
+                );
+            }
+        }
+        let earnings_cutoff = generated_at_unix_seconds.saturating_sub(POOL_EARNING_WINDOW_SECONDS);
+        let mut credited_atoms_last_24h = 0_u64;
+        for earning in earning_events
+            .iter()
+            .filter(|earning| earning.credited_at_unix_seconds >= earnings_cutoff)
+        {
+            credited_atoms_last_24h = checked_ledger_add(
+                credited_atoms_last_24h,
+                earning.atoms,
+                "dashboard 24-hour pool earnings",
+            )?;
+            let key = (hex::encode(earning.payout), earning.worker.clone());
+            let worker = workers
+                .entry(key)
+                .or_insert_with(|| PoolDashboardWorkerStats {
+                    worker: earning.worker.clone(),
+                    payout: hex::encode(earning.payout),
+                    connected: false,
+                    accepted_shares: 0,
+                    rejected_shares: 0,
+                    stale_shares: 0,
+                    pool_blocks: 0,
+                    credited_devnet_atoms: 0,
+                    reported_work_rate_fw_per_second: 0.0,
+                    reported_average_work_rate_fw_per_second: 0.0,
+                    telemetry_age_seconds: None,
+                    earned_atoms_last_24h: 0,
+                    estimated_24h_earnings_atoms: None,
+                });
+            worker.earned_atoms_last_24h = checked_ledger_add(
+                worker.earned_atoms_last_24h,
+                earning.atoms,
+                "dashboard 24-hour worker earnings",
+            )?;
         }
         let mut workers = workers.into_values().collect::<Vec<_>>();
+        let reported_work_rate_fw_per_second = workers
+            .iter()
+            .map(|worker| worker.reported_work_rate_fw_per_second)
+            .sum();
+        let reported_average_work_rate_fw_per_second = workers
+            .iter()
+            .map(|worker| worker.reported_average_work_rate_fw_per_second)
+            .sum::<f64>();
+        let earnings_observation_seconds = if earning_history_started_at == 0 {
+            0
+        } else {
+            generated_at_unix_seconds
+                .saturating_sub(earning_history_started_at.max(earnings_cutoff))
+        };
+        let estimated_24h_credited_atoms = (earnings_observation_seconds
+            >= POOL_MIN_PACE_SAMPLE_SECONDS
+            && credited_atoms_last_24h != 0
+            && reported_average_work_rate_fw_per_second > 0.0)
+            .then(|| {
+                let projected = u128::from(credited_atoms_last_24h)
+                    .saturating_mul(u128::from(POOL_EARNING_WINDOW_SECONDS))
+                    / u128::from(earnings_observation_seconds.max(1));
+                u64::try_from(projected).unwrap_or(u64::MAX)
+            });
+        if let Some(pool_estimate) = estimated_24h_credited_atoms {
+            for worker in &mut workers {
+                if worker.reported_average_work_rate_fw_per_second > 0.0 {
+                    worker.estimated_24h_earnings_atoms = Some(
+                        (pool_estimate as f64 * worker.reported_average_work_rate_fw_per_second
+                            / reported_average_work_rate_fw_per_second)
+                            .round()
+                            .clamp(0.0, u64::MAX as f64) as u64,
+                    );
+                }
+            }
+        }
         workers.sort_by(|left, right| {
             right
                 .connected
@@ -1998,7 +2229,7 @@ impl PoolDashboardSource {
             })
             .transpose()?;
         Ok(PoolDashboardSnapshot {
-            generated_at_unix_seconds: unix_time_seconds()?,
+            generated_at_unix_seconds,
             network_name: node_status.network.to_owned(),
             network_short_name: node_status.network_short_name.to_owned(),
             network_notice: node_status.network_notice.to_owned(),
@@ -2021,6 +2252,11 @@ impl PoolDashboardSource {
             configured_pplns_window_shares: pplns_policy
                 .and_then(|policy| (policy.window_shares != 0).then_some(policy.window_shares)),
             effective_pplns_window_shares,
+            reported_work_rate_fw_per_second,
+            reported_average_work_rate_fw_per_second,
+            credited_atoms_last_24h,
+            estimated_24h_credited_atoms,
+            earnings_observation_seconds,
             workers,
             ledger,
         })
@@ -2172,6 +2408,7 @@ pub fn spawn_pool_server(
         stop: AtomicBool::new(false),
         active_connections: AtomicUsize::new(0),
         active_sockets: Mutex::new(HashMap::new()),
+        worker_telemetry: Mutex::new(HashMap::new()),
         source_admission: PoolSourceAdmission::new(config.max_connections_per_source),
         share_verification: ShareVerificationGate::new(
             config.max_concurrent_share_verifications,
@@ -2481,7 +2718,7 @@ fn handle_connection(stream: TcpStream, shared: Arc<SharedServer>) -> Result<(),
             }
             (worker, payout)
         }
-        ClientMessage::SubmitShare { .. } => {
+        ClientMessage::SubmitShare { .. } | ClientMessage::WorkProgress { .. } => {
             send_error(&mut stream, "hello_required", "first message must be hello")?;
             return Err(PoolError::InvalidMessage("hello required".to_owned()));
         }
@@ -2491,6 +2728,7 @@ fn handle_connection(stream: TcpStream, shared: Arc<SharedServer>) -> Result<(),
     register_session(&shared.ledger, session_id, worker, payout)?;
     let _session_guard = SessionGuard {
         ledger: &shared.ledger,
+        worker_telemetry: &shared.worker_telemetry,
         session_id,
     };
     write_frame(
@@ -2533,13 +2771,23 @@ fn handle_connection(stream: TcpStream, shared: Arc<SharedServer>) -> Result<(),
             )?;
             return Err(error);
         }
-        let ClientMessage::SubmitShare { job_id, nonce } = message else {
-            send_error(
-                &mut stream,
-                "unexpected_hello",
-                "hello may only be sent once",
-            )?;
-            return Err(PoolError::InvalidMessage("duplicate hello".to_owned()));
+        let (job_id, nonce) = match message {
+            ClientMessage::SubmitShare { job_id, nonce } => (job_id, nonce),
+            ClientMessage::WorkProgress {
+                completed_work,
+                search_micros,
+            } => {
+                record_work_progress(&shared, session_id, completed_work, search_micros)?;
+                continue;
+            }
+            ClientMessage::Hello { .. } => {
+                send_error(
+                    &mut stream,
+                    "unexpected_hello",
+                    "hello may only be sent once",
+                )?;
+                return Err(PoolError::InvalidMessage("duplicate hello".to_owned()));
+            }
         };
         // The tip may have changed while this session was blocked waiting for
         // its next frame. Rotate again immediately before classifying work.
@@ -2565,6 +2813,7 @@ fn checked_pool_deadline(now: Instant, duration: Duration) -> Result<Instant, Po
 
 struct SessionGuard<'a> {
     ledger: &'a DurableLedger,
+    worker_telemetry: &'a Mutex<HashMap<u64, WorkerTelemetry>>,
     session_id: u64,
 }
 
@@ -2576,7 +2825,56 @@ impl Drop for SessionGuard<'_> {
             }
             Ok(())
         });
+        if let Ok(mut telemetry) = self.worker_telemetry.lock() {
+            telemetry.remove(&self.session_id);
+        }
     }
+}
+
+fn record_work_progress(
+    shared: &SharedServer,
+    session_id: u64,
+    completed_work: u64,
+    search_micros: u64,
+) -> Result<(), PoolError> {
+    let now = Instant::now();
+    let mut telemetry = shared
+        .worker_telemetry
+        .lock()
+        .map_err(|_| PoolError::SharedStatePoisoned)?;
+    let (previous_work, previous_micros) = telemetry.get(&session_id).map_or((0, 0), |sample| {
+        (sample.completed_work, sample.search_micros)
+    });
+    let counters_advanced = completed_work >= previous_work && search_micros > previous_micros;
+    let (work_delta, micros_delta) = if counters_advanced {
+        (
+            completed_work.saturating_sub(previous_work),
+            search_micros.saturating_sub(previous_micros),
+        )
+    } else {
+        (completed_work, search_micros)
+    };
+    let work_rate_fw_per_second = if micros_delta == 0 {
+        0.0
+    } else {
+        work_delta as f64 * 1_000_000.0 / micros_delta as f64
+    };
+    let average_work_rate_fw_per_second = if search_micros == 0 {
+        0.0
+    } else {
+        completed_work as f64 * 1_000_000.0 / search_micros as f64
+    };
+    telemetry.insert(
+        session_id,
+        WorkerTelemetry {
+            completed_work,
+            search_micros,
+            work_rate_fw_per_second,
+            average_work_rate_fw_per_second,
+            updated_at: now,
+        },
+    );
+    Ok(())
 }
 
 fn process_share(
@@ -2771,7 +3069,7 @@ fn rejected_result(
     nonce: u64,
     code: &str,
 ) -> Result<PoolShareResult, PoolError> {
-    let session = credit_rejected_share(&shared.ledger, session_id)?;
+    let session = credit_rejected_share(&shared.ledger, session_id, code == "stale_job")?;
     Ok(PoolShareResult {
         job_id,
         nonce,
@@ -3219,6 +3517,7 @@ fn register_session(
                 payout,
                 accepted_shares: 0,
                 rejected_shares: 0,
+                stale_shares: 0,
                 pool_blocks: 0,
                 credited_devnet_atoms: 0,
             },
@@ -3498,14 +3797,14 @@ fn append_pplns_share_work(
     pending_block_id: Option<[u8; 32]>,
 ) -> Result<(), PoolError> {
     decode_work(&work, "PPLNS share work")?;
-    let payout = ledger
+    let session = ledger
         .sessions
         .get(&session_id)
-        .ok_or_else(|| PoolError::InvalidMessage("unknown session".to_owned()))?
-        .payout;
+        .ok_or_else(|| PoolError::InvalidMessage("unknown session".to_owned()))?;
     ledger.pplns_shares.push_back(PplnsShareRecord {
         session_id,
-        payout,
+        payout: session.payout,
+        worker: session.worker.clone(),
         work,
         pending_block_id,
     });
@@ -3533,6 +3832,7 @@ fn pplns_allocations(
         ));
     }
     let mut weights = BTreeMap::<[u8; 32], BTreeMap<u64, U512>>::new();
+    let mut workers = BTreeMap::<u64, String>::new();
     let mut total_work = U512::zero();
     for share in &selected {
         let work = decode_work(&share.work, "PPLNS share work")?;
@@ -3547,6 +3847,21 @@ fn pplns_allocations(
         *weight = weight.checked_add(work).ok_or_else(|| {
             PoolError::LedgerCorrupt("PPLNS participant work overflow".to_owned())
         })?;
+        if !share.worker.is_empty() {
+            match workers.entry(share.session_id) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(share.worker.clone());
+                }
+                std::collections::btree_map::Entry::Occupied(entry)
+                    if entry.get() != &share.worker =>
+                {
+                    return Err(PoolError::LedgerCorrupt(
+                        "PPLNS session worker changed inside the share window".to_owned(),
+                    ));
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {}
+            }
+        }
     }
     if distributable_atoms == 0 {
         return Ok((selected.len(), total_work, Vec::new()));
@@ -3626,6 +3941,7 @@ fn pplns_allocations(
                     (atoms != 0).then_some(PplnsAllocationRecord {
                         session_id,
                         payout,
+                        worker: workers.get(&session_id).cloned().unwrap_or_default(),
                         atoms,
                     })
                 }),
@@ -3681,6 +3997,7 @@ fn distribute_mature_pplns_block(ledger: &mut Ledger, block_id: [u8; 32]) -> Res
     let operator_fee = pplns.operator_fee_atoms;
     let distributable = pplns.distributable_atoms;
     let allocations = pplns.allocations.clone();
+    let credited_at = unix_time_seconds()?;
     ledger.operator_fee_atoms = checked_ledger_add(
         ledger.operator_fee_atoms,
         operator_fee,
@@ -3709,6 +4026,14 @@ fn distribute_mature_pplns_block(ledger: &mut Ledger, block_id: [u8; 32]) -> Res
             payout.credited_devnet_atoms,
             allocation.atoms,
             "payout PPLNS credit",
+        )?;
+        record_earning_at(
+            ledger,
+            allocation.session_id,
+            allocation.payout,
+            allocation.worker,
+            allocation.atoms,
+            credited_at,
         )?;
     }
     ledger
@@ -3764,12 +4089,73 @@ fn apply_accepted_share_credit(
             payout.pool_blocks = checked_ledger_add(payout.pool_blocks, 1, "payout pool blocks")?;
         }
     }
+    if atoms != 0 {
+        let worker = ledger
+            .sessions
+            .get(&session_id)
+            .ok_or_else(|| PoolError::InvalidMessage("unknown earning session".to_owned()))?
+            .worker
+            .clone();
+        record_earning_at(
+            ledger,
+            session_id,
+            payout,
+            worker,
+            atoms,
+            unix_time_seconds()?,
+        )?;
+    }
+    Ok(())
+}
+
+fn record_earning_at(
+    ledger: &mut Ledger,
+    session_id: u64,
+    payout: [u8; 32],
+    worker: String,
+    atoms: u64,
+    credited_at_unix_seconds: u64,
+) -> Result<(), PoolError> {
+    if atoms == 0 {
+        return Ok(());
+    }
+    let worker = if worker.is_empty() {
+        ledger
+            .sessions
+            .get(&session_id)
+            .map(|session| session.worker.clone())
+            .unwrap_or_else(|| "historical".to_owned())
+    } else {
+        worker
+    };
+    if ledger.earning_history_started_at_unix_seconds == 0 {
+        ledger.earning_history_started_at_unix_seconds = credited_at_unix_seconds;
+    }
+    let cutoff = credited_at_unix_seconds.saturating_sub(POOL_EARNING_HISTORY_SECONDS);
+    while ledger
+        .earning_events
+        .front()
+        .is_some_and(|event| event.credited_at_unix_seconds < cutoff)
+    {
+        ledger.earning_events.pop_front();
+    }
+    while ledger.earning_events.len() >= POOL_MAX_EARNING_EVENTS {
+        ledger.earning_events.pop_front();
+    }
+    ledger.earning_events.push_back(EarningRecord {
+        credited_at_unix_seconds,
+        session_id,
+        worker,
+        payout,
+        atoms,
+    });
     Ok(())
 }
 
 fn credit_rejected_share(
     ledger: &DurableLedger,
     session_id: u64,
+    stale: bool,
 ) -> Result<PoolSessionStats, PoolError> {
     ledger.transaction(|ledger| {
         let payout = ledger
@@ -3778,13 +4164,24 @@ fn credit_rejected_share(
             .ok_or_else(|| PoolError::InvalidMessage("unknown session".to_owned()))?
             .payout;
         ledger.rejected_shares = checked_ledger_add(ledger.rejected_shares, 1, "rejected shares")?;
+        if stale {
+            ledger.stale_shares = checked_ledger_add(ledger.stale_shares, 1, "stale shares")?;
+        }
         let session = ledger.sessions.get_mut(&session_id).expect("checked above");
         session.rejected_shares =
             checked_ledger_add(session.rejected_shares, 1, "session rejected shares")?;
+        if stale {
+            session.stale_shares =
+                checked_ledger_add(session.stale_shares, 1, "session stale shares")?;
+        }
         let payout = ledger.payouts.entry(payout).or_default();
         payout.last_session_id = session_id;
         payout.rejected_shares =
             checked_ledger_add(payout.rejected_shares, 1, "payout rejected shares")?;
+        if stale {
+            payout.stale_shares =
+                checked_ledger_add(payout.stale_shares, 1, "payout stale shares")?;
+        }
         session_snapshot(
             session_id,
             ledger.sessions.get(&session_id).expect("checked above"),
@@ -3845,6 +4242,7 @@ fn snapshot_ledger(ledger: &DurableLedger) -> Result<PoolLedgerSnapshot, PoolErr
                 payout: hex::encode(payout),
                 accepted_shares: record.accepted_shares,
                 rejected_shares: record.rejected_shares,
+                stale_shares: record.stale_shares,
                 pool_blocks: record.pool_blocks,
                 credited_devnet_atoms: record.credited_devnet_atoms,
                 reserved_payout_atoms,
@@ -3901,6 +4299,7 @@ fn snapshot_ledger(ledger: &DurableLedger) -> Result<PoolLedgerSnapshot, PoolErr
         persistence,
         accepted_shares: ledger.accepted_shares,
         rejected_shares: ledger.rejected_shares,
+        stale_shares: ledger.stale_shares,
         pool_blocks: ledger.pool_blocks,
         credited_devnet_atoms: ledger.credited_devnet_atoms,
         operator_fee_atoms: ledger.operator_fee_atoms,
@@ -4168,6 +4567,20 @@ impl PoolClient {
     ) -> Result<PoolShareResult, PoolError> {
         self.submit_share_until(job_id, nonce, || false)?
             .ok_or(PoolError::ConnectionClosed)
+    }
+
+    pub fn report_work_progress(
+        &mut self,
+        completed_work: u64,
+        search_micros: u64,
+    ) -> Result<(), PoolError> {
+        write_frame(
+            &mut self.stream,
+            &ClientMessage::WorkProgress {
+                completed_work,
+                search_micros,
+            },
+        )
     }
 
     pub fn submit_share_interruptible(
@@ -5342,6 +5755,50 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_reports_worker_rate_stales_and_rolling_earnings() {
+        let (_root, server, _node, pin) = server("dashboard-miner-telemetry");
+        let mut client = client(server.local_addr(), pin, "forge-5090");
+        let work = client.current_work().unwrap();
+        let nonce = find_share(&work, false);
+        client.report_work_progress(100, 50_000_000).unwrap();
+        client.report_work_progress(300, 100_000_000).unwrap();
+        assert!(
+            client
+                .submit_share(work.job().job_id, nonce)
+                .unwrap()
+                .accepted
+        );
+
+        credit_rejected_share(&server.shared.ledger, client.session_id(), true).unwrap();
+        let now = unix_time_seconds().unwrap();
+        server
+            .shared
+            .ledger
+            .transaction(|ledger| {
+                ledger.earning_history_started_at_unix_seconds = now.saturating_sub(3_600);
+                Ok(())
+            })
+            .unwrap();
+
+        let dashboard = server.dashboard_source().snapshot().unwrap();
+        assert_eq!(dashboard.ledger.stale_shares, 1);
+        assert_eq!(dashboard.credited_atoms_last_24h, 1);
+        assert_eq!(dashboard.reported_work_rate_fw_per_second, 4.0);
+        assert_eq!(dashboard.reported_average_work_rate_fw_per_second, 3.0);
+        assert!(dashboard.estimated_24h_credited_atoms.is_some());
+        assert_eq!(dashboard.workers.len(), 1);
+        assert_eq!(dashboard.workers[0].stale_shares, 1);
+        assert_eq!(dashboard.workers[0].earned_atoms_last_24h, 1);
+        assert_eq!(dashboard.workers[0].reported_work_rate_fw_per_second, 4.0);
+        assert_eq!(
+            dashboard.workers[0].reported_average_work_rate_fw_per_second,
+            3.0
+        );
+        assert!(dashboard.workers[0].estimated_24h_earnings_atoms.is_some());
+        server.stop().unwrap();
+    }
+
+    #[test]
     fn durable_ledger_recovers_the_newest_valid_network_bound_slot() {
         let root = TestRoot::new("durable-ledger");
         let directory = root.path().join("ledger");
@@ -5646,18 +6103,21 @@ mod tests {
             PplnsShareRecord {
                 session_id: 1,
                 payout: first_payout,
+                worker: "first-a".to_owned(),
                 work: encode_work(U512::one()),
                 pending_block_id: None,
             },
             PplnsShareRecord {
                 session_id: 2,
                 payout: first_payout,
+                worker: "first-b".to_owned(),
                 work: encode_work(U512::one()),
                 pending_block_id: None,
             },
             PplnsShareRecord {
                 session_id: 3,
                 payout: second_payout,
+                worker: "second".to_owned(),
                 work: encode_work(U512::one()),
                 pending_block_id: None,
             },
@@ -5882,7 +6342,9 @@ mod tests {
         let payout = default_miner_destination();
         register_session(&ledger, 1, "worker".to_owned(), payout).unwrap();
         credit_accepted_share(&ledger, 1, 7).unwrap();
-        let current = ledger_payload(&ledger.state.lock().unwrap());
+        let mut current = ledger_payload(&ledger.state.lock().unwrap());
+        current.earning_history_started_at_unix_seconds = 0;
+        current.earning_events.clear();
         let previous = PreviousStoredLedgerPayloadV2 {
             accepted_shares: current.accepted_shares,
             rejected_shares: current.rejected_shares,

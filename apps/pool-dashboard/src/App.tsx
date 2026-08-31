@@ -8,6 +8,7 @@ import {
   Copy,
   Cpu,
   ExternalLink,
+  Gauge,
   Percent,
   Pickaxe,
   RefreshCw,
@@ -20,7 +21,16 @@ import { fetchPoolDashboard } from "./api";
 import mark from "./assets/common-foundry-mark.png";
 import type { DashboardDocument, PoolWorker } from "./types";
 
-type WorkerSort = "worker" | "accepted_shares" | "rejected_shares" | "pool_blocks";
+type WorkerSort =
+  | "worker"
+  | "reported_work_rate_fw_per_second"
+  | "reported_average_work_rate_fw_per_second"
+  | "accepted_shares"
+  | "stale_shares"
+  | "rejected_shares"
+  | "pool_blocks"
+  | "earned_atoms_last_24h"
+  | "estimated_24h_earnings_atoms";
 type Platform = "windows" | "linux";
 
 const REFRESH_FALLBACK_SECONDS = 10;
@@ -37,6 +47,11 @@ function formatAtoms(value: number) {
     minimumFractionDigits: amount < 1 && value > 0 ? 4 : 2,
     maximumFractionDigits: 8,
   }).format(amount)} CMFD`;
+}
+
+function formatWorkRate(value: number) {
+  if (value <= 0) return "—";
+  return `${new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 }).format(value)} FW/s`;
 }
 
 function shortHex(value: string, lead = 10, tail = 8) {
@@ -151,7 +166,7 @@ export function App() {
     sorted.sort((left, right) => {
       let comparison = 0;
       if (workerSort === "worker") comparison = left.worker.localeCompare(right.worker);
-      else comparison = left[workerSort] - right[workerSort];
+      else comparison = (left[workerSort] ?? -1) - (right[workerSort] ?? -1);
       return sortAscending ? comparison : -comparison;
     });
     return sorted;
@@ -251,8 +266,12 @@ export function App() {
 
         <section className="stat-rail" aria-label="Pool totals">
           <Stat icon={<Users />} label="Active workers" value={formatCount(pool.active_connections)} detail={`of ${formatCount(pool.connection_capacity)} connections`} />
+          <Stat icon={<Gauge />} label="Pool work rate" value={formatWorkRate(pool.reported_work_rate_fw_per_second)} detail={`${formatWorkRate(pool.reported_average_work_rate_fw_per_second)} average · miner reported`} />
           <Stat icon={<CircleCheck />} label="Accepted shares" value={formatCount(ledger.accepted_shares)} detail="durably accounted" />
+          <Stat icon={<CircleAlert />} label="Stale shares" value={formatCount(ledger.stale_shares)} detail="included in rejected shares" tone={ledger.stale_shares > 0 ? "warn" : undefined} />
           <Stat icon={<CircleAlert />} label="Rejected shares" value={formatCount(ledger.rejected_shares)} detail="visible to operators" tone={ledger.rejected_shares > 0 ? "warn" : undefined} />
+          <Stat icon={<WalletCards />} label="Earned · 24h" value={formatAtoms(pool.credited_atoms_last_24h)} detail="actual PPLNS credit" />
+          <Stat icon={<Pickaxe />} label="Estimated · 24h" value={pool.estimated_24h_credited_atoms === null ? "Collecting data" : formatAtoms(pool.estimated_24h_credited_atoms)} detail={pool.estimated_24h_credited_atoms === null ? `${formatCount(pool.earnings_observation_seconds)}s observed · 15m minimum` : "paced from observed earnings and average work rate"} />
           <Stat icon={<Blocks />} label="Pool blocks" value={formatCount(ledger.canonical_pool_blocks)} detail={`${formatCount(ledger.orphaned_pool_blocks)} orphaned`} />
           <Stat
             icon={<Percent />}
@@ -279,9 +298,14 @@ export function App() {
                     <tr>
                       <SortableHead label="Worker" sortKey="worker" active={workerSort} ascending={sortAscending} onSort={selectSort} />
                       <th>Status</th>
+                      <SortableHead label="Work rate" sortKey="reported_work_rate_fw_per_second" active={workerSort} ascending={sortAscending} onSort={selectSort} numeric />
+                      <SortableHead label="Average" sortKey="reported_average_work_rate_fw_per_second" active={workerSort} ascending={sortAscending} onSort={selectSort} numeric />
                       <SortableHead label="Accepted" sortKey="accepted_shares" active={workerSort} ascending={sortAscending} onSort={selectSort} numeric />
+                      <SortableHead label="Stale" sortKey="stale_shares" active={workerSort} ascending={sortAscending} onSort={selectSort} numeric />
                       <SortableHead label="Rejected" sortKey="rejected_shares" active={workerSort} ascending={sortAscending} onSort={selectSort} numeric />
                       <SortableHead label="Blocks" sortKey="pool_blocks" active={workerSort} ascending={sortAscending} onSort={selectSort} numeric />
+                      <SortableHead label="Earned · 24h" sortKey="earned_atoms_last_24h" active={workerSort} ascending={sortAscending} onSort={selectSort} numeric />
+                      <SortableHead label="Estimated · 24h" sortKey="estimated_24h_earnings_atoms" active={workerSort} ascending={sortAscending} onSort={selectSort} numeric />
                       <th className="numeric">Credit</th>
                     </tr>
                   </thead>
@@ -497,9 +521,14 @@ function WorkerRow({ worker }: { worker: PoolWorker }) {
     <tr>
       <td><span className="worker-name"><Cpu size={15} aria-hidden="true" />{worker.worker}</span><code title={worker.payout}>{shortHex(worker.payout, 8, 6)}</code></td>
       <td><span className={`worker-status ${worker.connected ? "online" : ""}`}><span />{worker.connected ? "Online" : "Offline"}</span></td>
+      <td className="numeric strong-cell" title="Current miner-reported Forge Work rate">{formatWorkRate(worker.reported_work_rate_fw_per_second)}</td>
+      <td className="numeric" title="Average miner-reported Forge Work rate">{formatWorkRate(worker.reported_average_work_rate_fw_per_second)}</td>
       <td className="numeric strong-cell">{formatCount(worker.accepted_shares)}</td>
+      <td className="numeric">{formatCount(worker.stale_shares)}</td>
       <td className="numeric">{formatCount(worker.rejected_shares)}</td>
       <td className="numeric">{formatCount(worker.pool_blocks)}</td>
+      <td className="numeric strong-cell">{formatAtoms(worker.earned_atoms_last_24h)}</td>
+      <td className="numeric">{worker.estimated_24h_earnings_atoms === null ? "Collecting" : formatAtoms(worker.estimated_24h_earnings_atoms)}</td>
       <td className="numeric strong-cell">{formatAtoms(worker.credited_devnet_atoms)}</td>
     </tr>
   );

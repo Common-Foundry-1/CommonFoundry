@@ -23,6 +23,11 @@ export interface PoolWorker {
   connected: boolean;
   accepted_shares: number;
   rejected_shares: number;
+  stale_shares: number;
+  reported_work_rate_fw_per_second: number;
+  reported_average_work_rate_fw_per_second: number;
+  earned_atoms_last_24h: number;
+  estimated_24h_earnings_atoms: number | null;
 }
 
 export interface PoolBlock {
@@ -53,10 +58,16 @@ export interface PoolSnapshot {
   operator_fee_bps: number | null;
   configured_pplns_window_shares: number | null;
   effective_pplns_window_shares: number | null;
+  reported_work_rate_fw_per_second: number;
+  reported_average_work_rate_fw_per_second: number;
+  credited_atoms_last_24h: number;
+  estimated_24h_credited_atoms: number | null;
+  earnings_observation_seconds: number;
   workers: PoolWorker[];
   ledger: {
     accepted_shares: number;
     rejected_shares: number;
+    stale_shares: number;
     pool_blocks: number;
     operator_fee_atoms: number;
     pplns_pending_blocks: number;

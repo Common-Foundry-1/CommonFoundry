@@ -1,9 +1,12 @@
 # Common Foundry pool dashboard
 
 This Vite application is served by `cmfd-node pool-serve`. It is read-only: the
-browser receives pool, worker, PPLNS block accounting, operator-fee, and payout summaries from
-`/api/v1/pool`, while all share verification and settlement remain inside the
-pool node.
+browser receives current and average miner-reported work rate, accepted,
+rejected, and stale shares, per-worker activity, rolling 24-hour PPLNS credits,
+estimated 24-hour earning pace, block accounting, operator-fee, and payout
+summaries from `/api/v1/pool`. All share verification and settlement remain
+inside the pool node. Work-rate telemetry and earning estimates are display
+data only and never affect PPLNS weights, credit, or payouts.
 
 Build the static dashboard:
 

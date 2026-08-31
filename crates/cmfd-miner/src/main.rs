@@ -698,6 +698,7 @@ struct PoolMinerStatistics {
     last_search_time: Duration,
     accepted: u64,
     rejected: u64,
+    stale: u64,
     blocks: u64,
     credited_atoms: u64,
     telemetry_warning_printed: bool,
@@ -715,6 +716,7 @@ impl PoolMinerStatistics {
             last_search_time: Duration::ZERO,
             accepted: 0,
             rejected: 0,
+            stale: 0,
             blocks: 0,
             credited_atoms: 0,
             telemetry_warning_printed: false,
@@ -744,6 +746,13 @@ impl PoolMinerStatistics {
         self.completed_work.saturating_sub(self.last_completed_work) as f64 / elapsed
     }
 
+    fn work_progress(&self) -> (u64, u64) {
+        (
+            self.completed_work,
+            u64::try_from(self.search_time.as_micros()).unwrap_or(u64::MAX),
+        )
+    }
+
     fn report_if_due(&mut self, height: u64, interval: Duration) {
         if self.last_report.elapsed() < interval {
             return;
@@ -768,9 +777,10 @@ impl PoolMinerStatistics {
             .as_ref()
             .and_then(|value| value.temperature_celsius);
         println!(
-            "MINER STATS | height {height} | hashrate {rate:.2} FW/s | accepted {} | rejected {} | blocks {} | credit {} atoms | power {} | efficiency {} | temp {} | uptime {}",
+            "MINER STATS | height {height} | hashrate {rate:.2} FW/s | accepted {} | rejected {} | stale {} | blocks {} | credit {} atoms | power {} | efficiency {} | temp {} | uptime {}",
             self.accepted,
             self.rejected,
+            self.stale,
             self.blocks,
             self.credited_atoms,
             format_metric(power, "W"),
@@ -911,6 +921,8 @@ fn mine_production_v4_pool_session(
         let scheduled_work = scheduled_pool_search_work(next_nonce);
         let result = searcher.search(&job, next_nonce, stop)?;
         statistics.record_search(&result, scheduled_work, search_started.elapsed());
+        let (completed_work, search_micros) = statistics.work_progress();
+        client.report_work_progress(completed_work, search_micros)?;
         let following_nonce = match &result {
             PoolWorkSearchResult::Found { next_nonce, .. }
             | PoolWorkSearchResult::Exhausted { next_nonce, .. }
@@ -965,6 +977,9 @@ fn mine_production_v4_pool_session(
             statistics.accepted = statistics.accepted.saturating_add(1);
         } else {
             statistics.rejected = statistics.rejected.saturating_add(1);
+            if submitted.code == "stale_job" {
+                statistics.stale = statistics.stale.saturating_add(1);
+            }
         }
         if submitted.block_accepted {
             statistics.blocks = statistics.blocks.saturating_add(1);

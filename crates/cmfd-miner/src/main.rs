@@ -692,8 +692,10 @@ struct ProductionV4PoolMinerOptions {
 struct PoolMinerStatistics {
     started_at: Instant,
     last_report: Instant,
-    attempts: u64,
-    last_attempts: u64,
+    completed_work: u64,
+    last_completed_work: u64,
+    search_time: Duration,
+    last_search_time: Duration,
     accepted: u64,
     rejected: u64,
     blocks: u64,
@@ -707,8 +709,10 @@ impl PoolMinerStatistics {
         Self {
             started_at: Instant::now(),
             last_report: Instant::now(),
-            attempts: 0,
-            last_attempts: 0,
+            completed_work: 0,
+            last_completed_work: 0,
+            search_time: Duration::ZERO,
+            last_search_time: Duration::ZERO,
             accepted: 0,
             rejected: 0,
             blocks: 0,
@@ -717,16 +721,35 @@ impl PoolMinerStatistics {
         }
     }
 
+    fn record_search(
+        &mut self,
+        result: &PoolWorkSearchResult,
+        scheduled_work: u64,
+        elapsed: Duration,
+    ) {
+        self.completed_work = self
+            .completed_work
+            .saturating_add(pool_search_work_completed(result, scheduled_work));
+        self.search_time = self.search_time.saturating_add(elapsed);
+    }
+
+    fn work_rate_since_last_report(&self) -> f64 {
+        let elapsed = self
+            .search_time
+            .saturating_sub(self.last_search_time)
+            .as_secs_f64();
+        if elapsed <= 0.0 {
+            return 0.0;
+        }
+        self.completed_work.saturating_sub(self.last_completed_work) as f64 / elapsed
+    }
+
     fn report_if_due(&mut self, height: u64, interval: Duration) {
         if self.last_report.elapsed() < interval {
             return;
         }
         let report_at = Instant::now();
-        let elapsed = report_at
-            .duration_since(self.last_report)
-            .as_secs_f64()
-            .max(f64::EPSILON);
-        let rate = self.attempts.saturating_sub(self.last_attempts) as f64 / elapsed;
+        let rate = self.work_rate_since_last_report();
         let telemetry = match query_nvidia_smi() {
             Ok(telemetry) => telemetry.get(&0).cloned(),
             Err(error) => {
@@ -755,8 +778,32 @@ impl PoolMinerStatistics {
             format_metric(temperature, "C"),
             format_duration(self.started_at.elapsed()),
         );
-        self.last_attempts = self.attempts;
+        self.last_completed_work = self.completed_work;
+        self.last_search_time = self.search_time;
         self.last_report = report_at;
+    }
+}
+
+#[cfg(feature = "production-v4")]
+fn pool_search_work_completed(result: &PoolWorkSearchResult, scheduled_work: u64) -> u64 {
+    match result {
+        PoolWorkSearchResult::Found { .. } | PoolWorkSearchResult::Exhausted { .. } => {
+            scheduled_work
+        }
+        PoolWorkSearchResult::Cancelled {
+            attempts_completed, ..
+        } => *attempts_completed,
+    }
+}
+
+#[cfg(feature = "production-v4")]
+fn scheduled_pool_search_work(start_nonce: u64) -> u64 {
+    let requested = u64::from(PRODUCTION_V4_POOL_SEARCH_BATCH_SIZE);
+    let remaining_after_first = u64::MAX - start_nonce;
+    if remaining_after_first < requested - 1 {
+        remaining_after_first + 1
+    } else {
+        requested
     }
 }
 
@@ -860,23 +907,15 @@ fn mine_production_v4_pool_session(
             job_id = Some(job.job_id);
             next_nonce = client.initial_nonce_for_job(&job);
         }
+        let search_started = Instant::now();
+        let scheduled_work = scheduled_pool_search_work(next_nonce);
         let result = searcher.search(&job, next_nonce, stop)?;
-        let (attempts_completed, following_nonce) = match &result {
-            PoolWorkSearchResult::Found {
-                attempts_completed,
-                next_nonce,
-                ..
-            }
-            | PoolWorkSearchResult::Exhausted {
-                attempts_completed,
-                next_nonce,
-            }
-            | PoolWorkSearchResult::Cancelled {
-                attempts_completed,
-                next_nonce,
-            } => (*attempts_completed, *next_nonce),
+        statistics.record_search(&result, scheduled_work, search_started.elapsed());
+        let following_nonce = match &result {
+            PoolWorkSearchResult::Found { next_nonce, .. }
+            | PoolWorkSearchResult::Exhausted { next_nonce, .. }
+            | PoolWorkSearchResult::Cancelled { next_nonce, .. } => *next_nonce,
         };
-        statistics.attempts = statistics.attempts.saturating_add(attempts_completed);
         next_nonce = following_nonce;
         statistics.report_if_due(
             client.current_job().challenge.height.saturating_sub(1),
@@ -5210,6 +5249,32 @@ mod tests {
         ] {
             assert!(parse_pinned_pool_url(value).is_err(), "accepted {value}");
         }
+    }
+
+    #[cfg(feature = "production-v4")]
+    #[test]
+    fn pool_hashrate_counts_the_gpu_batch_and_excludes_pool_wait_time() {
+        let result = PoolWorkSearchResult::Found {
+            nonce: 7,
+            work_digest: [0x42; 32],
+            meets_chain_target: true,
+            attempts_completed: 1,
+            next_nonce: 8,
+        };
+        let mut statistics = PoolMinerStatistics::new();
+
+        statistics.record_search(&result, 32, Duration::from_secs(2));
+        statistics.last_report = Instant::now() - Duration::from_secs(62);
+
+        assert_eq!(pool_search_work_completed(&result, 32), 32);
+        assert_eq!(statistics.work_rate_since_last_report(), 16.0);
+        assert_eq!(scheduled_pool_search_work(u64::MAX), 1);
+
+        let cancelled = PoolWorkSearchResult::Cancelled {
+            attempts_completed: 5,
+            next_nonce: 12,
+        };
+        assert_eq!(pool_search_work_completed(&cancelled, 32), 5);
     }
 
     #[cfg(feature = "production-v4")]

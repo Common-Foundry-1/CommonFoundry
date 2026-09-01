@@ -83,6 +83,24 @@ class SingleProducerRcActivationTests(unittest.TestCase):
                     rejected, require_candidate_claims=True
                 )
 
+    def test_network_uses_the_candidate_payload_timestamp(self) -> None:
+        network = single._network(
+            {
+                "payload": {
+                    "virtual_genesis_timestamp_unix_seconds": 1_788_800_400,
+                    "proof_of_work": {"pow_limit": "00" + "3f" * 31},
+                }
+            },
+            {
+                "launch_root": "1" * 64,
+                "network_id": "2" * 64,
+                "genesis": "3" * 64,
+            },
+        )
+        self.assertEqual(
+            network["virtual_genesis_timestamp_unix_seconds"], 1_788_800_400
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

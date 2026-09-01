@@ -114,20 +114,10 @@ def _canonical_candidate(path: Path) -> tuple[dict[str, object], dict[str, objec
 
 
 def _network(candidate: dict[str, object], validated: dict[str, object]) -> dict[str, object]:
-    payload = candidate.get("payload")
-    proof = payload.get("proof_of_work") if isinstance(payload, dict) else None
-    if not isinstance(proof, dict):
-        raise SingleProducerError("RCNet launch candidate proof policy is unavailable")
-    return {
-        "profile": "CommonFoundry RCNet-1",
-        "launch_root": candidate["launch_root"],
-        "network_id": validated["network_id"],
-        "virtual_genesis_hash": candidate["virtual_genesis_hash"],
-        "virtual_genesis_timestamp_unix_seconds": validated[
-            "virtual_genesis_timestamp_unix_seconds"
-        ],
-        "pow_limit": proof["pow_limit"],
-    }
+    try:
+        return integrity._production_v4_approval_network(candidate, validated)
+    except integrity.IntegrityError as error:
+        raise SingleProducerError(str(error)) from error
 
 
 def _parse_json_output(data: bytes, label: str) -> dict[str, object]:

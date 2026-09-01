@@ -76,8 +76,10 @@ cleanup() {
     printf 'QUIT\n' >&7 2>/dev/null || true
     wait "$replay_pid" 2>/dev/null || true
   fi
-  kill "$sampler_pid" 2>/dev/null || true
-  wait "$sampler_pid" 2>/dev/null || true
+  if [[ -n "${sampler_pid:-}" ]]; then
+    kill "$sampler_pid" 2>/dev/null || true
+    wait "$sampler_pid" 2>/dev/null || true
+  fi
   exit "$status"
 }
 trap cleanup EXIT INT TERM
@@ -194,7 +196,12 @@ grep -Eq '^complete_cpu_verify_seconds=[0-9]+\.[0-9]+$' "$work_dir/proof.log"
 grep -Fqx 'complete_mutations=REJECTED final,matrix,opening,truncation,byte' "$work_dir/proof.log"
 grep -Eq '^real_complete_proof=VERIFIED bytes=12025320 ' "$work_dir/proof.log"
 
+kill "$sampler_pid" 2>/dev/null || true
+wait "$sampler_pid" 2>/dev/null || true
+sampler_pid=
 sha256sum "$candidate_template" "$candidate_coefficients" "$final_activation" \
-  "$dynamic_record" "$proof" "$gpu_samples" "$log" >"$output_hashes"
+  "$dynamic_record" "$proof" "$gpu_samples" "$work_dir/miner-network-info.json" \
+  "$work_dir/work-inspection.txt" "$work_dir/dynamic-commitments.log" \
+  "$work_dir/proof.log" >"$output_hashes"
 cat "$output_hashes"
 echo "RCNET1_QUALIFICATION_COMPLETE $(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"

@@ -13,7 +13,10 @@ Group=commonfoundry
 WorkingDirectory=/opt/commonfoundry/current
 ExecStartPre=/usr/local/sbin/commonfoundry-disk-guard
 LoadCredential=wallet-passphrase:/etc/commonfoundry/wallet-passphrase
-ExecStart=/opt/commonfoundry/current/cmfd-node --data-dir /var/lib/commonfoundry --wallet-passphrase-file %d/wallet-passphrase run --bind 127.0.0.1:19443 --p2p-bind 0.0.0.0:19444 --allow-public-peers --no-default-seeds
+RuntimeDirectory=commonfoundry
+RuntimeDirectoryMode=0700
+ExecStartPre=/usr/bin/install --mode=0600 %d/wallet-passphrase /run/commonfoundry/wallet-passphrase
+ExecStart=/opt/commonfoundry/current/cmfd-node --data-dir /var/lib/commonfoundry --wallet-passphrase-file /run/commonfoundry/wallet-passphrase run --bind 127.0.0.1:19443 --p2p-bind 0.0.0.0:19444 --allow-public-peers --no-default-seeds
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=90s

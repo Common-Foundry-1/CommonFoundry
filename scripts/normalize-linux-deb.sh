@@ -62,7 +62,7 @@ if [[ "$DEB_PATH" != "$TARGET_ROOT/"* ]]; then
 fi
 validate_identity() {
   local deb="$1"
-  if [[ "$(dpkg-deb --field "$deb" Package)" != 'common-foundry-wallet' ||
+  if [[ "$(dpkg-deb --field "$deb" Package)" != 'common-foundry-wallet-rc-net' ||
     "$(dpkg-deb --field "$deb" Version)" != "$EXPECTED_VERSION" ||
     "$(dpkg-deb --field "$deb" Architecture)" != 'amd64' ]]; then
     echo 'The .deb package identity does not match Common Foundry, the expected version, and amd64.' >&2

@@ -148,7 +148,7 @@ prepare_tool \
 prepare_tool \
   'linuxdeploy-plugin-appimage.AppImage' \
   'https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/continuous/linuxdeploy-plugin-appimage-x86_64.AppImage' \
-  'a45d3e227bc7f397e9cf6bfa4c9507494efa2293357b6e86690a3de2ca992e79' \
+  '0441769ab38009504d2678c38cd7e526955388dd30a215b4a20afaa5471652f2' \
   'no'
 
 printf 'Pinned Tauri AppImage tools: %s (%s)\n' "$TOOLS_DIRECTORY" "$MODE"

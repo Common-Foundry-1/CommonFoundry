@@ -142,8 +142,8 @@ while (( start_nonce <= max_nonce )); do
     --fixed-record "$miner_fixed_record" \
     --winner-final-output "$miner_selected_final")
   printf '%s\n' "$inspection"
-  if grep -Eq 'CMFD_V4_SEARCH_BATCH qualified=true nonce=[0-9]+ ' <<<"$inspection"; then
-    winner_nonce=$(sed -nE 's/.* qualified=true nonce=([0-9]+) .*/\1/p' <<<"$inspection")
+  if grep -Eq '^CMFD_V4_SEARCH_BATCH qualified=true .* nonce=[0-9]+ ' <<<"$inspection"; then
+    winner_nonce=$(sed -nE 's/^CMFD_V4_SEARCH_BATCH qualified=true .* nonce=([0-9]+) .*/\1/p' <<<"$inspection")
     winner_final=$selected_final
     break
   fi

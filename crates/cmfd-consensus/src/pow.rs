@@ -320,7 +320,7 @@ pub enum BlockProof {
     /// Length-bounded production candidate. No consensus verifier can select
     /// this variant until the final model and proof parameters are pinned.
     V3Candidate(Box<ForgeMatrixV3CandidateProof>),
-    /// Length-bounded transparent-proof candidate for the isolated V4 testnet.
+    /// Length-bounded transparent-proof candidate for a ProductionV4 network.
     /// Existing verifiers deliberately reject this variant until the complete
     /// V4 relation and verifier parameters are pinned.
     V4Candidate(Box<ForgeMatrixV4CandidateProof>),
@@ -339,33 +339,44 @@ pub struct ForgeMatrixV4CandidateParameters {
 
 #[cfg(feature = "forgematrix-v4-verifier")]
 impl ForgeMatrixV4CandidateParameters {
-    pub fn production_testnet() -> Self {
-        Self {
-            network_id: crate::PRODUCTION_V4_TESTNET_NETWORK_ID,
+    pub fn for_network(network_id: [u8; 32]) -> Result<Self, PowError> {
+        let parameters = Self {
+            network_id,
             algorithm_version: FORGEMATRIX_V4_ALGORITHM_VERSION,
             proof_version: FORGEMATRIX_V4_PROOF_VERSION,
             proof_system_digest: forgematrix_v4_proof_system_digest(),
             model_manifest_digest: crate::forgematrix_v4::PRODUCTION_V4_MODEL_MANIFEST_DIGEST,
             fixed_artifact_record_digest:
                 crate::forgematrix_v4::PRODUCTION_V4_FIXED_ARTIFACT_RECORD_DIGEST,
-        }
+        };
+        parameters.validate_for_network(network_id)?;
+        Ok(parameters)
     }
 
-    fn from_record(record: &ForgeMatrixV4FixedArtifactRecordV1) -> Self {
-        let parameters = Self::production_testnet();
+    pub fn production_testnet() -> Self {
+        Self::for_network(crate::PRODUCTION_V4_TESTNET_NETWORK_ID)
+            .expect("the compiled ProductionV4 testnet network ID is valid")
+    }
+
+    fn from_record(
+        network_id: [u8; 32],
+        record: &ForgeMatrixV4FixedArtifactRecordV1,
+    ) -> Result<Self, PowError> {
+        let parameters = Self::for_network(network_id)?;
         debug_assert_eq!(parameters.model_manifest_digest, record.manifest_digest());
         debug_assert_eq!(
             parameters.fixed_artifact_record_digest,
             record.record_digest()
         );
-        parameters
+        Ok(parameters)
     }
 
     fn validate_for_network(self, network_id: [u8; 32]) -> Result<(), PowError> {
-        if network_id != crate::PRODUCTION_V4_TESTNET_NETWORK_ID || self.network_id != network_id {
+        if self.network_id != network_id {
             return Err(ForgeMatrixV4ConsensusError::WrongNetwork.into());
         }
-        if self.algorithm_version != FORGEMATRIX_V4_ALGORITHM_VERSION
+        if network_id == [0; 32]
+            || self.algorithm_version != FORGEMATRIX_V4_ALGORITHM_VERSION
             || self.proof_version != FORGEMATRIX_V4_PROOF_VERSION
             || self.proof_system_digest != forgematrix_v4_proof_system_digest()
             || self.model_manifest_digest == [0; 32]
@@ -374,6 +385,10 @@ impl ForgeMatrixV4CandidateParameters {
             return Err(ForgeMatrixV4ConsensusError::ParameterMismatch.into());
         }
         Ok(())
+    }
+
+    pub const fn network_id(self) -> [u8; 32] {
+        self.network_id
     }
 
     fn absorb(self, hasher: &mut Hasher) {
@@ -875,11 +890,26 @@ impl ConsensusPowVerifier {
         ))))
     }
 
-    /// Construct the isolated ProductionV4 verifier only after one reader has
+    /// Construct the ProductionV4 testnet verifier only after one reader has
     /// authenticated the complete model bank against the fixed-artifact
     /// record's manifest. The retained base input is published only after EOF.
     #[cfg(feature = "forgematrix-v4-verifier")]
     pub fn v4_candidate<ModelBank: Read>(
+        fixed_record: ForgeMatrixV4FixedArtifactRecordV1,
+        model_bank: ModelBank,
+    ) -> Result<Self, PowError> {
+        Self::v4_candidate_for_network(
+            crate::PRODUCTION_V4_TESTNET_NETWORK_ID,
+            fixed_record,
+            model_bank,
+        )
+    }
+
+    /// Construct a ProductionV4 verifier for an explicitly selected nonzero
+    /// network after authenticating the complete fixed model bank.
+    #[cfg(feature = "forgematrix-v4-verifier")]
+    pub fn v4_candidate_for_network<ModelBank: Read>(
+        network_id: [u8; 32],
         fixed_record: ForgeMatrixV4FixedArtifactRecordV1,
         model_bank: ModelBank,
     ) -> Result<Self, PowError> {
@@ -893,11 +923,10 @@ impl ConsensusPowVerifier {
         {
             return Err(ForgeMatrixV4ConsensusError::ParameterMismatch.into());
         }
+        let parameters = ForgeMatrixV4CandidateParameters::from_record(network_id, &fixed_record)?;
         let base_input =
             verify_model_bank_and_retain_base_input(model_bank, fixed_record.manifest())
                 .map_err(ForgeMatrixV4ConsensusError::from)?;
-        let parameters = ForgeMatrixV4CandidateParameters::from_record(&fixed_record);
-        parameters.validate_for_network(crate::PRODUCTION_V4_TESTNET_NETWORK_ID)?;
         Ok(Self::V4Candidate(Arc::new(VerifierInstance::new(
             ForgeMatrixV4ConsensusVerifier {
                 parameters,
@@ -2020,6 +2049,61 @@ mod tests {
                 "statement mutation not absorbed: {name}"
             );
         }
+    }
+
+    #[cfg(feature = "forgematrix-v4-verifier")]
+    #[test]
+    fn v4_parameters_accept_an_alternate_nonzero_network_and_reject_mismatches() {
+        const ALTERNATE_NETWORK_ID: [u8; 32] = [0xa5; 32];
+        let parameters =
+            ForgeMatrixV4CandidateParameters::for_network(ALTERNATE_NETWORK_ID).unwrap();
+
+        assert_eq!(parameters.network_id(), ALTERNATE_NETWORK_ID);
+        parameters
+            .validate_for_network(ALTERNATE_NETWORK_ID)
+            .unwrap();
+        assert!(matches!(
+            parameters.validate_for_network(crate::PRODUCTION_V4_TESTNET_NETWORK_ID),
+            Err(PowError::V4(ForgeMatrixV4ConsensusError::WrongNetwork))
+        ));
+        assert!(matches!(
+            ForgeMatrixV4CandidateParameters::for_network([0; 32]),
+            Err(PowError::V4(ForgeMatrixV4ConsensusError::ParameterMismatch))
+        ));
+        assert_eq!(
+            ForgeMatrixV4CandidateParameters::production_testnet(),
+            ForgeMatrixV4CandidateParameters::for_network(crate::PRODUCTION_V4_TESTNET_NETWORK_ID)
+                .unwrap()
+        );
+
+        let verifier = ForgeMatrixV4ConsensusVerifier {
+            parameters,
+            fixed_commitments: Default::default(),
+            base_input: Arc::from([]),
+        };
+        let candidate = ForgeMatrixV4CandidateProof {
+            algorithm_version: parameters.algorithm_version,
+            proof_version: parameters.proof_version,
+            nonce: 7,
+            proof_system_digest: parameters.proof_system_digest,
+            model_manifest_digest: parameters.model_manifest_digest,
+            challenge_digest: [1; 32],
+            final_activation_digest: [2; 32],
+            work_digest: [3; 32],
+            transparent_proof: Vec::new(),
+        };
+        assert!(matches!(
+            verifier.preflight(&block(ALTERNATE_NETWORK_ID), &candidate, false),
+            Err(ForgeMatrixV4ConsensusError::ProofSize)
+        ));
+        assert!(matches!(
+            verifier.preflight(
+                &block(crate::PRODUCTION_V4_TESTNET_NETWORK_ID),
+                &candidate,
+                false
+            ),
+            Err(ForgeMatrixV4ConsensusError::WrongNetwork)
+        ));
     }
 
     #[test]

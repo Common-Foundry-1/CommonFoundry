@@ -65,6 +65,12 @@ const wallet = {
   ],
 };
 
+const secureWallet = {
+  ...wallet,
+  insecure_demo_wallet: false,
+  warning: "ProductionV4 Testnet-1 wallet: back up wallet.key before testing recovery. This is not RCNet or mainnet.",
+};
+
 const mempool = {
   transactions: 1,
   bytes: 256,
@@ -124,7 +130,7 @@ describe("Common Foundry wallet", () => {
     expect(screen.getAllByText("CommonFoundry Profile Test").length).toBeGreaterThan(0);
     expect(screen.getByText("Block height").nextElementSibling).toHaveTextContent("128");
     expect(screen.getByText("Mined reward")).toBeInTheDocument();
-    expect(screen.getByText(/Testing network/)).toBeInTheDocument();
+    expect(screen.getByRole("note")).toHaveClass("network-context");
     expect(screen.queryByText(/USD|market price|sync percentage/i)).not.toBeInTheDocument();
   });
 
@@ -149,9 +155,43 @@ describe("Common Foundry wallet", () => {
     await screen.findByText("177.50");
 
     await user.click(screen.getAllByRole("button", { name: "Receive" })[0]);
-    expect(screen.getByRole("dialog", { name: "Receive CMFD" })).toBeInTheDocument();
+    const dialog = screen.getByRole("dialog", { name: "Receive CMFD" });
+    expect(dialog).toBeInTheDocument();
     expect(screen.getByText(wallet.destination)).toBeInTheDocument();
+    expect(within(dialog).getByRole("alert")).toHaveTextContent(wallet.warning);
     expect(screen.queryByLabelText(/private key/i)).not.toBeInTheDocument();
+  });
+
+  it("presents routine wallet guidance as neutral context", async () => {
+    vi.mocked(fetch).mockImplementation((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url.endsWith("/v1/status")) return jsonResponse(status);
+      if (url.endsWith("/v1/wallet")) return jsonResponse(secureWallet);
+      if (url.endsWith("/v1/mempool")) return jsonResponse(mempool);
+      return jsonResponse({ error: "not found" }, 404);
+    });
+
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByText("177.50");
+
+    await user.click(screen.getAllByRole("button", { name: "Receive" })[0]);
+    const receiveDialog = screen.getByRole("dialog", { name: "Receive CMFD" });
+    expect(within(receiveDialog).queryByRole("alert")).not.toBeInTheDocument();
+    expect(within(receiveDialog).getByRole("note")).toHaveClass("wallet-context");
+    await user.click(within(receiveDialog).getByRole("button", { name: "Done" }));
+
+    await user.click(screen.getAllByRole("button", { name: "Send" })[0]);
+    const sendDialog = screen.getByRole("dialog", { name: "Send CMFD" });
+    expect(within(sendDialog).queryByRole("alert")).not.toBeInTheDocument();
+    expect(within(sendDialog).getByText(secureWallet.warning)).toHaveClass("wallet-message");
+
+    await user.type(within(sendDialog).getByRole("textbox", { name: "Recipient" }), wallet.destination);
+    await user.type(within(sendDialog).getByRole("textbox", { name: "Amount" }), "1");
+    await user.click(within(sendDialog).getByRole("button", { name: "Review transaction" }));
+    const reviewDialog = screen.getByRole("dialog", { name: "Review transaction" });
+    expect(within(reviewDialog).queryByRole("alert")).not.toBeInTheDocument();
+    expect(within(reviewDialog).getByText(secureWallet.warning)).toHaveClass("wallet-message");
   });
 
   it("surfaces node errors and can retry", async () => {

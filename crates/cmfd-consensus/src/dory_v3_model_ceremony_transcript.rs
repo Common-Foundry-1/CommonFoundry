@@ -89,12 +89,7 @@ pub enum CeremonyTranscriptError {
     InvalidSignature,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FileIdentity {
-    pub bytes: u64,
-    pub blake3: [u8; 32],
-    pub sha256: [u8; 32],
-}
+pub use crate::FileIdentity;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReferenceBinary {

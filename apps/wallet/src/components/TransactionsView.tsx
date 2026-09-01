@@ -1,4 +1,4 @@
-import { ArrowRightLeft, CircleAlert, Layers3 } from "lucide-react";
+import { ArrowRightLeft, Layers3 } from "lucide-react";
 import { formatAtoms, formatBytes, shortenHash } from "../lib/amount";
 import type { MempoolSnapshot, WalletSnapshot } from "../types";
 import { TransactionList } from "./TransactionList";
@@ -49,10 +49,6 @@ export function TransactionsView({ wallet, mempool, onConsolidate }: Transaction
             <dd>{wallet?.reserved_utxo_count ?? "—"}</dd>
           </div>
         </dl>
-        <div className="hygiene-note">
-          <CircleAlert aria-hidden="true" size={17} />
-          <span>Only mature, unreserved outputs are selected. The transaction fee is burned.</span>
-        </div>
         <button className="button-primary wide" type="button" onClick={onConsolidate} disabled={!canConsolidate}>
           <ArrowRightLeft aria-hidden="true" size={18} />
           Consolidate outputs

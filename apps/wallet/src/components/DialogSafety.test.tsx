@@ -127,15 +127,18 @@ describe("wallet dialog safety", () => {
     await screen.findByText("125.00");
     await user.click(screen.getAllByRole("button", { name: "Send" })[0]);
     await waitFor(() => expect(screen.getByRole("dialog", { name: "Send CMFD" })).toHaveFocus());
-    await user.type(screen.getByRole("textbox", { name: "Recipient" }), destination);
-    await user.type(screen.getByRole("textbox", { name: "Amount" }), "1");
-    await user.click(screen.getByRole("button", { name: "Review transaction" }));
+    const editDialog = screen.getByRole("dialog", { name: "Send CMFD" });
+    expect(within(editDialog).getByRole("alert")).toHaveTextContent(wallet.warning);
+    await user.type(within(editDialog).getByRole("textbox", { name: "Recipient" }), destination);
+    await user.type(within(editDialog).getByRole("textbox", { name: "Amount" }), "1");
+    await user.click(within(editDialog).getByRole("button", { name: "Review transaction" }));
 
     const recipient = screen.getByLabelText("Full recipient public key");
     expect(recipient).toHaveTextContent(destination);
     expect(recipient).toHaveClass("review-value-address");
 
     const dialog = screen.getByRole("dialog", { name: "Review transaction" });
+    expect(within(dialog).getByRole("alert")).toHaveTextContent(wallet.warning);
     const submit = within(dialog).getByRole("button", { name: "Send transaction" });
     const close = within(dialog).getByRole("button", { name: "Close send dialog" });
     act(() => {

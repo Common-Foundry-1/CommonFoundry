@@ -5,8 +5,9 @@ use std::fs::File;
 use std::fs::{self, OpenOptions};
 #[cfg(feature = "production-v3")]
 use std::io::BufReader;
+use std::io::Write;
 #[cfg(any(feature = "production-v3-testnet", feature = "production-v4"))]
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 #[cfg(any(feature = "production-v3-testnet", feature = "production-v4"))]
@@ -36,8 +37,9 @@ use cmfd_consensus::{
     FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES, ForgeMatrixV4CandidateProof,
     ForgeMatrixV4FixedArtifactRecordV1, PRODUCTION_V2_LAYERS,
     PRODUCTION_V4_FIXED_ARTIFACT_RECORD_DIGEST, PRODUCTION_V4_MAX_BLOCK_BYTES,
-    PRODUCTION_V4_MAX_PROOF_BYTES, Transaction, forgematrix_v4_challenge_digest,
-    forgematrix_v4_proof_system_digest, forgematrix_v4_work_digest,
+    PRODUCTION_V4_MAX_PROOF_BYTES, PRODUCTION_V4_MODEL_MANIFEST_DIGEST, Transaction,
+    forgematrix_v4_challenge_digest, forgematrix_v4_proof_system_digest,
+    forgematrix_v4_work_digest,
 };
 #[cfg(feature = "production-v3-testnet")]
 use cmfd_consensus::{
@@ -78,6 +80,11 @@ use cmfd_node::{
 use cmfd_node::{
     ProductionV3MiningPeerIdentity, ProductionV3MiningWorkFactory, ProductionV3VerifierArtifacts,
 };
+#[cfg(feature = "production-v4-testnet")]
+use cmfd_node::{
+    ProductionV4VerifierArtifacts, RCNET1_PROFILE,
+    build_offline_rcnet1_block1_qualification_template, rcnet_candidate::RcnetLaunchCandidate,
+};
 #[cfg(any(feature = "production-v3-testnet", feature = "production-v4"))]
 use same_file::Handle as SameFileHandle;
 
@@ -89,6 +96,10 @@ use telemetry::{GpuTelemetry, query_nvidia_smi};
 const QUALIFIED_TEMPLATE_FORMAT_VERSION: u16 = 1;
 #[cfg(any(feature = "production-v3-testnet", feature = "production-v4"))]
 static QUALIFIED_OUTPUT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "production-v4-testnet")]
+const RCNET1_QUALIFICATION_TEMPLATE: &str = "RCNET1-BLOCK1-QUALIFICATION-TEMPLATE.json";
+#[cfg(feature = "production-v4-testnet")]
+const RCNET1_QUALIFICATION_COEFFICIENTS: &str = "RCNET1-BLOCK1-REPLAY-COEFFICIENTS.bin";
 
 const DEFAULT_MINER_DATA_DIR: &str = COMPILED_NETWORK_PROFILE.miner_data_dir_identity();
 const DEFAULT_MINER_P2P_ADDRESS: SocketAddr = COMPILED_NETWORK_PROFILE.miner_p2p_address();
@@ -103,6 +114,8 @@ const MAX_PRODUCTION_V3_BATCH_SIZE: u32 = 64;
 const AUTO_WORKERS_PER_GPU: usize = 0;
 const MAX_WORKERS_PER_GPU: usize = 16;
 const DEFAULT_STATS_SECONDS: u64 = 5;
+const MINER_NETWORK_INFO_FORMAT: &str = "commonfoundry-miner-network-info";
+const MINER_NETWORK_INFO_FORMAT_VERSION: u32 = 1;
 const PEER_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 /// Covers the external verifier's bounded 900-second authenticated restart
 /// while still placing a hard ceiling on retaining one exact candidate.
@@ -113,6 +126,17 @@ const PRODUCTION_V4_POOL_SEARCH_BATCH_SIZE: u32 = 32;
 const POOL_RECONNECT_INITIAL: Duration = Duration::from_millis(250);
 #[cfg(feature = "production-v4")]
 const POOL_RECONNECT_MAX: Duration = Duration::from_secs(4);
+
+#[derive(Debug, serde::Serialize, PartialEq, Eq)]
+struct MinerNetworkInfo {
+    format: &'static str,
+    format_version: u32,
+    network_id: String,
+    network_name: &'static str,
+    network_profile: &'static str,
+    proof_selection: &'static str,
+    build_source_commit: Option<&'static str>,
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -147,6 +171,8 @@ struct ProductionV3Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Print the canonical identity compiled into this miner without opening CUDA or artifacts.
+    NetworkInfo,
     /// List CUDA devices visible to the standalone miner.
     Devices {
         /// Path to the ForgeMatrix CUDA library. Defaults beside this executable.
@@ -272,6 +298,29 @@ enum Command {
         coefficients_output: PathBuf,
         #[arg(long)]
         output: PathBuf,
+    },
+    /// Create the deterministic offline RCNet-1 block-one qualification inputs.
+    ///
+    /// This source-stage command exists only in a ProductionV4 testnet build.
+    /// It authenticates Candidate V2 and the compiled artifacts, performs no
+    /// networking, and never writes activation evidence or a proof.
+    #[cfg(feature = "production-v4-testnet")]
+    PrepareRcnet1QualificationTemplate {
+        /// Exact canonical RCNET1-LAUNCH-CANDIDATE-V2.json.
+        #[arg(long)]
+        candidate: PathBuf,
+        /// 32-byte x-only Schnorr payout key as 64 hexadecimal characters.
+        #[arg(long)]
+        miner: String,
+        /// Complete release-pinned ProductionV4 model bank.
+        #[arg(long)]
+        model_bank: PathBuf,
+        /// Canonical release-pinned ProductionV4 fixed artifact record.
+        #[arg(long)]
+        fixed_record: PathBuf,
+        /// New absolute directory for the two qualification outputs.
+        #[arg(long)]
+        work_dir: PathBuf,
     },
     /// Bind another nonce to an already-frozen ProductionV4 block challenge.
     #[cfg(feature = "production-v4")]
@@ -494,6 +543,7 @@ struct WorkerThreadError {
 
 fn main() -> Result<()> {
     match Cli::parse().command {
+        Command::NetworkInfo => write_miner_network_info(),
         Command::Devices { cuda_library } => list_devices(cuda_library.as_deref()),
         Command::Mine {
             peers,
@@ -581,6 +631,20 @@ fn main() -> Result<()> {
             &fixed_record,
             &coefficients_output,
             &output,
+        ),
+        #[cfg(feature = "production-v4-testnet")]
+        Command::PrepareRcnet1QualificationTemplate {
+            candidate,
+            miner,
+            model_bank,
+            fixed_record,
+            work_dir,
+        } => prepare_rcnet1_qualification_template(
+            &candidate,
+            &miner,
+            &model_bank,
+            &fixed_record,
+            &work_dir,
         ),
         #[cfg(feature = "production-v4")]
         Command::BindV4Nonce {
@@ -674,6 +738,40 @@ fn main() -> Result<()> {
             production_v3,
         }),
     }
+}
+
+fn valid_build_source_commit(value: &str) -> bool {
+    matches!(value.len(), 40 | 64)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        && value.bytes().any(|byte| byte != b'0')
+}
+
+fn canonical_miner_network_info_json() -> Result<Vec<u8>> {
+    let build_source_commit = option_env!("CMFD_BUILD_SOURCE_COMMIT");
+    if build_source_commit.is_some_and(|value| !valid_build_source_commit(value)) {
+        bail!("compiled build source commit is not nonzero lowercase 40- or 64-character hex");
+    }
+    let info = MinerNetworkInfo {
+        format: MINER_NETWORK_INFO_FORMAT,
+        format_version: MINER_NETWORK_INFO_FORMAT_VERSION,
+        network_id: hex::encode(COMPILED_NETWORK_PROFILE.network_id),
+        network_name: COMPILED_NETWORK_PROFILE.name,
+        network_profile: COMPILED_NETWORK_PROFILE.short_name(),
+        proof_selection: COMPILED_NETWORK_PROFILE.proof.profile_name(),
+        build_source_commit,
+    };
+    let mut encoded = serde_json::to_vec(&info)?;
+    encoded.push(b'\n');
+    Ok(encoded)
+}
+
+fn write_miner_network_info() -> Result<()> {
+    std::io::stdout()
+        .lock()
+        .write_all(&canonical_miner_network_info_json()?)?;
+    Ok(())
 }
 
 #[cfg(feature = "production-v4")]
@@ -1199,6 +1297,242 @@ fn snapshot_v4_template(
         coefficients_output.display()
     );
     Ok(())
+}
+
+#[cfg(feature = "production-v4-testnet")]
+fn prepare_rcnet1_qualification_template(
+    candidate_path: &Path,
+    miner: &str,
+    model_bank_path: &Path,
+    fixed_record_path: &Path,
+    work_dir: &Path,
+) -> Result<()> {
+    ensure_existing_absolute_file(candidate_path, "RCNet-1 launch candidate")?;
+    ensure_existing_absolute_file(model_bank_path, "ProductionV4 model bank")?;
+    ensure_existing_absolute_file(fixed_record_path, "ProductionV4 fixed artifact record")?;
+    ensure_distinct_qualification_inputs(&[candidate_path, model_bank_path, fixed_record_path])?;
+    ensure_new_qualification_work_dir(work_dir)?;
+
+    let candidate_bytes = read_bounded_file(candidate_path, 64 * 1024, "RCNet-1 launch candidate")?;
+    RcnetLaunchCandidate::parse_exact_compiled_rcnet1(&candidate_bytes)
+        .context("RCNet-1 Candidate V2 authentication failed")?;
+    let payout = parse_miner_destination(miner).map_err(anyhow::Error::from)?;
+    let artifacts = ProductionV4VerifierArtifacts {
+        bank: model_bank_path.to_path_buf(),
+        fixed_record: fixed_record_path.to_path_buf(),
+    };
+    let template = build_offline_rcnet1_block1_qualification_template(&artifacts, payout)
+        .context("offline RCNet-1 block-one construction failed")?;
+    let frozen = FrozenProductionV4Template {
+        format_version: QUALIFIED_TEMPLATE_FORMAT_VERSION,
+        challenge: template.challenge,
+        coinbase: template.coinbase,
+        transactions: template.transactions,
+        nonce: 0,
+    };
+    if frozen.challenge.network_id != RCNET1_PROFILE.network_id
+        || frozen.challenge.previous_block != RCNET1_PROFILE.virtual_genesis_hash
+        || frozen.challenge.height != 1
+        || frozen.challenge.timestamp != RCNET1_PROFILE.virtual_genesis_timestamp + 1
+        || frozen.challenge.target != RCNET1_PROFILE.pow_limit
+        || frozen.coinbase.height != 1
+        || !frozen.transactions.is_empty()
+        || frozen.nonce != 0
+    {
+        bail!("offline RCNet-1 template failed final immutable-identity validation");
+    }
+    let challenge_digest = forgematrix_v4_challenge_digest(
+        &frozen.challenge,
+        frozen.nonce,
+        PRODUCTION_V4_MODEL_MANIFEST_DIGEST,
+    );
+    let coefficients = production_v4_replay_coefficients(challenge_digest);
+    let template_bytes = canonical_json(&frozen, "RCNet-1 qualification template")?;
+    publish_rcnet1_qualification_outputs(work_dir, &coefficients, &template_bytes)?;
+    println!(
+        "Prepared offline RCNet-1 block-one qualification template for miner {miner}: {} (coefficients: {})",
+        work_dir.join(RCNET1_QUALIFICATION_TEMPLATE).display(),
+        work_dir.join(RCNET1_QUALIFICATION_COEFFICIENTS).display()
+    );
+    Ok(())
+}
+
+#[cfg(feature = "production-v4-testnet")]
+fn ensure_distinct_qualification_inputs(paths: &[&Path]) -> Result<()> {
+    let identities = paths
+        .iter()
+        .map(|path| {
+            SameFileHandle::from_path(path).with_context(|| {
+                format!("failed to identify qualification input {}", path.display())
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for left in 0..identities.len() {
+        for right in left + 1..identities.len() {
+            if identities[left] == identities[right] {
+                bail!("RCNet-1 candidate and ProductionV4 artifact inputs must be distinct files");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "production-v4-testnet")]
+fn ensure_new_qualification_work_dir(work_dir: &Path) -> Result<()> {
+    if !work_dir.is_absolute() {
+        bail!("RCNet-1 qualification work directory must be an absolute path");
+    }
+    if work_dir.exists() {
+        bail!(
+            "RCNet-1 qualification work directory already exists: {}",
+            work_dir.display()
+        );
+    }
+    let parent = work_dir
+        .parent()
+        .ok_or_else(|| anyhow!("RCNet-1 qualification work directory has no parent"))?;
+    if !parent.is_dir() {
+        bail!(
+            "RCNet-1 qualification work-directory parent does not exist: {}",
+            parent.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "production-v4-testnet")]
+fn publish_rcnet1_qualification_outputs(
+    work_dir: &Path,
+    coefficients: &[u8],
+    template: &[u8],
+) -> Result<()> {
+    ensure_new_qualification_work_dir(work_dir)?;
+    fs::create_dir(work_dir).with_context(|| {
+        format!(
+            "failed to create RCNet-1 qualification work directory {}",
+            work_dir.display()
+        )
+    })?;
+    let mut guard = UnconfirmedQualificationWorkDir::new(work_dir.to_path_buf())?;
+    if let Some(parent) = work_dir.parent() {
+        sync_output_parent(parent)?;
+    }
+
+    let coefficients_path = work_dir.join(RCNET1_QUALIFICATION_COEFFICIENTS);
+    write_new_file(
+        &coefficients_path,
+        coefficients,
+        "RCNet-1 replay coefficients",
+    )?;
+    guard.remember(&coefficients_path, coefficients)?;
+
+    // The template is deliberately published last and is the completion
+    // marker for this pair. A failed call never confirms the work directory.
+    let template_path = work_dir.join(RCNET1_QUALIFICATION_TEMPLATE);
+    write_new_file(&template_path, template, "RCNet-1 qualification template")?;
+    guard.remember(&template_path, template)?;
+    guard.confirm()?;
+    Ok(())
+}
+
+#[cfg(feature = "production-v4-testnet")]
+struct UnconfirmedQualificationWorkDir {
+    path: PathBuf,
+    identity: SameFileHandle,
+    outputs: Vec<(PathBuf, SameFileHandle, Vec<u8>)>,
+    confirmed: bool,
+}
+
+#[cfg(feature = "production-v4-testnet")]
+impl UnconfirmedQualificationWorkDir {
+    fn new(path: PathBuf) -> Result<Self> {
+        let identity = SameFileHandle::from_path(&path).with_context(|| {
+            format!(
+                "failed to retain RCNet-1 qualification work-directory identity for {}",
+                path.display()
+            )
+        })?;
+        Ok(Self {
+            path,
+            identity,
+            outputs: Vec::new(),
+            confirmed: false,
+        })
+    }
+
+    fn ensure_current(&self) -> Result<()> {
+        if !SameFileHandle::from_path(&self.path).is_ok_and(|current| current == self.identity) {
+            bail!(
+                "RCNet-1 qualification work directory was replaced during publication: {}",
+                self.path.display()
+            );
+        }
+        Ok(())
+    }
+
+    fn remember(&mut self, path: &Path, expected: &[u8]) -> Result<()> {
+        self.ensure_current()?;
+        let identity = SameFileHandle::from_path(path)
+            .with_context(|| format!("failed to retain output identity for {}", path.display()))?;
+        self.outputs
+            .push((path.to_path_buf(), identity, expected.to_vec()));
+        Ok(())
+    }
+
+    fn confirm(&mut self) -> Result<()> {
+        self.ensure_current()?;
+        for (path, identity, expected) in &self.outputs {
+            let mut file = File::open(path).with_context(|| {
+                format!(
+                    "failed to reopen RCNet-1 qualification output {}",
+                    path.display()
+                )
+            })?;
+            let current = SameFileHandle::from_file(file.try_clone()?).with_context(|| {
+                format!(
+                    "failed to identify RCNet-1 qualification output {}",
+                    path.display()
+                )
+            })?;
+            if current != *identity {
+                bail!(
+                    "RCNet-1 qualification output was replaced during publication: {}",
+                    path.display()
+                );
+            }
+            let mut actual = Vec::with_capacity(expected.len() + 1);
+            Read::by_ref(&mut file)
+                .take(expected.len() as u64 + 1)
+                .read_to_end(&mut actual)?;
+            if actual != *expected {
+                bail!(
+                    "RCNet-1 qualification output changed during publication: {}",
+                    path.display()
+                );
+            }
+        }
+        self.confirmed = true;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "production-v4-testnet")]
+impl Drop for UnconfirmedQualificationWorkDir {
+    fn drop(&mut self) {
+        if self.confirmed {
+            return;
+        }
+        for (path, identity, _) in self.outputs.iter().rev() {
+            if SameFileHandle::from_path(path).is_ok_and(|current| current == *identity) {
+                let _ = fs::remove_file(path);
+            }
+        }
+        // This is intentionally non-recursive: an unexpected file quarantines
+        // the failed directory instead of broadening cleanup authority.
+        if SameFileHandle::from_path(&self.path).is_ok_and(|current| current == self.identity) {
+            let _ = fs::remove_dir(&self.path);
+        }
+    }
 }
 
 #[cfg(feature = "production-v4")]
@@ -5238,6 +5572,35 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn network_info_command_is_canonical_and_matches_the_compiled_profile() {
+        let cli = Cli::try_parse_from(["cmfd-miner", "network-info"]).unwrap();
+        assert!(matches!(cli.command, Command::NetworkInfo));
+
+        let expected = format!(
+            "{{\"format\":{},\"format_version\":1,\"network_id\":{},\"network_name\":{},\"network_profile\":{},\"proof_selection\":{},\"build_source_commit\":{}}}\n",
+            serde_json::to_string(MINER_NETWORK_INFO_FORMAT).unwrap(),
+            serde_json::to_string(&hex::encode(COMPILED_NETWORK_PROFILE.network_id)).unwrap(),
+            serde_json::to_string(COMPILED_NETWORK_PROFILE.name).unwrap(),
+            serde_json::to_string(COMPILED_NETWORK_PROFILE.short_name()).unwrap(),
+            serde_json::to_string(COMPILED_NETWORK_PROFILE.proof.profile_name()).unwrap(),
+            serde_json::to_string(&option_env!("CMFD_BUILD_SOURCE_COMMIT")).unwrap(),
+        );
+        assert_eq!(
+            canonical_miner_network_info_json().unwrap(),
+            expected.as_bytes()
+        );
+    }
+
+    #[test]
+    fn network_info_rejects_ambiguous_build_source_commits() {
+        assert!(valid_build_source_commit(&"1a".repeat(20)));
+        assert!(valid_build_source_commit(&"1a".repeat(32)));
+        assert!(!valid_build_source_commit(&"00".repeat(20)));
+        assert!(!valid_build_source_commit(&"AB".repeat(20)));
+        assert!(!valid_build_source_commit(&"1a".repeat(19)));
+    }
+
     #[cfg(feature = "production-v4")]
     #[test]
     fn parses_certificate_pinned_numeric_pool_urls() {
@@ -5314,6 +5677,235 @@ mod tests {
             snapshot.command,
             Command::SnapshotV4Template { nonce: 0, .. }
         ));
+    }
+
+    #[cfg(feature = "production-v4-testnet")]
+    #[test]
+    fn offline_rcnet1_qualification_command_requires_all_bound_inputs() {
+        let parsed = Cli::try_parse_from([
+            "cmfd-miner",
+            "prepare-rcnet1-qualification-template",
+            "--candidate",
+            "D:\\RCNET1-LAUNCH-CANDIDATE-V2.json",
+            "--miner",
+            "11e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1",
+            "--model-bank",
+            "D:\\MODEL-V2.bank",
+            "--fixed-record",
+            "D:\\FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json",
+            "--work-dir",
+            "D:\\rcnet1-block1-qualification",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::PrepareRcnet1QualificationTemplate { .. }
+        ));
+        assert!(
+            Cli::try_parse_from(["cmfd-miner", "prepare-rcnet1-qualification-template"]).is_err()
+        );
+    }
+
+    #[cfg(feature = "production-v4-testnet")]
+    #[test]
+    fn exact_rcnet1_candidate_with_altered_artifacts_creates_no_work_directory() {
+        let sequence = QUALIFIED_OUTPUT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let parent = std::env::temp_dir().join(format!(
+            "cmfd-rcnet1-altered-input-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&parent).unwrap();
+        let candidate_path = parent.join("RCNET1-LAUNCH-CANDIDATE-V2.json");
+        let bank_path = parent.join("MODEL-V2.bank");
+        let fixed_record_path = parent.join("FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json");
+        let work_dir = parent.join("work");
+        fs::write(
+            &candidate_path,
+            RcnetLaunchCandidate::compiled_rcnet1()
+                .unwrap()
+                .canonical_json()
+                .unwrap(),
+        )
+        .unwrap();
+        fs::write(&bank_path, b"altered model bank").unwrap();
+        fs::write(&fixed_record_path, b"{}\n").unwrap();
+
+        assert!(
+            prepare_rcnet1_qualification_template(
+                &candidate_path,
+                &hex::encode(RCNET1_PROFILE.rewards.steward),
+                &bank_path,
+                &fixed_record_path,
+                &work_dir,
+            )
+            .is_err()
+        );
+        assert!(!work_dir.exists());
+
+        fs::remove_file(candidate_path).unwrap();
+        fs::remove_file(bank_path).unwrap();
+        fs::remove_file(fixed_record_path).unwrap();
+        fs::remove_dir(parent).unwrap();
+    }
+
+    #[cfg(feature = "production-v4-testnet")]
+    #[test]
+    fn offline_rcnet1_outputs_are_create_new_and_byte_exact() {
+        let sequence = QUALIFIED_OUTPUT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let parent = std::env::temp_dir().join(format!(
+            "cmfd-rcnet1-output-{}-{sequence}",
+            std::process::id()
+        ));
+        let work_dir = parent.join("new-work");
+        fs::create_dir(&parent).unwrap();
+        publish_rcnet1_qualification_outputs(&work_dir, b"coefficients", b"template\n").unwrap();
+        assert_eq!(
+            fs::read(work_dir.join(RCNET1_QUALIFICATION_COEFFICIENTS)).unwrap(),
+            b"coefficients"
+        );
+        assert_eq!(
+            fs::read(work_dir.join(RCNET1_QUALIFICATION_TEMPLATE)).unwrap(),
+            b"template\n"
+        );
+        assert!(publish_rcnet1_qualification_outputs(&work_dir, b"changed", b"changed\n").is_err());
+        assert_eq!(
+            fs::read(work_dir.join(RCNET1_QUALIFICATION_TEMPLATE)).unwrap(),
+            b"template\n"
+        );
+        fs::remove_file(work_dir.join(RCNET1_QUALIFICATION_COEFFICIENTS)).unwrap();
+        fs::remove_file(work_dir.join(RCNET1_QUALIFICATION_TEMPLATE)).unwrap();
+        fs::remove_dir(work_dir).unwrap();
+        fs::remove_dir(parent).unwrap();
+    }
+
+    #[cfg(feature = "production-v4-testnet")]
+    #[test]
+    fn offline_rcnet1_rejects_nonempty_work_state_without_modification() {
+        let sequence = QUALIFIED_OUTPUT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let work_dir = std::env::temp_dir().join(format!(
+            "cmfd-rcnet1-existing-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&work_dir).unwrap();
+        let existing = work_dir.join(RCNET1_QUALIFICATION_TEMPLATE);
+        fs::write(&existing, b"existing\n").unwrap();
+        assert!(ensure_new_qualification_work_dir(&work_dir).is_err());
+        assert_eq!(fs::read(&existing).unwrap(), b"existing\n");
+        fs::remove_file(existing).unwrap();
+        fs::remove_dir(work_dir).unwrap();
+    }
+
+    #[cfg(feature = "production-v4-testnet")]
+    #[test]
+    fn failed_offline_rcnet1_work_is_cleaned_or_quarantined() {
+        let sequence = QUALIFIED_OUTPUT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let clean = std::env::temp_dir().join(format!(
+            "cmfd-rcnet1-clean-failure-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&clean).unwrap();
+        let own_output = clean.join(RCNET1_QUALIFICATION_COEFFICIENTS);
+        fs::write(&own_output, b"partial").unwrap();
+        let mut guard = UnconfirmedQualificationWorkDir::new(clean.clone()).unwrap();
+        guard.remember(&own_output, b"partial").unwrap();
+        drop(guard);
+        assert!(!clean.exists());
+
+        let sequence = QUALIFIED_OUTPUT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let quarantined = std::env::temp_dir().join(format!(
+            "cmfd-rcnet1-quarantined-failure-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&quarantined).unwrap();
+        let own_output = quarantined.join(RCNET1_QUALIFICATION_COEFFICIENTS);
+        let unexpected = quarantined.join("unexpected-state");
+        fs::write(&own_output, b"partial").unwrap();
+        fs::write(&unexpected, b"do not remove").unwrap();
+        let mut guard = UnconfirmedQualificationWorkDir::new(quarantined.clone()).unwrap();
+        guard.remember(&own_output, b"partial").unwrap();
+        drop(guard);
+        assert!(!own_output.exists());
+        assert_eq!(fs::read(&unexpected).unwrap(), b"do not remove");
+        assert!(quarantined.is_dir());
+        fs::remove_file(unexpected).unwrap();
+        fs::remove_dir(quarantined).unwrap();
+    }
+
+    #[cfg(feature = "production-v4-testnet")]
+    #[test]
+    fn offline_rcnet1_directory_replacement_fails_without_removing_replacement() {
+        let sequence = QUALIFIED_OUTPUT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let work_dir = std::env::temp_dir().join(format!(
+            "cmfd-rcnet1-replaced-work-{}-{sequence}",
+            std::process::id()
+        ));
+        let displaced = work_dir.with_extension("displaced");
+        fs::create_dir(&work_dir).unwrap();
+        let output = work_dir.join(RCNET1_QUALIFICATION_COEFFICIENTS);
+        fs::write(&output, b"owned partial output").unwrap();
+        let mut guard = UnconfirmedQualificationWorkDir::new(work_dir.clone()).unwrap();
+        guard.remember(&output, b"owned partial output").unwrap();
+
+        match fs::rename(&work_dir, &displaced) {
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                // Windows may deny the swap while the retained directory
+                // identity is live. That is already the desired fail-closed
+                // result, and Drop removes only our own partial state.
+                drop(guard);
+                assert!(!work_dir.exists());
+            }
+            Err(error) => panic!("unexpected directory-swap error: {error}"),
+            Ok(()) => {
+                fs::create_dir(&work_dir).unwrap();
+                let replacement = work_dir.join("unrelated-state");
+                fs::write(&replacement, b"must survive").unwrap();
+
+                assert!(guard.confirm().is_err());
+                drop(guard);
+                assert_eq!(fs::read(&replacement).unwrap(), b"must survive");
+                assert_eq!(
+                    fs::read(displaced.join(RCNET1_QUALIFICATION_COEFFICIENTS)).unwrap(),
+                    b"owned partial output"
+                );
+
+                fs::remove_file(replacement).unwrap();
+                fs::remove_dir(work_dir).unwrap();
+                fs::remove_file(displaced.join(RCNET1_QUALIFICATION_COEFFICIENTS)).unwrap();
+                fs::remove_dir(displaced).unwrap();
+            }
+        }
+    }
+
+    #[cfg(feature = "production-v4-testnet")]
+    #[test]
+    fn offline_rcnet1_in_place_output_mutation_cannot_be_confirmed() {
+        let sequence = QUALIFIED_OUTPUT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let work_dir = std::env::temp_dir().join(format!(
+            "cmfd-rcnet1-mutated-output-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&work_dir).unwrap();
+        let output = work_dir.join(RCNET1_QUALIFICATION_COEFFICIENTS);
+        let expected = b"stable qualification output";
+        fs::write(&output, expected).unwrap();
+        let mut mutator = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&output)
+            .unwrap();
+        let mut guard = UnconfirmedQualificationWorkDir::new(work_dir.clone()).unwrap();
+        guard.remember(&output, expected).unwrap();
+
+        let mut changed = expected.to_vec();
+        *changed.last_mut().unwrap() ^= 1;
+        mutator.seek(SeekFrom::Start(0)).unwrap();
+        mutator.write_all(&changed).unwrap();
+        mutator.sync_all().unwrap();
+        drop(mutator);
+
+        assert!(guard.confirm().is_err());
+        drop(guard);
+        assert!(!work_dir.exists());
     }
 
     #[cfg(feature = "production-v4")]

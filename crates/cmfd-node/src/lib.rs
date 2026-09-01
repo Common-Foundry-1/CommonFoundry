@@ -14,7 +14,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use blake3::Hasher;
 #[cfg(feature = "production-v4")]
 use cmfd_consensus::ForgeMatrixV4FixedArtifactRecordV1;
-#[cfg(any(test, feature = "production-v3", feature = "production-v4"))]
 use cmfd_consensus::PowParameters;
 use cmfd_consensus::chain::{ReversibleStateDeltaCapability, ValidatedBlock};
 use cmfd_consensus::{
@@ -51,6 +50,24 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+#[cfg(windows)]
+pub(crate) mod exchange_acl;
+pub mod exchange_acl_qualification;
+pub(crate) mod exchange_archive;
+pub(crate) mod exchange_custody_engine;
+#[cfg(test)]
+mod exchange_custody_rehearsal;
+pub(crate) mod exchange_custody_runtime_v3;
+pub use exchange_custody_runtime_v3::ExchangeCustodyV3Config;
+pub mod exchange_custody_tools;
+pub(crate) mod exchange_custody_v3;
+pub(crate) mod exchange_index;
+pub(crate) mod exchange_local_signer;
+pub(crate) mod exchange_policy;
+pub mod exchange_rpc;
+pub(crate) mod exchange_signer;
+pub(crate) mod exchange_withdrawal;
+pub(crate) mod exchange_withdrawal_v3;
 pub mod explorer;
 pub mod logging;
 pub mod network_info;
@@ -61,11 +78,14 @@ pub mod pool;
 pub mod pool_dashboard;
 #[cfg(feature = "production-v4")]
 pub mod production_v4_pool;
-#[cfg(feature = "production-v3")]
+#[cfg(feature = "production-v4")]
 pub mod rcnet_candidate;
+pub mod seed_peers;
 mod startup_snapshot;
 pub mod storage;
 pub mod wallet_backup;
+pub mod wallet_keyring;
+pub mod wallet_signing_protocol;
 
 #[path = "../release_gate.rs"]
 #[allow(dead_code)]
@@ -225,8 +245,7 @@ pub fn plain_package_path(path: PathBuf) -> PathBuf {
     path
 }
 
-pub fn compiled_production_v3_record_identity()
--> Result<cmfd_consensus::dory_v3_model_ceremony_transcript::FileIdentity, NodeError> {
+pub fn compiled_production_v3_record_identity() -> Result<cmfd_consensus::FileIdentity, NodeError> {
     let pin = release_gate::COMPILED_RELEASE_PROFILE
         .production_v3_artifacts
         .ok_or(NodeError::ProductionV3ArtifactPinsMissing)?
@@ -266,8 +285,8 @@ pub(crate) fn production_v3_record_for_profile(
 
 fn production_v3_file_identity_from_pin(
     pin: release_gate::ProductionV3FileIdentityPin,
-) -> cmfd_consensus::dory_v3_model_ceremony_transcript::FileIdentity {
-    cmfd_consensus::dory_v3_model_ceremony_transcript::FileIdentity {
+) -> cmfd_consensus::FileIdentity {
+    cmfd_consensus::FileIdentity {
         bytes: pin.bytes,
         blake3: pin.blake3,
         sha256: pin.sha256,
@@ -366,6 +385,7 @@ const RPC_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const RPC_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const RPC_TOTAL_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const RPC_ACCEPT_POLL: Duration = Duration::from_millis(50);
+const EXCHANGE_RPC_JSON_BODY_LIMIT: usize = MAX_TRANSACTION_BYTES * 2 + 16 * 1024;
 const PROOF_VERIFICATION_QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
 const WALLET_JSON_BODY_LIMIT: usize = 2 * 1024;
 
@@ -422,6 +442,8 @@ pub enum NodeError {
     ProductionV4ActivationEvidence(&'static str),
     #[error("the authenticated ProductionV4 {0} does not match its compiled identity pin")]
     ProductionV4ArtifactIdentityMismatch(&'static str),
+    #[error("offline RCNet-1 ProductionV4 qualification invariant failed: {0}")]
+    ProductionV4QualificationInvariant(&'static str),
     #[error("network metadata is missing while a nonempty block log already exists")]
     MissingMetadata,
     #[error("data directory belongs to a different immutable network fingerprint")]
@@ -457,6 +479,28 @@ pub enum NodeError {
     InvalidMiningShareTarget,
     #[error("RPC bind address must be loopback, received {0}")]
     NonLoopbackRpc(SocketAddr),
+    #[error("an exchange RPC listener is already active for this node")]
+    ExchangeRpcAlreadyActive,
+    #[error("exchange RPC authentication file is invalid: {0}")]
+    InvalidExchangeRpcAuthFile(&'static str),
+    #[error("exchange RPC authentication file permissions must be 0600 or stricter")]
+    InsecureExchangeRpcAuthFilePermissions,
+    #[error("exchange deposit index startup failed ({code}): {message}")]
+    ExchangeDepositIndex {
+        code: &'static str,
+        retryable: bool,
+        message: String,
+    },
+    #[error("exchange withdrawal journal startup failed ({code}): {message}")]
+    ExchangeWithdrawalJournal {
+        code: &'static str,
+        retryable: bool,
+        message: String,
+    },
+    #[error(
+        "native wallet mutation is disabled while exchange custody v3 exclusively owns the wallet"
+    )]
+    ExchangeCustodyV3WalletExclusive,
     #[error(
         "block storage is faulted after an append or sync failure; restart only after inspecting the log"
     )]
@@ -477,6 +521,10 @@ pub enum NodeError {
     MempoolInputConflict(OutPoint),
     #[error("transaction input is not confirmed on the active chain: {0:?}")]
     MempoolUnconfirmedInput(OutPoint),
+    #[error("transaction input is reserved by the exchange withdrawal journal: {0:?}")]
+    ExchangeWithdrawalInputReserved(OutPoint),
+    #[error("exchange withdrawal transaction does not match its input reservation: {0:?}")]
+    ExchangeWithdrawalReservationMismatch(OutPoint),
     #[error("mempool transaction count would exceed {MAX_MEMPOOL_TRANSACTIONS}")]
     MempoolTransactionLimit,
     #[error("mempool bytes would exceed {MAX_MEMPOOL_BYTES}")]
@@ -491,6 +539,8 @@ pub enum NodeError {
     WalletAmountOverflow,
     #[error("wallet send amount must be nonzero")]
     WalletZeroAmount,
+    #[error("wallet payment plan is invalid: {0}")]
+    InvalidWalletPaymentPlan(&'static str),
     #[error("wallet funds are immature: {immature} atoms immature, {required} atoms required")]
     WalletFundsImmature { immature: u64, required: u64 },
     #[error(
@@ -571,7 +621,8 @@ impl NodeError {
             | Self::ProductionV4ArtifactsUnexpected
             | Self::ProductionV4ArtifactPinsMissing
             | Self::ProductionV4ActivationEvidence(_)
-            | Self::ProductionV4ArtifactIdentityMismatch(_) => {
+            | Self::ProductionV4ArtifactIdentityMismatch(_)
+            | Self::ProductionV4QualificationInvariant(_) => {
                 ("proof_verifier_configuration", 500, false)
             }
             Self::MissingMetadata => ("missing_metadata", 500, false),
@@ -588,6 +639,20 @@ impl NodeError {
             Self::InvalidMiningSearchAttempts => ("invalid_mining_search_attempts", 400, false),
             Self::InvalidMiningShareTarget => ("invalid_mining_share_target", 400, false),
             Self::NonLoopbackRpc(_) => ("non_loopback_rpc", 400, false),
+            Self::ExchangeRpcAlreadyActive => ("exchange_rpc_already_active", 409, false),
+            Self::InvalidExchangeRpcAuthFile(_) => ("invalid_exchange_rpc_auth_file", 400, false),
+            Self::InsecureExchangeRpcAuthFilePermissions => {
+                ("insecure_exchange_rpc_auth_file_permissions", 400, false)
+            }
+            Self::ExchangeDepositIndex {
+                code, retryable, ..
+            } => (*code, 500, *retryable),
+            Self::ExchangeWithdrawalJournal {
+                code, retryable, ..
+            } => (*code, 500, *retryable),
+            Self::ExchangeCustodyV3WalletExclusive => {
+                ("exchange_custody_v3_wallet_exclusive", 409, false)
+            }
             Self::StorageFaulted => ("storage_faulted", 503, false),
             Self::DuplicateBlock(_) => ("duplicate_block", 409, false),
             Self::UnknownParent(_) => ("unknown_parent", 422, true),
@@ -597,6 +662,12 @@ impl NodeError {
             Self::DuplicateMempoolTransaction(_) => ("duplicate_mempool_transaction", 409, false),
             Self::MempoolInputConflict(_) => ("mempool_input_conflict", 409, false),
             Self::MempoolUnconfirmedInput(_) => ("mempool_unconfirmed_input", 422, true),
+            Self::ExchangeWithdrawalInputReserved(_) => {
+                ("exchange_withdrawal_input_reserved", 409, false)
+            }
+            Self::ExchangeWithdrawalReservationMismatch(_) => {
+                ("exchange_withdrawal_reservation_mismatch", 409, false)
+            }
             Self::MempoolTransactionLimit => ("mempool_transaction_limit", 422, true),
             Self::MempoolByteLimit => ("mempool_byte_limit", 422, true),
             Self::MempoolFeeTooLow { .. } => ("mempool_fee_too_low", 422, false),
@@ -604,6 +675,7 @@ impl NodeError {
             Self::InvalidWalletAmount => ("invalid_wallet_amount", 400, false),
             Self::WalletAmountOverflow => ("wallet_amount_overflow", 400, false),
             Self::WalletZeroAmount => ("wallet_zero_amount", 400, false),
+            Self::InvalidWalletPaymentPlan(_) => ("invalid_wallet_payment_plan", 500, false),
             Self::WalletFundsImmature { .. } => ("wallet_funds_immature", 422, true),
             Self::WalletInsufficientFunds { .. } => ("wallet_insufficient_funds", 422, false),
             Self::WalletInputLimit { .. } => ("wallet_input_limit", 422, false),
@@ -656,6 +728,14 @@ impl NodeError {
                 "block log is corrupt; inspect the node logs before restarting".to_owned()
             }
             Self::NonLoopbackRpc(_) => "RPC must remain bound to loopback".to_owned(),
+            Self::InvalidExchangeRpcAuthFile(_) => {
+                "exchange RPC authentication file is invalid".to_owned()
+            }
+            Self::InsecureExchangeRpcAuthFilePermissions => {
+                "exchange RPC authentication file permissions are too broad".to_owned()
+            }
+            Self::ExchangeDepositIndex { message, .. } => message.clone(),
+            Self::ExchangeWithdrawalJournal { message, .. } => message.clone(),
             Self::RpcIo(_) => "node RPC I/O failed".to_owned(),
             Self::ProofVerifierWorker(_) => {
                 "external proof verifier failed; inspect the node logs".to_owned()
@@ -2166,6 +2246,9 @@ pub struct NodeStatus {
     pub node_data_dir_identity: &'static str,
     pub wallet_data_dir_identity: &'static str,
     pub miner_data_dir_identity: &'static str,
+    /// Whether native wallet mutation is available, latched closed pending v3
+    /// activation, or owned by the active v3 custody runtime.
+    pub exchange_custody_v3_wallet_state: &'static str,
     pub bounded_reference_mining: bool,
     pub tip: String,
     pub cumulative_work: String,
@@ -3097,6 +3180,46 @@ pub struct MempoolEntry {
     pub fee_burned: u64,
 }
 
+/// Files that establish the authenticated exchange-withdrawal storage
+/// boundary. The journal key is a dedicated 32-byte secret; the external
+/// anchor is intentionally kept outside the node data directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExchangeWithdrawalSecurityConfig {
+    journal_key_file: PathBuf,
+    anchor_file: PathBuf,
+}
+
+impl ExchangeWithdrawalSecurityConfig {
+    pub fn new(journal_key_file: impl Into<PathBuf>, anchor_file: impl Into<PathBuf>) -> Self {
+        Self {
+            journal_key_file: journal_key_file.into(),
+            anchor_file: anchor_file.into(),
+        }
+    }
+
+    pub fn journal_key_file(&self) -> &Path {
+        &self.journal_key_file
+    }
+
+    pub fn anchor_file(&self) -> &Path {
+        &self.anchor_file
+    }
+}
+
+/// Deterministic, unsigned wallet payment intent suitable for durable
+/// journaling before the node's wallet key is used.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct WalletPaymentPlan {
+    pub(crate) transaction: Transaction,
+    pub(crate) recipient: [u8; 32],
+    pub(crate) amount_atoms: u64,
+    pub(crate) fee_burned_atoms: u64,
+    pub(crate) change_atoms: u64,
+    /// Values correspond positionally to `transaction.inputs`.
+    pub(crate) selected_input_values: Vec<u64>,
+    pub(crate) output_spendable_height: u64,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct WalletBalances {
     pub spendable_atoms: String,
@@ -3391,6 +3514,49 @@ fn next_node_instance_id() -> Result<u64, NodeError> {
         .map_err(|_| NodeError::CorruptLog("node instance identity counter exhausted".to_owned()))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExchangeCustodyV3WalletState {
+    Unclaimed,
+    Required,
+    Active,
+}
+
+impl ExchangeCustodyV3WalletState {
+    fn locks_native_wallet(self) -> bool {
+        self != Self::Unclaimed
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unclaimed => "unclaimed",
+            Self::Required => "required",
+            Self::Active => "active",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExchangeCustodyDestinationUtxoSummary {
+    pub tip: [u8; 32],
+    pub next_height: u64,
+    pub unspent_count: usize,
+    pub unspent_atoms: u64,
+    pub spendable_count: usize,
+    pub spendable_atoms: u64,
+    pub local_mempool_output_count: usize,
+    pub local_mempool_output_atoms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExchangeCustodyLegacySweepSummary {
+    pub txid: [u8; 32],
+    pub block_id: [u8; 32],
+    pub height: u64,
+    pub confirmations: u64,
+    pub legacy_input_count: usize,
+    pub legacy_output_count: usize,
+}
+
 pub struct Node {
     /// Process-local identity used to bind off-lock admissions to this exact
     /// live node value, even if the value inside a shared mutex is replaced.
@@ -3413,6 +3579,18 @@ pub struct Node {
     chain_revision: u64,
     mempool: BTreeMap<[u8; 32], MempoolEntry>,
     mempool_bytes: usize,
+    /// Active exchange-withdrawal reservations, bound to the exact unsigned
+    /// transaction digest authorized to spend each outpoint. The durable
+    /// journal restores this complete map before withdrawal RPCs are enabled.
+    exchange_withdrawal_reservations: HashMap<OutPoint, [u8; 32]>,
+    /// Dedicated authenticated-journal key and independently located rollback
+    /// anchor. This is loaded before journal reservations are restored.
+    exchange_withdrawal_security: Option<exchange_withdrawal::LoadedWithdrawalSecurity>,
+    /// Persistently required after v3 activation and promoted to Active when
+    /// the runtime claims the wallet. Both non-Unclaimed states keep native
+    /// wallet mutation fail-closed across omitted-flag restarts.
+    exchange_custody_v3_wallet_state: ExchangeCustodyV3WalletState,
+    exchange_rpc_active: bool,
     log: File,
     /// Digest of the exact last complete block-log record. V2 appends bind to
     /// this value; it advances only after the durable record commits in memory.
@@ -4032,19 +4210,38 @@ pub(crate) fn network_params_and_verifier_for_profile(
                 let pins = release_gate::COMPILED_RELEASE_PROFILE
                     .production_v4_artifacts
                     .ok_or(NodeError::ProductionV4ArtifactPinsMissing)?;
-                let fixed_record_file = require_production_v4_file_identity(
+                let mut fixed_record_reader = open_production_v4_pinned_reader(
                     &artifacts.fixed_record,
                     pins.fixed_record,
                     "fixed artifact record",
                 )?;
+                let fixed_record_limit = pins.fixed_record.bytes.checked_add(1).ok_or(
+                    NodeError::ProductionV4ArtifactIdentityMismatch("fixed artifact record"),
+                )?;
+                let mut fixed_record_bytes = Vec::new();
+                Read::by_ref(&mut fixed_record_reader)
+                    .take(fixed_record_limit)
+                    .read_to_end(&mut fixed_record_bytes)
+                    .map_err(|source| {
+                        io_error(
+                            "read ProductionV4 fixed artifact record",
+                            &artifacts.fixed_record,
+                            source,
+                        )
+                    })?;
+                fixed_record_reader.verify_pin(pins.fixed_record, "fixed artifact record")?;
                 let record: ForgeMatrixV4FixedArtifactRecordV1 =
-                    serde_json::from_reader(BufReader::new(fixed_record_file))?;
-                let bank_file =
-                    require_production_v4_file_identity(&artifacts.bank, pins.bank, "model bank")?;
-                ConsensusPowVerifier::v4_candidate(
+                    serde_json::from_slice(&fixed_record_bytes)?;
+
+                let mut bank_reader =
+                    open_production_v4_pinned_reader(&artifacts.bank, pins.bank, "model bank")?;
+                let verifier = ConsensusPowVerifier::v4_candidate_for_network(
+                    profile.network_id,
                     record,
-                    BufReader::with_capacity(64 * 1024 * 1024, bank_file),
-                )?
+                    BufReader::with_capacity(64 * 1024 * 1024, &mut bank_reader),
+                )?;
+                bank_reader.verify_pin(pins.bank, "model bank")?;
+                verifier
             }
             #[cfg(not(feature = "production-v4"))]
             {
@@ -4057,42 +4254,81 @@ pub(crate) fn network_params_and_verifier_for_profile(
 }
 
 #[cfg(feature = "production-v4")]
-fn require_production_v4_file_identity(
+fn open_production_v4_pinned_reader(
     path: &Path,
     pin: release_gate::ProductionV3FileIdentityPin,
     name: &'static str,
-) -> Result<File, NodeError> {
+) -> Result<ProductionV4PinnedReader<File>, NodeError> {
     if pin.bytes == 0 || pin.blake3 == [0; 32] || pin.sha256 == [0; 32] {
         return Err(NodeError::ProductionV4ArtifactPinsMissing);
     }
-    let mut file =
+    let file =
         File::open(path).map_err(|source| io_error("open ProductionV4 artifact", path, source))?;
-    let bytes = file
+    let metadata = file
         .metadata()
-        .map_err(|source| io_error("inspect ProductionV4 artifact", path, source))?
-        .len();
-    if bytes != pin.bytes {
+        .map_err(|source| io_error("inspect ProductionV4 artifact", path, source))?;
+    if !metadata.is_file() || metadata.len() != pin.bytes {
         return Err(NodeError::ProductionV4ArtifactIdentityMismatch(name));
     }
-    let mut blake3 = blake3::Hasher::new();
-    let mut sha256 = Sha256::new();
-    let mut buffer = vec![0_u8; 8 * 1024 * 1024];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|source| io_error("hash ProductionV4 artifact", path, source))?;
-        if read == 0 {
-            break;
+    Ok(ProductionV4PinnedReader::new(file))
+}
+
+/// Hashes the same stream that supplies verifier state. This closes both
+/// pathname replacement and in-place mutation windows: no verifier authority
+/// escapes until the exact consumed bytes match both compiled digests.
+#[cfg(feature = "production-v4")]
+struct ProductionV4PinnedReader<R> {
+    inner: R,
+    bytes: u64,
+    blake3: blake3::Hasher,
+    sha256: Sha256,
+}
+
+#[cfg(feature = "production-v4")]
+impl<R> ProductionV4PinnedReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            bytes: 0,
+            blake3: blake3::Hasher::new(),
+            sha256: Sha256::new(),
         }
-        blake3.update(&buffer[..read]);
-        sha256.update(&buffer[..read]);
     }
-    let actual_blake3 = *blake3.finalize().as_bytes();
-    let actual_sha256: [u8; 32] = sha256.finalize().into();
-    if actual_blake3 != pin.blake3 || actual_sha256 != pin.sha256 {
-        return Err(NodeError::ProductionV4ArtifactIdentityMismatch(name));
+
+    fn verify_pin(
+        self,
+        pin: release_gate::ProductionV3FileIdentityPin,
+        name: &'static str,
+    ) -> Result<(), NodeError> {
+        let actual_blake3 = *self.blake3.finalize().as_bytes();
+        let actual_sha256: [u8; 32] = self.sha256.finalize().into();
+        if self.bytes != pin.bytes || actual_blake3 != pin.blake3 || actual_sha256 != pin.sha256 {
+            return Err(NodeError::ProductionV4ArtifactIdentityMismatch(name));
+        }
+        Ok(())
     }
-    File::open(path).map_err(|source| io_error("reopen ProductionV4 artifact", path, source))
+}
+
+#[cfg(feature = "production-v4")]
+impl<R: Read> Read for ProductionV4PinnedReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        let read_u64 = u64::try_from(read).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ProductionV4 artifact read length exceeds u64",
+            )
+        })?;
+        self.bytes = self.bytes.checked_add(read_u64).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ProductionV4 artifact read length overflowed",
+            )
+        })?;
+        self.blake3.update(&buffer[..read]);
+        self.sha256.update(&buffer[..read]);
+        Ok(read)
+    }
 }
 
 fn network_params_from_verifier(
@@ -4129,7 +4365,7 @@ fn network_params_from_pow(
 fn require_production_v3_file_identity(
     name: &'static str,
     pin: release_gate::ProductionV3FileIdentityPin,
-    actual: &cmfd_consensus::dory_v3_model_ceremony_transcript::FileIdentity,
+    actual: &cmfd_consensus::FileIdentity,
 ) -> Result<(), NodeError> {
     if pin.bytes != actual.bytes || pin.blake3 != actual.blake3 || pin.sha256 != actual.sha256 {
         return Err(NodeError::ProductionV3ArtifactIdentityMismatch(name));
@@ -4151,7 +4387,9 @@ pub(crate) fn thin_miner_network_params() -> Result<NetworkParams, NodeError> {
                 network_params_from_pow(
                     COMPILED_NETWORK_PROFILE,
                     PowParameters::V4Candidate(
-                        cmfd_consensus::ForgeMatrixV4CandidateParameters::production_testnet(),
+                        cmfd_consensus::ForgeMatrixV4CandidateParameters::for_network(
+                            COMPILED_NETWORK_PROFILE.network_id,
+                        )?,
                     ),
                 )
             }
@@ -4191,6 +4429,192 @@ pub fn unix_time_seconds() -> Result<u64, NodeError> {
         .duration_since(UNIX_EPOCH)
         .map_err(|_| NodeError::InvalidSystemTime)?
         .as_secs())
+}
+
+/// Builds the deterministic RCNet-1 block-one qualification template entirely
+/// in memory. This source-stage tool exists only in the isolated ProductionV4
+/// testnet build: it has no peer address, storage path, activation evidence, or
+/// production-RC feature path. The fixed record is parsed from its authenticated
+/// byte snapshot, and the model-bank identity is computed over the exact stream
+/// consumed by verifier construction. No verifier authority or chain state is
+/// returned until both compiled identities match.
+#[cfg(feature = "production-v4-testnet")]
+pub fn build_offline_rcnet1_block1_qualification_template(
+    artifacts: &ProductionV4VerifierArtifacts,
+    miner_destination: [u8; 32],
+) -> Result<BlockTemplate, NodeError> {
+    if COMPILED_NETWORK_PROFILE != PRODUCTION_V4_TESTNET_PROFILE {
+        return Err(NodeError::ProductionV4QualificationInvariant(
+            "qualification helper is not running in the ProductionV4 testnet build",
+        ));
+    }
+    let (params, verifier) =
+        network_params_and_verifier_for_profile(RCNET1_PROFILE, None, Some(artifacts))?;
+    let state = ChainState::new(params, verifier)?;
+    let timestamp = RCNET1_PROFILE
+        .virtual_genesis_timestamp
+        .checked_add(1)
+        .ok_or(NodeError::ProductionV4QualificationInvariant(
+            "virtual genesis timestamp has no block-one successor",
+        ))?;
+    let template =
+        build_template_from_state(&state, &params, miner_destination, timestamp, Vec::new())?;
+    let allocation = params.monetary_policy.allocation(1, 0)?;
+    let expected_coinbase = Coinbase::new(1, allocation, miner_destination, params.rewards);
+    let expected_root = merkle_root(&[expected_coinbase.commitment(params.network_id)]);
+    if template.challenge.network_id != RCNET1_PROFILE.network_id
+        || template.challenge.previous_block != RCNET1_PROFILE.virtual_genesis_hash
+        || template.challenge.transaction_root != expected_root
+        || template.challenge.height != 1
+        || template.challenge.timestamp != timestamp
+        || template.challenge.target != RCNET1_PROFILE.pow_limit
+        || template.coinbase != expected_coinbase
+        || !template.transactions.is_empty()
+        || template.total_fees_burned != 0
+    {
+        return Err(NodeError::ProductionV4QualificationInvariant(
+            "constructed block-one template does not match immutable RCNet-1 state",
+        ));
+    }
+    Ok(template)
+}
+
+#[cfg(all(test, feature = "production-v4-testnet"))]
+mod offline_rcnet1_qualification_tests {
+    use std::io::Read as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    struct MidstreamMutationReader {
+        expected: Vec<u8>,
+        mutated: Vec<u8>,
+        position: usize,
+    }
+
+    impl Read for MidstreamMutationReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.position == self.expected.len() || buffer.is_empty() {
+                return Ok(0);
+            }
+            let split = self.expected.len() / 2;
+            let byte = if self.position < split {
+                self.expected[self.position]
+            } else {
+                self.mutated[self.position]
+            };
+            buffer[0] = byte;
+            self.position += 1;
+            Ok(1)
+        }
+    }
+
+    fn pin_for(bytes: &[u8]) -> release_gate::ProductionV3FileIdentityPin {
+        release_gate::ProductionV3FileIdentityPin {
+            bytes: bytes.len() as u64,
+            blake3: *blake3::hash(bytes).as_bytes(),
+            sha256: Sha256::digest(bytes).into(),
+        }
+    }
+
+    #[test]
+    fn pinned_reader_rejects_deterministic_midstream_mutation() {
+        let expected = b"authenticated ProductionV4 artifact".to_vec();
+        let mut mutated = expected.clone();
+        *mutated.last_mut().unwrap() ^= 1;
+        let pin = pin_for(&expected);
+        let mut reader = ProductionV4PinnedReader::new(MidstreamMutationReader {
+            expected,
+            mutated,
+            position: 0,
+        });
+        let mut consumed = Vec::new();
+        reader.read_to_end(&mut consumed).unwrap();
+        assert!(matches!(
+            reader.verify_pin(pin, "test artifact"),
+            Err(NodeError::ProductionV4ArtifactIdentityMismatch(
+                "test artifact"
+            ))
+        ));
+    }
+
+    #[test]
+    fn altered_artifacts_are_rejected_before_state_construction() {
+        let root = std::env::temp_dir().join(format!(
+            "cmfd-offline-rcnet1-altered-artifacts-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        let artifacts = ProductionV4VerifierArtifacts {
+            bank: root.join("altered-model.bank"),
+            fixed_record: root.join("altered-fixed-record.json"),
+        };
+        fs::write(&artifacts.bank, b"altered bank").unwrap();
+        fs::write(&artifacts.fixed_record, b"{}\n").unwrap();
+
+        assert!(matches!(
+            build_offline_rcnet1_block1_qualification_template(
+                &artifacts,
+                default_miner_destination()
+            ),
+            Err(NodeError::ProductionV4ArtifactIdentityMismatch(
+                "fixed artifact record"
+            ))
+        ));
+
+        fs::remove_file(artifacts.bank).unwrap();
+        fs::remove_file(artifacts.fixed_record).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
+}
+
+fn build_template_from_state(
+    state: &ChainState,
+    params: &NetworkParams,
+    miner_destination: [u8; 32],
+    now_unix_seconds: u64,
+    transactions: Vec<Transaction>,
+) -> Result<BlockTemplate, NodeError> {
+    VerifyingKey::from_bytes(&miner_destination).map_err(|_| NodeError::InvalidMinerDestination)?;
+    let earliest = state
+        .median_time_past()
+        .checked_add(1)
+        .ok_or(NodeError::TemplateTimeUnavailable)?;
+    let latest = now_unix_seconds
+        .checked_add(params.max_future_offset_secs)
+        .ok_or(NodeError::TemplateTimeUnavailable)?;
+    let timestamp = now_unix_seconds.max(earliest);
+    if timestamp > latest {
+        return Err(NodeError::TemplateTimeUnavailable);
+    }
+
+    let height = state.next_height();
+    let validation = state.validate_transactions_for_next_block(&transactions)?;
+    let allocation = params
+        .monetary_policy
+        .allocation(height, validation.total_burned_fees)?;
+    let coinbase = Coinbase::new(height, allocation, miner_destination, params.rewards);
+    let mut commitments = Vec::with_capacity(transactions.len() + 1);
+    commitments.push(coinbase.commitment(params.network_id));
+    commitments.extend(transactions.iter().map(Transaction::txid));
+    let transaction_root = merkle_root(&commitments);
+    let challenge = BlockChallenge {
+        network_id: params.network_id,
+        previous_block: state.tip(),
+        transaction_root,
+        height,
+        timestamp,
+        target: state.expected_target()?,
+    };
+    Ok(BlockTemplate {
+        challenge,
+        coinbase,
+        transactions,
+        total_fees_burned: validation.total_burned_fees,
+    })
 }
 
 impl Node {
@@ -4347,6 +4771,52 @@ impl Node {
         )
     }
 
+    /// Opens the compiled network with an authenticated withdrawal journal and
+    /// an external rollback anchor. Existing entry points remain suitable for
+    /// data directories that have never enrolled a withdrawal journal.
+    pub fn open_with_runtime_security_wallet_and_exchange_withdrawal(
+        data_dir: impl AsRef<Path>,
+        production_v3_record: Option<&ProductionV3VerifierRecord>,
+        production_v4_artifacts: Option<&ProductionV4VerifierArtifacts>,
+        verifier_worker: Option<&VerifierWorkerConfig>,
+        wallet_passphrase: Option<&[u8]>,
+        exchange_withdrawal_security: Option<&ExchangeWithdrawalSecurityConfig>,
+    ) -> Result<Self, NodeError> {
+        if production_v4_artifacts.is_some()
+            && (production_v3_record.is_some() || verifier_worker.is_some())
+        {
+            return Err(NodeError::ProductionV4ArtifactsUnexpected);
+        }
+        Self::open_with_profile_artifacts_worker_and_exchange_withdrawal(
+            data_dir,
+            COMPILED_NETWORK_PROFILE,
+            production_v3_record,
+            None,
+            production_v4_artifacts,
+            verifier_worker.cloned(),
+            wallet_passphrase,
+            exchange_withdrawal_security,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_with_profile_and_exchange_withdrawal_security(
+        data_dir: impl AsRef<Path>,
+        profile: NetworkProfile,
+        exchange_withdrawal_security: &ExchangeWithdrawalSecurityConfig,
+    ) -> Result<Self, NodeError> {
+        Self::open_with_profile_artifacts_worker_and_exchange_withdrawal(
+            data_dir,
+            profile,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(exchange_withdrawal_security),
+        )
+    }
+
     fn open_with_profile_artifacts_and_worker(
         data_dir: impl AsRef<Path>,
         profile: NetworkProfile,
@@ -4355,6 +4825,29 @@ impl Node {
         production_v4_artifacts: Option<&ProductionV4VerifierArtifacts>,
         verifier_worker: Option<VerifierWorkerConfig>,
         wallet_passphrase: Option<&[u8]>,
+    ) -> Result<Self, NodeError> {
+        Self::open_with_profile_artifacts_worker_and_exchange_withdrawal(
+            data_dir,
+            profile,
+            production_v3_record,
+            production_v3_artifacts,
+            production_v4_artifacts,
+            verifier_worker,
+            wallet_passphrase,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_with_profile_artifacts_worker_and_exchange_withdrawal(
+        data_dir: impl AsRef<Path>,
+        profile: NetworkProfile,
+        production_v3_record: Option<&ProductionV3VerifierRecord>,
+        production_v3_artifacts: Option<ProductionV3VerifierArtifacts>,
+        production_v4_artifacts: Option<&ProductionV4VerifierArtifacts>,
+        verifier_worker: Option<VerifierWorkerConfig>,
+        wallet_passphrase: Option<&[u8]>,
+        exchange_withdrawal_security: Option<&ExchangeWithdrawalSecurityConfig>,
     ) -> Result<Self, NodeError> {
         let (params, verifier) = network_params_and_verifier_for_profile(
             profile,
@@ -4370,6 +4863,14 @@ impl Node {
         }
         let data_dir = data_dir.as_ref().to_path_buf();
         let lock = DataDirLock::acquire(&data_dir)?;
+        let exchange_withdrawal_security = exchange_withdrawal_security
+            .map(|config| exchange_withdrawal::LoadedWithdrawalSecurity::load(config, &data_dir))
+            .transpose()
+            .map_err(|error| NodeError::ExchangeWithdrawalJournal {
+                code: error.code(),
+                retryable: error.retryable(),
+                message: error.client_message(),
+            })?;
         let log_path = data_dir.join(BLOCK_LOG_FILE);
         let log = open_block_log(&log_path)?;
         let fingerprint = params.fingerprint()?;
@@ -4417,7 +4918,13 @@ impl Node {
         #[cfg(not(feature = "production-v3"))]
         let _ = production_v3_artifacts;
 
-        let node = Self {
+        let exchange_custody_v3_wallet_state =
+            if exchange_custody_v3::persisted_v3_wallet_claim_required(&data_dir) {
+                ExchangeCustodyV3WalletState::Required
+            } else {
+                ExchangeCustodyV3WalletState::Unclaimed
+            };
+        let mut node = Self {
             instance_id: next_node_instance_id()?,
             data_dir,
             profile,
@@ -4434,6 +4941,10 @@ impl Node {
             chain_revision,
             mempool: BTreeMap::new(),
             mempool_bytes: 0,
+            exchange_withdrawal_reservations: HashMap::new(),
+            exchange_withdrawal_security,
+            exchange_custody_v3_wallet_state,
+            exchange_rpc_active: false,
             log,
             last_record_digest: replay.last_record_digest,
             block_log_length: replay.log_length,
@@ -4451,6 +4962,21 @@ impl Node {
             completion_fault_barrier: None,
             _lock: lock,
         };
+        // A persisted v3 marker or slot latches the native wallet closed before
+        // the v3 runtime is opened. Do not ask the legacy v2 loader to decode
+        // those same slot names; the v3 runtime authenticates them and installs
+        // their reservations when it claims the wallet. Exact v2 state remains
+        // Unclaimed and continues through the legacy recovery path below.
+        if node.exchange_custody_v3_wallet_state == ExchangeCustodyV3WalletState::Unclaimed {
+            exchange_withdrawal::ExchangeWithdrawalJournal::install_persisted_reservations(
+                &mut node,
+            )
+            .map_err(|error| NodeError::ExchangeWithdrawalJournal {
+                code: error.code(),
+                retryable: error.retryable(),
+                message: error.client_message(),
+            })?;
+        }
         if !startup_snapshot_used {
             let _ = node.persist_startup_snapshot();
         }
@@ -4568,6 +5094,113 @@ impl Node {
         self.wallet_signing_key.verifying_key().to_bytes().into()
     }
 
+    pub(crate) fn exchange_custody_destination_utxo_summary(
+        &self,
+        destination: [u8; 32],
+    ) -> Result<ExchangeCustodyDestinationUtxoSummary, NodeError> {
+        let next_height = self.state.next_height();
+        let mut summary = ExchangeCustodyDestinationUtxoSummary {
+            tip: self.state.tip(),
+            next_height,
+            unspent_count: 0,
+            unspent_atoms: 0,
+            spendable_count: 0,
+            spendable_atoms: 0,
+            local_mempool_output_count: 0,
+            local_mempool_output_atoms: 0,
+        };
+        for (_, output) in self.state.utxos().iter() {
+            if output.lock != OutputLock::Key(destination) {
+                continue;
+            }
+            summary.unspent_count += 1;
+            summary.unspent_atoms = checked_wallet_add(summary.unspent_atoms, output.value)?;
+            if next_height >= output.spendable_height {
+                summary.spendable_count += 1;
+                summary.spendable_atoms =
+                    checked_wallet_add(summary.spendable_atoms, output.value)?;
+            }
+        }
+        for entry in self.mempool.values() {
+            for output in &entry.transaction.outputs {
+                if output.lock != OutputLock::Key(destination) {
+                    continue;
+                }
+                summary.local_mempool_output_count += 1;
+                summary.local_mempool_output_atoms =
+                    checked_wallet_add(summary.local_mempool_output_atoms, output.value)?;
+            }
+        }
+        Ok(summary)
+    }
+
+    pub(crate) fn exchange_custody_confirmed_legacy_sweep(
+        &mut self,
+        sweep_txid: [u8; 32],
+        legacy_destination: [u8; 32],
+    ) -> Result<Option<ExchangeCustodyLegacySweepSummary>, NodeError> {
+        let result = (|| {
+            for position in (1..self.index.active_chain.len()).rev() {
+                let block_id = self.index.active_chain[position];
+                let indexed = self.index.blocks.get(&block_id).cloned().ok_or_else(|| {
+                    NodeError::CorruptLog(
+                        "active legacy-sweep lookup refers to an absent block".to_owned(),
+                    )
+                })?;
+                let block = read_indexed_block(
+                    &self.log,
+                    &self.data_dir.join(BLOCK_LOG_FILE),
+                    &indexed,
+                    block_id,
+                    self.params.network_id,
+                    matches!(self.profile.proof, ProofProfile::ProductionV3),
+                )?;
+                let Some(transaction) = block
+                    .transactions
+                    .iter()
+                    .find(|transaction| transaction.txid() == sweep_txid)
+                else {
+                    continue;
+                };
+                let confirmations = u64::try_from(self.index.active_chain.len() - position)
+                    .map_err(|_| {
+                        NodeError::CorruptLog(
+                            "legacy-sweep confirmation depth does not fit u64".to_owned(),
+                        )
+                    })?;
+                let height = u64::try_from(position).map_err(|_| {
+                    NodeError::CorruptLog("legacy-sweep height does not fit u64".to_owned())
+                })?;
+                let legacy_input_count = transaction
+                    .inputs
+                    .iter()
+                    .filter(|input| {
+                        matches!(
+                            &input.witness,
+                            InputWitness::Key { public_key, .. }
+                                if *public_key == legacy_destination
+                        )
+                    })
+                    .count();
+                let legacy_output_count = transaction
+                    .outputs
+                    .iter()
+                    .filter(|output| output.lock == OutputLock::Key(legacy_destination))
+                    .count();
+                return Ok(Some(ExchangeCustodyLegacySweepSummary {
+                    txid: sweep_txid,
+                    block_id,
+                    height,
+                    confirmations,
+                    legacy_input_count,
+                    legacy_output_count,
+                }));
+            }
+            Ok(None)
+        })();
+        self.latch_authenticated_storage_failure(result)
+    }
+
     pub fn pool_payout_signer(&self) -> pool::PoolPayoutSigner {
         pool::PoolPayoutSigner::new(self.wallet_signing_key.clone())
     }
@@ -4612,6 +5245,7 @@ impl Node {
             node_data_dir_identity: self.profile.default_data_dir_identity,
             wallet_data_dir_identity: self.profile.wallet_data_dir_identity,
             miner_data_dir_identity: self.profile.miner_data_dir_identity(),
+            exchange_custody_v3_wallet_state: self.exchange_custody_v3_wallet_state.as_str(),
             bounded_reference_mining: self.profile.proof.supports_bounded_reference_mining(),
             tip: hex::encode(self.state.tip()),
             cumulative_work: hex::encode(chain_work_bytes(self.index.active_work)),
@@ -4786,7 +5420,7 @@ impl Node {
     /// an upgrade cannot strand its existing test outputs. Confirmed history
     /// is reconstructed from the active branch on every call, while balances
     /// come from the active UTXO set with the volatile mempool applied as a
-    /// reservation/pending-output overlay.
+    /// mempool and durable exchange-withdrawal reservation overlays.
     pub fn wallet_snapshot(&mut self) -> Result<WalletSnapshot, NodeError> {
         let result = self.wallet_snapshot_unlatched();
         self.latch_authenticated_storage_failure(result)
@@ -4794,7 +5428,7 @@ impl Node {
 
     fn wallet_snapshot_unlatched(&mut self) -> Result<WalletSnapshot, NodeError> {
         let destination = self.wallet_destination();
-        let reserved = mempool_spent_inputs(&self.mempool);
+        let reserved = self.wallet_reserved_inputs();
         let mut spendable = 0_u64;
         let mut immature = 0_u64;
         let mut spendable_utxo_count = 0_usize;
@@ -4881,6 +5515,9 @@ impl Node {
         amount: u64,
         fee_burned: u64,
     ) -> Result<WalletSendResponse, NodeError> {
+        if self.exchange_custody_v3_wallet_state.locks_native_wallet() {
+            return Err(NodeError::ExchangeCustodyV3WalletExclusive);
+        }
         let (transaction, change) =
             self.prepare_dev_wallet_payment(recipient, amount, fee_burned)?;
         let entry = self.submit_transaction(transaction)?;
@@ -4904,19 +5541,91 @@ impl Node {
         amount: u64,
         fee_burned: u64,
     ) -> Result<(Transaction, u64), NodeError> {
+        let plan = self.plan_dev_wallet_payment(recipient, amount, fee_burned)?;
+        let transaction = self.sign_wallet_payment_plan(&plan, false)?;
+        Ok((transaction, plan.change_atoms))
+    }
+
+    /// Selects inputs and fixes the exact payment semantics without using the
+    /// wallet signing key. Exchange custody persists this intent and installs
+    /// its digest-bound reservations before calling
+    /// [`Self::sign_dev_wallet_payment`].
+    pub(crate) fn plan_dev_wallet_payment(
+        &self,
+        recipient: [u8; 32],
+        amount: u64,
+        fee_burned: u64,
+    ) -> Result<WalletPaymentPlan, NodeError> {
+        let destination = self.wallet_destination();
+        self.plan_wallet_payment_for_destinations(
+            recipient,
+            amount,
+            fee_burned,
+            &[destination],
+            destination,
+        )
+    }
+
+    /// Plans an exchange-custody payment for public keys whose private
+    /// material may be local, remote, or held by a threshold signer. This
+    /// function only reads chain state and never accesses wallet secrets.
+    pub(crate) fn plan_exchange_custody_payment(
+        &self,
+        recipient: [u8; 32],
+        amount: u64,
+        fee_burned: u64,
+        input_destinations: &[[u8; 32]],
+        change_destination: [u8; 32],
+    ) -> Result<WalletPaymentPlan, NodeError> {
+        self.plan_wallet_payment_for_destinations(
+            recipient,
+            amount,
+            fee_burned,
+            input_destinations,
+            change_destination,
+        )
+    }
+
+    fn plan_wallet_payment_for_destinations(
+        &self,
+        recipient: [u8; 32],
+        amount: u64,
+        fee_burned: u64,
+        input_destinations: &[[u8; 32]],
+        change_destination: [u8; 32],
+    ) -> Result<WalletPaymentPlan, NodeError> {
         VerifyingKey::from_bytes(&recipient).map_err(|_| NodeError::InvalidWalletRecipient)?;
         if amount == 0 {
             return Err(NodeError::WalletZeroAmount);
         }
+        let mut destinations = HashSet::with_capacity(input_destinations.len());
+        for destination in input_destinations {
+            VerifyingKey::from_bytes(destination)
+                .map_err(|_| NodeError::InvalidWalletPaymentPlan("custody input key is invalid"))?;
+            if !destinations.insert(*destination) {
+                return Err(NodeError::InvalidWalletPaymentPlan(
+                    "custody input keys are duplicated",
+                ));
+            }
+        }
+        VerifyingKey::from_bytes(&change_destination)
+            .map_err(|_| NodeError::InvalidWalletPaymentPlan("custody change key is invalid"))?;
+        if !destinations.contains(&change_destination) {
+            return Err(NodeError::InvalidWalletPaymentPlan(
+                "custody change key is not spendable",
+            ));
+        }
         let required = amount
             .checked_add(fee_burned)
             .ok_or(NodeError::WalletAmountOverflow)?;
-        let destination = self.wallet_destination();
-        let reserved = mempool_spent_inputs(&self.mempool);
+        let reserved = self.wallet_reserved_inputs();
         let mut candidates = Vec::new();
         let mut immature = 0_u64;
         for (outpoint, output) in self.state.utxos().iter() {
-            if output.lock != OutputLock::Key(destination) {
+            let OutputLock::Key(public_key) = output.lock else {
+                continue;
+            };
+            if !destinations.contains(&public_key) {
                 continue;
             }
             if self.state.next_height() < output.spendable_height {
@@ -4947,37 +5656,77 @@ impl Node {
         }
 
         let change = selected_value - required;
+        let output_spendable_height = self.state.next_height();
         let mut outputs = vec![TxOutput {
             value: amount,
             lock: OutputLock::Key(recipient),
-            spendable_height: self.state.next_height(),
+            spendable_height: output_spendable_height,
         }];
         if change > 0 {
             outputs.push(TxOutput {
                 value: change,
-                lock: OutputLock::Key(destination),
-                spendable_height: self.state.next_height(),
+                lock: OutputLock::Key(change_destination),
+                spendable_height: output_spendable_height,
             });
         }
-        let mut transaction = Transaction {
+        let selected_input_values = selected
+            .iter()
+            .map(|outpoint| {
+                self.state
+                    .utxos()
+                    .get(outpoint)
+                    .map(|output| output.value)
+                    .ok_or(NodeError::InvalidWalletPaymentPlan(
+                        "selected input disappeared during planning",
+                    ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let transaction = Transaction {
             network_id: self.params.network_id,
             version: TRANSACTION_VERSION,
             inputs: selected
                 .into_iter()
-                .map(|previous| TxInput {
-                    previous,
-                    witness: InputWitness::Key {
-                        public_key: [0; 32],
-                        signature: Vec::new(),
-                    },
+                .map(|previous| {
+                    let public_key =
+                        match self.state.utxos().get(&previous).map(|output| &output.lock) {
+                            Some(OutputLock::Key(public_key))
+                                if destinations.contains(public_key) =>
+                            {
+                                *public_key
+                            }
+                            _ => unreachable!("selected custody input was validated above"),
+                        };
+                    TxInput {
+                        previous,
+                        witness: InputWitness::Key {
+                            // The public key participates in the signing digest,
+                            // so fix it now while leaving only the signature blank.
+                            public_key,
+                            signature: Vec::new(),
+                        },
+                    }
                 })
                 .collect(),
             outputs,
         };
-        let signing_keys = vec![&self.wallet_signing_key; transaction.inputs.len()];
-        transaction.sign_all(&signing_keys)?;
-
-        let encoded_bytes = encode_transaction(&transaction)?.len();
+        let plan = WalletPaymentPlan {
+            transaction,
+            recipient,
+            amount_atoms: amount,
+            fee_burned_atoms: fee_burned,
+            change_atoms: change,
+            selected_input_values,
+            output_spendable_height,
+        };
+        self.validate_wallet_payment_plan_for_destinations(
+            &plan,
+            &destinations,
+            change_destination,
+        )?;
+        // Every supported key witness has the same fixed public-key and
+        // signature width, so this existing helper computes the exact signed
+        // size even when inputs belong to different custody keys.
+        let encoded_bytes = signed_wallet_payment_size(&plan.transaction, change_destination)?;
         let minimum_fee = required_relay_fee(encoded_bytes);
         if fee_burned < minimum_fee {
             return Err(NodeError::MempoolFeeTooLow {
@@ -4985,7 +5734,239 @@ impl Node {
                 actual: fee_burned,
             });
         }
-        Ok((transaction, change))
+        Ok(plan)
+    }
+
+    /// Signs a previously journaled payment intent. Every selected input must
+    /// still be reserved for this exact unsigned transaction digest.
+    pub(crate) fn sign_dev_wallet_payment(
+        &self,
+        plan: &WalletPaymentPlan,
+    ) -> Result<Transaction, NodeError> {
+        self.sign_wallet_payment_plan(plan, true)
+    }
+
+    fn sign_wallet_payment_plan(
+        &self,
+        plan: &WalletPaymentPlan,
+        require_exchange_reservation: bool,
+    ) -> Result<Transaction, NodeError> {
+        if self.exchange_custody_v3_wallet_state.locks_native_wallet()
+            && !require_exchange_reservation
+        {
+            return Err(NodeError::ExchangeCustodyV3WalletExclusive);
+        }
+        self.validate_wallet_payment_plan(plan)?;
+        if require_exchange_reservation {
+            let intent = plan.transaction.signing_digest();
+            for input in &plan.transaction.inputs {
+                if self.exchange_withdrawal_reservations.get(&input.previous) != Some(&intent) {
+                    return Err(NodeError::ExchangeWithdrawalReservationMismatch(
+                        input.previous,
+                    ));
+                }
+            }
+        }
+        let mut transaction = plan.transaction.clone();
+        let signing_keys = vec![&self.wallet_signing_key; transaction.inputs.len()];
+        transaction.sign_all(&signing_keys)?;
+        if transaction.signing_digest() != plan.transaction.signing_digest() {
+            return Err(NodeError::InvalidWalletPaymentPlan(
+                "signing changed the payment intent digest",
+            ));
+        }
+        let encoded_bytes = encode_transaction(&transaction)?.len();
+        let minimum_fee = required_relay_fee(encoded_bytes);
+        if plan.fee_burned_atoms < minimum_fee {
+            return Err(NodeError::MempoolFeeTooLow {
+                required: minimum_fee,
+                actual: plan.fee_burned_atoms,
+            });
+        }
+        Ok(transaction)
+    }
+
+    fn validate_wallet_payment_plan(&self, plan: &WalletPaymentPlan) -> Result<(), NodeError> {
+        let destination = self.wallet_destination();
+        self.validate_wallet_payment_plan_for_destinations(
+            plan,
+            &HashSet::from([destination]),
+            destination,
+        )
+    }
+
+    pub(crate) fn validate_exchange_custody_payment_plan(
+        &self,
+        plan: &WalletPaymentPlan,
+        input_destinations: &[[u8; 32]],
+        change_destination: [u8; 32],
+    ) -> Result<(), NodeError> {
+        let destinations: HashSet<_> = input_destinations.iter().copied().collect();
+        if destinations.len() != input_destinations.len()
+            || !destinations.contains(&change_destination)
+        {
+            return Err(NodeError::InvalidWalletPaymentPlan(
+                "custody wallet key set is invalid",
+            ));
+        }
+        self.validate_wallet_payment_plan_for_destinations(plan, &destinations, change_destination)
+    }
+
+    fn validate_wallet_payment_plan_for_destinations(
+        &self,
+        plan: &WalletPaymentPlan,
+        input_destinations: &HashSet<[u8; 32]>,
+        change_destination: [u8; 32],
+    ) -> Result<(), NodeError> {
+        VerifyingKey::from_bytes(&plan.recipient)
+            .map_err(|_| NodeError::InvalidWalletPaymentPlan("recipient key is invalid"))?;
+        VerifyingKey::from_bytes(&change_destination)
+            .map_err(|_| NodeError::InvalidWalletPaymentPlan("change key is invalid"))?;
+        if input_destinations.is_empty() || !input_destinations.contains(&change_destination) {
+            return Err(NodeError::InvalidWalletPaymentPlan(
+                "custody wallet key set is invalid",
+            ));
+        }
+        if plan.amount_atoms == 0 {
+            return Err(NodeError::InvalidWalletPaymentPlan("amount is zero"));
+        }
+        if plan.transaction.network_id != self.params.network_id {
+            return Err(NodeError::InvalidWalletPaymentPlan(
+                "network does not match",
+            ));
+        }
+        if plan.transaction.version != TRANSACTION_VERSION {
+            return Err(NodeError::InvalidWalletPaymentPlan(
+                "transaction version does not match",
+            ));
+        }
+        if plan.transaction.inputs.is_empty()
+            || plan.transaction.inputs.len() > MAX_TRANSACTION_INPUTS
+            || plan.transaction.inputs.len() != plan.selected_input_values.len()
+        {
+            return Err(NodeError::InvalidWalletPaymentPlan(
+                "input values do not match transaction inputs",
+            ));
+        }
+        if plan.output_spendable_height > self.state.next_height() {
+            return Err(NodeError::InvalidWalletPaymentPlan(
+                "output spendable height is in the future",
+            ));
+        }
+
+        let mut seen = HashSet::new();
+        let mut selected_value = 0_u64;
+        for (input, recorded_value) in plan
+            .transaction
+            .inputs
+            .iter()
+            .zip(&plan.selected_input_values)
+        {
+            if !seen.insert(input.previous) {
+                return Err(NodeError::InvalidWalletPaymentPlan(
+                    "transaction repeats an input",
+                ));
+            }
+            match &input.witness {
+                InputWitness::Key {
+                    public_key,
+                    signature,
+                } if input_destinations.contains(public_key) && signature.is_empty() => {}
+                _ => {
+                    return Err(NodeError::InvalidWalletPaymentPlan(
+                        "input is not an unsigned wallet-key witness",
+                    ));
+                }
+            }
+            let previous = self
+                .state
+                .utxos()
+                .get(&input.previous)
+                .ok_or(NodeError::MempoolUnconfirmedInput(input.previous))?;
+            let InputWitness::Key { public_key, .. } = &input.witness else {
+                unreachable!("the witness form was validated above")
+            };
+            if previous.lock != OutputLock::Key(*public_key) {
+                return Err(NodeError::InvalidWalletPaymentPlan(
+                    "input is not owned by this wallet",
+                ));
+            }
+            if self.state.next_height() < previous.spendable_height {
+                return Err(NodeError::InvalidWalletPaymentPlan("input is immature"));
+            }
+            if previous.value != *recorded_value {
+                return Err(NodeError::InvalidWalletPaymentPlan(
+                    "recorded input value does not match chain state",
+                ));
+            }
+            selected_value = checked_wallet_add(selected_value, *recorded_value)?;
+        }
+
+        let required = plan
+            .amount_atoms
+            .checked_add(plan.fee_burned_atoms)
+            .ok_or(NodeError::WalletAmountOverflow)?;
+        if selected_value.checked_sub(required) != Some(plan.change_atoms) {
+            return Err(NodeError::InvalidWalletPaymentPlan(
+                "input, payment, fee, and change values do not balance",
+            ));
+        }
+        let expected_output_count = if plan.change_atoms == 0 { 1 } else { 2 };
+        if plan.transaction.outputs.len() != expected_output_count {
+            return Err(NodeError::InvalidWalletPaymentPlan(
+                "payment has an unexpected output count",
+            ));
+        }
+        let recipient_output = &plan.transaction.outputs[0];
+        if recipient_output.value != plan.amount_atoms
+            || recipient_output.lock != OutputLock::Key(plan.recipient)
+            || recipient_output.spendable_height != plan.output_spendable_height
+        {
+            return Err(NodeError::InvalidWalletPaymentPlan(
+                "recipient output does not match the payment intent",
+            ));
+        }
+        if plan.change_atoms > 0 {
+            let change_output = &plan.transaction.outputs[1];
+            if change_output.value != plan.change_atoms
+                || change_output.lock != OutputLock::Key(change_destination)
+                || change_output.spendable_height != plan.output_spendable_height
+            {
+                return Err(NodeError::InvalidWalletPaymentPlan(
+                    "change output does not match the payment intent",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn wallet_reserved_inputs(&self) -> HashSet<OutPoint> {
+        let mut reserved = mempool_spent_inputs(&self.mempool);
+        reserved.extend(self.exchange_withdrawal_reservations.keys().copied());
+        reserved
+    }
+
+    /// Replaces the complete in-process reservation set restored from the
+    /// durable exchange withdrawal journal.
+    pub(crate) fn set_exchange_withdrawal_reservations(
+        &mut self,
+        reservations: HashMap<OutPoint, [u8; 32]>,
+    ) {
+        self.exchange_withdrawal_reservations = reservations;
+    }
+
+    pub(crate) fn claim_exchange_custody_v3_wallet(&mut self) -> Result<(), NodeError> {
+        if self.exchange_withdrawal_security.is_some()
+            || self.exchange_custody_v3_wallet_state == ExchangeCustodyV3WalletState::Active
+        {
+            return Err(NodeError::ExchangeCustodyV3WalletExclusive);
+        }
+        self.exchange_custody_v3_wallet_state = ExchangeCustodyV3WalletState::Active;
+        Ok(())
+    }
+
+    pub(crate) fn exchange_custody_v3_wallet_is_active(&self) -> bool {
+        self.exchange_custody_v3_wallet_state == ExchangeCustodyV3WalletState::Active
     }
 
     /// Validates a display-unit request and consolidates this data directory's
@@ -5006,11 +5987,14 @@ impl Node {
         fee_burned: u64,
         max_inputs: usize,
     ) -> Result<WalletConsolidateResponse, NodeError> {
+        if self.exchange_custody_v3_wallet_state.locks_native_wallet() {
+            return Err(NodeError::ExchangeCustodyV3WalletExclusive);
+        }
         if !(2..=MAX_TRANSACTION_INPUTS).contains(&max_inputs) {
             return Err(NodeError::InvalidConsolidationMaxInputs);
         }
         let destination = self.wallet_destination();
-        let reserved = mempool_spent_inputs(&self.mempool);
+        let reserved = self.wallet_reserved_inputs();
         let mut candidates: Vec<_> = self
             .state
             .utxos()
@@ -5320,6 +6304,14 @@ impl Node {
         u64::try_from(self.index.active_chain.len().checked_sub(position)?).ok()
     }
 
+    /// Returns the active-chain identifier at `height`, including the virtual
+    /// genesis anchor at height zero. Heights that do not fit this platform or
+    /// are above the active tip return `None`.
+    pub fn active_block_id_at_height(&self, height: u64) -> Option<[u8; 32]> {
+        let position = usize::try_from(height).ok()?;
+        self.index.active_chain.get(position).copied()
+    }
+
     pub(crate) fn mempool_contains_transaction(&self, txid: [u8; 32]) -> bool {
         self.mempool.contains_key(&txid)
     }
@@ -5488,53 +6480,18 @@ impl Node {
         if self.storage_faulted {
             return Err(NodeError::StorageFaulted);
         }
-        VerifyingKey::from_bytes(&miner_destination)
-            .map_err(|_| NodeError::InvalidMinerDestination)?;
-        let earliest = self
-            .state
-            .median_time_past()
-            .checked_add(1)
-            .ok_or(NodeError::TemplateTimeUnavailable)?;
-        let latest = now_unix_seconds
-            .checked_add(self.params.max_future_offset_secs)
-            .ok_or(NodeError::TemplateTimeUnavailable)?;
-        let timestamp = now_unix_seconds.max(earliest);
-        if timestamp > latest {
-            return Err(NodeError::TemplateTimeUnavailable);
-        }
-
-        let height = self.state.next_height();
         let transactions: Vec<_> = self
             .mempool
             .values()
             .map(|entry| entry.transaction.clone())
             .collect();
-        let validation = self
-            .state
-            .validate_transactions_for_next_block(&transactions)?;
-        let allocation = self
-            .params
-            .monetary_policy
-            .allocation(height, validation.total_burned_fees)?;
-        let coinbase = Coinbase::new(height, allocation, miner_destination, self.params.rewards);
-        let mut commitments = Vec::with_capacity(transactions.len() + 1);
-        commitments.push(coinbase.commitment(self.params.network_id));
-        commitments.extend(transactions.iter().map(Transaction::txid));
-        let transaction_root = merkle_root(&commitments);
-        let challenge = BlockChallenge {
-            network_id: self.params.network_id,
-            previous_block: self.state.tip(),
-            transaction_root,
-            height,
-            timestamp,
-            target: self.state.expected_target()?,
-        };
-        Ok(BlockTemplate {
-            challenge,
-            coinbase,
+        build_template_from_state(
+            &self.state,
+            &self.params,
+            miner_destination,
+            now_unix_seconds,
             transactions,
-            total_fees_burned: validation.total_burned_fees,
-        })
+        )
     }
 
     /// Captures an immutable template and verifier for mining outside any
@@ -5559,6 +6516,56 @@ impl Node {
         &mut self,
         transaction: Transaction,
     ) -> Result<MempoolEntry, NodeError> {
+        self.submit_transaction_inner(transaction, false)
+    }
+
+    /// Submits the exact transaction authorized by the durable withdrawal
+    /// journal. This bypasses only the ordinary custody-reservation rejection;
+    /// all wire, active-chain, fee, conflict, capacity, and block-set checks
+    /// remain identical to [`Self::submit_transaction`].
+    pub(crate) fn submit_exchange_withdrawal_transaction(
+        &mut self,
+        transaction: Transaction,
+    ) -> Result<MempoolEntry, NodeError> {
+        let intent = transaction.signing_digest();
+        for input in &transaction.inputs {
+            if self.exchange_withdrawal_reservations.get(&input.previous) != Some(&intent) {
+                return Err(NodeError::ExchangeWithdrawalReservationMismatch(
+                    input.previous,
+                ));
+            }
+        }
+        self.submit_transaction_inner(transaction, true)
+    }
+
+    fn submit_transaction_inner(
+        &mut self,
+        transaction: Transaction,
+        allow_exchange_withdrawal_reservations: bool,
+    ) -> Result<MempoolEntry, NodeError> {
+        if self.exchange_custody_v3_wallet_state.locks_native_wallet()
+            && !allow_exchange_withdrawal_reservations
+        {
+            let wallet_destination = self.wallet_destination();
+            if transaction.inputs.iter().any(|input| {
+                self.state
+                    .utxos()
+                    .get(&input.previous)
+                    .is_some_and(|output| output.lock == OutputLock::Key(wallet_destination))
+            }) {
+                return Err(NodeError::ExchangeCustodyV3WalletExclusive);
+            }
+        }
+        if !allow_exchange_withdrawal_reservations {
+            for input in &transaction.inputs {
+                if self
+                    .exchange_withdrawal_reservations
+                    .contains_key(&input.previous)
+                {
+                    return Err(NodeError::ExchangeWithdrawalInputReserved(input.previous));
+                }
+            }
+        }
         let canonical = encode_transaction(&transaction)?;
         let txid = transaction.txid();
         if self.mempool.contains_key(&txid) {
@@ -6201,6 +7208,27 @@ fn required_relay_fee(encoded_bytes: usize) -> u64 {
         .and_then(|kib| kib.checked_mul(MIN_RELAY_FEE_PER_KIB))
         .unwrap_or(u64::MAX)
         .max(MIN_RELAY_FEE_PER_KIB)
+}
+
+pub(crate) fn signed_wallet_payment_size(
+    transaction: &Transaction,
+    wallet_destination: [u8; 32],
+) -> Result<usize, NodeError> {
+    let mut sized = transaction.clone();
+    for input in &mut sized.inputs {
+        let InputWitness::Key {
+            public_key,
+            signature,
+        } = &mut input.witness
+        else {
+            return Err(NodeError::InvalidWalletPaymentPlan(
+                "input is not a wallet-key witness",
+            ));
+        };
+        *public_key = wallet_destination;
+        signature.resize(64, 0);
+    }
+    Ok(encode_transaction(&sized)?.len())
 }
 
 fn checked_wallet_add(left: u64, right: u64) -> Result<u64, NodeError> {
@@ -7028,6 +8056,16 @@ struct RpcRequest {
     body: Vec<u8>,
 }
 
+struct RpcRequestHead {
+    method: String,
+    target: String,
+    content_type: Option<String>,
+    authorization: Option<Zeroizing<String>>,
+    expect_continue: bool,
+    body_length: usize,
+    body_prefix: Vec<u8>,
+}
+
 struct DeadlineReader<'a> {
     stream: &'a mut TcpStream,
     deadline: Instant,
@@ -7039,6 +8077,13 @@ impl<'a> DeadlineReader<'a> {
             .checked_add(total_timeout)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "RPC deadline overflow"))?;
         Ok(Self { stream, deadline })
+    }
+
+    fn write_continue(&mut self) -> Result<(), NodeError> {
+        self.stream
+            .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+            .map_err(NodeError::RpcIo)?;
+        self.stream.flush().map_err(NodeError::RpcIo)
     }
 }
 
@@ -7060,6 +8105,7 @@ struct RpcResponse {
     reason: &'static str,
     content_type: &'static str,
     body: Vec<u8>,
+    basic_auth_challenge: bool,
 }
 
 impl RpcResponse {
@@ -7069,7 +8115,13 @@ impl RpcResponse {
             reason,
             content_type: "application/json",
             body: serde_json::to_vec(&value).expect("JSON value serialization cannot fail"),
+            basic_auth_challenge: false,
         }
+    }
+
+    fn with_basic_auth_challenge(mut self) -> Self {
+        self.basic_auth_challenge = true;
+        self
     }
 
     fn json_error(status: u16, reason: &'static str, error: impl ToString) -> Self {
@@ -7764,7 +8816,20 @@ fn template_json(template: &BlockTemplate, profile: NetworkProfile) -> serde_jso
 }
 
 fn read_rpc_request(reader: &mut impl Read, network_id: [u8; 32]) -> Result<RpcRequest, NodeError> {
-    let mut bytes = Vec::new();
+    let head = read_rpc_request_head(reader, network_id)?;
+    if head.expect_continue {
+        return Err(NodeError::InvalidRpcRequest(
+            "Expect: 100-continue is not supported".to_owned(),
+        ));
+    }
+    read_rpc_request_body(reader, head)
+}
+
+fn read_rpc_request_head(
+    reader: &mut impl Read,
+    network_id: [u8; 32],
+) -> Result<RpcRequestHead, NodeError> {
+    let mut bytes = Zeroizing::new(Vec::new());
     let header_end = loop {
         if let Some(position) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
             let end = position + 4;
@@ -7805,6 +8870,9 @@ fn read_rpc_request(reader: &mut impl Read, network_id: [u8; 32]) -> Result<RpcR
 
     let mut content_length = None;
     let mut content_type = None;
+    let mut authorization = None;
+    let mut expect_continue = false;
+    let mut expect_seen = false;
     let body_limit = rpc_body_limit(request_parts[0], request_parts[1], network_id);
     for line in lines {
         let (name, value) = line
@@ -7827,7 +8895,30 @@ fn read_rpc_request(reader: &mut impl Read, network_id: [u8; 32]) -> Result<RpcR
             }
             content_length = Some(length);
         } else if name.eq_ignore_ascii_case("content-type") {
+            if content_type.is_some() {
+                return Err(NodeError::InvalidRpcRequest(
+                    "duplicate Content-Type".to_owned(),
+                ));
+            }
             content_type = Some(value.to_owned());
+        } else if name.eq_ignore_ascii_case("authorization") {
+            if authorization.is_some() {
+                return Err(NodeError::InvalidRpcRequest(
+                    "duplicate Authorization".to_owned(),
+                ));
+            }
+            authorization = Some(Zeroizing::new(value.to_owned()));
+        } else if name.eq_ignore_ascii_case("expect") {
+            if expect_seen {
+                return Err(NodeError::InvalidRpcRequest("duplicate Expect".to_owned()));
+            }
+            expect_seen = true;
+            if !value.eq_ignore_ascii_case("100-continue") {
+                return Err(NodeError::InvalidRpcRequest(
+                    "unsupported Expect header".to_owned(),
+                ));
+            }
+            expect_continue = true;
         } else if name.eq_ignore_ascii_case("transfer-encoding") {
             return Err(NodeError::InvalidRpcRequest(
                 "Transfer-Encoding is not supported".to_owned(),
@@ -7841,18 +8932,39 @@ fn read_rpc_request(reader: &mut impl Read, network_id: [u8; 32]) -> Result<RpcR
             "POST requires Content-Length".to_owned(),
         ));
     }
-    let mut body = bytes[header_end..].to_vec();
-    if body.len() > body_length {
+    if request_parts[0] == "GET" && body_length != 0 {
+        return Err(NodeError::InvalidRpcRequest(
+            "GET requests may not contain a body".to_owned(),
+        ));
+    }
+    let body_prefix = bytes[header_end..].to_vec();
+    if body_prefix.len() > body_length {
         return Err(NodeError::InvalidRpcRequest(
             "request contains bytes after its declared body".to_owned(),
         ));
     }
-    let remaining = body_length - body.len();
+
+    Ok(RpcRequestHead {
+        method: request_parts[0].to_owned(),
+        target: request_parts[1].to_owned(),
+        content_type,
+        authorization,
+        expect_continue,
+        body_length,
+        body_prefix,
+    })
+}
+
+fn read_rpc_request_body(
+    reader: &mut impl Read,
+    mut head: RpcRequestHead,
+) -> Result<RpcRequest, NodeError> {
+    let remaining = head.body_length - head.body_prefix.len();
     if remaining > 0 {
-        let original_len = body.len();
-        body.resize(body_length, 0);
+        let original_len = head.body_prefix.len();
+        head.body_prefix.resize(head.body_length, 0);
         reader
-            .read_exact(&mut body[original_len..])
+            .read_exact(&mut head.body_prefix[original_len..])
             .map_err(|error| {
                 if error.kind() == io::ErrorKind::UnexpectedEof {
                     NodeError::InvalidRpcRequest("request body is truncated".to_owned())
@@ -7861,23 +8973,19 @@ fn read_rpc_request(reader: &mut impl Read, network_id: [u8; 32]) -> Result<RpcR
                 }
             })?;
     }
-    if request_parts[0] == "GET" && !body.is_empty() {
-        return Err(NodeError::InvalidRpcRequest(
-            "GET requests may not contain a body".to_owned(),
-        ));
-    }
 
     Ok(RpcRequest {
-        method: request_parts[0].to_owned(),
-        target: request_parts[1].to_owned(),
-        content_type,
-        body,
+        method: head.method,
+        target: head.target,
+        content_type: head.content_type,
+        body: head.body_prefix,
     })
 }
 
 fn rpc_body_limit(method: &str, target: &str, network_id: [u8; 32]) -> usize {
     match (method, target) {
         ("POST", "/v1/transaction") => MAX_TRANSACTION_BYTES,
+        ("POST", "/") => EXCHANGE_RPC_JSON_BODY_LIMIT,
         ("POST", "/v1/wallet/send" | "/v1/wallet/consolidate") => WALLET_JSON_BODY_LIMIT,
         ("POST", "/v1/block") => max_block_bytes_for_network(network_id),
         ("POST", target) if target.starts_with("/v1/mine?") => 0,
@@ -7887,12 +8995,18 @@ fn rpc_body_limit(method: &str, target: &str, network_id: [u8; 32]) -> usize {
 }
 
 fn write_rpc_response(stream: &mut impl Write, response: RpcResponse) -> Result<(), NodeError> {
+    let challenge = if response.basic_auth_challenge {
+        "WWW-Authenticate: Basic realm=\"cmfd-exchange-rpc\", charset=\"UTF-8\"\r\n"
+    } else {
+        ""
+    };
     let header = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\n\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\n{}\r\n",
         response.status,
         response.reason,
         response.content_type,
-        response.body.len()
+        response.body.len(),
+        challenge,
     );
     stream
         .write_all(header.as_bytes())
@@ -11577,6 +12691,137 @@ mod tests {
     }
 
     #[test]
+    fn exchange_withdrawal_reorg_rebroadcasts_the_exact_signed_transaction() {
+        use crate::exchange_withdrawal::{
+            ExchangeWithdrawalJournal, WithdrawalRequest, WithdrawalStatus, encode_external_anchor,
+        };
+
+        let path = test_dir("exchange-withdrawal-reorg");
+        let security_path = path.with_extension("withdrawal-security");
+        clean_test_dir(&path);
+        let _ = fs::remove_dir_all(&security_path);
+        fs::create_dir_all(&security_path).unwrap();
+        let journal_key_path = security_path.join("journal.key");
+        fs::write(&journal_key_path, [0x5a_u8; 32]).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&journal_key_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let security = ExchangeWithdrawalSecurityConfig::new(
+            journal_key_path,
+            security_path.join("journal.anchor"),
+        );
+        let mut node = Node::open_with_profile_and_exchange_withdrawal_security(
+            &path,
+            DEVNET_PROFILE,
+            &security,
+        )
+        .unwrap();
+        let destination = node.wallet_destination();
+        for height in 1..=100 {
+            node.mine_once(
+                destination,
+                DEVNET_GENESIS_TIMESTAMP + height * 60,
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        }
+        let fork_parent = node.state.tip();
+        let shared = Arc::new(Mutex::new(node));
+        let mut journal = ExchangeWithdrawalJournal::open_and_reconcile(&shared).unwrap();
+        let bootstrap_anchor = journal.journal_info().unwrap().current_anchor;
+        fs::write(
+            security.anchor_file(),
+            encode_external_anchor(&bootstrap_anchor).unwrap(),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(security.anchor_file(), fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let request = WithdrawalRequest {
+            request_id: "reorg-withdrawal-1".to_owned(),
+            destination,
+            amount_atoms: 1,
+            fee_atoms: 1,
+        };
+        let prepared = journal.prepare(&shared, &request).unwrap();
+        assert_eq!(prepared.status, WithdrawalStatus::Prepared);
+        fs::write(
+            security.anchor_file(),
+            encode_external_anchor(&prepared.prepared_anchor.unwrap()).unwrap(),
+        )
+        .unwrap();
+        let submitted = journal.release(&shared, &request.request_id).unwrap();
+        assert_eq!(submitted.status, WithdrawalStatus::InMempool);
+        let txid = submitted.txid.unwrap();
+        let transaction_bytes = submitted.transaction_bytes.unwrap();
+
+        shared
+            .lock()
+            .unwrap()
+            .mine_once(
+                destination,
+                DEVNET_GENESIS_TIMESTAMP + 101 * 60,
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        let confirmed = journal.get(&shared, &request.request_id).unwrap().unwrap();
+        assert_eq!(confirmed.status, WithdrawalStatus::Confirmed);
+        assert_eq!(confirmed.confirmations, Some(1));
+
+        {
+            let mut node = shared.lock().unwrap();
+            let side = mined_child(
+                &node,
+                fork_parent,
+                DEVNET_GENESIS_TIMESTAMP + 101 * 60,
+                0x7a,
+            );
+            node.submit_block(side.clone(), DEVNET_GENESIS_TIMESTAMP + 101 * 60)
+                .unwrap();
+            let heavier = mined_child(
+                &node,
+                side.block_id(),
+                DEVNET_GENESIS_TIMESTAMP + 102 * 60,
+                0x7b,
+            );
+            node.submit_block(heavier, DEVNET_GENESIS_TIMESTAMP + 102 * 60)
+                .unwrap();
+        }
+
+        let rebroadcast = journal
+            .reconcile_released(&shared)
+            .unwrap()
+            .into_iter()
+            .find(|view| view.request_id == request.request_id)
+            .unwrap();
+        assert_eq!(rebroadcast.status, WithdrawalStatus::InMempool);
+        assert_eq!(rebroadcast.txid, Some(txid));
+        assert_eq!(rebroadcast.transaction_bytes, Some(transaction_bytes));
+
+        shared
+            .lock()
+            .unwrap()
+            .mine_once(
+                destination,
+                DEVNET_GENESIS_TIMESTAMP + 103 * 60,
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        let reconfirmed = journal.get(&shared, &request.request_id).unwrap().unwrap();
+        assert_eq!(reconfirmed.status, WithdrawalStatus::Confirmed);
+        assert_eq!(reconfirmed.txid, Some(txid));
+
+        drop(journal);
+        drop(shared);
+        clean_test_dir(&path);
+        fs::remove_dir_all(security_path).unwrap();
+    }
+
+    #[test]
     fn devnet_params_bind_the_exact_v2_verifier() {
         let params = devnet_params().unwrap();
         assert_eq!(params.network_id, DEVNET_NETWORK_ID);
@@ -11680,6 +12925,30 @@ mod tests {
             Err(NodeError::ProductionV4ArtifactsMissing)
         ));
         assert!(!path.exists());
+    }
+
+    #[cfg(feature = "production-v4")]
+    #[test]
+    fn rcnet_v4_parameters_bind_the_profile_network_and_reject_testnet_parameters() {
+        let parameters = cmfd_consensus::ForgeMatrixV4CandidateParameters::for_network(
+            RCNET1_PROFILE.network_id,
+        )
+        .unwrap();
+        let params =
+            network_params_from_pow(RCNET1_PROFILE, PowParameters::V4Candidate(parameters))
+                .unwrap();
+        assert_eq!(params.network_id, RCNET1_PROFILE.network_id);
+        assert_eq!(params.pow, PowParameters::V4Candidate(parameters));
+
+        assert!(matches!(
+            network_params_from_pow(
+                RCNET1_PROFILE,
+                PowParameters::V4Candidate(
+                    cmfd_consensus::ForgeMatrixV4CandidateParameters::production_testnet(),
+                ),
+            ),
+            Err(NodeError::Network(_))
+        ));
     }
 
     #[test]
@@ -11800,7 +13069,7 @@ mod tests {
     #[cfg(feature = "production-v3")]
     #[test]
     fn production_v3_file_pin_matches_every_identity_field() {
-        use cmfd_consensus::dory_v3_model_ceremony_transcript::FileIdentity;
+        use cmfd_consensus::FileIdentity;
 
         let actual = FileIdentity {
             bytes: 7,
@@ -13274,11 +14543,15 @@ mod tests {
 
         let assert_chain_rejected = |candidate: &[Vec<u8>]| {
             write_complete_log_records(&path, candidate);
-            assert!(matches!(
-                Node::open(&path),
-                Err(NodeError::CorruptLog(message))
-                    if message.contains("previous-record digest mismatch")
-            ));
+            let error = Node::open(&path).err().expect("tampered chain must fail");
+            assert!(
+                matches!(
+                    &error,
+                    NodeError::CorruptLog(message)
+                        if message.contains("previous-record digest mismatch")
+                ),
+                "unexpected tampered-chain error: {error:?}"
+            );
         };
 
         let mut changed = records.clone();
@@ -14624,6 +15897,14 @@ mod tests {
         assert_eq!(body["txid"], hex::encode(entry.txid));
         assert_eq!(entry.transaction.txid(), entry.txid);
         assert_eq!(entry.fee_burned, fee);
+        let local_exposure = node
+            .exchange_custody_destination_utxo_summary(node.wallet_destination())
+            .unwrap();
+        assert_eq!(local_exposure.local_mempool_output_count, 1);
+        assert_eq!(
+            local_exposure.local_mempool_output_atoms,
+            input_atoms - amount - fee
+        );
 
         let pending = node.wallet_snapshot().unwrap();
         assert_eq!(pending.spendable_utxo_count, 0);
@@ -14775,6 +16056,391 @@ mod tests {
             &mut node,
         );
         assert_eq!(wrong_type.status, 415);
+
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn exchange_withdrawal_requires_an_exact_intent_reservation() {
+        let path = test_dir("exchange-withdrawal-reservation");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        mine_default_chain_to(&mut node, 100);
+
+        let plan = node
+            .plan_dev_wallet_payment(insecure_dev_destination(0x7a), COIN, 1)
+            .unwrap();
+        let intent = plan.transaction.signing_digest();
+        assert!(plan.transaction.inputs.iter().all(|input| {
+            matches!(
+                &input.witness,
+                InputWitness::Key {
+                    public_key,
+                    signature,
+                } if *public_key == node.wallet_destination() && signature.is_empty()
+            )
+        }));
+        assert!(matches!(
+            node.sign_dev_wallet_payment(&plan),
+            Err(NodeError::ExchangeWithdrawalReservationMismatch(_))
+        ));
+
+        node.set_exchange_withdrawal_reservations(
+            plan.transaction
+                .inputs
+                .iter()
+                .map(|input| (input.previous, intent))
+                .collect(),
+        );
+        let reserved = node.wallet_snapshot().unwrap();
+        assert_eq!(reserved.spendable_utxo_count, 0);
+        assert_eq!(reserved.reserved_utxo_count, plan.transaction.inputs.len());
+        assert!(matches!(
+            node.plan_dev_wallet_payment(insecure_dev_destination(0x7b), 1, 1),
+            Err(NodeError::WalletFundsImmature { .. })
+        ));
+
+        let signed = node.sign_dev_wallet_payment(&plan).unwrap();
+        assert_eq!(signed.signing_digest(), intent);
+        let mut different_intent = signed.clone();
+        different_intent.outputs[0].value -= 1;
+        assert!(matches!(
+            node.submit_exchange_withdrawal_transaction(different_intent),
+            Err(NodeError::ExchangeWithdrawalReservationMismatch(_))
+        ));
+        assert!(matches!(
+            node.submit_transaction(signed.clone()),
+            Err(NodeError::ExchangeWithdrawalInputReserved(_))
+        ));
+        let accepted = node
+            .submit_exchange_withdrawal_transaction(signed.clone())
+            .unwrap();
+        assert_eq!(accepted.txid, signed.txid());
+        assert!(node.mempool_contains_transaction(accepted.txid));
+
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn exchange_custody_plans_for_an_external_key_not_held_by_the_node_wallet() {
+        let path = test_dir("exchange-custody-external-public-key");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        let external_destination = insecure_dev_destination(0x6d);
+        assert_ne!(external_destination, node.wallet_destination());
+        for height in 1..=100 {
+            node.mine_once(
+                external_destination,
+                DEVNET_PROFILE.virtual_genesis_timestamp + height * 60,
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        }
+
+        let external_utxos = node
+            .exchange_custody_destination_utxo_summary(external_destination)
+            .unwrap();
+        assert_eq!(external_utxos.tip, node.state.tip());
+        assert_eq!(external_utxos.next_height, node.state.next_height());
+        assert_eq!(external_utxos.unspent_count, 100);
+        assert!(external_utxos.unspent_atoms > 0);
+        assert!(external_utxos.spendable_count > 0);
+        assert!(external_utxos.spendable_atoms > 0);
+        assert_eq!(
+            node.exchange_custody_destination_utxo_summary(insecure_dev_destination(0x6f))
+                .unwrap()
+                .unspent_count,
+            0
+        );
+
+        assert!(
+            node.plan_dev_wallet_payment(insecure_dev_destination(0x6e), 1, 1)
+                .is_err()
+        );
+        let plan = node
+            .plan_exchange_custody_payment(
+                insecure_dev_destination(0x6e),
+                1,
+                1,
+                &[external_destination],
+                external_destination,
+            )
+            .unwrap();
+        assert!(plan.transaction.inputs.iter().all(|input| {
+            matches!(
+                &input.witness,
+                InputWitness::Key {
+                    public_key,
+                    signature,
+                } if *public_key == external_destination && signature.is_empty()
+            )
+        }));
+        assert_eq!(
+            plan.transaction.outputs[1].lock,
+            OutputLock::Key(external_destination)
+        );
+        node.validate_exchange_custody_payment_plan(
+            &plan,
+            &[external_destination],
+            external_destination,
+        )
+        .unwrap();
+
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn legacy_sweep_evidence_is_read_from_the_authenticated_active_chain() {
+        let path = test_dir("exchange-custody-legacy-sweep");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        let legacy_destination = node.wallet_destination();
+        let external_destination = insecure_dev_destination(0x70);
+        let first = node
+            .mine_once(
+                legacy_destination,
+                DEVNET_PROFILE.virtual_genesis_timestamp + 60,
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        for height in 2..=100 {
+            node.mine_once(
+                external_destination,
+                DEVNET_PROFILE.virtual_genesis_timestamp + height * 60,
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        }
+        let legacy_atoms = first.coinbase.outputs[0].value;
+        let (sweep, _) = node
+            .prepare_dev_wallet_payment(external_destination, legacy_atoms - 1, 1)
+            .unwrap();
+        let sweep_txid = sweep.txid();
+        node.submit_transaction(sweep).unwrap();
+        node.mine_once(
+            external_destination,
+            DEVNET_PROFILE.virtual_genesis_timestamp + 101 * 60,
+            DEFAULT_MINING_ATTEMPTS,
+        )
+        .unwrap();
+
+        let unspent = node
+            .exchange_custody_destination_utxo_summary(legacy_destination)
+            .unwrap();
+        assert_eq!(unspent.unspent_count, 0);
+        assert_eq!(unspent.unspent_atoms, 0);
+        let sweep = node
+            .exchange_custody_confirmed_legacy_sweep(sweep_txid, legacy_destination)
+            .unwrap()
+            .unwrap();
+        assert_eq!(sweep.txid, sweep_txid);
+        assert_eq!(sweep.height, 101);
+        assert_eq!(sweep.confirmations, 1);
+        assert_eq!(sweep.legacy_input_count, 1);
+        assert_eq!(sweep.legacy_output_count, 0);
+
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn v3_custody_exclusively_blocks_native_wallet_mutations() {
+        let path = test_dir("exchange-custody-v3-wallet-exclusive");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        mine_default_chain_to(&mut node, 101);
+
+        // Confirm a third-party output so ordinary relay can be distinguished
+        // from transactions spending this node's custody wallet.
+        let third_party_key = SigningKey::from_bytes(&[0x7c; 32]).unwrap();
+        let third_party_destination = third_party_key.verifying_key().to_bytes().into();
+        let (third_party_funding, _) = node
+            .prepare_dev_wallet_payment(third_party_destination, 10, 1)
+            .unwrap();
+        let third_party_funding_txid = third_party_funding.txid();
+        node.submit_transaction(third_party_funding).unwrap();
+        let funding_height = node.state.next_height();
+        node.mine_once(
+            node.wallet_destination(),
+            DEVNET_GENESIS_TIMESTAMP + funding_height * 60,
+            DEFAULT_MINING_ATTEMPTS,
+        )
+        .unwrap();
+        let mut third_party_relay = Transaction {
+            network_id: node.params.network_id,
+            version: TRANSACTION_VERSION,
+            inputs: vec![TxInput {
+                previous: OutPoint {
+                    txid: third_party_funding_txid,
+                    index: 0,
+                },
+                witness: InputWitness::Key {
+                    public_key: [0; 32],
+                    signature: Vec::new(),
+                },
+            }],
+            outputs: vec![TxOutput {
+                value: 9,
+                lock: OutputLock::Key(insecure_dev_destination(0x7e)),
+                spendable_height: node.state.next_height(),
+            }],
+        };
+        third_party_relay.sign_all(&[&third_party_key]).unwrap();
+
+        // Preserve a valid wallet transaction signed before custody activation
+        // to prove the submission boundary also fails closed.
+        let (pre_signed_wallet_transaction, _) = node
+            .prepare_dev_wallet_payment(insecure_dev_destination(0x7d), 1, 1)
+            .unwrap();
+        let custody_intent = pre_signed_wallet_transaction.signing_digest();
+
+        node.claim_exchange_custody_v3_wallet().unwrap();
+        assert!(matches!(
+            node.send_from_dev_wallet(insecure_dev_destination(0x7d), 1, 1),
+            Err(NodeError::ExchangeCustodyV3WalletExclusive)
+        ));
+        assert!(matches!(
+            node.consolidate_dev_wallet(1, MAX_TRANSACTION_INPUTS),
+            Err(NodeError::ExchangeCustodyV3WalletExclusive)
+        ));
+        assert!(matches!(
+            node.prepare_dev_wallet_payment(insecure_dev_destination(0x7f), 1, 1),
+            Err(NodeError::ExchangeCustodyV3WalletExclusive)
+        ));
+        assert!(matches!(
+            node.submit_transaction(pre_signed_wallet_transaction.clone()),
+            Err(NodeError::ExchangeCustodyV3WalletExclusive)
+        ));
+        assert!(node.mempool.is_empty());
+
+        node.set_exchange_withdrawal_reservations(
+            pre_signed_wallet_transaction
+                .inputs
+                .iter()
+                .map(|input| (input.previous, custody_intent))
+                .collect(),
+        );
+        node.submit_exchange_withdrawal_transaction(pre_signed_wallet_transaction)
+            .unwrap();
+        node.submit_transaction(third_party_relay).unwrap();
+        assert_eq!(node.mempool.len(), 2);
+
+        node.exchange_custody_v3_wallet_state = ExchangeCustodyV3WalletState::Unclaimed;
+        assert!(!node.exchange_custody_v3_wallet_is_active());
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn persisted_v3_activation_keeps_native_wallet_locked_without_runtime_flags() {
+        let path = test_dir("exchange-custody-v3-persisted-lock");
+        clean_test_dir(&path);
+        {
+            let node = Node::open(&path).unwrap();
+            assert_eq!(
+                node.exchange_custody_v3_wallet_state,
+                ExchangeCustodyV3WalletState::Unclaimed
+            );
+            assert_eq!(
+                node.status().unwrap().exchange_custody_v3_wallet_state,
+                "unclaimed"
+            );
+        }
+        fs::write(
+            path.join("exchange-withdrawals.v3.initialized"),
+            b"persisted-v3-activation",
+        )
+        .unwrap();
+
+        let mut node = Node::open(&path).unwrap();
+        assert_eq!(
+            node.exchange_custody_v3_wallet_state,
+            ExchangeCustodyV3WalletState::Required
+        );
+        assert_eq!(
+            node.status().unwrap().exchange_custody_v3_wallet_state,
+            "required"
+        );
+        assert!(matches!(
+            node.send_from_dev_wallet(insecure_dev_destination(0x7d), 1, 1),
+            Err(NodeError::ExchangeCustodyV3WalletExclusive)
+        ));
+        assert!(matches!(
+            node.consolidate_dev_wallet(1, MAX_TRANSACTION_INPUTS),
+            Err(NodeError::ExchangeCustodyV3WalletExclusive)
+        ));
+        node.claim_exchange_custody_v3_wallet().unwrap();
+        assert!(node.exchange_custody_v3_wallet_is_active());
+        assert_eq!(
+            node.status().unwrap().exchange_custody_v3_wallet_state,
+            "active"
+        );
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn incomplete_v3_migration_slot_keeps_native_wallet_locked() {
+        let path = test_dir("exchange-custody-v3-incomplete-slot-lock");
+        clean_test_dir(&path);
+        drop(Node::open(&path).unwrap());
+        let mut legacy_header = Vec::from(*b"CMFDEXW\0");
+        legacy_header.extend_from_slice(&2_u32.to_le_bytes());
+        legacy_header.extend_from_slice(&[0x71; 64]);
+        let mut v3_header = Vec::from(*b"CMFDEXW\0");
+        v3_header.extend_from_slice(&3_u32.to_le_bytes());
+        v3_header.extend_from_slice(&[0x72; 64]);
+        fs::write(path.join("exchange-withdrawals.0.bin"), legacy_header).unwrap();
+        fs::write(path.join("exchange-withdrawals.1.bin"), v3_header).unwrap();
+
+        let mut node = Node::open(&path).unwrap();
+        assert_eq!(
+            node.exchange_custody_v3_wallet_state,
+            ExchangeCustodyV3WalletState::Required
+        );
+        assert_eq!(
+            node.status().unwrap().exchange_custody_v3_wallet_state,
+            "required"
+        );
+        assert!(matches!(
+            node.send_from_dev_wallet(insecure_dev_destination(0x7d), 1, 1),
+            Err(NodeError::ExchangeCustodyV3WalletExclusive)
+        ));
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn exchange_withdrawal_reservations_are_excluded_from_consolidation() {
+        let path = test_dir("exchange-reservation-consolidation");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        let blocks = mine_default_chain_to(&mut node, 101);
+        let reserved_outpoint = OutPoint {
+            txid: blocks[0].coinbase_outpoint_id(),
+            index: 0,
+        };
+        node.set_exchange_withdrawal_reservations(HashMap::from([(reserved_outpoint, [0x44; 32])]));
+
+        let snapshot = node.wallet_snapshot().unwrap();
+        assert_eq!(snapshot.spendable_utxo_count, 1);
+        assert_eq!(snapshot.reserved_utxo_count, 1);
+        let plan = node
+            .plan_dev_wallet_payment(insecure_dev_destination(0x7c), 1, 1)
+            .unwrap();
+        assert!(
+            plan.transaction
+                .inputs
+                .iter()
+                .all(|input| input.previous != reserved_outpoint)
+        );
+        assert!(matches!(
+            node.consolidate_dev_wallet(1, MAX_TRANSACTION_INPUTS),
+            Err(NodeError::WalletNotEnoughUtxos(1))
+        ));
 
         drop(node);
         clean_test_dir(&path);

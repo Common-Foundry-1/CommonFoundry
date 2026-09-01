@@ -1,4 +1,4 @@
-import { AlertTriangle, RefreshCw, Settings2, ShieldCheck, X } from "lucide-react";
+import { RefreshCw, Settings2, ShieldCheck, X } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { getWalletCustodyStatus, usesEmbeddedNode } from "./api/nodeClient";
 import { ConsolidationDialog } from "./components/ConsolidationDialog";
@@ -110,8 +110,7 @@ export function App() {
           </div>
         </header>
 
-        <div className="devnet-warning" role="note">
-          <AlertTriangle aria-hidden="true" size={16} />
+        <div className="network-context" role="note">
           <span>
             <strong>{data.status?.network ?? "Common Foundry network"}</strong>
             {` · ${data.status?.network_notice ?? "Network status unavailable"}`}

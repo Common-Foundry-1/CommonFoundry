@@ -316,9 +316,6 @@ export function ConsolidationDialog({
             <p className="form-help form-help-estimate">
               Estimate only: individual UTXO values are not exposed here. The node selects mature, unreserved outputs smallest-first and returns exact totals after submission.
             </p>
-            <p className="warning-inline" role="note">
-              Consolidation improves UTXO hygiene but does not increase your balance.
-            </p>
             {errors.form && <p className="form-error form-error-summary" role="alert">{errors.form}</p>}
 
             <div className="dialog-actions">
@@ -354,7 +351,7 @@ export function ConsolidationDialog({
             <p className="form-help form-help-estimate">
               This is an estimate. Exact input and output totals are shown after the node accepts the transaction.
             </p>
-            <p className="warning-inline" role="note">
+            <p className="info-inline" role="note">
               Mine this transaction before consolidating the next batch.
             </p>
             {errors.form && <p className="form-error form-error-summary" role="alert">{errors.form}</p>}
@@ -406,7 +403,7 @@ export function ConsolidationDialog({
                 <strong className="review-value">{formatAtoms(result.output_atoms)} CMFD</strong>
               </div>
             </div>
-            <p className="warning-inline" role="note">
+            <p className="info-inline" role="note">
               Mine this transaction before consolidating the next batch.
             </p>
             <div className="dialog-actions dialog-actions-single">

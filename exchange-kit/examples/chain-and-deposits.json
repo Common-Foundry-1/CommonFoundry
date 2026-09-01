@@ -1,0 +1,222 @@
+{
+  "schema": "common-foundry-exchange-example-transcript-v1",
+  "illustrative_only": true,
+  "warning": "Values are non-production examples and are not network pins, registered destinations, or replayable events. Destination examples use known compromised test keys; never send value to them.",
+  "exchanges": [
+    {
+      "name": "discover integration capabilities",
+      "credential_scope": "integration",
+      "result_schema": "ExchangeInfo",
+      "request": {
+        "jsonrpc": "2.0",
+        "id": "capabilities-1",
+        "method": "getexchangeinfo",
+        "params": []
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": "capabilities-1",
+        "result": {
+          "api_version": "chain-preview-v0.4",
+          "service": "common-foundry-exchange-rpc",
+          "status": "integration_preview",
+          "production_ready": false,
+          "network_id": "1111111111111111111111111111111111111111111111111111111111111111",
+          "consensus_fingerprint": "2222222222222222222222222222222222222222222222222222222222222222",
+          "custody": {
+            "mode": "v0.5-policy-keyring",
+            "api_version": "chain-preview-v0.5",
+            "separate_withdrawal_credential": true,
+            "external_signer_protocol": "CMFDSIG1-v1-provider-neutral"
+          },
+          "encodings": {
+            "amounts": "canonical unsigned decimal atom strings",
+            "destination": "64 lowercase hexadecimal characters encoding a 32-byte x-only secp256k1 public key",
+            "checksummed_address_available": false
+          },
+          "methods": {
+            "integration": [
+              "getexchangeinfo",
+              "getblockchaininfo",
+              "getblockcount",
+              "getbestblockhash",
+              "getblockhash",
+              "getblock",
+              "getrawmempool",
+              "sendrawtransaction",
+              "registerwatchdestination",
+              "registerwatchdestinations",
+              "getwatchdestination",
+              "getdepositevents"
+            ],
+            "withdrawal": [
+              "preparewithdrawal",
+              "getwithdrawalsigningpackage",
+              "getwithdrawalapprovalpayload",
+              "releasewithdrawal",
+              "cancelwithdrawal",
+              "getwithdrawal",
+              "getwithdrawaljournalinfo"
+            ]
+          },
+          "deposit_index": {
+            "healthy": true,
+            "indexed_tip": {
+              "height": 125,
+              "hash": "3333333333333333333333333333333333333333333333333333333333333333"
+            },
+            "high_watermark": "0",
+            "capacity": {
+              "watch_destination_count": "0",
+              "watch_destination_limit": "100000",
+              "watch_destination_remaining": "100000",
+              "active_deposit_count": "0",
+              "active_deposit_limit": "1000000",
+              "deposit_event_limit": "1000000",
+              "registration_batch_limit": "1000",
+              "event_page_limit": "1000"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "atomically register two customer destinations",
+      "credential_scope": "integration",
+      "result_schema": "WatchRegistrationBatchResult",
+      "request": {
+        "jsonrpc": "2.0",
+        "id": "register-20260901-0001",
+        "method": "registerwatchdestinations",
+        "params": [
+          [
+            {
+              "label": "customer-1042",
+              "destination_hex": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+            },
+            {
+              "label": "customer-1043",
+              "destination_hex": "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
+            }
+          ]
+        ]
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": "register-20260901-0001",
+        "result": {
+          "api_version": "chain-preview-v0.4",
+          "registration_count": 2,
+          "registrations": [
+            {
+              "api_version": "chain-preview-v0.4",
+              "label": "customer-1042",
+              "destination_hex": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+              "registered_at_height": 125,
+              "registered_at_tip": "3333333333333333333333333333333333333333333333333333333333333333"
+            },
+            {
+              "api_version": "chain-preview-v0.4",
+              "label": "customer-1043",
+              "destination_hex": "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+              "registered_at_height": 125,
+              "registered_at_tip": "3333333333333333333333333333333333333333333333333333333333333333"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "commit one addition and its later reorganization removal",
+      "credential_scope": "integration",
+      "result_schema": "DepositEventPage",
+      "request": {
+        "jsonrpc": "2.0",
+        "id": "deposits-after-0",
+        "method": "getdepositevents",
+        "params": ["0", 100]
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": "deposits-after-0",
+        "result": {
+          "api_version": "chain-preview-v0.4",
+          "network_id": "1111111111111111111111111111111111111111111111111111111111111111",
+          "consensus_fingerprint": "2222222222222222222222222222222222222222222222222222222222222222",
+          "indexed_tip": {
+            "height": 127,
+            "hash": "5555555555555555555555555555555555555555555555555555555555555555"
+          },
+          "events": [
+            {
+              "cursor": "1",
+              "added_cursor": "1",
+              "kind": "deposit_added",
+              "label": "customer-1042",
+              "destination_hex": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+              "txid": "4444444444444444444444444444444444444444444444444444444444444444",
+              "vout": 0,
+              "value_atoms": "250000000",
+              "spendable_height": 126,
+              "coinbase": false,
+              "blockhash": "6666666666666666666666666666666666666666666666666666666666666666",
+              "blockheight": 126,
+              "blocktime": 1788296400
+            },
+            {
+              "cursor": "2",
+              "added_cursor": "1",
+              "kind": "deposit_removed",
+              "label": "customer-1042",
+              "destination_hex": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+              "txid": "4444444444444444444444444444444444444444444444444444444444444444",
+              "vout": 0,
+              "value_atoms": "250000000",
+              "spendable_height": 126,
+              "coinbase": false,
+              "blockhash": "6666666666666666666666666666666666666666666666666666666666666666",
+              "blockheight": 126,
+              "blocktime": 1788296400
+            }
+          ],
+          "next_cursor": "2",
+          "high_watermark": "2",
+          "has_more": false
+        }
+      }
+    },
+    {
+      "name": "duplicate label inside one batch is rejected before mutation",
+      "credential_scope": "integration",
+      "request": {
+        "jsonrpc": "2.0",
+        "id": "duplicate-batch",
+        "method": "registerwatchdestinations",
+        "params": [
+          [
+            {
+              "label": "customer-2000",
+              "destination_hex": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+            },
+            {
+              "label": "customer-2000",
+              "destination_hex": "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
+            }
+          ]
+        ]
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": "duplicate-batch",
+        "error": {
+          "code": -32602,
+          "message": "watch registration batch contains a duplicate label",
+          "data": {
+            "code": "duplicate_watch_batch_label",
+            "retryable": false
+          }
+        }
+      }
+    }
+  ]
+}

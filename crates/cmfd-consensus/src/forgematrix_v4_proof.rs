@@ -9,7 +9,7 @@ use crate::{
     FORGEMATRIX_V4_ALGORITHM_VERSION, FORGEMATRIX_V4_FIELD_MODULUS,
     FORGEMATRIX_V4_FINAL_ACTIVATION_DIGEST_DOMAIN, FORGEMATRIX_V4_OPENING_CLAIMS_PER_BANK,
     FORGEMATRIX_V4_PROOF_VERSION, FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES,
-    FORGEMATRIX_V4_RELATION_REPETITIONS, PRODUCTION_V4_TESTNET_NETWORK_ID,
+    FORGEMATRIX_V4_RELATION_REPETITIONS,
     forgematrix_v2::{
         PRODUCTION_V2_BANKS, PRODUCTION_V2_BATCH, PRODUCTION_V2_DIMENSION,
         PRODUCTION_V2_LAYERS_PER_BANK, V2_MODEL_VALUE_CENTER, mask_coefficients,
@@ -308,7 +308,7 @@ pub fn forgematrix_v4_activation_evaluation(
 fn validate_statement(
     statement: ForgeMatrixV4TranscriptStatement,
 ) -> Result<(), ForgeMatrixV4ProofError> {
-    if statement.block.network_id != PRODUCTION_V4_TESTNET_NETWORK_ID
+    if statement.block.network_id == [0; 32]
         || statement.algorithm_version != FORGEMATRIX_V4_ALGORITHM_VERSION
         || statement.proof_version != FORGEMATRIX_V4_PROOF_VERSION
         || statement.proof_system_digest != forgematrix_v4_proof_system_digest()
@@ -517,7 +517,7 @@ mod tests {
 
     #[test]
     fn transparent_verifier_rejects_bad_statement_before_proof_access() {
-        let statement = ForgeMatrixV4TranscriptStatement {
+        let mut statement = ForgeMatrixV4TranscriptStatement {
             block: BlockChallenge {
                 network_id: [0; 32],
                 previous_block: [1; 32],
@@ -539,5 +539,7 @@ mod tests {
             validate_statement(statement),
             Err(ForgeMatrixV4ProofError::Statement)
         );
+        statement.block.network_id = [0xa5; 32];
+        assert_eq!(validate_statement(statement), Ok(()));
     }
 }

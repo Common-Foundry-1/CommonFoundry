@@ -1,0 +1,149 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commonfoundry.org/schemas/exchange-example-transcript-v1.json",
+  "title": "Common Foundry exchange example transcript",
+  "type": "object",
+  "required": ["schema", "illustrative_only", "warning", "exchanges"],
+  "properties": {
+    "schema": { "const": "common-foundry-exchange-example-transcript-v1" },
+    "illustrative_only": { "const": true },
+    "warning": { "type": "string", "minLength": 1 },
+    "exchanges": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/TranscriptItem" }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "SuccessEnvelope": {
+      "type": "object",
+      "required": ["jsonrpc", "id", "result"],
+      "properties": {
+        "jsonrpc": { "const": "2.0" },
+        "id": { "$ref": "https://commonfoundry.org/schemas/exchange-rpc-preview.json#/$defs/RequestId" },
+        "result": true
+      },
+      "additionalProperties": false
+    },
+    "TranscriptBase": {
+      "type": "object",
+      "required": ["name", "credential_scope", "request", "response"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "credential_scope": { "enum": ["integration", "withdrawal"] },
+        "result_schema": { "type": "string" },
+        "request": { "$ref": "https://commonfoundry.org/schemas/exchange-rpc-preview.json#/$defs/JsonRpcRequest" },
+        "response": true
+      },
+      "additionalProperties": false
+    },
+    "TranscriptItem": {
+      "allOf": [
+        { "$ref": "#/$defs/TranscriptBase" },
+        {
+          "oneOf": [
+            {
+              "type": "object",
+              "not": { "type": "object", "required": ["result_schema"] },
+              "properties": {
+                "response": { "$ref": "https://commonfoundry.org/schemas/exchange-rpc-preview.json#/$defs/JsonRpcError" }
+              }
+            },
+            {
+              "type": "object",
+              "required": ["result_schema"],
+              "properties": {
+                "result_schema": { "const": "ExchangeInfo" },
+                "response": {
+                  "allOf": [
+                    { "$ref": "#/$defs/SuccessEnvelope" },
+                    { "type": "object", "properties": { "result": { "$ref": "https://commonfoundry.org/schemas/exchange-rpc-preview.json#/$defs/ExchangeInfo" } } }
+                  ]
+                }
+              }
+            },
+            {
+              "type": "object",
+              "required": ["result_schema"],
+              "properties": {
+                "result_schema": { "const": "WatchRegistrationBatchResult" },
+                "response": {
+                  "allOf": [
+                    { "$ref": "#/$defs/SuccessEnvelope" },
+                    { "type": "object", "properties": { "result": { "$ref": "https://commonfoundry.org/schemas/exchange-rpc-preview.json#/$defs/WatchRegistrationBatchResult" } } }
+                  ]
+                }
+              }
+            },
+            {
+              "type": "object",
+              "required": ["result_schema"],
+              "properties": {
+                "result_schema": { "const": "DepositEventPage" },
+                "response": {
+                  "allOf": [
+                    { "$ref": "#/$defs/SuccessEnvelope" },
+                    { "type": "object", "properties": { "result": { "$ref": "https://commonfoundry.org/schemas/exchange-rpc-preview.json#/$defs/DepositEventPage" } } }
+                  ]
+                }
+              }
+            },
+            {
+              "type": "object",
+              "required": ["result_schema"],
+              "properties": {
+                "result_schema": { "const": "WithdrawalJournalInfoV3" },
+                "response": {
+                  "allOf": [
+                    { "$ref": "#/$defs/SuccessEnvelope" },
+                    { "type": "object", "properties": { "result": { "$ref": "https://commonfoundry.org/schemas/exchange-rpc-preview.json#/$defs/WithdrawalJournalInfoV3" } } }
+                  ]
+                }
+              }
+            },
+            {
+              "type": "object",
+              "required": ["result_schema"],
+              "properties": {
+                "result_schema": { "const": "WithdrawalV3" },
+                "response": {
+                  "allOf": [
+                    { "$ref": "#/$defs/SuccessEnvelope" },
+                    { "type": "object", "properties": { "result": { "$ref": "https://commonfoundry.org/schemas/exchange-rpc-preview.json#/$defs/WithdrawalV3" } } }
+                  ]
+                }
+              }
+            },
+            {
+              "type": "object",
+              "required": ["result_schema"],
+              "properties": {
+                "result_schema": { "const": "ApprovalPayloadResult" },
+                "response": {
+                  "allOf": [
+                    { "$ref": "#/$defs/SuccessEnvelope" },
+                    { "type": "object", "properties": { "result": { "$ref": "https://commonfoundry.org/schemas/exchange-rpc-preview.json#/$defs/ApprovalPayloadResult" } } }
+                  ]
+                }
+              }
+            },
+            {
+              "type": "object",
+              "required": ["result_schema"],
+              "properties": {
+                "result_schema": { "const": "SigningPackageResult" },
+                "response": {
+                  "allOf": [
+                    { "$ref": "#/$defs/SuccessEnvelope" },
+                    { "type": "object", "properties": { "result": { "$ref": "https://commonfoundry.org/schemas/exchange-rpc-preview.json#/$defs/SigningPackageResult" } } }
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

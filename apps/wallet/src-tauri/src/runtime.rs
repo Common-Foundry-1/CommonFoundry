@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use cmfd_node::p2p::{InboundPeerHandle, spawn_inbound_listener_with_policy};
-use cmfd_node::peer::PeerLimits;
+use cmfd_node::p2p::{InboundPeerHandle, PeerDiscovery, spawn_inbound_listener_with_discovery};
+use cmfd_node::peer::{PeerAddressPolicy, PeerLimits};
 use cmfd_node::wallet_backup::{
     WalletBackupError, WalletKeyStorage, create_encrypted_wallet_backup,
     inspect_wallet_key_storage, migrate_plaintext_wallet_key, read_wallet_passphrase_file,
@@ -519,6 +519,7 @@ fn start_embedded_node(
                     None
                 },
             });
+    let discovery_hello = node.peer_hello();
     let shared = Arc::new(Mutex::new(node));
     let listener = TcpListener::bind(config.p2p_bind).map_err(|_| {
         startup_error(
@@ -541,11 +542,18 @@ fn start_embedded_node(
         )
     })?;
     let limits = PeerLimits::default();
-    let inbound = spawn_inbound_listener_with_policy(
+    let discovery = Arc::new(PeerDiscovery::open(
+        data_dir,
+        discovery_hello,
+        p2p_address,
+        PeerAddressPolicy::AllowPublic,
+    ));
+    let inbound = spawn_inbound_listener_with_discovery(
         Arc::clone(&shared),
         listener,
         limits,
         config.address_policy(),
+        Arc::clone(&discovery),
     )
     .map_err(|_| {
         startup_error(
@@ -564,6 +572,7 @@ fn start_embedded_node(
         p2p_address,
         limits,
         STATIC_PEER_POLL_INTERVAL,
+        discovery,
     ) {
         Ok(peers) => Arc::new(peers),
         Err(error) => {
@@ -997,10 +1006,11 @@ fn command_help_text_for_profile(profile: NetworkProfile) -> String {
         concat!(
             "Common Foundry Wallet\n",
             "Compiled network: {} ({})\n",
-            "Usage: common-foundry-wallet [--help|--version] [--p2p-bind <addr>] [--peer <addr> ...] [--allow-public-peers] [--wallet-passphrase-file <path>] [-v...]\n",
+            "Usage: common-foundry-wallet [runtime-identity|--help|--version] [--p2p-bind <addr>] [--peer <addr> ...] [--allow-public-peers] [--wallet-passphrase-file <path>] [-v...]\n",
             "Arguments:\n",
             "  --help (-h)             Show this help\n",
             "  --version (-V)          Print version\n",
+            "  runtime-identity        Authenticate packaged V4 artifacts and print compiled wallet identity\n",
             "  -v, --verbose           Increase console verbosity (repeatable)\n",
             "  --p2p-bind <addr>       Local P2P bind address (default {})\n",
             "  --peer <addr>           Public or private outbound peer (repeatable)\n",
@@ -1359,7 +1369,7 @@ mod tests {
         let security = PreparedNodeSecurity {
             production_v3_record: Some(ProductionV3VerifierRecord {
                 record_v2: PathBuf::from("C:\\private\\record-v2.json"),
-                expected_file: cmfd_consensus::dory_v3_model_ceremony_transcript::FileIdentity {
+                expected_file: cmfd_consensus::FileIdentity {
                     bytes: 1,
                     blake3: [1; 32],
                     sha256: [2; 32],

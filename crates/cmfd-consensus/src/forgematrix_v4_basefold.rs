@@ -16,8 +16,7 @@ use crate::{
     FORGEMATRIX_V4_BASEFOLD_POW_BITS, FORGEMATRIX_V4_BASEFOLD_QUERIES,
     FORGEMATRIX_V4_BASEFOLD_ROW_VARIABLES, FORGEMATRIX_V4_DYNAMIC_COLUMNS,
     FORGEMATRIX_V4_FIXED_COLUMNS, FORGEMATRIX_V4_MAX_OPENING_CLAIMS, FORGEMATRIX_V4_PROOF_VERSION,
-    ForgeMatrixV4CandidateProof, PRODUCTION_V4_TESTNET_NETWORK_ID,
-    forgematrix_v4_proof_system_digest,
+    ForgeMatrixV4CandidateProof, forgematrix_v4_proof_system_digest,
 };
 
 pub(crate) const TRANSCRIPT_STATEMENT_DOMAIN: &str =
@@ -49,7 +48,7 @@ impl ForgeMatrixV4TranscriptStatement {
         block: &BlockChallenge,
         proof: &ForgeMatrixV4CandidateProof,
     ) -> Result<Self, ForgeMatrixV4VerifierError> {
-        if block.network_id != PRODUCTION_V4_TESTNET_NETWORK_ID
+        if block.network_id == [0; 32]
             || proof.algorithm_version != FORGEMATRIX_V4_ALGORITHM_VERSION
             || proof.proof_version != FORGEMATRIX_V4_PROOF_VERSION
             || proof.proof_system_digest != forgematrix_v4_proof_system_digest()
@@ -314,7 +313,10 @@ mod tests {
     use slop_tensor::{Dimensions, Tensor};
 
     use super::*;
-    use crate::{FORGEMATRIX_V4_EXTENSION_DEGREE, FORGEMATRIX_V4_FIELD_MODULUS};
+    use crate::{
+        FORGEMATRIX_V4_EXTENSION_DEGREE, FORGEMATRIX_V4_FIELD_MODULUS,
+        PRODUCTION_V4_TESTNET_NETWORK_ID,
+    };
 
     #[test]
     fn cpu_verifier_types_match_the_pinned_v4_field() {
@@ -457,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn candidate_transcript_requires_the_isolated_pinned_statement() {
+    fn candidate_transcript_requires_a_valid_pinned_statement() {
         let statement = statement();
         let mut proof = ForgeMatrixV4CandidateProof {
             algorithm_version: statement.algorithm_version,
@@ -473,6 +475,20 @@ mod tests {
         assert_eq!(
             ForgeMatrixV4TranscriptStatement::from_candidate(&statement.block, &proof).unwrap(),
             statement
+        );
+        let mut alternate_block = statement.block;
+        alternate_block.network_id = [0xa5; 32];
+        assert_eq!(
+            ForgeMatrixV4TranscriptStatement::from_candidate(&alternate_block, &proof)
+                .unwrap()
+                .block
+                .network_id,
+            alternate_block.network_id
+        );
+        alternate_block.network_id = [0; 32];
+        assert_eq!(
+            ForgeMatrixV4TranscriptStatement::from_candidate(&alternate_block, &proof),
+            Err(ForgeMatrixV4VerifierError::Statement)
         );
         proof.proof_system_digest[0] ^= 1;
         assert_eq!(

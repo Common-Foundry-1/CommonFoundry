@@ -422,22 +422,77 @@ pub(crate) fn validate_peer_address(
     address: SocketAddr,
     policy: PeerAddressPolicy,
 ) -> Result<(), PeerError> {
-    let private = match address.ip() {
-        IpAddr::V4(ip) => ip.is_loopback() || ip.is_private(),
-        IpAddr::V6(ip) => ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local(),
-    };
-    let unsafe_address = address.port() == 0
-        || match address.ip() {
-            IpAddr::V4(ip) => ip.is_unspecified() || ip.is_multicast() || ip.octets() == [255; 4],
-            IpAddr::V6(ip) => ip.is_unspecified() || ip.is_multicast(),
-        };
-    if unsafe_address {
+    let private = is_safe_private_peer_ip(address.ip());
+    let public = is_publicly_routable_peer_ip(address.ip());
+    if address.port() == 0 || (!private && !public) {
         return Err(PeerError::UnsafeAddress(address));
     }
-    if !private && policy == PeerAddressPolicy::PrivateOnly {
+    if public && policy == PeerAddressPolicy::PrivateOnly {
         return Err(PeerError::NonPrivateAddress(address));
     }
     Ok(())
+}
+
+fn canonical_peer_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(ip)),
+        ip => ip,
+    }
+}
+
+fn is_safe_private_peer_ip(ip: IpAddr) -> bool {
+    match canonical_peer_ip(ip) {
+        IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        }
+        IpAddr::V6(ip) => ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local(),
+    }
+}
+
+/// Returns whether `ip` is suitable as an Internet-routable peer endpoint.
+///
+/// This deliberately excludes non-global entries from the IANA special-purpose
+/// registries. Local development addresses are handled separately by
+/// [`validate_peer_address`].
+pub fn is_publicly_routable_peer_ip(ip: IpAddr) -> bool {
+    match canonical_peer_ip(ip) {
+        IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            !ip.is_unspecified()
+                && !is_safe_private_peer_ip(IpAddr::V4(ip))
+                && !ip.is_multicast()
+                && !ip.is_broadcast()
+                && octets[0] != 0
+                && !matches!(octets, [192, 0, 0, _] | [192, 88, 99, _])
+                && !(octets[0] == 198 && matches!(octets[1], 18 | 19))
+                && octets[0] < 240
+                && !matches!(
+                    octets,
+                    [192, 0, 2, _] | [198, 51, 100, _] | [203, 0, 113, _]
+                )
+        }
+        IpAddr::V6(ip) => {
+            let segments = ip.segments();
+            let global_unicast = segments[0] & 0xe000 == 0x2000;
+            let well_known_nat64 = segments[..6] == [0x0064, 0xff9b, 0, 0, 0, 0];
+            let ietf_protocol_assignments = segments[0] == 0x2001 && segments[1] <= 0x01ff;
+            let documentation = (segments[0] == 0x2001 && segments[1] == 0x0db8)
+                || (segments[0] == 0x3fff && segments[1] & 0xf000 == 0);
+            let six_to_four = segments[0] == 0x2002;
+
+            (global_unicast || well_known_nat64)
+                && !ietf_protocol_assignments
+                && !documentation
+                && !six_to_four
+        }
+    }
 }
 
 pub fn encode_peer_frame(frame: &PeerFrame) -> Result<Vec<u8>, PeerError> {
@@ -2558,6 +2613,66 @@ mod tests {
         assert!(stopped_at.elapsed() < Duration::from_millis(500));
         let mut byte = [0_u8; 1];
         assert_eq!(late_socket.read(&mut byte).unwrap(), 0);
+    }
+
+    #[test]
+    fn peer_address_scope_accepts_safe_private_and_global_unicast_addresses() {
+        for value in [
+            "127.0.0.1:19000",
+            "192.168.1.20:19000",
+            "169.254.1.20:19000",
+            "100.64.0.20:19000",
+            "[::1]:19000",
+            "[fd12::20]:19000",
+            "[fe80::20]:19000",
+            "[::ffff:192.168.1.20]:19000",
+        ] {
+            validate_peer_address(value.parse().unwrap(), PeerAddressPolicy::PrivateOnly).unwrap();
+        }
+
+        for value in [
+            "8.8.8.8:19000",
+            "173.249.35.251:19000",
+            "[64:ff9b::808:808]:19000",
+            "[2606:4700:4700::1111]:19000",
+            "[::ffff:8.8.8.8]:19000",
+        ] {
+            let address: SocketAddr = value.parse().unwrap();
+            assert!(is_publicly_routable_peer_ip(address.ip()), "{value}");
+            validate_peer_address(address, PeerAddressPolicy::AllowPublic).unwrap();
+            assert!(matches!(
+                validate_peer_address(address, PeerAddressPolicy::PrivateOnly),
+                Err(PeerError::NonPrivateAddress(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn public_peer_policy_rejects_non_global_special_use_addresses() {
+        for value in [
+            "0.0.0.0:19000",
+            "192.0.2.1:19000",
+            "198.18.0.1:19000",
+            "[::]:19000",
+            "[64:ff9b:1::1]:19000",
+            "[100::1]:19000",
+            "[100:0:0:1::1]:19000",
+            "[2001::1]:19000",
+            "[2001:2::1]:19000",
+            "[2001:20::1]:19000",
+            "[2001:db8::1]:19000",
+            "[2002:c000:0204::1]:19000",
+            "[3fff:fff::1]:19000",
+            "[5f00::1]:19000",
+            "[fec0::1]:19000",
+        ] {
+            let address: SocketAddr = value.parse().unwrap();
+            assert!(!is_publicly_routable_peer_ip(address.ip()), "{value}");
+            assert!(matches!(
+                validate_peer_address(address, PeerAddressPolicy::AllowPublic),
+                Err(PeerError::UnsafeAddress(_))
+            ));
+        }
     }
 
     #[test]

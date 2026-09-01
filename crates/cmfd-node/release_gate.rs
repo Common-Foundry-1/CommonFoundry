@@ -66,6 +66,25 @@ pub struct ProductionV4ActivationEvidence {
     pub core_spec_sha256: &'static str,
     pub core_vector_sha256: &'static str,
     pub proof_algebra_sha256: &'static str,
+    pub approval_trust: ProductionV4ActivationApprovalTrust,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProductionV4ActivationSignerTrust {
+    pub signer_identity: &'static str,
+    pub allowed_signers_sha256: &'static str,
+    pub key_blob_sha256: &'static str,
+    pub key_fingerprint: &'static str,
+    pub key_type: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProductionV4ActivationApprovalTrust {
+    pub contract_schema: &'static str,
+    pub qualification_binding_sha256: &'static str,
+    pub ssh_keygen_sha256: &'static str,
+    pub producer: ProductionV4ActivationSignerTrust,
+    pub independent_reproducer: ProductionV4ActivationSignerTrust,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,7 +116,6 @@ pub struct ProductionRcNetworkIdentityPin {
     pub network_id: [u8; 32],
     pub virtual_genesis_hash: [u8; 32],
     pub virtual_genesis_timestamp: u64,
-    pub bootstrap_ipv4: [u8; 4],
     pub pow_limit: [u8; 32],
     pub steward_reward_destination: [u8; 32],
     pub community_reward_destination: [u8; 32],
@@ -205,9 +223,9 @@ pub const COMPILED_RELEASE_PROFILE: CompiledReleaseProfile = CompiledReleaseProf
 /// Exact verifier inputs accepted by the isolated ProductionV4 latency
 /// testnet. The fixed record binds all three fixed commitments; the complete
 /// model bank is authenticated before its base-input prefix is retained.
-#[cfg(feature = "production-v4-testnet")]
+#[cfg(any(feature = "production-v4-testnet", feature = "production-rc"))]
 #[allow(dead_code)] // build.rs includes this module without loading verifier artifacts.
-pub const PRODUCTION_V4_TESTNET_ARTIFACT_PINS: ProductionV4ArtifactIdentityPins =
+pub const PRODUCTION_V4_ARTIFACT_PINS: ProductionV4ArtifactIdentityPins =
     ProductionV4ArtifactIdentityPins {
         bank: ProductionV3FileIdentityPin {
             bytes: 6_442_975_416,
@@ -245,14 +263,53 @@ pub const COMPILED_RELEASE_PROFILE: CompiledReleaseProfile = CompiledReleaseProf
     production_v3_artifacts: None,
     production_v3_verifier_workers: None,
     production_v4_activation: None,
-    production_v4_artifacts: Some(PRODUCTION_V4_TESTNET_ARTIFACT_PINS),
+    production_v4_artifacts: Some(PRODUCTION_V4_ARTIFACT_PINS),
     production_network_identity: None,
 };
 
-/// ProductionV4 release-candidate shape. Every launch-specific identity is
-/// intentionally absent until it is independently reproduced and approved.
-/// Selecting `production-rc` therefore chooses the correct proof system but
-/// still fails closed in the build gate.
+#[cfg(feature = "production-rc")]
+pub const PRODUCTION_RC_NETWORK_IDENTITY: ProductionRcNetworkIdentityPin =
+    ProductionRcNetworkIdentityPin {
+        network_id: [
+            0x3e, 0x99, 0xd4, 0x59, 0x59, 0xc1, 0x9c, 0x00, 0x53, 0xd8, 0xe9, 0xfe, 0xf3, 0x48,
+            0x75, 0xb5, 0x7b, 0x46, 0xa8, 0xa1, 0xce, 0x33, 0x06, 0x37, 0xda, 0xdd, 0xab, 0x51,
+            0x5b, 0xc7, 0xb9, 0x2d,
+        ],
+        virtual_genesis_hash: [
+            0xa5, 0x72, 0xb6, 0xce, 0x50, 0x97, 0x85, 0x11, 0xce, 0x87, 0x71, 0xdb, 0x66, 0x03,
+            0xa6, 0x02, 0xfa, 0xcc, 0xf3, 0x80, 0x2c, 0xf0, 0xd4, 0x79, 0x1c, 0x1c, 0xe4, 0xe4,
+            0x67, 0xba, 0x6b, 0x71,
+        ],
+        virtual_genesis_timestamp: 1_788_800_400,
+        pow_limit: [
+            0x00, 0x3f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff,
+        ],
+        steward_reward_destination: [
+            0x69, 0x89, 0xa6, 0x15, 0x23, 0x1a, 0x86, 0x55, 0x8b, 0x8e, 0xbf, 0x1f, 0x0b, 0x00,
+            0x11, 0xcf, 0x4f, 0xb1, 0xe0, 0x20, 0x9f, 0x68, 0xa7, 0xb1, 0x27, 0x4f, 0x38, 0x77,
+            0xe3, 0xb1, 0x6a, 0x6b,
+        ],
+        community_reward_destination: [
+            0x2d, 0x70, 0x66, 0xdf, 0x96, 0x29, 0x7c, 0x41, 0xf8, 0xe4, 0xbb, 0x3b, 0xe2, 0x18,
+            0xce, 0xfb, 0x82, 0x2f, 0xf1, 0xe7, 0xdc, 0x6c, 0xc6, 0x48, 0xf4, 0x7f, 0x92, 0xa9,
+            0xc0, 0xc8, 0x8e, 0xf8,
+        ],
+    };
+
+/// Two-phase insertion point for independently produced ProductionV4
+/// activation evidence. The tracked include remains `None` during phase one;
+/// phase two may replace only that expression after the required evidence has
+/// been independently produced and authenticated.
+#[cfg(feature = "production-rc")]
+pub const PRODUCTION_V4_ACTIVATION: Option<ProductionV4ActivationEvidence> =
+    include!("production_v4_activation_pin.inc.rs");
+
+/// ProductionV4 release-candidate shape. The V2 launch candidate pins the
+/// immutable RCNet identity and exact proof artifacts. Independent activation
+/// evidence remains absent, so `production-rc` continues to fail closed until
+/// a clean reproducer and fresh-process verifier have supplied real reports.
 #[cfg(feature = "production-rc")]
 pub const COMPILED_RELEASE_PROFILE: CompiledReleaseProfile = CompiledReleaseProfile {
     network: CompiledNetworkProfile::Rcnet,
@@ -260,9 +317,9 @@ pub const COMPILED_RELEASE_PROFILE: CompiledReleaseProfile = CompiledReleaseProf
     activation: None,
     production_v3_artifacts: None,
     production_v3_verifier_workers: None,
-    production_v4_activation: None,
-    production_v4_artifacts: None,
-    production_network_identity: None,
+    production_v4_activation: PRODUCTION_V4_ACTIVATION,
+    production_v4_artifacts: Some(PRODUCTION_V4_ARTIFACT_PINS),
+    production_network_identity: Some(PRODUCTION_RC_NETWORK_IDENTITY),
 };
 
 /// The identity selected by an ordinary source-tree build.
@@ -328,6 +385,107 @@ fn valid_file_identity_pin(pin: ProductionV3FileIdentityPin) -> bool {
     pin.bytes != 0 && pin.blake3 != [0; 32] && pin.sha256 != [0; 32]
 }
 
+fn valid_signer_token(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 128
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes.iter().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(*byte, b'@' | b'.' | b'_' | b'+' | b'-')
+        })
+}
+
+fn valid_key_fingerprint(value: &str) -> bool {
+    value.strip_prefix("SHA256:").is_some_and(|digest| {
+        digest.len() == 43
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'))
+    })
+}
+
+fn decode_lower_hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        _ => None,
+    }
+}
+
+fn key_fingerprint_matches(key_blob_sha256: &str, fingerprint: &str) -> bool {
+    if !is_nonzero_lower_hex(key_blob_sha256, 32) || !valid_key_fingerprint(fingerprint) {
+        return false;
+    }
+    let encoded = key_blob_sha256.as_bytes();
+    let mut digest = [0_u8; 32];
+    for (index, output) in digest.iter_mut().enumerate() {
+        let Some(high) = decode_lower_hex_nibble(encoded[index * 2]) else {
+            return false;
+        };
+        let Some(low) = decode_lower_hex_nibble(encoded[index * 2 + 1]) else {
+            return false;
+        };
+        *output = (high << 4) | low;
+    }
+
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut expected = String::with_capacity(50);
+    expected.push_str("SHA256:");
+    for chunk in digest.chunks_exact(3) {
+        expected.push(ALPHABET[(chunk[0] >> 2) as usize] as char);
+        expected.push(ALPHABET[(((chunk[0] & 0x03) << 4) | (chunk[1] >> 4)) as usize] as char);
+        expected.push(ALPHABET[(((chunk[1] & 0x0f) << 2) | (chunk[2] >> 6)) as usize] as char);
+        expected.push(ALPHABET[(chunk[2] & 0x3f) as usize] as char);
+    }
+    let remainder = digest.chunks_exact(3).remainder();
+    expected.push(ALPHABET[(remainder[0] >> 2) as usize] as char);
+    expected.push(ALPHABET[(((remainder[0] & 0x03) << 4) | (remainder[1] >> 4)) as usize] as char);
+    expected.push(ALPHABET[((remainder[1] & 0x0f) << 2) as usize] as char);
+    expected == fingerprint
+}
+
+fn validate_production_v4_approval_trust(
+    trust: ProductionV4ActivationApprovalTrust,
+) -> Result<(), &'static str> {
+    if trust.contract_schema != "CMFD_PRODUCTION_V4_ACTIVATION_APPROVAL_SUBJECT_V1" {
+        return Err("ProductionV4 activation approval contract schema is unsupported");
+    }
+    if !is_nonzero_lower_hex(trust.qualification_binding_sha256, 32) {
+        return Err("ProductionV4 qualification binding digest is invalid");
+    }
+    if !is_nonzero_lower_hex(trust.ssh_keygen_sha256, 32) {
+        return Err("ProductionV4 OpenSSH verifier trust digest is invalid");
+    }
+    for signer in [trust.producer, trust.independent_reproducer] {
+        if !valid_signer_token(signer.signer_identity) {
+            return Err("ProductionV4 activation approval signer identity is invalid");
+        }
+        if !is_nonzero_lower_hex(signer.allowed_signers_sha256, 32)
+            || !is_nonzero_lower_hex(signer.key_blob_sha256, 32)
+        {
+            return Err("ProductionV4 activation approval trust digest is invalid");
+        }
+        if !key_fingerprint_matches(signer.key_blob_sha256, signer.key_fingerprint) {
+            return Err("ProductionV4 activation approval key fingerprint is invalid");
+        }
+        if !valid_signer_token(signer.key_type)
+            || signer.key_type.contains("-cert-v01@openssh.com")
+            || signer.key_type.starts_with("ssh-dss")
+        {
+            return Err("ProductionV4 activation approval key type is invalid");
+        }
+    }
+    if trust.producer.signer_identity == trust.independent_reproducer.signer_identity
+        || trust.producer.allowed_signers_sha256
+            == trust.independent_reproducer.allowed_signers_sha256
+        || trust.producer.key_blob_sha256 == trust.independent_reproducer.key_blob_sha256
+        || trust.producer.key_fingerprint == trust.independent_reproducer.key_fingerprint
+    {
+        return Err("ProductionV4 producer and reproducer approval authorities are not distinct");
+    }
+    Ok(())
+}
+
 fn is_repeated_byte(value: [u8; 32]) -> bool {
     value.iter().all(|byte| *byte == value[0])
 }
@@ -346,13 +504,6 @@ fn lower_hex(value: [u8; 32]) -> String {
     encoded
 }
 
-fn is_rfc5737(address: [u8; 4]) -> bool {
-    matches!(
-        address,
-        [192, 0, 2, _] | [198, 51, 100, _] | [203, 0, 113, _]
-    )
-}
-
 fn validate_production_network_identity(
     identity: ProductionRcNetworkIdentityPin,
 ) -> Result<(), &'static str> {
@@ -367,9 +518,6 @@ fn validate_production_network_identity(
     }
     if identity.virtual_genesis_timestamp == 0 {
         return Err("production RC virtual genesis timestamp is invalid");
-    }
-    if is_rfc5737(identity.bootstrap_ipv4) {
-        return Err("production RC bootstrap address is an RFC 5737 documentation address");
     }
     if identity.pow_limit == [0; 32] {
         return Err("production RC proof-of-work limit is zero");
@@ -509,6 +657,7 @@ pub fn validate_production_rc(
             return Err(error);
         }
     }
+    validate_production_v4_approval_trust(evidence.approval_trust)?;
     let artifacts = profile
         .production_v4_artifacts
         .ok_or("ProductionV4 artifact identity pins are absent")?;
@@ -593,9 +742,26 @@ pub fn canonical_production_v4_activation_evidence_json(
     let artifacts = profile
         .production_v4_artifacts
         .ok_or("ProductionV4 artifact identity pins are absent")?;
+    let trust = evidence.approval_trust;
     Ok(format!(
         concat!(
-            "{{\"artifacts\":{{",
+            "{{\"activation_approval_trust\":{{",
+            "\"contract_schema\":\"{}\",",
+            "\"independent_reproducer\":{{",
+            "\"allowed_signers_sha256\":\"{}\",",
+            "\"key_blob_sha256\":\"{}\",",
+            "\"key_fingerprint\":\"{}\",",
+            "\"key_type\":\"{}\",",
+            "\"signer_identity\":\"{}\"}},",
+            "\"producer\":{{",
+            "\"allowed_signers_sha256\":\"{}\",",
+            "\"key_blob_sha256\":\"{}\",",
+            "\"key_fingerprint\":\"{}\",",
+            "\"key_type\":\"{}\",",
+            "\"signer_identity\":\"{}\"}},",
+            "\"qualification_binding_sha256\":\"{}\",",
+            "\"ssh_keygen_sha256\":\"{}\"}},",
+            "\"artifacts\":{{",
             "\"bank\":{{\"blake3\":\"{}\",\"bytes\":\"{}\",\"sha256\":\"{}\"}},",
             "\"fixed_record\":{{\"blake3\":\"{}\",\"bytes\":\"{}\",\"sha256\":\"{}\"}}}},",
             "\"core_spec_sha256\":\"{}\",",
@@ -610,6 +776,19 @@ pub fn canonical_production_v4_activation_evidence_json(
             "\"schema\":\"{}\",",
             "\"source_commit\":\"{}\"}}\n"
         ),
+        trust.contract_schema,
+        trust.independent_reproducer.allowed_signers_sha256,
+        trust.independent_reproducer.key_blob_sha256,
+        trust.independent_reproducer.key_fingerprint,
+        trust.independent_reproducer.key_type,
+        trust.independent_reproducer.signer_identity,
+        trust.producer.allowed_signers_sha256,
+        trust.producer.key_blob_sha256,
+        trust.producer.key_fingerprint,
+        trust.producer.key_type,
+        trust.producer.signer_identity,
+        trust.qualification_binding_sha256,
+        trust.ssh_keygen_sha256,
         lower_hex(artifacts.bank.blake3),
         artifacts.bank.bytes,
         lower_hex(artifacts.bank.sha256),
@@ -671,6 +850,26 @@ mod tests {
             sha256: [0x49; 32],
         },
     };
+    const V4_APPROVAL_TRUST: ProductionV4ActivationApprovalTrust =
+        ProductionV4ActivationApprovalTrust {
+            contract_schema: "CMFD_PRODUCTION_V4_ACTIVATION_APPROVAL_SUBJECT_V1",
+            qualification_binding_sha256: "9999999999999999999999999999999999999999999999999999999999999999",
+            ssh_keygen_sha256: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            producer: ProductionV4ActivationSignerTrust {
+                signer_identity: "producer@example.invalid",
+                allowed_signers_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                key_blob_sha256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                key_fingerprint: "SHA256:u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7s",
+                key_type: "ssh-ed25519",
+            },
+            independent_reproducer: ProductionV4ActivationSignerTrust {
+                signer_identity: "reproducer@example.invalid",
+                allowed_signers_sha256: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                key_blob_sha256: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                key_fingerprint: "SHA256:3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d0",
+                key_type: "ssh-ed25519",
+            },
+        };
     const V4_EVIDENCE: ProductionV4ActivationEvidence = ProductionV4ActivationEvidence {
         schema: "CMFD_PRODUCTION_V4_ACTIVATION_V1",
         qualification_source_commit: "1111111111111111111111111111111111111111",
@@ -680,6 +879,7 @@ mod tests {
         core_spec_sha256: "6666666666666666666666666666666666666666666666666666666666666666",
         core_vector_sha256: "7777777777777777777777777777777777777777777777777777777777777777",
         proof_algebra_sha256: "8888888888888888888888888888888888888888888888888888888888888888",
+        approval_trust: V4_APPROVAL_TRUST,
     };
     const V4_ARTIFACTS: ProductionV4ArtifactIdentityPins = ProductionV4ArtifactIdentityPins {
         bank: ProductionV3FileIdentityPin {
@@ -714,7 +914,6 @@ mod tests {
         network_id: varied(1),
         virtual_genesis_hash: varied(65),
         virtual_genesis_timestamp: 1_800_000_000,
-        bootstrap_ipv4: [1, 1, 1, 1],
         pow_limit: [0xff; 32],
         steward_reward_destination: varied(129),
         community_reward_destination: varied(193),
@@ -744,6 +943,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "production-rc"))]
     fn current_source_tree_fails_the_production_rc_gate() {
         assert_eq!(
             validate_production_rc(COMPILED_RELEASE_PROFILE, BUILD_SOURCE_COMMIT),
@@ -906,6 +1106,107 @@ mod tests {
             validate_production_rc(invalid_artifacts, BUILD_SOURCE_COMMIT),
             Err("ProductionV4 artifact identity pins are invalid")
         );
+
+        let self_approved = CompiledReleaseProfile {
+            production_v4_activation: Some(ProductionV4ActivationEvidence {
+                approval_trust: ProductionV4ActivationApprovalTrust {
+                    independent_reproducer: V4_APPROVAL_TRUST.producer,
+                    ..V4_APPROVAL_TRUST
+                },
+                ..V4_EVIDENCE
+            }),
+            ..v4_profile()
+        };
+        assert_eq!(
+            validate_production_rc(self_approved, BUILD_SOURCE_COMMIT),
+            Err("ProductionV4 producer and reproducer approval authorities are not distinct")
+        );
+    }
+
+    #[test]
+    fn production_rc_gate_rejects_malformed_approval_trust() {
+        let profile_with_trust = |approval_trust| CompiledReleaseProfile {
+            production_v4_activation: Some(ProductionV4ActivationEvidence {
+                approval_trust,
+                ..V4_EVIDENCE
+            }),
+            ..v4_profile()
+        };
+
+        let zero_verifier = ProductionV4ActivationApprovalTrust {
+            ssh_keygen_sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+            ..V4_APPROVAL_TRUST
+        };
+        assert_eq!(
+            validate_production_rc(profile_with_trust(zero_verifier), BUILD_SOURCE_COMMIT),
+            Err("ProductionV4 OpenSSH verifier trust digest is invalid")
+        );
+
+        let zero_policy = ProductionV4ActivationApprovalTrust {
+            producer: ProductionV4ActivationSignerTrust {
+                allowed_signers_sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+                ..V4_APPROVAL_TRUST.producer
+            },
+            ..V4_APPROVAL_TRUST
+        };
+        assert_eq!(
+            validate_production_rc(profile_with_trust(zero_policy), BUILD_SOURCE_COMMIT),
+            Err("ProductionV4 activation approval trust digest is invalid")
+        );
+
+        let bad_fingerprint = ProductionV4ActivationApprovalTrust {
+            producer: ProductionV4ActivationSignerTrust {
+                key_fingerprint: "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                ..V4_APPROVAL_TRUST.producer
+            },
+            ..V4_APPROVAL_TRUST
+        };
+        assert_eq!(
+            validate_production_rc(profile_with_trust(bad_fingerprint), BUILD_SOURCE_COMMIT),
+            Err("ProductionV4 activation approval key fingerprint is invalid")
+        );
+
+        for key_type in ["ssh-dss", "ssh-ed25519-cert-v01@openssh.com"] {
+            let invalid_key_type = ProductionV4ActivationApprovalTrust {
+                producer: ProductionV4ActivationSignerTrust {
+                    key_type,
+                    ..V4_APPROVAL_TRUST.producer
+                },
+                ..V4_APPROVAL_TRUST
+            };
+            assert_eq!(
+                validate_production_rc(profile_with_trust(invalid_key_type), BUILD_SOURCE_COMMIT),
+                Err("ProductionV4 activation approval key type is invalid")
+            );
+        }
+
+        for duplicate in ["identity", "policy", "key"] {
+            let independent_reproducer = match duplicate {
+                "identity" => ProductionV4ActivationSignerTrust {
+                    signer_identity: V4_APPROVAL_TRUST.producer.signer_identity,
+                    ..V4_APPROVAL_TRUST.independent_reproducer
+                },
+                "policy" => ProductionV4ActivationSignerTrust {
+                    allowed_signers_sha256: V4_APPROVAL_TRUST.producer.allowed_signers_sha256,
+                    ..V4_APPROVAL_TRUST.independent_reproducer
+                },
+                "key" => ProductionV4ActivationSignerTrust {
+                    key_blob_sha256: V4_APPROVAL_TRUST.producer.key_blob_sha256,
+                    key_fingerprint: V4_APPROVAL_TRUST.producer.key_fingerprint,
+                    ..V4_APPROVAL_TRUST.independent_reproducer
+                },
+                _ => unreachable!(),
+            };
+            let not_distinct = ProductionV4ActivationApprovalTrust {
+                independent_reproducer,
+                ..V4_APPROVAL_TRUST
+            };
+            assert_eq!(
+                validate_production_rc(profile_with_trust(not_distinct), BUILD_SOURCE_COMMIT),
+                Err("ProductionV4 producer and reproducer approval authorities are not distinct"),
+                "{duplicate}"
+            );
+        }
     }
 
     #[test]
@@ -936,7 +1237,18 @@ mod tests {
         assert_eq!(
             String::from_utf8(encoded).unwrap(),
             concat!(
-                "{\"artifacts\":{\"bank\":{\"blake3\":\"4444444444444444444444444444444444444444444444444444444444444444\",",
+                "{\"activation_approval_trust\":{\"contract_schema\":\"CMFD_PRODUCTION_V4_ACTIVATION_APPROVAL_SUBJECT_V1\",",
+                "\"independent_reproducer\":{\"allowed_signers_sha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",",
+                "\"key_blob_sha256\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",",
+                "\"key_fingerprint\":\"SHA256:3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d0\",",
+                "\"key_type\":\"ssh-ed25519\",\"signer_identity\":\"reproducer@example.invalid\"},",
+                "\"producer\":{\"allowed_signers_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",",
+                "\"key_blob_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",",
+                "\"key_fingerprint\":\"SHA256:u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7s\",",
+                "\"key_type\":\"ssh-ed25519\",\"signer_identity\":\"producer@example.invalid\"},",
+                "\"qualification_binding_sha256\":\"9999999999999999999999999999999999999999999999999999999999999999\",",
+                "\"ssh_keygen_sha256\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"},",
+                "\"artifacts\":{\"bank\":{\"blake3\":\"4444444444444444444444444444444444444444444444444444444444444444\",",
                 "\"bytes\":\"1\",\"sha256\":\"4545454545454545454545454545454545454545454545454545454545454545\"},",
                 "\"fixed_record\":{\"blake3\":\"4646464646464646464646464646464646464646464646464646464646464646\",",
                 "\"bytes\":\"2\",\"sha256\":\"4747474747474747474747474747474747474747474747474747474747474747\"}},",
@@ -1044,14 +1356,6 @@ mod tests {
             validate_production_rc(profile(Some(identity)), BUILD_SOURCE_COMMIT)
                 .unwrap_err()
                 .contains("placeholder")
-        );
-
-        let mut identity = NETWORK_IDENTITY;
-        identity.bootstrap_ipv4 = [203, 0, 113, 10];
-        assert!(
-            validate_production_rc(profile(Some(identity)), BUILD_SOURCE_COMMIT)
-                .unwrap_err()
-                .contains("RFC 5737")
         );
 
         let mut identity = NETWORK_IDENTITY;

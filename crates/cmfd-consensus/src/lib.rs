@@ -1,3 +1,14 @@
+/// Exact byte length and independent content digests for a release artifact.
+///
+/// This identity is proof-system neutral so verifier boundaries can compile
+/// without enabling an unrelated proof implementation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileIdentity {
+    pub bytes: u64,
+    pub blake3: [u8; 32],
+    pub sha256: [u8; 32],
+}
+
 pub mod chain;
 pub mod difficulty;
 #[cfg(feature = "dory-bls12-381-prototype")]
@@ -403,8 +414,9 @@ pub use wire::{
     FORGEMATRIX_V3_CANDIDATE_PROOF_TAG, FORGEMATRIX_V4_CANDIDATE_PROOF_TAG, MAX_BLOCK_BYTES,
     MAX_FORGEMATRIX_V3_STRUCTURED_PROOF_BYTES, MAX_FORGEMATRIX_V4_TRANSPARENT_PROOF_BYTES,
     MAX_PROOF_BYTES, MAX_TRANSACTION_BYTES, PRODUCTION_V4_MAX_BLOCK_BYTES,
-    PRODUCTION_V4_MAX_PROOF_BYTES, PRODUCTION_V4_TESTNET_NETWORK_ID, TRANSACTION_KIND,
-    WIRE_HEADER_BYTES, WIRE_VERSION, WireError, decode_block, decode_forgematrix_proof,
-    decode_transaction, encode_block, encode_forgematrix_proof, encode_transaction,
-    max_block_bytes_for_network, max_proof_bytes_for_network, network_magic,
+    PRODUCTION_V4_MAX_PROOF_BYTES, PRODUCTION_V4_RCNET1_NETWORK_ID,
+    PRODUCTION_V4_TESTNET_NETWORK_ID, TRANSACTION_KIND, WIRE_HEADER_BYTES, WIRE_VERSION, WireError,
+    decode_block, decode_forgematrix_proof, decode_transaction, encode_block,
+    encode_forgematrix_proof, encode_transaction, max_block_bytes_for_network,
+    max_proof_bytes_for_network, network_magic,
 };

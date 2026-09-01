@@ -14,6 +14,7 @@ import io
 import ipaddress
 import json
 import os
+import platform as host_platform
 import re
 import shutil
 import stat
@@ -22,10 +23,12 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-import tomllib
 import zipfile
 import zlib
 from pathlib import Path, PurePosixPath
+
+import production_v4_activation_approval as activation_approval
+import tomllib
 
 try:
     import blake3
@@ -79,6 +82,42 @@ PRODUCTION_V3_FRESH_PROCESS_VERIFIER_BINARY_NAME = (
 PRODUCTION_V3_FRESH_PROCESS_VERIFIER_REPORT_NAME = (
     "PRODUCTION-V3-FRESH-PROCESS-VERIFIER-REPORT.json"
 )
+PRODUCTION_V4_ACTIVATION_NAME = "PRODUCTION-V4-ACTIVATION.json"
+PRODUCTION_V4_QUALIFICATION_MANIFEST_NAME = (
+    "PRODUCTION-V4-QUALIFICATION-MANIFEST.json"
+)
+PRODUCTION_V4_FRESH_PROCESS_VERIFIER_SCRIPT_NAME = (
+    "PRODUCTION-V4-FRESH-PROCESS-VERIFIER.py"
+)
+PRODUCTION_V4_FRESH_PROCESS_VERIFIER_REPORT_NAME = (
+    "PRODUCTION-V4-FRESH-PROCESS-VERIFIER-REPORT.json"
+)
+PRODUCTION_V4_PRODUCER_APPROVAL_NAME = (
+    "PRODUCTION-V4-ACTIVATION-PRODUCER-APPROVAL.json"
+)
+PRODUCTION_V4_PRODUCER_APPROVAL_SIGNATURE_NAME = (
+    "PRODUCTION-V4-ACTIVATION-PRODUCER-APPROVAL.json.sig"
+)
+PRODUCTION_V4_PRODUCER_ALLOWED_SIGNERS_NAME = (
+    "PRODUCTION-V4-ACTIVATION-PRODUCER.allowed_signers"
+)
+PRODUCTION_V4_REPRODUCER_APPROVAL_NAME = (
+    "PRODUCTION-V4-ACTIVATION-REPRODUCER-APPROVAL.json"
+)
+PRODUCTION_V4_REPRODUCER_APPROVAL_SIGNATURE_NAME = (
+    "PRODUCTION-V4-ACTIVATION-REPRODUCER-APPROVAL.json.sig"
+)
+PRODUCTION_V4_REPRODUCER_ALLOWED_SIGNERS_NAME = (
+    "PRODUCTION-V4-ACTIVATION-REPRODUCER.allowed_signers"
+)
+PRODUCTION_V4_ACTIVATION_PIN_RELATIVE = (
+    "crates/cmfd-node/production_v4_activation_pin.inc.rs"
+)
+PRODUCTION_V4_VERIFIER_ENTRYPOINT_RELATIVE = (
+    "scripts/production-v4-independent-verifier.py"
+)
+PRODUCTION_V4_RCNET_INPUT_MANIFEST_NAME = "production-v4-rcnet-1-inputs.json"
+PRODUCTION_V4_RCNET_NETWORK_NAME = "CommonFoundry RCNet-1"
 PRODUCTION_RC_WINDOWS_RUNTIME_PACKAGE_NAME = (
     "commonfoundry-rc-runtime-windows-x86_64.zip"
 )
@@ -88,6 +127,9 @@ PRODUCTION_RC_LINUX_RUNTIME_PACKAGE_NAME = (
 PRODUCTION_RC_WINDOWS_ATTESTATION_NAME = "RUNTIME-ATTESTATION-WINDOWS-X86_64.json"
 PRODUCTION_RC_LINUX_ATTESTATION_NAME = "RUNTIME-ATTESTATION-LINUX-X86_64.json"
 PRODUCTION_RC_RUNTIME_ATTESTATION_SCHEMA = "CMFD_RUNTIME_NETWORK_INFO_ATTESTATION_V1"
+PRODUCTION_V4_RUNTIME_ATTESTATION_SCHEMA = "CMFD_RUNTIME_NETWORK_INFO_ATTESTATION_V3"
+WALLET_RUNTIME_IDENTITY_SCHEMA = "CMFD_WALLET_RUNTIME_IDENTITY_V1"
+WALLET_RUNTIME_IDENTITY_ROLE = "common-foundry-wallet"
 PRODUCTION_RC_RUNTIME_ROOTS = {
     "windows-x86_64": "commonfoundry-rc-runtime-windows-x86_64",
     "linux-x86_64": "commonfoundry-rc-runtime-linux-x86_64",
@@ -96,6 +138,58 @@ PRODUCTION_V3_PACKAGE_ARTIFACT_DIRECTORY = "production-v3"
 PRODUCTION_V3_PACKAGE_BANK = "MODEL-V2.bank"
 PRODUCTION_V3_PACKAGE_MANIFEST = "MODEL-V2.manifest.json"
 PRODUCTION_V3_PACKAGE_RECORD_V2 = "DORY-V3-MODEL-RECORD-V2.json"
+PRODUCTION_V4_PACKAGE_ARTIFACT_DIRECTORY = "production-v4"
+PRODUCTION_V4_PACKAGE_BANK = "MODEL-V2.bank"
+PRODUCTION_V4_PACKAGE_FIXED_RECORD = "FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json"
+PRODUCTION_V4_MODEL_BANK_FILE_BYTES = 6_442_975_416
+PRODUCTION_V4_MODEL_BANK_FILE_BLAKE3 = (
+    "b8be8450b933dc759aa34f2d60e73cf4eac3064407c6a9f48372175abe87b6ac"
+)
+PRODUCTION_V4_MODEL_BANK_FILE_SHA256 = (
+    "5f9b213c3bda51b74e4ebabb26607b67385d613aa8d99af915a48ab063e17d4e"
+)
+PRODUCTION_V4_FIXED_RECORD_FILE_BYTES = 6_973
+PRODUCTION_V4_FIXED_RECORD_FILE_BLAKE3 = (
+    "3c9587fb833234cdfa88b97502a89abba613b9002c16bb6483b34d5399deebd0"
+)
+PRODUCTION_V4_FIXED_RECORD_FILE_SHA256 = (
+    "ea218831aa567e486426ded77c84a5752a817329c496e3557c6d43577f0afe79"
+)
+PRODUCTION_V4_RCNET_INPUT_NAMES = (
+    PRODUCTION_V4_PACKAGE_BANK,
+    PRODUCTION_V4_PACKAGE_FIXED_RECORD,
+    *(
+        f"FORGEMATRIX-V4-FIXED-BANK-{bank}.{suffix}"
+        for bank in range(3)
+        for suffix in ("row-major.codeword", "tree")
+    ),
+)
+PRODUCTION_V4_VERIFIER_FILE_NAMES = (
+    "production-v4-verify-qualification.py",
+    "production-v4-independent-verifier.py",
+    "production_v4_independent_verifier.py",
+    "production_v4_transcript.py",
+    "production_v4_poseidon.py",
+    "production_v4_wire.py",
+)
+PRODUCTION_V4_ACTIVATION_APPROVAL_ERROR = (
+    "ProductionV4 activation requires signed producer and independent reproducer "
+    "approval payloads, identities, and trusted allowed-signers authorities"
+)
+PRODUCTION_V4_CORE_SPEC_SHA256 = (
+    "507075fb6d22b7ac0968508b18c48a09a017806e7d4e0454b71f8ae88440df84"
+)
+PRODUCTION_V4_CORE_VECTOR_SHA256 = (
+    "c885ae499a65c5bb965e08f4894a0d2768d823b0e23979958f00e3db73e0b168"
+)
+PRODUCTION_V4_PROOF_ALGEBRA_SHA256 = (
+    "5a686ad518a7d957b8af908fb52cd58056e63da4dab578a40d4ef097654aaf33"
+)
+PRODUCTION_V4_FROZEN_SPEC_SHA256 = {
+    "docs/consensus/production-v4-core-spec-v1.md": PRODUCTION_V4_CORE_SPEC_SHA256,
+    "docs/consensus/production-v4-core-vector-v1.json": PRODUCTION_V4_CORE_VECTOR_SHA256,
+    "docs/consensus/production-v4-proof-algebra-v1.md": PRODUCTION_V4_PROOF_ALGEBRA_SHA256,
+}
 INSECURE_DEV_REWARD_DESTINATIONS = {
     "4f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa",
     "6360e856310ce5d294e8be33fc807077dc56ac80d95d9cd4ddbd21325eff73f7",
@@ -105,6 +199,39 @@ PRODUCTION_RC_SERVICE_PORTS = {
     "p2p_port": 19_444,
     "pool_port": 19_445,
 }
+PRODUCTION_RC_BOOTSTRAP_PEER = "173.249.35.251:19444"
+PRODUCTION_RC_CONSENSUS_FINGERPRINT = (
+    "fadb0d51f3df9a33a414dac2b8a82f8c6f17b84c8ab665aae9da07c406d215d4"
+)
+RCNET_LAUNCH_CANDIDATE_V2_SCHEMA = "CMFD_RCNET_LAUNCH_CANDIDATE_V2"
+RCNET_LAUNCH_ROOT_V2_CONTEXT = "CMFD/RCNET/LAUNCH-ROOT/V2"
+RCNET_NETWORK_ID_V2_CONTEXT = "CMFD/RCNET/NETWORK-ID/V2"
+RCNET_VIRTUAL_GENESIS_V2_CONTEXT = "CMFD/RCNET/VIRTUAL-GENESIS/V2"
+PRODUCTION_RC_NETWORK_ID = (
+    "3e99d45959c19c0053d8e9fef34875b57b46a8a1ce330637daddab515bc7b92d"
+)
+PRODUCTION_RC_LAUNCH_ROOT = (
+    "748f32c069e721221b8ba17df358eb35ec0e05d93f3a31ee0c1a135c87bb7b85"
+)
+PRODUCTION_RC_VIRTUAL_GENESIS_HASH = (
+    "a572b6ce50978511ce8771db6603a602faccf3802cf0d4791c1ce4e467ba6b71"
+)
+PRODUCTION_RC_VIRTUAL_GENESIS_TIMESTAMP = "1788800400"
+PRODUCTION_RC_POW_LIMIT = (
+    "003fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+)
+PRODUCTION_V4_PROOF_SYSTEM_DIGEST = (
+    "e849e3bfc83f8f8dd0f1fc1100879417718ba2bffb92af5cd649b61c720675a3"
+)
+PRODUCTION_V4_MODEL_MANIFEST_DIGEST = (
+    "68f6fe674f75a363c62c275ebb11fa74aa089e9bbde5bcb952ec35b8890b575c"
+)
+PRODUCTION_V4_FIXED_ARTIFACT_FORMAT_DIGEST = (
+    "1c26e090041e96e5ef805747b87cf5bd591d5d127a3b86dee5cca5945e57df44"
+)
+PRODUCTION_V4_FIXED_ARTIFACT_RECORD_DIGEST = (
+    "2efd2c4244bbd7808547b85266987544233fbe339f445135b07843aa8893d45e"
+)
 PRODUCTION_RC_VERSION_FILES = (
     "apps/wallet/package.json",
     "apps/wallet/src-tauri/Cargo.toml",
@@ -171,7 +298,11 @@ def is_production_rc_label(label: str) -> bool:
     )
 
 
-def reject_production_rc_source_assets(stage_files: dict[str, Path]) -> None:
+def reject_production_rc_source_assets(
+    stage_files: dict[str, Path],
+    *,
+    allowed_source_assets: frozenset[str] = frozenset(),
+) -> None:
     """Keep reviewed binary stages from accidentally carrying source bundles."""
     for name in stage_files:
         if name in {
@@ -180,13 +311,13 @@ def reject_production_rc_source_assets(stage_files: dict[str, Path]) -> None:
             PROVENANCE_NAME,
             CHECKSUM_NAME,
             CHECKSUM_SIGNATURE_NAME,
-        }:
+        } or name in allowed_source_assets:
             continue
         normalized = name.strip().lower()
         if (
             SOURCE_ASSET_TOKEN_RE.search(normalized)
             or normalized in {"cargo.toml", "cargo.lock"}
-            or normalized.endswith((".crate", ".rs"))
+            or normalized.endswith((".crate", ".py", ".rs"))
         ):
             raise IntegrityError(
                 f"production RC binary release contains a source-like asset: {name}"
@@ -225,22 +356,42 @@ def _json_object_bytes(data: bytes, label: str) -> dict[str, object]:
     return value
 
 
-def _runtime_package_paths(platform: str) -> tuple[set[str], str]:
+def _runtime_artifact_directory(selection: str) -> str:
+    if selection == "ProductionV3":
+        return PRODUCTION_V3_PACKAGE_ARTIFACT_DIRECTORY
+    if selection == "ProductionV4":
+        return PRODUCTION_V4_PACKAGE_ARTIFACT_DIRECTORY
+    raise IntegrityError(f"unsupported production proof selection: {selection}")
+
+
+def _runtime_package_paths(
+    platform: str, selection: str = "ProductionV3"
+) -> tuple[set[str], str | None]:
     if platform == "windows-x86_64":
         suffix = ".exe"
     elif platform == "linux-x86_64":
         suffix = ""
     else:  # pragma: no cover - callers use the two frozen release targets.
         raise IntegrityError(f"unsupported production runtime platform: {platform}")
-    worker = f"cmfd-proof-worker{suffix}"
+    artifact_directory = _runtime_artifact_directory(selection)
+    worker = f"cmfd-proof-worker{suffix}" if selection == "ProductionV3" else None
+    if selection == "ProductionV4":
+        artifacts = {
+            f"{artifact_directory}/{PRODUCTION_V4_PACKAGE_BANK}",
+            f"{artifact_directory}/{PRODUCTION_V4_PACKAGE_FIXED_RECORD}",
+        }
+    else:
+        artifacts = {
+            f"{artifact_directory}/{PRODUCTION_V3_PACKAGE_BANK}",
+            f"{artifact_directory}/{PRODUCTION_V3_PACKAGE_MANIFEST}",
+            f"{artifact_directory}/{PRODUCTION_V3_PACKAGE_RECORD_V2}",
+        }
     return (
         {
             f"cmfd-node{suffix}",
             f"common-foundry-wallet{suffix}",
-            worker,
-            f"{PRODUCTION_V3_PACKAGE_ARTIFACT_DIRECTORY}/{PRODUCTION_V3_PACKAGE_BANK}",
-            f"{PRODUCTION_V3_PACKAGE_ARTIFACT_DIRECTORY}/{PRODUCTION_V3_PACKAGE_MANIFEST}",
-            f"{PRODUCTION_V3_PACKAGE_ARTIFACT_DIRECTORY}/{PRODUCTION_V3_PACKAGE_RECORD_V2}",
+            *({worker} if worker is not None else set()),
+            *artifacts,
         },
         worker,
     )
@@ -292,7 +443,7 @@ def _stream_sha256(
     digest = hashlib.sha256()
     if blake3 is None:
         raise IntegrityError(
-            "ProductionV3 package inspection requires the pinned Python blake3 dependency"
+            "production runtime inspection requires the pinned Python blake3 dependency"
         )
     blake3_digest = blake3.blake3()
     count = 0
@@ -313,10 +464,16 @@ def _stream_sha256(
     return count, digest.hexdigest(), blake3_digest.hexdigest(), bytes(captured)
 
 
-def _runtime_member_limit(relative: str) -> int:
-    if relative.endswith((PRODUCTION_V3_PACKAGE_MANIFEST, PRODUCTION_V3_PACKAGE_RECORD_V2)):
+def _runtime_member_limit(relative: str, selection: str = "ProductionV3") -> int:
+    if relative.endswith(
+        (
+            PRODUCTION_V3_PACKAGE_MANIFEST,
+            PRODUCTION_V3_PACKAGE_RECORD_V2,
+            PRODUCTION_V4_PACKAGE_FIXED_RECORD,
+        )
+    ):
         return MAX_RELEASE_GATE_JSON_BYTES
-    if relative.startswith(f"{PRODUCTION_V3_PACKAGE_ARTIFACT_DIRECTORY}/"):
+    if relative.startswith(f"{_runtime_artifact_directory(selection)}/"):
         return MAX_RUNTIME_ARTIFACT_BYTES
     return MAX_RUNTIME_BINARY_BYTES
 
@@ -916,10 +1073,16 @@ def _validate_gzip_tar_framing(
 
 
 def _validate_runtime_member_metadata(
-    *, platform: str, member: object, relative: str, is_directory: bool
+    *,
+    platform: str,
+    member: object,
+    relative: str,
+    is_directory: bool,
+    selection: str = "ProductionV3",
 ) -> None:
+    artifact_directory = _runtime_artifact_directory(selection)
     expected_mode = 0o755 if is_directory or not relative.startswith(
-        f"{PRODUCTION_V3_PACKAGE_ARTIFACT_DIRECTORY}/"
+        f"{artifact_directory}/"
     ) else 0o644
     if platform == "windows-x86_64":
         if not isinstance(member, zipfile.ZipInfo):  # pragma: no cover
@@ -963,13 +1126,16 @@ def _validate_runtime_member_metadata(
 
 
 def _inspect_runtime_members(
-    *, platform: str, members: object, open_member: object
+    *,
+    platform: str,
+    members: object,
+    open_member: object,
+    selection: str = "ProductionV3",
 ) -> dict[str, dict[str, object]]:
-    expected, _ = _runtime_package_paths(platform)
+    expected, _ = _runtime_package_paths(platform, selection)
+    artifact_directory = _runtime_artifact_directory(selection)
     expected_root = _runtime_package_root(platform)
-    expected_order = sorted(
-        expected | {"", PRODUCTION_V3_PACKAGE_ARTIFACT_DIRECTORY}
-    )
+    expected_order = sorted(expected | {"", artifact_directory})
     rows: dict[str, dict[str, object]] = {}
     root: str | None = None
     seen: set[str] = set()
@@ -987,9 +1153,10 @@ def _inspect_runtime_members(
             member=member,
             relative=relative,
             is_directory=is_directory,
+            selection=selection,
         )
         if is_directory:
-            if relative not in ("", PRODUCTION_V3_PACKAGE_ARTIFACT_DIRECTORY):
+            if relative not in ("", artifact_directory):
                 raise IntegrityError(f"{platform} runtime package has an unexpected directory")
             continue
         if not is_regular or not relative or relative in rows:
@@ -1003,16 +1170,20 @@ def _inspect_runtime_members(
             capture_bytes = (
                 size
                 if relative.endswith(
-                    (PRODUCTION_V3_PACKAGE_MANIFEST, PRODUCTION_V3_PACKAGE_RECORD_V2)
+                    (
+                        PRODUCTION_V3_PACKAGE_MANIFEST,
+                        PRODUCTION_V3_PACKAGE_RECORD_V2,
+                        PRODUCTION_V4_PACKAGE_FIXED_RECORD,
+                    )
                 )
                 else MAX_EXECUTABLE_HEADER_BYTES
-                if not relative.startswith(f"{PRODUCTION_V3_PACKAGE_ARTIFACT_DIRECTORY}/")
+                if not relative.startswith(f"{artifact_directory}/")
                 else 0
             )
             actual_size, digest, blake3_hash, captured = _stream_sha256(
                 source,
                 expected_size=size,
-                maximum_size=_runtime_member_limit(relative),
+                maximum_size=_runtime_member_limit(relative, selection),
                 label=f"{platform} runtime {relative}",
                 capture_bytes=capture_bytes,
             )
@@ -1034,24 +1205,26 @@ def _preflight_runtime_tar_gz(
     handle: object,
     platform: str,
     expected_artifact_sizes: dict[str, int] | None = None,
+    selection: str = "ProductionV3",
 ) -> tuple[list[tarfile.TarInfo], int, int, str]:
-    expected, _ = _runtime_package_paths(platform)
+    expected, _ = _runtime_package_paths(platform, selection)
+    artifact_directory = _runtime_artifact_directory(selection)
     expected_root = _runtime_package_root(platform)
-    expected_order = sorted(
-        expected | {"", PRODUCTION_V3_PACKAGE_ARTIFACT_DIRECTORY}
-    )
+    expected_order = sorted(expected | {"", artifact_directory})
     expected_artifact_sizes = expected_artifact_sizes or {}
     specifications: list[tuple[str, bool, int | None, int, int]] = []
     for relative in expected_order:
         is_directory = relative in (
             "",
-            PRODUCTION_V3_PACKAGE_ARTIFACT_DIRECTORY,
+            artifact_directory,
         )
         name = expected_root if not relative else f"{expected_root}/{relative}"
         exact_size = 0 if is_directory else expected_artifact_sizes.get(relative)
-        maximum_size = 0 if is_directory else _runtime_member_limit(relative)
+        maximum_size = (
+            0 if is_directory else _runtime_member_limit(relative, selection)
+        )
         mode = 0o755 if is_directory or not relative.startswith(
-            f"{PRODUCTION_V3_PACKAGE_ARTIFACT_DIRECTORY}/"
+            f"{artifact_directory}/"
         ) else 0o644
         specifications.append(
             (name, is_directory, exact_size, maximum_size, mode)
@@ -1068,6 +1241,7 @@ def _inspect_runtime_package_archive(
     path: Path,
     platform: str,
     expected_artifact_sizes: dict[str, int] | None = None,
+    selection: str = "ProductionV3",
 ) -> dict[str, dict[str, object]]:
     package = _regular_file(path, f"{platform} runtime package")
     try:
@@ -1114,6 +1288,7 @@ def _inspect_runtime_package_archive(
                         platform=platform,
                         members=members,
                         open_member=lambda member: archive.open(member, "r"),
+                        selection=selection,
                     )
                 if _sha256_handle(raw) != initial_digest:
                     raise IntegrityError("Windows runtime ZIP changed during inspection")
@@ -1123,7 +1298,7 @@ def _inspect_runtime_package_archive(
         ) as (_, raw, _):
             initial_digest = _sha256_handle(raw)
             _, _, _, framing_digest = _preflight_runtime_tar_gz(
-                raw, platform, expected_artifact_sizes
+                raw, platform, expected_artifact_sizes, selection
             )
             if framing_digest != initial_digest:
                 raise IntegrityError("Linux runtime tar.gz changed during framing validation")
@@ -1142,6 +1317,7 @@ def _inspect_runtime_package_archive(
                         for member in archive
                     ),
                     open_member=archive.extractfile,
+                    selection=selection,
                 )
             if _sha256_handle(raw) != initial_digest:
                 raise IntegrityError("Linux runtime tar.gz changed during inspection")
@@ -1161,6 +1337,21 @@ def _compiled_runtime_worker(proof: dict[str, object], platform: str) -> str:
         f"compiled {platform} runtime proof worker",
         reject_repeated=True,
     )
+
+
+def _json_byte_array_hex(value: object, label: str) -> str:
+    if (
+        not isinstance(value, list)
+        or len(value) != 32
+        or any(
+            not isinstance(item, int)
+            or isinstance(item, bool)
+            or not 0 <= item <= 255
+            for item in value
+        )
+    ):
+        raise IntegrityError(f"{label} is not an exact 32-byte array")
+    return bytes(value).hex()
 
 
 def _validate_pe_x86_64(header: bytes, size: int, label: str) -> None:
@@ -1278,7 +1469,7 @@ def _validate_elf_x86_64(header: bytes, size: int, label: str) -> None:
         raise IntegrityError(f"{label} has no executable ELF entry point")
 
 
-def _validate_runtime_rows(
+def _validate_runtime_rows_v3(
     *,
     rows: dict[str, dict[str, object]],
     platform: str,
@@ -1391,6 +1582,155 @@ def _validate_runtime_rows(
             )
 
 
+def _validate_runtime_rows_v4(
+    *,
+    rows: dict[str, dict[str, object]],
+    platform: str,
+    staged_network_info: dict[str, object],
+) -> None:
+    suffix = ".exe" if platform == "windows-x86_64" else ""
+    for name in (f"cmfd-node{suffix}", f"common-foundry-wallet{suffix}"):
+        header = rows[name]["captured"]
+        if not isinstance(header, bytes):  # pragma: no cover - internal row contract.
+            raise IntegrityError(f"{platform} runtime {name} header is unavailable")
+        if platform == "windows-x86_64":
+            _validate_pe_x86_64(header, rows[name]["bytes"], f"{platform} runtime {name}")
+        else:
+            _validate_elf_x86_64(header, rows[name]["bytes"], f"{platform} runtime {name}")
+
+    proof = staged_network_info.get("proof_of_work")
+    if not isinstance(proof, dict) or proof.get("selection") != "ProductionV4":
+        raise IntegrityError("staged NETWORK-INFO proof identity is not ProductionV4")
+    pins = proof.get("artifacts")
+    if not isinstance(pins, dict) or set(pins) != {"bank", "fixed_record"}:
+        raise IntegrityError(f"{platform} runtime artifact identity pins are incomplete")
+    file_names = {
+        "bank": PRODUCTION_V4_PACKAGE_BANK,
+        "fixed_record": PRODUCTION_V4_PACKAGE_FIXED_RECORD,
+    }
+    labels = {"bank": "model bank", "fixed_record": "fixed artifact record"}
+    for role, file_name in file_names.items():
+        pin = _require_exact_fields(
+            pins.get(role), {"bytes", "blake3", "sha256"}, f"{platform} {role} pin"
+        )
+        try:
+            expected_bytes = int(pin["bytes"])
+        except (TypeError, ValueError) as error:
+            raise IntegrityError(f"{platform} {role} byte length is invalid") from error
+        if str(expected_bytes) != pin["bytes"] or expected_bytes <= 0:
+            raise IntegrityError(f"{platform} {role} byte length is invalid")
+        expected_blake3 = _require_hex256(
+            pin["blake3"], f"{platform} {role} BLAKE3", reject_repeated=False
+        )
+        expected_sha256 = _require_hex256(
+            pin["sha256"], f"{platform} {role} SHA-256", reject_repeated=False
+        )
+        relative = f"{PRODUCTION_V4_PACKAGE_ARTIFACT_DIRECTORY}/{file_name}"
+        row = rows[relative]
+        if (
+            row["bytes"] != expected_bytes
+            or row["sha256"] != expected_sha256
+            or row["blake3"] != expected_blake3
+        ):
+            raise IntegrityError(
+                f"{platform} packaged {labels[role]} does not match NETWORK-INFO.json"
+            )
+    if pins["fixed_record"] != {
+        "bytes": str(PRODUCTION_V4_FIXED_RECORD_FILE_BYTES),
+        "blake3": PRODUCTION_V4_FIXED_RECORD_FILE_BLAKE3,
+        "sha256": PRODUCTION_V4_FIXED_RECORD_FILE_SHA256,
+    }:
+        raise IntegrityError(
+            f"{platform} fixed artifact record does not match the immutable ProductionV4 file"
+        )
+
+    record_row = rows[
+        f"{PRODUCTION_V4_PACKAGE_ARTIFACT_DIRECTORY}/{PRODUCTION_V4_PACKAGE_FIXED_RECORD}"
+    ]
+    record_bytes = record_row["captured"]
+    if not isinstance(record_bytes, bytes):  # pragma: no cover - internal row contract.
+        raise IntegrityError(f"{platform} packaged fixed artifact record is unavailable")
+    record = _json_object_bytes(
+        record_bytes, f"{platform} packaged fixed artifact record"
+    )
+    _require_exact_fields(
+        record,
+        {
+            "record_version",
+            "proof_system_digest",
+            "manifest",
+            "manifest_digest",
+            "artifact_format_digest",
+            "banks",
+            "record_digest",
+        },
+        f"{platform} packaged fixed artifact record",
+    )
+    canonical_record = (
+        json.dumps(record, indent=2, ensure_ascii=False) + "\n"
+    ).encode("utf-8")
+    if record_bytes != canonical_record:
+        raise IntegrityError(
+            f"{platform} packaged fixed artifact record is not canonical pretty JSON"
+        )
+    record_digests = {
+        "proof_system_digest": _json_byte_array_hex(
+            record["proof_system_digest"],
+            f"{platform} fixed artifact proof-system digest",
+        ),
+        "model_manifest_digest": _json_byte_array_hex(
+            record["manifest_digest"],
+            f"{platform} fixed artifact model-manifest digest",
+        ),
+        "fixed_artifact_record_digest": _json_byte_array_hex(
+            record["record_digest"],
+            f"{platform} fixed artifact record digest",
+        ),
+    }
+    if (
+        record["record_version"] != 1
+        or not isinstance(record["manifest"], dict)
+        or not isinstance(record["banks"], list)
+        or len(record["banks"]) != 3
+        or _json_byte_array_hex(
+            record["artifact_format_digest"],
+            f"{platform} fixed artifact format digest",
+        )
+        != PRODUCTION_V4_FIXED_ARTIFACT_FORMAT_DIGEST
+        or record_digests
+        != {
+            "proof_system_digest": PRODUCTION_V4_PROOF_SYSTEM_DIGEST,
+            "model_manifest_digest": PRODUCTION_V4_MODEL_MANIFEST_DIGEST,
+            "fixed_artifact_record_digest": PRODUCTION_V4_FIXED_ARTIFACT_RECORD_DIGEST,
+        }
+        or any(proof.get(field) != expected for field, expected in record_digests.items())
+    ):
+        raise IntegrityError(
+            f"{platform} packaged fixed artifact record does not match frozen ProductionV4 identity"
+        )
+
+
+def _validate_runtime_rows(
+    *,
+    rows: dict[str, dict[str, object]],
+    platform: str,
+    staged_network_info: dict[str, object],
+) -> None:
+    proof = staged_network_info.get("proof_of_work")
+    selection = proof.get("selection") if isinstance(proof, dict) else None
+    if selection == "ProductionV3":
+        _validate_runtime_rows_v3(
+            rows=rows, platform=platform, staged_network_info=staged_network_info
+        )
+        return
+    if selection == "ProductionV4":
+        _validate_runtime_rows_v4(
+            rows=rows, platform=platform, staged_network_info=staged_network_info
+        )
+        return
+    raise IntegrityError("staged NETWORK-INFO proof selection is unsupported")
+
+
 def _validate_runtime_package(
     *,
     path: Path,
@@ -1398,15 +1738,27 @@ def _validate_runtime_package(
     staged_network_info: dict[str, object],
 ) -> dict[str, dict[str, object]]:
     proof = staged_network_info.get("proof_of_work")
+    selection = proof.get("selection") if isinstance(proof, dict) else None
+    if selection == "ProductionV3":
+        artifact_directory = PRODUCTION_V3_PACKAGE_ARTIFACT_DIRECTORY
+        artifact_files = (
+            ("bank", PRODUCTION_V3_PACKAGE_BANK),
+            ("manifest", PRODUCTION_V3_PACKAGE_MANIFEST),
+            ("record_v2", PRODUCTION_V3_PACKAGE_RECORD_V2),
+        )
+    elif selection == "ProductionV4":
+        artifact_directory = PRODUCTION_V4_PACKAGE_ARTIFACT_DIRECTORY
+        artifact_files = (
+            ("bank", PRODUCTION_V4_PACKAGE_BANK),
+            ("fixed_record", PRODUCTION_V4_PACKAGE_FIXED_RECORD),
+        )
+    else:
+        raise IntegrityError("staged NETWORK-INFO proof selection is unsupported")
     pins = proof.get("artifacts") if isinstance(proof, dict) else None
-    if not isinstance(pins, dict) or set(pins) != {"bank", "manifest", "record_v2"}:
+    if not isinstance(pins, dict) or set(pins) != {role for role, _ in artifact_files}:
         raise IntegrityError(f"{platform} runtime artifact identity pins are incomplete")
     expected_artifact_sizes: dict[str, int] = {}
-    for role, file_name in (
-        ("bank", PRODUCTION_V3_PACKAGE_BANK),
-        ("manifest", PRODUCTION_V3_PACKAGE_MANIFEST),
-        ("record_v2", PRODUCTION_V3_PACKAGE_RECORD_V2),
-    ):
+    for role, file_name in artifact_files:
         pin = _require_exact_fields(
             pins.get(role), {"bytes", "blake3", "sha256"}, f"{platform} {role} pin"
         )
@@ -1414,16 +1766,16 @@ def _validate_runtime_package(
             expected_size = int(pin["bytes"])
         except (TypeError, ValueError) as error:
             raise IntegrityError(f"{platform} {role} byte length is invalid") from error
-        relative = f"{PRODUCTION_V3_PACKAGE_ARTIFACT_DIRECTORY}/{file_name}"
+        relative = f"{artifact_directory}/{file_name}"
         if (
             str(expected_size) != pin["bytes"]
             or expected_size <= 0
-            or expected_size > _runtime_member_limit(relative)
+            or expected_size > _runtime_member_limit(relative, selection)
         ):
             raise IntegrityError(f"{platform} {role} byte length is invalid")
         expected_artifact_sizes[relative] = expected_size
     rows = _inspect_runtime_package_archive(
-        path, platform, expected_artifact_sizes
+        path, platform, expected_artifact_sizes, selection
     )
     _validate_runtime_rows(
         rows=rows, platform=platform, staged_network_info=staged_network_info
@@ -1431,33 +1783,98 @@ def _validate_runtime_package(
     return rows
 
 
+def _validate_wallet_runtime_identity(
+    identity_bytes: bytes,
+    *,
+    platform: str,
+    version: str,
+    network_bytes: bytes,
+) -> dict[str, object]:
+    if len(identity_bytes) > MAX_RELEASE_GATE_JSON_BYTES:
+        raise IntegrityError(f"{platform} wallet runtime identity exceeds its size limit")
+    identity = _json_object_bytes(
+        identity_bytes, f"{platform} packaged-wallet runtime identity"
+    )
+    if identity_bytes != _canonical_json(identity):
+        raise IntegrityError(f"{platform} packaged-wallet runtime identity is not canonical")
+    _require_exact_fields(
+        identity,
+        {"network_info_base64", "package_version", "role", "schema"},
+        f"{platform} packaged-wallet runtime identity",
+    )
+    if (
+        identity["schema"] != WALLET_RUNTIME_IDENTITY_SCHEMA
+        or identity["role"] != WALLET_RUNTIME_IDENTITY_ROLE
+        or identity["package_version"] != version
+    ):
+        raise IntegrityError(f"{platform} packaged-wallet runtime identity is invalid")
+    encoded = identity["network_info_base64"]
+    if not isinstance(encoded, str) or len(encoded) > 2 * MAX_RELEASE_GATE_JSON_BYTES:
+        raise IntegrityError(
+            f"{platform} packaged-wallet runtime network identity is invalid"
+        )
+    try:
+        wallet_network_bytes = base64.b64decode(encoded, validate=True)
+    except (ValueError, binascii.Error) as error:
+        raise IntegrityError(
+            f"{platform} packaged-wallet runtime network identity is not canonical base64"
+        ) from error
+    if base64.b64encode(wallet_network_bytes).decode("ascii") != encoded:
+        raise IntegrityError(
+            f"{platform} packaged-wallet runtime network identity is not canonical base64"
+        )
+    if wallet_network_bytes != network_bytes:
+        raise IntegrityError(
+            f"{platform} packaged wallet did not report the packaged-node network identity"
+        )
+    return identity
+
+
 def _validate_runtime_attestation(
     *,
     path: Path,
     platform: str,
     commit: str,
+    version: str,
     rows: dict[str, dict[str, object]],
     staged_network_info: dict[str, object],
 ) -> None:
-    attestation, _ = _bounded_json_object(
+    attestation, attestation_bytes = _bounded_json_object(
         path, f"{platform} packaged-node network-info attestation"
     )
+    if attestation_bytes != _canonical_json(attestation):
+        raise IntegrityError(
+            f"{platform} packaged-node network-info attestation is not canonical"
+        )
+    proof = staged_network_info.get("proof_of_work")
+    selection = proof.get("selection") if isinstance(proof, dict) else None
+    common_fields = {
+        "schema",
+        "platform",
+        "source_commit",
+        "node_sha256",
+        "wallet_sha256",
+        "network_info_sha256",
+        "network_info_base64",
+    }
+    if selection == "ProductionV3":
+        expected_fields = common_fields | {"worker_sha256"}
+        expected_schema = PRODUCTION_RC_RUNTIME_ATTESTATION_SCHEMA
+    elif selection == "ProductionV4":
+        expected_fields = common_fields | {
+            "wallet_runtime_identity_sha256",
+            "wallet_runtime_identity_base64",
+        }
+        expected_schema = PRODUCTION_V4_RUNTIME_ATTESTATION_SCHEMA
+    else:
+        raise IntegrityError("staged NETWORK-INFO proof selection is unsupported")
     _require_exact_fields(
         attestation,
-        {
-            "schema",
-            "platform",
-            "source_commit",
-            "node_sha256",
-            "wallet_sha256",
-            "worker_sha256",
-            "network_info_sha256",
-            "network_info_base64",
-        },
+        expected_fields,
         f"{platform} packaged-node network-info attestation",
     )
     if (
-        attestation["schema"] != PRODUCTION_RC_RUNTIME_ATTESTATION_SCHEMA
+        attestation["schema"] != expected_schema
         or attestation["platform"] != platform
         or attestation["source_commit"] != commit
     ):
@@ -1482,23 +1899,64 @@ def _validate_runtime_attestation(
     attested_network = _json_object_bytes(
         network_bytes, f"{platform} attested packaged-node network information"
     )
-    expected_network = json.loads(json.dumps(staged_network_info))
-    expected_proof = expected_network.get("proof_of_work")
-    if not isinstance(expected_proof, dict):  # pragma: no cover - validated caller contract.
-        raise IntegrityError("staged NETWORK-INFO proof identity is missing")
-    expected_proof["runtime_verifier_worker_sha256"] = _compiled_runtime_worker(
-        expected_proof, platform
-    )
+    expected_network = staged_network_info
+    if selection == "ProductionV3":
+        expected_network = json.loads(json.dumps(staged_network_info))
+        expected_proof = expected_network.get("proof_of_work")
+        if not isinstance(expected_proof, dict):  # pragma: no cover
+            raise IntegrityError("staged NETWORK-INFO proof identity is missing")
+        expected_proof["runtime_verifier_worker_sha256"] = _compiled_runtime_worker(
+            expected_proof, platform
+        )
     if attested_network != expected_network:
         raise IntegrityError(
             f"{platform} packaged node did not report the staged network identity"
         )
+    if selection == "ProductionV4":
+        wallet_encoded = attestation["wallet_runtime_identity_base64"]
+        if (
+            not isinstance(wallet_encoded, str)
+            or len(wallet_encoded) > 2 * MAX_RELEASE_GATE_JSON_BYTES
+        ):
+            raise IntegrityError(f"{platform} attested wallet runtime identity is invalid")
+        try:
+            wallet_identity_bytes = base64.b64decode(wallet_encoded, validate=True)
+        except (ValueError, binascii.Error) as error:
+            raise IntegrityError(
+                f"{platform} attested wallet runtime identity is not canonical base64"
+            ) from error
+        if (
+            base64.b64encode(wallet_identity_bytes).decode("ascii") != wallet_encoded
+            or attestation["wallet_runtime_identity_sha256"]
+            != _sha256_bytes(wallet_identity_bytes)
+        ):
+            raise IntegrityError(
+                f"{platform} attested wallet runtime identity is invalid"
+            )
+        _validate_wallet_runtime_identity(
+            wallet_identity_bytes,
+            platform=platform,
+            version=version,
+            network_bytes=network_bytes,
+        )
+        canonical_network_bytes = (
+            json.dumps(attested_network, indent=2, ensure_ascii=False) + "\n"
+        ).encode("utf-8")
+        if network_bytes != canonical_network_bytes:
+            raise IntegrityError(
+                f"{platform} attested packaged-node network information is not canonical"
+            )
     suffix = ".exe" if platform == "windows-x86_64" else ""
     expected_hashes = {
         "node_sha256": rows[f"cmfd-node{suffix}"]["sha256"],
         "wallet_sha256": rows[f"common-foundry-wallet{suffix}"]["sha256"],
-        "worker_sha256": rows[f"cmfd-proof-worker{suffix}"]["sha256"],
     }
+    if expected_hashes["node_sha256"] == expected_hashes["wallet_sha256"]:
+        raise IntegrityError(
+            f"{platform} packaged node and wallet executables are not distinct"
+        )
+    if selection == "ProductionV3":
+        expected_hashes["worker_sha256"] = rows[f"cmfd-proof-worker{suffix}"]["sha256"]
     for field, expected in expected_hashes.items():
         if attestation[field] != expected:
             raise IntegrityError(
@@ -1511,6 +1969,7 @@ def validate_production_rc_runtime_packages(
     stage_files: dict[str, Path],
     staged_network_info: dict[str, object],
     commit: str,
+    version: str,
 ) -> dict[str, dict[str, dict[str, object]]]:
     missing = [
         name
@@ -1529,17 +1988,21 @@ def validate_production_rc_runtime_packages(
     proof = staged_network_info.get("proof_of_work")
     if not isinstance(proof, dict):
         raise IntegrityError("staged NETWORK-INFO proof identity is missing")
-    windows_worker = _compiled_runtime_worker(proof, "windows-x86_64")
-    linux_worker = _compiled_runtime_worker(proof, "linux-x86_64")
-    if windows_worker == linux_worker:
-        raise IntegrityError("Windows/Linux runtime proof-worker identities are not distinct")
-    selected_worker = _require_hex256(
-        proof.get("runtime_verifier_worker_sha256"),
-        "selected runtime proof worker",
-        reject_repeated=True,
-    )
-    if selected_worker not in {windows_worker, linux_worker}:
-        raise IntegrityError("selected runtime proof worker is not a compiled platform pin")
+    selection = proof.get("selection")
+    if selection == "ProductionV3":
+        windows_worker = _compiled_runtime_worker(proof, "windows-x86_64")
+        linux_worker = _compiled_runtime_worker(proof, "linux-x86_64")
+        if windows_worker == linux_worker:
+            raise IntegrityError("Windows/Linux runtime proof-worker identities are not distinct")
+        selected_worker = _require_hex256(
+            proof.get("runtime_verifier_worker_sha256"),
+            "selected runtime proof worker",
+            reject_repeated=True,
+        )
+        if selected_worker not in {windows_worker, linux_worker}:
+            raise IntegrityError("selected runtime proof worker is not a compiled platform pin")
+    elif selection != "ProductionV4":
+        raise IntegrityError("staged NETWORK-INFO proof selection is unsupported")
     windows_rows = _validate_runtime_package(
         path=stage_files[PRODUCTION_RC_WINDOWS_RUNTIME_PACKAGE_NAME],
         platform="windows-x86_64",
@@ -1554,6 +2017,7 @@ def validate_production_rc_runtime_packages(
         path=stage_files[PRODUCTION_RC_WINDOWS_ATTESTATION_NAME],
         platform="windows-x86_64",
         commit=commit,
+        version=version,
         rows=windows_rows,
         staged_network_info=staged_network_info,
     )
@@ -1561,6 +2025,7 @@ def validate_production_rc_runtime_packages(
         path=stage_files[PRODUCTION_RC_LINUX_ATTESTATION_NAME],
         platform="linux-x86_64",
         commit=commit,
+        version=version,
         rows=linux_rows,
         staged_network_info=staged_network_info,
     )
@@ -1571,7 +2036,12 @@ def validate_production_rc_runtime_packages(
 
 
 def create_runtime_network_info_attestation(
-    *, platform: str, package_directory: Path, commit: str, output: Path
+    *,
+    platform: str,
+    package_directory: Path,
+    commit: str,
+    output: Path,
+    version: str | None = None,
 ) -> dict[str, object]:
     commit = _full_commit(commit)
     package_directory = _regular_directory(
@@ -1593,7 +2063,6 @@ def create_runtime_network_info_attestation(
     paths = {
         "node_sha256": package_directory / f"cmfd-node{suffix}",
         "wallet_sha256": package_directory / f"common-foundry-wallet{suffix}",
-        "worker_sha256": package_directory / f"cmfd-proof-worker{suffix}",
     }
     identities: dict[str, str] = {}
     for field, path in paths.items():
@@ -1628,28 +2097,106 @@ def create_runtime_network_info_attestation(
         process.stdout, f"{platform} packaged-node network information"
     )
     proof = network.get("proof_of_work")
-    if (
-        not isinstance(proof, dict)
-        or proof.get("selection") != "ProductionV3"
-        or proof.get("build_source_commit") != commit
-        or proof.get("runtime_verifier_worker_sha256") != identities["worker_sha256"]
-    ):
+    selection = proof.get("selection") if isinstance(proof, dict) else None
+    if not isinstance(proof, dict) or proof.get("build_source_commit") != commit:
         raise IntegrityError(
             f"{platform} packaged node reported an unexpected compiled identity"
+        )
+    worker_path = package_directory / f"cmfd-proof-worker{suffix}"
+    if selection == "ProductionV3":
+        paths["worker_sha256"] = worker_path
+        with _stable_regular_handle(
+            worker_path, f"{platform} packaged {worker_path.name}"
+        ) as (_, handle, opened):
+            header = handle.read(MAX_EXECUTABLE_HEADER_BYTES)
+            if platform == "windows-x86_64":
+                _validate_pe_x86_64(header, opened.st_size, worker_path.name)
+            else:
+                _validate_elf_x86_64(header, opened.st_size, worker_path.name)
+            identities["worker_sha256"] = _sha256_handle(handle)
+        if proof.get("runtime_verifier_worker_sha256") != identities["worker_sha256"]:
+            raise IntegrityError(
+                f"{platform} packaged node reported an unexpected proof-worker identity"
+            )
+        schema = PRODUCTION_RC_RUNTIME_ATTESTATION_SCHEMA
+    elif selection == "ProductionV4":
+        if os.path.lexists(worker_path):
+            raise IntegrityError(
+                f"{platform} ProductionV4 runtime must not contain a proof worker"
+            )
+        if version is None:
+            raise IntegrityError(
+                f"{platform} ProductionV4 runtime attestation requires an expected package version"
+            )
+        version = _single_line("expected package version", version)
+        if not is_production_rc_label(version):
+            raise IntegrityError(
+                f"{platform} ProductionV4 runtime package version is not an RC label"
+            )
+        _validate_production_v4_runtime_identity(network, commit)
+        canonical_network_bytes = (
+            json.dumps(network, indent=2, ensure_ascii=False) + "\n"
+        ).encode("utf-8")
+        if process.stdout != canonical_network_bytes:
+            raise IntegrityError(
+                f"{platform} packaged-node network information is not canonical"
+            )
+        try:
+            wallet_process = subprocess.run(
+                [str(paths["wallet_sha256"]), "runtime-identity"],
+                cwd=package_directory,
+                check=False,
+                capture_output=True,
+                timeout=20 * 60,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise IntegrityError(
+                f"{platform} packaged wallet runtime-identity execution failed"
+            ) from error
+        if (
+            wallet_process.returncode != 0
+            or wallet_process.stderr
+            or len(wallet_process.stdout) > MAX_RELEASE_GATE_JSON_BYTES
+        ):
+            raise IntegrityError(
+                f"{platform} packaged wallet runtime-identity execution was not clean"
+            )
+        _validate_wallet_runtime_identity(
+            wallet_process.stdout,
+            platform=platform,
+            version=version,
+            network_bytes=process.stdout,
+        )
+        schema = PRODUCTION_V4_RUNTIME_ATTESTATION_SCHEMA
+    else:
+        raise IntegrityError(
+            f"{platform} packaged node reported an unsupported proof selection"
         )
     for field, path in paths.items():
         if _sha256_file(path) != identities[field]:
             raise IntegrityError(f"{platform} packaged executable changed during attestation")
+    if identities["node_sha256"] == identities["wallet_sha256"]:
+        raise IntegrityError(
+            f"{platform} packaged node and wallet executables are not distinct"
+        )
     attestation: dict[str, object] = {
         "network_info_base64": base64.b64encode(process.stdout).decode("ascii"),
         "network_info_sha256": _sha256_bytes(process.stdout),
         "node_sha256": identities["node_sha256"],
         "platform": platform,
-        "schema": PRODUCTION_RC_RUNTIME_ATTESTATION_SCHEMA,
+        "schema": schema,
         "source_commit": commit,
         "wallet_sha256": identities["wallet_sha256"],
-        "worker_sha256": identities["worker_sha256"],
     }
+    if selection == "ProductionV3":
+        attestation["worker_sha256"] = identities["worker_sha256"]
+    else:
+        attestation["wallet_runtime_identity_base64"] = base64.b64encode(
+            wallet_process.stdout
+        ).decode("ascii")
+        attestation["wallet_runtime_identity_sha256"] = _sha256_bytes(
+            wallet_process.stdout
+        )
     _write_new(output, _canonical_json(attestation))
     return attestation
 
@@ -1671,7 +2218,7 @@ def _require_hex256(value: object, label: str, *, reject_repeated: bool) -> str:
     return value
 
 
-def _validate_rcnet_launch_candidate(
+def _validate_rcnet_launch_candidate_v1(
     candidate: dict[str, object], network_info: dict[str, object]
 ) -> None:
     _require_exact_fields(
@@ -1681,6 +2228,11 @@ def _validate_rcnet_launch_candidate(
     )
     if candidate["schema"] != "CMFD_RCNET_LAUNCH_CANDIDATE_V1":
         raise IntegrityError("RCNet launch candidate schema is unsupported")
+    compiled_proof = network_info.get("proof_of_work")
+    if not isinstance(compiled_proof, dict) or compiled_proof.get("selection") != "ProductionV3":
+        raise IntegrityError(
+            "legacy RCNet launch candidate is valid only for compiled ProductionV3"
+        )
     payload = _require_exact_fields(
         candidate["payload"],
         {
@@ -1797,7 +2349,8 @@ def _validate_rcnet_launch_candidate(
     compiled_consensus = network_info.get("consensus")
     compiled_monetary_policy = network_info.get("monetary_policy")
     if not isinstance(network, dict) or (
-        network.get("network_id") != network_id
+        network.get("name") != payload["profile"]
+        or network.get("network_id") != network_id
         or network.get("virtual_genesis_hash") != genesis
         or network.get("virtual_genesis_timestamp_unix_seconds")
         != str(payload["virtual_genesis_timestamp_unix_seconds"])
@@ -1859,7 +2412,463 @@ def _validate_rcnet_launch_candidate(
             )
 
 
-def validate_production_rc_artifacts(
+def _require_unsigned_integer(
+    value: object, label: str, *, positive: bool = False
+) -> int:
+    minimum = 1 if positive else 0
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not minimum <= value <= (1 << 64) - 1
+    ):
+        qualifier = "positive " if positive else ""
+        raise IntegrityError(f"{label} is not a {qualifier}unsigned integer")
+    return value
+
+
+def _require_xonly_public_key(value: object, label: str) -> str:
+    encoded = _require_hex256(value, label, reject_repeated=False)
+    coordinate = int(encoded, 16)
+    field_prime = (1 << 256) - (1 << 32) - 977
+    if coordinate >= field_prime:
+        raise IntegrityError(f"{label} is not a valid secp256k1 x-only public key")
+    curve_value = (pow(coordinate, 3, field_prime) + 7) % field_prime
+    if pow(curve_value, (field_prime - 1) // 2, field_prime) != 1:
+        raise IntegrityError(f"{label} is not a valid secp256k1 x-only public key")
+    return encoded
+
+
+def _require_rcnet_v2_file_identity(value: object, label: str) -> dict[str, object]:
+    identity = _require_exact_fields(value, {"bytes", "blake3", "sha256"}, label)
+    _require_unsigned_integer(identity["bytes"], f"{label} byte length", positive=True)
+    _require_hex256(identity["blake3"], f"{label} BLAKE3", reject_repeated=False)
+    _require_hex256(identity["sha256"], f"{label} SHA-256", reject_repeated=False)
+    return identity
+
+
+def _rcnet_v2_derived_hash(context: str, data: bytes) -> bytes:
+    if blake3 is None:
+        raise IntegrityError(
+            "the Python blake3 module is required to validate an RCNet launch candidate"
+        )
+    return blake3.blake3(data, derive_key_context=context).digest()
+
+
+def _validate_rcnet_launch_candidate_v2(
+    candidate: dict[str, object], network_info: dict[str, object] | None = None
+) -> dict[str, object]:
+    _require_exact_fields(
+        candidate,
+        {"schema", "payload", "launch_root", "network_id", "virtual_genesis_hash"},
+        "RCNet launch candidate",
+    )
+    if candidate["schema"] != RCNET_LAUNCH_CANDIDATE_V2_SCHEMA:
+        raise IntegrityError("RCNet launch candidate schema is unsupported")
+    payload = _require_exact_fields(
+        candidate["payload"],
+        {
+            "profile",
+            "artifacts",
+            "virtual_genesis_timestamp_unix_seconds",
+            "consensus",
+            "proof_of_work",
+            "monetary_policy",
+            "reward_destinations",
+        },
+        "RCNet launch payload",
+    )
+    if payload["profile"] != "CommonFoundry RCNet-1":
+        raise IntegrityError("RCNet launch candidate profile is invalid")
+
+    artifacts = _require_exact_fields(
+        payload["artifacts"],
+        {
+            "bank",
+            "fixed_record",
+            "fixed_record_version",
+            "proof_system_digest",
+            "model_manifest_digest",
+            "fixed_artifact_format_digest",
+            "fixed_artifact_record_digest",
+        },
+        "RCNet ProductionV4 artifacts",
+    )
+    bank = _require_rcnet_v2_file_identity(
+        artifacts["bank"], "RCNet ProductionV4 bank identity"
+    )
+    fixed_record = _require_rcnet_v2_file_identity(
+        artifacts["fixed_record"], "RCNet ProductionV4 fixed-record identity"
+    )
+    _require_unsigned_integer(
+        artifacts["fixed_record_version"],
+        "RCNet ProductionV4 fixed-record version",
+        positive=True,
+    )
+    expected_artifact_fields = {
+        "fixed_record_version": 1,
+        "proof_system_digest": PRODUCTION_V4_PROOF_SYSTEM_DIGEST,
+        "model_manifest_digest": PRODUCTION_V4_MODEL_MANIFEST_DIGEST,
+        "fixed_artifact_format_digest": PRODUCTION_V4_FIXED_ARTIFACT_FORMAT_DIGEST,
+        "fixed_artifact_record_digest": PRODUCTION_V4_FIXED_ARTIFACT_RECORD_DIGEST,
+    }
+    for field, expected in expected_artifact_fields.items():
+        if artifacts[field] != expected:
+            raise IntegrityError(
+                f"RCNet ProductionV4 {field} does not match the frozen consensus value"
+            )
+
+    consensus_fields = (
+        "network_protocol_version",
+        "block_version",
+        "transaction_version",
+        "wire_version",
+        "maximum_future_offset_seconds",
+        "target_spacing_seconds",
+        "coinbase_maturity_blocks",
+        "median_time_window",
+        "max_block_transactions",
+        "max_transaction_inputs",
+        "max_transaction_outputs",
+        "max_block_aggregate_inputs",
+        "max_block_aggregate_outputs",
+        "max_block_signature_checks",
+        "max_coinbase_outputs",
+        "consensus_signature_bytes",
+        "dgw_window",
+        "wire_header_bytes",
+        "max_transaction_bytes",
+        "max_proof_bytes",
+        "max_block_bytes",
+    )
+    consensus = _require_exact_fields(
+        payload["consensus"], set(consensus_fields), "RCNet consensus parameters"
+    )
+    for field in consensus_fields:
+        _require_unsigned_integer(consensus[field], f"RCNet consensus {field}")
+    expected_consensus = {
+        "network_protocol_version": 2,
+        "block_version": 1,
+        "transaction_version": 1,
+        "wire_version": 1,
+        "maximum_future_offset_seconds": 86_400,
+        "target_spacing_seconds": 60,
+        "coinbase_maturity_blocks": 100,
+        "median_time_window": 11,
+        "max_block_transactions": 1_024,
+        "max_transaction_inputs": 128,
+        "max_transaction_outputs": 128,
+        "max_block_aggregate_inputs": 4_096,
+        "max_block_aggregate_outputs": 4_096,
+        "max_block_signature_checks": 2_048,
+        "max_coinbase_outputs": 3,
+        "consensus_signature_bytes": 64,
+        "dgw_window": 180,
+        "wire_header_bytes": 16,
+        "max_transaction_bytes": 65_536,
+        "max_proof_bytes": 13 * 1024 * 1024,
+        "max_block_bytes": 16 * 1024 * 1024,
+    }
+    if consensus != expected_consensus:
+        raise IntegrityError("RCNet consensus does not match the frozen ProductionV4 values")
+
+    timestamp = _require_unsigned_integer(
+        payload["virtual_genesis_timestamp_unix_seconds"],
+        "RCNet virtual genesis timestamp",
+        positive=True,
+    )
+    if timestamp > (1 << 64) - 1 - consensus["maximum_future_offset_seconds"]:
+        raise IntegrityError("RCNet virtual genesis timestamp future-offset calculation overflows")
+
+    proof_fields = (
+        "selection",
+        "wire_type",
+        "algorithm_version",
+        "proof_version",
+        "banks",
+        "layers_per_bank",
+        "exact_transparent_proof_bytes",
+        "pow_limit",
+    )
+    proof = _require_exact_fields(
+        payload["proof_of_work"], set(proof_fields), "RCNet proof-of-work parameters"
+    )
+    expected_proof_fields = {
+        "selection": "ProductionV4",
+        "wire_type": 4,
+        "algorithm_version": 4,
+        "proof_version": 1,
+        "banks": 3,
+        "layers_per_bank": 128,
+        "exact_transparent_proof_bytes": 12_025_320,
+    }
+    for field in (
+        "wire_type",
+        "algorithm_version",
+        "proof_version",
+        "banks",
+        "layers_per_bank",
+        "exact_transparent_proof_bytes",
+    ):
+        _require_unsigned_integer(proof[field], f"RCNet proof-of-work {field}")
+    for field, expected in expected_proof_fields.items():
+        if proof[field] != expected:
+            raise IntegrityError(
+                f"RCNet {field} does not match the frozen ProductionV4 value"
+            )
+    _require_hex256(
+        proof["pow_limit"], "RCNet proof-of-work limit", reject_repeated=False
+    )
+
+    monetary_fields = (
+        "atoms_per_coin",
+        "initial_subsidy_atoms",
+        "tail_height",
+        "tail_subsidy_atoms",
+        "steward_percent",
+        "community_percent",
+    )
+    monetary_policy = _require_exact_fields(
+        payload["monetary_policy"], set(monetary_fields), "RCNet monetary policy"
+    )
+    for field in monetary_fields:
+        _require_unsigned_integer(monetary_policy[field], f"RCNet monetary policy {field}")
+    if monetary_policy != {
+        "atoms_per_coin": 100_000_000,
+        "initial_subsidy_atoms": 50_000_000_000,
+        "tail_height": 2_628_001,
+        "tail_subsidy_atoms": 500_000_000,
+        "steward_percent": 25,
+        "community_percent": 5,
+    }:
+        raise IntegrityError("RCNet monetary policy does not match the frozen values")
+
+    reward_fields = ("steward_xonly_public_key", "community_xonly_public_key")
+    rewards = _require_exact_fields(
+        payload["reward_destinations"], set(reward_fields), "RCNet reward destinations"
+    )
+    for field in reward_fields:
+        destination = _require_xonly_public_key(rewards[field], f"RCNet {field}")
+        if destination in INSECURE_DEV_REWARD_DESTINATIONS:
+            raise IntegrityError("RCNet reward destination is a known insecure development key")
+
+    canonical_payload = {
+        "profile": payload["profile"],
+        "artifacts": {
+            "bank": {
+                "bytes": bank["bytes"],
+                "blake3": bank["blake3"],
+                "sha256": bank["sha256"],
+            },
+            "fixed_record": {
+                "bytes": fixed_record["bytes"],
+                "blake3": fixed_record["blake3"],
+                "sha256": fixed_record["sha256"],
+            },
+            "fixed_record_version": artifacts["fixed_record_version"],
+            "proof_system_digest": artifacts["proof_system_digest"],
+            "model_manifest_digest": artifacts["model_manifest_digest"],
+            "fixed_artifact_format_digest": artifacts["fixed_artifact_format_digest"],
+            "fixed_artifact_record_digest": artifacts["fixed_artifact_record_digest"],
+        },
+        "virtual_genesis_timestamp_unix_seconds": timestamp,
+        "consensus": {field: consensus[field] for field in consensus_fields},
+        "proof_of_work": {field: proof[field] for field in proof_fields},
+        "monetary_policy": {
+            field: monetary_policy[field] for field in monetary_fields
+        },
+        "reward_destinations": {field: rewards[field] for field in reward_fields},
+    }
+    payload_bytes = json.dumps(
+        canonical_payload, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    expected_launch_root = _rcnet_v2_derived_hash(
+        RCNET_LAUNCH_ROOT_V2_CONTEXT, payload_bytes
+    )
+    launch_root = _require_hex256(
+        candidate["launch_root"], "RCNet launch root", reject_repeated=True
+    )
+    if launch_root != expected_launch_root.hex():
+        raise IntegrityError("RCNet launch root is not derived from the canonical V2 payload")
+    expected_network_id = _rcnet_v2_derived_hash(
+        RCNET_NETWORK_ID_V2_CONTEXT, expected_launch_root
+    ).hex()
+    network_id = _require_hex256(
+        candidate["network_id"], "RCNet network ID", reject_repeated=True
+    )
+    if network_id != expected_network_id:
+        raise IntegrityError("RCNet network ID is not derived from the V2 launch root")
+    expected_genesis = _rcnet_v2_derived_hash(
+        RCNET_VIRTUAL_GENESIS_V2_CONTEXT, expected_launch_root
+    ).hex()
+    genesis = _require_hex256(
+        candidate["virtual_genesis_hash"],
+        "RCNet virtual genesis",
+        reject_repeated=True,
+    )
+    if genesis != expected_genesis:
+        raise IntegrityError("RCNet virtual genesis is not derived from the V2 launch root")
+    if len({launch_root, network_id, genesis}) != 3:
+        raise IntegrityError("RCNet launch root and derived identities are not distinct")
+
+    validated = {
+        "artifacts": artifacts,
+        "bank": bank,
+        "canonical_payload": canonical_payload,
+        "consensus": consensus,
+        "fixed_record": fixed_record,
+        "genesis": genesis,
+        "launch_root": launch_root,
+        "monetary_policy": monetary_policy,
+        "network_id": network_id,
+        "proof": proof,
+        "rewards": rewards,
+        "timestamp": timestamp,
+    }
+    if network_info is None:
+        return validated
+
+    network = network_info.get("network")
+    compiled_proof = network_info.get("proof_of_work")
+    compiled_rewards = network_info.get("reward_destinations")
+    compiled_consensus = network_info.get("consensus")
+    compiled_monetary_policy = network_info.get("monetary_policy")
+    if not isinstance(network, dict) or (
+        network.get("network_id") != network_id
+        or network.get("virtual_genesis_hash") != genesis
+        or network.get("virtual_genesis_timestamp_unix_seconds") != str(timestamp)
+    ):
+        raise IntegrityError("compiled RCNet identity does not match the launch candidate")
+    if not isinstance(compiled_proof, dict):
+        raise IntegrityError("compiled RCNet ProductionV4 parameters are missing")
+    compiled_proof_fields = (
+        "selection",
+        "wire_type",
+        "algorithm_version",
+        "proof_version",
+        "pow_limit",
+    )
+    for field in compiled_proof_fields:
+        actual = compiled_proof.get(field)
+        if actual != proof[field] or type(actual) is not type(proof[field]):
+            raise IntegrityError(
+                "compiled RCNet proof-of-work parameters do not match the launch candidate"
+            )
+    if compiled_proof.get("exact_transparent_proof_bytes") != str(
+        proof["exact_transparent_proof_bytes"]
+    ):
+        raise IntegrityError(
+            "compiled RCNet proof-of-work parameters do not match the launch candidate"
+        )
+    compiled_digest_fields = (
+        "proof_system_digest",
+        "model_manifest_digest",
+        "fixed_artifact_record_digest",
+    )
+    for field in compiled_digest_fields:
+        if compiled_proof.get(field) != artifacts[field]:
+            raise IntegrityError(
+                "compiled RCNet ProductionV4 digests do not match the launch candidate"
+            )
+    compiled_artifacts = compiled_proof.get("artifacts")
+    if not isinstance(compiled_artifacts, dict):
+        raise IntegrityError("compiled RCNet ProductionV4 artifact identities are missing")
+    for field, identity in (("bank", bank), ("fixed_record", fixed_record)):
+        compiled_identity = compiled_artifacts.get(field)
+        if not isinstance(compiled_identity, dict) or compiled_identity != {
+            "bytes": str(identity["bytes"]),
+            "blake3": identity["blake3"],
+            "sha256": identity["sha256"],
+        }:
+            raise IntegrityError(
+                "compiled RCNet ProductionV4 artifacts do not match the launch candidate"
+            )
+    if not isinstance(compiled_rewards, dict) or compiled_rewards != rewards:
+        raise IntegrityError("compiled RCNet reward destinations do not match the launch candidate")
+    if not isinstance(compiled_consensus, dict):
+        raise IntegrityError("compiled RCNet consensus parameters are missing")
+    versions = compiled_consensus.get("versions")
+    limits = compiled_consensus.get("limits")
+    version_fields = set(consensus_fields[:4])
+    for field in consensus_fields:
+        if field in version_fields:
+            actual = versions.get(field) if isinstance(versions, dict) else None
+            expected = consensus[field]
+        else:
+            actual = limits.get(field) if isinstance(limits, dict) else None
+            expected = str(consensus[field])
+        if actual != expected or type(actual) is not type(expected):
+            raise IntegrityError(
+                "compiled RCNet consensus parameters do not match the launch candidate"
+            )
+    if not isinstance(compiled_monetary_policy, dict):
+        raise IntegrityError("compiled RCNet monetary policy is missing")
+    for field in monetary_fields:
+        value = monetary_policy[field]
+        expected = value if field.endswith("_percent") else str(value)
+        actual = compiled_monetary_policy.get(field)
+        if actual != expected or type(actual) is not type(expected):
+            raise IntegrityError(
+                "compiled RCNet monetary policy does not match the launch candidate"
+            )
+    return validated
+
+
+def _validate_production_v4_rcnet_candidate(
+    candidate: dict[str, object], network_info: dict[str, object] | None = None
+) -> dict[str, object]:
+    validated = _validate_rcnet_launch_candidate_v2(candidate, network_info)
+    expected_identity = {
+        "launch_root": PRODUCTION_RC_LAUNCH_ROOT,
+        "network_id": PRODUCTION_RC_NETWORK_ID,
+        "genesis": PRODUCTION_RC_VIRTUAL_GENESIS_HASH,
+        "timestamp": int(PRODUCTION_RC_VIRTUAL_GENESIS_TIMESTAMP),
+    }
+    for field, expected in expected_identity.items():
+        if validated[field] != expected:
+            raise IntegrityError(
+                f"RCNet launch candidate does not match the immutable {field}"
+            )
+    proof = validated["proof"]
+    if not isinstance(proof, dict) or proof.get("pow_limit") != PRODUCTION_RC_POW_LIMIT:
+        raise IntegrityError("RCNet launch candidate does not match the immutable pow_limit")
+    expected_artifacts = {
+        "bank": {
+            "bytes": PRODUCTION_V4_MODEL_BANK_FILE_BYTES,
+            "blake3": PRODUCTION_V4_MODEL_BANK_FILE_BLAKE3,
+            "sha256": PRODUCTION_V4_MODEL_BANK_FILE_SHA256,
+        },
+        "fixed_record": {
+            "bytes": PRODUCTION_V4_FIXED_RECORD_FILE_BYTES,
+            "blake3": PRODUCTION_V4_FIXED_RECORD_FILE_BLAKE3,
+            "sha256": PRODUCTION_V4_FIXED_RECORD_FILE_SHA256,
+        },
+    }
+    for role, expected in expected_artifacts.items():
+        if validated[role] != expected:
+            raise IntegrityError(
+                f"RCNet launch candidate does not match the immutable ProductionV4 {role}"
+            )
+    return validated
+
+
+def _validate_rcnet_launch_candidate(
+    candidate: dict[str, object], network_info: dict[str, object]
+) -> None:
+    validated = _require_exact_fields(
+        candidate,
+        {"schema", "payload", "launch_root", "network_id", "virtual_genesis_hash"},
+        "RCNet launch candidate",
+    )
+    if validated["schema"] == RCNET_LAUNCH_CANDIDATE_V2_SCHEMA:
+        _validate_rcnet_launch_candidate_v2(candidate, network_info)
+        return
+    if validated["schema"] == "CMFD_RCNET_LAUNCH_CANDIDATE_V1":
+        _validate_rcnet_launch_candidate_v1(candidate, network_info)
+        return
+    raise IntegrityError("RCNet launch candidate schema is unsupported")
+
+
+def _validate_production_v3_rc_artifacts(
     *, version: str, commit: str, stage_files: dict[str, Path]
 ) -> None:
     if not is_production_rc_label(version):
@@ -2145,8 +3154,1078 @@ def validate_production_rc_artifacts(
                 f"ProductionV3 fresh-process verifier report has invalid {field}"
             )
     validate_production_rc_runtime_packages(
-        stage_files=stage_files, staged_network_info=network_info, commit=commit
+        stage_files=stage_files,
+        staged_network_info=network_info,
+        commit=commit,
+        version=version,
     )
+
+
+def _validate_report_file_identity(value: object, label: str) -> dict[str, object]:
+    row = _require_exact_fields(value, {"name", "bytes", "sha256", "blake3"}, label)
+    name = row["name"]
+    byte_count = row["bytes"]
+    if (
+        not isinstance(name, str)
+        or not name
+        or PurePosixPath(name).name != name
+        or not isinstance(byte_count, int)
+        or isinstance(byte_count, bool)
+        or byte_count <= 0
+    ):
+        raise IntegrityError(f"{label} has an invalid name or byte length")
+    _require_hex256(row["sha256"], f"{label} SHA-256", reject_repeated=False)
+    _require_hex256(row["blake3"], f"{label} BLAKE3", reject_repeated=False)
+    return row
+
+
+def _validate_production_v4_statement(
+    value: object, expected_network_id: str
+) -> dict[str, object]:
+    statement = _require_exact_fields(
+        value,
+        {"schema", "block", "candidate"},
+        "ProductionV4 qualification statement",
+    )
+    if (
+        statement["schema"]
+        != "CommonFoundry/ForgeMatrix/V4/IndependentVerifierInput/v1"
+    ):
+        raise IntegrityError("ProductionV4 qualification statement schema is invalid")
+    block = _require_exact_fields(
+        statement["block"],
+        {
+            "network_id",
+            "previous_block",
+            "transaction_root",
+            "height",
+            "timestamp",
+            "target",
+        },
+        "ProductionV4 qualification statement block",
+    )
+    for field in ("network_id", "previous_block", "transaction_root", "target"):
+        _require_hex256(
+            block[field],
+            f"ProductionV4 qualification statement {field}",
+            reject_repeated=False,
+        )
+    if block["network_id"] != expected_network_id:
+        raise IntegrityError(
+            "ProductionV4 qualification statement is not bound to the RCNet candidate"
+        )
+    for field in ("height", "timestamp"):
+        _require_unsigned_integer(
+            block[field], f"ProductionV4 qualification statement {field}"
+        )
+    if int(str(block["target"]), 16) == 0:
+        raise IntegrityError("ProductionV4 qualification statement target is zero")
+
+    candidate = _require_exact_fields(
+        statement["candidate"],
+        {
+            "algorithm_version",
+            "proof_version",
+            "nonce",
+            "proof_system_digest",
+            "model_manifest_digest",
+            "challenge_digest",
+            "final_activation_digest",
+            "work_digest",
+        },
+        "ProductionV4 qualification statement candidate",
+    )
+    for field in ("algorithm_version", "proof_version", "nonce"):
+        _require_unsigned_integer(
+            candidate[field], f"ProductionV4 qualification statement {field}"
+        )
+    if (
+        candidate["algorithm_version"] != 4
+        or candidate["proof_version"] != 1
+        or candidate["proof_system_digest"] != PRODUCTION_V4_PROOF_SYSTEM_DIGEST
+        or candidate["model_manifest_digest"] != PRODUCTION_V4_MODEL_MANIFEST_DIGEST
+    ):
+        raise IntegrityError("ProductionV4 qualification statement identity is invalid")
+    for field in (
+        "proof_system_digest",
+        "model_manifest_digest",
+        "challenge_digest",
+        "final_activation_digest",
+        "work_digest",
+    ):
+        _require_hex256(
+            candidate[field],
+            f"ProductionV4 qualification statement {field}",
+            reject_repeated=False,
+        )
+    if int(str(candidate["work_digest"]), 16) > int(str(block["target"]), 16):
+        raise IntegrityError("ProductionV4 qualification statement does not meet its target")
+    return statement
+
+
+def _validate_production_v4_derived(
+    value: object, statement: dict[str, object], label: str
+) -> dict[str, object]:
+    derived = _require_exact_fields(
+        value,
+        {
+            "challenge_digest",
+            "final_activation_digest",
+            "work_digest",
+            "transcript_statement_digest",
+        },
+        label,
+    )
+    candidate = statement["candidate"]
+    if not isinstance(candidate, dict):  # pragma: no cover - validated statement contract.
+        raise IntegrityError("ProductionV4 qualification statement candidate is missing")
+    for field in derived:
+        _require_hex256(derived[field], f"{label} {field}", reject_repeated=False)
+    for field in ("challenge_digest", "final_activation_digest", "work_digest"):
+        if derived[field] != candidate[field]:
+            raise IntegrityError(f"{label} does not match the qualification statement")
+    return derived
+
+
+def _validate_production_v4_qualification_manifest(
+    manifest: dict[str, object], proof: dict[str, object], expected_network_id: str
+) -> tuple[
+    str,
+    str,
+    tuple[int, str],
+    dict[str, object],
+    dict[str, object],
+    dict[str, object],
+]:
+    _require_exact_fields(
+        manifest,
+        {
+            "schema",
+            "status",
+            "reproduction_complete",
+            "fresh_generation_attested",
+            "operator",
+            "reproducer_source_commit",
+            "artifact_generation_source_commit",
+            "environment",
+            "toolchains",
+            "generation_commands",
+            "frozen_specifications",
+            "core_vector",
+            "input_manifest",
+            "artifacts",
+            "proof_verification",
+            "statement",
+        },
+        "ProductionV4 qualification manifest",
+    )
+    source_commit = manifest["reproducer_source_commit"]
+    generation_commit = manifest["artifact_generation_source_commit"]
+    if (
+        manifest["schema"]
+        != "CommonFoundry/ForgeMatrix/V4/IndependentReproductionReport/v1"
+        or manifest["status"] != "verified"
+        or manifest["reproduction_complete"] is not True
+        or manifest["fresh_generation_attested"] is not True
+        or not isinstance(manifest["operator"], str)
+        or not manifest["operator"].strip()
+        or not isinstance(source_commit, str)
+        or not FULL_COMMIT_RE.fullmatch(source_commit)
+        or set(source_commit) == {"0"}
+        or not isinstance(generation_commit, str)
+        or not FULL_COMMIT_RE.fullmatch(generation_commit)
+        or set(generation_commit) == {"0"}
+    ):
+        raise IntegrityError("ProductionV4 qualification manifest is incomplete or invalid")
+
+    environment = _require_exact_fields(
+        manifest["environment"],
+        {"system", "release", "machine", "python", "byteorder"},
+        "ProductionV4 qualification environment",
+    )
+    if environment["byteorder"] != "little" or any(
+        not isinstance(environment[field], str) or not environment[field].strip()
+        for field in ("system", "release", "machine", "python")
+    ):
+        raise IntegrityError("ProductionV4 qualification environment is invalid")
+    toolchains = _require_exact_fields(
+        manifest["toolchains"],
+        {"python", "git", "rustc", "cargo", "nvcc"},
+        "ProductionV4 qualification toolchains",
+    )
+    if any(
+        not isinstance(toolchains[field], str) or not toolchains[field].strip()
+        for field in ("python", "rustc", "cargo", "nvcc")
+    ) or (
+        toolchains["git"] is not None
+        and (
+            not isinstance(toolchains["git"], str)
+            or not toolchains["git"].strip()
+        )
+    ):
+        raise IntegrityError("ProductionV4 qualification toolchain identity is incomplete")
+    commands = manifest["generation_commands"]
+    if (
+        not isinstance(commands, list)
+        or not commands
+        or any(not isinstance(command, str) or not command.strip() for command in commands)
+    ):
+        raise IntegrityError("ProductionV4 qualification generation commands are incomplete")
+
+    specifications = manifest["frozen_specifications"]
+    if not isinstance(specifications, list):
+        raise IntegrityError("ProductionV4 frozen specification identities are missing")
+    specification_hashes: dict[str, str] = {}
+    for value in specifications:
+        row = _require_exact_fields(
+            value,
+            {"name", "path", "bytes", "sha256", "blake3"},
+            "ProductionV4 frozen specification identity",
+        )
+        path = row["path"]
+        if (
+            not isinstance(path, str)
+            or _safe_repo_relative(path) != path
+            or row["name"] != PurePosixPath(path).name
+            or not isinstance(row["bytes"], int)
+            or isinstance(row["bytes"], bool)
+            or row["bytes"] <= 0
+        ):
+            raise IntegrityError("ProductionV4 frozen specification identity is invalid")
+        _require_hex256(
+            row["blake3"],
+            "ProductionV4 frozen specification BLAKE3",
+            reject_repeated=False,
+        )
+        _require_hex256(
+            row["sha256"],
+            "ProductionV4 frozen specification SHA-256",
+            reject_repeated=False,
+        )
+        if path in specification_hashes:
+            raise IntegrityError("ProductionV4 frozen specification identity is duplicated")
+        specification_hashes[path] = row["sha256"]
+    if specification_hashes != PRODUCTION_V4_FROZEN_SPEC_SHA256:
+        raise IntegrityError(
+            "ProductionV4 frozen specification identities do not match the release"
+        )
+
+    core_vector = _require_exact_fields(
+        manifest["core_vector"],
+        {"schema", "derived", "rejections_verified"},
+        "ProductionV4 core-vector qualification",
+    )
+    derived = _require_exact_fields(
+        core_vector["derived"],
+        {
+            "challenge_digest",
+            "final_activation_digest",
+            "work_digest",
+            "transcript_statement_digest",
+        },
+        "ProductionV4 core-vector derived identity",
+    )
+    expected_derived = {
+        "challenge_digest": "523a47eb90c07299243a1aa8fa7ca07a67b0527dfbd6b367bb14a3ea8dbb6a23",
+        "final_activation_digest": "c9802d97d27707d05cf38db9286866c4fbd40a5a5a76809cb654b4d3f221844b",
+        "work_digest": "e9c3ec2fd53ab08340e58a642733a6d528e476ce19a9247e0983d6f71ee2606a",
+        "transcript_statement_digest": "9c3e50fa124dbb2df551ec893c44d1a9813b6245d0f981e1a4e10884e4bd0387",
+    }
+    if (
+        core_vector["schema"]
+        != "CommonFoundry/ForgeMatrix/V4/CoreCanonicalVector/v1"
+        or core_vector["rejections_verified"] != 5
+        or derived != expected_derived
+    ):
+        raise IntegrityError("ProductionV4 core-vector qualification is invalid")
+
+    input_manifest = _validate_report_file_identity(
+        manifest["input_manifest"], "ProductionV4 qualification input manifest"
+    )
+    if input_manifest["name"] != PRODUCTION_V4_RCNET_INPUT_MANIFEST_NAME:
+        raise IntegrityError("ProductionV4 qualification input manifest identity is invalid")
+    artifact_values = manifest["artifacts"]
+    if not isinstance(artifact_values, list) or not artifact_values:
+        raise IntegrityError("ProductionV4 qualification artifact identities are missing")
+    artifact_rows: dict[str, dict[str, object]] = {}
+    for value in artifact_values:
+        row = _validate_report_file_identity(value, "ProductionV4 qualification artifact")
+        name = str(row["name"])
+        if name in artifact_rows:
+            raise IntegrityError("ProductionV4 qualification artifact identity is duplicated")
+        artifact_rows[name] = row
+    expected_artifact_names = {
+        PRODUCTION_V4_PACKAGE_BANK,
+        PRODUCTION_V4_PACKAGE_FIXED_RECORD,
+        *(
+            f"FORGEMATRIX-V4-FIXED-BANK-{bank}.{suffix}"
+            for bank in range(3)
+            for suffix in ("json", "codeword", "row-major.codeword", "tree")
+        ),
+    }
+    if set(artifact_rows) != expected_artifact_names:
+        raise IntegrityError("ProductionV4 qualification artifact set is incomplete")
+    compiled_artifacts = _require_exact_fields(
+        proof.get("artifacts"),
+        {"bank", "fixed_record"},
+        "compiled ProductionV4 artifact identities",
+    )
+    for role, name in (
+        ("bank", PRODUCTION_V4_PACKAGE_BANK),
+        ("fixed_record", PRODUCTION_V4_PACKAGE_FIXED_RECORD),
+    ):
+        pin = _require_exact_fields(
+            compiled_artifacts[role],
+            {"bytes", "blake3", "sha256"},
+            f"compiled ProductionV4 {role} identity",
+        )
+        report_row = artifact_rows.get(name)
+        try:
+            compiled_bytes = int(pin["bytes"])
+        except (TypeError, ValueError) as error:
+            raise IntegrityError(
+                f"compiled ProductionV4 {role} byte length is invalid"
+            ) from error
+        if (
+            str(compiled_bytes) != pin["bytes"]
+            or compiled_bytes <= 0
+            or report_row is None
+            or report_row["bytes"] != compiled_bytes
+            or report_row["sha256"] != pin["sha256"]
+            or report_row["blake3"] != pin["blake3"]
+        ):
+            raise IntegrityError(
+                f"compiled ProductionV4 {role} does not match qualification evidence"
+            )
+
+    statement = _validate_production_v4_statement(
+        manifest["statement"], expected_network_id
+    )
+    verification = manifest["proof_verification"]
+    if (
+        not isinstance(verification, dict)
+        or verification.get("implemented_stages_accepted") is not True
+        or verification.get("full_cryptographic_proof_verified") is not True
+        or verification.get("candidate_claims_verified") is not False
+    ):
+        raise IntegrityError("ProductionV4 qualification proof verification is incomplete")
+    proof_result = verification.get("proof")
+    if (
+        not isinstance(proof_result, dict)
+        or proof_result.get("schema")
+        != "CommonFoundry/ForgeMatrix/V4/WireConformanceResult/v1"
+        or proof_result.get("canonical") is not True
+        or proof_result.get("bytes") != 12_025_320
+    ):
+        raise IntegrityError("ProductionV4 qualification proof identity is invalid")
+    proof_sha256 = _require_hex256(
+        proof_result.get("sha256"),
+        "ProductionV4 qualification proof SHA-256",
+        reject_repeated=False,
+    )
+    verification_derived = _validate_production_v4_derived(
+        verification.get("derived"), statement, "ProductionV4 qualification derived values"
+    )
+    statement_block = statement["block"]
+    if (
+        not isinstance(statement_block, dict)  # pragma: no cover - validated above.
+        or verification.get("target") != statement_block["target"]
+        or verification.get("target_met") is not True
+    ):
+        raise IntegrityError("ProductionV4 qualification target evidence is invalid")
+    return (
+        str(source_commit),
+        str(generation_commit),
+        (12_025_320, proof_sha256),
+        statement,
+        input_manifest,
+        verification_derived,
+    )
+
+
+def _validate_production_v4_verifier_report(
+    report: dict[str, object],
+    qualification_source_commit: str,
+    qualification_proof: tuple[int, str],
+    qualification_statement: dict[str, object],
+    qualification_derived: dict[str, object],
+    verifier_script_identity: tuple[int, str, str],
+) -> None:
+    _require_exact_fields(
+        report,
+        {
+            "schema",
+            "status",
+            "source_commit",
+            "operator",
+            "fresh_process_verifier",
+            "verifier_files",
+            "known_valid_proof",
+            "statement_derivation",
+            "known_valid_result",
+            "mutation_rejections",
+        },
+        "ProductionV4 fresh-process verifier report",
+    )
+    if (
+        report["schema"]
+        != "CommonFoundry/ForgeMatrix/V4/IndependentVerifierQualification/v1"
+        or report["status"] != "verified"
+        or report["source_commit"] != qualification_source_commit
+        or report["fresh_process_verifier"] is not True
+        or not isinstance(report["operator"], str)
+        or not report["operator"].strip()
+    ):
+        raise IntegrityError("ProductionV4 fresh-process verifier report is invalid")
+    verifier_files = report["verifier_files"]
+    if not isinstance(verifier_files, list) or not verifier_files:
+        raise IntegrityError("ProductionV4 fresh-process verifier files are missing")
+    verifier_rows: dict[str, dict[str, object]] = {}
+    for value in verifier_files:
+        row = _validate_report_file_identity(
+            value, "ProductionV4 fresh-process verifier file"
+        )
+        name = str(row["name"])
+        if name in verifier_rows:
+            raise IntegrityError("ProductionV4 fresh-process verifier file is duplicated")
+        verifier_rows[name] = row
+    expected_verifier_names = set(PRODUCTION_V4_VERIFIER_FILE_NAMES)
+    if set(verifier_rows) != expected_verifier_names:
+        raise IntegrityError("ProductionV4 fresh-process verifier file set is incomplete")
+    script_bytes, script_sha256, script_blake3 = verifier_script_identity
+    verifier_entrypoint = verifier_rows["production-v4-independent-verifier.py"]
+    if (
+        verifier_entrypoint["bytes"] != script_bytes
+        or verifier_entrypoint["sha256"] != script_sha256
+        or verifier_entrypoint["blake3"] != script_blake3
+    ):
+        raise IntegrityError(
+            "staged ProductionV4 verifier script is not bound by the verifier report"
+        )
+    known_proof = _validate_report_file_identity(
+        report["known_valid_proof"], "ProductionV4 known-valid proof"
+    )
+    if (known_proof["bytes"], known_proof["sha256"]) != qualification_proof:
+        raise IntegrityError(
+            "ProductionV4 verifier report proof does not match qualification evidence"
+        )
+    statement_derivation = _require_exact_fields(
+        report["statement_derivation"],
+        {"command", "result"},
+        "ProductionV4 statement derivation",
+    )
+    known_valid = _require_exact_fields(
+        report["known_valid_result"],
+        {"command", "result"},
+        "ProductionV4 known-valid verifier result",
+    )
+    for label, value in (
+        ("statement derivation", statement_derivation),
+        ("known-valid verification", known_valid),
+    ):
+        command = value["command"]
+        if (
+            not isinstance(command, list)
+            or not command
+            or any(not isinstance(item, str) or not item for item in command)
+            or not isinstance(value["result"], dict)
+        ):
+            raise IntegrityError(f"ProductionV4 {label} evidence is invalid")
+    if (
+        statement_derivation["result"].get("schema")
+        != "CommonFoundry/ForgeMatrix/V4/IndependentVerificationResult/v1"
+        or statement_derivation["result"].get("implemented_stages_accepted") is not True
+        or statement_derivation["result"].get("full_cryptographic_proof_verified")
+        is not False
+        or statement_derivation["result"].get("candidate_claims_verified") is not False
+        or known_valid["result"].get("schema")
+        != "CommonFoundry/ForgeMatrix/V4/IndependentVerificationResult/v1"
+        or known_valid["result"].get("implemented_stages_accepted") is not True
+        or known_valid["result"].get("full_cryptographic_proof_verified") is not True
+        or known_valid["result"].get("candidate_claims_verified") is not True
+    ):
+        raise IntegrityError(
+            "ProductionV4 fresh-process verifier acceptance evidence is invalid"
+        )
+    for label, result in (
+        ("statement derivation", statement_derivation["result"]),
+        ("known-valid verification", known_valid["result"]),
+    ):
+        result_proof = result.get("proof")
+        if (
+            not isinstance(result_proof, dict)
+            or result_proof.get("bytes") != known_proof["bytes"]
+            or result_proof.get("sha256") != known_proof["sha256"]
+        ):
+            raise IntegrityError(f"ProductionV4 {label} proof identity is invalid")
+        result_derived = _validate_production_v4_derived(
+            result.get("derived"),
+            qualification_statement,
+            f"ProductionV4 {label} derived values",
+        )
+        statement_block = qualification_statement["block"]
+        if (
+            result_derived != qualification_derived
+            or not isinstance(statement_block, dict)  # pragma: no cover - validated above.
+            or result.get("target") != statement_block["target"]
+            or result.get("target_met") is not True
+        ):
+            raise IntegrityError(
+                f"ProductionV4 {label} is not bound to the qualification statement"
+            )
+
+    mutation_values = report["mutation_rejections"]
+    expected_mutations = {
+        "truncated": 12_025_319,
+        "trailing-byte": 12_025_321,
+        "noncanonical-field": 12_025_320,
+        "final-activation": 12_025_320,
+        "relation-round": 12_025_320,
+        "fixed-merkle-path": 12_025_320,
+        "fri-query": 12_025_320,
+        "grinding-witness": 12_025_320,
+    }
+    if not isinstance(mutation_values, list):
+        raise IntegrityError("ProductionV4 mutation rejection evidence is missing")
+    observed_mutations: set[str] = set()
+    observed_proof_digests: set[tuple[object, object]] = set()
+    for value in mutation_values:
+        row = _require_exact_fields(
+            value,
+            {"mutation", "proof", "error", "command"},
+            "ProductionV4 mutation rejection",
+        )
+        mutation = row["mutation"]
+        command = row["command"]
+        if (
+            not isinstance(mutation, str)
+            or mutation in observed_mutations
+            or not isinstance(row["error"], str)
+            or not row["error"].strip()
+            or not isinstance(command, list)
+            or not command
+            or any(not isinstance(item, str) or not item for item in command)
+        ):
+            raise IntegrityError("ProductionV4 mutation rejection evidence is invalid")
+        proof_row = _validate_report_file_identity(
+            row["proof"], f"ProductionV4 {mutation} mutation proof"
+        )
+        proof_digests = (proof_row["sha256"], proof_row["blake3"])
+        if (
+            mutation not in expected_mutations
+            or proof_row["name"] != f"proof-{mutation}.bin"
+            or proof_row["bytes"] != expected_mutations[mutation]
+            or proof_row["sha256"] == known_proof["sha256"]
+            or proof_row["blake3"] == known_proof["blake3"]
+            or proof_digests in observed_proof_digests
+        ):
+            raise IntegrityError("ProductionV4 mutation proof identity is invalid")
+        observed_proof_digests.add(proof_digests)
+        observed_mutations.add(mutation)
+    if observed_mutations != set(expected_mutations):
+        raise IntegrityError("ProductionV4 mutation rejection set is incomplete")
+
+
+def _production_v4_evidence_subject_from_approval(
+    *, approval_path: Path, approval_trust: dict[str, object]
+) -> tuple[dict[str, object], dict[str, object]]:
+    approval, approval_bytes = _bounded_json_object(
+        approval_path, "ProductionV4 producer activation approval"
+    )
+    if approval_bytes != activation_approval.canonical_json(approval):
+        raise IntegrityError("ProductionV4 producer approval is not canonical JSON")
+    _require_exact_fields(
+        approval,
+        {
+            "schema",
+            "role",
+            "namespace",
+            "signer_identity",
+            "trusted_authority",
+            "subject",
+        },
+        "ProductionV4 producer activation approval",
+    )
+    if (
+        approval["schema"] != activation_approval.APPROVAL_SCHEMA
+        or approval["role"] != activation_approval.PRODUCER_ROLE
+        or approval["namespace"]
+        != activation_approval.NAMESPACES[activation_approval.PRODUCER_ROLE]
+    ):
+        raise IntegrityError("ProductionV4 producer approval role is invalid")
+    subject = approval["subject"]
+    try:
+        activation_approval.validate_subject(subject)
+    except activation_approval.ApprovalError as error:
+        raise IntegrityError(str(error)) from error
+    if not isinstance(subject, dict) or subject.get("phase") != "evidence":
+        raise IntegrityError("ProductionV4 staged approval is not for evidence phase")
+    files = subject.get("files")
+    if not isinstance(files, dict):  # pragma: no cover - validated above.
+        raise IntegrityError("ProductionV4 staged approval file bindings are unavailable")
+    common_files = {
+        role: files[role] for role in activation_approval.COMMON_FILE_ROLES
+    }
+    try:
+        binding = activation_approval.qualification_binding_sha256(common_files)
+    except activation_approval.ApprovalError as error:
+        raise IntegrityError(str(error)) from error
+    if binding != approval_trust["qualification_binding_sha256"]:
+        raise IntegrityError(
+            "ProductionV4 producer approval files do not match the compiled qualification binding"
+        )
+    return subject, common_files
+
+
+def _production_v4_staged_common_files(
+    *,
+    common_files: dict[str, object],
+    launch_candidate_bytes: bytes,
+    qualification_manifest: dict[str, object],
+    qualification_manifest_bytes: bytes,
+    qualification_input_manifest: dict[str, object],
+    verifier_report: dict[str, object],
+    verifier_report_bytes: bytes,
+    verifier_script_size: int,
+    verifier_script_sha256: str,
+    verifier_script_blake3: str,
+) -> dict[str, object]:
+    rebuilt = json.loads(json.dumps(common_files))
+    rebuilt["launch_candidate"] = _production_v4_approval_identity(
+        PRODUCTION_RC_LAUNCH_CANDIDATE_NAME, launch_candidate_bytes
+    )
+    rebuilt["rcnet_input_manifest"] = dict(qualification_input_manifest)
+    rebuilt["independent_reproduction_report"] = _production_v4_approval_identity(
+        PRODUCTION_V4_QUALIFICATION_MANIFEST_NAME, qualification_manifest_bytes
+    )
+    rebuilt["fresh_process_verifier_report"] = _production_v4_approval_identity(
+        PRODUCTION_V4_FRESH_PROCESS_VERIFIER_REPORT_NAME, verifier_report_bytes
+    )
+    rebuilt["fresh_process_verifier_script"] = {
+        "name": PRODUCTION_V4_FRESH_PROCESS_VERIFIER_SCRIPT_NAME,
+        "bytes": verifier_script_size,
+        "sha256": verifier_script_sha256,
+        "blake3": verifier_script_blake3,
+    }
+    rebuilt["qualification_proof"] = dict(
+        _validate_report_file_identity(
+            verifier_report["known_valid_proof"], "ProductionV4 known-valid proof"
+        )
+    )
+    artifact_values = qualification_manifest.get("artifacts")
+    if not isinstance(artifact_values, list):  # pragma: no cover - validated upstream.
+        raise IntegrityError("ProductionV4 qualification artifacts are unavailable")
+    artifacts = {
+        str(row["name"]): row
+        for row in artifact_values
+        if isinstance(row, dict) and isinstance(row.get("name"), str)
+    }
+    rebuilt["model_bank"] = dict(artifacts[PRODUCTION_V4_PACKAGE_BANK])
+    rebuilt["fixed_artifact_record"] = dict(
+        artifacts[PRODUCTION_V4_PACKAGE_FIXED_RECORD]
+    )
+    for bank in range(3):
+        for suffix, role_suffix in (
+            ("json", "json"),
+            ("codeword", "codeword"),
+            ("row-major.codeword", "row_major_codeword"),
+            ("tree", "tree"),
+        ):
+            rebuilt[f"fixed_bank_{bank}_{role_suffix}"] = dict(
+                artifacts[f"FORGEMATRIX-V4-FIXED-BANK-{bank}.{suffix}"]
+            )
+    return rebuilt
+
+
+def _validate_production_v4_rc_artifacts(
+    *,
+    version: str,
+    commit: str,
+    stage_files: dict[str, Path],
+    repo: Path | None = None,
+    activation_ssh_keygen: Path | None = None,
+    activation_ssh_keygen_sha256: str | None = None,
+) -> None:
+    required = {
+        PRODUCTION_RC_NETWORK_INFO_NAME,
+        PRODUCTION_RC_LAUNCH_CANDIDATE_NAME,
+        PRODUCTION_V4_ACTIVATION_NAME,
+        PRODUCTION_V4_QUALIFICATION_MANIFEST_NAME,
+        PRODUCTION_V4_FRESH_PROCESS_VERIFIER_SCRIPT_NAME,
+        PRODUCTION_V4_FRESH_PROCESS_VERIFIER_REPORT_NAME,
+    }
+    missing = sorted(required - set(stage_files))
+    if missing:
+        raise IntegrityError(
+            "production RC release gate is blocked; "
+            f"missing required ProductionV4 release artifacts: {missing}"
+        )
+    network_info, network_info_bytes = _bounded_json_object(
+        stage_files[PRODUCTION_RC_NETWORK_INFO_NAME], "compiled network information"
+    )
+    launch_candidate, launch_candidate_bytes = _bounded_json_object(
+        stage_files[PRODUCTION_RC_LAUNCH_CANDIDATE_NAME], "RCNet launch candidate"
+    )
+    evidence, evidence_bytes = _bounded_json_object(
+        stage_files[PRODUCTION_V4_ACTIVATION_NAME], "ProductionV4 activation evidence"
+    )
+    qualification_manifest, qualification_manifest_bytes = _bounded_json_object(
+        stage_files[PRODUCTION_V4_QUALIFICATION_MANIFEST_NAME],
+        "ProductionV4 qualification manifest",
+    )
+    verifier_script = _regular_file(
+        stage_files[PRODUCTION_V4_FRESH_PROCESS_VERIFIER_SCRIPT_NAME],
+        "ProductionV4 fresh-process verifier script",
+    )
+    verifier_report, verifier_report_bytes = _bounded_json_object(
+        stage_files[PRODUCTION_V4_FRESH_PROCESS_VERIFIER_REPORT_NAME],
+        "ProductionV4 fresh-process verifier report",
+    )
+    if evidence_bytes != _canonical_json(evidence):
+        raise IntegrityError("ProductionV4 activation evidence is not canonical JSON")
+    if qualification_manifest_bytes != _canonical_json(qualification_manifest):
+        raise IntegrityError("ProductionV4 qualification manifest is not canonical JSON")
+    if verifier_report_bytes != _canonical_json(verifier_report):
+        raise IntegrityError("ProductionV4 verifier report is not canonical JSON")
+    with _stable_regular_handle(
+        verifier_script, "ProductionV4 fresh-process verifier script"
+    ) as (_, verifier_handle, verifier_stat):
+        if verifier_stat.st_size <= 0:
+            raise IntegrityError("ProductionV4 fresh-process verifier script size is invalid")
+        (
+            verifier_script_size,
+            verifier_script_sha256,
+            verifier_script_blake3,
+            _,
+        ) = _stream_sha256(
+            verifier_handle,
+            expected_size=verifier_stat.st_size,
+            maximum_size=MAX_RUNTIME_BINARY_BYTES,
+            label="ProductionV4 fresh-process verifier script",
+            capture_bytes=0,
+        )
+
+    network = network_info.get("network")
+    proof = _require_exact_fields(
+        network_info.get("proof_of_work"),
+        {
+            "selection",
+            "profile",
+            "build_source_commit",
+            "activation_evidence_sha256",
+            "wire_type",
+            "pow_limit",
+            "algorithm_version",
+            "proof_version",
+            "proof_system_digest",
+            "model_manifest_digest",
+            "fixed_artifact_record_digest",
+            "exact_transparent_proof_bytes",
+            "artifacts",
+        },
+        "compiled ProductionV4 proof identity",
+    )
+    if not isinstance(network, dict) or network.get("name") != "CommonFoundry RCNet-1":
+        raise IntegrityError("production RC compiled network profile is not RCNet-1")
+    if (
+        proof["selection"] != "ProductionV4"
+        or proof["profile"] != "ForgeMatrix-v4 transparent BaseFold"
+    ):
+        raise IntegrityError("production RC compiled proof selection is not ProductionV4")
+    if proof["build_source_commit"] != commit:
+        raise IntegrityError(
+            "production RC compiled build source commit does not match the checked-out commit"
+        )
+    expected_proof_identity = {
+        "wire_type": 4,
+        "algorithm_version": 4,
+        "proof_version": 1,
+        "proof_system_digest": PRODUCTION_V4_PROOF_SYSTEM_DIGEST,
+        "model_manifest_digest": PRODUCTION_V4_MODEL_MANIFEST_DIGEST,
+        "fixed_artifact_record_digest": PRODUCTION_V4_FIXED_ARTIFACT_RECORD_DIGEST,
+        "exact_transparent_proof_bytes": "12025320",
+    }
+    if any(proof.get(field) != expected for field, expected in expected_proof_identity.items()):
+        raise IntegrityError("production RC compiled ProductionV4 proof identity is invalid")
+    validated_candidate = _validate_production_v4_rcnet_candidate(
+        launch_candidate, network_info
+    )
+
+    (
+        qualification_source_commit,
+        qualification_generation_commit,
+        qualification_proof,
+        qualification_statement,
+        qualification_input_manifest,
+        qualification_derived,
+    ) = _validate_production_v4_qualification_manifest(
+        qualification_manifest, proof, str(launch_candidate["network_id"])
+    )
+    _validate_production_v4_verifier_report(
+        verifier_report,
+        qualification_source_commit,
+        qualification_proof,
+        qualification_statement,
+        qualification_derived,
+        (verifier_script_size, verifier_script_sha256, verifier_script_blake3),
+    )
+    expected_evidence = {
+        "artifacts": proof["artifacts"],
+        "core_spec_sha256": PRODUCTION_V4_CORE_SPEC_SHA256,
+        "core_vector_sha256": PRODUCTION_V4_CORE_VECTOR_SHA256,
+        "fresh_process_verifier_binary_sha256": verifier_script_sha256,
+        "fresh_process_verifier_report_sha256": _sha256_bytes(verifier_report_bytes),
+        "network_profile": "RCNet-1",
+        "proof_algebra_sha256": PRODUCTION_V4_PROOF_ALGEBRA_SHA256,
+        "proof_selection": "ProductionV4",
+        "qualification_manifest_sha256": _sha256_bytes(qualification_manifest_bytes),
+        "qualification_source_commit": qualification_source_commit,
+        "schema": "CMFD_PRODUCTION_V4_ACTIVATION_V1",
+        "source_commit": commit,
+    }
+    evidence_fields = set(evidence)
+    legacy_fields = set(expected_evidence)
+    trusted_fields = legacy_fields | {"activation_approval_trust"}
+    if evidence_fields not in (legacy_fields, trusted_fields):
+        raise IntegrityError("ProductionV4 activation evidence has missing or unknown fields")
+    for field, expected in expected_evidence.items():
+        if evidence.get(field) != expected:
+            raise IntegrityError(f"ProductionV4 activation evidence has invalid {field}")
+    if proof["activation_evidence_sha256"] != _sha256_bytes(evidence_bytes):
+        raise IntegrityError(
+            "compiled ProductionV4 selection is not bound to the staged activation evidence"
+        )
+    validate_production_rc_runtime_packages(
+        stage_files=stage_files,
+        staged_network_info=network_info,
+        commit=commit,
+        version=version,
+    )
+    approval_names = {
+        PRODUCTION_V4_PRODUCER_APPROVAL_NAME,
+        PRODUCTION_V4_PRODUCER_APPROVAL_SIGNATURE_NAME,
+        PRODUCTION_V4_PRODUCER_ALLOWED_SIGNERS_NAME,
+        PRODUCTION_V4_REPRODUCER_APPROVAL_NAME,
+        PRODUCTION_V4_REPRODUCER_APPROVAL_SIGNATURE_NAME,
+        PRODUCTION_V4_REPRODUCER_ALLOWED_SIGNERS_NAME,
+    }
+    if approval_names - set(stage_files):
+        raise IntegrityError(PRODUCTION_V4_ACTIVATION_APPROVAL_ERROR)
+    if evidence_fields == legacy_fields:
+        raise IntegrityError(PRODUCTION_V4_ACTIVATION_APPROVAL_ERROR)
+    approval_trust = _validate_production_v4_approval_trust_fields(
+        evidence["activation_approval_trust"]
+    )
+    if (
+        repo is None
+        or activation_ssh_keygen is None
+        or activation_ssh_keygen_sha256 is None
+    ):
+        raise IntegrityError(PRODUCTION_V4_ACTIVATION_APPROVAL_ERROR)
+    if approval_trust["ssh_keygen_sha256"] != activation_ssh_keygen_sha256:
+        raise IntegrityError(
+            "ProductionV4 activation verifier digest does not match compiled trust"
+        )
+    pin_fields = {
+        "schema": evidence["schema"],
+        "qualification_source_commit": evidence["qualification_source_commit"],
+        "qualification_manifest_sha256": evidence["qualification_manifest_sha256"],
+        "fresh_process_verifier_binary_sha256": evidence[
+            "fresh_process_verifier_binary_sha256"
+        ],
+        "fresh_process_verifier_report_sha256": evidence[
+            "fresh_process_verifier_report_sha256"
+        ],
+        "core_spec_sha256": evidence["core_spec_sha256"],
+        "core_vector_sha256": evidence["core_vector_sha256"],
+        "proof_algebra_sha256": evidence["proof_algebra_sha256"],
+        "approval_trust": approval_trust,
+    }
+    pin_bytes = _render_production_v4_activation_pin(pin_fields)
+    if _tracked_blob(repo, PRODUCTION_V4_ACTIVATION_PIN_RELATIVE) != pin_bytes:
+        raise IntegrityError(
+            "tracked ProductionV4 activation pin does not match staged evidence and approval trust"
+        )
+    _validate_production_v4_activation_history(
+        phase="evidence",
+        repo=repo,
+        commit=commit,
+        generation_commit=qualification_generation_commit,
+        qualification_commit=qualification_source_commit,
+        pin_bytes=pin_bytes,
+    )
+    _, common_files = _production_v4_evidence_subject_from_approval(
+        approval_path=stage_files[PRODUCTION_V4_PRODUCER_APPROVAL_NAME],
+        approval_trust=approval_trust,
+    )
+    common_files = _production_v4_staged_common_files(
+        common_files=common_files,
+        launch_candidate_bytes=launch_candidate_bytes,
+        qualification_manifest=qualification_manifest,
+        qualification_manifest_bytes=qualification_manifest_bytes,
+        qualification_input_manifest=qualification_input_manifest,
+        verifier_report=verifier_report,
+        verifier_report_bytes=verifier_report_bytes,
+        verifier_script_size=verifier_script_size,
+        verifier_script_sha256=verifier_script_sha256,
+        verifier_script_blake3=verifier_script_blake3,
+    )
+    try:
+        common_binding = activation_approval.qualification_binding_sha256(
+            common_files
+        )
+    except activation_approval.ApprovalError as error:
+        raise IntegrityError(str(error)) from error
+    if common_binding != approval_trust["qualification_binding_sha256"]:
+        raise IntegrityError(
+            "staged ProductionV4 qualification evidence does not match compiled approval trust"
+        )
+    canonical_network_info = (
+        json.dumps(network_info, indent=2, ensure_ascii=False) + "\n"
+    ).encode("utf-8")
+    if network_info_bytes != canonical_network_info:
+        raise IntegrityError("compiled ProductionV4 NETWORK-INFO.json is not canonical")
+    subject_files = {
+        **common_files,
+        "activation_evidence": _production_v4_approval_identity(
+            PRODUCTION_V4_ACTIVATION_NAME, evidence_bytes
+        ),
+        "compiled_network_info": _production_v4_approval_identity(
+            PRODUCTION_RC_NETWORK_INFO_NAME, network_info_bytes
+        ),
+    }
+    try:
+        subject = activation_approval.build_subject(
+            phase="evidence",
+            activation_source_commit=commit,
+            artifact_generation_source_commit=qualification_generation_commit,
+            qualification_source_commit=qualification_source_commit,
+            network=_production_v4_approval_network(
+                launch_candidate, validated_candidate
+            ),
+            source_pin_sha256=_sha256_bytes(pin_bytes),
+            files=subject_files,
+        )
+    except activation_approval.ApprovalError as error:
+        raise IntegrityError(str(error)) from error
+    producer_trust = approval_trust["producer"]
+    reproducer_trust = approval_trust["independent_reproducer"]
+    if not isinstance(producer_trust, dict) or not isinstance(
+        reproducer_trust, dict
+    ):  # pragma: no cover - validated above.
+        raise IntegrityError("ProductionV4 approval signer trust is unavailable")
+    approval_receipt = _verify_production_v4_activation_approvals(
+        subject=subject,
+        approval_trust=approval_trust,
+        producer_approval=stage_files[PRODUCTION_V4_PRODUCER_APPROVAL_NAME],
+        producer_signature=stage_files[
+            PRODUCTION_V4_PRODUCER_APPROVAL_SIGNATURE_NAME
+        ],
+        producer_allowed_signers=stage_files[
+            PRODUCTION_V4_PRODUCER_ALLOWED_SIGNERS_NAME
+        ],
+        producer_signer_identity=producer_trust["signer_identity"],
+        reproducer_approval=stage_files[PRODUCTION_V4_REPRODUCER_APPROVAL_NAME],
+        reproducer_signature=stage_files[
+            PRODUCTION_V4_REPRODUCER_APPROVAL_SIGNATURE_NAME
+        ],
+        reproducer_allowed_signers=stage_files[
+            PRODUCTION_V4_REPRODUCER_ALLOWED_SIGNERS_NAME
+        ],
+        reproducer_signer_identity=reproducer_trust["signer_identity"],
+        ssh_keygen=activation_ssh_keygen,
+        expected_ssh_keygen_sha256=activation_ssh_keygen_sha256,
+    )
+    receipt_approvals = approval_receipt.get("approvals")
+    if not isinstance(receipt_approvals, dict):  # pragma: no cover - verifier contract.
+        raise IntegrityError("ProductionV4 approval verification receipt is malformed")
+    approval_rechecks = (
+        (
+            PRODUCTION_V4_PRODUCER_APPROVAL_NAME,
+            receipt_approvals[activation_approval.PRODUCER_ROLE]["approval_sha256"],
+        ),
+        (
+            PRODUCTION_V4_PRODUCER_APPROVAL_SIGNATURE_NAME,
+            receipt_approvals[activation_approval.PRODUCER_ROLE]["signature_sha256"],
+        ),
+        (
+            PRODUCTION_V4_PRODUCER_ALLOWED_SIGNERS_NAME,
+            producer_trust["allowed_signers_sha256"],
+        ),
+        (
+            PRODUCTION_V4_REPRODUCER_APPROVAL_NAME,
+            receipt_approvals[activation_approval.REPRODUCER_ROLE]["approval_sha256"],
+        ),
+        (
+            PRODUCTION_V4_REPRODUCER_APPROVAL_SIGNATURE_NAME,
+            receipt_approvals[activation_approval.REPRODUCER_ROLE]["signature_sha256"],
+        ),
+        (
+            PRODUCTION_V4_REPRODUCER_ALLOWED_SIGNERS_NAME,
+            reproducer_trust["allowed_signers_sha256"],
+        ),
+    )
+    for name, expected_sha256 in approval_rechecks:
+        if _sha256_file(stage_files[name]) != expected_sha256:
+            raise IntegrityError(f"ProductionV4 staged approval changed: {name}")
+    for name, expected_bytes in (
+        (PRODUCTION_RC_NETWORK_INFO_NAME, network_info_bytes),
+        (PRODUCTION_RC_LAUNCH_CANDIDATE_NAME, launch_candidate_bytes),
+        (PRODUCTION_V4_ACTIVATION_NAME, evidence_bytes),
+        (PRODUCTION_V4_QUALIFICATION_MANIFEST_NAME, qualification_manifest_bytes),
+        (PRODUCTION_V4_FRESH_PROCESS_VERIFIER_REPORT_NAME, verifier_report_bytes),
+    ):
+        if _sha256_file(stage_files[name]) != _sha256_bytes(expected_bytes):
+            raise IntegrityError(f"ProductionV4 staged approval input changed: {name}")
+    if _sha256_file(verifier_script) != verifier_script_sha256:
+        raise IntegrityError("ProductionV4 staged verifier script changed")
+
+
+def validate_production_rc_artifacts(
+    *,
+    version: str,
+    commit: str,
+    stage_files: dict[str, Path],
+    repo: Path | None = None,
+    activation_ssh_keygen: Path | None = None,
+    activation_ssh_keygen_sha256: str | None = None,
+) -> None:
+    if not is_production_rc_label(version):
+        return
+    reject_production_rc_source_assets(
+        stage_files,
+        allowed_source_assets=frozenset(
+            {PRODUCTION_V4_FRESH_PROCESS_VERIFIER_SCRIPT_NAME}
+        ),
+    )
+    common = {PRODUCTION_RC_NETWORK_INFO_NAME, PRODUCTION_RC_LAUNCH_CANDIDATE_NAME}
+    missing = sorted(common - set(stage_files))
+    if missing:
+        raise IntegrityError(
+            "production RC release gate is blocked; "
+            f"missing compiled activation artifacts: {missing}"
+        )
+    network_info, _ = _bounded_json_object(
+        stage_files[PRODUCTION_RC_NETWORK_INFO_NAME], "compiled network information"
+    )
+    proof = network_info.get("proof_of_work")
+    selection = proof.get("selection") if isinstance(proof, dict) else None
+    if selection == "ProductionV3":
+        _validate_production_v3_rc_artifacts(
+            version=version, commit=commit, stage_files=stage_files
+        )
+        return
+    if selection == "ProductionV4":
+        _validate_production_v4_rc_artifacts(
+            version=version,
+            commit=commit,
+            stage_files=stage_files,
+            repo=repo,
+            activation_ssh_keygen=activation_ssh_keygen,
+            activation_ssh_keygen_sha256=activation_ssh_keygen_sha256,
+        )
+        return
+    raise IntegrityError("production RC compiled proof selection is unsupported")
 
 
 def _sha256_bytes(data: bytes) -> str:
@@ -2156,7 +4235,7 @@ def _sha256_bytes(data: bytes) -> str:
 def _blake3_bytes(data: bytes) -> str:
     if blake3 is None:
         raise IntegrityError(
-            "ProductionV3 package inspection requires the pinned Python blake3 dependency"
+            "production release inspection requires the pinned Python blake3 dependency"
         )
     return blake3.blake3(data).hexdigest()
 
@@ -2291,8 +4370,10 @@ def _assert_clean_exact_repo(repo: Path, expected_commit: str) -> str:
     return actual
 
 
-def _commit_epoch(repo: Path) -> int:
-    value = _run_git(repo, "show", "-s", "--format=%ct", "HEAD")
+def _commit_epoch(repo: Path, revision: str = "HEAD") -> int:
+    if revision != "HEAD":
+        revision = _full_commit(revision)
+    value = _run_git(repo, "show", "-s", "--format=%ct", revision)
     try:
         epoch = int(value, 10)
     except ValueError as error:
@@ -2302,14 +4383,16 @@ def _commit_epoch(repo: Path) -> int:
     return epoch
 
 
-def _source_date_epoch(repo: Path | None, explicit: str | int | None) -> int:
+def _source_date_epoch(
+    repo: Path | None, explicit: str | int | None, commit: str | None = None
+) -> int:
     value: str | int | None = explicit
     if value is None:
         value = os.environ.get("SOURCE_DATE_EPOCH")
     if value is None:
         if repo is None:
             raise IntegrityError("SOURCE_DATE_EPOCH is required")
-        return _commit_epoch(repo)
+        return _commit_epoch(repo, commit or "HEAD")
     try:
         epoch = int(value)
     except (TypeError, ValueError) as error:
@@ -2347,8 +4430,14 @@ def _tracked_blob(repo: Path, relative: str) -> bytes:
     return _run_git_bytes(repo, "cat-file", "blob", f"HEAD:{safe}")
 
 
-def _manifest_version(repo: Path, relative: str) -> str:
-    data = _tracked_blob(repo, relative)
+def _manifest_version(
+    repo: Path, relative: str, commit: str | None = None
+) -> str:
+    data = (
+        _tracked_blob(repo, relative)
+        if commit is None
+        else _tracked_blob_at(repo, commit, relative)
+    )
     try:
         text = data.decode("utf-8", "strict")
     except UnicodeDecodeError as error:
@@ -2377,12 +4466,16 @@ def _manifest_version(repo: Path, relative: str) -> str:
     return _single_line(f"version in {relative}", version)
 
 
-def validate_production_rc_source_versions(*, repo: Path, version: str) -> None:
+def validate_production_rc_source_versions(
+    *, repo: Path, version: str, commit: str | None = None
+) -> None:
     if not is_production_rc_label(version):
         return
+    if commit is not None:
+        commit = _full_commit(commit)
     mismatches: dict[str, str] = {}
     for relative in PRODUCTION_RC_VERSION_FILES:
-        actual = _manifest_version(repo, relative)
+        actual = _manifest_version(repo, relative, commit)
         if actual != version:
             mismatches[relative] = actual
     if mismatches:
@@ -2497,29 +4590,198 @@ def _write_atomic(path: Path, data: bytes) -> None:
             temporary.unlink()
 
 
-def _write_new(path: Path, data: bytes) -> None:
-    created = False
+def _stat_object_identity(value: os.stat_result) -> tuple[int, int, int]:
+    return value.st_dev, value.st_ino, stat.S_IFMT(value.st_mode)
+
+
+def _sync_directory(path: Path) -> None:
+    directory = _regular_directory(path, "durability directory")
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = (
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        )
+        create_file.restype = wintypes.HANDLE
+        flush_file_buffers = kernel32.FlushFileBuffers
+        flush_file_buffers.argtypes = (wintypes.HANDLE,)
+        flush_file_buffers.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = (wintypes.HANDLE,)
+        close_handle.restype = wintypes.BOOL
+        handle = create_file(
+            str(directory),
+            0x40000000,  # GENERIC_WRITE
+            0x00000007,  # FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+            None,
+            3,  # OPEN_EXISTING
+            0x02000000,  # FILE_FLAG_BACKUP_SEMANTICS
+            None,
+        )
+        if handle == ctypes.c_void_p(-1).value:
+            raise OSError(ctypes.get_last_error(), f"cannot open directory: {directory}")
+        try:
+            if not flush_file_buffers(handle):
+                raise OSError(
+                    ctypes.get_last_error(), f"cannot flush directory: {directory}"
+                )
+        finally:
+            close_handle(handle)
+        return
+    descriptor = os.open(
+        directory,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _sync_regular_file(path: Path, label: str) -> tuple[int, int, int, int, int]:
+    candidate = _regular_file(path, label)
+    before = candidate.lstat()
+    descriptor = os.open(
+        candidate,
+        os.O_RDWR | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        opened = os.fstat(descriptor)
+        if _stat_identity(before) != _stat_identity(opened):
+            raise IntegrityError(f"{label} changed before it could be synchronized")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    after = candidate.lstat()
+    if _stat_identity(after) != _stat_identity(opened):
+        raise IntegrityError(f"{label} changed while it was synchronized")
+    return _stat_identity(opened)
+
+
+def _write_new(path: Path, data: bytes) -> tuple[int, int, int, int, int]:
+    path = _absolute_path(path)
+    created_identity: tuple[int, int, int] | None = None
+    complete_identity: tuple[int, int, int, int, int] | None = None
     try:
         handle = path.open("xb")
-        created = True
         with handle:
+            created_identity = _stat_object_identity(os.fstat(handle.fileno()))
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-    except Exception:
-        if created and path.exists():
-            path.unlink()
+            complete_identity = _stat_identity(os.fstat(handle.fileno()))
+        _sync_directory(path.parent)
+    except BaseException:
+        if created_identity is not None:
+            try:
+                current = path.lstat()
+                if _stat_object_identity(current) != created_identity:
+                    raise IntegrityError(f"new output changed during cleanup: {path}")
+                path.unlink()
+                _sync_directory(path.parent)
+            except FileNotFoundError:
+                pass
+            except BaseException as cleanup_error:
+                raise IntegrityError(f"cannot clean up new output: {path}") from cleanup_error
         raise
+    if complete_identity is None:  # pragma: no cover - a successful write sets it.
+        raise IntegrityError(f"new output identity is unavailable: {path}")
+    return complete_identity
 
 
-def _publish_new_archive(temporary: Path, output: Path) -> None:
+def _write_new_verified(
+    *,
+    path: Path,
+    data: bytes,
+    parent_identity: tuple[int, int, int],
+    label: str,
+) -> tuple[int, int, int, int, int]:
+    path = _absolute_path(path)
+    if _stat_object_identity(path.parent.lstat()) != parent_identity:
+        raise IntegrityError(f"{label} output directory changed before publication")
+    created = _write_new(path, data)
     try:
-        os.link(temporary, output, follow_symlinks=False)
-    except FileExistsError as error:
-        raise IntegrityError(f"archive already exists: {output}") from error
-    except OSError as error:
-        raise IntegrityError(f"cannot publish archive without replacement: {output}") from error
-    temporary.unlink()
+        if _stat_object_identity(path.parent.lstat()) != parent_identity:
+            raise IntegrityError(f"{label} output directory changed during publication")
+        with _stable_regular_handle(path, label) as (_, handle, opened):
+            written = handle.read(len(data) + 1)
+        if _stat_identity(opened) != created or written != data:
+            raise IntegrityError(f"{label} changed during publication")
+    except BaseException:
+        try:
+            current = path.lstat()
+            if _stat_identity(current) != created:
+                raise IntegrityError(f"{label} changed during cleanup")
+            path.unlink()
+            _sync_directory(path.parent)
+        except FileNotFoundError:
+            pass
+        except BaseException as cleanup_error:
+            raise IntegrityError(f"cannot clean up {label}") from cleanup_error
+        raise
+    return created
+
+
+def _remove_exact_new(
+    path: Path, identity: tuple[int, int, int, int, int], label: str
+) -> None:
+    try:
+        current = path.lstat()
+    except FileNotFoundError:
+        return
+    if _stat_identity(current) != identity:
+        raise IntegrityError(f"{label} changed before cleanup")
+    path.unlink()
+    _sync_directory(path.parent)
+
+
+def _publish_new_archive(
+    temporary: Path, output: Path
+) -> tuple[int, int, int, int, int]:
+    temporary = _regular_file(temporary, "temporary archive")
+    output = _absolute_path(output)
+    temporary_identity = _sync_regular_file(temporary, "temporary archive")
+    published_identity: tuple[int, int, int, int, int] | None = None
+    try:
+        try:
+            os.link(temporary, output, follow_symlinks=False)
+        except FileExistsError as error:
+            raise IntegrityError(f"archive already exists: {output}") from error
+        except OSError as error:
+            raise IntegrityError(
+                f"cannot publish archive without replacement: {output}"
+            ) from error
+        published_identity = _stat_identity(output.lstat())
+        if published_identity != temporary_identity:
+            raise IntegrityError(f"published archive identity is unstable: {output}")
+        _sync_directory(output.parent)
+        temporary.unlink()
+        _sync_directory(temporary.parent)
+        return published_identity
+    except BaseException:
+        if published_identity is not None:
+            try:
+                current = output.lstat()
+                if _stat_identity(current) != published_identity:
+                    raise IntegrityError(f"published archive changed during cleanup: {output}")
+                output.unlink()
+                _sync_directory(output.parent)
+            except FileNotFoundError:
+                pass
+            except BaseException as cleanup_error:
+                raise IntegrityError(
+                    f"cannot clean up unpublished archive: {output}"
+                ) from cleanup_error
+        raise
 
 
 def write_native_build_receipt(
@@ -2979,6 +5241,2050 @@ def verify_deterministic_tar_gz(stage: Path, archive_path: Path, epoch: int) -> 
                 raise IntegrityError("tar.gz archive changed during verification")
     except (OSError, tarfile.TarError) as error:
         raise IntegrityError(f"cannot verify tar.gz archive: {error}") from error
+
+
+def _native_runtime_platform() -> str:
+    system = host_platform.system().lower()
+    machine = host_platform.machine().lower()
+    if machine not in {"amd64", "x86_64"}:
+        raise IntegrityError(
+            f"production runtime packaging requires an x86_64 host, found {machine or 'unknown'}"
+        )
+    if system == "windows":
+        return "windows-x86_64"
+    if system == "linux":
+        return "linux-x86_64"
+    raise IntegrityError(
+        f"production runtime packaging is unsupported on {system or 'unknown'}"
+    )
+
+
+def _require_native_runtime_platform(platform: str) -> None:
+    if platform not in PRODUCTION_RC_RUNTIME_ROOTS:
+        raise IntegrityError(f"unsupported production runtime platform: {platform}")
+    actual = _native_runtime_platform()
+    if actual != platform:
+        raise IntegrityError(
+            f"{platform} runtime package must be assembled on a native {platform} host; "
+            f"current host is {actual}"
+        )
+
+
+def _copy_runtime_input(
+    source: Path, destination: Path, *, label: str, mode: int
+) -> None:
+    if os.path.lexists(destination):  # pragma: no cover - private temporary staging.
+        raise IntegrityError(f"runtime staging destination already exists: {destination}")
+    created = False
+    try:
+        with _stable_regular_handle(source, label) as (_, input_handle, opened):
+            output_handle = destination.open("xb")
+            created = True
+            with output_handle:
+                shutil.copyfileobj(input_handle, output_handle, length=1024 * 1024)
+                output_handle.flush()
+                os.fsync(output_handle.fileno())
+            if destination.stat().st_size != opened.st_size:
+                raise IntegrityError(f"{label} was not copied completely")
+        destination.chmod(mode)
+    except BaseException:
+        if created:
+            destination.unlink(missing_ok=True)
+        raise
+
+
+def _network_info_from_runtime_attestation(
+    attestation: dict[str, object], platform: str
+) -> tuple[dict[str, object], bytes]:
+    encoded = attestation.get("network_info_base64")
+    if not isinstance(encoded, str) or len(encoded) > 2 * MAX_RELEASE_GATE_JSON_BYTES:
+        raise IntegrityError(f"{platform} runtime attestation has invalid network information")
+    try:
+        network_bytes = base64.b64decode(encoded, validate=True)
+    except (ValueError, binascii.Error) as error:
+        raise IntegrityError(
+            f"{platform} runtime attestation has invalid network information"
+        ) from error
+    if (
+        len(network_bytes) > MAX_RELEASE_GATE_JSON_BYTES
+        or base64.b64encode(network_bytes).decode("ascii") != encoded
+        or attestation.get("network_info_sha256") != _sha256_bytes(network_bytes)
+    ):
+        raise IntegrityError(f"{platform} runtime attestation has invalid network information")
+    return (
+        _json_object_bytes(network_bytes, f"{platform} packaged-node network information"),
+        network_bytes,
+    )
+
+
+def _runtime_unsigned_decimal(value: object, label: str) -> int:
+    if (
+        not isinstance(value, str)
+        or len(value) > 20
+        or not re.fullmatch(r"0|[1-9][0-9]*", value)
+    ):
+        raise IntegrityError(f"{label} is not a canonical unsigned decimal string")
+    parsed = int(value, 10)
+    if parsed > (1 << 64) - 1:
+        raise IntegrityError(f"{label} exceeds the unsigned 64-bit range")
+    return parsed
+
+
+def _production_v4_runtime_candidate(
+    network_info: dict[str, object],
+) -> dict[str, object]:
+    network = _require_exact_fields(
+        network_info["network"],
+        {
+            "name",
+            "network_id",
+            "virtual_genesis_hash",
+            "virtual_genesis_timestamp_unix_seconds",
+        },
+        "packaged-node network identity",
+    )
+    proof = _require_exact_fields(
+        network_info["proof_of_work"],
+        {
+            "selection",
+            "profile",
+            "build_source_commit",
+            "activation_evidence_sha256",
+            "wire_type",
+            "pow_limit",
+            "algorithm_version",
+            "proof_version",
+            "proof_system_digest",
+            "model_manifest_digest",
+            "fixed_artifact_record_digest",
+            "exact_transparent_proof_bytes",
+            "artifacts",
+        },
+        "packaged-node ProductionV4 identity",
+    )
+    artifacts = _require_exact_fields(
+        proof["artifacts"],
+        {"bank", "fixed_record"},
+        "packaged-node ProductionV4 artifacts",
+    )
+    consensus_identity = _require_exact_fields(
+        network_info["consensus"],
+        {"consensus_fingerprint", "versions", "limits"},
+        "packaged-node consensus identity",
+    )
+    if (
+        consensus_identity["consensus_fingerprint"]
+        != PRODUCTION_RC_CONSENSUS_FINGERPRINT
+    ):
+        raise IntegrityError(
+            "packaged node does not report the RCNet consensus fingerprint"
+        )
+    version_fields = (
+        "network_protocol_version",
+        "block_version",
+        "transaction_version",
+        "wire_version",
+    )
+    limit_fields = (
+        "maximum_future_offset_seconds",
+        "target_spacing_seconds",
+        "coinbase_maturity_blocks",
+        "median_time_window",
+        "max_block_transactions",
+        "max_transaction_inputs",
+        "max_transaction_outputs",
+        "max_block_aggregate_inputs",
+        "max_block_aggregate_outputs",
+        "max_block_signature_checks",
+        "max_coinbase_outputs",
+        "consensus_signature_bytes",
+        "dgw_window",
+        "wire_header_bytes",
+        "max_transaction_bytes",
+        "max_proof_bytes",
+        "max_block_bytes",
+    )
+    versions = _require_exact_fields(
+        consensus_identity["versions"],
+        set(version_fields),
+        "packaged-node consensus versions",
+    )
+    limits = _require_exact_fields(
+        consensus_identity["limits"],
+        set(limit_fields),
+        "packaged-node consensus limits",
+    )
+    for field in version_fields:
+        _require_unsigned_integer(
+            versions[field], f"packaged-node consensus {field}"
+        )
+    consensus = {
+        **{field: versions[field] for field in version_fields},
+        **{
+            field: _runtime_unsigned_decimal(
+                limits[field], f"packaged-node consensus {field}"
+            )
+            for field in limit_fields
+        },
+    }
+
+    monetary_fields = (
+        "atoms_per_coin",
+        "initial_subsidy_atoms",
+        "tail_height",
+        "tail_subsidy_atoms",
+        "steward_percent",
+        "community_percent",
+    )
+    monetary_identity = _require_exact_fields(
+        network_info["monetary_policy"],
+        set(monetary_fields),
+        "packaged-node monetary policy",
+    )
+    monetary_policy: dict[str, object] = {}
+    for field in monetary_fields:
+        value = monetary_identity[field]
+        if field.endswith("_percent"):
+            _require_unsigned_integer(value, f"packaged-node monetary policy {field}")
+            monetary_policy[field] = value
+        else:
+            monetary_policy[field] = _runtime_unsigned_decimal(
+                value, f"packaged-node monetary policy {field}"
+            )
+
+    rewards = _require_exact_fields(
+        network_info["reward_destinations"],
+        {"steward_xonly_public_key", "community_xonly_public_key"},
+        "packaged-node reward destinations",
+    )
+    candidate_artifacts: dict[str, object] = {}
+    for role in ("bank", "fixed_record"):
+        identity = _require_exact_fields(
+            artifacts[role],
+            {"bytes", "blake3", "sha256"},
+            f"packaged-node ProductionV4 {role}",
+        )
+        candidate_artifacts[role] = {
+            "bytes": _runtime_unsigned_decimal(
+                identity["bytes"],
+                f"packaged-node ProductionV4 {role} byte length",
+            ),
+            "blake3": identity["blake3"],
+            "sha256": identity["sha256"],
+        }
+    candidate_artifacts.update(
+        {
+            "fixed_record_version": 1,
+            "proof_system_digest": proof["proof_system_digest"],
+            "model_manifest_digest": proof["model_manifest_digest"],
+            "fixed_artifact_format_digest": PRODUCTION_V4_FIXED_ARTIFACT_FORMAT_DIGEST,
+            "fixed_artifact_record_digest": proof[
+                "fixed_artifact_record_digest"
+            ],
+        }
+    )
+    return {
+        "schema": RCNET_LAUNCH_CANDIDATE_V2_SCHEMA,
+        "payload": {
+            "profile": network["name"],
+            "artifacts": candidate_artifacts,
+            "virtual_genesis_timestamp_unix_seconds": _runtime_unsigned_decimal(
+                network["virtual_genesis_timestamp_unix_seconds"],
+                "packaged-node virtual genesis timestamp",
+            ),
+            "consensus": consensus,
+            "proof_of_work": {
+                "selection": proof["selection"],
+                "wire_type": proof["wire_type"],
+                "algorithm_version": proof["algorithm_version"],
+                "proof_version": proof["proof_version"],
+                "banks": 3,
+                "layers_per_bank": 128,
+                "exact_transparent_proof_bytes": _runtime_unsigned_decimal(
+                    proof["exact_transparent_proof_bytes"],
+                    "packaged-node exact transparent proof byte length",
+                ),
+                "pow_limit": proof["pow_limit"],
+            },
+            "monetary_policy": monetary_policy,
+            "reward_destinations": rewards,
+        },
+        "launch_root": PRODUCTION_RC_LAUNCH_ROOT,
+        "network_id": network["network_id"],
+        "virtual_genesis_hash": network["virtual_genesis_hash"],
+    }
+
+
+def _validate_production_v4_runtime_identity(
+    network_info: dict[str, object], commit: str
+) -> None:
+    _require_exact_fields(
+        network_info,
+        {
+            "format",
+            "format_version",
+            "network",
+            "consensus",
+            "proof_of_work",
+            "services",
+            "data_directories",
+            "monetary_policy",
+            "reward_destinations",
+        },
+        "packaged-node network information",
+    )
+    if (
+        network_info["format"] != "commonfoundry-network-info"
+        or network_info["format_version"] != 1
+        or type(network_info["format_version"]) is not int
+    ):
+        raise IntegrityError("packaged node reported an unsupported network-info format")
+    services = _require_exact_fields(
+        network_info["services"],
+        {"rpc_port", "p2p_port", "pool_port", "bootstrap_peer"},
+        "packaged-node service identity",
+    )
+    if any(
+        services[field] != expected
+        for field, expected in PRODUCTION_RC_SERVICE_PORTS.items()
+    ):
+        raise IntegrityError(
+            "packaged node does not report the reserved RCNet service ports"
+        )
+    if services["bootstrap_peer"] != PRODUCTION_RC_BOOTSTRAP_PEER:
+        raise IntegrityError(
+            "packaged node does not report the reviewed RCNet bootstrap peer"
+        )
+    data_directories = _require_exact_fields(
+        network_info["data_directories"],
+        {"node", "wallet"},
+        "packaged-node data-directory identity",
+    )
+    if data_directories != {"node": "commonfoundry-rcnet1", "wallet": "rcnet-1"}:
+        raise IntegrityError(
+            "packaged node does not report the isolated RCNet data-directory identities"
+        )
+    network = _require_exact_fields(
+        network_info["network"],
+        {
+            "name",
+            "network_id",
+            "virtual_genesis_hash",
+            "virtual_genesis_timestamp_unix_seconds",
+        },
+        "packaged-node network identity",
+    )
+    if network != {
+        "name": "CommonFoundry RCNet-1",
+        "network_id": PRODUCTION_RC_NETWORK_ID,
+        "virtual_genesis_hash": PRODUCTION_RC_VIRTUAL_GENESIS_HASH,
+        "virtual_genesis_timestamp_unix_seconds": (
+            PRODUCTION_RC_VIRTUAL_GENESIS_TIMESTAMP
+        ),
+    }:
+        raise IntegrityError(
+            "packaged node does not match the immutable RCNet-1 launch candidate identity"
+        )
+    proof = _require_exact_fields(
+        network_info["proof_of_work"],
+        {
+            "selection",
+            "profile",
+            "build_source_commit",
+            "activation_evidence_sha256",
+            "wire_type",
+            "pow_limit",
+            "algorithm_version",
+            "proof_version",
+            "proof_system_digest",
+            "model_manifest_digest",
+            "fixed_artifact_record_digest",
+            "exact_transparent_proof_bytes",
+            "artifacts",
+        },
+        "packaged-node ProductionV4 identity",
+    )
+    expected = {
+        "selection": "ProductionV4",
+        "profile": "ForgeMatrix-v4 transparent BaseFold",
+        "build_source_commit": commit,
+        "wire_type": 4,
+        "pow_limit": PRODUCTION_RC_POW_LIMIT,
+        "algorithm_version": 4,
+        "proof_version": 1,
+        "proof_system_digest": PRODUCTION_V4_PROOF_SYSTEM_DIGEST,
+        "model_manifest_digest": PRODUCTION_V4_MODEL_MANIFEST_DIGEST,
+        "fixed_artifact_record_digest": PRODUCTION_V4_FIXED_ARTIFACT_RECORD_DIGEST,
+        "exact_transparent_proof_bytes": "12025320",
+    }
+    if any(proof.get(field) != value for field, value in expected.items()):
+        raise IntegrityError(
+            "packaged node does not report the expected RCNet-1 ProductionV4 identity"
+        )
+    _require_hex256(
+        proof["activation_evidence_sha256"],
+        "packaged-node ProductionV4 activation evidence",
+        reject_repeated=True,
+    )
+    artifacts = _require_exact_fields(
+        proof["artifacts"],
+        {"bank", "fixed_record"},
+        "packaged-node ProductionV4 artifacts",
+    )
+    expected_artifacts = {
+        "bank": {
+            "bytes": str(PRODUCTION_V4_MODEL_BANK_FILE_BYTES),
+            "blake3": PRODUCTION_V4_MODEL_BANK_FILE_BLAKE3,
+            "sha256": PRODUCTION_V4_MODEL_BANK_FILE_SHA256,
+        },
+        "fixed_record": {
+            "bytes": str(PRODUCTION_V4_FIXED_RECORD_FILE_BYTES),
+            "blake3": PRODUCTION_V4_FIXED_RECORD_FILE_BLAKE3,
+            "sha256": PRODUCTION_V4_FIXED_RECORD_FILE_SHA256,
+        },
+    }
+    for role in ("bank", "fixed_record"):
+        pin = _require_exact_fields(
+            artifacts[role],
+            {"bytes", "blake3", "sha256"},
+            f"packaged-node ProductionV4 {role}",
+        )
+        try:
+            byte_count = int(pin["bytes"])
+        except (TypeError, ValueError) as error:
+            raise IntegrityError(
+                f"packaged-node ProductionV4 {role} byte length is invalid"
+            ) from error
+        if str(byte_count) != pin["bytes"] or byte_count <= 0:
+            raise IntegrityError(
+                f"packaged-node ProductionV4 {role} byte length is invalid"
+            )
+        _require_hex256(
+            pin["blake3"],
+            f"packaged-node ProductionV4 {role} BLAKE3",
+            reject_repeated=False,
+        )
+        _require_hex256(
+            pin["sha256"],
+            f"packaged-node ProductionV4 {role} SHA-256",
+            reject_repeated=False,
+        )
+        if pin != expected_artifacts[role]:
+            raise IntegrityError(
+                f"packaged-node ProductionV4 {role} does not match the release pin"
+            )
+    _validate_production_v4_rcnet_candidate(
+        _production_v4_runtime_candidate(network_info), network_info
+    )
+
+
+def _remove_published_runtime_outputs(
+    outputs: list[tuple[Path, tuple[int, int, int, int, int]]]
+) -> None:
+    failures: list[str] = []
+    synchronized: set[Path] = set()
+    for path, expected_identity in reversed(outputs):
+        try:
+            current = path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            failures.append(f"{path}: {error}")
+            continue
+        if _stat_identity(current) != expected_identity:
+            failures.append(f"{path}: identity changed")
+            continue
+        try:
+            path.unlink()
+            synchronized.add(path.parent)
+        except OSError as error:
+            failures.append(f"{path}: {error}")
+    for directory in sorted(synchronized, key=os.fspath):
+        try:
+            _sync_directory(directory)
+        except (OSError, IntegrityError) as error:
+            failures.append(f"{directory}: {error}")
+    if failures:
+        raise IntegrityError(
+            "cannot durably roll back runtime publication: " + "; ".join(failures)
+        )
+
+
+def create_production_v4_runtime_package(
+    *,
+    repo: Path,
+    expected_commit: str,
+    version: str,
+    platform: str,
+    node: Path,
+    wallet: Path,
+    model_bank: Path,
+    fixed_record: Path,
+    output_directory: Path,
+    source_date_epoch: str | int | None,
+) -> dict[str, object]:
+    repo = repo.resolve(strict=True)
+    commit = _assert_clean_exact_repo(repo, expected_commit)
+    if not is_production_rc_label(version):
+        raise IntegrityError("production runtime package version is not an RC label")
+    validate_production_rc_source_versions(repo=repo, version=version, commit=commit)
+    _require_native_runtime_platform(platform)
+    output_directory = _regular_directory(
+        output_directory, "production runtime output directory"
+    )
+    epoch = _source_date_epoch(repo, source_date_epoch, commit)
+    archive_name = (
+        PRODUCTION_RC_WINDOWS_RUNTIME_PACKAGE_NAME
+        if platform == "windows-x86_64"
+        else PRODUCTION_RC_LINUX_RUNTIME_PACKAGE_NAME
+    )
+    attestation_name = (
+        PRODUCTION_RC_WINDOWS_ATTESTATION_NAME
+        if platform == "windows-x86_64"
+        else PRODUCTION_RC_LINUX_ATTESTATION_NAME
+    )
+    archive_output = output_directory / archive_name
+    attestation_output = output_directory / attestation_name
+    for output in (archive_output, attestation_output):
+        if os.path.lexists(output):
+            raise IntegrityError(f"production runtime output already exists: {output}")
+
+    suffix = ".exe" if platform == "windows-x86_64" else ""
+    with tempfile.TemporaryDirectory(
+        prefix=".cmfd-runtime-package-", dir=output_directory
+    ) as temporary_name:
+        temporary = Path(temporary_name)
+        package_directory = temporary / _runtime_package_root(platform)
+        package_directory.mkdir()
+        artifact_directory = package_directory / PRODUCTION_V4_PACKAGE_ARTIFACT_DIRECTORY
+        artifact_directory.mkdir()
+        for source, destination, label, mode in (
+            (
+                node,
+                package_directory / f"cmfd-node{suffix}",
+                f"{platform} node executable",
+                0o755,
+            ),
+            (
+                wallet,
+                package_directory / f"common-foundry-wallet{suffix}",
+                f"{platform} wallet executable",
+                0o755,
+            ),
+            (
+                model_bank,
+                artifact_directory / PRODUCTION_V4_PACKAGE_BANK,
+                "ProductionV4 model bank",
+                0o644,
+            ),
+            (
+                fixed_record,
+                artifact_directory / PRODUCTION_V4_PACKAGE_FIXED_RECORD,
+                "ProductionV4 fixed artifact record",
+                0o644,
+            ),
+        ):
+            _copy_runtime_input(source, destination, label=label, mode=mode)
+
+        temporary_attestation = temporary / attestation_name
+        attestation = create_runtime_network_info_attestation(
+            platform=platform,
+            package_directory=package_directory,
+            commit=commit,
+            output=temporary_attestation,
+            version=version,
+        )
+        network_info, _ = _network_info_from_runtime_attestation(
+            attestation, platform
+        )
+        _validate_production_v4_runtime_identity(network_info, commit)
+
+        temporary_archive = temporary / archive_name
+        if platform == "windows-x86_64":
+            create_deterministic_zip(package_directory, temporary_archive, epoch)
+        else:
+            create_deterministic_tar_gz(package_directory, temporary_archive, epoch)
+        rows = _validate_runtime_package(
+            path=temporary_archive,
+            platform=platform,
+            staged_network_info=network_info,
+        )
+        _validate_runtime_attestation(
+            path=temporary_attestation,
+            platform=platform,
+            commit=commit,
+            version=version,
+            rows=rows,
+            staged_network_info=network_info,
+        )
+        result: dict[str, object] = {
+            "archive": {
+                "bytes": temporary_archive.stat().st_size,
+                "name": archive_name,
+                "sha256": _sha256_file(temporary_archive),
+            },
+            "attestation": {
+                "bytes": temporary_attestation.stat().st_size,
+                "name": attestation_name,
+                "sha256": _sha256_file(temporary_attestation),
+            },
+            "platform": platform,
+            "source_commit": commit,
+            "source_date_epoch": epoch,
+            "version": version,
+        }
+        published: list[tuple[Path, tuple[int, int, int, int, int]]] = []
+        try:
+            _assert_clean_exact_repo(repo, commit)
+            # The durable attestation is published last as the logical set commit;
+            # final validation rejects an archive left alone by power loss.
+            for source, output in (
+                (temporary_archive, archive_output),
+                (temporary_attestation, attestation_output),
+            ):
+                published.append((output, _publish_new_archive(source, output)))
+        except BaseException:
+            try:
+                _remove_published_runtime_outputs(published)
+            except BaseException as cleanup_error:
+                raise IntegrityError(
+                    "runtime package publication failed and rollback was incomplete"
+                ) from cleanup_error
+            raise
+    return result
+
+
+def _canonical_rcnet_v2_candidate(
+    candidate: dict[str, object], validated: dict[str, object]
+) -> bytes:
+    canonical = {
+        "schema": RCNET_LAUNCH_CANDIDATE_V2_SCHEMA,
+        "payload": validated["canonical_payload"],
+        "launch_root": validated["launch_root"],
+        "network_id": validated["network_id"],
+        "virtual_genesis_hash": validated["genesis"],
+    }
+    if candidate != canonical:
+        raise IntegrityError("RCNet launch candidate is not the canonical V2 candidate")
+    return (json.dumps(canonical, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def _production_v4_file_identity(
+    path: Path, label: str, *, expected_name: str | None = None
+) -> dict[str, object]:
+    path = _regular_file(path, label)
+    if expected_name is not None and path.name != expected_name:
+        raise IntegrityError(f"{label} must be named {expected_name}")
+    with _stable_regular_handle(path, label) as (_, handle, opened):
+        size, sha256, blake3_hash, _ = _stream_sha256(
+            handle,
+            expected_size=opened.st_size,
+            maximum_size=MAX_RUNTIME_ARTIFACT_BYTES,
+            label=label,
+            capture_bytes=0,
+        )
+    return {
+        "name": path.name,
+        "bytes": size,
+        "sha256": sha256,
+        "blake3": blake3_hash,
+    }
+
+
+def _validate_production_v4_rcnet_input_manifest(
+    path: Path,
+    *,
+    expected_network_id: str,
+    expected_source_commit: str,
+    expected_identity: dict[str, object],
+) -> tuple[dict[str, object], dict[str, dict[str, object]]]:
+    path = _regular_file(path, "ProductionV4 RCNet input manifest")
+    if path.name != PRODUCTION_V4_RCNET_INPUT_MANIFEST_NAME:
+        raise IntegrityError(
+            "ProductionV4 RCNet input manifest must have its canonical RCNet name"
+        )
+    manifest, manifest_bytes = _bounded_json_object(
+        path, "ProductionV4 RCNet input manifest"
+    )
+    if manifest_bytes != _canonical_json(manifest):
+        raise IntegrityError("ProductionV4 RCNet input manifest is not canonical JSON")
+    _require_exact_fields(
+        manifest,
+        {"schema_version", "network", "network_id", "source_commit", "total_bytes", "files"},
+        "ProductionV4 RCNet input manifest",
+    )
+    if (
+        manifest["schema_version"] != 1
+        or manifest["network"] != PRODUCTION_V4_RCNET_NETWORK_NAME
+        or manifest["network_id"] != expected_network_id
+        or manifest["source_commit"] != expected_source_commit
+    ):
+        raise IntegrityError(
+            "ProductionV4 RCNet input manifest is not bound to the RCNet candidate and generation commit"
+        )
+    files = manifest["files"]
+    if not isinstance(files, list) or len(files) != len(PRODUCTION_V4_RCNET_INPUT_NAMES):
+        raise IntegrityError("ProductionV4 RCNet input manifest file set is incomplete")
+    rows: dict[str, dict[str, object]] = {}
+    observed_names: list[str] = []
+    total_bytes = 0
+    for value in files:
+        row = _require_exact_fields(
+            value,
+            {"name", "bytes", "sha256"},
+            "ProductionV4 RCNet input identity",
+        )
+        name = row["name"]
+        if not isinstance(name, str) or name in rows:
+            raise IntegrityError("ProductionV4 RCNet input file name is invalid")
+        byte_count = _require_unsigned_integer(
+            row["bytes"], f"ProductionV4 RCNet input {name} byte length", positive=True
+        )
+        if byte_count > MAX_RUNTIME_ARTIFACT_BYTES:
+            raise IntegrityError(f"ProductionV4 RCNet input {name} exceeds its size limit")
+        _require_hex256(
+            row["sha256"],
+            f"ProductionV4 RCNet input {name} SHA-256",
+            reject_repeated=False,
+        )
+        observed_names.append(name)
+        rows[name] = row
+        total_bytes += byte_count
+    if tuple(observed_names) != PRODUCTION_V4_RCNET_INPUT_NAMES:
+        raise IntegrityError("ProductionV4 RCNet input manifest file order is not canonical")
+    if manifest["total_bytes"] != total_bytes:
+        raise IntegrityError("ProductionV4 RCNet input manifest total byte count is invalid")
+    exact_inputs = {
+        PRODUCTION_V4_PACKAGE_BANK: (
+            PRODUCTION_V4_MODEL_BANK_FILE_BYTES,
+            PRODUCTION_V4_MODEL_BANK_FILE_SHA256,
+        ),
+        PRODUCTION_V4_PACKAGE_FIXED_RECORD: (
+            PRODUCTION_V4_FIXED_RECORD_FILE_BYTES,
+            PRODUCTION_V4_FIXED_RECORD_FILE_SHA256,
+        ),
+    }
+    for name, (byte_count, sha256) in exact_inputs.items():
+        if rows[name]["bytes"] != byte_count or rows[name]["sha256"] != sha256:
+            raise IntegrityError(
+                f"ProductionV4 RCNet input manifest has invalid immutable identity for {name}"
+            )
+    actual_identity = {
+        "name": path.name,
+        "bytes": len(manifest_bytes),
+        "sha256": _sha256_bytes(manifest_bytes),
+        "blake3": _blake3_bytes(manifest_bytes),
+    }
+    if actual_identity != expected_identity:
+        raise IntegrityError(
+            "ProductionV4 RCNet input manifest does not match qualification evidence"
+        )
+    return manifest, rows
+
+
+def _validate_production_v4_activation_artifacts(
+    *,
+    input_rows: dict[str, dict[str, object]],
+    qualification_manifest: dict[str, object],
+    verifier_report: dict[str, object],
+    model_bank: Path,
+    fixed_record: Path,
+    artifact_directory: Path,
+    proof: Path,
+) -> dict[str, dict[str, object]]:
+    artifact_values = qualification_manifest["artifacts"]
+    if not isinstance(artifact_values, list):  # pragma: no cover - validated upstream.
+        raise IntegrityError("ProductionV4 qualification artifact identities are missing")
+    qualification_rows = {
+        str(row["name"]): row for row in artifact_values if isinstance(row, dict)
+    }
+    artifact_directory = _regular_directory(
+        artifact_directory, "ProductionV4 fixed-artifact directory"
+    )
+    paths = {
+        PRODUCTION_V4_PACKAGE_BANK: model_bank,
+        PRODUCTION_V4_PACKAGE_FIXED_RECORD: fixed_record,
+        **{
+            f"FORGEMATRIX-V4-FIXED-BANK-{bank}.{suffix}": artifact_directory
+            / f"FORGEMATRIX-V4-FIXED-BANK-{bank}.{suffix}"
+            for bank in range(3)
+            for suffix in ("json", "codeword", "row-major.codeword", "tree")
+        },
+    }
+    identities: dict[str, dict[str, object]] = {}
+    for name, path in paths.items():
+        actual = _production_v4_file_identity(
+            path, f"ProductionV4 artifact {name}", expected_name=name
+        )
+        expected = qualification_rows.get(name)
+        if actual != expected:
+            raise IntegrityError(
+                f"ProductionV4 artifact {name} does not match qualification evidence"
+            )
+        input_row = input_rows.get(name)
+        if input_row is not None and (
+            actual["bytes"] != input_row["bytes"]
+            or actual["sha256"] != input_row["sha256"]
+        ):
+            raise IntegrityError(
+                f"ProductionV4 artifact {name} does not match the RCNet input manifest"
+            )
+        identities[name] = actual
+
+    known_proof = _validate_report_file_identity(
+        verifier_report["known_valid_proof"], "ProductionV4 known-valid proof"
+    )
+    proof_identity = _production_v4_file_identity(
+        proof, "ProductionV4 known-valid proof", expected_name=str(known_proof["name"])
+    )
+    if proof_identity != known_proof:
+        raise IntegrityError(
+            "ProductionV4 known-valid proof does not match verifier evidence"
+        )
+    identities[str(proof_identity["name"])] = proof_identity
+    return identities
+
+
+def _validate_production_v4_verifier_sources(
+    repo: Path, verifier_report: dict[str, object]
+) -> None:
+    values = verifier_report["verifier_files"]
+    if not isinstance(values, list):  # pragma: no cover - validated upstream.
+        raise IntegrityError("ProductionV4 fresh-process verifier files are missing")
+    reported = {str(row["name"]): row for row in values if isinstance(row, dict)}
+    for name in PRODUCTION_V4_VERIFIER_FILE_NAMES:
+        tracked = _tracked_blob(repo, f"scripts/{name}")
+        expected = {
+            "name": name,
+            "bytes": len(tracked),
+            "sha256": _sha256_bytes(tracked),
+            "blake3": _blake3_bytes(tracked),
+        }
+        if reported.get(name) != expected:
+            raise IntegrityError(
+                f"tracked ProductionV4 verifier source does not match qualification evidence: {name}"
+            )
+
+
+def _resolve_production_v4_commit(repo: Path, value: str, label: str) -> str:
+    commit = _full_commit(value)
+    try:
+        resolved = _run_git(
+            repo, "rev-parse", "--verify", f"{commit}^{{commit}}"
+        ).lower()
+    except IntegrityError as error:
+        raise IntegrityError(f"{label} does not resolve in the exact source repository") from error
+    if resolved != commit:
+        raise IntegrityError(f"{label} does not resolve to its exact Git commit")
+    return commit
+
+
+def _require_production_v4_ancestor(
+    repo: Path, ancestor: str, descendant: str, label: str
+) -> None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo), "merge-base", "--is-ancestor", ancestor, descendant],
+            check=False,
+            capture_output=True,
+        )
+    except OSError as error:
+        raise IntegrityError(f"cannot inspect {label} Git ancestry") from error
+    if result.returncode != 0:
+        raise IntegrityError(f"{label} is not on the required Git ancestry")
+
+
+def _tracked_blob_at(repo: Path, commit: str, relative: str) -> bytes:
+    commit = _full_commit(commit)
+    safe = _safe_repo_relative(relative)
+    return _run_git_bytes(repo, "cat-file", "blob", f"{commit}:{safe}")
+
+
+def _validate_production_v4_activation_history(
+    *,
+    phase: str,
+    repo: Path,
+    commit: str,
+    generation_commit: str,
+    qualification_commit: str,
+    pin_bytes: bytes,
+) -> None:
+    generation_commit = _resolve_production_v4_commit(
+        repo, generation_commit, "ProductionV4 artifact-generation source commit"
+    )
+    qualification_commit = _resolve_production_v4_commit(
+        repo, qualification_commit, "ProductionV4 qualification source commit"
+    )
+    _require_production_v4_ancestor(
+        repo,
+        generation_commit,
+        qualification_commit,
+        "ProductionV4 artifact-generation commit",
+    )
+    ancestry_tip = commit
+    if phase == "pin":
+        if _tracked_blob(repo, PRODUCTION_V4_ACTIVATION_PIN_RELATIVE) != b"None\n":
+            raise IntegrityError(
+                "ProductionV4 pin phase requires the tracked activation pin to be None"
+            )
+    else:
+        if _tracked_blob(repo, PRODUCTION_V4_ACTIVATION_PIN_RELATIVE) != pin_bytes:
+            raise IntegrityError(
+                "tracked ProductionV4 activation pin does not match validated evidence"
+            )
+        revision = _run_git(repo, "rev-list", "--parents", "-n", "1", commit).split()
+        if len(revision) != 2:
+            raise IntegrityError(
+                "ProductionV4 activation commit must have exactly one parent"
+            )
+        ancestry_tip = revision[1]
+        changed = _run_git(
+            repo,
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "--no-renames",
+            "-r",
+            commit,
+        ).splitlines()
+        if changed != [PRODUCTION_V4_ACTIVATION_PIN_RELATIVE]:
+            raise IntegrityError(
+                "ProductionV4 activation commit must change only the reviewed source pin"
+            )
+        if (
+            _tracked_blob_at(repo, ancestry_tip, PRODUCTION_V4_ACTIVATION_PIN_RELATIVE)
+            != b"None\n"
+            or _tracked_blob(repo, PRODUCTION_V4_ACTIVATION_PIN_RELATIVE) != pin_bytes
+        ):
+            raise IntegrityError(
+                "ProductionV4 activation commit is not the exact None-to-reviewed-pin transition"
+            )
+    _require_production_v4_ancestor(
+        repo,
+        qualification_commit,
+        ancestry_tip,
+        "ProductionV4 qualification commit",
+    )
+
+
+def _run_production_v4_verifier(repo: Path, arguments: list[str]) -> dict[str, object]:
+    entrypoint = _tracked_file(repo, PRODUCTION_V4_VERIFIER_ENTRYPOINT_RELATIVE)
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(entrypoint), *arguments, "--json"],
+            cwd=repo,
+            check=False,
+            capture_output=True,
+            timeout=3_600,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise IntegrityError("ProductionV4 fresh-process verifier could not complete") from error
+    if (
+        len(completed.stdout) > MAX_RELEASE_GATE_JSON_BYTES
+        or len(completed.stderr) > MAX_RELEASE_GATE_JSON_BYTES
+    ):
+        raise IntegrityError("ProductionV4 fresh-process verifier output exceeds its bound")
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", "replace").strip()
+        raise IntegrityError(
+            f"ProductionV4 fresh-process verifier rejected qualification inputs: {detail[:500]}"
+        )
+    return _json_object_bytes(
+        completed.stdout, "ProductionV4 fresh-process verifier result"
+    )
+
+
+def _normalized_production_v4_verifier_result(
+    value: dict[str, object],
+) -> dict[str, object]:
+    normalized = json.loads(json.dumps(value))
+    proof = normalized.get("proof")
+    if isinstance(proof, dict):
+        proof.pop("path", None)
+    return normalized
+
+
+def _replay_production_v4_verifier(
+    *,
+    repo: Path,
+    template: Path,
+    proof: Path,
+    fixed_record: Path,
+    model_bank: Path,
+    qualification_manifest: dict[str, object],
+    verifier_report: dict[str, object],
+    qualification_statement: dict[str, object],
+) -> None:
+    template_path = _regular_file(template, "ProductionV4 RCNet proof template")
+    _, template_bytes = _bounded_json_object(
+        template_path, "ProductionV4 RCNet proof template"
+    )
+    proof = _regular_file(proof, "ProductionV4 known-valid proof")
+    fixed_record = _regular_file(fixed_record, "ProductionV4 fixed-artifact record")
+    model_bank = _regular_file(model_bank, "ProductionV4 model bank")
+    with tempfile.TemporaryDirectory(prefix="cmfd-v4-activation-replay-") as temporary:
+        statement_path = Path(temporary) / "statement.json"
+        derived = _run_production_v4_verifier(
+            repo,
+            [
+                "--template",
+                str(template_path),
+                "--proof",
+                str(proof),
+                "--write-statement",
+                str(statement_path),
+            ],
+        )
+        replayed_statement, _ = _bounded_json_object(
+            statement_path, "replayed ProductionV4 qualification statement"
+        )
+        if replayed_statement != qualification_statement:
+            raise IntegrityError(
+                "replayed ProductionV4 statement does not match qualification evidence"
+            )
+        verified = _run_production_v4_verifier(
+            repo,
+            [
+                "--statement",
+                str(statement_path),
+                "--proof",
+                str(proof),
+                "--fixed-artifact-record",
+                str(fixed_record),
+                "--model-bank",
+                str(model_bank),
+            ],
+        )
+
+    statement_derivation = verifier_report["statement_derivation"]
+    known_valid = verifier_report["known_valid_result"]
+    if not isinstance(statement_derivation, dict) or not isinstance(known_valid, dict):
+        raise IntegrityError("ProductionV4 verifier replay evidence is malformed")
+    expected_derived = statement_derivation.get("result")
+    expected_verified = known_valid.get("result")
+    if (
+        not isinstance(expected_derived, dict)
+        or not isinstance(expected_verified, dict)
+        or _normalized_production_v4_verifier_result(derived)
+        != _normalized_production_v4_verifier_result(expected_derived)
+        or _normalized_production_v4_verifier_result(verified)
+        != _normalized_production_v4_verifier_result(expected_verified)
+    ):
+        raise IntegrityError(
+            "fresh ProductionV4 verifier replay does not reproduce the recorded report"
+        )
+    reproduction_result = qualification_manifest["proof_verification"]
+    if not isinstance(reproduction_result, dict):  # pragma: no cover - validated upstream.
+        raise IntegrityError("ProductionV4 qualification proof verification is missing")
+    expected_reproduction = json.loads(json.dumps(verified))
+    expected_reproduction["candidate_claims_verified"] = False
+    if _normalized_production_v4_verifier_result(
+        reproduction_result
+    ) != _normalized_production_v4_verifier_result(expected_reproduction):
+        raise IntegrityError(
+            "ProductionV4 reproduction result does not match fresh full verification"
+        )
+    _, template_bytes_after = _bounded_json_object(
+        template_path, "ProductionV4 RCNet proof template"
+    )
+    if template_bytes_after != template_bytes:
+        raise IntegrityError("ProductionV4 RCNet proof template changed during replay")
+    qualification_rows = {
+        str(row["name"]): row
+        for row in qualification_manifest["artifacts"]
+        if isinstance(row, dict)
+    }
+    for path, name in (
+        (model_bank, PRODUCTION_V4_PACKAGE_BANK),
+        (fixed_record, PRODUCTION_V4_PACKAGE_FIXED_RECORD),
+    ):
+        if _production_v4_file_identity(
+            path, f"ProductionV4 replay input {name}", expected_name=name
+        ) != qualification_rows[name]:
+            raise IntegrityError(f"ProductionV4 replay input {name} changed during replay")
+    known_proof = _validate_report_file_identity(
+        verifier_report["known_valid_proof"], "ProductionV4 known-valid proof"
+    )
+    if _production_v4_file_identity(
+        proof,
+        "ProductionV4 replay known-valid proof",
+        expected_name=str(known_proof["name"]),
+    ) != known_proof:
+        raise IntegrityError("ProductionV4 known-valid proof changed during replay")
+
+
+def _production_v4_approval_identity(name: str, data: bytes) -> dict[str, object]:
+    return {
+        "name": name,
+        "bytes": len(data),
+        "sha256": _sha256_bytes(data),
+        "blake3": _blake3_bytes(data),
+    }
+
+
+def _production_v4_approval_network(
+    candidate: dict[str, object], validated: dict[str, object]
+) -> dict[str, object]:
+    payload = candidate.get("payload")
+    if not isinstance(payload, dict):  # pragma: no cover - validated candidate contract.
+        raise IntegrityError("RCNet launch candidate payload is unavailable")
+    proof = payload.get("proof_of_work")
+    timestamp = payload.get("virtual_genesis_timestamp_unix_seconds")
+    if not isinstance(proof, dict) or not isinstance(timestamp, int):
+        raise IntegrityError("RCNet launch candidate approval identity is unavailable")
+    return {
+        "profile": PRODUCTION_V4_RCNET_NETWORK_NAME,
+        "launch_root": validated["launch_root"],
+        "network_id": validated["network_id"],
+        "virtual_genesis_hash": validated["genesis"],
+        "virtual_genesis_timestamp_unix_seconds": timestamp,
+        "pow_limit": proof["pow_limit"],
+    }
+
+
+def _production_v4_approval_common_files(
+    *,
+    candidate_bytes: bytes,
+    input_manifest: dict[str, object],
+    qualification_manifest_bytes: bytes,
+    qualification_manifest: dict[str, object],
+    verifier_report_bytes: bytes,
+    verifier_report: dict[str, object],
+    verifier_script_size: int,
+    verifier_script_sha256: str,
+    verifier_script_blake3: str,
+    template_path: Path,
+) -> dict[str, object]:
+    artifact_values = qualification_manifest.get("artifacts")
+    if not isinstance(artifact_values, list):  # pragma: no cover - validated upstream.
+        raise IntegrityError("ProductionV4 qualification artifact identities are unavailable")
+    artifacts = {
+        str(row["name"]): row
+        for row in artifact_values
+        if isinstance(row, dict) and isinstance(row.get("name"), str)
+    }
+    known_proof = _validate_report_file_identity(
+        verifier_report.get("known_valid_proof"), "ProductionV4 known-valid proof"
+    )
+    template = _production_v4_file_identity(
+        template_path, "ProductionV4 RCNet proof template"
+    )
+    template["name"] = "PRODUCTION-V4-RCNET-PROOF-TEMPLATE.json"
+    files: dict[str, object] = {
+        "launch_candidate": _production_v4_approval_identity(
+            PRODUCTION_RC_LAUNCH_CANDIDATE_NAME, candidate_bytes
+        ),
+        "rcnet_input_manifest": dict(input_manifest),
+        "independent_reproduction_report": _production_v4_approval_identity(
+            PRODUCTION_V4_QUALIFICATION_MANIFEST_NAME, qualification_manifest_bytes
+        ),
+        "fresh_process_verifier_report": _production_v4_approval_identity(
+            PRODUCTION_V4_FRESH_PROCESS_VERIFIER_REPORT_NAME, verifier_report_bytes
+        ),
+        "fresh_process_verifier_script": {
+            "name": PRODUCTION_V4_FRESH_PROCESS_VERIFIER_SCRIPT_NAME,
+            "bytes": verifier_script_size,
+            "sha256": verifier_script_sha256,
+            "blake3": verifier_script_blake3,
+        },
+        "rcnet_proof_template": template,
+        "qualification_proof": dict(known_proof),
+        "model_bank": dict(artifacts[PRODUCTION_V4_PACKAGE_BANK]),
+        "fixed_artifact_record": dict(
+            artifacts[PRODUCTION_V4_PACKAGE_FIXED_RECORD]
+        ),
+    }
+    for bank in range(3):
+        for suffix, role_suffix in (
+            ("json", "json"),
+            ("codeword", "codeword"),
+            ("row-major.codeword", "row_major_codeword"),
+            ("tree", "tree"),
+        ):
+            name = f"FORGEMATRIX-V4-FIXED-BANK-{bank}.{suffix}"
+            try:
+                files[f"fixed_bank_{bank}_{role_suffix}"] = dict(artifacts[name])
+            except KeyError as error:  # pragma: no cover - validated upstream.
+                raise IntegrityError(
+                    f"ProductionV4 qualification artifact identity is missing: {name}"
+                ) from error
+    try:
+        activation_approval.qualification_binding_sha256(files)
+    except activation_approval.ApprovalError as error:
+        raise IntegrityError(str(error)) from error
+    return files
+
+
+def _validate_production_v4_activation_inputs(
+    *,
+    repo: Path,
+    candidate_path: Path,
+    input_manifest_path: Path,
+    qualification_manifest_path: Path,
+    verifier_report_path: Path,
+    verifier_script_path: Path,
+    template_path: Path,
+    proof_path: Path,
+    model_bank_path: Path,
+    fixed_record_path: Path,
+    artifact_directory: Path,
+) -> dict[str, object]:
+    candidate, candidate_bytes = _bounded_json_object(
+        candidate_path, "RCNet launch candidate"
+    )
+    validated_candidate = _validate_production_v4_rcnet_candidate(candidate)
+    if candidate_bytes != _canonical_rcnet_v2_candidate(candidate, validated_candidate):
+        raise IntegrityError("RCNet launch candidate is not canonical pretty JSON")
+    candidate_artifacts = {
+        "bank": validated_candidate["bank"],
+        "fixed_record": validated_candidate["fixed_record"],
+    }
+    if any(not isinstance(identity, dict) for identity in candidate_artifacts.values()):
+        raise IntegrityError("RCNet launch candidate artifact identities are unavailable")
+    artifact_pins = {
+        role: {
+            "bytes": str(identity["bytes"]),
+            "blake3": identity["blake3"],
+            "sha256": identity["sha256"],
+        }
+        for role, identity in candidate_artifacts.items()
+    }
+    proof = {"artifacts": artifact_pins}
+
+    qualification_manifest, qualification_manifest_bytes = _bounded_json_object(
+        qualification_manifest_path, "ProductionV4 qualification manifest"
+    )
+    if qualification_manifest_bytes != _canonical_json(qualification_manifest):
+        raise IntegrityError("ProductionV4 qualification manifest is not canonical JSON")
+    (
+        qualification_source_commit,
+        qualification_generation_commit,
+        qualification_proof,
+        qualification_statement,
+        qualification_input_manifest,
+        qualification_derived,
+    ) = _validate_production_v4_qualification_manifest(
+        qualification_manifest, proof, str(validated_candidate["network_id"])
+    )
+
+    specification_rows = qualification_manifest["frozen_specifications"]
+    if not isinstance(specification_rows, list):  # pragma: no cover - validated above.
+        raise IntegrityError("ProductionV4 frozen specification identities are missing")
+    reported_specifications = {
+        str(row["path"]): row for row in specification_rows if isinstance(row, dict)
+    }
+    for relative, expected_sha256 in PRODUCTION_V4_FROZEN_SPEC_SHA256.items():
+        tracked = _tracked_blob(repo, relative)
+        row = reported_specifications.get(relative)
+        if (
+            _sha256_bytes(tracked) != expected_sha256
+            or row is None
+            or row.get("bytes") != len(tracked)
+            or row.get("sha256") != expected_sha256
+            or row.get("blake3") != _blake3_bytes(tracked)
+        ):
+            raise IntegrityError(
+                f"tracked ProductionV4 frozen specification does not match qualification evidence: {relative}"
+            )
+
+    verifier_script_path = _regular_file(
+        verifier_script_path, "ProductionV4 fresh-process verifier script"
+    )
+    with _stable_regular_handle(
+        verifier_script_path, "ProductionV4 fresh-process verifier script"
+    ) as (_, verifier_handle, verifier_stat):
+        if verifier_stat.st_size <= 0:
+            raise IntegrityError("ProductionV4 fresh-process verifier script is empty")
+        (
+            verifier_script_size,
+            verifier_script_sha256,
+            verifier_script_blake3,
+            verifier_script_bytes,
+        ) = _stream_sha256(
+            verifier_handle,
+            expected_size=verifier_stat.st_size,
+            maximum_size=MAX_RELEASE_GATE_JSON_BYTES,
+            label="ProductionV4 fresh-process verifier script",
+            capture_bytes=MAX_RELEASE_GATE_JSON_BYTES,
+        )
+    tracked_verifier = _tracked_blob(repo, PRODUCTION_V4_VERIFIER_ENTRYPOINT_RELATIVE)
+    if verifier_script_bytes != tracked_verifier:
+        raise IntegrityError(
+            "ProductionV4 verifier script is not byte-identical to the tracked HEAD entrypoint"
+        )
+
+    verifier_report, verifier_report_bytes = _bounded_json_object(
+        verifier_report_path, "ProductionV4 fresh-process verifier report"
+    )
+    if verifier_report_bytes != _canonical_json(verifier_report):
+        raise IntegrityError("ProductionV4 verifier report is not canonical JSON")
+    _validate_production_v4_verifier_report(
+        verifier_report,
+        qualification_source_commit,
+        qualification_proof,
+        qualification_statement,
+        qualification_derived,
+        (verifier_script_size, verifier_script_sha256, verifier_script_blake3),
+    )
+    _validate_production_v4_verifier_sources(repo, verifier_report)
+
+    _, input_rows = _validate_production_v4_rcnet_input_manifest(
+        input_manifest_path,
+        expected_network_id=str(validated_candidate["network_id"]),
+        expected_source_commit=qualification_generation_commit,
+        expected_identity=qualification_input_manifest,
+    )
+    _validate_production_v4_activation_artifacts(
+        input_rows=input_rows,
+        qualification_manifest=qualification_manifest,
+        verifier_report=verifier_report,
+        model_bank=model_bank_path,
+        fixed_record=fixed_record_path,
+        artifact_directory=artifact_directory,
+        proof=proof_path,
+    )
+    _replay_production_v4_verifier(
+        repo=repo,
+        template=template_path,
+        proof=proof_path,
+        fixed_record=fixed_record_path,
+        model_bank=model_bank_path,
+        qualification_manifest=qualification_manifest,
+        verifier_report=verifier_report,
+        qualification_statement=qualification_statement,
+    )
+
+    approval_files = _production_v4_approval_common_files(
+        candidate_bytes=candidate_bytes,
+        input_manifest=qualification_input_manifest,
+        qualification_manifest_bytes=qualification_manifest_bytes,
+        qualification_manifest=qualification_manifest,
+        verifier_report_bytes=verifier_report_bytes,
+        verifier_report=verifier_report,
+        verifier_script_size=verifier_script_size,
+        verifier_script_sha256=verifier_script_sha256,
+        verifier_script_blake3=verifier_script_blake3,
+        template_path=template_path,
+    )
+
+    pin_fields = {
+        "schema": "CMFD_PRODUCTION_V4_ACTIVATION_V1",
+        "qualification_source_commit": qualification_source_commit,
+        "qualification_manifest_sha256": _sha256_bytes(qualification_manifest_bytes),
+        "fresh_process_verifier_binary_sha256": verifier_script_sha256,
+        "fresh_process_verifier_report_sha256": _sha256_bytes(verifier_report_bytes),
+        "core_spec_sha256": PRODUCTION_V4_CORE_SPEC_SHA256,
+        "core_vector_sha256": PRODUCTION_V4_CORE_VECTOR_SHA256,
+        "proof_algebra_sha256": PRODUCTION_V4_PROOF_ALGEBRA_SHA256,
+    }
+    return {
+        "approval_files": approval_files,
+        "approval_network": _production_v4_approval_network(
+            candidate, validated_candidate
+        ),
+        "artifacts": artifact_pins,
+        "generation_commit": qualification_generation_commit,
+        "pin_fields": pin_fields,
+        "qualification_commit": qualification_source_commit,
+    }
+
+
+def _production_v4_approval_trust(
+    *,
+    common_files: dict[str, object],
+    producer_allowed_signers: Path,
+    producer_signer_identity: str,
+    reproducer_allowed_signers: Path,
+    reproducer_signer_identity: str,
+    expected_ssh_keygen_sha256: str,
+) -> dict[str, object]:
+    _require_hex256(
+        expected_ssh_keygen_sha256,
+        "trusted OpenSSH verifier SHA-256",
+        reject_repeated=False,
+    )
+    try:
+        authorities = activation_approval.load_trusted_authorities(
+            producer_allowed_signers=producer_allowed_signers,
+            producer_signer_identity=producer_signer_identity,
+            reproducer_allowed_signers=reproducer_allowed_signers,
+            reproducer_signer_identity=reproducer_signer_identity,
+        )
+        binding = activation_approval.qualification_binding_sha256(common_files)
+    except activation_approval.ApprovalError as error:
+        raise IntegrityError(str(error)) from error
+    return {
+        "contract_schema": activation_approval.SUBJECT_SCHEMA,
+        "qualification_binding_sha256": binding,
+        "ssh_keygen_sha256": expected_ssh_keygen_sha256,
+        "producer": authorities[activation_approval.PRODUCER_ROLE],
+        "independent_reproducer": authorities[activation_approval.REPRODUCER_ROLE],
+    }
+
+
+def _production_v4_pin_fields_with_trust(
+    base_fields: dict[str, object], approval_trust: dict[str, object]
+) -> dict[str, object]:
+    return {**base_fields, "approval_trust": approval_trust}
+
+
+def _validate_production_v4_approval_trust_fields(
+    value: object,
+) -> dict[str, object]:
+    trust = _require_exact_fields(
+        value,
+        {
+            "contract_schema",
+            "qualification_binding_sha256",
+            "ssh_keygen_sha256",
+            "producer",
+            "independent_reproducer",
+        },
+        "ProductionV4 activation approval trust",
+    )
+    if trust["contract_schema"] != activation_approval.SUBJECT_SCHEMA:
+        raise IntegrityError("ProductionV4 activation approval contract schema is invalid")
+    _require_hex256(
+        trust["qualification_binding_sha256"],
+        "ProductionV4 qualification binding SHA-256",
+        reject_repeated=False,
+    )
+    _require_hex256(
+        trust["ssh_keygen_sha256"],
+        "ProductionV4 trusted OpenSSH verifier SHA-256",
+        reject_repeated=False,
+    )
+    for role in ("producer", "independent_reproducer"):
+        row = _require_exact_fields(
+            trust[role],
+            {
+                "signer_identity",
+                "allowed_signers_sha256",
+                "key_blob_sha256",
+                "key_fingerprint",
+                "key_type",
+            },
+            f"ProductionV4 {role} approval trust",
+        )
+        if (
+            not isinstance(row["signer_identity"], str)
+            or not SIGNER_IDENTITY_RE.fullmatch(row["signer_identity"])
+        ):
+            raise IntegrityError(f"ProductionV4 {role} approval signer identity is invalid")
+        for field in ("allowed_signers_sha256", "key_blob_sha256"):
+            _require_hex256(
+                row[field],
+                f"ProductionV4 {role} {field}",
+                reject_repeated=False,
+            )
+        if (
+            not isinstance(row["key_fingerprint"], str)
+            or not re.fullmatch(r"SHA256:[A-Za-z0-9+/]{43}", row["key_fingerprint"])
+            or not isinstance(row["key_type"], str)
+            or not SIGNER_IDENTITY_RE.fullmatch(row["key_type"])
+            or "-cert-v01@openssh.com" in row["key_type"]
+            or row["key_type"].startswith("ssh-dss")
+        ):
+            raise IntegrityError(f"ProductionV4 {role} approval key identity is invalid")
+        expected_fingerprint = "SHA256:" + base64.b64encode(
+            bytes.fromhex(row["key_blob_sha256"])
+        ).decode("ascii").rstrip("=")
+        if row["key_fingerprint"] != expected_fingerprint:
+            raise IntegrityError(
+                f"ProductionV4 {role} key fingerprint does not match its key digest"
+            )
+    producer = trust["producer"]
+    reproducer = trust["independent_reproducer"]
+    if not isinstance(producer, dict) or not isinstance(reproducer, dict):
+        raise IntegrityError("ProductionV4 approval trust is malformed")
+    if any(
+        producer[field] == reproducer[field]
+        for field in (
+            "signer_identity",
+            "allowed_signers_sha256",
+            "key_blob_sha256",
+            "key_fingerprint",
+        )
+    ):
+        raise IntegrityError(
+            "ProductionV4 producer and independent reproducer authorities must differ"
+        )
+    return trust
+
+
+def _render_production_v4_activation_pin(pin_fields: dict[str, object]) -> bytes:
+    fields = (
+        "schema",
+        "qualification_source_commit",
+        "qualification_manifest_sha256",
+        "fresh_process_verifier_binary_sha256",
+        "fresh_process_verifier_report_sha256",
+        "core_spec_sha256",
+        "core_vector_sha256",
+        "proof_algebra_sha256",
+    )
+    _require_exact_fields(
+        pin_fields, {*fields, "approval_trust"}, "ProductionV4 activation source pin"
+    )
+    lines = ["Some(ProductionV4ActivationEvidence {"]
+    for field in fields:
+        value = pin_fields[field]
+        if not isinstance(value, str):  # pragma: no cover - internal validated contract.
+            raise IntegrityError(f"ProductionV4 activation source pin has invalid {field}")
+        lines.append(f'    {field}: "{value}",')
+    trust = _validate_production_v4_approval_trust_fields(pin_fields["approval_trust"])
+    lines.append("    approval_trust: ProductionV4ActivationApprovalTrust {")
+    lines.append(f'        contract_schema: "{trust["contract_schema"]}",')
+    lines.append(
+        "        qualification_binding_sha256: "
+        f'"{trust["qualification_binding_sha256"]}",'
+    )
+    lines.append(f'        ssh_keygen_sha256: "{trust["ssh_keygen_sha256"]}",')
+    for role in ("producer", "independent_reproducer"):
+        signer = trust[role]
+        if not isinstance(signer, dict):  # pragma: no cover - validated above.
+            raise IntegrityError("ProductionV4 approval signer trust is unavailable")
+        lines.append(f"        {role}: ProductionV4ActivationSignerTrust {{")
+        for field in (
+            "signer_identity",
+            "allowed_signers_sha256",
+            "key_blob_sha256",
+            "key_fingerprint",
+            "key_type",
+        ):
+            lines.append(f'            {field}: "{signer[field]}",')
+        lines.append("        },")
+    lines.append("    },")
+    lines.append("})")
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def _production_v4_activation_evidence(
+    *, validated: dict[str, object], pin_fields: dict[str, object], commit: str
+) -> tuple[dict[str, object], bytes]:
+    approval_trust = _validate_production_v4_approval_trust_fields(
+        pin_fields.get("approval_trust")
+    )
+    evidence = {
+        "activation_approval_trust": approval_trust,
+        "artifacts": validated["artifacts"],
+        "core_spec_sha256": pin_fields["core_spec_sha256"],
+        "core_vector_sha256": pin_fields["core_vector_sha256"],
+        "fresh_process_verifier_binary_sha256": pin_fields[
+            "fresh_process_verifier_binary_sha256"
+        ],
+        "fresh_process_verifier_report_sha256": pin_fields[
+            "fresh_process_verifier_report_sha256"
+        ],
+        "network_profile": "RCNet-1",
+        "proof_algebra_sha256": pin_fields["proof_algebra_sha256"],
+        "proof_selection": "ProductionV4",
+        "qualification_manifest_sha256": pin_fields[
+            "qualification_manifest_sha256"
+        ],
+        "qualification_source_commit": pin_fields["qualification_source_commit"],
+        "schema": pin_fields["schema"],
+        "source_commit": commit,
+    }
+    return evidence, _canonical_json(evidence)
+
+
+def _production_v4_approval_subject(
+    *,
+    phase: str,
+    commit: str,
+    validated: dict[str, object],
+    pin_bytes: bytes,
+    evidence_bytes: bytes | None,
+    network_info: Path | None,
+) -> dict[str, object]:
+    common_files = validated.get("approval_files")
+    network = validated.get("approval_network")
+    generation_commit = validated.get("generation_commit")
+    qualification_commit = validated.get("qualification_commit")
+    if (
+        not isinstance(common_files, dict)
+        or not isinstance(network, dict)
+        or not isinstance(generation_commit, str)
+        or not isinstance(qualification_commit, str)
+    ):
+        raise IntegrityError("ProductionV4 activation approval inputs are unavailable")
+    files = json.loads(json.dumps(common_files))
+    if phase == "evidence":
+        if evidence_bytes is None or network_info is None:
+            raise IntegrityError(
+                "ProductionV4 evidence approval requires compiled NETWORK-INFO.json"
+            )
+        network_value, network_bytes = _bounded_json_object(
+            network_info, "compiled ProductionV4 NETWORK-INFO.json"
+        )
+        canonical_network = (
+            json.dumps(network_value, indent=2, ensure_ascii=False) + "\n"
+        ).encode("utf-8")
+        if network_bytes != canonical_network:
+            raise IntegrityError("compiled ProductionV4 NETWORK-INFO.json is not canonical")
+        _validate_production_v4_runtime_identity(network_value, commit)
+        proof = network_value.get("proof_of_work")
+        if (
+            not isinstance(proof, dict)
+            or proof.get("activation_evidence_sha256")
+            != _sha256_bytes(evidence_bytes)
+        ):
+            raise IntegrityError(
+                "compiled ProductionV4 NETWORK-INFO.json is not bound to activation evidence"
+            )
+        files["activation_evidence"] = _production_v4_approval_identity(
+            PRODUCTION_V4_ACTIVATION_NAME, evidence_bytes
+        )
+        files["compiled_network_info"] = _production_v4_approval_identity(
+            PRODUCTION_RC_NETWORK_INFO_NAME, network_bytes
+        )
+    elif network_info is not None:
+        raise IntegrityError("ProductionV4 pin approval must not include NETWORK-INFO.json")
+    try:
+        return activation_approval.build_subject(
+            phase=phase,
+            activation_source_commit=commit,
+            artifact_generation_source_commit=generation_commit,
+            qualification_source_commit=qualification_commit,
+            network=network,
+            source_pin_sha256=_sha256_bytes(pin_bytes),
+            files=files,
+        )
+    except activation_approval.ApprovalError as error:
+        raise IntegrityError(str(error)) from error
+
+
+def _required_production_v4_approval_path(value: Path | None, label: str) -> Path:
+    if value is None:
+        raise IntegrityError(PRODUCTION_V4_ACTIVATION_APPROVAL_ERROR)
+    return value
+
+
+def _verify_production_v4_activation_approvals(
+    *,
+    subject: dict[str, object],
+    approval_trust: dict[str, object],
+    producer_approval: Path | None,
+    producer_signature: Path | None,
+    producer_allowed_signers: Path | None,
+    producer_signer_identity: str | None,
+    reproducer_approval: Path | None,
+    reproducer_signature: Path | None,
+    reproducer_allowed_signers: Path | None,
+    reproducer_signer_identity: str | None,
+    ssh_keygen: Path | None,
+    expected_ssh_keygen_sha256: str | None,
+) -> dict[str, object]:
+    if (
+        producer_signer_identity is None
+        or reproducer_signer_identity is None
+        or expected_ssh_keygen_sha256 is None
+    ):
+        raise IntegrityError(PRODUCTION_V4_ACTIVATION_APPROVAL_ERROR)
+    trust = _validate_production_v4_approval_trust_fields(approval_trust)
+    expected_trust = {
+        activation_approval.PRODUCER_ROLE: trust["producer"],
+        activation_approval.REPRODUCER_ROLE: trust["independent_reproducer"],
+    }
+    if trust["ssh_keygen_sha256"] != expected_ssh_keygen_sha256:
+        raise IntegrityError("trusted OpenSSH verifier digest does not match the source pin")
+    try:
+        return activation_approval.verify_approval_pair(
+            subject=subject,
+            producer_approval=_required_production_v4_approval_path(
+                producer_approval, "producer approval"
+            ),
+            producer_signature=_required_production_v4_approval_path(
+                producer_signature, "producer approval signature"
+            ),
+            producer_allowed_signers=_required_production_v4_approval_path(
+                producer_allowed_signers, "producer allowed-signers authority"
+            ),
+            producer_signer_identity=producer_signer_identity,
+            reproducer_approval=_required_production_v4_approval_path(
+                reproducer_approval, "independent reproducer approval"
+            ),
+            reproducer_signature=_required_production_v4_approval_path(
+                reproducer_signature, "independent reproducer approval signature"
+            ),
+            reproducer_allowed_signers=_required_production_v4_approval_path(
+                reproducer_allowed_signers,
+                "independent reproducer allowed-signers authority",
+            ),
+            reproducer_signer_identity=reproducer_signer_identity,
+            ssh_keygen=_required_production_v4_approval_path(
+                ssh_keygen, "trusted OpenSSH verifier"
+            ),
+            expected_verifier_sha256=expected_ssh_keygen_sha256,
+            expected_trust=expected_trust,
+        )
+    except activation_approval.ApprovalError as error:
+        raise IntegrityError(str(error)) from error
+
+
+def create_production_v4_activation(
+    *,
+    phase: str,
+    repo: Path,
+    expected_commit: str,
+    candidate: Path,
+    input_manifest: Path,
+    qualification_manifest: Path,
+    verifier_report: Path,
+    verifier_script: Path,
+    template: Path,
+    proof: Path,
+    model_bank: Path,
+    fixed_record: Path,
+    artifact_directory: Path,
+    output: Path,
+    network_info: Path | None = None,
+    producer_approval: Path | None = None,
+    producer_signature: Path | None = None,
+    producer_allowed_signers: Path | None = None,
+    producer_signer_identity: str | None = None,
+    reproducer_approval: Path | None = None,
+    reproducer_signature: Path | None = None,
+    reproducer_allowed_signers: Path | None = None,
+    reproducer_signer_identity: str | None = None,
+    ssh_keygen: Path | None = None,
+    expected_ssh_keygen_sha256: str | None = None,
+) -> dict[str, object]:
+    if phase not in {"pin", "evidence"}:
+        raise IntegrityError("ProductionV4 activation phase must be pin or evidence")
+    repo = repo.resolve(strict=True)
+    commit = _assert_clean_exact_repo(repo, expected_commit)
+    output_parent = _regular_directory(
+        output.parent.resolve(strict=True), "ProductionV4 activation output directory"
+    )
+    output_parent_identity = _stat_object_identity(output_parent.lstat())
+    output = output_parent / output.name
+    if os.path.lexists(output):
+        raise IntegrityError(f"ProductionV4 activation output already exists: {output}")
+    tracked_pin = (repo / PRODUCTION_V4_ACTIVATION_PIN_RELATIVE).resolve(strict=False)
+    if phase == "pin" and os.path.normcase(
+        str(output.resolve(strict=False))
+    ) == os.path.normcase(str(tracked_pin)):
+        raise IntegrityError(
+            "pin phase cannot write the tracked ProductionV4 activation include"
+        )
+    if phase == "evidence" and output.name != PRODUCTION_V4_ACTIVATION_NAME:
+        raise IntegrityError(
+            f"ProductionV4 activation evidence must be named {PRODUCTION_V4_ACTIVATION_NAME}"
+        )
+
+    validated = _validate_production_v4_activation_inputs(
+        repo=repo,
+        candidate_path=candidate,
+        input_manifest_path=input_manifest,
+        qualification_manifest_path=qualification_manifest,
+        verifier_report_path=verifier_report,
+        verifier_script_path=verifier_script,
+        template_path=template,
+        proof_path=proof,
+        model_bank_path=model_bank,
+        fixed_record_path=fixed_record,
+        artifact_directory=artifact_directory,
+    )
+    base_pin_fields = validated["pin_fields"]
+    common_files = validated.get("approval_files")
+    if not isinstance(base_pin_fields, dict) or not isinstance(
+        common_files, dict
+    ):  # pragma: no cover - internal contract.
+        raise IntegrityError("ProductionV4 activation pin fields are unavailable")
+    generation_commit = validated["generation_commit"]
+    qualification_commit = validated["qualification_commit"]
+    if not isinstance(generation_commit, str) or not isinstance(
+        qualification_commit, str
+    ):  # pragma: no cover - internal validated contract.
+        raise IntegrityError("ProductionV4 activation source commits are unavailable")
+    preflight_pin = b""
+    if phase == "evidence":
+        current_pin = _tracked_blob(repo, PRODUCTION_V4_ACTIVATION_PIN_RELATIVE)
+        if current_pin != b"None\n":
+            preflight_pin = current_pin
+    _validate_production_v4_activation_history(
+        phase=phase,
+        repo=repo,
+        commit=commit,
+        generation_commit=generation_commit,
+        qualification_commit=qualification_commit,
+        pin_bytes=preflight_pin,
+    )
+    if (
+        producer_signer_identity is None
+        or reproducer_signer_identity is None
+        or expected_ssh_keygen_sha256 is None
+    ):
+        raise IntegrityError(PRODUCTION_V4_ACTIVATION_APPROVAL_ERROR)
+    producer_policy = _required_production_v4_approval_path(
+        producer_allowed_signers, "producer allowed-signers authority"
+    )
+    reproducer_policy = _required_production_v4_approval_path(
+        reproducer_allowed_signers, "independent reproducer allowed-signers authority"
+    )
+    approval_trust = _production_v4_approval_trust(
+        common_files=common_files,
+        producer_allowed_signers=producer_policy,
+        producer_signer_identity=producer_signer_identity,
+        reproducer_allowed_signers=reproducer_policy,
+        reproducer_signer_identity=reproducer_signer_identity,
+        expected_ssh_keygen_sha256=expected_ssh_keygen_sha256,
+    )
+    pin_fields = _production_v4_pin_fields_with_trust(
+        base_pin_fields, approval_trust
+    )
+    pin_bytes = _render_production_v4_activation_pin(pin_fields)
+    _validate_production_v4_activation_history(
+        phase=phase,
+        repo=repo,
+        commit=commit,
+        generation_commit=generation_commit,
+        qualification_commit=qualification_commit,
+        pin_bytes=pin_bytes,
+    )
+    _assert_clean_exact_repo(repo, commit)
+    evidence_bytes = None
+    if phase == "evidence":
+        _, evidence_bytes = _production_v4_activation_evidence(
+            validated=validated, pin_fields=pin_fields, commit=commit
+        )
+    subject = _production_v4_approval_subject(
+        phase=phase,
+        commit=commit,
+        validated=validated,
+        pin_bytes=pin_bytes,
+        evidence_bytes=evidence_bytes,
+        network_info=network_info,
+    )
+    receipt = _verify_production_v4_activation_approvals(
+        subject=subject,
+        approval_trust=approval_trust,
+        producer_approval=producer_approval,
+        producer_signature=producer_signature,
+        producer_allowed_signers=producer_policy,
+        producer_signer_identity=producer_signer_identity,
+        reproducer_approval=reproducer_approval,
+        reproducer_signature=reproducer_signature,
+        reproducer_allowed_signers=reproducer_policy,
+        reproducer_signer_identity=reproducer_signer_identity,
+        ssh_keygen=ssh_keygen,
+        expected_ssh_keygen_sha256=expected_ssh_keygen_sha256,
+    )
+    _assert_clean_exact_repo(repo, commit)
+    output_bytes = pin_bytes if phase == "pin" else evidence_bytes
+    if output_bytes is None:  # pragma: no cover - phase contract above.
+        raise IntegrityError("ProductionV4 activation output bytes are unavailable")
+    _write_new_verified(
+        path=output,
+        data=output_bytes,
+        parent_identity=output_parent_identity,
+        label="ProductionV4 activation output",
+    )
+    return {
+        "phase": phase,
+        "output": _production_v4_approval_identity(output.name, output_bytes),
+        "approval_receipt": receipt,
+    }
+
+
+def create_production_v4_activation_approval_request(
+    *,
+    phase: str,
+    repo: Path,
+    expected_commit: str,
+    candidate: Path,
+    input_manifest: Path,
+    qualification_manifest: Path,
+    verifier_report: Path,
+    verifier_script: Path,
+    template: Path,
+    proof: Path,
+    model_bank: Path,
+    fixed_record: Path,
+    artifact_directory: Path,
+    output_directory: Path,
+    producer_allowed_signers: Path,
+    producer_signer_identity: str,
+    reproducer_allowed_signers: Path,
+    reproducer_signer_identity: str,
+    ssh_keygen: Path,
+    expected_ssh_keygen_sha256: str,
+    network_info: Path | None = None,
+) -> dict[str, object]:
+    if phase not in {"pin", "evidence"}:
+        raise IntegrityError("ProductionV4 activation phase must be pin or evidence")
+    repo = repo.resolve(strict=True)
+    commit = _assert_clean_exact_repo(repo, expected_commit)
+    output_directory = _regular_directory(
+        output_directory.resolve(strict=True),
+        "ProductionV4 approval-request output directory",
+    )
+    output_parent_identity = _stat_object_identity(output_directory.lstat())
+    _require_hex256(
+        expected_ssh_keygen_sha256,
+        "trusted OpenSSH verifier SHA-256",
+        reject_repeated=False,
+    )
+    if _sha256_file(ssh_keygen) != expected_ssh_keygen_sha256:
+        raise IntegrityError("OpenSSH verifier does not match its expected SHA-256")
+
+    validated = _validate_production_v4_activation_inputs(
+        repo=repo,
+        candidate_path=candidate,
+        input_manifest_path=input_manifest,
+        qualification_manifest_path=qualification_manifest,
+        verifier_report_path=verifier_report,
+        verifier_script_path=verifier_script,
+        template_path=template,
+        proof_path=proof,
+        model_bank_path=model_bank,
+        fixed_record_path=fixed_record,
+        artifact_directory=artifact_directory,
+    )
+    base_pin_fields = validated.get("pin_fields")
+    common_files = validated.get("approval_files")
+    if not isinstance(base_pin_fields, dict) or not isinstance(common_files, dict):
+        raise IntegrityError("ProductionV4 activation approval inputs are unavailable")
+    approval_trust = _production_v4_approval_trust(
+        common_files=common_files,
+        producer_allowed_signers=producer_allowed_signers,
+        producer_signer_identity=producer_signer_identity,
+        reproducer_allowed_signers=reproducer_allowed_signers,
+        reproducer_signer_identity=reproducer_signer_identity,
+        expected_ssh_keygen_sha256=expected_ssh_keygen_sha256,
+    )
+    pin_fields = _production_v4_pin_fields_with_trust(
+        base_pin_fields, approval_trust
+    )
+    pin_bytes = _render_production_v4_activation_pin(pin_fields)
+    generation_commit = validated.get("generation_commit")
+    qualification_commit = validated.get("qualification_commit")
+    if not isinstance(generation_commit, str) or not isinstance(
+        qualification_commit, str
+    ):
+        raise IntegrityError("ProductionV4 activation source commits are unavailable")
+    _validate_production_v4_activation_history(
+        phase=phase,
+        repo=repo,
+        commit=commit,
+        generation_commit=generation_commit,
+        qualification_commit=qualification_commit,
+        pin_bytes=pin_bytes,
+    )
+    evidence_bytes = None
+    if phase == "evidence":
+        _, evidence_bytes = _production_v4_activation_evidence(
+            validated=validated, pin_fields=pin_fields, commit=commit
+        )
+    subject = _production_v4_approval_subject(
+        phase=phase,
+        commit=commit,
+        validated=validated,
+        pin_bytes=pin_bytes,
+        evidence_bytes=evidence_bytes,
+        network_info=network_info,
+    )
+    try:
+        prepared = activation_approval.prepare_approval_payloads(
+            subject=subject,
+            producer_allowed_signers=producer_allowed_signers,
+            producer_signer_identity=producer_signer_identity,
+            reproducer_allowed_signers=reproducer_allowed_signers,
+            reproducer_signer_identity=reproducer_signer_identity,
+        )
+    except activation_approval.ApprovalError as error:
+        raise IntegrityError(str(error)) from error
+    authorities = prepared.get("authorities")
+    payloads = prepared.get("payloads")
+    expected_authorities = {
+        activation_approval.PRODUCER_ROLE: approval_trust["producer"],
+        activation_approval.REPRODUCER_ROLE: approval_trust[
+            "independent_reproducer"
+        ],
+    }
+    if authorities != expected_authorities or not isinstance(payloads, dict):
+        raise IntegrityError("ProductionV4 approval preparation changed its trust inputs")
+    producer_payload = payloads.get(activation_approval.PRODUCER_ROLE)
+    reproducer_payload = payloads.get(activation_approval.REPRODUCER_ROLE)
+    if not isinstance(producer_payload, bytes) or not isinstance(
+        reproducer_payload, bytes
+    ):
+        raise IntegrityError("ProductionV4 approval payload bytes are unavailable")
+    target_bytes = pin_bytes if phase == "pin" else evidence_bytes
+    if target_bytes is None:  # pragma: no cover - phase contract above.
+        raise IntegrityError("ProductionV4 approval review target is unavailable")
+
+    prefix = f"PRODUCTION-V4-ACTIVATION-{phase.upper()}"
+    outputs = {
+        f"{prefix}-PRODUCER-APPROVAL.json": producer_payload,
+        f"{prefix}-REPRODUCER-APPROVAL.json": reproducer_payload,
+        f"{prefix}-TARGET.review": target_bytes,
+    }
+    paths = {name: output_directory / name for name in outputs}
+    existing = sorted(name for name, path in paths.items() if os.path.lexists(path))
+    if existing:
+        raise IntegrityError(
+            f"ProductionV4 approval-request outputs already exist: {existing}"
+        )
+    _assert_clean_exact_repo(repo, commit)
+    if _sha256_file(ssh_keygen) != expected_ssh_keygen_sha256:
+        raise IntegrityError("OpenSSH verifier changed during approval preparation")
+    written: list[tuple[Path, tuple[int, int, int, int, int], str]] = []
+    try:
+        for name, data in outputs.items():
+            path = paths[name]
+            identity = _write_new_verified(
+                path=path,
+                data=data,
+                parent_identity=output_parent_identity,
+                label=f"ProductionV4 approval-request output {name}",
+            )
+            written.append((path, identity, name))
+        if _stat_object_identity(output_directory.lstat()) != output_parent_identity:
+            raise IntegrityError(
+                "ProductionV4 approval-request output directory changed during publication"
+            )
+        for path, identity, name in written:
+            expected = outputs[name]
+            with _stable_regular_handle(
+                path, f"ProductionV4 approval-request output {name}"
+            ) as (_, handle, opened):
+                actual = handle.read(len(expected) + 1)
+            if _stat_identity(opened) != identity or actual != expected:
+                raise IntegrityError(
+                    f"ProductionV4 approval-request output changed: {name}"
+                )
+        _assert_clean_exact_repo(repo, commit)
+        if _sha256_file(ssh_keygen) != expected_ssh_keygen_sha256:
+            raise IntegrityError("OpenSSH verifier changed during approval publication")
+    except BaseException:
+        cleanup_errors: list[str] = []
+        for path, identity, name in reversed(written):
+            try:
+                _remove_exact_new(
+                    path,
+                    identity,
+                    f"ProductionV4 approval-request output {name}",
+                )
+            except BaseException as error:
+                cleanup_errors.append(str(error))
+        if cleanup_errors:
+            raise IntegrityError(
+                "cannot clean up ProductionV4 approval-request outputs: "
+                + "; ".join(cleanup_errors)
+            )
+        raise
+    return {
+        "phase": phase,
+        "subject_sha256": _sha256_bytes(activation_approval.canonical_json(subject)),
+        "ssh_keygen_sha256": expected_ssh_keygen_sha256,
+        "outputs": {
+            name: _production_v4_approval_identity(name, data)
+            for name, data in outputs.items()
+        },
+    }
 
 
 def _ar_number(field: bytes, label: str, base: int = 10) -> int:
@@ -3718,6 +8024,8 @@ def _verify_release(
     inventory: Path,
     source_date_epoch: str | int | None,
     required_generated_files: frozenset[str] = frozenset(),
+    activation_ssh_keygen: Path | None = None,
+    activation_ssh_keygen_sha256: str | None = None,
 ) -> tuple[dict[str, object], str]:
     repo = repo.resolve(strict=True)
     commit = _assert_clean_exact_repo(repo, expected_commit)
@@ -3726,7 +8034,12 @@ def _verify_release(
     names, inventory_data = _inventory_names(inventory)
     stage_files = _stage_files(stage)
     validate_production_rc_artifacts(
-        version=version, commit=commit, stage_files=stage_files
+        version=version,
+        commit=commit,
+        stage_files=stage_files,
+        repo=repo,
+        activation_ssh_keygen=activation_ssh_keygen,
+        activation_ssh_keygen_sha256=activation_ssh_keygen_sha256,
     )
     validate_production_rc_source_versions(repo=repo, version=version)
     if not required_generated_files.issubset({CHECKSUM_SIGNATURE_NAME}):
@@ -3808,6 +8121,8 @@ def verify_release(
     inventory: Path,
     source_date_epoch: str | int | None,
     required_generated_files: frozenset[str] = frozenset(),
+    activation_ssh_keygen: Path | None = None,
+    activation_ssh_keygen_sha256: str | None = None,
 ) -> dict[str, object]:
     release, _ = _verify_release(
         repo=repo,
@@ -3817,6 +8132,8 @@ def verify_release(
         inventory=inventory,
         source_date_epoch=source_date_epoch,
         required_generated_files=required_generated_files,
+        activation_ssh_keygen=activation_ssh_keygen,
+        activation_ssh_keygen_sha256=activation_ssh_keygen_sha256,
     )
     return release
 
@@ -3832,6 +8149,8 @@ def verify_signed_release(
     allowed_signers: Path,
     signer_identity: str,
     ssh_keygen: Path,
+    activation_ssh_keygen: Path | None = None,
+    activation_ssh_keygen_sha256: str | None = None,
 ) -> dict[str, object]:
     release, checksum_sha256 = _verify_release(
         repo=repo,
@@ -3841,6 +8160,8 @@ def verify_signed_release(
         inventory=inventory,
         source_date_epoch=source_date_epoch,
         required_generated_files=frozenset({CHECKSUM_SIGNATURE_NAME}),
+        activation_ssh_keygen=activation_ssh_keygen,
+        activation_ssh_keygen_sha256=activation_ssh_keygen_sha256,
     )
     signature = verify_release_signature(
         stage=stage,
@@ -3862,6 +8183,8 @@ def compare_reproducible_releases(
     second_stage: Path,
     inventory: Path,
     source_date_epoch: str | int | None,
+    activation_ssh_keygen: Path | None = None,
+    activation_ssh_keygen_sha256: str | None = None,
 ) -> dict[str, object]:
     """Require two independently staged releases to be byte-identical."""
 
@@ -3875,6 +8198,8 @@ def compare_reproducible_releases(
         "version": version,
         "inventory": inventory,
         "source_date_epoch": source_date_epoch,
+        "activation_ssh_keygen": activation_ssh_keygen,
+        "activation_ssh_keygen_sha256": activation_ssh_keygen_sha256,
     }
     first_release = verify_release(stage=first_stage, **common)
     second_release = verify_release(stage=second_stage, **common)
@@ -3937,6 +8262,8 @@ def finalize_release(
     stage: Path,
     inventory: Path,
     source_date_epoch: str | int | None,
+    activation_ssh_keygen: Path | None = None,
+    activation_ssh_keygen_sha256: str | None = None,
 ) -> dict[str, object]:
     repo = repo.resolve(strict=True)
     commit = _assert_clean_exact_repo(repo, expected_commit)
@@ -3945,7 +8272,12 @@ def finalize_release(
     names, inventory_data = _inventory_names(inventory)
     stage_files = _stage_files(stage)
     validate_production_rc_artifacts(
-        version=version, commit=commit, stage_files=stage_files
+        version=version,
+        commit=commit,
+        stage_files=stage_files,
+        repo=repo,
+        activation_ssh_keygen=activation_ssh_keygen,
+        activation_ssh_keygen_sha256=activation_ssh_keygen_sha256,
     )
     validate_production_rc_source_versions(repo=repo, version=version)
     generated_names = {
@@ -4010,6 +8342,8 @@ def finalize_release(
         stage=stage,
         inventory=inventory,
         source_date_epoch=epoch,
+        activation_ssh_keygen=activation_ssh_keygen,
+        activation_ssh_keygen_sha256=activation_ssh_keygen_sha256,
     )
 
 
@@ -4031,6 +8365,33 @@ def _add_release_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--stage", type=Path, required=True)
     parser.add_argument("--inventory", type=Path, required=True)
     parser.add_argument("--source-date-epoch")
+    parser.add_argument("--activation-ssh-keygen", type=Path)
+    parser.add_argument("--activation-ssh-keygen-sha256")
+
+
+def _add_production_v4_activation_inputs(parser: argparse.ArgumentParser) -> None:
+    _add_repo_arguments(parser)
+    parser.add_argument("--phase", choices=("pin", "evidence"), required=True)
+    parser.add_argument("--candidate", type=Path, required=True)
+    parser.add_argument("--input-manifest", type=Path, required=True)
+    parser.add_argument("--qualification-manifest", type=Path, required=True)
+    parser.add_argument("--verifier-report", type=Path, required=True)
+    parser.add_argument("--verifier-script", type=Path, required=True)
+    parser.add_argument("--template", type=Path, required=True)
+    parser.add_argument("--proof", type=Path, required=True)
+    parser.add_argument("--model-bank", type=Path, required=True)
+    parser.add_argument("--fixed-record", type=Path, required=True)
+    parser.add_argument("--artifact-directory", type=Path, required=True)
+    parser.add_argument("--network-info", type=Path)
+
+
+def _add_production_v4_approval_trust(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--producer-allowed-signers", type=Path, required=True)
+    parser.add_argument("--producer-signer-identity", required=True)
+    parser.add_argument("--reproducer-allowed-signers", type=Path, required=True)
+    parser.add_argument("--reproducer-signer-identity", required=True)
+    parser.add_argument("--ssh-keygen", type=Path, required=True)
+    parser.add_argument("--expected-ssh-keygen-sha256", required=True)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -4084,7 +8445,54 @@ def _parser() -> argparse.ArgumentParser:
     )
     runtime_attestation.add_argument("--package-directory", type=Path, required=True)
     runtime_attestation.add_argument("--expected-commit", required=True)
+    runtime_attestation.add_argument("--expected-version")
     runtime_attestation.add_argument("--output", type=Path, required=True)
+
+    runtime_package = commands.add_parser(
+        "runtime-package",
+        help="assemble and attest one native ProductionV4 RC runtime package",
+    )
+    _add_repo_arguments(runtime_package)
+    runtime_package.add_argument("--version", required=True)
+    runtime_package.add_argument(
+        "--platform", choices=("windows-x86_64", "linux-x86_64"), required=True
+    )
+    runtime_package.add_argument("--node", type=Path, required=True)
+    runtime_package.add_argument("--wallet", type=Path, required=True)
+    runtime_package.add_argument("--model-bank", type=Path, required=True)
+    runtime_package.add_argument("--fixed-record", type=Path, required=True)
+    runtime_package.add_argument("--output-directory", type=Path, required=True)
+    runtime_package.add_argument("--source-date-epoch")
+
+    production_v4_activation = commands.add_parser(
+        "production-v4-activation",
+        help="render a reviewed ProductionV4 source pin or final activation evidence",
+    )
+    _add_production_v4_activation_inputs(production_v4_activation)
+    _add_production_v4_approval_trust(production_v4_activation)
+    production_v4_activation.add_argument(
+        "--producer-approval", type=Path, required=True
+    )
+    production_v4_activation.add_argument(
+        "--producer-signature", type=Path, required=True
+    )
+    production_v4_activation.add_argument(
+        "--reproducer-approval", type=Path, required=True
+    )
+    production_v4_activation.add_argument(
+        "--reproducer-signature", type=Path, required=True
+    )
+    production_v4_activation.add_argument("--output", type=Path, required=True)
+
+    production_v4_approval_request = commands.add_parser(
+        "production-v4-approval-request",
+        help="derive create-new ProductionV4 approval payloads without activating",
+    )
+    _add_production_v4_activation_inputs(production_v4_approval_request)
+    _add_production_v4_approval_trust(production_v4_approval_request)
+    production_v4_approval_request.add_argument(
+        "--output-directory", type=Path, required=True
+    )
 
     finalize = commands.add_parser(
         "finalize", help="generate and re-verify canonical release metadata"
@@ -4119,6 +8527,8 @@ def _parser() -> argparse.ArgumentParser:
     compare.add_argument("--second-stage", type=Path, required=True)
     compare.add_argument("--inventory", type=Path, required=True)
     compare.add_argument("--source-date-epoch")
+    compare.add_argument("--activation-ssh-keygen", type=Path)
+    compare.add_argument("--activation-ssh-keygen-sha256")
     return parser
 
 
@@ -4168,6 +8578,75 @@ def main(arguments: list[str] | None = None) -> int:
                 package_directory=args.package_directory,
                 commit=args.expected_commit,
                 output=args.output,
+                version=args.expected_version,
+            )
+            print(json.dumps(result, sort_keys=True))
+        elif args.command == "runtime-package":
+            result = create_production_v4_runtime_package(
+                repo=args.repo,
+                expected_commit=args.expected_commit,
+                version=args.version,
+                platform=args.platform,
+                node=args.node,
+                wallet=args.wallet,
+                model_bank=args.model_bank,
+                fixed_record=args.fixed_record,
+                output_directory=args.output_directory,
+                source_date_epoch=args.source_date_epoch,
+            )
+            print(json.dumps(result, sort_keys=True))
+        elif args.command == "production-v4-activation":
+            result = create_production_v4_activation(
+                phase=args.phase,
+                repo=args.repo,
+                expected_commit=args.expected_commit,
+                candidate=args.candidate,
+                input_manifest=args.input_manifest,
+                qualification_manifest=args.qualification_manifest,
+                verifier_report=args.verifier_report,
+                verifier_script=args.verifier_script,
+                template=args.template,
+                proof=args.proof,
+                model_bank=args.model_bank,
+                fixed_record=args.fixed_record,
+                artifact_directory=args.artifact_directory,
+                output=args.output,
+                network_info=args.network_info,
+                producer_approval=args.producer_approval,
+                producer_signature=args.producer_signature,
+                producer_allowed_signers=args.producer_allowed_signers,
+                producer_signer_identity=args.producer_signer_identity,
+                reproducer_approval=args.reproducer_approval,
+                reproducer_signature=args.reproducer_signature,
+                reproducer_allowed_signers=args.reproducer_allowed_signers,
+                reproducer_signer_identity=args.reproducer_signer_identity,
+                ssh_keygen=args.ssh_keygen,
+                expected_ssh_keygen_sha256=args.expected_ssh_keygen_sha256,
+            )
+            print(json.dumps(result, sort_keys=True))
+        elif args.command == "production-v4-approval-request":
+            result = create_production_v4_activation_approval_request(
+                phase=args.phase,
+                repo=args.repo,
+                expected_commit=args.expected_commit,
+                candidate=args.candidate,
+                input_manifest=args.input_manifest,
+                qualification_manifest=args.qualification_manifest,
+                verifier_report=args.verifier_report,
+                verifier_script=args.verifier_script,
+                template=args.template,
+                proof=args.proof,
+                model_bank=args.model_bank,
+                fixed_record=args.fixed_record,
+                artifact_directory=args.artifact_directory,
+                output_directory=args.output_directory,
+                network_info=args.network_info,
+                producer_allowed_signers=args.producer_allowed_signers,
+                producer_signer_identity=args.producer_signer_identity,
+                reproducer_allowed_signers=args.reproducer_allowed_signers,
+                reproducer_signer_identity=args.reproducer_signer_identity,
+                ssh_keygen=args.ssh_keygen,
+                expected_ssh_keygen_sha256=args.expected_ssh_keygen_sha256,
             )
             print(json.dumps(result, sort_keys=True))
         elif args.command == "finalize":
@@ -4178,6 +8657,8 @@ def main(arguments: list[str] | None = None) -> int:
                 stage=args.stage,
                 inventory=args.inventory,
                 source_date_epoch=args.source_date_epoch,
+                activation_ssh_keygen=args.activation_ssh_keygen,
+                activation_ssh_keygen_sha256=args.activation_ssh_keygen_sha256,
             )
             print(json.dumps(result, sort_keys=True))
         elif args.command == "verify":
@@ -4188,6 +8669,8 @@ def main(arguments: list[str] | None = None) -> int:
                 stage=args.stage,
                 inventory=args.inventory,
                 source_date_epoch=args.source_date_epoch,
+                activation_ssh_keygen=args.activation_ssh_keygen,
+                activation_ssh_keygen_sha256=args.activation_ssh_keygen_sha256,
             )
             print(json.dumps(result, sort_keys=True))
         elif args.command == "verify-signed":
@@ -4201,6 +8684,8 @@ def main(arguments: list[str] | None = None) -> int:
                 allowed_signers=args.allowed_signers,
                 signer_identity=args.signer_identity,
                 ssh_keygen=args.ssh_keygen,
+                activation_ssh_keygen=args.activation_ssh_keygen,
+                activation_ssh_keygen_sha256=args.activation_ssh_keygen_sha256,
             )
             print(json.dumps(result, sort_keys=True))
         elif args.command == "verify-download":
@@ -4220,6 +8705,8 @@ def main(arguments: list[str] | None = None) -> int:
                 second_stage=args.second_stage,
                 inventory=args.inventory,
                 source_date_epoch=args.source_date_epoch,
+                activation_ssh_keygen=args.activation_ssh_keygen,
+                activation_ssh_keygen_sha256=args.activation_ssh_keygen_sha256,
             )
             print(json.dumps(result, sort_keys=True))
         else:  # pragma: no cover - argparse guarantees a known command.

@@ -12,6 +12,7 @@ pub(super) const DEFAULT_PROOF_VERIFIER_MEMORY_BYTES: u64 = 2_147_483_648;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProcessCommand {
     Help,
+    RuntimeIdentity,
     Version,
     Run(Box<NodeRuntimeConfig>),
 }
@@ -96,6 +97,7 @@ impl NodeRuntimeConfig {
         let default_bind = COMPILED_NETWORK_PROFILE.p2p_address();
 
         let mut asked_for_help = false;
+        let mut asked_for_runtime_identity = false;
         let mut asked_for_version = false;
         let mut has_control_arg = false;
 
@@ -112,6 +114,9 @@ impl NodeRuntimeConfig {
             if asked_for_help {
                 return Err(ConfigError::HelpWithArguments);
             }
+            if asked_for_runtime_identity {
+                return Err(ConfigError::RuntimeIdentityWithArguments);
+            }
             if asked_for_version {
                 return Err(ConfigError::VersionWithArguments);
             }
@@ -122,6 +127,12 @@ impl NodeRuntimeConfig {
                 }
                 "-V" | "--version" => {
                     asked_for_version = true;
+                }
+                "runtime-identity" => {
+                    if has_control_arg {
+                        return Err(ConfigError::RuntimeIdentityWithArguments);
+                    }
+                    asked_for_runtime_identity = true;
                 }
                 "--p2p-bind" => {
                     has_control_arg = true;
@@ -299,6 +310,10 @@ impl NodeRuntimeConfig {
             return Ok(ProcessCommand::Version);
         }
 
+        if asked_for_runtime_identity {
+            return Ok(ProcessCommand::RuntimeIdentity);
+        }
+
         let config = Self {
             p2p_bind: p2p_bind.unwrap_or(default_bind),
             peers,
@@ -431,6 +446,7 @@ pub(crate) enum ConfigError {
     MalformedProductionV3Argument,
     InvalidPeerConfiguration(String),
     HelpWithArguments,
+    RuntimeIdentityWithArguments,
     VersionWithArguments,
 }
 
@@ -475,6 +491,9 @@ impl fmt::Display for ConfigError {
             Self::HelpWithArguments => {
                 formatter.write_str("--help cannot be combined with other arguments")
             }
+            Self::RuntimeIdentityWithArguments => {
+                formatter.write_str("runtime-identity cannot be combined with other arguments")
+            }
             Self::VersionWithArguments => {
                 formatter.write_str("--version cannot be combined with other arguments")
             }
@@ -495,6 +514,9 @@ mod tests {
             ProcessCommand::Run(config) => *config,
             ProcessCommand::Help => {
                 panic!("expected run configuration, got help")
+            }
+            ProcessCommand::RuntimeIdentity => {
+                panic!("expected run configuration, got runtime identity")
             }
             ProcessCommand::Version => {
                 panic!("expected run configuration, got version")
@@ -539,21 +561,27 @@ mod tests {
         assert_eq!(
             match parse_command(["--verbose"]) {
                 ProcessCommand::Run(config) => config.verbose,
-                ProcessCommand::Help | ProcessCommand::Version => 0,
+                ProcessCommand::Help
+                | ProcessCommand::RuntimeIdentity
+                | ProcessCommand::Version => 0,
             },
             1
         );
         assert_eq!(
             match parse_command(["-vv"]) {
                 ProcessCommand::Run(config) => config.verbose,
-                ProcessCommand::Help | ProcessCommand::Version => 0,
+                ProcessCommand::Help
+                | ProcessCommand::RuntimeIdentity
+                | ProcessCommand::Version => 0,
             },
             2
         );
         assert_eq!(
             match parse_command(["-v", "--verbose", "-vv"]) {
                 ProcessCommand::Run(config) => config.verbose,
-                ProcessCommand::Help | ProcessCommand::Version => 0,
+                ProcessCommand::Help
+                | ProcessCommand::RuntimeIdentity
+                | ProcessCommand::Version => 0,
             },
             4
         );
@@ -667,6 +695,18 @@ mod tests {
         assert!(matches!(
             NodeRuntimeConfig::parse(["--version"]),
             Ok(ProcessCommand::Version)
+        ));
+        assert!(matches!(
+            NodeRuntimeConfig::parse(["runtime-identity"]),
+            Ok(ProcessCommand::RuntimeIdentity)
+        ));
+        assert!(matches!(
+            NodeRuntimeConfig::parse(["runtime-identity", "--version"]),
+            Err(ConfigError::RuntimeIdentityWithArguments)
+        ));
+        assert!(matches!(
+            NodeRuntimeConfig::parse(["--peer", "127.0.0.1:18445", "runtime-identity"]),
+            Err(ConfigError::RuntimeIdentityWithArguments)
         ));
     }
 

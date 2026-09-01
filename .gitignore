@@ -1,5 +1,11 @@
 /target/
+/target-linux/
+/tmp/
 /commonfoundry-devnet0/
+/commonfoundry-production-v4-testnet1/
+/output/audit/
+/output/integration/
+/output/pdf/Common-Foundry-Technical-Whitepaper-v0.2-review.pdf
 /apps/wallet/node_modules/
 /apps/wallet/dist/
 /apps/pool-dashboard/node_modules/

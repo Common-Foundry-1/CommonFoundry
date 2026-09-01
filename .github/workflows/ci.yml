@@ -102,6 +102,21 @@ jobs:
       - run: cargo test -p cmfd-consensus --all-targets --features whir-prototype --locked
       - run: cargo test -p cmfd-consensus --all-targets --features gpu-proof-prover --locked
       - run: cargo test -p cmfd-consensus --lib --features production-whir-candidate,gpu-proof-prover --locked production_candidate
+      - name: Build and test the bounded ProductionV4 node surface
+        run: |
+          cargo check --locked -p cmfd-node --bin cmfd-node --features production-v4
+          cargo test --locked -p cmfd-node --lib --features production-v4 production_v4_
+      - name: Keep production RC fail-closed without ProductionV4 activation evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CMFD_BUILD_SOURCE_COMMIT="$(git rev-parse HEAD)"
+          if output="$(cargo check --locked -p cmfd-node --bin cmfd-node --features production-rc 2>&1)"; then
+            echo "production RC unexpectedly built without ProductionV4 activation evidence" >&2
+            exit 1
+          fi
+          printf '%s\n' "$output"
+          grep -Fq "production RC build gate: ProductionV4 activation evidence is absent" <<<"$output"
 
   proof-codec:
     strategy:
@@ -195,14 +210,14 @@ jobs:
           - os: windows-latest
             artifact: common-foundry-wallet-windows
             package-paths: |
-              target/release/bundle/nsis/Common Foundry Wallet_0.1.0-devnet.15_x64-setup.exe
+              target/release/bundle/nsis/Common Foundry Wallet_0.1.0-devnet.16_x64-setup.exe
             binary-path: target/release/common-foundry-wallet.exe
             node-path: target/release/cmfd-node.exe
           - os: ubuntu-22.04
             artifact: common-foundry-wallet-linux
             package-paths: |
-              target/release/bundle/appimage/Common Foundry Wallet_0.1.0-devnet.15_amd64.AppImage
-              target/release/bundle/deb/Common Foundry Wallet_0.1.0-devnet.15_amd64.deb
+              target/release/bundle/appimage/Common Foundry Wallet_0.1.0-devnet.16_amd64.AppImage
+              target/release/bundle/deb/Common Foundry Wallet_0.1.0-devnet.16_amd64.deb
             binary-path: target/release/common-foundry-wallet
             node-path: target/release/cmfd-node
     runs-on: ${{ matrix.os }}
@@ -260,18 +275,18 @@ jobs:
           CMFD_RELEASE_COMMIT: ${{ github.sha }}
         run: >-
           bash scripts/normalize-linux-appimage.sh
-          "target/release/bundle/appimage/Common Foundry Wallet_0.1.0-devnet.15_amd64.AppImage"
+          "target/release/bundle/appimage/Common Foundry Wallet_0.1.0-devnet.16_amd64.AppImage"
           "$CMFD_RELEASE_COMMIT"
-          "0.1.0-devnet.15"
+          "0.1.0-devnet.16"
       - name: Normalize Linux deb package
         if: runner.os == 'Linux'
         env:
           CMFD_RELEASE_COMMIT: ${{ github.sha }}
         run: >-
           bash scripts/normalize-linux-deb.sh
-          "target/release/bundle/deb/Common Foundry Wallet_0.1.0-devnet.15_amd64.deb"
+          "target/release/bundle/deb/Common Foundry Wallet_0.1.0-devnet.16_amd64.deb"
           "$CMFD_RELEASE_COMMIT"
-          "0.1.0-devnet.15"
+          "0.1.0-devnet.16"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.artifact }}

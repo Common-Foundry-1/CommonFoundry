@@ -353,6 +353,21 @@ def verify_artifacts(
     return manifest, identities
 
 
+def _require_testnet_template_network(
+    block: dict[str, object], manifest: dict[str, object]
+) -> None:
+    template_network_id = block["network_id"].hex()
+    manifest_network_id = manifest["network_id"]
+    if template_network_id != manifest_network_id:
+        raise ReproductionError(
+            "ProductionV4 template network ID does not match the authenticated input manifest"
+        )
+    if template_network_id != EXPECTED_NETWORK_ID:
+        raise ReproductionError(
+            "ProductionV4 template network ID is not the qualified Testnet-1 network"
+        )
+
+
 def build_report(
     *,
     repo_root: Path,
@@ -388,6 +403,7 @@ def build_report(
         input_manifest, model_bank, fixed_record, artifact_dir
     )
     block, candidate = parse_template(template)
+    _require_testnet_template_network(block, manifest)
     proof_result, statement = verify(
         proof,
         block,

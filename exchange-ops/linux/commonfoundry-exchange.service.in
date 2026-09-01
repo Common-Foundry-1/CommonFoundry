@@ -1,0 +1,48 @@
+[Unit]
+Description=Common Foundry exchange integration node (candidate)
+Documentation=@@OPERATIONS_DOCUMENTATION_URL@@
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=@@SERVICE_USER@@
+Group=@@SERVICE_GROUP@@
+UMask=0077
+WorkingDirectory=@@INSTALL_ROOT@@
+ExecStart=@@INSTALL_ROOT@@/cmfd-node \
+  --data-dir @@DATA_DIR@@ \
+  --wallet-passphrase-file @@WALLET_PASSPHRASE_FILE@@ \
+  --exchange-withdrawal-journal-key-file @@JOURNAL_KEY_FILE@@ \
+  --exchange-withdrawal-anchor-file @@JOURNAL_ANCHOR_FILE@@ \
+  run \
+  --bind 127.0.0.1:@@NATIVE_RPC_PORT@@ \
+  --exchange-rpc-bind 127.0.0.1:@@EXCHANGE_RPC_PORT@@ \
+  --exchange-rpc-auth-file @@INTEGRATION_AUTH_FILE@@ \
+  --exchange-rpc-withdrawal-auth-file @@WITHDRAWAL_AUTH_FILE@@ \
+  --exchange-custody-v3-policy-file @@POLICY_FILE@@ \
+  --exchange-custody-v3-keyring-file @@KEYRING_FILE@@ \
+  --exchange-custody-v3-keyring-anchor-file @@KEYRING_ANCHOR_FILE@@ \
+  --exchange-custody-v3-keyring-passphrase-file @@KEYRING_PASSPHRASE_FILE@@ \
+  --p2p-bind @@P2P_BIND@@ \
+  --peer @@PINNED_PEER@@
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=90s
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=@@DATA_DIR@@
+ReadOnlyPaths=@@INSTALL_ROOT@@ @@CUSTODY_CONFIG_ROOT@@ @@EXTERNAL_ANCHOR_ROOT@@
+
+[Install]
+WantedBy=multi-user.target

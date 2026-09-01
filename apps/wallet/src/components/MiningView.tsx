@@ -1,5 +1,4 @@
 import {
-  AlertTriangle,
   Blocks,
   Cpu,
   Gauge,
@@ -213,31 +212,25 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
           )}
 
           {poolSelected ? (
-            <>
-              <div className="mining-last-block pool-connection-row">
-                <span className="mining-detail-icon"><Gauge aria-hidden="true" size={18} /></span>
+            <div className="mining-last-block pool-connection-row">
+              <span className="mining-detail-icon"><Gauge aria-hidden="true" size={18} /></span>
+              <div>
+                <span>Pool connection</span>
+                <strong className={metricsStatus?.pool_connected ? "is-connected" : ""}>
+                  {metricsStatus?.pool_connected ? "Connected" : "Not connected"}
+                </strong>
+              </div>
+              <dl className="pool-context-metrics">
                 <div>
-                  <span>Pool connection</span>
-                  <strong className={metricsStatus?.pool_connected ? "is-connected" : ""}>
-                    {metricsStatus?.pool_connected ? "Connected" : "Not connected"}
-                  </strong>
+                  <dt>Session attempts</dt>
+                  <dd>{integerFormatter.format(metricsStatus?.session_attempts ?? 0)}</dd>
                 </div>
-                <dl className="pool-context-metrics">
-                  <div>
-                    <dt>Session attempts</dt>
-                    <dd>{integerFormatter.format(metricsStatus?.session_attempts ?? 0)}</dd>
-                  </div>
-                  <div>
-                    <dt>Pool height</dt>
-                    <dd>{currentHeight === null ? "—" : integerFormatter.format(currentHeight)}</dd>
-                  </div>
-                </dl>
-              </div>
-              <div className="warning-inline pool-credit-note" role="note">
-                <ShieldAlert aria-hidden="true" size={17} />
-                <span>Authenticated Devnet share credits can be settled on-chain under the pool operator's published payout policy.</span>
-              </div>
-            </>
+                <div>
+                  <dt>Pool height</dt>
+                  <dd>{currentHeight === null ? "—" : integerFormatter.format(currentHeight)}</dd>
+                </div>
+              </dl>
+            </div>
           ) : (
             <div className="mining-last-block">
               <span className="mining-detail-icon"><Blocks aria-hidden="true" size={18} /></span>
@@ -289,12 +282,6 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
               </div>
             </div>
           </div>
-          <div className="warning-inline mining-proof-warning">
-            <AlertTriangle aria-hidden="true" size={17} />
-            <span>{cudaActive
-              ? "This wallet is using CUDA locally, but consensus validates only the committed result; it cannot prove physical GPU or VRAM residency."
-              : "This reference engine makes no GPU-use or VRAM-residency claim. Those physical properties are not proven by consensus."}</span>
-          </div>
         </section>
       </div>
 
@@ -307,7 +294,7 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
           : "Mine directly against the embedded node and send accepted block rewards to this wallet."}</p>
 
         {!referenceMiningAvailable && !(poolSelected && productionV4PoolAvailable) ? (
-          <div className="warning-inline" role="status">
+          <div className="info-inline" role="status">
             <ShieldAlert aria-hidden="true" size={17} />
             <span>{proofProfile} solo mining uses the standalone production miner. Select Pool to connect this wallet to the ProductionV4 test pool.</span>
           </div>

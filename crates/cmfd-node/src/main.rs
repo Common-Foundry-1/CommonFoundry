@@ -1,6 +1,6 @@
+#[cfg(feature = "production-v4")]
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
-#[cfg(feature = "production-v3")]
-use std::net::Ipv4Addr;
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError, sync_channel};
@@ -9,6 +9,25 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use cmfd_consensus::forgematrix::target_with_leading_zero_bits;
+use cmfd_node::exchange_acl_qualification::{qualify_fixture, qualify_installed_host};
+use cmfd_node::exchange_custody_tools::{
+    ArchiveRestoreVerifyConfig, CanceledArchiveApplyConfig, CanceledArchivePlanConfig,
+    ExternalKeyringFinalizationApplyConfig, ExternalKeyringFinalizationPlanConfig,
+    ExternalKeyringTransitionApplyConfig, ExternalKeyringTransitionPlanConfig,
+    LegacyKeyringApplyConfig, LegacyKeyringPlanConfig, V3MigrationApplyConfig,
+    V3MigrationApprovalPayloadConfig, V3MigrationPlanConfig, V3OfflineControlConfig,
+    apply_canceled_archive_compaction, apply_external_keyring_finalization,
+    apply_external_keyring_transition, apply_legacy_keyring_import, apply_v3_migration,
+    create_exchange_journal_key_create_new, load_exchange_custody_v3_wallet_passphrase,
+    persisted_exchange_custody_v3_wallet_security_required, plan_canceled_archive,
+    plan_external_keyring_finalization, plan_external_keyring_transition,
+    plan_legacy_keyring_import, plan_v3_migration, verify_archive_restore_offline,
+    write_v3_migration_approval_payload,
+};
+use cmfd_node::exchange_rpc::{
+    EXCHANGE_CUSTODY_RPC_API_VERSION, EXCHANGE_RPC_API_VERSION, spawn_exchange_rpc_server,
+    spawn_exchange_rpc_server_v3,
+};
 use cmfd_node::p2p::{
     PeerDiscovery, spawn_inbound_listener_with_discovery, spawn_peer_polling_with_discovery,
 };
@@ -29,10 +48,11 @@ use cmfd_node::production_v4_pool::{
     ProductionV4PersistentPoolVerifier, ProductionV4PoolVerifierConfig,
     ProductionV4PoolWorkerCommand,
 };
-#[cfg(feature = "production-v3")]
+#[cfg(feature = "production-v4")]
 use cmfd_node::rcnet_candidate::{
     RcnetLaunchCandidate, RcnetLaunchConfiguration, write_candidate_create_new,
 };
+use cmfd_node::seed_peers::{SystemSeedResolver, production_rc_seed_set};
 use cmfd_node::storage::{inspect_block_log, repair_partial_block_log_tail};
 #[cfg(test)]
 use cmfd_node::wallet_backup::MAXIMUM_PASSPHRASE_BYTES;
@@ -40,19 +60,19 @@ use cmfd_node::wallet_backup::{
     create_encrypted_wallet_backup, read_wallet_passphrase_file, restore_encrypted_wallet_backup,
 };
 use cmfd_node::{
-    COMPILED_NETWORK_PROFILE, DEFAULT_DATA_DIR, DEFAULT_MINING_ATTEMPTS, Node,
-    ProductionV4VerifierArtifacts, ProofProfile, canonical_network_info_json_with_record,
-    canonical_network_info_json_with_v4_artifacts, compiled_production_v3_worker_sha256,
-    parse_miner_destination, production_v3_package_layout, production_v4_package_artifacts,
-    spawn_rpc_server, unix_time_seconds,
+    COMPILED_NETWORK_PROFILE, DEFAULT_DATA_DIR, DEFAULT_MINING_ATTEMPTS, ExchangeCustodyV3Config,
+    ExchangeWithdrawalSecurityConfig, Node, ProductionV4VerifierArtifacts, ProofProfile,
+    canonical_network_info_json_with_record, canonical_network_info_json_with_v4_artifacts,
+    compiled_production_v3_worker_sha256, parse_miner_destination, production_v3_package_layout,
+    production_v4_package_artifacts, spawn_rpc_server, unix_time_seconds,
 };
 use cmfd_proof_worker::{ProductionV3VerifierRecord, VerifierWorkerConfig};
 use serde_json::json;
+use zeroize::Zeroizing;
 
 const SERVICE_SUPERVISION_POLL: Duration = Duration::from_millis(50);
 const POOL_SHUTDOWN_REQUEST_BYTES: &[u8] = b"CMFD_POOL_SHUTDOWN_V1\n";
 
-#[cfg(feature = "production-v3")]
 fn parse_hex32(value: &str) -> Result<[u8; 32], String> {
     if value.len() != 64
         || !value
@@ -126,6 +146,12 @@ struct Cli {
     /// File containing the passphrase used to unlock or create encrypted wallet.key.
     #[arg(long, global = true)]
     wallet_passphrase_file: Option<PathBuf>,
+    /// Absolute path to the dedicated raw 32-byte withdrawal-journal authentication key.
+    #[arg(long, global = true)]
+    exchange_withdrawal_journal_key_file: Option<PathBuf>,
+    /// Absolute external file containing the exchange-persisted withdrawal anchor.
+    #[arg(long, global = true)]
+    exchange_withdrawal_anchor_file: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -135,23 +161,17 @@ struct Cli {
 enum Command {
     /// Print the compiled network identity and consensus manifest.
     NetworkInfo,
-    /// Derive a canonical RCNet identity candidate from a final Record V2.
-    #[cfg(feature = "production-v3")]
+    /// Derive a canonical RCNet identity candidate from authenticated ProductionV4 artifacts.
+    #[cfg(feature = "production-v4")]
     RcnetCandidate {
         #[arg(long)]
-        record_v2: PathBuf,
+        model_bank: PathBuf,
+        #[arg(long)]
+        fixed_record: PathBuf,
         #[arg(long)]
         output: PathBuf,
         #[arg(long)]
         virtual_genesis_timestamp: u64,
-        #[arg(long)]
-        bootstrap_ipv4: Ipv4Addr,
-        #[arg(long)]
-        rpc_port: u16,
-        #[arg(long)]
-        p2p_port: u16,
-        #[arg(long)]
-        pool_port: u16,
         #[arg(long, value_parser = parse_hex32)]
         pow_limit: [u8; 32],
         #[arg(long, value_parser = parse_hex32)]
@@ -163,14 +183,241 @@ enum Command {
     Run {
         #[arg(long, default_value_t = COMPILED_NETWORK_PROFILE.rpc_address())]
         bind: SocketAddr,
+        /// Dedicated loopback address for the authenticated exchange chain RPC.
+        /// Disabled unless this and --exchange-rpc-auth-file are both supplied.
+        #[arg(long, requires = "exchange_rpc_auth_file")]
+        exchange_rpc_bind: Option<SocketAddr>,
+        /// File containing `username:password` for HTTP Basic authentication.
+        #[arg(long, requires = "exchange_rpc_bind")]
+        exchange_rpc_auth_file: Option<PathBuf>,
+        /// Separate `username:password` file that enables the preview withdrawal signer.
+        /// This credential is accepted only by withdrawal methods.
+        #[arg(long, requires = "exchange_rpc_auth_file")]
+        exchange_rpc_withdrawal_auth_file: Option<PathBuf>,
+        /// Canonical v3 withdrawal-policy document. All v3 custody options are required together.
+        #[arg(long)]
+        exchange_custody_v3_policy_file: Option<PathBuf>,
+        /// Encrypted v3 wallet keyring bound to the live node wallet.
+        #[arg(long)]
+        exchange_custody_v3_keyring_file: Option<PathBuf>,
+        /// External rollback anchor for the encrypted v3 wallet keyring.
+        #[arg(long)]
+        exchange_custody_v3_keyring_anchor_file: Option<PathBuf>,
+        /// External file containing the v3 wallet-keyring passphrase.
+        #[arg(long)]
+        exchange_custody_v3_keyring_passphrase_file: Option<PathBuf>,
         #[arg(long, default_value_t = COMPILED_NETWORK_PROFILE.p2p_address())]
         p2p_bind: SocketAddr,
         /// Static peer address. Public IPs require --allow-public-peers.
         #[arg(long = "peer")]
         peers: Vec<SocketAddr>,
+        /// Do not use the compiled operational RC seed when no --peer is supplied.
+        #[arg(long)]
+        no_default_seeds: bool,
         /// Explicitly allow unauthenticated, unencrypted public P2P addresses.
         #[arg(long)]
         allow_public_peers: bool,
+    },
+    /// Generate a create-new raw 32-byte withdrawal-journal authentication key.
+    ExchangeWithdrawalKeygen {
+        /// Absolute output path. Existing files are never overwritten.
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Qualify an installed v0.5 custody package under the configured service identity.
+    ExchangeV3AclQualify {
+        /// Absolute path to the live qualification configuration.
+        #[arg(long)]
+        config: PathBuf,
+        /// Absolute create-new path for qualification evidence.
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Evaluate a dry ACL fact fixture without claiming host qualification.
+    ExchangeV3AclFixtureQualify {
+        /// Path to a normalized fixture document.
+        #[arg(long)]
+        fixture: PathBuf,
+        /// Absolute create-new path for fixture evidence.
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Plan an explicit legacy wallet-key import into an encrypted v3 keyring.
+    ExchangeKeyringImportPlan {
+        #[arg(long)]
+        legacy_key_file: PathBuf,
+        /// Required when --legacy-key-file uses the encrypted RCNet wallet format.
+        #[arg(long)]
+        legacy_wallet_passphrase_file: Option<PathBuf>,
+        #[arg(long, value_parser = parse_hex32)]
+        keyring_instance_id: [u8; 32],
+        #[arg(long)]
+        plan_output: PathBuf,
+    },
+    /// Apply an exact confirmed keyring-import plan to create-new artifacts.
+    ExchangeKeyringImportApply {
+        #[arg(long)]
+        plan_file: PathBuf,
+        #[arg(long, value_parser = parse_hex32)]
+        confirmation_digest: [u8; 32],
+        #[arg(long)]
+        keyring_passphrase_file: PathBuf,
+        #[arg(long)]
+        keyring_output: PathBuf,
+        #[arg(long)]
+        anchor_output: PathBuf,
+    },
+    /// Plan conversion of one imported local keyring to an external active key.
+    ExchangeKeyringExternalTransitionPlan {
+        #[arg(long)]
+        source_keyring_file: PathBuf,
+        #[arg(long)]
+        source_anchor_file: PathBuf,
+        #[arg(long)]
+        source_keyring_passphrase_file: PathBuf,
+        #[arg(long, value_parser = parse_hex32)]
+        external_public_key: [u8; 32],
+        #[arg(long, value_parser = parse_hex32)]
+        external_signer_id: [u8; 32],
+        #[arg(long)]
+        keyring_output: PathBuf,
+        #[arg(long)]
+        anchor_output: PathBuf,
+        #[arg(long)]
+        plan_output: PathBuf,
+    },
+    /// Apply an exact confirmed import-to-external transition to create-new artifacts.
+    ExchangeKeyringExternalTransitionApply {
+        #[arg(long)]
+        plan_file: PathBuf,
+        #[arg(long, value_parser = parse_hex32)]
+        confirmation_digest: [u8; 32],
+        #[arg(long)]
+        source_keyring_passphrase_file: PathBuf,
+    },
+    /// Plan disabling the retired local key after proving it owns no active-chain UTXOs.
+    ExchangeKeyringExternalFinalizationPlan {
+        #[arg(long)]
+        policy_file: PathBuf,
+        #[arg(long)]
+        source_keyring_file: PathBuf,
+        #[arg(long)]
+        source_anchor_file: PathBuf,
+        #[arg(long)]
+        source_keyring_passphrase_file: PathBuf,
+        #[arg(long, value_parser = parse_hex32)]
+        legacy_public_key: [u8; 32],
+        #[arg(long)]
+        decommission_evidence_file: PathBuf,
+        #[arg(long, value_parser = parse_hex32)]
+        rotation_decision_id: [u8; 32],
+        #[arg(long, value_parser = parse_hex32)]
+        approval_digest: [u8; 32],
+        #[arg(long)]
+        keyring_output: PathBuf,
+        #[arg(long)]
+        keyring_anchor_output: PathBuf,
+        #[arg(long)]
+        journal_anchor_output: PathBuf,
+        #[arg(long)]
+        plan_output: PathBuf,
+    },
+    /// Apply an exact chain-bound finalization plan to create-new artifacts.
+    ExchangeKeyringExternalFinalizationApply {
+        #[arg(long)]
+        plan_file: PathBuf,
+        #[arg(long, value_parser = parse_hex32)]
+        confirmation_digest: [u8; 32],
+    },
+    /// Emit one canonical unsigned approval payload for a Released v2 record.
+    ExchangeV3MigrationApprovalPayload {
+        #[arg(long)]
+        policy_file: PathBuf,
+        #[arg(long)]
+        keyring_file: PathBuf,
+        #[arg(long)]
+        keyring_anchor_file: PathBuf,
+        #[arg(long)]
+        keyring_passphrase_file: PathBuf,
+        #[arg(long)]
+        request_id: String,
+        #[arg(long, value_parser = parse_hex32)]
+        decision_id: [u8; 32],
+        #[arg(long)]
+        authorized_at_unix_seconds: u64,
+        #[arg(long)]
+        expires_at_unix_seconds: u64,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Plan authenticated v2-to-v3 withdrawal-journal migration.
+    ExchangeV3MigrationPlan {
+        #[arg(long)]
+        evidence_file: PathBuf,
+        #[arg(long)]
+        policy_file: PathBuf,
+        #[arg(long)]
+        keyring_file: PathBuf,
+        #[arg(long)]
+        keyring_anchor_file: PathBuf,
+        #[arg(long)]
+        keyring_passphrase_file: PathBuf,
+        #[arg(long)]
+        validated_snapshot_output: PathBuf,
+        #[arg(long)]
+        v3_anchor_output: PathBuf,
+        #[arg(long)]
+        plan_output: PathBuf,
+    },
+    /// Apply an exact confirmed v2-to-v3 migration plan while offline.
+    ExchangeV3MigrationApply {
+        #[arg(long)]
+        plan_file: PathBuf,
+        #[arg(long, value_parser = parse_hex32)]
+        confirmation_plan_digest: [u8; 32],
+    },
+    /// Create an authenticated canceled-record archive and manifest artifact for independent retention.
+    ExchangeV3ArchivePlan {
+        #[arg(long)]
+        policy_file: PathBuf,
+        #[arg(long)]
+        keyring_file: PathBuf,
+        #[arg(long)]
+        keyring_anchor_file: PathBuf,
+        #[arg(long)]
+        keyring_passphrase_file: PathBuf,
+        #[arg(long = "request-id", required = true)]
+        request_ids: Vec<String>,
+        #[arg(long)]
+        archive_output: PathBuf,
+        #[arg(long)]
+        manifest_pin_output: PathBuf,
+    },
+    /// Compact only the records proven by an exact confirmed archive and pin.
+    ExchangeV3ArchiveApply {
+        #[arg(long)]
+        policy_file: PathBuf,
+        #[arg(long)]
+        keyring_file: PathBuf,
+        #[arg(long)]
+        keyring_anchor_file: PathBuf,
+        #[arg(long)]
+        keyring_passphrase_file: PathBuf,
+        #[arg(long)]
+        archive_file: PathBuf,
+        #[arg(long)]
+        manifest_pin_file: PathBuf,
+        #[arg(long, value_parser = parse_hex32)]
+        confirmation_archive_id: [u8; 32],
+        #[arg(long)]
+        proposed_anchor_output: PathBuf,
+    },
+    /// Verify an authenticated archive for restore without writing journal state.
+    ExchangeV3ArchiveVerify {
+        #[arg(long)]
+        archive_file: PathBuf,
+        #[arg(long)]
+        manifest_pin_file: PathBuf,
     },
     /// Mine, validate, persist, and apply one bounded reference block locally.
     MineOnce {
@@ -226,6 +473,9 @@ enum Command {
         /// Static peer address. Public IPs require --allow-public-peers.
         #[arg(long = "peer")]
         peers: Vec<SocketAddr>,
+        /// Do not use the compiled operational RC seed when no --peer is supplied.
+        #[arg(long)]
+        no_default_seeds: bool,
         /// Explicitly allow unauthenticated, unencrypted public P2P addresses.
         #[arg(long)]
         allow_public_peers: bool,
@@ -298,46 +548,236 @@ enum Command {
     },
 }
 
+#[cfg(windows)]
+const WINDOWS_CLI_PARSER_STACK_BYTES: usize = 4 * 1024 * 1024;
+
+#[cfg(windows)]
+fn parse_cli() -> Result<Cli, Box<dyn std::error::Error>> {
+    // clap's generated builder for this intentionally broad operator CLI has
+    // a measured nested debug-frame high-water mark above Windows' 1 MiB main
+    // stack. Isolate only construction/parsing on a fixed-size thread; all
+    // command execution returns to the normal main thread.
+    std::thread::Builder::new()
+        .name("cmfd-cli-parser".to_owned())
+        .stack_size(WINDOWS_CLI_PARSER_STACK_BYTES)
+        .spawn(Cli::parse)?
+        .join()
+        .map_err(|_| "CLI parser thread panicked".into())
+}
+
+#[cfg(not(windows))]
+fn parse_cli() -> Result<Cli, Box<dyn std::error::Error>> {
+    Ok(Cli::parse())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     if cmfd_proof_worker::verifier_worker_mode_requested() {
         std::process::exit(cmfd_proof_worker::worker_main());
     }
-    let cli = Cli::parse();
-    #[cfg(feature = "production-v3")]
+    let cli = parse_cli()?;
+    validate_exchange_withdrawal_cli(&cli)?;
+    if let Command::ExchangeV3AclQualify { config, output } = &cli.command {
+        let evidence = qualify_installed_host(config, output)?;
+        println!("{}", serde_json::to_string_pretty(&evidence)?);
+        if !evidence.host_qualified {
+            return Err(format!(
+                "installed-host ACL qualification was rejected; evidence was written to `{}`",
+                output.display()
+            )
+            .into());
+        }
+        return Ok(());
+    }
+    if let Command::ExchangeV3AclFixtureQualify { fixture, output } = &cli.command {
+        let evidence = qualify_fixture(fixture, output)?;
+        println!("{}", serde_json::to_string_pretty(&evidence)?);
+        if !evidence.fixture_qualified {
+            return Err(format!(
+                "ACL fixture qualification was rejected; evidence was written to `{}`",
+                output.display()
+            )
+            .into());
+        }
+        return Ok(());
+    }
+    if let Command::ExchangeWithdrawalKeygen { output } = &cli.command {
+        create_exchange_withdrawal_journal_key(output)?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "status": "created",
+                "format": "Common Foundry raw withdrawal-journal key v1",
+                "path": output,
+                "bytes": 32,
+                "warning": "keep this key outside the node data directory and back it up separately"
+            }))?
+        );
+        return Ok(());
+    }
+    if let Command::ExchangeKeyringImportPlan {
+        legacy_key_file,
+        legacy_wallet_passphrase_file,
+        keyring_instance_id,
+        plan_output,
+    } = &cli.command
+    {
+        let report = plan_legacy_keyring_import(&LegacyKeyringPlanConfig {
+            data_dir: cli.data_dir.clone(),
+            legacy_key_file: legacy_key_file.clone(),
+            legacy_wallet_passphrase_file: legacy_wallet_passphrase_file.clone(),
+            keyring_instance_id: *keyring_instance_id,
+            plan_output: plan_output.clone(),
+        })?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    if let Command::ExchangeKeyringImportApply {
+        plan_file,
+        confirmation_digest,
+        keyring_passphrase_file,
+        keyring_output,
+        anchor_output,
+    } = &cli.command
+    {
+        let report = apply_legacy_keyring_import(&LegacyKeyringApplyConfig {
+            data_dir: cli.data_dir.clone(),
+            plan_file: plan_file.clone(),
+            expected_confirmation_digest: *confirmation_digest,
+            passphrase_file: keyring_passphrase_file.clone(),
+            keyring_output: keyring_output.clone(),
+            anchor_output: anchor_output.clone(),
+        })?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    if let Command::ExchangeKeyringExternalTransitionPlan {
+        source_keyring_file,
+        source_anchor_file,
+        source_keyring_passphrase_file,
+        external_public_key,
+        external_signer_id,
+        keyring_output,
+        anchor_output,
+        plan_output,
+    } = &cli.command
+    {
+        let report = plan_external_keyring_transition(&ExternalKeyringTransitionPlanConfig {
+            data_dir: cli.data_dir.clone(),
+            source_keyring_file: source_keyring_file.clone(),
+            source_anchor_file: source_anchor_file.clone(),
+            source_keyring_passphrase_file: source_keyring_passphrase_file.clone(),
+            external_public_key: *external_public_key,
+            external_signer_id: *external_signer_id,
+            keyring_output: keyring_output.clone(),
+            anchor_output: anchor_output.clone(),
+            plan_output: plan_output.clone(),
+        })?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    if let Command::ExchangeKeyringExternalTransitionApply {
+        plan_file,
+        confirmation_digest,
+        source_keyring_passphrase_file,
+    } = &cli.command
+    {
+        let report = apply_external_keyring_transition(&ExternalKeyringTransitionApplyConfig {
+            data_dir: cli.data_dir.clone(),
+            plan_file: plan_file.clone(),
+            expected_confirmation_digest: *confirmation_digest,
+            source_keyring_passphrase_file: source_keyring_passphrase_file.clone(),
+        })?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    if let Command::ExchangeV3ArchivePlan {
+        policy_file,
+        keyring_file,
+        keyring_anchor_file,
+        keyring_passphrase_file,
+        request_ids,
+        archive_output,
+        manifest_pin_output,
+    } = &cli.command
+    {
+        let controls = v3_offline_controls(
+            &cli,
+            policy_file,
+            keyring_file,
+            keyring_anchor_file,
+            keyring_passphrase_file,
+        )?;
+        let report = plan_canceled_archive(&CanceledArchivePlanConfig {
+            controls,
+            request_ids: request_ids.clone(),
+            archive_output: archive_output.clone(),
+            manifest_pin_output: manifest_pin_output.clone(),
+        })?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    if let Command::ExchangeV3ArchiveApply {
+        policy_file,
+        keyring_file,
+        keyring_anchor_file,
+        keyring_passphrase_file,
+        archive_file,
+        manifest_pin_file,
+        confirmation_archive_id,
+        proposed_anchor_output,
+    } = &cli.command
+    {
+        let controls = v3_offline_controls(
+            &cli,
+            policy_file,
+            keyring_file,
+            keyring_anchor_file,
+            keyring_passphrase_file,
+        )?;
+        let report = apply_canceled_archive_compaction(&CanceledArchiveApplyConfig {
+            controls,
+            archive_file: archive_file.clone(),
+            manifest_pin_file: manifest_pin_file.clone(),
+            expected_archive_id: *confirmation_archive_id,
+            proposed_anchor_output: proposed_anchor_output.clone(),
+        })?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    if let Command::ExchangeV3ArchiveVerify {
+        archive_file,
+        manifest_pin_file,
+    } = &cli.command
+    {
+        let journal_key_file = cli
+            .exchange_withdrawal_journal_key_file
+            .as_ref()
+            .ok_or("archive verification requires --exchange-withdrawal-journal-key-file")?;
+        let report = verify_archive_restore_offline(&ArchiveRestoreVerifyConfig {
+            data_dir: cli.data_dir.clone(),
+            journal_key_file: journal_key_file.to_path_buf(),
+            archive_file: archive_file.clone(),
+            manifest_pin_file: manifest_pin_file.clone(),
+        })?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    #[cfg(feature = "production-v4")]
     if let Command::RcnetCandidate {
-        record_v2,
+        model_bank,
+        fixed_record,
         output,
         virtual_genesis_timestamp,
-        bootstrap_ipv4,
-        rpc_port,
-        p2p_port,
-        pool_port,
         pow_limit,
         steward_reward_destination,
         community_reward_destination,
     } = &cli.command
     {
-        let bytes = std::fs::read(record_v2)?;
-        if bytes.len() > 1024 * 1024 {
-            return Err("Record V2 exceeds the 1 MiB candidate-generator limit".into());
-        }
-        let record: cmfd_consensus::dory_v3_model_record::DoryV3ModelCommitmentRecordV2 =
-            serde_json::from_slice(&bytes)?;
-        if bytes
-            != cmfd_consensus::dory_v3_model_record::canonical_dory_v3_model_record_v2_json(
-                &record,
-            )?
-        {
-            return Err("Record V2 is not canonically encoded".into());
-        }
-        let candidate = RcnetLaunchCandidate::from_record(
-            &record,
+        let candidate = RcnetLaunchCandidate::from_artifact_paths(
+            model_bank,
+            fixed_record,
             RcnetLaunchConfiguration {
                 virtual_genesis_timestamp: *virtual_genesis_timestamp,
-                bootstrap_ipv4: *bootstrap_ipv4,
-                rpc_port: *rpc_port,
-                p2p_port: *p2p_port,
-                pool_port: *pool_port,
                 pow_limit: *pow_limit,
                 rewards: cmfd_consensus::FixedRewardDestinations {
                     steward: *steward_reward_destination,
@@ -440,25 +880,252 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let verifier_worker = verifier_worker_config(&cli, production_v3_record.clone())?;
-    let wallet_passphrase = cli
-        .wallet_passphrase_file
-        .as_deref()
-        .map(read_wallet_passphrase_file)
-        .transpose()?;
+    let exchange_custody_v3 = exchange_custody_v3_config(&cli)?;
+    let wallet_requires_v3_security = exchange_custody_v3.is_some()
+        || persisted_exchange_custody_v3_wallet_security_required(&cli.data_dir);
+    let wallet_passphrase = load_runtime_wallet_passphrase(
+        &cli.data_dir,
+        cli.wallet_passphrase_file.as_deref(),
+        wallet_requires_v3_security,
+    )?;
+    let exchange_withdrawal_security = if exchange_custody_v3.is_some() {
+        None
+    } else {
+        match (
+            cli.exchange_withdrawal_journal_key_file.as_ref(),
+            cli.exchange_withdrawal_anchor_file.as_ref(),
+        ) {
+            (Some(journal_key_file), Some(anchor_file)) => Some(
+                ExchangeWithdrawalSecurityConfig::new(journal_key_file, anchor_file),
+            ),
+            (None, None) => None,
+            _ => unreachable!("clap requires both exchange withdrawal security files"),
+        }
+    };
     let _log_guard = cmfd_node::logging::init_tracing(&cli.data_dir, cli.verbose);
     match cli.command {
         Command::NetworkInfo => unreachable!("network-info exits before node initialization"),
-        #[cfg(feature = "production-v3")]
+        #[cfg(feature = "production-v4")]
         Command::RcnetCandidate { .. } => {
             unreachable!("RCNet candidate generation exits before node initialization")
         }
+        Command::ExchangeWithdrawalKeygen { .. } => {
+            unreachable!("withdrawal journal key generation exits before node initialization")
+        }
+        Command::ExchangeV3AclQualify { .. } | Command::ExchangeV3AclFixtureQualify { .. } => {
+            unreachable!("ACL qualification exits before node initialization")
+        }
+        Command::ExchangeKeyringImportPlan { .. }
+        | Command::ExchangeKeyringImportApply { .. }
+        | Command::ExchangeKeyringExternalTransitionPlan { .. }
+        | Command::ExchangeKeyringExternalTransitionApply { .. }
+        | Command::ExchangeV3ArchivePlan { .. }
+        | Command::ExchangeV3ArchiveApply { .. }
+        | Command::ExchangeV3ArchiveVerify { .. } => {
+            unreachable!("offline exchange custody command exits before node initialization")
+        }
+        Command::ExchangeKeyringExternalFinalizationPlan {
+            policy_file,
+            source_keyring_file,
+            source_anchor_file,
+            source_keyring_passphrase_file,
+            legacy_public_key,
+            decommission_evidence_file,
+            rotation_decision_id,
+            approval_digest,
+            keyring_output,
+            keyring_anchor_output,
+            journal_anchor_output,
+            plan_output,
+        } => {
+            let mut node = open_node(
+                &cli.data_dir,
+                production_v3_record.as_ref(),
+                production_v4_artifacts.as_ref(),
+                verifier_worker.as_ref(),
+                wallet_passphrase.as_ref().map(|value| value.as_slice()),
+                None,
+            )?;
+            let report = plan_external_keyring_finalization(
+                &mut node,
+                &ExternalKeyringFinalizationPlanConfig {
+                    data_dir: cli.data_dir.clone(),
+                    controls: V3OfflineControlConfig {
+                        data_dir: cli.data_dir.clone(),
+                        journal_key_file: cli
+                            .exchange_withdrawal_journal_key_file
+                            .clone()
+                            .expect("validated finalization journal key"),
+                        external_anchor_file: cli
+                            .exchange_withdrawal_anchor_file
+                            .clone()
+                            .expect("validated finalization external anchor"),
+                        policy_file,
+                        keyring_file: source_keyring_file,
+                        keyring_anchor_file: source_anchor_file,
+                        keyring_passphrase_file: source_keyring_passphrase_file,
+                    },
+                    legacy_public_key,
+                    decommission_evidence_file,
+                    rotation_decision_id,
+                    approval_digest,
+                    keyring_output,
+                    keyring_anchor_output,
+                    journal_anchor_output,
+                    plan_output,
+                },
+            )?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(())
+        }
+        Command::ExchangeKeyringExternalFinalizationApply {
+            plan_file,
+            confirmation_digest,
+        } => {
+            let mut node = open_node(
+                &cli.data_dir,
+                production_v3_record.as_ref(),
+                production_v4_artifacts.as_ref(),
+                verifier_worker.as_ref(),
+                wallet_passphrase.as_ref().map(|value| value.as_slice()),
+                None,
+            )?;
+            let report = apply_external_keyring_finalization(
+                &mut node,
+                &ExternalKeyringFinalizationApplyConfig {
+                    data_dir: cli.data_dir.clone(),
+                    journal_key_file: cli
+                        .exchange_withdrawal_journal_key_file
+                        .clone()
+                        .expect("validated finalization journal key"),
+                    external_anchor_file: cli
+                        .exchange_withdrawal_anchor_file
+                        .clone()
+                        .expect("validated finalization external anchor"),
+                    plan_file,
+                    expected_confirmation_digest: confirmation_digest,
+                },
+            )?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(())
+        }
+        Command::ExchangeV3MigrationApprovalPayload {
+            policy_file,
+            keyring_file,
+            keyring_anchor_file,
+            keyring_passphrase_file,
+            request_id,
+            decision_id,
+            authorized_at_unix_seconds,
+            expires_at_unix_seconds,
+            output,
+        } => {
+            let node = open_node(
+                &cli.data_dir,
+                production_v3_record.as_ref(),
+                production_v4_artifacts.as_ref(),
+                verifier_worker.as_ref(),
+                wallet_passphrase.as_ref().map(|value| value.as_slice()),
+                exchange_withdrawal_security.as_ref(),
+            )?;
+            let report = write_v3_migration_approval_payload(
+                &node,
+                &V3MigrationApprovalPayloadConfig {
+                    data_dir: cli.data_dir.clone(),
+                    policy_file,
+                    keyring_file,
+                    keyring_anchor_file,
+                    keyring_passphrase_file,
+                    request_id,
+                    decision_id,
+                    authorized_at_unix_seconds,
+                    expires_at_unix_seconds,
+                    output,
+                },
+            )?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(())
+        }
+        Command::ExchangeV3MigrationPlan {
+            evidence_file,
+            policy_file,
+            keyring_file,
+            keyring_anchor_file,
+            keyring_passphrase_file,
+            validated_snapshot_output,
+            v3_anchor_output,
+            plan_output,
+        } => {
+            let node = open_node(
+                &cli.data_dir,
+                production_v3_record.as_ref(),
+                production_v4_artifacts.as_ref(),
+                verifier_worker.as_ref(),
+                wallet_passphrase.as_ref().map(|value| value.as_slice()),
+                exchange_withdrawal_security.as_ref(),
+            )?;
+            let journal_key_file = cli
+                .exchange_withdrawal_journal_key_file
+                .clone()
+                .expect("validated migration journal key");
+            let report = plan_v3_migration(
+                &node,
+                &V3MigrationPlanConfig {
+                    data_dir: cli.data_dir.clone(),
+                    journal_key_file,
+                    evidence_file,
+                    policy_file,
+                    keyring_file,
+                    keyring_anchor_file,
+                    keyring_passphrase_file,
+                    validated_snapshot_output,
+                    v3_anchor_output,
+                    plan_output,
+                },
+            )?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(())
+        }
+        Command::ExchangeV3MigrationApply {
+            plan_file,
+            confirmation_plan_digest,
+        } => {
+            let node = open_node(
+                &cli.data_dir,
+                production_v3_record.as_ref(),
+                production_v4_artifacts.as_ref(),
+                verifier_worker.as_ref(),
+                wallet_passphrase.as_ref().map(|value| value.as_slice()),
+                exchange_withdrawal_security.as_ref(),
+            )?;
+            let report = apply_v3_migration(
+                node,
+                &V3MigrationApplyConfig {
+                    data_dir: cli.data_dir.clone(),
+                    plan_file,
+                    expected_plan_digest: confirmation_plan_digest,
+                },
+            )?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(())
+        }
         Command::Run {
             bind,
+            exchange_rpc_bind,
+            exchange_rpc_auth_file,
+            exchange_rpc_withdrawal_auth_file,
+            exchange_custody_v3_policy_file: _,
+            exchange_custody_v3_keyring_file: _,
+            exchange_custody_v3_keyring_anchor_file: _,
+            exchange_custody_v3_keyring_passphrase_file: _,
             p2p_bind,
             peers,
+            no_default_seeds,
             allow_public_peers,
         } => {
             let shutdown = install_shutdown_handler()?;
+            let (peers, allow_public_peers) =
+                effective_operational_peers(peers, allow_public_peers, no_default_seeds)?;
             let address_policy = peer_address_policy(allow_public_peers);
             let mut node = open_node(
                 &cli.data_dir,
@@ -466,11 +1133,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 production_v4_artifacts.as_ref(),
                 verifier_worker.as_ref(),
                 wallet_passphrase.as_ref().map(|value| value.as_slice()),
+                exchange_withdrawal_security.as_ref(),
             )?;
             node.set_public_peer_mode(allow_public_peers);
-            let status = node.status()?;
             let discovery_hello = node.peer_hello();
             let shared = Arc::new(Mutex::new(node));
+            let exchange_withdrawals_enabled = exchange_rpc_withdrawal_auth_file.is_some();
+            let exchange_custody_v3_active = exchange_custody_v3.is_some();
+            let exchange_rpc = match (exchange_rpc_bind, exchange_rpc_auth_file) {
+                (Some(exchange_bind), Some(authentication_file)) => {
+                    if let Some((custody_config, keyring_passphrase_file)) = exchange_custody_v3 {
+                        Some(spawn_exchange_rpc_server_v3(
+                            Arc::clone(&shared),
+                            exchange_bind,
+                            &authentication_file,
+                            exchange_rpc_withdrawal_auth_file
+                                .as_deref()
+                                .expect("validated v3 withdrawal credential"),
+                            &custody_config,
+                            &keyring_passphrase_file,
+                        )?)
+                    } else {
+                        Some(spawn_exchange_rpc_server(
+                            Arc::clone(&shared),
+                            exchange_bind,
+                            &authentication_file,
+                            exchange_rpc_withdrawal_auth_file.as_deref(),
+                        )?)
+                    }
+                }
+                (None, None) => None,
+                _ => unreachable!("clap requires both exchange RPC options"),
+            };
+            let status = shared
+                .lock()
+                .map_err(|_| cmfd_node::NodeError::SharedNodePoisoned)?
+                .status()?;
             let limits = PeerLimits::default();
             let p2p_socket = TcpListener::bind(p2p_bind)?;
             let p2p_address = p2p_socket.local_addr()?;
@@ -500,20 +1198,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?);
             let rpc = spawn_rpc_server(Arc::clone(&shared), bind)?;
             let rpc_address = rpc.local_addr();
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "rpc": rpc_address.to_string(),
-                    "p2p": p2p_address.to_string(),
-                    "static_peers": peers.iter().map(ToString::to_string).collect::<Vec<_>>(),
-                    "status": status,
-                    "public_peer_mode": allow_public_peers,
-                    "warning": peer_warning(allow_public_peers)
-                }))?
-            );
+            let mut startup = json!({
+                "rpc": rpc_address.to_string(),
+                "exchange_rpc": exchange_rpc.as_ref().map(|rpc| rpc.local_addr().to_string()),
+                "exchange_rpc_api": exchange_rpc.as_ref().map(|_| if exchange_custody_v3_active {
+                    EXCHANGE_CUSTODY_RPC_API_VERSION
+                } else {
+                    EXCHANGE_RPC_API_VERSION
+                }),
+                "exchange_rpc_withdrawals": exchange_rpc.as_ref().map(|_| exchange_withdrawals_enabled),
+                "p2p": p2p_address.to_string(),
+                "static_peers": peers.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "status": status,
+                "public_peer_mode": allow_public_peers,
+                "warning": peer_warning(allow_public_peers)
+            });
+            if exchange_custody_v3_active {
+                startup
+                    .as_object_mut()
+                    .expect("startup document is an object")
+                    .insert("exchange_rpc_custody".to_owned(), json!("v3"));
+            }
+            println!("{}", serde_json::to_string_pretty(&startup)?);
             let service_exit = shutdown.wait_for_service_exit(|| {
                 if rpc.is_finished() {
                     Some("RPC")
+                } else if exchange_rpc.as_ref().is_some_and(|rpc| rpc.is_finished()) {
+                    Some("exchange RPC")
                 } else if inbound.is_finished() {
                     Some("inbound P2P")
                 } else if poller.as_ref().is_some_and(|poller| poller.is_finished()) {
@@ -528,6 +1239,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 node.shutdown_proof_verifier();
             }
+            let exchange_rpc_result = match exchange_rpc {
+                Some(exchange_rpc) => exchange_rpc.stop(),
+                None => Ok(()),
+            };
             let rpc_result = rpc.stop();
             let poll_result = match poller {
                 Some(poller) => poller.stop(),
@@ -535,6 +1250,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let inbound_result = inbound.stop();
             drop(shared);
+            exchange_rpc_result?;
             rpc_result?;
             poll_result?;
             inbound_result?;
@@ -551,6 +1267,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 production_v4_artifacts.as_ref(),
                 verifier_worker.as_ref(),
                 wallet_passphrase.as_ref().map(|value| value.as_slice()),
+                exchange_withdrawal_security.as_ref(),
             )?;
             let miner_destination = match miner.as_deref() {
                 Some(value) => parse_miner_destination(value)?,
@@ -579,6 +1296,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 production_v4_artifacts.as_ref(),
                 verifier_worker.as_ref(),
                 wallet_passphrase.as_ref().map(|value| value.as_slice()),
+                exchange_withdrawal_security.as_ref(),
             )?;
             println!("{}", serde_json::to_string_pretty(&node.status()?)?);
             Ok(())
@@ -590,6 +1308,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 production_v4_artifacts.as_ref(),
                 verifier_worker.as_ref(),
                 wallet_passphrase.as_ref().map(|value| value.as_slice()),
+                exchange_withdrawal_security.as_ref(),
             )?;
             node.persist_startup_snapshot()?;
             println!(
@@ -632,6 +1351,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             bind,
             p2p_bind,
             peers,
+            no_default_seeds,
             allow_public_peers,
             allow_public_pool_clients,
             allow_address_only_payouts,
@@ -657,6 +1377,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             shutdown_request_file,
         } => {
             require_pool_mining_profile()?;
+            let (peers, allow_public_peers) =
+                effective_operational_peers(peers, allow_public_peers, no_default_seeds)?;
             let shutdown =
                 install_shutdown_handler()?.with_request_file(shutdown_request_file.as_deref())?;
             if share_leading_zero_bits >= 8 {
@@ -685,6 +1407,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 production_v4_artifacts.as_ref(),
                 verifier_worker.as_ref(),
                 wallet_passphrase.as_ref().map(|value| value.as_slice()),
+                exchange_withdrawal_security.as_ref(),
             )?;
             node_instance.set_public_peer_mode(allow_public_peers);
             let discovery_hello = node_instance.peer_hello();
@@ -1131,11 +1854,10 @@ fn configure_production_v4_pool_verifier(
                 },
                 ProductionV4PoolWorkerCommand {
                     program: proof_worker,
-                    arguments: vec![
-                        "--server".into(),
-                        artifacts.bank.as_os_str().to_owned(),
-                        fixed_artifact_directory.as_os_str().to_owned(),
-                    ],
+                    arguments: production_v4_proof_worker_server_arguments(
+                        artifacts.bank.as_os_str(),
+                        fixed_artifact_directory.as_os_str(),
+                    ),
                 },
                 scratch_directory
                     .to_str()
@@ -1163,6 +1885,19 @@ fn configure_production_v4_pool_verifier(
         );
         Err("ProductionV4 pool support is not compiled into this binary".into())
     }
+}
+
+#[cfg(feature = "production-v4")]
+fn production_v4_proof_worker_server_arguments(
+    model_bank: &OsStr,
+    fixed_artifact_directory: &OsStr,
+) -> Vec<OsString> {
+    vec![
+        "--server".into(),
+        hex::encode(COMPILED_NETWORK_PROFILE.network_id).into(),
+        model_bank.to_owned(),
+        fixed_artifact_directory.to_owned(),
+    ]
 }
 
 #[cfg(feature = "production-v4")]
@@ -1241,11 +1976,10 @@ fn production_v4_wsl_pool_workers(
             ),
             worker_command(
                 proof_worker,
-                vec![
-                    "--server".into(),
-                    model_bank.into(),
-                    fixed_artifact_directory.into(),
-                ],
+                production_v4_proof_worker_server_arguments(
+                    OsStr::new(&model_bank),
+                    OsStr::new(&fixed_artifact_directory),
+                ),
             ),
             worker_scratch_directory,
         ))
@@ -1317,14 +2051,234 @@ fn open_node(
     production_v4_artifacts: Option<&ProductionV4VerifierArtifacts>,
     verifier_worker: Option<&VerifierWorkerConfig>,
     wallet_passphrase: Option<&[u8]>,
+    exchange_withdrawal_security: Option<&ExchangeWithdrawalSecurityConfig>,
 ) -> Result<Node, Box<dyn std::error::Error>> {
-    Ok(Node::open_with_runtime_security_and_wallet_passphrase(
-        data_dir,
-        production_v3_record,
-        production_v4_artifacts,
-        verifier_worker,
-        wallet_passphrase,
-    )?)
+    Ok(
+        Node::open_with_runtime_security_wallet_and_exchange_withdrawal(
+            data_dir,
+            production_v3_record,
+            production_v4_artifacts,
+            verifier_worker,
+            wallet_passphrase,
+            exchange_withdrawal_security,
+        )?,
+    )
+}
+
+fn create_exchange_withdrawal_journal_key(output: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    create_exchange_journal_key_create_new(output)?;
+    Ok(())
+}
+
+fn validate_exchange_withdrawal_cli(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let archive_verify = matches!(&cli.command, Command::ExchangeV3ArchiveVerify { .. });
+    if archive_verify {
+        if cli.exchange_withdrawal_journal_key_file.is_none() {
+            return Err(
+                "archive verification requires --exchange-withdrawal-journal-key-file".into(),
+            );
+        }
+    } else if cli.exchange_withdrawal_journal_key_file.is_some()
+        != cli.exchange_withdrawal_anchor_file.is_some()
+    {
+        return Err("--exchange-withdrawal-journal-key-file and \
+            --exchange-withdrawal-anchor-file must be supplied together"
+            .into());
+    }
+    if let Command::Run {
+        exchange_rpc_bind,
+        exchange_rpc_auth_file,
+        exchange_rpc_withdrawal_auth_file,
+        exchange_custody_v3_policy_file,
+        exchange_custody_v3_keyring_file,
+        exchange_custody_v3_keyring_anchor_file,
+        exchange_custody_v3_keyring_passphrase_file,
+        ..
+    } = &cli.command
+    {
+        let v3_inputs = [
+            exchange_custody_v3_policy_file.is_some(),
+            exchange_custody_v3_keyring_file.is_some(),
+            exchange_custody_v3_keyring_anchor_file.is_some(),
+            exchange_custody_v3_keyring_passphrase_file.is_some(),
+        ];
+        let any_v3_input = v3_inputs.iter().any(|present| *present);
+        let all_v3_inputs = v3_inputs.iter().all(|present| *present);
+        if any_v3_input && !all_v3_inputs {
+            return Err("v3 exchange custody activation requires all of \
+                --exchange-custody-v3-policy-file, --exchange-custody-v3-keyring-file, \
+                --exchange-custody-v3-keyring-anchor-file, and \
+                --exchange-custody-v3-keyring-passphrase-file"
+                .into());
+        }
+        if all_v3_inputs
+            && (exchange_rpc_bind.is_none()
+                || exchange_rpc_auth_file.is_none()
+                || exchange_rpc_withdrawal_auth_file.is_none()
+                || cli.exchange_withdrawal_journal_key_file.is_none()
+                || cli.exchange_withdrawal_anchor_file.is_none())
+        {
+            return Err(
+                "v3 exchange custody activation requires --exchange-rpc-bind, \
+                --exchange-rpc-auth-file, --exchange-rpc-withdrawal-auth-file, \
+                --exchange-withdrawal-journal-key-file, and \
+                --exchange-withdrawal-anchor-file"
+                    .into(),
+            );
+        }
+    }
+    if matches!(
+        &cli.command,
+        Command::Run {
+            exchange_rpc_withdrawal_auth_file: Some(_),
+            ..
+        }
+    ) && (cli.exchange_withdrawal_journal_key_file.is_none()
+        || cli.exchange_withdrawal_anchor_file.is_none())
+    {
+        return Err("--exchange-rpc-withdrawal-auth-file requires both \
+            --exchange-withdrawal-journal-key-file and --exchange-withdrawal-anchor-file"
+            .into());
+    }
+    if matches!(
+        &cli.command,
+        Command::ExchangeV3MigrationApprovalPayload { .. }
+            | Command::ExchangeV3MigrationPlan { .. }
+            | Command::ExchangeV3MigrationApply { .. }
+            | Command::ExchangeKeyringExternalFinalizationPlan { .. }
+            | Command::ExchangeKeyringExternalFinalizationApply { .. }
+            | Command::ExchangeV3ArchivePlan { .. }
+            | Command::ExchangeV3ArchiveApply { .. }
+    ) && (cli.exchange_withdrawal_journal_key_file.is_none()
+        || cli.exchange_withdrawal_anchor_file.is_none())
+    {
+        return Err("v3 exchange custody tools require both \
+            --exchange-withdrawal-journal-key-file and --exchange-withdrawal-anchor-file"
+            .into());
+    }
+    Ok(())
+}
+
+fn exchange_custody_v3_config(
+    cli: &Cli,
+) -> Result<Option<(ExchangeCustodyV3Config, PathBuf)>, Box<dyn std::error::Error>> {
+    let Command::Run {
+        exchange_custody_v3_policy_file,
+        exchange_custody_v3_keyring_file,
+        exchange_custody_v3_keyring_anchor_file,
+        exchange_custody_v3_keyring_passphrase_file,
+        ..
+    } = &cli.command
+    else {
+        return Ok(None);
+    };
+    match (
+        exchange_custody_v3_policy_file,
+        exchange_custody_v3_keyring_file,
+        exchange_custody_v3_keyring_anchor_file,
+        exchange_custody_v3_keyring_passphrase_file,
+    ) {
+        (Some(policy), Some(keyring), Some(keyring_anchor), Some(passphrase)) => {
+            let (journal_key, external_anchor) = required_exchange_withdrawal_security(cli)?;
+            let passphrase = canonical_external_v3_passphrase_file(&cli.data_dir, passphrase)?;
+            Ok(Some((
+                ExchangeCustodyV3Config::new(
+                    journal_key,
+                    external_anchor,
+                    policy,
+                    keyring,
+                    keyring_anchor,
+                ),
+                passphrase,
+            )))
+        }
+        (None, None, None, None) => Ok(None),
+        _ => Err("incomplete v3 exchange custody activation".into()),
+    }
+}
+
+fn load_runtime_wallet_passphrase(
+    data_dir: &Path,
+    passphrase_file: Option<&Path>,
+    exchange_custody_v3_enabled: bool,
+) -> Result<Option<Zeroizing<Vec<u8>>>, Box<dyn std::error::Error>> {
+    match passphrase_file {
+        Some(path) if exchange_custody_v3_enabled => Ok(Some(
+            load_exchange_custody_v3_wallet_passphrase(data_dir, path)?,
+        )),
+        Some(path) => Ok(Some(read_wallet_passphrase_file(path)?)),
+        None => Ok(None),
+    }
+}
+
+fn canonical_external_v3_passphrase_file(
+    data_dir: &Path,
+    passphrase_file: &Path,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if !passphrase_file.is_absolute() {
+        return Err("--exchange-custody-v3-keyring-passphrase-file must be absolute".into());
+    }
+    let metadata = std::fs::symlink_metadata(passphrase_file)?;
+    #[cfg(windows)]
+    let is_reparse_point = {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    };
+    #[cfg(not(windows))]
+    let is_reparse_point = false;
+    if metadata.file_type().is_symlink() || is_reparse_point || !metadata.is_file() {
+        return Err(
+            "--exchange-custody-v3-keyring-passphrase-file must be a regular non-symlink file"
+                .into(),
+        );
+    }
+    let canonical_data_dir = std::fs::canonicalize(data_dir)?;
+    let canonical_passphrase_file = std::fs::canonicalize(passphrase_file)?;
+    let lexical_data_dir = if data_dir.is_absolute() {
+        data_dir.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(data_dir)
+    };
+    if passphrase_file.starts_with(&lexical_data_dir)
+        || canonical_passphrase_file.starts_with(&canonical_data_dir)
+    {
+        return Err(
+            "--exchange-custody-v3-keyring-passphrase-file must be outside --data-dir".into(),
+        );
+    }
+    Ok(canonical_passphrase_file)
+}
+
+fn required_exchange_withdrawal_security(
+    cli: &Cli,
+) -> Result<(&Path, &Path), Box<dyn std::error::Error>> {
+    match (
+        cli.exchange_withdrawal_journal_key_file.as_deref(),
+        cli.exchange_withdrawal_anchor_file.as_deref(),
+    ) {
+        (Some(key), Some(anchor)) => Ok((key, anchor)),
+        _ => Err("both exchange withdrawal security paths are required".into()),
+    }
+}
+
+fn v3_offline_controls(
+    cli: &Cli,
+    policy_file: &Path,
+    keyring_file: &Path,
+    keyring_anchor_file: &Path,
+    keyring_passphrase_file: &Path,
+) -> Result<V3OfflineControlConfig, Box<dyn std::error::Error>> {
+    let (journal_key_file, external_anchor_file) = required_exchange_withdrawal_security(cli)?;
+    Ok(V3OfflineControlConfig {
+        data_dir: cli.data_dir.clone(),
+        journal_key_file: journal_key_file.to_path_buf(),
+        external_anchor_file: external_anchor_file.to_path_buf(),
+        policy_file: policy_file.to_path_buf(),
+        keyring_file: keyring_file.to_path_buf(),
+        keyring_anchor_file: keyring_anchor_file.to_path_buf(),
+        keyring_passphrase_file: keyring_passphrase_file.to_path_buf(),
+    })
 }
 
 fn peer_address_policy(allow_public_peers: bool) -> PeerAddressPolicy {
@@ -1333,6 +2287,32 @@ fn peer_address_policy(allow_public_peers: bool) -> PeerAddressPolicy {
     } else {
         PeerAddressPolicy::PrivateOnly
     }
+}
+
+fn effective_operational_peers(
+    peers: Vec<SocketAddr>,
+    allow_public_peers: bool,
+    no_default_seeds: bool,
+) -> Result<(Vec<SocketAddr>, bool), Box<dyn std::error::Error>> {
+    effective_operational_peers_for_build(
+        peers,
+        allow_public_peers,
+        no_default_seeds,
+        cfg!(feature = "production-rc"),
+    )
+}
+
+fn effective_operational_peers_for_build(
+    mut peers: Vec<SocketAddr>,
+    mut allow_public_peers: bool,
+    no_default_seeds: bool,
+    use_production_rc_seed: bool,
+) -> Result<(Vec<SocketAddr>, bool), Box<dyn std::error::Error>> {
+    if peers.is_empty() && !no_default_seeds && use_production_rc_seed {
+        peers = production_rc_seed_set().resolve(&SystemSeedResolver)?;
+        allow_public_peers = true;
+    }
+    Ok((peers, allow_public_peers))
 }
 
 fn require_bounded_reference_mining(command: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -1382,6 +2362,24 @@ fn peer_warning(allow_public_peers: bool) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "production-v4")]
+    #[test]
+    fn production_v4_proof_worker_arguments_bind_the_compiled_network() {
+        let arguments = production_v4_proof_worker_server_arguments(
+            OsStr::new("/srv/commonfoundry/MODEL-V2.bank"),
+            OsStr::new("/srv/commonfoundry/fixed"),
+        );
+        assert_eq!(
+            arguments,
+            vec![
+                OsString::from("--server"),
+                OsString::from(hex::encode(COMPILED_NETWORK_PROFILE.network_id)),
+                OsString::from("/srv/commonfoundry/MODEL-V2.bank"),
+                OsString::from("/srv/commonfoundry/fixed"),
+            ]
+        );
+    }
+
     #[test]
     fn cli_defaults_follow_the_compile_time_network_profile() {
         let cli = Cli::try_parse_from(["cmfd-node", "run"]).unwrap();
@@ -1390,11 +2388,115 @@ mod tests {
         assert_eq!(cli.proof_verifier_cpu_period_us, None);
         assert_eq!(cli.proof_verifier_pids_limit, None);
         assert_eq!(cli.wallet_passphrase_file, None);
-        let Command::Run { bind, p2p_bind, .. } = cli.command else {
+        assert_eq!(cli.exchange_withdrawal_journal_key_file, None);
+        assert_eq!(cli.exchange_withdrawal_anchor_file, None);
+        let Command::Run {
+            bind,
+            exchange_rpc_bind,
+            exchange_rpc_auth_file,
+            exchange_rpc_withdrawal_auth_file,
+            exchange_custody_v3_policy_file,
+            exchange_custody_v3_keyring_file,
+            exchange_custody_v3_keyring_anchor_file,
+            exchange_custody_v3_keyring_passphrase_file,
+            p2p_bind,
+            ..
+        } = cli.command
+        else {
             unreachable!()
         };
         assert_eq!(bind, COMPILED_NETWORK_PROFILE.rpc_address());
+        assert_eq!(exchange_rpc_bind, None);
+        assert_eq!(exchange_rpc_auth_file, None);
+        assert_eq!(exchange_rpc_withdrawal_auth_file, None);
+        assert_eq!(exchange_custody_v3_policy_file, None);
+        assert_eq!(exchange_custody_v3_keyring_file, None);
+        assert_eq!(exchange_custody_v3_keyring_anchor_file, None);
+        assert_eq!(exchange_custody_v3_keyring_passphrase_file, None);
         assert_eq!(p2p_bind, COMPILED_NETWORK_PROFILE.p2p_address());
+
+        assert!(
+            Cli::try_parse_from(["cmfd-node", "run", "--exchange-rpc-bind", "127.0.0.1:38101",])
+                .is_err()
+        );
+        let exchange = Cli::try_parse_from([
+            "cmfd-node",
+            "run",
+            "--exchange-rpc-bind",
+            "127.0.0.1:38101",
+            "--exchange-rpc-auth-file",
+            "exchange-rpc.auth",
+        ])
+        .unwrap();
+        assert!(matches!(
+            exchange.command,
+            Command::Run {
+                exchange_rpc_bind: Some(address),
+                exchange_rpc_auth_file: Some(path),
+                ..
+            } if address == "127.0.0.1:38101".parse().unwrap()
+                && path == Path::new("exchange-rpc.auth")
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "cmfd-node",
+                "run",
+                "--exchange-rpc-withdrawal-auth-file",
+                "withdrawal.auth",
+            ])
+            .is_err()
+        );
+        let missing_withdrawal_security = Cli::try_parse_from([
+            "cmfd-node",
+            "run",
+            "--exchange-rpc-bind",
+            "127.0.0.1:38101",
+            "--exchange-rpc-auth-file",
+            "exchange-rpc.auth",
+            "--exchange-rpc-withdrawal-auth-file",
+            "withdrawal.auth",
+        ])
+        .unwrap();
+        assert!(validate_exchange_withdrawal_cli(&missing_withdrawal_security).is_err());
+        let partial_security = Cli::try_parse_from([
+            "cmfd-node",
+            "--exchange-withdrawal-journal-key-file",
+            "withdrawal-journal.key",
+            "run",
+        ])
+        .unwrap();
+        assert!(validate_exchange_withdrawal_cli(&partial_security).is_err());
+        let withdrawal = Cli::try_parse_from([
+            "cmfd-node",
+            "run",
+            "--exchange-rpc-bind",
+            "127.0.0.1:38101",
+            "--exchange-rpc-auth-file",
+            "exchange-rpc.auth",
+            "--exchange-rpc-withdrawal-auth-file",
+            "withdrawal.auth",
+            "--exchange-withdrawal-journal-key-file",
+            "withdrawal-journal.key",
+            "--exchange-withdrawal-anchor-file",
+            "withdrawal-anchor.json",
+        ])
+        .unwrap();
+        validate_exchange_withdrawal_cli(&withdrawal).unwrap();
+        assert!(matches!(
+            withdrawal.command,
+            Command::Run {
+                exchange_rpc_withdrawal_auth_file: Some(path),
+                ..
+            } if path == Path::new("withdrawal.auth")
+        ));
+        assert_eq!(
+            withdrawal.exchange_withdrawal_journal_key_file,
+            Some(PathBuf::from("withdrawal-journal.key"))
+        );
+        assert_eq!(
+            withdrawal.exchange_withdrawal_anchor_file,
+            Some(PathBuf::from("withdrawal-anchor.json"))
+        );
 
         let cli = Cli::try_parse_from([
             "cmfd-node",
@@ -1424,6 +2526,130 @@ mod tests {
     }
 
     #[test]
+    fn production_rc_seed_defaults_are_explicit_replaceable_and_disableable() {
+        let (defaults, public) =
+            effective_operational_peers_for_build(Vec::new(), false, false, true).unwrap();
+        assert_eq!(defaults, vec![cmfd_node::seed_peers::PRODUCTION_RC_SEED]);
+        assert!(public);
+
+        let explicit = vec!["10.1.2.3:19444".parse().unwrap()];
+        assert_eq!(
+            effective_operational_peers_for_build(explicit.clone(), false, false, true).unwrap(),
+            (explicit, false)
+        );
+        assert_eq!(
+            effective_operational_peers_for_build(Vec::new(), false, true, true).unwrap(),
+            (Vec::new(), false)
+        );
+        assert_eq!(
+            effective_operational_peers_for_build(Vec::new(), false, false, false).unwrap(),
+            (Vec::new(), false)
+        );
+    }
+
+    #[test]
+    fn run_v3_custody_requires_the_complete_explicit_activation_set() {
+        let partial = Cli::try_parse_from([
+            "cmfd-node",
+            "run",
+            "--exchange-custody-v3-policy-file",
+            "C:/controls/policy.json",
+        ])
+        .unwrap();
+        assert!(validate_exchange_withdrawal_cli(&partial).is_err());
+
+        let missing_rpc_and_journal_controls = Cli::try_parse_from([
+            "cmfd-node",
+            "run",
+            "--exchange-custody-v3-policy-file",
+            "C:/controls/policy.json",
+            "--exchange-custody-v3-keyring-file",
+            "C:/node/exchange-keyring.bin",
+            "--exchange-custody-v3-keyring-anchor-file",
+            "C:/controls/keyring.anchor",
+            "--exchange-custody-v3-keyring-passphrase-file",
+            "C:/controls/keyring.passphrase",
+        ])
+        .unwrap();
+        assert!(validate_exchange_withdrawal_cli(&missing_rpc_and_journal_controls).is_err());
+
+        let complete = Cli::try_parse_from([
+            "cmfd-node",
+            "--exchange-withdrawal-journal-key-file",
+            "C:/controls/journal.key",
+            "--exchange-withdrawal-anchor-file",
+            "C:/controls/journal.anchor",
+            "run",
+            "--exchange-rpc-bind",
+            "127.0.0.1:38101",
+            "--exchange-rpc-auth-file",
+            "C:/controls/integration.auth",
+            "--exchange-rpc-withdrawal-auth-file",
+            "C:/controls/withdrawal.auth",
+            "--exchange-custody-v3-policy-file",
+            "C:/controls/policy.json",
+            "--exchange-custody-v3-keyring-file",
+            "C:/node/exchange-keyring.bin",
+            "--exchange-custody-v3-keyring-anchor-file",
+            "C:/controls/keyring.anchor",
+            "--exchange-custody-v3-keyring-passphrase-file",
+            "C:/controls/keyring.passphrase",
+        ])
+        .unwrap();
+        validate_exchange_withdrawal_cli(&complete).unwrap();
+        assert!(matches!(
+            complete.command,
+            Command::Run {
+                exchange_custody_v3_policy_file: Some(policy),
+                exchange_custody_v3_keyring_file: Some(keyring),
+                exchange_custody_v3_keyring_anchor_file: Some(keyring_anchor),
+                exchange_custody_v3_keyring_passphrase_file: Some(passphrase),
+                ..
+            } if policy == Path::new("C:/controls/policy.json")
+                && keyring == Path::new("C:/node/exchange-keyring.bin")
+                && keyring_anchor == Path::new("C:/controls/keyring.anchor")
+                && passphrase == Path::new("C:/controls/keyring.passphrase")
+        ));
+    }
+
+    #[test]
+    fn run_v3_keyring_passphrase_must_be_a_regular_file_outside_data_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "cmfd-v3-run-passphrase-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let data_dir = root.join("node");
+        let controls_dir = root.join("controls");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&data_dir).unwrap();
+        std::fs::create_dir(&controls_dir).unwrap();
+        let external = controls_dir.join("keyring.passphrase");
+        let inside = data_dir.join("keyring.passphrase");
+        std::fs::write(&external, b"correct horse battery staple").unwrap();
+        std::fs::write(&inside, b"correct horse battery staple").unwrap();
+
+        assert_eq!(
+            canonical_external_v3_passphrase_file(&data_dir, &external).unwrap(),
+            std::fs::canonicalize(&external).unwrap()
+        );
+        assert!(canonical_external_v3_passphrase_file(&data_dir, &inside).is_err());
+        assert!(
+            canonical_external_v3_passphrase_file(&data_dir, Path::new("relative.passphrase"))
+                .is_err()
+        );
+
+        std::fs::remove_file(external).unwrap();
+        std::fs::remove_file(inside).unwrap();
+        std::fs::remove_dir(controls_dir).unwrap();
+        std::fs::remove_dir(data_dir).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
     fn network_info_accepts_no_command_specific_inputs() {
         assert!(matches!(
             Cli::try_parse_from(["cmfd-node", "network-info"])
@@ -1432,6 +2658,43 @@ mod tests {
             Command::NetworkInfo
         ));
         assert!(Cli::try_parse_from(["cmfd-node", "network-info", "unexpected"]).is_err());
+    }
+
+    #[test]
+    fn acl_qualification_commands_require_explicit_inputs() {
+        let live = Cli::try_parse_from([
+            "cmfd-node",
+            "exchange-v3-acl-qualify",
+            "--config",
+            "C:/controls/acl-config.json",
+            "--output",
+            "C:/evidence/acl-live.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            live.command,
+            Command::ExchangeV3AclQualify { config, output }
+                if config == Path::new("C:/controls/acl-config.json")
+                    && output == Path::new("C:/evidence/acl-live.json")
+        ));
+
+        let fixture = Cli::try_parse_from([
+            "cmfd-node",
+            "exchange-v3-acl-fixture-qualify",
+            "--fixture",
+            "C:/fixtures/acl.json",
+            "--output",
+            "C:/evidence/acl-fixture.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            fixture.command,
+            Command::ExchangeV3AclFixtureQualify { fixture, output }
+                if fixture == Path::new("C:/fixtures/acl.json")
+                    && output == Path::new("C:/evidence/acl-fixture.json")
+        ));
+        assert!(Cli::try_parse_from(["cmfd-node", "exchange-v3-acl-qualify"]).is_err());
+        assert!(Cli::try_parse_from(["cmfd-node", "exchange-v3-acl-fixture-qualify"]).is_err());
     }
 
     #[test]
@@ -1486,6 +2749,308 @@ mod tests {
     }
 
     #[test]
+    fn withdrawal_journal_keygen_is_create_new_and_exactly_32_bytes() {
+        let directory = std::env::temp_dir().join(format!(
+            "cmfd-withdrawal-keygen-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        #[cfg(windows)]
+        {
+            let identity = std::process::Command::new("whoami.exe").output().unwrap();
+            assert!(identity.status.success());
+            let identity = String::from_utf8(identity.stdout).unwrap();
+            let grant = format!("{}:(OI)(CI)(F)", identity.trim());
+            assert!(
+                std::process::Command::new("icacls.exe")
+                    .arg(&directory)
+                    .arg("/inheritance:r")
+                    .arg("/grant:r")
+                    .arg(grant)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let output = directory.join("withdrawal-journal.key");
+        let cli = Cli::try_parse_from([
+            "cmfd-node",
+            "exchange-withdrawal-keygen",
+            "--output",
+            output.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::ExchangeWithdrawalKeygen { output: ref parsed } if parsed == &output
+        ));
+
+        create_exchange_withdrawal_journal_key(&output).unwrap();
+        let first = std::fs::read(&output).unwrap();
+        assert_eq!(first.len(), 32);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&output).unwrap().permissions().mode() & 0o077,
+                0
+            );
+        }
+        assert!(create_exchange_withdrawal_journal_key(&output).is_err());
+        assert_eq!(std::fs::read(&output).unwrap(), first);
+        assert!(create_exchange_withdrawal_journal_key(Path::new("relative.key")).is_err());
+
+        std::fs::remove_file(output).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn v3_offline_operator_commands_require_explicit_confirmations_and_controls() {
+        let digest = "11".repeat(32);
+        let import = Cli::try_parse_from([
+            "cmfd-node",
+            "exchange-keyring-import-plan",
+            "--legacy-key-file",
+            "C:/controls/wallet.key",
+            "--legacy-wallet-passphrase-file",
+            "C:/controls/legacy.passphrase",
+            "--keyring-instance-id",
+            &digest,
+            "--plan-output",
+            "C:/controls/keyring-plan.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            import.command,
+            Command::ExchangeKeyringImportPlan {
+                legacy_wallet_passphrase_file: Some(_),
+                ..
+            }
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "cmfd-node",
+                "exchange-keyring-import-apply",
+                "--plan-file",
+                "C:/controls/keyring-plan.json",
+            ])
+            .is_err()
+        );
+
+        let external_transition = Cli::try_parse_from([
+            "cmfd-node",
+            "--data-dir",
+            "C:/node",
+            "exchange-keyring-external-transition-plan",
+            "--source-keyring-file",
+            "C:/node/imported-keyring.bin",
+            "--source-anchor-file",
+            "C:/provisioning/imported-keyring.anchor",
+            "--source-keyring-passphrase-file",
+            "C:/provisioning/keyring.passphrase",
+            "--external-public-key",
+            &digest,
+            "--external-signer-id",
+            &"22".repeat(32),
+            "--keyring-output",
+            "C:/node/external-keyring.bin",
+            "--anchor-output",
+            "C:/provisioning/external-keyring.anchor",
+            "--plan-output",
+            "C:/provisioning/external-transition-plan.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            external_transition.command,
+            Command::ExchangeKeyringExternalTransitionPlan {
+                external_public_key,
+                external_signer_id,
+                ..
+            } if external_public_key == [0x11; 32] && external_signer_id == [0x22; 32]
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "cmfd-node",
+                "exchange-keyring-external-transition-apply",
+                "--plan-file",
+                "C:/provisioning/external-transition-plan.json",
+            ])
+            .is_err()
+        );
+
+        let finalization = Cli::try_parse_from([
+            "cmfd-node",
+            "--data-dir",
+            "C:/node",
+            "--exchange-withdrawal-journal-key-file",
+            "C:/node-secrets/journal.key",
+            "--exchange-withdrawal-anchor-file",
+            "C:/controls/journal.anchor",
+            "exchange-keyring-external-finalization-plan",
+            "--policy-file",
+            "C:/controls/policy.json",
+            "--source-keyring-file",
+            "C:/node/mixed-keyring.bin",
+            "--source-anchor-file",
+            "C:/controls/mixed-keyring.anchor",
+            "--source-keyring-passphrase-file",
+            "C:/controls/keyring.passphrase",
+            "--legacy-public-key",
+            &digest,
+            "--decommission-evidence-file",
+            "C:/controls/legacy-decommission.json",
+            "--rotation-decision-id",
+            &"22".repeat(32),
+            "--approval-digest",
+            &"33".repeat(32),
+            "--keyring-output",
+            "C:/node/finalized-keyring.bin",
+            "--keyring-anchor-output",
+            "C:/staging/finalized-keyring.anchor",
+            "--journal-anchor-output",
+            "C:/staging/finalized-journal.anchor",
+            "--plan-output",
+            "C:/staging/finalization-plan.json",
+        ])
+        .unwrap();
+        validate_exchange_withdrawal_cli(&finalization).unwrap();
+        assert!(matches!(
+            finalization.command,
+            Command::ExchangeKeyringExternalFinalizationPlan {
+                legacy_public_key,
+                ..
+            } if legacy_public_key == [0x11; 32]
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "cmfd-node",
+                "exchange-keyring-external-finalization-apply",
+                "--plan-file",
+                "C:/staging/finalization-plan.json",
+            ])
+            .is_err()
+        );
+
+        let archive_without_security = Cli::try_parse_from([
+            "cmfd-node",
+            "exchange-v3-archive-verify",
+            "--archive-file",
+            "C:/controls/archive.bin",
+            "--manifest-pin-file",
+            "C:/controls/archive.pin",
+        ])
+        .unwrap();
+        assert!(validate_exchange_withdrawal_cli(&archive_without_security).is_err());
+        let archive_verify = Cli::try_parse_from([
+            "cmfd-node",
+            "--exchange-withdrawal-journal-key-file",
+            "C:/controls/journal.key",
+            "exchange-v3-archive-verify",
+            "--archive-file",
+            "C:/controls/archive.bin",
+            "--manifest-pin-file",
+            "C:/controls/archive.pin",
+        ])
+        .unwrap();
+        validate_exchange_withdrawal_cli(&archive_verify).unwrap();
+        assert!(archive_verify.exchange_withdrawal_anchor_file.is_none());
+        let archive = Cli::try_parse_from([
+            "cmfd-node",
+            "--exchange-withdrawal-journal-key-file",
+            "C:/controls/journal.key",
+            "--exchange-withdrawal-anchor-file",
+            "C:/controls/journal.anchor",
+            "exchange-v3-archive-apply",
+            "--policy-file",
+            "C:/controls/policy.json",
+            "--keyring-file",
+            "C:/node/keyring.bin",
+            "--keyring-anchor-file",
+            "C:/controls/keyring.anchor",
+            "--keyring-passphrase-file",
+            "C:/controls/keyring.passphrase",
+            "--archive-file",
+            "C:/controls/archive.bin",
+            "--manifest-pin-file",
+            "C:/controls/archive.pin",
+            "--confirmation-archive-id",
+            &digest,
+            "--proposed-anchor-output",
+            "C:/controls/compacted.anchor",
+        ])
+        .unwrap();
+        validate_exchange_withdrawal_cli(&archive).unwrap();
+        assert!(matches!(
+            archive.command,
+            Command::ExchangeV3ArchiveApply { .. }
+        ));
+
+        let migration_payload = Cli::try_parse_from([
+            "cmfd-node",
+            "--exchange-withdrawal-journal-key-file",
+            "C:/controls/journal.key",
+            "--exchange-withdrawal-anchor-file",
+            "C:/controls/journal.anchor",
+            "exchange-v3-migration-approval-payload",
+            "--policy-file",
+            "C:/controls/policy.json",
+            "--keyring-file",
+            "C:/node/keyring.bin",
+            "--keyring-anchor-file",
+            "C:/controls/keyring.anchor",
+            "--keyring-passphrase-file",
+            "C:/controls/keyring.passphrase",
+            "--request-id",
+            "migrated-withdrawal-0001",
+            "--decision-id",
+            &digest,
+            "--authorized-at-unix-seconds",
+            "100",
+            "--expires-at-unix-seconds",
+            "200",
+            "--output",
+            "C:/controls/migrated-withdrawal-0001.approval.json",
+        ])
+        .unwrap();
+        validate_exchange_withdrawal_cli(&migration_payload).unwrap();
+        assert!(matches!(
+            migration_payload.command,
+            Command::ExchangeV3MigrationApprovalPayload {
+                decision_id,
+                authorized_at_unix_seconds: 100,
+                expires_at_unix_seconds: 200,
+                ..
+            } if decision_id == [0x11; 32]
+        ));
+
+        let migration = Cli::try_parse_from([
+            "cmfd-node",
+            "--exchange-withdrawal-journal-key-file",
+            "C:/controls/journal.key",
+            "--exchange-withdrawal-anchor-file",
+            "C:/controls/journal.anchor",
+            "exchange-v3-migration-apply",
+            "--plan-file",
+            "C:/controls/migration-plan.json",
+            "--confirmation-plan-digest",
+            &digest,
+        ])
+        .unwrap();
+        validate_exchange_withdrawal_cli(&migration).unwrap();
+        assert!(matches!(
+            migration.command,
+            Command::ExchangeV3MigrationApply {
+                confirmation_plan_digest,
+                ..
+            } if confirmation_plan_digest == [0x11; 32]
+        ));
+    }
+
+    #[test]
     fn storage_maintenance_commands_are_explicit() {
         assert!(matches!(
             Cli::try_parse_from(["cmfd-node", "storage-inspect"])
@@ -1525,7 +3090,10 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
         assert_eq!(
-            read_wallet_passphrase_file(&path).unwrap().as_slice(),
+            load_runtime_wallet_passphrase(Path::new("unused"), Some(&path), false)
+                .unwrap()
+                .unwrap()
+                .as_slice(),
             b"correct horse battery staple"
         );
         std::fs::write(&path, b"too short\n").unwrap();
@@ -1533,6 +3101,64 @@ mod tests {
         std::fs::write(&path, vec![b'x'; MAXIMUM_PASSPHRASE_BYTES + 3]).unwrap();
         assert!(read_wallet_passphrase_file(&path).is_err());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn v3_runtime_wallet_passphrase_rejects_node_controlled_path() {
+        let root = std::env::temp_dir().join(format!(
+            "cmfd-v3-wallet-passphrase-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let data_dir = root.join("node");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let passphrase = root.join("wallet.passphrase");
+        std::fs::write(&passphrase, b"correct horse battery staple\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&passphrase, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        assert!(
+            load_runtime_wallet_passphrase(&data_dir, Some(&passphrase), true).is_err(),
+            "v3 must reject a wallet passphrase controlled by the node identity"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn persisted_v3_latch_keeps_wallet_passphrase_hardened_without_flags() {
+        let root = std::env::temp_dir().join(format!(
+            "cmfd-persisted-v3-wallet-passphrase-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let data_dir = root.join("node");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(
+            data_dir.join("exchange-withdrawals.v3.initialized"),
+            b"persisted v3 enrollment",
+        )
+        .unwrap();
+        let passphrase = root.join("wallet.passphrase");
+        std::fs::write(&passphrase, b"correct horse battery staple\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&passphrase, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let hardened = persisted_exchange_custody_v3_wallet_security_required(&data_dir);
+        assert!(hardened);
+        assert!(load_runtime_wallet_passphrase(&data_dir, Some(&passphrase), hardened).is_err());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

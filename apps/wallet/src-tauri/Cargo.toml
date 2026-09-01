@@ -33,6 +33,7 @@ production-rc = ["production-v4", "cmfd-node/production-rc"]
 tauri-build = { version = "=2.6.3", features = [] }
 
 [dependencies]
+base64 = "0.22"
 cmfd-consensus = { path = "../../../crates/cmfd-consensus" }
 cmfd-cuda = { path = "../../../crates/cmfd-cuda" }
 cmfd-node = { path = "../../../crates/cmfd-node" }

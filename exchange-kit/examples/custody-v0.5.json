@@ -1,0 +1,467 @@
+{
+  "schema": "common-foundry-exchange-example-transcript-v1",
+  "illustrative_only": true,
+  "warning": "Hashes, approvals, signatures, binary frames, and transaction bytes are deliberately nonfunctional examples. Any destination examples use known compromised test keys; never send value to them. These values demonstrate exact JSON shape and state ordering only.",
+  "exchanges": [
+    {
+      "name": "inspect custody health before mutation",
+      "credential_scope": "withdrawal",
+      "result_schema": "WithdrawalJournalInfoV3",
+      "request": {
+        "jsonrpc": "2.0",
+        "id": "custody-health-1",
+        "method": "getwithdrawaljournalinfo",
+        "params": []
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": "custody-health-1",
+        "result": {
+          "api_version": "chain-preview-v0.5",
+          "anchor": {
+            "key_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "journal_instance_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "generation": "41",
+            "commitment": "9999999999999999999999999999999999999999999999999999999999999999"
+          },
+          "external_anchor": {
+            "key_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "journal_instance_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "generation": "41",
+            "commitment": "9999999999999999999999999999999999999999999999999999999999999999"
+          },
+          "anchor_relationship": "current",
+          "policy_id": "1414141414141414141414141414141414141414141414141414141414141414",
+          "active_keyring": {
+            "instance_id": "2424242424242424242424242424242424242424242424242424242424242424",
+            "generation": "3",
+            "commitment": "2525252525252525252525252525252525252525252525252525252525252525"
+          },
+          "policy_time_watermark_unix_seconds": "1788296400",
+          "policy_release_event_count": "12",
+          "capacity": {
+            "live_record_count": "37",
+            "live_record_limit": "100000",
+            "tombstone_count": "5",
+            "tombstone_limit": "100000",
+            "commitment_count": "153",
+            "commitment_limit": "1000000",
+            "estimated_full_release_capacity_remaining": "199969",
+            "warning": false,
+            "warning_threshold_full_releases": "1024"
+          },
+          "redundancy_degraded": false,
+          "faulted": false
+        }
+      }
+    },
+    {
+      "name": "prepare the fixed unsigned plan",
+      "credential_scope": "withdrawal",
+      "result_schema": "WithdrawalV3",
+      "request": {
+        "jsonrpc": "2.0",
+        "id": "withdrawal-0001-prepare",
+        "method": "preparewithdrawal",
+        "params": [
+          "withdrawal-0001",
+          "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+          "250000000",
+          "1000"
+        ]
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": "withdrawal-0001-prepare",
+        "result": {
+          "api_version": "chain-preview-v0.5",
+          "anchor": {
+            "key_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "journal_instance_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "generation": "44",
+            "commitment": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          },
+          "prepared_anchor": {
+            "key_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "journal_instance_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "generation": "43",
+            "commitment": "abababababababababababababababababababababababababababababababab"
+          },
+          "journal_key_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "journal_instance_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "journal_generation": "44",
+          "journal_commitment": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "request_id": "withdrawal-0001",
+          "request_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "destination_hex": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+          "amount_atoms": "250000000",
+          "fee_atoms": "1000",
+          "change_atoms": "49999000",
+          "reserved_inputs": [
+            {
+              "txid": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+              "vout": 1,
+              "value_atoms": "300000000"
+            }
+          ],
+          "signing_digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "signer_package_digest": "1717171717171717171717171717171717171717171717171717171717171717",
+          "signer_package_bytes_digest": "1818181818181818181818181818181818181818181818181818181818181818",
+          "terminal_action": null,
+          "decision_id": null,
+          "approval_digest": null,
+          "action_anchor": null,
+          "authorized_at_unix_seconds": null,
+          "accounted_at_unix_seconds": null,
+          "txid": null,
+          "transaction_hex": null,
+          "phase": "prepared",
+          "status": "prepared",
+          "confirmations": null,
+          "broadcast_retryable": false,
+          "custody_model": "keyring-routed local/external signing with action-specific threshold approvals; external signer deployment requires operator qualification"
+        }
+      }
+    },
+    {
+      "name": "obtain the exact release approval document",
+      "credential_scope": "withdrawal",
+      "result_schema": "ApprovalPayloadResult",
+      "request": {
+        "jsonrpc": "2.0",
+        "id": "withdrawal-0001-approval",
+        "method": "getwithdrawalapprovalpayload",
+        "params": [
+          "withdrawal-0001",
+          "release",
+          "1212121212121212121212121212121212121212121212121212121212121212",
+          "1788296500",
+          "1788297100"
+        ]
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": "withdrawal-0001-approval",
+        "result": {
+          "api_version": "chain-preview-v0.5",
+          "action": "release",
+          "decision_id": "1212121212121212121212121212121212121212121212121212121212121212",
+          "action_anchor": {
+            "key_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "journal_instance_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "generation": "44",
+            "commitment": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          },
+          "signing_digest": "1313131313131313131313131313131313131313131313131313131313131313",
+          "approval_document": {
+            "schema": "common-foundry-exchange-withdrawal-approval-v1",
+            "action": "release",
+            "decision_id": "1212121212121212121212121212121212121212121212121212121212121212",
+            "policy_id": "1414141414141414141414141414141414141414141414141414141414141414",
+            "action_anchor": {
+              "key_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "journal_instance_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "generation": "44",
+              "commitment": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            },
+            "request_id": "withdrawal-0001",
+            "request_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "transaction_signing_digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "authorized_at_unix_seconds": "1788296500",
+            "expires_at_unix_seconds": "1788297100",
+            "signatures": []
+          },
+          "approval_document_base64": "eyJhY3Rpb24iOiJyZWxlYXNlIiwiYWN0aW9uX2FuY2hvciI6eyJjb21taXRtZW50IjoiY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjYyIsImdlbmVyYXRpb24iOiI0NCIsImpvdXJuYWxfaW5zdGFuY2VfaWQiOiJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiIiwia2V5X2lkIjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSJ9LCJhdXRob3JpemVkX2F0X3VuaXhfc2Vjb25kcyI6IjE3ODgyOTY1MDAiLCJkZWNpc2lvbl9pZCI6IjEyMTIxMjEyMTIxMjEyMTIxMjEyMTIxMjEyMTIxMjEyMTIxMjEyMTIxMjEyMTIxMjEyMTIxMjEyMTIxMjEyMTIiLCJleHBpcmVzX2F0X3VuaXhfc2Vjb25kcyI6IjE3ODgyOTcxMDAiLCJwb2xpY3lfaWQiOiIxNDE0MTQxNDE0MTQxNDE0MTQxNDE0MTQxNDE0MTQxNDE0MTQxNDE0MTQxNDE0MTQxNDE0MTQxNDE0MTQxNDE0IiwicmVxdWVzdF9kaWdlc3QiOiJkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkIiwicmVxdWVzdF9pZCI6IndpdGhkcmF3YWwtMDAwMSIsInNjaGVtYSI6ImNvbW1vbi1mb3VuZHJ5LWV4Y2hhbmdlLXdpdGhkcmF3YWwtYXBwcm92YWwtdjEiLCJzaWduYXR1cmVzIjpbXSwidHJhbnNhY3Rpb25fc2lnbmluZ19kaWdlc3QiOiJmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmIn0="
+        }
+      }
+    },
+    {
+      "name": "durably authorize release",
+      "credential_scope": "withdrawal",
+      "result_schema": "WithdrawalV3",
+      "request": {
+        "jsonrpc": "2.0",
+        "id": "withdrawal-0001-authorize",
+        "method": "releasewithdrawal",
+        "params": [
+          "withdrawal-0001",
+          {
+            "schema": "common-foundry-exchange-withdrawal-approval-v1",
+            "action": "release",
+            "decision_id": "1212121212121212121212121212121212121212121212121212121212121212",
+            "policy_id": "1414141414141414141414141414141414141414141414141414141414141414",
+            "action_anchor": {
+              "key_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "journal_instance_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "generation": "44",
+              "commitment": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            },
+            "request_id": "withdrawal-0001",
+            "request_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "transaction_signing_digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "authorized_at_unix_seconds": "1788296500",
+            "expires_at_unix_seconds": "1788297100",
+            "signatures": [
+              {
+                "public_key": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+                "signature": "15151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515"
+              }
+            ]
+          }
+        ]
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": "withdrawal-0001-authorize",
+        "result": {
+          "api_version": "chain-preview-v0.5",
+          "anchor": {
+            "key_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "journal_instance_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "generation": "45",
+            "commitment": "1616161616161616161616161616161616161616161616161616161616161616"
+          },
+          "prepared_anchor": {
+            "key_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "journal_instance_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "generation": "43",
+            "commitment": "abababababababababababababababababababababababababababababababab"
+          },
+          "journal_key_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "journal_instance_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "journal_generation": "45",
+          "journal_commitment": "1616161616161616161616161616161616161616161616161616161616161616",
+          "request_id": "withdrawal-0001",
+          "request_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "destination_hex": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+          "amount_atoms": "250000000",
+          "fee_atoms": "1000",
+          "change_atoms": "49999000",
+          "reserved_inputs": [
+            {
+              "txid": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+              "vout": 1,
+              "value_atoms": "300000000"
+            }
+          ],
+          "signing_digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "signer_package_digest": "1717171717171717171717171717171717171717171717171717171717171717",
+          "signer_package_bytes_digest": "1818181818181818181818181818181818181818181818181818181818181818",
+          "terminal_action": "release",
+          "decision_id": "1212121212121212121212121212121212121212121212121212121212121212",
+          "approval_digest": "1313131313131313131313131313131313131313131313131313131313131313",
+          "action_anchor": {
+            "key_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "journal_instance_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "generation": "44",
+            "commitment": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          },
+          "authorized_at_unix_seconds": "1788296500",
+          "accounted_at_unix_seconds": "1788296502",
+          "txid": null,
+          "transaction_hex": null,
+          "phase": "release_authorized",
+          "status": "release_authorized",
+          "confirmations": null,
+          "broadcast_retryable": false,
+          "custody_model": "keyring-routed local/external signing with action-specific threshold approvals; external signer deployment requires operator qualification"
+        }
+      }
+    },
+    {
+      "name": "fetch the post-authorization signer package",
+      "credential_scope": "withdrawal",
+      "result_schema": "SigningPackageResult",
+      "request": {
+        "jsonrpc": "2.0",
+        "id": "withdrawal-0001-signing-package",
+        "method": "getwithdrawalsigningpackage",
+        "params": [
+          "withdrawal-0001",
+          {
+            "schema": "common-foundry-exchange-withdrawal-approval-v1",
+            "action": "release",
+            "decision_id": "1212121212121212121212121212121212121212121212121212121212121212",
+            "policy_id": "1414141414141414141414141414141414141414141414141414141414141414",
+            "action_anchor": {
+              "key_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "journal_instance_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "generation": "44",
+              "commitment": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            },
+            "request_id": "withdrawal-0001",
+            "request_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "transaction_signing_digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "authorized_at_unix_seconds": "1788296500",
+            "expires_at_unix_seconds": "1788297100",
+            "signatures": [
+              {
+                "public_key": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+                "signature": "15151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515"
+              }
+            ]
+          }
+        ]
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": "withdrawal-0001-signing-package",
+        "result": {
+          "api_version": "chain-preview-v0.5",
+          "request_id": "withdrawal-0001",
+          "request_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "current_anchor": {
+            "key_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "journal_instance_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "generation": "45",
+            "commitment": "1616161616161616161616161616161616161616161616161616161616161616"
+          },
+          "prepared_anchor": {
+            "key_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "journal_instance_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "generation": "43",
+            "commitment": "abababababababababababababababababababababababababababababababab"
+          },
+          "approval_action_anchor": {
+            "key_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "journal_instance_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "generation": "44",
+            "commitment": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          },
+          "signing_digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "signer_package_digest": "1717171717171717171717171717171717171717171717171717171717171717",
+          "signer_package_bytes_digest": "1818181818181818181818181818181818181818181818181818181818181818",
+          "signer_package_base64": "Q01GRFNJRzEBAAIAmAQAAA==",
+          "release_authorization": {
+            "release_authorized_anchor": {
+              "key_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "journal_instance_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "generation": "45",
+              "commitment": "1616161616161616161616161616161616161616161616161616161616161616"
+            },
+            "decision_id": "1212121212121212121212121212121212121212121212121212121212121212",
+            "approval_digest": "1313131313131313131313131313131313131313131313131313131313131313",
+            "release_authorization_digest": "1919191919191919191919191919191919191919191919191919191919191919",
+            "signed_approval": {
+              "schema": "common-foundry-exchange-withdrawal-approval-v1",
+              "action": "release",
+              "decision_id": "1212121212121212121212121212121212121212121212121212121212121212",
+              "policy_id": "1414141414141414141414141414141414141414141414141414141414141414",
+              "action_anchor": {
+                "key_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "journal_instance_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "generation": "44",
+                "commitment": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+              },
+              "request_id": "withdrawal-0001",
+              "request_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "transaction_signing_digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+              "authorized_at_unix_seconds": "1788296500",
+              "expires_at_unix_seconds": "1788297100",
+              "signatures": [
+                {
+                  "public_key": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+                  "signature": "15151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515"
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "complete external signing and durably release exact bytes",
+      "credential_scope": "withdrawal",
+      "result_schema": "WithdrawalV3",
+      "request": {
+        "jsonrpc": "2.0",
+        "id": "withdrawal-0001-release",
+        "method": "releasewithdrawal",
+        "params": [
+          "withdrawal-0001",
+          {
+            "schema": "common-foundry-exchange-withdrawal-approval-v1",
+            "action": "release",
+            "decision_id": "1212121212121212121212121212121212121212121212121212121212121212",
+            "policy_id": "1414141414141414141414141414141414141414141414141414141414141414",
+            "action_anchor": {
+              "key_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "journal_instance_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "generation": "44",
+              "commitment": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            },
+            "request_id": "withdrawal-0001",
+            "request_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "transaction_signing_digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "authorized_at_unix_seconds": "1788296500",
+            "expires_at_unix_seconds": "1788297100",
+            "signatures": [
+              {
+                "public_key": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+                "signature": "15151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515"
+              }
+            ]
+          },
+          ["Q01GRFNJRzEBAAMAAAAAAA=="]
+        ]
+      },
+      "response": {
+        "jsonrpc": "2.0",
+        "id": "withdrawal-0001-release",
+        "result": {
+          "api_version": "chain-preview-v0.5",
+          "anchor": {
+            "key_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "journal_instance_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "generation": "46",
+            "commitment": "2020202020202020202020202020202020202020202020202020202020202020"
+          },
+          "prepared_anchor": {
+            "key_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "journal_instance_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "generation": "43",
+            "commitment": "abababababababababababababababababababababababababababababababab"
+          },
+          "journal_key_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "journal_instance_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "journal_generation": "46",
+          "journal_commitment": "2020202020202020202020202020202020202020202020202020202020202020",
+          "request_id": "withdrawal-0001",
+          "request_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "destination_hex": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+          "amount_atoms": "250000000",
+          "fee_atoms": "1000",
+          "change_atoms": "49999000",
+          "reserved_inputs": [
+            {
+              "txid": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+              "vout": 1,
+              "value_atoms": "300000000"
+            }
+          ],
+          "signing_digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "signer_package_digest": "1717171717171717171717171717171717171717171717171717171717171717",
+          "signer_package_bytes_digest": "1818181818181818181818181818181818181818181818181818181818181818",
+          "terminal_action": "release",
+          "decision_id": "1212121212121212121212121212121212121212121212121212121212121212",
+          "approval_digest": "1313131313131313131313131313131313131313131313131313131313131313",
+          "action_anchor": {
+            "key_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "journal_instance_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "generation": "44",
+            "commitment": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          },
+          "authorized_at_unix_seconds": "1788296500",
+          "accounted_at_unix_seconds": "1788296502",
+          "txid": "2121212121212121212121212121212121212121212121212121212121212121",
+          "transaction_hex": "01020304",
+          "phase": "released",
+          "status": "in_mempool",
+          "confirmations": null,
+          "broadcast_retryable": false,
+          "custody_model": "keyring-routed local/external signing with action-specific threshold approvals; external signer deployment requires operator qualification"
+        }
+      }
+    }
+  ]
+}

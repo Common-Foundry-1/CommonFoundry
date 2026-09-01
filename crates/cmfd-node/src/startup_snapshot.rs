@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -11,7 +11,7 @@ use super::{
     BlockIndex, BlockRecordLocator, BlockRecordVersion, ChainState, ConsensusPowVerifier,
     EMPTY_RECORD_CHAIN_ROOT, IndexedBlock, MAX_CHAIN_STATE_SNAPSHOT_BYTES, NetworkParams, Node,
     NodeError, ReplayLogState, SuccessorHeaderPreflight, add_chain_work, io_error,
-    read_located_record, sync_parent_directory, verify_retained_block_log_path,
+    read_located_record, scan_replay_log, sync_parent_directory, verify_retained_block_log_path,
 };
 
 pub(super) const STARTUP_SNAPSHOT_FILE_PREFIX: &str = "startup-state";
@@ -303,6 +303,25 @@ fn load_slot(
     {
         return Err(NodeError::CorruptLog(
             "startup snapshot index has trailing or missing data".to_owned(),
+        ));
+    }
+    // A local snapshot is a replay accelerator, not an authority over the
+    // append-only block log. Scan the complete retained record chain before
+    // accepting cached state; validating only the terminal record would let a
+    // rewritten middle record bypass its successor's previous-digest link.
+    let mut scan_file = log
+        .try_clone()
+        .map_err(|source| io_error("clone block log for startup validation", log_path, source))?;
+    scan_file
+        .seek(SeekFrom::Start(0))
+        .map_err(|source| io_error("seek block log for startup validation", log_path, source))?;
+    let scanned = scan_replay_log(scan_file, log_path, params, params.network_id)?;
+    if scanned.log_length != snapshot_log_length
+        || scanned.last_record_digest != last_record_digest
+        || scanned.records.len() != record_count
+    {
+        return Err(NodeError::CorruptLog(
+            "startup snapshot block-log chain binding mismatch".to_owned(),
         ));
     }
     match last_locator {

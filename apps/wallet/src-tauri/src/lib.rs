@@ -3,11 +3,58 @@ mod cuda;
 mod mining;
 mod runtime;
 
+use std::io::Write as _;
+
+use base64::Engine as _;
 use tauri::webview::{NewWindowResponse, WebviewWindowBuilder};
 use tauri::{Manager, RunEvent};
 
-use cmfd_node::COMPILED_NETWORK_PROFILE;
+use cmfd_node::{
+    COMPILED_NETWORK_PROFILE, ProofProfile, canonical_network_info_json_with_v4_artifacts,
+    production_v4_package_artifacts,
+};
 use runtime::RuntimeState;
+
+const WALLET_RUNTIME_IDENTITY_SCHEMA: &str = "CMFD_WALLET_RUNTIME_IDENTITY_V1";
+const WALLET_RUNTIME_ROLE: &str = "common-foundry-wallet";
+
+#[derive(serde::Serialize)]
+struct WalletRuntimeIdentity<'a> {
+    // This field order is lexicographic. The compact encoding and trailing LF
+    // are part of the release-integrity interface.
+    network_info_base64: String,
+    package_version: &'a str,
+    role: &'static str,
+    schema: &'static str,
+}
+
+fn canonical_runtime_identity_json() -> Result<Vec<u8>, String> {
+    if COMPILED_NETWORK_PROFILE.proof != ProofProfile::ProductionV4 {
+        return Err("runtime identity is available only in a ProductionV4 wallet build".to_owned());
+    }
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("cannot resolve the packaged wallet executable: {error}"))?;
+    let artifacts = production_v4_package_artifacts(&executable)
+        .map_err(|error| format!("cannot resolve packaged ProductionV4 artifacts: {error}"))?;
+    let network_info = canonical_network_info_json_with_v4_artifacts(&artifacts)
+        .map_err(|error| format!("cannot authenticate packaged ProductionV4 artifacts: {error}"))?;
+    canonical_runtime_identity_json_for_network_info(&network_info)
+}
+
+fn canonical_runtime_identity_json_for_network_info(
+    network_info: &[u8],
+) -> Result<Vec<u8>, String> {
+    let identity = WalletRuntimeIdentity {
+        network_info_base64: base64::engine::general_purpose::STANDARD.encode(network_info),
+        package_version: env!("CARGO_PKG_VERSION"),
+        role: WALLET_RUNTIME_ROLE,
+        schema: WALLET_RUNTIME_IDENTITY_SCHEMA,
+    };
+    let mut encoded = serde_json::to_vec(&identity)
+        .map_err(|error| format!("cannot encode the wallet runtime identity: {error}"))?;
+    encoded.push(b'\n');
+    Ok(encoded)
+}
 
 pub fn run() -> i32 {
     let command = match runtime::parse_command() {
@@ -26,6 +73,20 @@ pub fn run() -> i32 {
         }
         runtime::ProcessCommand::Version => {
             println!(env!("CARGO_PKG_VERSION"));
+            return 0;
+        }
+        runtime::ProcessCommand::RuntimeIdentity => {
+            let identity = match canonical_runtime_identity_json() {
+                Ok(identity) => identity,
+                Err(error) => {
+                    eprintln!("Common Foundry Wallet: {error}");
+                    return 1;
+                }
+            };
+            if let Err(error) = std::io::stdout().lock().write_all(&identity) {
+                eprintln!("Common Foundry Wallet: cannot write runtime identity: {error}");
+                return 1;
+            }
             return 0;
         }
         runtime::ProcessCommand::Run(config) => *config,
@@ -108,6 +169,28 @@ fn allow_navigation(url: &tauri::Url) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_identity_encoding_is_canonical_and_binds_network_bytes() {
+        let network_info = b"{\"format\":\"commonfoundry-network-info\"}\n";
+        let encoded = canonical_runtime_identity_json_for_network_info(network_info).unwrap();
+        assert!(encoded.ends_with(b"\n"));
+        assert!(!encoded.contains(&b'\r'));
+
+        let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(value["schema"], WALLET_RUNTIME_IDENTITY_SCHEMA);
+        assert_eq!(value["role"], WALLET_RUNTIME_ROLE);
+        assert_eq!(value["package_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(value["network_info_base64"].as_str().unwrap())
+                .unwrap(),
+            network_info
+        );
+        let mut canonical = serde_json::to_vec(&value).unwrap();
+        canonical.push(b'\n');
+        assert_eq!(encoded, canonical);
+    }
 
     #[test]
     fn network_packaging_overrides_have_distinct_application_identities() {

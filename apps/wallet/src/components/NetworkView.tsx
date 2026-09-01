@@ -127,7 +127,7 @@ export function NetworkView({ status, wallet, mempool, refreshing, onRefresh, on
         </div>
 
         {status?.public_peer_mode ? (
-          <div className="warning-inline" role="status">
+          <div className="info-inline" role="status">
             <ShieldAlert aria-hidden="true" size={17} />
             <span>Public {status.network_short_name} P2P is enabled. Node RPC remains local to this computer.</span>
           </div>
@@ -271,10 +271,6 @@ export function NetworkView({ status, wallet, mempool, refreshing, onRefresh, on
               <span>Reward destination</span>
               <code title={wallet?.destination}>{wallet ? shortenHash(wallet.destination, 9, 9) : "Waiting for wallet"}</code>
             </div>
-            <div className="warning-inline">
-              <ShieldAlert aria-hidden="true" size={17} />
-              <span>This reward destination belongs to your local {status.network_short_name} wallet.</span>
-            </div>
             {error ? <p className="form-error" role="alert">{error}</p> : null}
             <button className="button-primary wide" type="button" disabled={!wallet || mining} onClick={() => void mine()}>
               {mining ? <RefreshCw className="spin" aria-hidden="true" size={18} /> : <Blocks aria-hidden="true" size={18} />}
@@ -287,7 +283,7 @@ export function NetworkView({ status, wallet, mempool, refreshing, onRefresh, on
             <span className="card-eyebrow">{status?.proof_profile ?? "Production"} mining</span>
             <h2>Production proof path selected</h2>
             <p>The bounded DevnetV2 forge action is disabled. This build will not substitute the Devnet proof for ProductionV3 work.</p>
-            <div className="warning-inline">
+            <div className="info-inline">
               <ShieldAlert aria-hidden="true" size={17} />
               <span>Use a ProductionV3-capable external miner when the production work protocol is enabled.</span>
             </div>

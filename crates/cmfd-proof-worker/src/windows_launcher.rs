@@ -2666,7 +2666,7 @@ mod tests {
         retry_pending_appcontainer_profile_cleanup, windows_file_identity,
     };
     use crate::verifier::ProductionV3VerifierRecord;
-    use cmfd_consensus::dory_v3_model_ceremony_transcript::FileIdentity;
+    use cmfd_consensus::FileIdentity;
 
     const CHILD_TEST: &str = "windows_launcher::tests::windows_appcontainer_probe_child";
     const INVALID_HANDLE_CHILD_TEST: &str =

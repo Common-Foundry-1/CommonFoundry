@@ -1050,6 +1050,7 @@ name = "cmfd-node"
 version = "0.1.0-devnet.16"
 dependencies = [
  "argon2",
+ "base64 0.22.1",
  "blake3",
  "chacha20poly1305",
  "clap",
@@ -1137,6 +1138,7 @@ dependencies = [
 name = "common-foundry-wallet"
 version = "0.1.0-devnet.16"
 dependencies = [
+ "base64 0.22.1",
  "cmfd-consensus",
  "cmfd-cuda",
  "cmfd-node",

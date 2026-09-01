@@ -79,6 +79,7 @@ describe("WalletSecurityDialog", () => {
     };
     apiMocks.migrateWalletEncryption.mockResolvedValue(locked);
     const { onStatusChange } = renderDialog(plaintext);
+    await waitFor(() => expect(screen.getByRole("dialog", { name: "Encrypt existing wallet" })).toHaveFocus());
 
     fireEvent.change(screen.getByLabelText("New backup file"), {
       target: { value: "D:\\Offline\\wallet.cmfd-backup" },

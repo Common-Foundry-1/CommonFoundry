@@ -22,7 +22,7 @@ pub const FORGEMATRIX_V1_PROOF_TAG: u8 = 1;
 pub const FORGEMATRIX_V2_PROOF_TAG: u8 = 2;
 /// Reserved, fail-closed production-candidate proof tag.
 pub const FORGEMATRIX_V3_CANDIDATE_PROOF_TAG: u8 = 3;
-/// Reserved exclusively for the isolated ProductionV4 latency testnet.
+/// Reserved exclusively for ProductionV4 networks.
 pub const FORGEMATRIX_V4_CANDIDATE_PROOF_TAG: u8 = 4;
 
 pub const MAX_TRANSACTION_BYTES: usize = 64 * 1024;
@@ -37,6 +37,12 @@ pub const PRODUCTION_V4_MAX_BLOCK_BYTES: usize = 16 * 1024 * 1024;
 pub const PRODUCTION_V4_TESTNET_NETWORK_ID: [u8; 32] = [
     0xb9, 0xe5, 0x5d, 0x5a, 0x5e, 0x80, 0xc8, 0xe3, 0xd7, 0x3b, 0xf8, 0x1b, 0x19, 0x9b, 0xc6, 0x43,
     0xac, 0x93, 0x67, 0x43, 0x69, 0x62, 0xc2, 0x8b, 0x6a, 0xac, 0xdc, 0x37, 0xf3, 0x80, 0x99, 0x62,
+];
+
+/// RCNet-1 identity derived by `CMFD_RCNET_LAUNCH_CANDIDATE_V2`.
+pub const PRODUCTION_V4_RCNET1_NETWORK_ID: [u8; 32] = [
+    0x3e, 0x99, 0xd4, 0x59, 0x59, 0xc1, 0x9c, 0x00, 0x53, 0xd8, 0xe9, 0xfe, 0xf3, 0x48, 0x75, 0xb5,
+    0x7b, 0x46, 0xa8, 0xa1, 0xce, 0x33, 0x06, 0x37, 0xda, 0xdd, 0xab, 0x51, 0x5b, 0xc7, 0xb9, 0x2d,
 ];
 
 pub(crate) const FORGEMATRIX_V3_PUBLIC_PREFIX_BYTES: usize = 1 + 32 + 4 + 4 + 8 + 4 * 32;
@@ -104,7 +110,7 @@ pub enum WireError {
 }
 
 pub fn max_proof_bytes_for_network(network_id: [u8; 32]) -> usize {
-    if network_id == PRODUCTION_V4_TESTNET_NETWORK_ID {
+    if is_production_v4_network(network_id) {
         PRODUCTION_V4_MAX_PROOF_BYTES
     } else {
         MAX_PROOF_BYTES
@@ -112,7 +118,7 @@ pub fn max_proof_bytes_for_network(network_id: [u8; 32]) -> usize {
 }
 
 pub fn max_block_bytes_for_network(network_id: [u8; 32]) -> usize {
-    if network_id == PRODUCTION_V4_TESTNET_NETWORK_ID {
+    if is_production_v4_network(network_id) {
         PRODUCTION_V4_MAX_BLOCK_BYTES
     } else {
         MAX_BLOCK_BYTES
@@ -121,11 +127,18 @@ pub fn max_block_bytes_for_network(network_id: [u8; 32]) -> usize {
 
 fn ensure_proof_tag_for_network(tag: u8, network_id: [u8; 32]) -> Result<(), WireError> {
     let is_v4_tag = tag == FORGEMATRIX_V4_CANDIDATE_PROOF_TAG;
-    let is_v4_network = network_id == PRODUCTION_V4_TESTNET_NETWORK_ID;
+    let is_v4_network = is_production_v4_network(network_id);
     if is_v4_tag != is_v4_network {
         return Err(WireError::ProofTagNetworkMismatch { tag });
     }
     Ok(())
+}
+
+fn is_production_v4_network(network_id: [u8; 32]) -> bool {
+    matches!(
+        network_id,
+        PRODUCTION_V4_TESTNET_NETWORK_ID | PRODUCTION_V4_RCNET1_NETWORK_ID
+    )
 }
 
 /// Derives the four-byte frame discriminator from all 32 bytes of a network ID.
@@ -1663,6 +1676,14 @@ mod tests {
             PRODUCTION_V4_MAX_BLOCK_BYTES
         );
         assert_eq!(
+            max_proof_bytes_for_network(PRODUCTION_V4_RCNET1_NETWORK_ID),
+            PRODUCTION_V4_MAX_PROOF_BYTES
+        );
+        assert_eq!(
+            max_block_bytes_for_network(PRODUCTION_V4_RCNET1_NETWORK_ID),
+            PRODUCTION_V4_MAX_BLOCK_BYTES
+        );
+        assert_eq!(
             WIRE_HEADER_BYTES
                 + FORGEMATRIX_V4_PUBLIC_PREFIX_BYTES
                 + FORGEMATRIX_V4_LENGTH_BYTES
@@ -1678,6 +1699,12 @@ mod tests {
         );
         assert_eq!(
             decode_forgematrix_proof(&encoded, PRODUCTION_V4_TESTNET_NETWORK_ID).unwrap(),
+            proof
+        );
+        let rcnet_encoded =
+            encode_forgematrix_proof(&proof, PRODUCTION_V4_RCNET1_NETWORK_ID).unwrap();
+        assert_eq!(
+            decode_forgematrix_proof(&rcnet_encoded, PRODUCTION_V4_RCNET1_NETWORK_ID).unwrap(),
             proof
         );
 

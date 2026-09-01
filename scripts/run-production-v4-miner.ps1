@@ -527,15 +527,72 @@ function Remove-AttemptDirectory {
     Remove-Item -LiteralPath $resolvedAttempt -Recurse -Force
 }
 
+function ConvertFrom-UniqueJson {
+    param(
+        [string]$Json,
+        [string]$Label
+    )
+    $reader = $null
+    try {
+        Add-Type -AssemblyName System.Runtime.Serialization
+        $bytes = [Text.Encoding]::UTF8.GetBytes($Json)
+        $reader = [System.Runtime.Serialization.Json.JsonReaderWriterFactory]::CreateJsonReader(
+            $bytes,
+            [System.Xml.XmlDictionaryReaderQuotas]::Max
+        )
+        $document = [Xml.XmlDocument]::new()
+        $document.Load($reader)
+    } catch {
+        throw "$Label is not strict JSON"
+    } finally {
+        if ($null -ne $reader) {
+            $reader.Dispose()
+        }
+    }
+    $objectNodes = $document.DocumentElement.SelectNodes(
+        'descendant-or-self::*[@type="object"]'
+    )
+    foreach ($objectNode in $objectNodes) {
+        $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($child in $objectNode.ChildNodes) {
+            if ($child.NodeType -ne [Xml.XmlNodeType]::Element) {
+                continue
+            }
+            $fieldName = if ($child.HasAttribute('item')) {
+                $child.GetAttribute('item')
+            } else {
+                $child.LocalName
+            }
+            if (-not $seen.Add($fieldName)) {
+                throw "$Label repeats JSON field $fieldName"
+            }
+        }
+    }
+    try {
+        return $Json | ConvertFrom-Json
+    } catch {
+        throw "$Label is not valid JSON"
+    }
+}
+
 function Assert-InputManifest {
     param(
         [string]$ManifestPath,
         [hashtable]$ExpectedInputs,
         [switch]$Prepared
     )
-    $manifest = Get-Content -Raw -LiteralPath $ManifestPath | ConvertFrom-Json
+    $manifestJson = Get-Content -Raw -LiteralPath $ManifestPath
+    $manifest = ConvertFrom-UniqueJson $manifestJson 'ProductionV4 input manifest'
     if ($manifest.schema_version -ne 1) {
         throw "unsupported ProductionV4 input manifest version: $($manifest.schema_version)"
+    }
+    $networkIdProperty = $manifest.PSObject.Properties['network_id']
+    if ($null -eq $networkIdProperty -or $networkIdProperty.Value -isnot [string]) {
+        throw 'input manifest network_id must be a string'
+    }
+    $networkId = [string]$networkIdProperty.Value
+    if ($networkId -cnotmatch '\A[0-9a-f]{64}\z') {
+        throw 'input manifest network_id must contain exactly 64 lowercase hexadecimal characters'
     }
     $entries = @($manifest.files)
     if ($entries.Count -ne $ExpectedInputs.Count) {
@@ -570,6 +627,124 @@ function Assert-InputManifest {
     if ($totalBytes -ne [uint64]$manifest.total_bytes) {
         throw "input manifest total is $($manifest.total_bytes); authenticated $totalBytes bytes"
     }
+    return [pscustomobject]@{
+        Manifest = $manifest
+        NetworkId = $networkId
+    }
+}
+
+function Assert-MinerNetworkIdentityJson {
+    param(
+        [string]$Json,
+        [string]$ExpectedNetworkId
+    )
+    if ([string]::IsNullOrEmpty($Json) -or $Json.Contains("`r") -or $Json.Contains("`n")) {
+        throw 'cmfd-miner network-info must contain exactly one canonical JSON line'
+    }
+    try {
+        $identity = $Json | ConvertFrom-Json
+    } catch {
+        throw 'cmfd-miner network-info is not valid JSON'
+    }
+    $expectedFields = @(
+        'format',
+        'format_version',
+        'network_id',
+        'network_name',
+        'network_profile',
+        'proof_selection',
+        'build_source_commit'
+    )
+    $actualFields = @($identity.PSObject.Properties | ForEach-Object { $_.Name })
+    if ($actualFields.Count -ne $expectedFields.Count) {
+        throw 'cmfd-miner network-info fields do not match the canonical schema'
+    }
+    for ($index = 0; $index -lt $expectedFields.Count; $index++) {
+        if ($actualFields[$index] -cne $expectedFields[$index]) {
+            throw 'cmfd-miner network-info fields do not match the canonical schema'
+        }
+    }
+    $formatVersionIsInteger = $identity.format_version -is [int] -or $identity.format_version -is [long]
+    if (
+        $identity.format -cne 'commonfoundry-miner-network-info' -or
+        -not $formatVersionIsInteger -or
+        $identity.format_version -ne 1
+    ) {
+        throw 'cmfd-miner network-info format is unsupported'
+    }
+    if ($identity.network_id -isnot [string] -or $identity.network_id -cnotmatch '\A[0-9a-f]{64}\z') {
+        throw 'cmfd-miner network-info network_id is not canonical lowercase hexadecimal'
+    }
+    if ($identity.network_id -cne $ExpectedNetworkId) {
+        throw "cmfd-miner network $($identity.network_id) does not match input manifest network $ExpectedNetworkId"
+    }
+    foreach ($field in @('network_name', 'network_profile')) {
+        $value = $identity.$field
+        if ($value -isnot [string] -or $value -cnotmatch '\A[\x20-\x7e]{1,128}\z') {
+            throw "cmfd-miner network-info $field is not a canonical printable name"
+        }
+    }
+    if ($identity.proof_selection -cne 'ProductionV4') {
+        throw "cmfd-miner proof selection is $($identity.proof_selection); ProductionV4 is required"
+    }
+    $sourceCommit = $identity.build_source_commit
+    if ($null -ne $sourceCommit -and (
+        $sourceCommit -isnot [string] -or
+        $sourceCommit -cnotmatch '\A(?:[0-9a-f]{40}|[0-9a-f]{64})\z' -or
+        $sourceCommit -cmatch '\A0+\z'
+    )) {
+        throw 'cmfd-miner build_source_commit is not canonical nonzero lowercase hexadecimal'
+    }
+    $canonical = [ordered]@{
+        format = [string]$identity.format
+        format_version = $identity.format_version
+        network_id = [string]$identity.network_id
+        network_name = [string]$identity.network_name
+        network_profile = [string]$identity.network_profile
+        proof_selection = [string]$identity.proof_selection
+        build_source_commit = $sourceCommit
+    } | ConvertTo-Json -Compress
+    if ($Json -cne $canonical) {
+        throw 'cmfd-miner network-info is not canonical JSON'
+    }
+    return [string]$identity.network_id
+}
+
+function Assert-MinerNetworkIdentity {
+    param(
+        [string]$MinerPath,
+        [string]$ExpectedNetworkId
+    )
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $MinerPath
+    $startInfo.Arguments = 'network-info'
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) {
+            throw 'failed to start cmfd-miner network-info'
+        }
+        $stdout = $process.StandardOutput.ReadToEnd()
+        $stderr = $process.StandardError.ReadToEnd()
+        $process.WaitForExit()
+        if ($process.ExitCode -ne 0) {
+            throw "cmfd-miner network-info exited with code $($process.ExitCode): $($stderr.Trim())"
+        }
+        if (-not [string]::IsNullOrEmpty($stderr)) {
+            throw 'cmfd-miner network-info wrote unexpected diagnostic output'
+        }
+    } finally {
+        $process.Dispose()
+    }
+    if (-not $stdout.EndsWith("`n", [StringComparison]::Ordinal)) {
+        throw 'cmfd-miner network-info is missing its canonical trailing LF'
+    }
+    $json = $stdout.Substring(0, $stdout.Length - 1)
+    return Assert-MinerNetworkIdentityJson $json $ExpectedNetworkId
 }
 
 $modelBankPath = Resolve-ExistingFile $ModelBank 'model bank'
@@ -628,7 +803,9 @@ $expectedInputs = @{
         $artifactDirectoryPath
     ) "FORGEMATRIX-V4-FIXED-BANK-$_.tree"
 }
-Assert-InputManifest $inputManifestPath $expectedInputs -Prepared:$InputsPrepared
+$manifestValidation = Assert-InputManifest $inputManifestPath $expectedInputs -Prepared:$InputsPrepared
+$networkId = [string]$manifestValidation.NetworkId
+$networkId = Assert-MinerNetworkIdentity $cmfdMinerPath $networkId
 
 $modelBankWsl, $artifactDirectoryWsl, $replayBinaryWsl, $dynamicCommitmentBinaryWsl, $proofBinaryWsl, $wslCacheHelperWsl = @(
     Convert-ToWslPaths @(
@@ -646,7 +823,7 @@ if ($ValidateOnly) {
     return
 }
 
-$manifest = Get-Content -Raw -LiteralPath $inputManifestPath | ConvertFrom-Json
+$manifest = $manifestValidation.Manifest
 $manifestByName = @{}
 foreach ($entry in @($manifest.files)) {
     $manifestByName[[string]$entry.name] = $entry
@@ -748,7 +925,7 @@ Write-MinerStats $accepted $rejected ([double]::NaN) ([double]::NaN) $sessionEne
 try {
 $proofWorker = Start-PersistentWslWorker `
     $persistentProofWsl `
-    @('--server', $cachedModelBankWsl, $cachedArtifactDirectoryWsl) `
+    @('--server', $networkId, $cachedModelBankWsl, $cachedArtifactDirectoryWsl) `
     'CMFD_V4_PROOF_READY' `
     $sessionLog `
     'ProductionV4 proof worker'

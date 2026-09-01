@@ -4,6 +4,12 @@ This document defines the custody, rotation, and revocation controls required
 for RCNet and mainnet. It does not assign owners or select launch keys. Those
 values are approved separately and recorded in the production key register.
 
+For the current RCNet-1 version-2 launch candidate, the steward and community
+public destinations are already selected and bound into the network identity.
+That pin is not custody evidence: the owner, threshold, encrypted/offline key
+handling, independent verification, backup, recovery, and permitted-use rows
+in the register must still be completed before the candidate is operated.
+
 ## Key register
 
 Before RCNet-1, the release owner maintains an offline register with one row
@@ -42,8 +48,8 @@ recorded threshold and preserved in the release evidence archive.
 
 ### Steward and community destinations
 
-- Consensus-fixed receive destinations selected before the network identity is
-  frozen.
+- Consensus-fixed receive destinations selected as inputs to the network
+  identity.
 - Each destination must have documented beneficial ownership, custody,
   threshold, recovery, reporting, and permitted-use policy.
 - The selected public destinations and their custody evidence are reviewed as

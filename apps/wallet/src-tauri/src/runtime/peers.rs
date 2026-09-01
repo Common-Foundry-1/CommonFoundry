@@ -4,8 +4,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use cmfd_node::p2p::{StaticPeerPollHandle, spawn_static_peer_polling};
-use cmfd_node::peer::{PeerAddressPolicy, PeerLimits, StaticPeerConfig};
+use cmfd_node::p2p::{
+    PeerDiscovery, StaticPeerPollHandle, spawn_peer_polling_with_discovery,
+    spawn_static_peer_polling,
+};
+use cmfd_node::peer::{
+    PeerAddressPolicy, PeerLimits, StaticPeerConfig, is_publicly_routable_peer_ip,
+};
 use cmfd_node::{Node, NodeClientError};
 use serde::{Deserialize, Serialize};
 
@@ -46,6 +51,7 @@ pub struct PeerManager {
     settings_path: PathBuf,
     limits: PeerLimits,
     poll_interval: Duration,
+    discovery: Arc<PeerDiscovery>,
     control: Mutex<PeerControl>,
 }
 
@@ -57,6 +63,7 @@ impl PeerManager {
         p2p_address: SocketAddr,
         limits: PeerLimits,
         poll_interval: Duration,
+        discovery: Arc<PeerDiscovery>,
     ) -> Result<Self, NodeClientError> {
         let settings_path = data_dir.join("peers.json");
         let (peers, allow_public_peers) = if config.peers_explicit {
@@ -80,6 +87,7 @@ impl PeerManager {
             allow_public_peers,
             limits,
             poll_interval,
+            Arc::clone(&discovery),
         )?;
         node.lock()
             .map_err(|_| {
@@ -96,6 +104,7 @@ impl PeerManager {
             settings_path,
             limits,
             poll_interval,
+            discovery,
             control: Mutex::new(PeerControl {
                 peers,
                 poller,
@@ -142,6 +151,7 @@ impl PeerManager {
             allow_public_peers,
             self.limits,
             self.poll_interval,
+            Arc::clone(&self.discovery),
         )?;
         if let Err(error) = persist_peers(&self.settings_path, &peers) {
             if let Some(poller) = new_poller {
@@ -297,20 +307,22 @@ fn start_poller(
     allow_public_peers: bool,
     limits: PeerLimits,
     poll_interval: Duration,
+    discovery: Arc<PeerDiscovery>,
 ) -> Result<Option<StaticPeerPollHandle>, NodeClientError> {
     if peers.is_empty() {
         return Ok(None);
     }
-    spawn_static_peer_polling(
-        node,
-        StaticPeerConfig {
-            listen_address: p2p_address,
-            peers,
-            limits,
-            address_policy: address_policy(allow_public_peers),
-        },
-        poll_interval,
-    )
+    let config = StaticPeerConfig {
+        listen_address: p2p_address,
+        peers,
+        limits,
+        address_policy: address_policy(allow_public_peers),
+    };
+    if allow_public_peers {
+        spawn_peer_polling_with_discovery(node, config, poll_interval, discovery)
+    } else {
+        spawn_static_peer_polling(node, config, poll_interval)
+    }
     .map(Some)
     .map_err(|_| {
         peer_runtime_error(
@@ -338,10 +350,7 @@ fn address_policy(allow_public_peers: bool) -> PeerAddressPolicy {
 }
 
 fn is_public(address: SocketAddr) -> bool {
-    match address.ip() {
-        IpAddr::V4(ip) => !(ip.is_loopback() || ip.is_private()),
-        IpAddr::V6(ip) => !(ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local()),
-    }
+    is_publicly_routable_peer_ip(address.ip())
 }
 
 fn peer_error(code: &'static str, message: impl Into<String>) -> NodeClientError {
@@ -424,7 +433,13 @@ mod tests {
     fn public_mode_is_derived_from_the_saved_addresses() {
         assert!(!is_public("127.0.0.1:18444".parse().unwrap()));
         assert!(!is_public("192.168.1.10:18444".parse().unwrap()));
+        assert!(!is_public("100.64.0.1:18444".parse().unwrap()));
+        assert!(!is_public("[64:ff9b:1::1]:18444".parse().unwrap()));
+        assert!(!is_public("[2001:2::1]:18444".parse().unwrap()));
+        assert!(!is_public("[2002:c000:0204::1]:18444".parse().unwrap()));
+        assert!(!is_public("[5f00::1]:18444".parse().unwrap()));
         assert!(is_public("107.214.187.2:18444".parse().unwrap()));
+        assert!(is_public("[2606:4700:4700::1111]:18444".parse().unwrap()));
     }
 
     #[test]

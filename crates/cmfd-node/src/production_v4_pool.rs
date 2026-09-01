@@ -21,16 +21,16 @@ use cmfd_consensus::{
     FORGEMATRIX_V4_FINAL_ACTIVATION_DIGEST_DOMAIN, FORGEMATRIX_V4_PROOF_VERSION,
     FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES, ForgeMatrixV4CandidateProof,
     PRODUCTION_V2_LAYERS, PRODUCTION_V4_MAX_PROOF_BYTES, PRODUCTION_V4_MODEL_MANIFEST_DIGEST,
-    PRODUCTION_V4_TESTNET_NETWORK_ID, forgematrix_v4_challenge_digest,
-    forgematrix_v4_proof_system_digest, forgematrix_v4_work_digest,
+    forgematrix_v4_challenge_digest, forgematrix_v4_proof_system_digest,
+    forgematrix_v4_work_digest,
 };
 use serde::Serialize;
 
-use crate::BlockTemplate;
 use crate::pool::{
     PoolError, PoolJob, PoolWorkSearchResult, ProductionV4PoolShareEvaluation,
     ProductionV4PoolShareVerifier,
 };
+use crate::{BlockTemplate, COMPILED_NETWORK_PROFILE};
 
 const WORKER_OUTPUT_MAX_LINES: usize = 4_096;
 const WORKER_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
@@ -150,6 +150,7 @@ pub fn production_v4_pool_searcher_config(
 
 #[derive(Debug)]
 pub struct ProductionV4PersistentPoolVerifier {
+    expected_network_id: [u8; 32],
     scratch_directory: PathBuf,
     worker_scratch_directory: String,
     startup_id: [u8; 8],
@@ -158,6 +159,7 @@ pub struct ProductionV4PersistentPoolVerifier {
 
 #[derive(Debug)]
 pub struct ProductionV4PersistentPoolSearcher {
+    expected_network_id: [u8; 32],
     scratch_directory: PathBuf,
     worker_scratch_directory: String,
     startup_id: [u8; 8],
@@ -202,6 +204,14 @@ struct AttemptFiles {
 
 impl ProductionV4PersistentPoolVerifier {
     pub fn start(config: ProductionV4PoolVerifierConfig) -> Result<Self, PoolError> {
+        Self::start_for_network(COMPILED_NETWORK_PROFILE.network_id, config)
+    }
+
+    pub fn start_for_network(
+        expected_network_id: [u8; 32],
+        config: ProductionV4PoolVerifierConfig,
+    ) -> Result<Self, PoolError> {
+        validate_expected_network_id(expected_network_id)?;
         validate_scratch_paths(&config.scratch_directory, &config.worker_scratch_directory)?;
         fs::create_dir_all(&config.scratch_directory).map_err(replay_error)?;
         let replay = PersistentWorker::start(
@@ -217,6 +227,7 @@ impl ProductionV4PersistentPoolVerifier {
         let mut startup_id = [0_u8; 8];
         getrandom::fill(&mut startup_id).map_err(replay_error)?;
         Ok(Self {
+            expected_network_id,
             scratch_directory: config.scratch_directory,
             worker_scratch_directory: config.worker_scratch_directory,
             startup_id,
@@ -235,7 +246,7 @@ impl ProductionV4PersistentPoolVerifier {
         nonce: u64,
         share_target: [u8; 32],
     ) -> Result<ProductionV4PoolShareEvaluation, PoolError> {
-        if template.challenge.network_id != PRODUCTION_V4_TESTNET_NETWORK_ID {
+        if template.challenge.network_id != self.expected_network_id {
             return Err(pool_replay_failure(
                 "pool replay received a template for another network",
             ));
@@ -381,6 +392,14 @@ impl ProductionV4PersistentPoolVerifier {
 
 impl ProductionV4PersistentPoolSearcher {
     pub fn start(config: ProductionV4PoolSearcherConfig) -> Result<Self, PoolError> {
+        Self::start_for_network(COMPILED_NETWORK_PROFILE.network_id, config)
+    }
+
+    pub fn start_for_network(
+        expected_network_id: [u8; 32],
+        config: ProductionV4PoolSearcherConfig,
+    ) -> Result<Self, PoolError> {
+        validate_expected_network_id(expected_network_id)?;
         validate_scratch_paths(&config.scratch_directory, &config.worker_scratch_directory)?;
         if !(1..=PRODUCTION_V4_POOL_SEARCH_MAX_BATCH_SIZE).contains(&config.batch_size) {
             return Err(pool_replay_failure(format!(
@@ -396,6 +415,7 @@ impl ProductionV4PersistentPoolSearcher {
         let mut startup_id = [0_u8; 8];
         getrandom::fill(&mut startup_id).map_err(replay_error)?;
         Ok(Self {
+            expected_network_id,
             scratch_directory: config.scratch_directory,
             worker_scratch_directory: config.worker_scratch_directory,
             startup_id,
@@ -419,7 +439,7 @@ impl ProductionV4PersistentPoolSearcher {
                 next_nonce: start_nonce,
             });
         }
-        validate_search_job(job)?;
+        validate_search_job(self.expected_network_id, job)?;
         let batch_size = bounded_batch_size(start_nonce, self.batch_size);
         let mut state = self
             .state
@@ -469,7 +489,12 @@ impl ProductionV4PersistentPoolSearcher {
                 next_nonce: start_nonce.wrapping_add(u64::from(batch_size)),
             });
         }
-        inspect_search_batch(job, start_nonce, &final_activations)
+        inspect_search_batch(
+            self.expected_network_id,
+            job,
+            start_nonce,
+            &final_activations,
+        )
     }
 
     fn worker_path(&self, local_path: &Path) -> Result<String, PoolError> {
@@ -692,8 +717,18 @@ fn validate_scratch_paths(local: &Path, worker: &str) -> Result<(), PoolError> {
     Ok(())
 }
 
-fn validate_search_job(job: &PoolJob) -> Result<(), PoolError> {
-    if job.challenge.network_id != PRODUCTION_V4_TESTNET_NETWORK_ID {
+fn validate_expected_network_id(expected_network_id: [u8; 32]) -> Result<(), PoolError> {
+    if expected_network_id == [0; 32] {
+        return Err(pool_replay_failure(
+            "ProductionV4 pool expected network ID must be nonzero",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_search_job(expected_network_id: [u8; 32], job: &PoolJob) -> Result<(), PoolError> {
+    validate_expected_network_id(expected_network_id)?;
+    if job.challenge.network_id != expected_network_id {
         return Err(pool_replay_failure(
             "pool search received a job for another network",
         ));
@@ -716,11 +751,12 @@ fn bounded_batch_size(start_nonce: u64, requested: u32) -> u32 {
 }
 
 fn inspect_search_batch(
+    expected_network_id: [u8; 32],
     job: &PoolJob,
     start_nonce: u64,
     final_activations: &[u8],
 ) -> Result<PoolWorkSearchResult, PoolError> {
-    validate_search_job(job)?;
+    validate_search_job(expected_network_id, job)?;
     let mut chunks = final_activations.chunks_exact(FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES);
     if !chunks.remainder().is_empty()
         || chunks.len() == 0
@@ -881,10 +917,11 @@ mod tests {
 
     #[test]
     fn search_batch_inspection_reports_first_qualifying_nonce() {
+        const ALTERNATE_NETWORK_ID: [u8; 32] = [0xa5; 32];
         let job = PoolJob {
             job_id: [9; 32],
             challenge: cmfd_consensus::BlockChallenge {
-                network_id: PRODUCTION_V4_TESTNET_NETWORK_ID,
+                network_id: ALTERNATE_NETWORK_ID,
                 previous_block: [2; 32],
                 transaction_root: [3; 32],
                 height: 4,
@@ -894,7 +931,7 @@ mod tests {
             share_target: [0xff; 32],
         };
         let activations = vec![0_u8; FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES * 2];
-        let result = inspect_search_batch(&job, 41, &activations).unwrap();
+        let result = inspect_search_batch(ALTERNATE_NETWORK_ID, &job, 41, &activations).unwrap();
         assert!(matches!(
             result,
             PoolWorkSearchResult::Found {
@@ -904,6 +941,8 @@ mod tests {
                 ..
             }
         ));
+        assert!(inspect_search_batch([0x5a; 32], &job, 41, &activations).is_err());
+        assert!(validate_search_job([0; 32], &job).is_err());
     }
 
     #[test]

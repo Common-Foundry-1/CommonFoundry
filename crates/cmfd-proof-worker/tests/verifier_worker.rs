@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use std::{ffi::CString, os::unix::ffi::OsStrExt, os::unix::fs::PermissionsExt};
 
 #[cfg(any(not(feature = "production-v3"), windows))]
-use cmfd_consensus::dory_v3_model_ceremony_transcript::FileIdentity;
+use cmfd_consensus::FileIdentity;
 use cmfd_consensus::{
     BLOCK_VERSION, Block, BlockChallenge, BlockProof, Coinbase, ConsensusPowVerifier, TEST_PROFILE,
     v2_test_reference,

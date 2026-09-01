@@ -165,8 +165,6 @@ describe("MiningView", () => {
     expect(screen.getByText("4,321")).toBeInTheDocument();
     expect(screen.getByText("Pool height")).toBeInTheDocument();
     expect(screen.getByText("130")).toBeInTheDocument();
-    expect(screen.getByText(/Authenticated Devnet share credits/i)).toBeInTheDocument();
-    expect(screen.getByText(/pool operator's published payout policy/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Solo" })).toBeDisabled();
     expect(urlInput).toBeDisabled();
     expect(workerInput).toBeDisabled();
@@ -233,11 +231,10 @@ describe("MiningView", () => {
     await waitFor(() => expect(apiMocks.stopMining).toHaveBeenCalledTimes(1));
   });
 
-  it("states the reference-engine, maturity, fee-burn, and hardware boundaries", async () => {
+  it("states the reference-engine, maturity, and fee-burn behavior", async () => {
     render(<MiningView wallet={wallet} nodeStatus={nodeStatus} />);
     expect(await screen.findByText("CPU reference engine")).toBeInTheDocument();
     expect(screen.getByText("100-block maturity")).toBeInTheDocument();
     expect(screen.getByText("Transaction fees are burned")).toBeInTheDocument();
-    expect(screen.getByText(/no GPU-use or VRAM-residency claim/)).toBeInTheDocument();
   });
 });

@@ -4,6 +4,12 @@ use crate::release_gate::{
     COMPILED_RELEASE_PROFILE, CompiledNetworkProfile, ConsensusProofSelection,
 };
 
+/// Mutable RCNet-1 cold-start infrastructure. These values are deliberately
+/// excluded from the immutable network identity and may be rotated without a
+/// consensus reset.
+pub const PRODUCTION_RC_SEED_IPV4: Ipv4Addr = Ipv4Addr::new(173, 249, 35, 251);
+pub const PRODUCTION_RC_SEED_PORT: u16 = 19_444;
+
 /// Compile-time identity and default endpoints for one Common Foundry network.
 ///
 /// Consensus identity fields are bound through [`crate::devnet_params`]. The
@@ -318,28 +324,49 @@ pub const PRODUCTION_V4_TESTNET_PROFILE: NetworkProfile = NetworkProfile {
 
 /// Isolated rehearsal identity for the first launch-candidate network.
 ///
-/// RCNet-1 is not mainnet and cannot currently start. Its identity, service
-/// ports, and storage paths are intentionally disjoint from Devnet-0 so a
-/// future ProductionV4 integration cannot accidentally reuse Devnet state.
-/// The production proof selector is the hard gate: code must never substitute
-/// the tiny V2 reference relation for this profile.
+/// RCNet-1 is not mainnet. Its immutable identity was derived from the
+/// canonical `CMFD_RCNET_LAUNCH_CANDIDATE_V2`; service endpoints remain
+/// replaceable operational configuration. Ports and storage paths are
+/// intentionally disjoint from Devnet-0, and the ProductionV4 selector must
+/// never fall back to the tiny V2 reference relation.
 pub const RCNET1_PROFILE: NetworkProfile = NetworkProfile {
     kind: NetworkProfileKind::Rcnet,
     proof: ProofProfile::ProductionV4,
     name: "CommonFoundry RCNet-1",
-    network_id: [0x72; 32],
-    virtual_genesis_hash: [0x52; 32],
-    virtual_genesis_timestamp: 1_787_616_000,
-    // These remain explicit blockers, not proposed launch values. The final
-    // candidate must pin a reviewed limit and non-development destinations.
-    pow_limit: DEVNET_PROFILE.pow_limit,
-    rewards: DEVNET_PROFILE.rewards,
+    network_id: [
+        0x3e, 0x99, 0xd4, 0x59, 0x59, 0xc1, 0x9c, 0x00, 0x53, 0xd8, 0xe9, 0xfe, 0xf3, 0x48, 0x75,
+        0xb5, 0x7b, 0x46, 0xa8, 0xa1, 0xce, 0x33, 0x06, 0x37, 0xda, 0xdd, 0xab, 0x51, 0x5b, 0xc7,
+        0xb9, 0x2d,
+    ],
+    virtual_genesis_hash: [
+        0xa5, 0x72, 0xb6, 0xce, 0x50, 0x97, 0x85, 0x11, 0xce, 0x87, 0x71, 0xdb, 0x66, 0x03, 0xa6,
+        0x02, 0xfa, 0xcc, 0xf3, 0x80, 0x2c, 0xf0, 0xd4, 0x79, 0x1c, 0x1c, 0xe4, 0xe4, 0x67, 0xba,
+        0x6b, 0x71,
+    ],
+    virtual_genesis_timestamp: 1_788_800_400, // 2026-09-07T17:00:00Z
+    pow_limit: [
+        0x00, 0x3f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff,
+    ],
+    rewards: RewardDestinations {
+        steward: [
+            0x69, 0x89, 0xa6, 0x15, 0x23, 0x1a, 0x86, 0x55, 0x8b, 0x8e, 0xbf, 0x1f, 0x0b, 0x00,
+            0x11, 0xcf, 0x4f, 0xb1, 0xe0, 0x20, 0x9f, 0x68, 0xa7, 0xb1, 0x27, 0x4f, 0x38, 0x77,
+            0xe3, 0xb1, 0x6a, 0x6b,
+        ],
+        community: [
+            0x2d, 0x70, 0x66, 0xdf, 0x96, 0x29, 0x7c, 0x41, 0xf8, 0xe4, 0xbb, 0x3b, 0xe2, 0x18,
+            0xce, 0xfb, 0x82, 0x2f, 0xf1, 0xe7, 0xdc, 0x6c, 0xc6, 0x48, 0xf4, 0x7f, 0x92, 0xa9,
+            0xc0, 0xc8, 0x8e, 0xf8,
+        ],
+    },
     rpc_port: 19_443,
-    p2p_port: 19_444,
+    p2p_port: PRODUCTION_RC_SEED_PORT,
     pool_port: 19_445,
-    // RFC 5737 TEST-NET-1. A real bootstrap must be selected and published as
-    // part of the launch-candidate manifest before RCNet-1 is enabled.
-    bootstrap_ipv4: Ipv4Addr::new(192, 0, 2, 1),
+    // Operational seed only; it is excluded from the immutable identity and
+    // can be rotated without resetting RCNet-1 consensus.
+    bootstrap_ipv4: PRODUCTION_RC_SEED_IPV4,
     default_data_dir_identity: "commonfoundry-rcnet1",
     wallet_data_dir_identity: "rcnet-1",
 };
@@ -383,6 +410,14 @@ mod tests {
             DEVNET_PROFILE.wallet_data_dir_identity
         );
         assert_eq!(RCNET1_PROFILE.proof, ProofProfile::ProductionV4);
+        assert_eq!(
+            RCNET1_PROFILE.network_id,
+            cmfd_consensus::PRODUCTION_V4_RCNET1_NETWORK_ID
+        );
+        assert_ne!(RCNET1_PROFILE.pow_limit, DEVNET_PROFILE.pow_limit);
+        assert_ne!(RCNET1_PROFILE.rewards, DEVNET_PROFILE.rewards);
+        assert!(k256::schnorr::VerifyingKey::from_bytes(&RCNET1_PROFILE.rewards.steward).is_ok());
+        assert!(k256::schnorr::VerifyingKey::from_bytes(&RCNET1_PROFILE.rewards.community).is_ok());
         assert_eq!(DEVNET_PROFILE.proof, ProofProfile::DevnetV2Reference);
         assert_eq!(DEVNET_PROFILE.short_name(), "Devnet-0");
         assert_eq!(DEVNET_PROFILE.proof.profile_name(), "DevnetV2");
@@ -391,6 +426,10 @@ mod tests {
         assert_eq!(RCNET1_PROFILE.rpc_address().to_string(), "127.0.0.1:19443");
         assert_eq!(RCNET1_PROFILE.p2p_address().to_string(), "127.0.0.1:19444");
         assert_eq!(RCNET1_PROFILE.pool_address().to_string(), "127.0.0.1:19445");
+        assert_eq!(
+            RCNET1_PROFILE.bootstrap_peer(),
+            crate::seed_peers::PRODUCTION_RC_SEED
+        );
         assert_eq!(
             DEVNET_PROFILE.miner_p2p_address().to_string(),
             "127.0.0.1:19444"

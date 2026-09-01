@@ -94,6 +94,98 @@ if ((INPUTS_PREPARED != 0)); then
   input_validation+=(--prepared-inputs)
 fi
 python3 "$SCRIPT_DIR/production-v4-inputs.py" "${input_validation[@]}"
+NETWORK_ID="$(python3 - "$INPUT_MANIFEST" "$CMFD_MINER" <<'PY'
+import json
+import re
+import subprocess
+import sys
+
+
+def unique_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON field: {key}")
+        value[key] = item
+    return value
+
+
+with open(sys.argv[1], "r", encoding="utf-8") as source:
+    manifest = json.load(source, object_pairs_hook=unique_object)
+network_id = manifest.get("network_id") if isinstance(manifest, dict) else None
+if not isinstance(network_id, str) or re.fullmatch(r"[0-9a-f]{64}", network_id) is None:
+    raise SystemExit(
+        "input manifest network_id must contain exactly 64 lowercase hexadecimal characters"
+    )
+
+result = subprocess.run(
+    [sys.argv[2], "network-info"],
+    check=False,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+)
+if result.returncode != 0:
+    detail = result.stderr.decode("utf-8", errors="replace").strip()
+    raise SystemExit(f"cmfd-miner network-info exited with code {result.returncode}: {detail}")
+if result.stderr:
+    raise SystemExit("cmfd-miner network-info wrote unexpected diagnostic output")
+try:
+    identity_text = result.stdout.decode("utf-8", errors="strict")
+except UnicodeDecodeError as error:
+    raise SystemExit("cmfd-miner network-info is not UTF-8") from error
+if not identity_text.endswith("\n") or "\r" in identity_text or identity_text.count("\n") != 1:
+    raise SystemExit("cmfd-miner network-info must contain exactly one canonical JSON line")
+try:
+    identity = json.loads(identity_text, object_pairs_hook=unique_object)
+except ValueError as error:
+    raise SystemExit(f"cmfd-miner network-info is not strict JSON: {error}") from error
+expected_fields = [
+    "format",
+    "format_version",
+    "network_id",
+    "network_name",
+    "network_profile",
+    "proof_selection",
+    "build_source_commit",
+]
+if not isinstance(identity, dict) or list(identity) != expected_fields:
+    raise SystemExit("cmfd-miner network-info fields do not match the canonical schema")
+if (
+    identity["format"] != "commonfoundry-miner-network-info"
+    or type(identity["format_version"]) is not int
+    or identity["format_version"] != 1
+):
+    raise SystemExit("cmfd-miner network-info format is unsupported")
+miner_network_id = identity["network_id"]
+if not isinstance(miner_network_id, str) or re.fullmatch(r"[0-9a-f]{64}", miner_network_id) is None:
+    raise SystemExit("cmfd-miner network-info network_id is not canonical lowercase hexadecimal")
+if miner_network_id != network_id:
+    raise SystemExit(
+        f"cmfd-miner network {miner_network_id} does not match input manifest network {network_id}"
+    )
+for field in ("network_name", "network_profile"):
+    value = identity[field]
+    if not isinstance(value, str) or re.fullmatch(r"[\x20-\x7e]{1,128}", value) is None:
+        raise SystemExit(f"cmfd-miner network-info {field} is not a canonical printable name")
+if identity["proof_selection"] != "ProductionV4":
+    raise SystemExit(
+        f"cmfd-miner proof selection is {identity['proof_selection']}; ProductionV4 is required"
+    )
+source_commit = identity["build_source_commit"]
+if source_commit is not None and (
+    not isinstance(source_commit, str)
+    or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", source_commit) is None
+    or set(source_commit) == {"0"}
+):
+    raise SystemExit(
+        "cmfd-miner build_source_commit is not canonical nonzero lowercase hexadecimal"
+    )
+canonical = json.dumps(identity, ensure_ascii=False, separators=(",", ":")) + "\n"
+if identity_text != canonical:
+    raise SystemExit("cmfd-miner network-info is not canonical JSON")
+print(network_id)
+PY
+)"
 
 gpu_line="$(nvidia-smi --id="$CUDA_DEVICE" --query-gpu=name,memory.total,compute_cap --format=csv,noheader,nounits)"
 IFS=',' read -r gpu_name gpu_memory gpu_compute <<<"$gpu_line"
@@ -267,7 +359,7 @@ worker_session_directory="$(mktemp -d -- "$WORK_DIRECTORY/.worker-session.XXXXXX
 mkfifo -- "$worker_session_directory/proof.in" "$worker_session_directory/proof.out" \
   "$worker_session_directory/replay.in" "$worker_session_directory/replay.out"
 
-"$PROOF_BINARY" --server "$MODEL_BANK" "$FIXED_DIRECTORY" \
+"$PROOF_BINARY" --server "$NETWORK_ID" "$MODEL_BANK" "$FIXED_DIRECTORY" \
   <"$worker_session_directory/proof.in" >"$worker_session_directory/proof.out" 2>&1 &
 proof_pid="$!"
 exec {proof_input_fd}>"$worker_session_directory/proof.in"

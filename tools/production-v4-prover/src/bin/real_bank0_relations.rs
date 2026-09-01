@@ -43,7 +43,8 @@ use cmfd_consensus::{
     forgematrix_v4_challenge_digest, forgematrix_v4_proof_system_digest,
     forgematrix_v4_work_digest, BlockChallenge, ForgeMatrixV4FixedArtifactRecordV1,
     FORGEMATRIX_V4_ALGORITHM_VERSION, FORGEMATRIX_V4_PROOF_VERSION,
-    PRODUCTION_V4_FIXED_ARTIFACT_RECORD_DIGEST, PRODUCTION_V4_TESTNET_NETWORK_ID,
+    PRODUCTION_V4_FIXED_ARTIFACT_RECORD_DIGEST, PRODUCTION_V4_RCNET1_NETWORK_ID,
+    PRODUCTION_V4_TESTNET_NETWORK_ID,
 };
 use cpu_slop_algebra::AbstractField as CpuAbstractField;
 use memmap2::{Mmap, MmapOptions};
@@ -128,31 +129,39 @@ struct PreparedProver {
 fn main() -> Result<()> {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
     if args.first().is_some_and(|value| value == "--server") {
-        ensure!(args.len() == 3, "usage: --server MODEL ARTIFACT_DIRECTORY");
-        let prepared = prepare_prover(Path::new(&args[1]), Path::new(&args[2]))?;
-        run_sync_in_place(move |scope| run_persistent_server(&prepared, &scope))??;
+        ensure!(
+            args.len() == 4,
+            "usage: --server EXPECTED_NETWORK_ID MODEL ARTIFACT_DIRECTORY"
+        );
+        let expected_network_id = parse_expected_network_id(&args[1])?;
+        let prepared = prepare_prover(Path::new(&args[2]), Path::new(&args[3]))?;
+        run_sync_in_place(move |scope| {
+            run_persistent_server(&prepared, expected_network_id, &scope)
+        })??;
         return Ok(());
     }
     ensure!(
-        args.len() == 7,
-        "usage: MODEL ARTIFACT_DIRECTORY TEMPLATE TRACE_PREFIX DYNAMIC_RECORD FINAL OUTPUT"
+        args.len() == 9 && args.first().is_some_and(|value| value == "--network-id"),
+        "usage: --network-id EXPECTED_NETWORK_ID MODEL ARTIFACT_DIRECTORY TEMPLATE TRACE_PREFIX DYNAMIC_RECORD FINAL OUTPUT"
     );
     run_one_shot(args)
 }
 
 fn run_one_shot(args: Vec<OsString>) -> Result<()> {
-    let model_path = PathBuf::from(&args[0]);
-    let artifact_dir = PathBuf::from(&args[1]);
-    let template_path = PathBuf::from(&args[2]);
-    let dynamic_prefix = PathBuf::from(&args[3]);
-    let dynamic_record_path = PathBuf::from(&args[4]);
-    let final_path = PathBuf::from(&args[5]);
-    let output_path = PathBuf::from(&args[6]);
+    let expected_network_id = parse_expected_network_id(&args[1])?;
+    let model_path = PathBuf::from(&args[2]);
+    let artifact_dir = PathBuf::from(&args[3]);
+    let template_path = PathBuf::from(&args[4]);
+    let dynamic_prefix = PathBuf::from(&args[5]);
+    let dynamic_record_path = PathBuf::from(&args[6]);
+    let final_path = PathBuf::from(&args[7]);
+    let output_path = PathBuf::from(&args[8]);
     let prepared = prepare_prover(&model_path, &artifact_dir)?;
     let expected = read_dynamic_commitment_record(&dynamic_record_path)?;
     run_sync_in_place(move |scope| {
         prove_job(
             &prepared,
+            expected_network_id,
             &template_path,
             &dynamic_prefix,
             &final_path,
@@ -164,6 +173,28 @@ fn run_one_shot(args: Vec<OsString>) -> Result<()> {
     Ok(())
 }
 
+fn parse_expected_network_id(value: &OsString) -> Result<[u8; 32]> {
+    let value = value
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("expected network ID is not valid UTF-8"))?;
+    ensure!(
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "expected network ID must contain exactly 64 lowercase hexadecimal characters"
+    );
+    let mut network_id = [0_u8; 32];
+    hex::decode_to_slice(value, &mut network_id)
+        .map_err(|_| anyhow::anyhow!("expected network ID is not a 32-byte hexadecimal value"))?;
+    ensure!(
+        network_id == PRODUCTION_V4_TESTNET_NETWORK_ID
+            || network_id == PRODUCTION_V4_RCNET1_NETWORK_ID,
+        "expected network ID is not a compiled ProductionV4 network"
+    );
+    Ok(network_id)
+}
+
 fn prepare_prover(model_path: &Path, artifact_dir: &Path) -> Result<PreparedProver> {
     let fixed_record: ForgeMatrixV4FixedArtifactRecordV1 = serde_json::from_reader(File::open(
         artifact_dir.join("FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json"),
@@ -171,7 +202,7 @@ fn prepare_prover(model_path: &Path, artifact_dir: &Path) -> Result<PreparedProv
     fixed_record.validate()?;
     ensure!(
         fixed_record.record_digest() == PRODUCTION_V4_FIXED_ARTIFACT_RECORD_DIGEST,
-        "fixed artifact record is not the compiled V4 testnet record"
+        "fixed artifact record is not the compiled ProductionV4 record"
     );
     let fixed_words: [[u32; 8]; 3] =
         std::array::from_fn(|bank| fixed_record.banks()[bank].commitment_words());
@@ -218,7 +249,11 @@ fn prepare_prover(model_path: &Path, artifact_dir: &Path) -> Result<PreparedProv
     })
 }
 
-fn run_persistent_server(prepared: &PreparedProver, scope: &TaskScope) -> Result<()> {
+fn run_persistent_server(
+    prepared: &PreparedProver,
+    expected_network_id: [u8; 32],
+    scope: &TaskScope,
+) -> Result<()> {
     println!("CMFD_V4_PROOF_READY");
     std::io::stdout().flush()?;
     for line in BufReader::new(std::io::stdin().lock()).lines() {
@@ -234,6 +269,7 @@ fn run_persistent_server(prepared: &PreparedProver, scope: &TaskScope) -> Result
         );
         prove_job(
             prepared,
+            expected_network_id,
             Path::new(fields[1]),
             Path::new(fields[2]),
             Path::new(fields[3]),
@@ -267,6 +303,7 @@ fn read_dynamic_commitment_record(path: &Path) -> Result<[[u32; 8]; 3]> {
 #[allow(clippy::too_many_arguments)]
 fn prove_job(
     prepared: &PreparedProver,
+    expected_network_id: [u8; 32],
     template_path: &Path,
     dynamic_prefix: &Path,
     final_path: &Path,
@@ -276,7 +313,7 @@ fn prove_job(
 ) -> Result<()> {
     let frozen: FrozenProductionV4Template = serde_json::from_reader(File::open(template_path)?)?;
     ensure!(
-        frozen.challenge.network_id == PRODUCTION_V4_TESTNET_NETWORK_ID,
+        frozen.challenge.network_id == expected_network_id,
         "frozen template belongs to another network"
     );
     let final_activation = read_final_activation(final_path)?;

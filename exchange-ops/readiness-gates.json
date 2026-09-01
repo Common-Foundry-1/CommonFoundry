@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "schema": "CMFD_EXCHANGE_ONBOARDING_GATES_V1",
+  "overall": "not_production_ready",
+  "status_basis": "repository-local candidate evidence only",
+  "gates": [
+    {
+      "id": "machine_readable_rpc_contract",
+      "status": "implemented_candidate",
+      "evidence": "exchange-kit OpenRPC and JSON Schema validation"
+    },
+    {
+      "id": "capability_discovery",
+      "status": "implemented_candidate",
+      "evidence": "getexchangeinfo RPC and focused Rust tests"
+    },
+    {
+      "id": "batch_deposit_watch_registration",
+      "status": "implemented_candidate",
+      "evidence": "atomic registerwatchdestinations RPC and focused Rust tests"
+    },
+    {
+      "id": "checksummed_network_address",
+      "status": "not_implemented",
+      "evidence": "current destination format remains a raw 32-byte x-only key in lowercase hex"
+    },
+    {
+      "id": "multi_deposit_key_custody_lifecycle",
+      "status": "not_implemented",
+      "evidence": "watch-only batching does not enroll spending keys into the authenticated keyring"
+    },
+    {
+      "id": "reference_coordinator",
+      "status": "implemented_candidate",
+      "evidence": "process-restart-safe poll-ack outbox with exact-retry acknowledgement tests; no physical power-loss claim"
+    },
+    {
+      "id": "provider_neutral_signer_reference",
+      "status": "implemented_candidate_not_hsm",
+      "evidence": "CMFDSIG1 software reference signer with independently signed context and tamper tests; no chain-input proof or replay ledger"
+    },
+    {
+      "id": "vendor_hsm_or_threshold_provider",
+      "status": "not_qualified",
+      "evidence": "no vendor adapter, transport, key ceremony, or certification accepted"
+    },
+    {
+      "id": "installed_host_acl",
+      "status": "procedure_available_not_executed_for_release_host",
+      "evidence": "qualification tooling exists; exact packaged host evidence is required"
+    },
+    {
+      "id": "live_migration_and_physical_power_loss",
+      "status": "not_qualified",
+      "evidence": "software crash matrices do not constitute representative physical power-cut evidence"
+    },
+    {
+      "id": "released_journal_rollover",
+      "status": "not_implemented",
+      "evidence": "released-record archive and journal epoch rollover remain open"
+    },
+    {
+      "id": "independent_external_audit",
+      "status": "not_completed",
+      "evidence": "internal adversarial review and audit candidate bundle are not an independent opinion"
+    },
+    {
+      "id": "exchange_production_acceptance",
+      "status": "not_received",
+      "evidence": "venue-specific technical and operational approval is required"
+    }
+  ]
+}

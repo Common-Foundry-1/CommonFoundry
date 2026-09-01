@@ -1,0 +1,521 @@
+{
+  "openrpc": "1.3.2",
+  "info": {
+    "title": "Common Foundry Exchange RPC",
+    "version": "chain-preview-v0.5-kit-v1",
+    "description": "Loopback-only authenticated integration preview. Chain and deposit results use chain-preview-v0.4; v3 custody results use chain-preview-v0.5. Parameters are positional. Integration and withdrawal credentials are separate. Method error arrays identify representative JSON-RPC classes; errors.json routes the stable pair of error.code and error.data.code."
+  },
+  "servers": [
+    {
+      "name": "local-node",
+      "url": "http://127.0.0.1:38101/",
+      "summary": "Illustrative loopback listener; deployment may choose another loopback port."
+    }
+  ],
+  "methods": [
+    {
+      "name": "getexchangeinfo",
+      "summary": "Discover the enabled exchange surface and deposit-index capacity",
+      "description": "Integration credential only. Synchronizes the deposit index before returning. production_ready is always false in this preview.",
+      "paramStructure": "by-position",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/ExchangeInfo" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/ChainChanged" },
+        { "$ref": "#/components/errors/CustodyFault" },
+        { "$ref": "#/components/errors/InternalError" }
+      ],
+      "tags": [{ "name": "integration" }]
+    },
+    {
+      "name": "getblockchaininfo",
+      "summary": "Return network pins, active tip, storage, and advisory peer observations",
+      "description": "Integration credential only. initialblockdownload remains true; an external readiness policy is required.",
+      "paramStructure": "by-position",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/BlockchainInfo" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/CustodyFault" },
+        { "$ref": "#/components/errors/InternalError" }
+      ],
+      "tags": [{ "name": "chain" }]
+    },
+    {
+      "name": "getblockcount",
+      "summary": "Return active tip height",
+      "paramStructure": "by-position",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": { "type": "integer", "minimum": 0 }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/InternalError" }
+      ],
+      "tags": [{ "name": "chain" }]
+    },
+    {
+      "name": "getbestblockhash",
+      "summary": "Return active tip block ID",
+      "paramStructure": "by-position",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/Hash32" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/InternalError" }
+      ],
+      "tags": [{ "name": "chain" }]
+    },
+    {
+      "name": "getblockhash",
+      "summary": "Return active-chain block ID at a height",
+      "paramStructure": "by-position",
+      "params": [
+        {
+          "name": "height",
+          "required": true,
+          "schema": { "type": "integer", "minimum": 0 }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/Hash32" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/BlockNotFound" },
+        { "$ref": "#/components/errors/InternalError" }
+      ],
+      "tags": [{ "name": "chain" }]
+    },
+    {
+      "name": "getblock",
+      "summary": "Read a canonical block frame or decoded block",
+      "description": "Verbosity 0 returns canonical frame hex, 1 returns txids, and 2 returns transaction objects. Virtual genesis has no raw frame.",
+      "paramStructure": "by-position",
+      "params": [
+        {
+          "name": "hash",
+          "required": true,
+          "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/Hash32" }
+        },
+        {
+          "name": "verbosity",
+          "required": false,
+          "schema": { "type": "integer", "enum": [0, 1, 2], "default": 1 }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/BlockResult" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/BlockNotFound" },
+        { "$ref": "#/components/errors/CustodyFault" },
+        { "$ref": "#/components/errors/InternalError" }
+      ],
+      "tags": [{ "name": "chain" }]
+    },
+    {
+      "name": "getrawmempool",
+      "summary": "Return local mempool transaction IDs or verbose entries",
+      "paramStructure": "by-position",
+      "params": [
+        {
+          "name": "verbose",
+          "required": false,
+          "schema": { "type": "boolean", "default": false }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/MempoolResult" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/InternalError" }
+      ],
+      "tags": [{ "name": "mempool" }]
+    },
+    {
+      "name": "sendrawtransaction",
+      "summary": "Submit canonical transaction wire bytes",
+      "description": "Integration credential only. An identical transaction already in this mempool returns the same txid. This is not withdrawal idempotency.",
+      "paramStructure": "by-position",
+      "params": [
+        {
+          "name": "transaction_hex",
+          "required": true,
+          "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/EvenLowerHex" }
+        }
+      ],
+      "result": {
+        "name": "txid",
+        "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/Hash32" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/MempoolRejected" },
+        { "$ref": "#/components/errors/CustodyFault" },
+        { "$ref": "#/components/errors/InternalError" }
+      ],
+      "tags": [{ "name": "mempool" }]
+    },
+    {
+      "name": "registerwatchdestination",
+      "summary": "Register one immutable deposit destination",
+      "description": "Integration credential only. Returns after complete active-chain history has been indexed. Exact retry is idempotent.",
+      "paramStructure": "by-position",
+      "params": [
+        {
+          "name": "label",
+          "required": true,
+          "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/VisibleAsciiId" }
+        },
+        {
+          "name": "destination_hex",
+          "required": true,
+          "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/Hash32" }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/WatchDestination" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/WatchConflict" },
+        { "$ref": "#/components/errors/ChainChanged" },
+        { "$ref": "#/components/errors/CustodyFault" },
+        { "$ref": "#/components/errors/InternalError" }
+      ],
+      "tags": [{ "name": "deposits" }]
+    },
+    {
+      "name": "registerwatchdestinations",
+      "summary": "Atomically register 1 to 1,000 immutable deposit destinations",
+      "description": "Integration credential only. The sole positional parameter is an ordered array of exact label/destination_hex objects. The batch is atomic and exact-retry idempotent.",
+      "paramStructure": "by-position",
+      "params": [
+        {
+          "name": "registrations",
+          "required": true,
+          "schema": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 1000,
+            "items": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/WatchRegistrationParameter" }
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/WatchRegistrationBatchResult" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/WatchConflict" },
+        { "$ref": "#/components/errors/ChainChanged" },
+        { "$ref": "#/components/errors/CustodyFault" },
+        { "$ref": "#/components/errors/InternalError" }
+      ],
+      "tags": [{ "name": "deposits" }]
+    },
+    {
+      "name": "getwatchdestination",
+      "summary": "Return an immutable watch registration by label",
+      "paramStructure": "by-position",
+      "params": [
+        {
+          "name": "label",
+          "required": true,
+          "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/VisibleAsciiId" }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/WatchDestination" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/WatchNotFound" },
+        { "$ref": "#/components/errors/CustodyFault" },
+        { "$ref": "#/components/errors/InternalError" }
+      ],
+      "tags": [{ "name": "deposits" }]
+    },
+    {
+      "name": "getdepositevents",
+      "summary": "Page durable active-chain deposit additions and removals",
+      "description": "after_cursor is exclusive. Persist events and next_cursor atomically. Limit defaults to 100 and is capped at 1,000.",
+      "paramStructure": "by-position",
+      "params": [
+        {
+          "name": "after_cursor",
+          "required": true,
+          "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/DecimalU64String" }
+        },
+        {
+          "name": "limit",
+          "required": false,
+          "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/DepositEventPage" }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/ChainChanged" },
+        { "$ref": "#/components/errors/CustodyFault" },
+        { "$ref": "#/components/errors/InternalError" }
+      ],
+      "tags": [{ "name": "deposits" }]
+    },
+    {
+      "name": "preparewithdrawal",
+      "summary": "Durably prepare and reserve an unsigned custody v0.5 withdrawal",
+      "description": "Withdrawal credential only. Exact retry is idempotent and does not sign or broadcast.",
+      "paramStructure": "by-position",
+      "params": [
+        { "name": "request_id", "required": true, "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/VisibleAsciiId" } },
+        { "name": "destination_hex", "required": true, "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/Hash32" } },
+        { "name": "amount_atoms", "required": true, "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/PositiveU64String" } },
+        { "name": "fee_atoms", "required": true, "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/CanonicalU64String" } }
+      ],
+      "result": { "name": "result", "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/WithdrawalV3" } },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/OperationalLimit" },
+        { "$ref": "#/components/errors/WithdrawalConflict" },
+        { "$ref": "#/components/errors/CustodyFault" },
+        { "$ref": "#/components/errors/AuthorizationRequired" },
+        { "$ref": "#/components/errors/V3Required" },
+        { "$ref": "#/components/errors/InternalError" }
+      ],
+      "tags": [{ "name": "withdrawals" }]
+    },
+    {
+      "name": "getwithdrawalapprovalpayload",
+      "summary": "Build the exact action-specific approval payload",
+      "description": "Withdrawal credential and custody v0.5 only. The result wrapper is not submitted; copy approval_document and add strictly public-key-sorted signatures.",
+      "paramStructure": "by-position",
+      "params": [
+        { "name": "request_id", "required": true, "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/VisibleAsciiId" } },
+        { "name": "action", "required": true, "schema": { "type": "string", "enum": ["release", "cancel"] } },
+        { "name": "decision_id", "required": true, "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/NonzeroHash32" } },
+        { "name": "authorized_at_unix_seconds", "required": true, "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/PositiveU64String" } },
+        { "name": "expires_at_unix_seconds", "required": true, "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/PositiveU64String" } }
+      ],
+      "result": { "name": "result", "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/ApprovalPayloadResult" } },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/WithdrawalNotFound" },
+        { "$ref": "#/components/errors/WithdrawalConflict" },
+        { "$ref": "#/components/errors/CustodyFault" },
+        { "$ref": "#/components/errors/AuthorizationRequired" },
+        { "$ref": "#/components/errors/V3Required" },
+        { "$ref": "#/components/errors/InternalError" }
+      ],
+      "tags": [{ "name": "withdrawals" }]
+    },
+    {
+      "name": "releasewithdrawal",
+      "summary": "Authorize, then sign and submit, one custody v0.5 withdrawal",
+      "description": "Withdrawal credential only. First identical call durably enters release_authorized; after its anchor is externally pinned, the identical retry completes local or external signing and stores exact bytes before broadcast.",
+      "paramStructure": "by-position",
+      "params": [
+        { "name": "request_id", "required": true, "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/VisibleAsciiId" } },
+        { "name": "signed_approval", "required": true, "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/ApprovalDocument" } },
+        {
+          "name": "external_signer_responses",
+          "required": false,
+          "schema": { "type": "array", "maxItems": 128, "items": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/CanonicalBase64" } }
+        }
+      ],
+      "result": { "name": "result", "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/WithdrawalV3" } },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/OperationalLimit" },
+        { "$ref": "#/components/errors/WithdrawalConflict" },
+        { "$ref": "#/components/errors/CustodyFault" },
+        { "$ref": "#/components/errors/AuthorizationRequired" },
+        { "$ref": "#/components/errors/V3Required" },
+        { "$ref": "#/components/errors/InternalError" }
+      ],
+      "tags": [{ "name": "withdrawals" }]
+    },
+    {
+      "name": "cancelwithdrawal",
+      "summary": "Durably cancel a custody v0.5 withdrawal",
+      "description": "Withdrawal credential and custody v0.5 only. Requires an action=cancel threshold approval.",
+      "paramStructure": "by-position",
+      "params": [
+        { "name": "request_id", "required": true, "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/VisibleAsciiId" } },
+        { "name": "signed_approval", "required": true, "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/ApprovalDocument" } }
+      ],
+      "result": { "name": "result", "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/WithdrawalV3" } },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/WithdrawalConflict" },
+        { "$ref": "#/components/errors/CustodyFault" },
+        { "$ref": "#/components/errors/AuthorizationRequired" },
+        { "$ref": "#/components/errors/V3Required" },
+        { "$ref": "#/components/errors/InternalError" }
+      ],
+      "tags": [{ "name": "withdrawals" }]
+    },
+    {
+      "name": "getwithdrawalsigningpackage",
+      "summary": "Return the authorized provider-neutral signer package",
+      "description": "Withdrawal credential and custody v0.5 only. Available only after the release_authorized anchor is externally pinned and the exact persisted approval is resubmitted. The result separately binds the Prepared, approval-action, and ReleaseAuthorized anchors.",
+      "paramStructure": "by-position",
+      "params": [
+        { "name": "request_id", "required": true, "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/VisibleAsciiId" } },
+        { "name": "signed_approval", "required": true, "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/ApprovalDocument" } }
+      ],
+      "result": { "name": "result", "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/SigningPackageResult" } },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/WithdrawalNotFound" },
+        { "$ref": "#/components/errors/WithdrawalConflict" },
+        { "$ref": "#/components/errors/CustodyFault" },
+        { "$ref": "#/components/errors/AuthorizationRequired" },
+        { "$ref": "#/components/errors/V3Required" },
+        { "$ref": "#/components/errors/InternalError" }
+      ],
+      "tags": [{ "name": "withdrawals" }]
+    },
+    {
+      "name": "getwithdrawal",
+      "summary": "Observe durable withdrawal evidence and current chain/mempool status",
+      "description": "Withdrawal credential only. This read does not sign, release, broadcast, or rebroadcast.",
+      "paramStructure": "by-position",
+      "params": [
+        { "name": "request_id", "required": true, "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/VisibleAsciiId" } }
+      ],
+      "result": { "name": "result", "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/WithdrawalV3" } },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/WithdrawalNotFound" },
+        { "$ref": "#/components/errors/CustodyFault" },
+        { "$ref": "#/components/errors/AuthorizationRequired" },
+        { "$ref": "#/components/errors/InternalError" }
+      ],
+      "tags": [{ "name": "withdrawals" }]
+    },
+    {
+      "name": "getwithdrawaljournalinfo",
+      "summary": "Return current custody v0.5 anchors, policy, keyring, capacity, and health",
+      "description": "Withdrawal credential only. This is observation, not anchor repair or advancement.",
+      "paramStructure": "by-position",
+      "params": [],
+      "result": { "name": "result", "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/WithdrawalJournalInfoV3" } },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/CustodyFault" },
+        { "$ref": "#/components/errors/AuthorizationRequired" },
+        { "$ref": "#/components/errors/InternalError" }
+      ],
+      "tags": [{ "name": "withdrawals" }]
+    }
+  ],
+  "components": {
+    "errors": {
+      "ParseError": {
+        "code": -32700,
+        "message": "parse error",
+        "data": { "code": "parse_error", "retryable": false }
+      },
+      "InvalidRequest": {
+        "code": -32600,
+        "message": "invalid or unsupported request envelope",
+        "data": { "code": "invalid_request", "retryable": false }
+      },
+      "MethodNotFound": {
+        "code": -32601,
+        "message": "method not found",
+        "data": { "code": "method_not_found", "retryable": false }
+      },
+      "InvalidParams": {
+        "code": -32602,
+        "message": "parameters are invalid",
+        "data": { "code": "invalid_params", "retryable": false }
+      },
+      "BlockNotFound": {
+        "code": -32001,
+        "message": "block was not found or has no canonical frame",
+        "data": { "code": "block_not_found", "retryable": false }
+      },
+      "WatchNotFound": {
+        "code": -32001,
+        "message": "watch destination was not found",
+        "data": { "code": "watch_not_found", "retryable": false }
+      },
+      "WithdrawalNotFound": {
+        "code": -32001,
+        "message": "withdrawal request was not found",
+        "data": { "code": "withdrawal_not_found", "retryable": false }
+      },
+      "MempoolRejected": {
+        "code": -32005,
+        "message": "transaction input conflicts with the first mempool spend",
+        "data": { "code": "mempool_input_conflict", "retryable": false }
+      },
+      "OperationalLimit": {
+        "code": -32006,
+        "message": "wallet has insufficient funds for the withdrawal",
+        "data": { "code": "wallet_insufficient_funds", "retryable": false }
+      },
+      "CustodyFault": {
+        "code": -32007,
+        "message": "authenticated node storage is faulted",
+        "data": { "code": "storage_faulted", "retryable": false }
+      },
+      "ChainChanged": {
+        "code": -32008,
+        "message": "active chain changed during the deposit scan; retry the request",
+        "data": { "code": "exchange_index_chain_changed", "retryable": true }
+      },
+      "WatchConflict": {
+        "code": -32009,
+        "message": "watch label is already registered to another destination",
+        "data": { "code": "watch_label_conflict", "retryable": false }
+      },
+      "WithdrawalConflict": {
+        "code": -32009,
+        "message": "withdrawal request conflicts with its durable record",
+        "data": { "code": "withdrawal_request_conflict", "retryable": false }
+      },
+      "AuthorizationRequired": {
+        "code": -32010,
+        "message": "credential scope or withdrawal configuration does not authorize this method",
+        "data": { "code": "withdrawal_authorization_required", "retryable": false }
+      },
+      "V3Required": {
+        "code": -32011,
+        "message": "withdrawal method requires the explicit v3 custody listener",
+        "data": { "code": "withdrawal_method_requires_v3", "retryable": false }
+      },
+      "InternalError": {
+        "code": -32603,
+        "message": "internal error",
+        "data": { "code": "internal_error", "retryable": false }
+      }
+    }
+  }
+}

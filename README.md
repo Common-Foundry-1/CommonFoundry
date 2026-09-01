@@ -404,6 +404,48 @@ block is fully validated before it is indexed, the active branch is selected by
 strictly greater cumulative work, and the checksummed block log is replayed on
 startup to reconstruct forks and the active tip.
 
+Exchange integration work has a separate, default-disabled authenticated
+JSON-RPC listener for chain reads, canonical transaction broadcast, and a
+durable watch-only deposit event index. Exchanges can register labelled key
+destinations, replay block-included active-chain deposits from genesis, and
+consume explicit removal events after a reorganization. Mempool transactions
+never enter that deposit stream. An optional, separately authenticated
+withdrawal signer adds a durable request journal, permanent input reservations,
+and exact transaction replay across retries, restarts, and reorganizations. The
+v0.4 protocol never signs or broadcasts during `preparewithdrawal`: the
+exchange must persist the exact unsigned plan and copy its returned anchor to a
+separately controlled file before `releasewithdrawal` can authorize signing,
+durable release, and broadcast.
+`getwithdrawal` is observation only. Withdrawal-journal v2 uses keyed BLAKE3
+with a dedicated 32-byte key file and fails startup closed when initialized
+state is missing or does not equal or descend from the configured external
+anchor. Legacy v1 journals are refused and are not migrated automatically. The
+signer still uses the node's single in-process
+wallet key, so this remains an integration preview rather than a production
+custody wallet.
+
+An explicit v0.5 custody candidate is also available after offline v2-to-v3
+migration. It adds an authenticated encrypted keyring, action-specific
+threshold approvals and limits, durable cancellation, authorization-before-
+signing with a mandatory external `ReleaseAuthorized` pin, exact-bytes-before-
+broadcast ordering, restart replay, verified signed-approval evidence for
+migrated Released retries, canceled-record archival/compaction, and a
+provider-neutral external signer-response path. Custody inputs may be assigned
+to local keys, remote/HSM identities, or an aggregate threshold-key service;
+the node verifies exact signer capabilities, key membership, input coverage,
+and both transaction and package-authorization signatures before assembly.
+No HSM vendor, remote transport, or threshold implementation is certified, and
+the single-key consensus lock is not claimed as native on-chain multisig. See
+[Exchange custody v0.5](docs/exchange-custody-v0.5.md) for the activation,
+signer, and recovery contract.
+
+Exchange implementers should start with
+[Exchange Integration Kit v1](exchange-kit/START-HERE.md) for the OpenRPC
+contract, JSON Schemas, examples, and stable error catalog. The
+[exchange integration guide](docs/exchange-integration.md) covers the full
+operating contract, conformance tooling, security boundary, and remaining
+readiness gates.
+
 The community Devnet bootstrap is currently `107.214.187.2:18444`. Testers can
 join it by double-clicking the wallet; it is the default outbound peer. The
 wallet's **Network -> Configured peers** panel can add or remove numeric peers

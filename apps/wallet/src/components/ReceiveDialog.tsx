@@ -127,12 +127,17 @@ export function ReceiveDialog({ open, wallet, onClose }: ReceiveDialogProps) {
           </p>
         )}
 
-        <div className="warning-panel" role="note">
-          <strong className="warning-title">{wallet?.network ?? "Network"} wallet</strong>
-          <span className="warning-copy">
-            {wallet?.warning ?? "This test wallet is currently unavailable."}
-          </span>
-        </div>
+        {wallet?.insecure_demo_wallet ? (
+          <div className="security-panel" role="alert">
+            <strong className="security-title">{wallet.network} wallet</strong>
+            <span className="security-copy">{wallet.warning}</span>
+          </div>
+        ) : wallet ? (
+          <div className="wallet-context" role="note">
+            <strong>{wallet.network} wallet</strong>
+            <span>{wallet.warning}</span>
+          </div>
+        ) : null}
 
         <div className="dialog-actions dialog-actions-single">
           <button className="button-primary" type="button" onClick={onClose}>Done</button>

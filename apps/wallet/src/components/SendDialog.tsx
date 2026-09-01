@@ -314,9 +314,11 @@ export function SendDialog({
             </div>
 
             {errors.form && <p className="form-error form-error-summary" role="alert">{errors.form}</p>}
-            <p className="warning-inline" role="note">
-              {wallet?.warning ?? "Network wallet unavailable."}
-            </p>
+            {wallet?.insecure_demo_wallet ? (
+              <p className="security-inline" role="alert">{wallet.warning}</p>
+            ) : wallet ? (
+              <p className="form-help wallet-message" role="note">{wallet.warning}</p>
+            ) : null}
 
             <div className="dialog-actions">
               <button className="button-secondary" type="button" onClick={onClose}>Cancel</button>
@@ -351,7 +353,12 @@ export function SendDialog({
               </div>
             </div>
             {errors.form && <p className="form-error form-error-summary" role="alert">{errors.form}</p>}
-            <p className="warning-inline" role="note">
+            {wallet?.insecure_demo_wallet ? (
+              <p className="security-inline" role="alert">{wallet.warning}</p>
+            ) : wallet ? (
+              <p className="form-help wallet-message" role="note">{wallet.warning}</p>
+            ) : null}
+            <p className="form-help" role="note">
               {wallet?.network ?? "Network"} transaction · Verify the recipient and amount before sending.
             </p>
             <div className="dialog-actions">
@@ -398,7 +405,7 @@ export function SendDialog({
                 <strong className="review-value">{formatAtoms(result.change_atoms)} CMFD</strong>
               </div>
             </div>
-            <p className="warning-inline" role="note">This transaction is not final until mined.</p>
+            <p className="form-help" role="note">Pending confirmation: this transaction is not final until mined.</p>
             <div className="dialog-actions dialog-actions-single">
               <button className="button-primary" type="button" onClick={onClose}>Done</button>
             </div>

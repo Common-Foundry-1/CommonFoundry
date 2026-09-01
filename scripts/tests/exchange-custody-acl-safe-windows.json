@@ -1,0 +1,39 @@
+{
+  "schema": "common-foundry-exchange-custody-acl-fixture-v1",
+  "platform": "windows",
+  "identities": {
+    "service": { "configured": ".\\cmfd-node-service", "exists": true, "resolved_id": "S-1-5-21-fixture-1001" },
+    "operator": { "configured": ".\\cmfd-custody-operator", "exists": true, "resolved_id": "S-1-5-21-fixture-1002" },
+    "anchor": { "configured": ".\\cmfd-anchor-controller", "exists": true, "resolved_id": "S-1-5-21-fixture-1003" },
+    "current_process_id": "S-1-5-21-fixture-1001",
+    "current_process_is_service": true,
+    "current_process_is_privileged": false
+  },
+  "package": {
+    "root": "C:\\Program Files\\commonfoundry-rc-runtime-windows-x86_64",
+    "node": "C:\\Program Files\\commonfoundry-rc-runtime-windows-x86_64\\cmfd-node.exe",
+    "present": true,
+    "layout_matches": true,
+    "running_from_package": true,
+    "owner_id": "S-1-5-21-fixture-1002",
+    "owner_matches_operator": true,
+    "allowed_authority_ids": ["S-1-5-21-fixture-1001", "S-1-5-21-fixture-1002"],
+    "authority_allowlist_valid": true,
+    "runtime_acl_valid": true,
+    "node_sha256": "abababababababababababababababababababababababababababababababab",
+    "version": "fixture-v0.5",
+    "detail": "normalized fixture package fact"
+  },
+  "artifacts": [
+    { "name": "data_directory", "path": "C:\\ProgramData\\CommonFoundry\\node", "kind": "node_directory", "authority": "service", "present": true, "layout_valid": true, "owner_id": "S-1-5-21-fixture-1001", "owner_matches_authority": true, "allowed_authority_ids": ["S-1-5-21-fixture-1001"], "authority_allowlist_valid": true, "runtime_acl_valid": true, "detail": "normalized fixture fact" },
+    { "name": "journal_key", "path": "C:\\ProgramData\\CommonFoundry\\node-secrets\\withdrawal-journal.key", "kind": "node_secret", "authority": "service", "present": true, "layout_valid": true, "owner_id": "S-1-5-21-fixture-1001", "owner_matches_authority": true, "allowed_authority_ids": ["S-1-5-21-fixture-1001"], "authority_allowlist_valid": true, "runtime_acl_valid": true, "detail": "normalized fixture fact" },
+    { "name": "withdrawal_anchor", "path": "C:\\ProgramData\\CommonFoundryControls\\anchors\\withdrawal-anchor-v3.json", "kind": "external_control", "authority": "anchor", "present": true, "layout_valid": true, "owner_id": "S-1-5-21-fixture-1003", "owner_matches_authority": true, "allowed_authority_ids": ["S-1-5-21-fixture-1001", "S-1-5-21-fixture-1003"], "authority_allowlist_valid": true, "runtime_acl_valid": true, "detail": "normalized fixture fact" },
+    { "name": "policy", "path": "C:\\ProgramData\\CommonFoundryControls\\policy\\withdrawal-policy.json", "kind": "external_control", "authority": "operator", "present": true, "layout_valid": true, "owner_id": "S-1-5-21-fixture-1002", "owner_matches_authority": true, "allowed_authority_ids": ["S-1-5-21-fixture-1001", "S-1-5-21-fixture-1002"], "authority_allowlist_valid": true, "runtime_acl_valid": true, "detail": "normalized fixture fact" },
+    { "name": "keyring", "path": "C:\\ProgramData\\CommonFoundry\\node\\exchange-keyring.bin", "kind": "node_secret", "authority": "service", "present": true, "layout_valid": true, "owner_id": "S-1-5-21-fixture-1001", "owner_matches_authority": true, "allowed_authority_ids": ["S-1-5-21-fixture-1001"], "authority_allowlist_valid": true, "runtime_acl_valid": true, "detail": "normalized fixture fact" },
+    { "name": "keyring_anchor", "path": "C:\\ProgramData\\CommonFoundryControls\\anchors\\exchange-keyring.anchor", "kind": "external_control", "authority": "anchor", "present": true, "layout_valid": true, "owner_id": "S-1-5-21-fixture-1003", "owner_matches_authority": true, "allowed_authority_ids": ["S-1-5-21-fixture-1001", "S-1-5-21-fixture-1003"], "authority_allowlist_valid": true, "runtime_acl_valid": true, "detail": "normalized fixture fact" },
+    { "name": "wallet_passphrase", "path": "C:\\ProgramData\\CommonFoundryControls\\secrets\\wallet.passphrase", "kind": "external_secret", "authority": "operator", "present": true, "layout_valid": true, "owner_id": "S-1-5-21-fixture-1002", "owner_matches_authority": true, "allowed_authority_ids": ["S-1-5-21-fixture-1001", "S-1-5-21-fixture-1002"], "authority_allowlist_valid": true, "runtime_acl_valid": true, "detail": "normalized fixture fact" },
+    { "name": "keyring_passphrase", "path": "C:\\ProgramData\\CommonFoundryControls\\secrets\\keyring.passphrase", "kind": "external_secret", "authority": "operator", "present": true, "layout_valid": true, "owner_id": "S-1-5-21-fixture-1002", "owner_matches_authority": true, "allowed_authority_ids": ["S-1-5-21-fixture-1001", "S-1-5-21-fixture-1002"], "authority_allowlist_valid": true, "runtime_acl_valid": true, "detail": "normalized fixture fact" },
+    { "name": "integration_rpc_auth", "path": "C:\\ProgramData\\CommonFoundryControls\\secrets\\integration.auth", "kind": "external_secret", "authority": "operator", "present": true, "layout_valid": true, "owner_id": "S-1-5-21-fixture-1002", "owner_matches_authority": true, "allowed_authority_ids": ["S-1-5-21-fixture-1001", "S-1-5-21-fixture-1002"], "authority_allowlist_valid": true, "runtime_acl_valid": true, "detail": "normalized fixture fact" },
+    { "name": "withdrawal_rpc_auth", "path": "C:\\ProgramData\\CommonFoundryControls\\secrets\\withdrawal.auth", "kind": "external_secret", "authority": "operator", "present": true, "layout_valid": true, "owner_id": "S-1-5-21-fixture-1002", "owner_matches_authority": true, "allowed_authority_ids": ["S-1-5-21-fixture-1001", "S-1-5-21-fixture-1002"], "authority_allowlist_valid": true, "runtime_acl_valid": true, "detail": "normalized fixture fact" }
+  ]
+}

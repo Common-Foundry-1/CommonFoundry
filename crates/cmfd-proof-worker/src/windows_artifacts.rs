@@ -207,10 +207,7 @@ impl WindowsArtifactHandleDescriptor {
         }
     }
 
-    pub(crate) fn matches_file_identity(
-        &self,
-        expected: &cmfd_consensus::dory_v3_model_ceremony_transcript::FileIdentity,
-    ) -> bool {
+    pub(crate) fn matches_file_identity(&self, expected: &cmfd_consensus::FileIdentity) -> bool {
         self.expected_bytes == expected.bytes
             && self.expected_blake3 == expected.blake3
             && self.expected_sha256 == expected.sha256
@@ -592,8 +589,8 @@ fn hash_open_file(
 #[cfg(feature = "production-v3")]
 fn consensus_file_identity(
     identity: WindowsArtifactContentIdentity,
-) -> cmfd_consensus::dory_v3_model_ceremony_transcript::FileIdentity {
-    cmfd_consensus::dory_v3_model_ceremony_transcript::FileIdentity {
+) -> cmfd_consensus::FileIdentity {
+    cmfd_consensus::FileIdentity {
         bytes: identity.bytes,
         blake3: identity.blake3,
         sha256: identity.sha256,

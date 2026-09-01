@@ -1,0 +1,621 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commonfoundry.org/schemas/exchange-rpc-preview.json",
+  "title": "Common Foundry exchange RPC preview objects",
+  "description": "Schemas derived from the chain-preview-v0.4 chain/deposit and chain-preview-v0.5 custody implementation.",
+  "oneOf": [
+    { "$ref": "#/$defs/JsonRpcRequest" },
+    { "$ref": "#/$defs/JsonRpcSuccess" },
+    { "$ref": "#/$defs/JsonRpcError" }
+  ],
+  "$defs": {
+    "RequestId": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "number" }
+      ]
+    },
+    "Hash32": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "NonzeroHash32": {
+      "allOf": [
+        { "$ref": "#/$defs/Hash32" },
+        { "not": { "const": "0000000000000000000000000000000000000000000000000000000000000000" } }
+      ]
+    },
+    "Signature64": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{128}$"
+    },
+    "EvenLowerHex": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{2})*$"
+    },
+    "CanonicalU64String": {
+      "type": "string",
+      "pattern": "^(?:0|[1-9][0-9]{0,19})$",
+      "description": "Canonical decimal u64; values above 18446744073709551615 are rejected by the implementation."
+    },
+    "DecimalU64String": {
+      "type": "string",
+      "pattern": "^[0-9]{1,20}$",
+      "description": "Unsigned decimal u64 input. The deposit cursor parser accepts leading zeroes but rejects values above 18446744073709551615."
+    },
+    "PositiveU64String": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]{0,19}$",
+      "description": "Positive canonical decimal u64; values above 18446744073709551615 are rejected by the implementation."
+    },
+    "VisibleAsciiId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[!-~]+$"
+    },
+    "CanonicalBase64": {
+      "type": "string",
+      "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$",
+      "description": "The implementation additionally verifies decode-and-reencode byte equality."
+    },
+    "JsonRpcRequest": {
+      "type": "object",
+      "required": ["jsonrpc", "id", "method"],
+      "properties": {
+        "jsonrpc": { "const": "2.0" },
+        "id": { "$ref": "#/$defs/RequestId" },
+        "method": { "type": "string", "minLength": 1 },
+        "params": { "type": "array" }
+      },
+      "additionalProperties": false
+    },
+    "JsonRpcSuccess": {
+      "type": "object",
+      "required": ["jsonrpc", "id", "result"],
+      "properties": {
+        "jsonrpc": { "const": "2.0" },
+        "id": { "$ref": "#/$defs/RequestId" },
+        "result": true
+      },
+      "additionalProperties": false
+    },
+    "ErrorData": {
+      "type": "object",
+      "required": ["code", "retryable"],
+      "properties": {
+        "code": { "type": "string", "minLength": 1 },
+        "retryable": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "JsonRpcError": {
+      "type": "object",
+      "required": ["jsonrpc", "id", "error"],
+      "properties": {
+        "jsonrpc": { "const": "2.0" },
+        "id": {
+          "oneOf": [
+            { "$ref": "#/$defs/RequestId" },
+            { "type": "null" }
+          ]
+        },
+        "error": {
+          "type": "object",
+          "required": ["code", "message", "data"],
+          "properties": {
+            "code": { "type": "integer" },
+            "message": { "type": "string" },
+            "data": { "$ref": "#/$defs/ErrorData" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "AnchorV3": {
+      "type": "object",
+      "required": ["key_id", "journal_instance_id", "generation", "commitment"],
+      "properties": {
+        "key_id": { "$ref": "#/$defs/Hash32" },
+        "journal_instance_id": { "$ref": "#/$defs/Hash32" },
+        "generation": { "$ref": "#/$defs/CanonicalU64String" },
+        "commitment": { "$ref": "#/$defs/Hash32" }
+      },
+      "additionalProperties": false
+    },
+    "BlockchainInfo": {
+      "type": "object",
+      "required": [
+        "api_version", "chain", "network_id", "consensus_fingerprint",
+        "blocks", "headers", "bestblockhash", "chainwork",
+        "initialblockdownload", "verificationprogress", "connections",
+        "recent_reachable_peers", "peer_observation_caught_up",
+        "peer_observation_tip_match", "storage_healthy",
+        "first_block_height", "sync_basis", "warnings"
+      ],
+      "properties": {
+        "api_version": { "const": "chain-preview-v0.4" },
+        "chain": { "type": "string", "minLength": 1 },
+        "network_id": { "$ref": "#/$defs/Hash32" },
+        "consensus_fingerprint": { "$ref": "#/$defs/Hash32" },
+        "blocks": { "type": "integer", "minimum": 0 },
+        "headers": { "type": "integer", "minimum": 0 },
+        "bestblockhash": { "$ref": "#/$defs/Hash32" },
+        "chainwork": { "type": "string", "pattern": "^[0-9a-f]{128}$" },
+        "initialblockdownload": { "const": true },
+        "verificationprogress": { "type": "number", "minimum": 0, "maximum": 1 },
+        "connections": { "type": "integer", "minimum": 0 },
+        "recent_reachable_peers": { "type": "integer", "minimum": 0 },
+        "peer_observation_caught_up": { "type": "boolean" },
+        "peer_observation_tip_match": { "type": "boolean" },
+        "storage_healthy": { "type": "boolean" },
+        "first_block_height": { "const": 1 },
+        "sync_basis": { "const": "external_readiness_policy_required" },
+        "warnings": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "TransactionInput": {
+      "type": "object",
+      "required": ["txid", "vout", "witness_type"],
+      "properties": {
+        "txid": { "$ref": "#/$defs/Hash32" },
+        "vout": { "type": "integer", "minimum": 0 },
+        "witness_type": {
+          "enum": ["key", "inference_settlement", "inference_refund"]
+        }
+      },
+      "additionalProperties": false
+    },
+    "TransactionOutput": {
+      "type": "object",
+      "required": ["n", "value_atoms", "spendable_height", "lock_type", "destination_hex", "channel_id"],
+      "properties": {
+        "n": { "type": "integer", "minimum": 0 },
+        "value_atoms": { "$ref": "#/$defs/CanonicalU64String" },
+        "spendable_height": { "type": "integer", "minimum": 0 },
+        "lock_type": { "enum": ["key", "inference_channel"] },
+        "destination_hex": {
+          "oneOf": [
+            { "$ref": "#/$defs/Hash32" },
+            { "type": "null" }
+          ]
+        },
+        "channel_id": {
+          "oneOf": [
+            { "$ref": "#/$defs/Hash32" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "lock_type": { "const": "key" } } },
+          "then": {
+            "properties": {
+              "destination_hex": { "$ref": "#/$defs/Hash32" },
+              "channel_id": { "type": "null" }
+            }
+          },
+          "else": {
+            "properties": {
+              "destination_hex": { "type": "null" },
+              "channel_id": { "$ref": "#/$defs/Hash32" }
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "Transaction": {
+      "type": "object",
+      "required": ["txid", "hex", "size", "version", "network_id", "blockhash", "blockheight", "confirmations", "time", "vin", "vout"],
+      "properties": {
+        "txid": { "$ref": "#/$defs/Hash32" },
+        "hex": { "$ref": "#/$defs/EvenLowerHex" },
+        "size": { "type": "integer", "minimum": 0 },
+        "version": { "type": "integer", "minimum": 0 },
+        "network_id": { "$ref": "#/$defs/Hash32" },
+        "blockhash": {
+          "oneOf": [{ "$ref": "#/$defs/Hash32" }, { "type": "null" }]
+        },
+        "blockheight": { "type": ["integer", "null"], "minimum": 0 },
+        "confirmations": { "type": ["integer", "null"], "minimum": -1 },
+        "time": { "type": ["integer", "null"], "minimum": 0 },
+        "vin": { "type": "array", "items": { "$ref": "#/$defs/TransactionInput" } },
+        "vout": { "type": "array", "items": { "$ref": "#/$defs/TransactionOutput" } }
+      },
+      "additionalProperties": false
+    },
+    "BlockProof": {
+      "type": "object",
+      "required": ["type", "nonce", "work_digest"],
+      "properties": {
+        "type": { "enum": ["v1_legacy", "v2_reference", "v3_candidate", "v4_candidate"] },
+        "nonce": { "$ref": "#/$defs/CanonicalU64String" },
+        "work_digest": { "$ref": "#/$defs/Hash32" }
+      },
+      "additionalProperties": false
+    },
+    "Coinbase": {
+      "type": "object",
+      "required": ["height", "outpoint_txid", "vout"],
+      "properties": {
+        "height": { "type": "integer", "minimum": 1 },
+        "outpoint_txid": { "$ref": "#/$defs/Hash32" },
+        "vout": { "type": "array", "items": { "$ref": "#/$defs/TransactionOutput" } }
+      },
+      "additionalProperties": false
+    },
+    "Block": {
+      "type": "object",
+      "required": ["hash", "height", "confirmations", "active", "size", "version", "time", "previousblockhash", "nextblockhash", "merkleroot", "target", "proof", "coinbase", "tx"],
+      "properties": {
+        "hash": { "$ref": "#/$defs/Hash32" },
+        "height": { "type": "integer", "minimum": 0 },
+        "confirmations": { "type": "integer", "minimum": -1 },
+        "active": { "type": "boolean" },
+        "virtual": { "type": "boolean" },
+        "size": { "type": "integer", "minimum": 0 },
+        "version": { "type": "integer", "minimum": 0 },
+        "time": { "type": "integer", "minimum": 0 },
+        "previousblockhash": { "oneOf": [{ "$ref": "#/$defs/Hash32" }, { "type": "null" }] },
+        "nextblockhash": { "oneOf": [{ "$ref": "#/$defs/Hash32" }, { "type": "null" }] },
+        "merkleroot": { "oneOf": [{ "$ref": "#/$defs/Hash32" }, { "type": "null" }] },
+        "target": { "oneOf": [{ "$ref": "#/$defs/Hash32" }, { "type": "null" }] },
+        "proof": { "oneOf": [{ "$ref": "#/$defs/BlockProof" }, { "type": "null" }] },
+        "coinbase": { "oneOf": [{ "$ref": "#/$defs/Coinbase" }, { "type": "null" }] },
+        "tx": {
+          "anyOf": [
+            { "type": "array", "items": { "$ref": "#/$defs/Hash32" } },
+            { "type": "array", "items": { "$ref": "#/$defs/Transaction" } }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "BlockResult": {
+      "oneOf": [
+        { "$ref": "#/$defs/EvenLowerHex" },
+        { "$ref": "#/$defs/Block" }
+      ]
+    },
+    "MempoolVerboseEntry": {
+      "type": "object",
+      "required": ["size", "fee_atoms"],
+      "properties": {
+        "size": { "type": "integer", "minimum": 0 },
+        "fee_atoms": { "$ref": "#/$defs/CanonicalU64String" }
+      },
+      "additionalProperties": false
+    },
+    "MempoolResult": {
+      "oneOf": [
+        { "type": "array", "items": { "$ref": "#/$defs/Hash32" } },
+        {
+          "type": "object",
+          "propertyNames": { "pattern": "^[0-9a-f]{64}$" },
+          "additionalProperties": { "$ref": "#/$defs/MempoolVerboseEntry" }
+        }
+      ]
+    },
+    "WatchDestination": {
+      "type": "object",
+      "required": ["api_version", "label", "destination_hex", "registered_at_height", "registered_at_tip"],
+      "properties": {
+        "api_version": { "const": "chain-preview-v0.4" },
+        "label": { "$ref": "#/$defs/VisibleAsciiId" },
+        "destination_hex": { "$ref": "#/$defs/Hash32" },
+        "registered_at_height": { "type": "integer", "minimum": 0 },
+        "registered_at_tip": { "$ref": "#/$defs/Hash32" }
+      },
+      "additionalProperties": false
+    },
+    "WatchRegistrationParameter": {
+      "type": "object",
+      "required": ["label", "destination_hex"],
+      "properties": {
+        "label": { "$ref": "#/$defs/VisibleAsciiId" },
+        "destination_hex": { "$ref": "#/$defs/Hash32" }
+      },
+      "additionalProperties": false
+    },
+    "WatchRegistrationBatchResult": {
+      "type": "object",
+      "required": ["api_version", "registration_count", "registrations"],
+      "properties": {
+        "api_version": { "const": "chain-preview-v0.4" },
+        "registration_count": { "type": "integer", "minimum": 1, "maximum": 1000 },
+        "registrations": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1000,
+          "items": { "$ref": "#/$defs/WatchDestination" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "ExchangeInfo": {
+      "type": "object",
+      "required": ["api_version", "service", "status", "production_ready", "network_id", "consensus_fingerprint", "custody", "encodings", "methods", "deposit_index"],
+      "properties": {
+        "api_version": { "const": "chain-preview-v0.4" },
+        "service": { "const": "common-foundry-exchange-rpc" },
+        "status": { "const": "integration_preview" },
+        "production_ready": { "const": false },
+        "network_id": { "$ref": "#/$defs/Hash32" },
+        "consensus_fingerprint": { "$ref": "#/$defs/Hash32" },
+        "custody": {
+          "type": "object",
+          "required": ["mode", "api_version", "separate_withdrawal_credential", "external_signer_protocol"],
+          "properties": {
+            "mode": { "enum": ["disabled", "v0.4-preview", "v0.5-policy-keyring"] },
+            "api_version": {
+              "type": ["string", "null"],
+              "enum": ["chain-preview-v0.4", "chain-preview-v0.5", null]
+            },
+            "separate_withdrawal_credential": { "const": true },
+            "external_signer_protocol": { "const": "CMFDSIG1-v1-provider-neutral" }
+          },
+          "additionalProperties": false
+        },
+        "encodings": {
+          "type": "object",
+          "required": ["amounts", "destination", "checksummed_address_available"],
+          "properties": {
+            "amounts": { "const": "canonical unsigned decimal atom strings" },
+            "destination": { "const": "64 lowercase hexadecimal characters encoding a 32-byte x-only secp256k1 public key" },
+            "checksummed_address_available": { "const": false }
+          },
+          "additionalProperties": false
+        },
+        "methods": {
+          "type": "object",
+          "required": ["integration", "withdrawal"],
+          "properties": {
+            "integration": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+            "withdrawal": { "type": "array", "items": { "type": "string" }, "uniqueItems": true }
+          },
+          "additionalProperties": false
+        },
+        "deposit_index": {
+          "type": "object",
+          "required": ["healthy", "indexed_tip", "high_watermark", "capacity"],
+          "properties": {
+            "healthy": { "const": true },
+            "indexed_tip": {
+              "type": "object",
+              "required": ["height", "hash"],
+              "properties": {
+                "height": { "type": "integer", "minimum": 0 },
+                "hash": { "$ref": "#/$defs/Hash32" }
+              },
+              "additionalProperties": false
+            },
+            "high_watermark": { "$ref": "#/$defs/CanonicalU64String" },
+            "capacity": {
+              "type": "object",
+              "required": ["watch_destination_count", "watch_destination_limit", "watch_destination_remaining", "active_deposit_count", "active_deposit_limit", "deposit_event_limit", "registration_batch_limit", "event_page_limit"],
+              "properties": {
+                "watch_destination_count": { "$ref": "#/$defs/CanonicalU64String" },
+                "watch_destination_limit": { "const": "100000" },
+                "watch_destination_remaining": { "$ref": "#/$defs/CanonicalU64String" },
+                "active_deposit_count": { "$ref": "#/$defs/CanonicalU64String" },
+                "active_deposit_limit": { "const": "1000000" },
+                "deposit_event_limit": { "const": "1000000" },
+                "registration_batch_limit": { "const": "1000" },
+                "event_page_limit": { "const": "1000" }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "DepositEvent": {
+      "type": "object",
+      "required": ["cursor", "added_cursor", "kind", "label", "destination_hex", "txid", "vout", "value_atoms", "spendable_height", "coinbase", "blockhash", "blockheight", "blocktime"],
+      "properties": {
+        "cursor": { "$ref": "#/$defs/PositiveU64String" },
+        "added_cursor": { "$ref": "#/$defs/PositiveU64String" },
+        "kind": { "enum": ["deposit_added", "deposit_removed"] },
+        "label": { "$ref": "#/$defs/VisibleAsciiId" },
+        "destination_hex": { "$ref": "#/$defs/Hash32" },
+        "txid": { "$ref": "#/$defs/Hash32" },
+        "vout": { "type": "integer", "minimum": 0 },
+        "value_atoms": { "$ref": "#/$defs/CanonicalU64String" },
+        "spendable_height": { "type": "integer", "minimum": 0 },
+        "coinbase": { "type": "boolean" },
+        "blockhash": { "$ref": "#/$defs/Hash32" },
+        "blockheight": { "type": "integer", "minimum": 1 },
+        "blocktime": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "DepositEventPage": {
+      "type": "object",
+      "required": ["api_version", "network_id", "consensus_fingerprint", "indexed_tip", "events", "next_cursor", "high_watermark", "has_more"],
+      "properties": {
+        "api_version": { "const": "chain-preview-v0.4" },
+        "network_id": { "$ref": "#/$defs/Hash32" },
+        "consensus_fingerprint": { "$ref": "#/$defs/Hash32" },
+        "indexed_tip": {
+          "type": "object",
+          "required": ["height", "hash"],
+          "properties": {
+            "height": { "type": "integer", "minimum": 0 },
+            "hash": { "$ref": "#/$defs/Hash32" }
+          },
+          "additionalProperties": false
+        },
+        "events": { "type": "array", "items": { "$ref": "#/$defs/DepositEvent" } },
+        "next_cursor": { "$ref": "#/$defs/CanonicalU64String" },
+        "high_watermark": { "$ref": "#/$defs/CanonicalU64String" },
+        "has_more": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "ReservedInput": {
+      "type": "object",
+      "required": ["txid", "vout", "value_atoms"],
+      "properties": {
+        "txid": { "$ref": "#/$defs/Hash32" },
+        "vout": { "type": "integer", "minimum": 0 },
+        "value_atoms": { "$ref": "#/$defs/CanonicalU64String" }
+      },
+      "additionalProperties": false
+    },
+    "ApprovalSignature": {
+      "type": "object",
+      "required": ["public_key", "signature"],
+      "properties": {
+        "public_key": { "$ref": "#/$defs/Hash32" },
+        "signature": { "$ref": "#/$defs/Signature64" }
+      },
+      "additionalProperties": false
+    },
+    "ApprovalDocument": {
+      "type": "object",
+      "required": ["schema", "action", "decision_id", "policy_id", "action_anchor", "request_id", "request_digest", "transaction_signing_digest", "authorized_at_unix_seconds", "expires_at_unix_seconds", "signatures"],
+      "properties": {
+        "schema": { "const": "common-foundry-exchange-withdrawal-approval-v1" },
+        "action": { "enum": ["release", "cancel"] },
+        "decision_id": { "$ref": "#/$defs/NonzeroHash32" },
+        "policy_id": { "$ref": "#/$defs/NonzeroHash32" },
+        "action_anchor": { "$ref": "#/$defs/AnchorV3" },
+        "request_id": { "$ref": "#/$defs/VisibleAsciiId" },
+        "request_digest": { "$ref": "#/$defs/NonzeroHash32" },
+        "transaction_signing_digest": { "$ref": "#/$defs/NonzeroHash32" },
+        "authorized_at_unix_seconds": { "$ref": "#/$defs/PositiveU64String" },
+        "expires_at_unix_seconds": { "$ref": "#/$defs/PositiveU64String" },
+        "signatures": { "type": "array", "maxItems": 32, "items": { "$ref": "#/$defs/ApprovalSignature" } }
+      },
+      "additionalProperties": false
+    },
+    "WithdrawalV3": {
+      "type": "object",
+      "required": ["api_version", "anchor", "prepared_anchor", "journal_key_id", "journal_instance_id", "journal_generation", "journal_commitment", "request_id", "request_digest", "destination_hex", "amount_atoms", "fee_atoms", "change_atoms", "reserved_inputs", "signing_digest", "signer_package_digest", "signer_package_bytes_digest", "terminal_action", "decision_id", "approval_digest", "action_anchor", "authorized_at_unix_seconds", "accounted_at_unix_seconds", "txid", "transaction_hex", "phase", "status", "confirmations", "broadcast_retryable", "custody_model"],
+      "properties": {
+        "api_version": { "const": "chain-preview-v0.5" },
+        "anchor": { "$ref": "#/$defs/AnchorV3" },
+        "prepared_anchor": { "oneOf": [{ "$ref": "#/$defs/AnchorV3" }, { "type": "null" }] },
+        "journal_key_id": { "$ref": "#/$defs/Hash32" },
+        "journal_instance_id": { "$ref": "#/$defs/Hash32" },
+        "journal_generation": { "$ref": "#/$defs/CanonicalU64String" },
+        "journal_commitment": { "$ref": "#/$defs/Hash32" },
+        "request_id": { "$ref": "#/$defs/VisibleAsciiId" },
+        "request_digest": { "$ref": "#/$defs/Hash32" },
+        "destination_hex": { "$ref": "#/$defs/Hash32" },
+        "amount_atoms": { "$ref": "#/$defs/CanonicalU64String" },
+        "fee_atoms": { "$ref": "#/$defs/CanonicalU64String" },
+        "change_atoms": { "$ref": "#/$defs/CanonicalU64String" },
+        "reserved_inputs": { "type": "array", "items": { "$ref": "#/$defs/ReservedInput" } },
+        "signing_digest": { "$ref": "#/$defs/Hash32" },
+        "signer_package_digest": { "oneOf": [{ "$ref": "#/$defs/Hash32" }, { "type": "null" }] },
+        "signer_package_bytes_digest": { "oneOf": [{ "$ref": "#/$defs/Hash32" }, { "type": "null" }] },
+        "terminal_action": { "type": ["string", "null"], "enum": ["release", "cancel", null] },
+        "decision_id": { "oneOf": [{ "$ref": "#/$defs/Hash32" }, { "type": "null" }] },
+        "approval_digest": { "oneOf": [{ "$ref": "#/$defs/Hash32" }, { "type": "null" }] },
+        "action_anchor": { "oneOf": [{ "$ref": "#/$defs/AnchorV3" }, { "type": "null" }] },
+        "authorized_at_unix_seconds": { "oneOf": [{ "$ref": "#/$defs/CanonicalU64String" }, { "type": "null" }] },
+        "accounted_at_unix_seconds": { "oneOf": [{ "$ref": "#/$defs/CanonicalU64String" }, { "type": "null" }] },
+        "txid": { "oneOf": [{ "$ref": "#/$defs/Hash32" }, { "type": "null" }] },
+        "transaction_hex": { "oneOf": [{ "$ref": "#/$defs/EvenLowerHex" }, { "type": "null" }] },
+        "phase": { "enum": ["intent", "prepared", "release_authorized", "released", "canceled"] },
+        "status": { "enum": ["intent", "prepared", "release_authorized", "broadcast_pending", "in_mempool", "confirmed", "conflicted", "canceled"] },
+        "confirmations": { "oneOf": [{ "$ref": "#/$defs/CanonicalU64String" }, { "type": "null" }] },
+        "broadcast_retryable": { "type": "boolean" },
+        "custody_model": { "const": "keyring-routed local/external signing with action-specific threshold approvals; external signer deployment requires operator qualification" }
+      },
+      "additionalProperties": false
+    },
+    "ApprovalPayloadResult": {
+      "type": "object",
+      "required": ["api_version", "action", "decision_id", "action_anchor", "signing_digest", "approval_document", "approval_document_base64"],
+      "properties": {
+        "api_version": { "const": "chain-preview-v0.5" },
+        "action": { "enum": ["release", "cancel"] },
+        "decision_id": { "$ref": "#/$defs/NonzeroHash32" },
+        "action_anchor": { "$ref": "#/$defs/AnchorV3" },
+        "signing_digest": { "$ref": "#/$defs/Hash32" },
+        "approval_document": { "$ref": "#/$defs/ApprovalDocument" },
+        "approval_document_base64": { "$ref": "#/$defs/CanonicalBase64" }
+      },
+      "additionalProperties": false
+    },
+    "SigningPackageResult": {
+      "type": "object",
+      "required": ["api_version", "request_id", "request_digest", "current_anchor", "prepared_anchor", "approval_action_anchor", "signing_digest", "signer_package_digest", "signer_package_bytes_digest", "signer_package_base64", "release_authorization"],
+      "properties": {
+        "api_version": { "const": "chain-preview-v0.5" },
+        "request_id": { "$ref": "#/$defs/VisibleAsciiId" },
+        "request_digest": { "$ref": "#/$defs/Hash32" },
+        "current_anchor": { "$ref": "#/$defs/AnchorV3" },
+        "prepared_anchor": { "oneOf": [{ "$ref": "#/$defs/AnchorV3" }, { "type": "null" }] },
+        "approval_action_anchor": { "$ref": "#/$defs/AnchorV3" },
+        "signing_digest": { "$ref": "#/$defs/Hash32" },
+        "signer_package_digest": { "$ref": "#/$defs/Hash32" },
+        "signer_package_bytes_digest": { "oneOf": [{ "$ref": "#/$defs/Hash32" }, { "type": "null" }] },
+        "signer_package_base64": { "$ref": "#/$defs/CanonicalBase64" },
+        "release_authorization": {
+          "type": "object",
+          "required": ["release_authorized_anchor", "decision_id", "approval_digest", "release_authorization_digest", "signed_approval"],
+          "properties": {
+            "release_authorized_anchor": { "$ref": "#/$defs/AnchorV3" },
+            "decision_id": { "$ref": "#/$defs/Hash32" },
+            "approval_digest": { "$ref": "#/$defs/Hash32" },
+            "release_authorization_digest": { "$ref": "#/$defs/Hash32" },
+            "signed_approval": { "$ref": "#/$defs/ApprovalDocument" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "WithdrawalJournalInfoV3": {
+      "type": "object",
+      "required": ["api_version", "anchor", "external_anchor", "anchor_relationship", "policy_id", "active_keyring", "policy_time_watermark_unix_seconds", "policy_release_event_count", "capacity", "redundancy_degraded", "faulted"],
+      "properties": {
+        "api_version": { "const": "chain-preview-v0.5" },
+        "anchor": { "$ref": "#/$defs/AnchorV3" },
+        "external_anchor": { "$ref": "#/$defs/AnchorV3" },
+        "anchor_relationship": { "enum": ["current", "descendant"] },
+        "policy_id": { "$ref": "#/$defs/Hash32" },
+        "active_keyring": {
+          "type": "object",
+          "required": ["instance_id", "generation", "commitment"],
+          "properties": {
+            "instance_id": { "$ref": "#/$defs/Hash32" },
+            "generation": { "$ref": "#/$defs/CanonicalU64String" },
+            "commitment": { "$ref": "#/$defs/Hash32" }
+          },
+          "additionalProperties": false
+        },
+        "policy_time_watermark_unix_seconds": { "$ref": "#/$defs/CanonicalU64String" },
+        "policy_release_event_count": { "$ref": "#/$defs/CanonicalU64String" },
+        "capacity": {
+          "type": "object",
+          "required": ["live_record_count", "live_record_limit", "tombstone_count", "tombstone_limit", "commitment_count", "commitment_limit", "estimated_full_release_capacity_remaining", "warning", "warning_threshold_full_releases"],
+          "properties": {
+            "live_record_count": { "$ref": "#/$defs/CanonicalU64String" },
+            "live_record_limit": { "$ref": "#/$defs/CanonicalU64String" },
+            "tombstone_count": { "$ref": "#/$defs/CanonicalU64String" },
+            "tombstone_limit": { "$ref": "#/$defs/CanonicalU64String" },
+            "commitment_count": { "$ref": "#/$defs/CanonicalU64String" },
+            "commitment_limit": { "$ref": "#/$defs/CanonicalU64String" },
+            "estimated_full_release_capacity_remaining": { "$ref": "#/$defs/CanonicalU64String" },
+            "warning": { "type": "boolean" },
+            "warning_threshold_full_releases": { "const": "1024" }
+          },
+          "additionalProperties": false
+        },
+        "redundancy_degraded": { "type": "boolean" },
+        "faulted": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

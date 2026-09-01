@@ -1,0 +1,244 @@
+{
+  "schema_version": "common-foundry-exchange-error-catalog-v1",
+  "api_versions": ["chain-preview-v0.4", "chain-preview-v0.5"],
+  "routing_key": ["error.code", "error.data.code"],
+  "notes": [
+    "HTTP 401 is an authentication failure outside the authenticated JSON-RPC error contract.",
+    "Authenticated JSON-RPC failures return HTTP 200.",
+    "The ordered pair (error.code, error.data.code) is the routing key; each pair has one handling rule.",
+    "Messages are diagnostic text and are not routing keys.",
+    "retryable=true authorizes only an unchanged retry after the transient condition clears.",
+    "Underlying node failures not reachable in an ordinary exchange workflow may retain their NodeError client code and map to -32603."
+  ],
+  "groups": [
+    {
+      "scope": ["request-envelope"],
+      "jsonrpc_code": -32700,
+      "retryable": false,
+      "data_codes": ["parse_error"],
+      "meaning": "The request body is not valid JSON.",
+      "action": "Correct the serializer; do not retry the same bytes."
+    },
+    {
+      "scope": ["request-envelope"],
+      "jsonrpc_code": -32600,
+      "retryable": false,
+      "data_codes": ["invalid_request", "batch_unsupported", "notification_unsupported"],
+      "meaning": "The JSON-RPC envelope is invalid or uses an unsupported batch or notification form.",
+      "action": "Send one JSON object with jsonrpc 2.0 and a string or numeric id."
+    },
+    {
+      "scope": ["all-authenticated"],
+      "jsonrpc_code": -32601,
+      "retryable": false,
+      "data_codes": ["method_not_found"],
+      "meaning": "The method is not implemented on this listener.",
+      "action": "Stop and compare getexchangeinfo with the pinned binary and kit."
+    },
+    {
+      "scope": ["all-authenticated"],
+      "jsonrpc_code": -32602,
+      "retryable": false,
+      "data_codes": [
+        "invalid_params",
+        "invalid_watch_label",
+        "invalid_watch_destination",
+        "invalid_watch_registration_batch",
+        "duplicate_watch_batch_label",
+        "duplicate_watch_batch_destination",
+        "invalid_deposit_event_page_limit",
+        "deposit_cursor_ahead",
+        "invalid_withdrawal_request_id",
+        "invalid_withdrawal_destination",
+        "invalid_withdrawal_amount",
+        "withdrawal_amount_overflow",
+        "invalid_exchange_withdrawal_policy",
+        "invalid_withdrawal_approval",
+        "invalid_withdrawal_request"
+      ],
+      "meaning": "A positional parameter, bounded batch, destination, amount, policy, or approval document is invalid.",
+      "action": "Correct the request from authoritative exchange state; do not retry unchanged."
+    },
+    {
+      "scope": ["chain", "deposits", "withdrawals"],
+      "jsonrpc_code": -32001,
+      "retryable": false,
+      "data_codes": ["block_not_found", "watch_not_found", "withdrawal_not_found"],
+      "meaning": "The requested active-chain block, label, or durable withdrawal does not exist.",
+      "action": "Reconcile the identifier and current active-chain or durable state."
+    },
+    {
+      "scope": ["sendrawtransaction"],
+      "jsonrpc_code": -32005,
+      "retryable": false,
+      "data_codes": [
+        "mempool_input_conflict",
+        "mempool_unconfirmed_input",
+        "mempool_fee_too_low",
+        "duplicate_mempool_transaction",
+        "chain_rejected"
+      ],
+      "meaning": "The exact transaction is not admissible. Duplicate transactions normally return success; the code remains cataloged for passthrough compatibility.",
+      "action": "Do not mutate signed bytes. Investigate conflict, inputs, fee, or consensus rejection."
+    },
+    {
+      "scope": ["sendrawtransaction"],
+      "jsonrpc_code": -32005,
+      "retryable": true,
+      "data_codes": ["mempool_transaction_limit", "mempool_byte_limit", "chain_temporarily_rejected"],
+      "meaning": "A transient admission capacity or chain-time condition rejected the transaction.",
+      "action": "Retry the identical canonical transaction after the condition clears."
+    },
+    {
+      "scope": ["withdrawals"],
+      "jsonrpc_code": -32006,
+      "retryable": true,
+      "data_codes": ["wallet_funds_immature"],
+      "meaning": "Owned funds exist but are not yet spendable.",
+      "action": "Wait for maturity, then retry the identical request."
+    },
+    {
+      "scope": ["withdrawals"],
+      "jsonrpc_code": -32006,
+      "retryable": false,
+      "data_codes": [
+        "wallet_insufficient_funds",
+        "wallet_input_limit",
+        "mempool_fee_too_low",
+        "withdrawal_single_amount_limit_exceeded",
+        "withdrawal_single_fee_limit_exceeded",
+        "withdrawal_single_debit_limit_exceeded",
+        "withdrawal_rolling_24h_debit_limit_exceeded",
+        "withdrawal_rolling_24h_count_limit_exceeded"
+      ],
+      "meaning": "Funding, fee, input, or configured custody policy prevents this withdrawal.",
+      "action": "Stop automated release and reconcile available funds or approved policy."
+    },
+    {
+      "scope": ["deposits", "withdrawals", "chain-storage"],
+      "jsonrpc_code": -32007,
+      "retryable": false,
+      "data_codes": [
+        "storage_faulted",
+        "corrupt_block_log",
+        "storage_io",
+        "exchange_index_io",
+        "exchange_index_corrupt",
+        "exchange_index_binding_mismatch",
+        "exchange_index_faulted",
+        "exchange_index_capacity",
+        "exchange_withdrawal_io",
+        "exchange_withdrawal_corrupt",
+        "exchange_withdrawal_binding_mismatch",
+        "exchange_withdrawal_wallet_mismatch",
+        "exchange_withdrawal_faulted",
+        "exchange_withdrawal_capacity",
+        "exchange_withdrawal_security_required",
+        "invalid_exchange_withdrawal_journal_key",
+        "insecure_exchange_withdrawal_journal_key_permissions",
+        "exchange_withdrawal_anchor_inside_data_dir",
+        "invalid_exchange_withdrawal_anchor",
+        "exchange_withdrawal_anchor_mismatch",
+        "exchange_withdrawal_v1_migration_required",
+        "exchange_custody_v3_faulted",
+        "exchange_custody_v3_migration_required",
+        "exchange_custody_v3_storage",
+        "exchange_custody_v3_engine",
+        "exchange_custody_v3_keyring",
+        "exchange_custody_v3_signing_protocol",
+        "exchange_custody_v3_binding_mismatch",
+        "exchange_custody_v3_wallet_mismatch",
+        "exchange_custody_v3_released_transaction_invalid",
+        "exchange_withdrawal_policy_binding_mismatch",
+        "exchange_withdrawal_policy_state_corrupt",
+        "exchange_withdrawal_clock_regression",
+        "withdrawal_policy_release_already_counted",
+        "withdrawal_approval_policy_mismatch",
+        "withdrawal_approval_action_mismatch",
+        "withdrawal_approval_request_mismatch",
+        "withdrawal_approval_transaction_signing_digest_mismatch",
+        "withdrawal_approval_anchor_mismatch",
+        "withdrawal_approval_time_range_invalid",
+        "withdrawal_approval_validity_too_long",
+        "withdrawal_approval_not_yet_valid",
+        "withdrawal_approval_expired",
+        "withdrawal_approval_signer_unauthorized",
+        "withdrawal_approval_threshold_not_met",
+        "withdrawal_approval_signature_invalid",
+        "shared_node_poisoned"
+      ],
+      "meaning": "Authenticated storage, runtime binding, keyring, signing evidence, policy state, or authorization validation failed.",
+      "action": "Hard stop the affected custody workflow, preserve files and logs byte-for-byte, and follow the documented recovery case."
+    },
+    {
+      "scope": ["withdrawals"],
+      "jsonrpc_code": -32007,
+      "retryable": true,
+      "data_codes": ["exchange_custody_v3_busy"],
+      "meaning": "Another process currently holds the custody storage lock.",
+      "action": "Remove the unintended concurrent operator, then retry the identical operation."
+    },
+    {
+      "scope": ["getexchangeinfo", "registerwatchdestination", "registerwatchdestinations", "getdepositevents"],
+      "jsonrpc_code": -32008,
+      "retryable": true,
+      "data_codes": ["exchange_index_chain_changed"],
+      "meaning": "The active chain changed while a deposit-index scan was being prepared.",
+      "action": "Retry the identical operation from the exchange's last committed cursor or registration set."
+    },
+    {
+      "scope": ["deposits", "withdrawals"],
+      "jsonrpc_code": -32009,
+      "retryable": false,
+      "data_codes": [
+        "watch_label_conflict",
+        "watch_destination_conflict",
+        "withdrawal_request_conflict",
+        "withdrawal_not_prepared",
+        "withdrawal_prepared_anchor_mismatch",
+        "withdrawal_prepared_pending",
+        "withdrawal_invalid_phase",
+        "withdrawal_terminal_conflict",
+        "withdrawal_canceled",
+        "withdrawal_signer_package_unavailable",
+        "withdrawal_signing_not_authorized",
+        "withdrawal_signer_response_invalid",
+        "withdrawal_plan_revalidation_failed",
+        "exchange_custody_v3_anchor_mismatch"
+      ],
+      "meaning": "The call conflicts with immutable registration, durable request identity, phase, independently pinned anchor, or signer evidence.",
+      "action": "Stop and reconcile exact durable state. Never replace the request, anchor, approval, or transaction speculatively."
+    },
+    {
+      "scope": ["credential-boundary"],
+      "jsonrpc_code": -32010,
+      "retryable": false,
+      "data_codes": ["withdrawal_authorization_required", "withdrawals_disabled", "withdrawal_scope_only"],
+      "meaning": "The credential scope or listener configuration does not authorize this method.",
+      "action": "Correct credential routing or explicitly provision withdrawals; do not collapse the two credential scopes."
+    },
+    {
+      "scope": ["withdrawals"],
+      "jsonrpc_code": -32011,
+      "retryable": false,
+      "data_codes": ["withdrawal_method_requires_v3"],
+      "meaning": "The requested withdrawal method is not available on the legacy v0.4 backend.",
+      "action": "Stop and complete explicit v3 migration and qualification."
+    },
+    {
+      "scope": ["internal-locks", "internal-invariants"],
+      "jsonrpc_code": -32603,
+      "retryable": false,
+      "data_codes": [
+        "internal_error",
+        "exchange_index_poisoned",
+        "exchange_withdrawal_poisoned",
+        "exchange_custody_v3_poisoned",
+        "exchange_custody_v3_internal",
+        "shared_node_poisoned"
+      ],
+      "meaning": "An internal invariant or in-process state lock failed.",
+      "action": "Stop the affected workflow and preserve the complete node logs for investigation."
+    }
+  ]
+}

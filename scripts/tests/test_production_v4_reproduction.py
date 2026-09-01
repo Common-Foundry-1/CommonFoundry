@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import blake3
 
@@ -62,6 +63,62 @@ class ReproductionEvidenceTests(unittest.TestCase):
                 reproduction.ReproductionError, "derived values mismatch"
             ):
                 reproduction.verify_core_vector(copied_root)
+
+    def test_testnet_template_network_matches_authenticated_manifest(self) -> None:
+        reproduction._require_testnet_template_network(
+            {"network_id": bytes.fromhex(reproduction.EXPECTED_NETWORK_ID)},
+            {"network_id": reproduction.EXPECTED_NETWORK_ID},
+        )
+
+    def test_report_rejects_rcnet_template_before_proof_verification(self) -> None:
+        rcnet_network_id = bytes.fromhex(
+            "3e99d45959c19c0053d8e9fef34875b57b46a8a1ce330637daddab515bc7b92d"
+        )
+        with (
+            mock.patch.object(reproduction, "toolchain_versions", return_value={}),
+            mock.patch.object(reproduction, "verify_frozen_spec", return_value={}),
+            mock.patch.object(reproduction, "verify_core_vector", return_value={}),
+            mock.patch.object(
+                reproduction,
+                "verify_artifacts",
+                return_value=({"network_id": reproduction.EXPECTED_NETWORK_ID}, []),
+            ),
+            mock.patch.object(
+                reproduction,
+                "parse_template",
+                return_value=({"network_id": rcnet_network_id}, {}),
+            ),
+            mock.patch.object(reproduction, "verify") as verifier,
+        ):
+            with self.assertRaisesRegex(
+                reproduction.ReproductionError, "authenticated input manifest"
+            ):
+                reproduction.build_report(
+                    repo_root=Path("unused-repo"),
+                    source_commit="a" * 40,
+                    operator="independent-reproducer",
+                    input_manifest=Path("unused-input-manifest.json"),
+                    model_bank=Path("unused-model-bank"),
+                    fixed_record=Path("unused-fixed-record.json"),
+                    artifact_dir=Path("unused-artifacts"),
+                    template=Path("unused-template.json"),
+                    proof=Path("unused-proof.bin"),
+                    fresh_generation_attested=False,
+                    generation_commands=[],
+                )
+            verifier.assert_not_called()
+
+    def test_matching_rcnet_template_and_manifest_are_not_testnet_qualification(self) -> None:
+        rcnet_network_id = (
+            "3e99d45959c19c0053d8e9fef34875b57b46a8a1ce330637daddab515bc7b92d"
+        )
+        with self.assertRaisesRegex(
+            reproduction.ReproductionError, "qualified Testnet-1 network"
+        ):
+            reproduction._require_testnet_template_network(
+                {"network_id": bytes.fromhex(rcnet_network_id)},
+                {"network_id": rcnet_network_id},
+            )
 
 
 if __name__ == "__main__":

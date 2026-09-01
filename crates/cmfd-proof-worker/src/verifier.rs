@@ -9,9 +9,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use cmfd_consensus::{
-    Block, ConsensusPowVerifier, ExternalPreverificationBinding, MAX_BLOCK_BYTES,
-    PreverifiedBlockProof, decode_block, dory_v3_model_ceremony_transcript::FileIdentity,
-    encode_block, v2_reference_for_network,
+    Block, ConsensusPowVerifier, ExternalPreverificationBinding, FileIdentity, MAX_BLOCK_BYTES,
+    PreverifiedBlockProof, decode_block, encode_block, v2_reference_for_network,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;

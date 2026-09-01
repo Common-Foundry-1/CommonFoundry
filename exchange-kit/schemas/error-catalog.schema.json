@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commonfoundry.org/schemas/exchange-error-catalog-v1.json",
+  "title": "Common Foundry exchange error catalog",
+  "type": "object",
+  "required": ["schema_version", "api_versions", "routing_key", "notes", "groups"],
+  "properties": {
+    "schema_version": { "const": "common-foundry-exchange-error-catalog-v1" },
+    "api_versions": {
+      "type": "array",
+      "const": ["chain-preview-v0.4", "chain-preview-v0.5"]
+    },
+    "routing_key": {
+      "type": "array",
+      "const": ["error.code", "error.data.code"]
+    },
+    "notes": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "groups": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["scope", "jsonrpc_code", "retryable", "data_codes", "meaning", "action"],
+        "properties": {
+          "scope": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "minLength": 1 },
+            "uniqueItems": true
+          },
+          "jsonrpc_code": {
+            "type": "integer",
+            "enum": [-32700, -32600, -32601, -32602, -32001, -32005, -32006, -32007, -32008, -32009, -32010, -32011, -32603]
+          },
+          "retryable": { "type": "boolean" },
+          "data_codes": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+            "uniqueItems": true
+          },
+          "meaning": { "type": "string", "minLength": 1 },
+          "action": { "type": "string", "minLength": 1 }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

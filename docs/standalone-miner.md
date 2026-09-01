@@ -82,6 +82,13 @@ see [Release identity guards](release-integrity.md).
 
 ## Direct commands
 
+Print the canonical network/profile and proof selection compiled into the miner without opening
+CUDA or proof artifacts:
+
+```text
+cmfd-miner network-info
+```
+
 List devices:
 
 ```text

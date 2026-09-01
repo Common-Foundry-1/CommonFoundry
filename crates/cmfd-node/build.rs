@@ -19,6 +19,7 @@ fn main() {
         println!("cargo:rerun-if-env-changed={variable}");
     }
     println!("cargo:rerun-if-changed=release_gate.rs");
+    println!("cargo:rerun-if-changed=production_v4_activation_pin.inc.rs");
     println!("cargo:rerun-if-changed=src/network_profile.rs");
 
     let mutually_exclusive_profiles = [
@@ -47,7 +48,6 @@ fn main() {
             network_id: network.network_id,
             virtual_genesis_hash: network.virtual_genesis_hash,
             virtual_genesis_timestamp: network.virtual_genesis_timestamp,
-            bootstrap_ipv4: network.bootstrap_ipv4.octets(),
             pow_limit: network.pow_limit,
             steward_reward_destination: network.rewards.steward,
             community_reward_destination: network.rewards.community,

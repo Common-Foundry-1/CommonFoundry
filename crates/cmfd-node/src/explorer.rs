@@ -360,9 +360,11 @@ mod tests {
 
     #[test]
     fn explorer_limits_are_bounded() {
-        assert!(EXPLORER_BLOCK_LIMIT <= 32);
-        assert!(EXPLORER_TRANSACTION_LIMIT <= 64);
-        assert!(EXPLORER_TRANSACTION_LOOKBACK <= 4_096);
+        const {
+            assert!(EXPLORER_BLOCK_LIMIT <= 32);
+            assert!(EXPLORER_TRANSACTION_LIMIT <= 64);
+            assert!(EXPLORER_TRANSACTION_LOOKBACK <= 4_096);
+        }
     }
 
     #[test]

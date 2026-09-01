@@ -13,16 +13,19 @@ The source tree now gives RCNet-1 the correct proof shape:
 - proof and block envelopes: the ProductionV4 network-specific limits
 - node, miner, wallet, and pool runtime: shared ProductionV4 feature
 
-The `production-rc` feature deliberately does not contain launch identities.
-It stops in `cmfd-node/build.rs` before a runnable binary is produced. At the
-time of this revision the first blocker is:
+The canonical `CMFD_RCNET_LAUNCH_CANDIDATE_V2` has now been generated and its
+network identity is pinned into the `production-rc` profile. The build still
+stops in `cmfd-node/build.rs` before a runnable binary is produced. At the time
+of this revision the first blocker is:
 
 ```text
-production RC build gate: production RC network identity pin is absent
+production RC build gate: ProductionV4 activation evidence is absent
 ```
 
-This is expected. Real launch values may enter source only after the decisions
-and reproduction checks below are complete.
+This is expected. The identity pin is not activation evidence and does not
+qualify a package, a seed host, reward-key custody, or RCNet operations. The
+missing activation record may be populated only from the completed independent
+reproduction and fresh-process verification outputs described below.
 
 ## Frozen ProductionV4 proof surface
 
@@ -53,22 +56,71 @@ The frozen core vector binds:
 Changing any of these is a new proof-system revision, not an RC packaging
 change.
 
-## Launch identities that remain to be selected
+## Pinned launch candidate and remaining activation inputs
 
-RCNet-1 cannot be enabled until each item below has a reviewed, final value:
+The current version-2 launch candidate binds the following immutable RCNet-1
+values:
 
-1. Network ID.
-2. Virtual-genesis hash and timestamp.
-3. Proof-of-work limit and initial difficulty policy.
-4. Steward and community reward destinations with documented custody.
-5. Public bootstrap address and final RC ports.
-6. Exact model-bank and fixed-record byte length, BLAKE3, and SHA-256 pins.
-7. Qualification source commit and qualification manifest.
-8. Fresh-process verifier executable and report identities.
+- launch root
+  `748f32c069e721221b8ba17df358eb35ec0e05d93f3a31ee0c1a135c87bb7b85`
+- network ID
+  `3e99d45959c19c0053d8e9fef34875b57b46a8a1ce330637daddab515bc7b92d`
+- virtual-genesis hash
+  `a572b6ce50978511ce8771db6603a602faccf3802cf0d4791c1ce4e467ba6b71`
+- virtual-genesis time `2026-09-07T17:00:00Z`
+- the ProductionV4 proof selector, proof-of-work limit, consensus limits,
+  monetary policy, reward public destinations, and exact model-bank and
+  fixed-record identities
 
-The current repeated-byte identifiers, development reward destinations,
-development proof-of-work limit, and RFC 5737 bootstrap address are explicit
-placeholders. The build gate rejects them.
+The compile-time release gate validates those values rather than accepting the
+old placeholder identity. Selection of the public reward destinations does not
+close their governance, threshold custody, recovery, or beneficial-ownership
+gate. Private reward keys must not enter source, build automation, the seed
+host, or release artifacts.
+
+The remaining canonical activation inputs are the independently qualified
+source commit and manifest identities, the exact fresh-process Python verifier
+script and report identities, and the trusted release source commit supplied by
+build automation. The staged verifier evidence is named
+`PRODUCTION-V4-FRESH-PROCESS-VERIFIER.py`; it must be byte-identical to the
+audited `production-v4-independent-verifier.py` entrypoint bound by the report.
+For activation-schema compatibility, the existing
+`fresh_process_verifier_binary_sha256` field hashes this exact executable
+verifier program, which is currently that Python script.
+These values must come from the independent process below; they must not be
+filled with local test output or invented values.
+
+## Operational seed and service endpoints
+
+Bootstrap peers and service ports are operational discoverability
+configuration, not part of the immutable version-2 launch identity. Rotating a
+seed does not change the launch root, network ID, virtual genesis, consensus
+fingerprint, or ledger rules.
+
+The currently provisioned RCNet-1 cold-start endpoint is
+`173.249.35.251:19444`. In a `production-rc` node or pool invocation:
+
+- no `--peer` and no `--no-default-seeds` selects that compiled operational
+  seed and permits its public address;
+- one or more explicit `--peer` arguments replace the default seed set;
+  explicit public peers also require `--allow-public-peers`; and
+- `--no-default-seeds` leaves the peer set empty when no explicit peer is
+  supplied. The seed service uses this mode so it does not dial itself.
+
+Peer exchange can provide additional peers after first contact, so the seed is
+a cold-start aid rather than a permanent authority or consensus dependency.
+The host has been provisioned and the system service is staged but deliberately
+disabled. There is no live qualified RCNet seed until a release-gated binary
+and its authenticated ProductionV4 artifacts are installed, the service is
+enabled, and an external node proves public reachability and peer exchange.
+
+The seed's 300 GB disk is suitable only for a bounded RC rehearsal. At the
+measured 12,025,320-byte proof and 60-second target spacing, proof payload alone
+grows by about 16.13 GiB per day; the 16 MiB block ceiling would permit about
+22.5 GiB per day. Because `blocks.log` is not pruned, the observed-size budget
+is approximately 15 days after operating-system, artifact, and safety
+headroom, not long-term retention. A bounded retention/pruning design or a
+larger storage plan remains required before long-running operation.
 
 ## Canonical activation evidence
 
@@ -79,7 +131,7 @@ encoding is produced only by
 - exact bank and fixed-record identities
 - qualification source commit
 - qualification manifest SHA-256
-- fresh-process verifier executable SHA-256
+- exact fresh-process Python verifier script SHA-256
 - fresh-process verifier report SHA-256
 - all three normative specification SHA-256 values
 - trusted build source commit
@@ -103,7 +155,10 @@ Before launch pins are inserted, a second clean environment must reproduce:
 
 The reproducer records OS, architecture, compiler versions, source commit,
 commands, inputs, outputs, and hashes. The original producer and independent
-reproducer sign the resulting manifest separately.
+reproducer then complete the role-separated, two-phase signature procedure in
+[`production-v4-activation-approvals.md`](production-v4-activation-approvals.md).
+An unsigned report, two signatures from one identity or key, or signatures over
+the wrong activation phase cannot satisfy the release gate.
 
 `scripts/production-v4-reproduction.py` packages those checks into one bounded,
 fail-closed run. It authenticates the frozen specifications and core vector,
@@ -111,6 +166,11 @@ streams SHA-256 and BLAKE3 over every generated artifact, validates the fixed
 record and complete model bank independently of the Rust verifier, and requires
 one full cryptographic proof verification before it creates a canonical report.
 The output is create-new and must be signed separately by the reproducer.
+
+This report is explicitly a ProductionV4 Testnet-1 proof-system qualification.
+The supplied template network ID must match both the authenticated Testnet-1
+input manifest and the compiled Testnet-1 identity. It is not RCNet fresh-launch
+evidence and must not be presented as such.
 
 Without `--attest-fresh-generation`, the report is explicitly marked
 `reproduction_complete: false`; that mode is useful for a producer baseline but
@@ -142,8 +202,11 @@ $env:CMFD_BUILD_SOURCE_COMMIT = '<trusted lowercase source commit>'
 cargo check -p cmfd-node --features production-rc
 ```
 
-Until every approved identity is present, that command must fail before a node
-can open storage.
+With the identity pin present but canonical ProductionV4 activation evidence
+absent, that command must fail with the activation-evidence error before a node
+can open storage. After real activation evidence is pinned, the same command
+becomes a positive build gate and must bind the trusted source commit to that
+evidence.
 
 ## RCNet-1 rehearsal acceptance
 
@@ -161,6 +224,13 @@ After the identity and reproduction gates pass, RCNet-1 must demonstrate:
   provenance
 - documented backup, restore, update, rollback, incident, and key-rotation
   procedures
+
+Provisioning or staging one seed host does not satisfy these items. Acceptance
+requires preserved results from the independently operated node, clean package
+installs, live discovery, migration, abrupt-power-loss recovery, update and
+rollback rehearsals, and the applicable external cryptographic, custody, and
+implementation audits. Local harness output is preparation for those runs, not
+a substitute for named-operator evidence.
 
 The operator procedures and evidence requirements are defined in
 [`incident-response.md`](incident-response.md) and

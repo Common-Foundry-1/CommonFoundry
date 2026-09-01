@@ -1,0 +1,46 @@
+[Unit]
+Description=Common Foundry RCNet-1 seed node
+Documentation=https://commonfoundry.org/
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=commonfoundry
+Group=commonfoundry
+WorkingDirectory=/opt/commonfoundry/current
+ExecStartPre=/usr/local/sbin/commonfoundry-disk-guard
+ExecStart=/opt/commonfoundry/current/cmfd-node --data-dir /var/lib/commonfoundry run --bind 127.0.0.1:19443 --p2p-bind 0.0.0.0:19444 --allow-public-peers --no-default-seeds
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=90s
+UMask=0027
+LimitNOFILE=65536
+
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/commonfoundry
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=commonfoundry-node
+
+[Install]
+WantedBy=multi-user.target

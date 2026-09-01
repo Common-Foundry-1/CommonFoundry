@@ -3056,6 +3056,10 @@ class ProductionRcGateTests(unittest.TestCase):
         }
         rendered = integrity._render_production_v4_activation_pin(fields)
         self.assertTrue(rendered.startswith(b"Some(ProductionV4ActivationEvidence {\n"))
+        self.assertIn(
+            b"independent_reproducer: Some(ProductionV4ActivationSignerTrust {",
+            rendered,
+        )
         self.assertNotIn(b"\n    source_commit:", rendered)
 
     def test_production_v4_approval_trust_rejects_malformed_or_shared_values(
@@ -3118,6 +3122,49 @@ class ProductionRcGateTests(unittest.TestCase):
                 integrity.IntegrityError
             ):
                 integrity._validate_production_v4_approval_trust_fields(value)
+
+    def test_single_producer_rc_activation_pin_is_explicit_and_has_no_reproducer(
+        self,
+    ) -> None:
+        digest = "b" * 64
+        fields = {
+            "schema": "CMFD_PRODUCTION_V4_RC_SINGLE_PRODUCER_ACTIVATION_V1",
+            "qualification_source_commit": "1" * 40,
+            "qualification_manifest_sha256": "2" * 64,
+            "fresh_process_verifier_binary_sha256": "3" * 64,
+            "fresh_process_verifier_report_sha256": "4" * 64,
+            "core_spec_sha256": "5" * 64,
+            "core_vector_sha256": "6" * 64,
+            "proof_algebra_sha256": "7" * 64,
+            "approval_trust": {
+                "contract_schema": (
+                    "CMFD_PRODUCTION_V4_RC_SINGLE_PRODUCER_APPROVAL_SUBJECT_V1"
+                ),
+                "qualification_binding_sha256": "8" * 64,
+                "ssh_keygen_sha256": "9" * 64,
+                "producer": {
+                    "signer_identity": "producer@example.test",
+                    "allowed_signers_sha256": "a" * 64,
+                    "key_blob_sha256": digest,
+                    "key_fingerprint": "SHA256:"
+                    + base64.b64encode(bytes.fromhex(digest))
+                    .decode("ascii")
+                    .rstrip("="),
+                    "key_type": "ssh-ed25519",
+                },
+                "independent_reproducer": None,
+            },
+        }
+        rendered = integrity._render_production_v4_activation_pin(fields)
+        self.assertIn(b"independent_reproducer: None,", rendered)
+        self.assertNotIn(b"independent_reproducer: Some(", rendered)
+
+        dual_without_reproducer = copy.deepcopy(fields)
+        dual_without_reproducer["approval_trust"][
+            "contract_schema"
+        ] = integrity.activation_approval.SUBJECT_SCHEMA
+        with self.assertRaisesRegex(integrity.IntegrityError, "requires an independent"):
+            integrity._render_production_v4_activation_pin(dual_without_reproducer)
 
     def test_production_v4_activation_evidence_before_pin_is_rejected(self) -> None:
         stage_files, repository = self.activation_writer_fixture()

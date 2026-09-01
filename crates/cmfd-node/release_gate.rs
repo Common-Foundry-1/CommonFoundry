@@ -84,7 +84,7 @@ pub struct ProductionV4ActivationApprovalTrust {
     pub qualification_binding_sha256: &'static str,
     pub ssh_keygen_sha256: &'static str,
     pub producer: ProductionV4ActivationSignerTrust,
-    pub independent_reproducer: ProductionV4ActivationSignerTrust,
+    pub independent_reproducer: Option<ProductionV4ActivationSignerTrust>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -298,18 +298,17 @@ pub const PRODUCTION_RC_NETWORK_IDENTITY: ProductionRcNetworkIdentityPin =
         ],
     };
 
-/// Two-phase insertion point for independently produced ProductionV4
-/// activation evidence. The tracked include remains `None` during phase one;
-/// phase two may replace only that expression after the required evidence has
-/// been independently produced and authenticated.
+/// Fail-closed insertion point for authenticated ProductionV4 activation
+/// evidence. RCNet may use the explicit single-producer RC policy; mainnet
+/// remains on the distinct producer and independent-reproducer policy.
 #[cfg(feature = "production-rc")]
 pub const PRODUCTION_V4_ACTIVATION: Option<ProductionV4ActivationEvidence> =
     include!("production_v4_activation_pin.inc.rs");
 
 /// ProductionV4 release-candidate shape. The V2 launch candidate pins the
-/// immutable RCNet identity and exact proof artifacts. Independent activation
-/// evidence remains absent, so `production-rc` continues to fail closed until
-/// a clean reproducer and fresh-process verifier have supplied real reports.
+/// immutable RCNet identity and exact proof artifacts. Activation evidence
+/// remains absent, so `production-rc` continues to fail closed until a
+/// supported approval policy and fresh-process verifier report are pinned.
 #[cfg(feature = "production-rc")]
 pub const COMPILED_RELEASE_PROFILE: CompiledReleaseProfile = CompiledReleaseProfile {
     network: CompiledNetworkProfile::Rcnet,
@@ -447,16 +446,35 @@ fn key_fingerprint_matches(key_blob_sha256: &str, fingerprint: &str) -> bool {
 fn validate_production_v4_approval_trust(
     trust: ProductionV4ActivationApprovalTrust,
 ) -> Result<(), &'static str> {
-    if trust.contract_schema != "CMFD_PRODUCTION_V4_ACTIVATION_APPROVAL_SUBJECT_V1" {
-        return Err("ProductionV4 activation approval contract schema is unsupported");
-    }
+    const DUAL_APPROVAL_SCHEMA: &str = "CMFD_PRODUCTION_V4_ACTIVATION_APPROVAL_SUBJECT_V1";
+    const SINGLE_PRODUCER_RC_SCHEMA: &str =
+        "CMFD_PRODUCTION_V4_RC_SINGLE_PRODUCER_APPROVAL_SUBJECT_V1";
+    let independent_reproducer = match trust.contract_schema {
+        DUAL_APPROVAL_SCHEMA => Some(
+            trust
+                .independent_reproducer
+                .ok_or("ProductionV4 independent reproducer approval trust is absent")?,
+        ),
+        SINGLE_PRODUCER_RC_SCHEMA => {
+            if trust.independent_reproducer.is_some() {
+                return Err(
+                    "ProductionV4 single-producer RC trust must not claim an independent reproducer",
+                );
+            }
+            None
+        }
+        _ => return Err("ProductionV4 activation approval contract schema is unsupported"),
+    };
     if !is_nonzero_lower_hex(trust.qualification_binding_sha256, 32) {
         return Err("ProductionV4 qualification binding digest is invalid");
     }
     if !is_nonzero_lower_hex(trust.ssh_keygen_sha256, 32) {
         return Err("ProductionV4 OpenSSH verifier trust digest is invalid");
     }
-    for signer in [trust.producer, trust.independent_reproducer] {
+    for signer in [Some(trust.producer), independent_reproducer]
+        .into_iter()
+        .flatten()
+    {
         if !valid_signer_token(signer.signer_identity) {
             return Err("ProductionV4 activation approval signer identity is invalid");
         }
@@ -475,13 +493,16 @@ fn validate_production_v4_approval_trust(
             return Err("ProductionV4 activation approval key type is invalid");
         }
     }
-    if trust.producer.signer_identity == trust.independent_reproducer.signer_identity
-        || trust.producer.allowed_signers_sha256
-            == trust.independent_reproducer.allowed_signers_sha256
-        || trust.producer.key_blob_sha256 == trust.independent_reproducer.key_blob_sha256
-        || trust.producer.key_fingerprint == trust.independent_reproducer.key_fingerprint
-    {
-        return Err("ProductionV4 producer and reproducer approval authorities are not distinct");
+    if let Some(reproducer) = independent_reproducer {
+        if trust.producer.signer_identity == reproducer.signer_identity
+            || trust.producer.allowed_signers_sha256 == reproducer.allowed_signers_sha256
+            || trust.producer.key_blob_sha256 == reproducer.key_blob_sha256
+            || trust.producer.key_fingerprint == reproducer.key_fingerprint
+        {
+            return Err(
+                "ProductionV4 producer and reproducer approval authorities are not distinct",
+            );
+        }
     }
     Ok(())
 }
@@ -614,7 +635,10 @@ pub fn validate_production_rc(
     let evidence = profile
         .production_v4_activation
         .ok_or("ProductionV4 activation evidence is absent")?;
-    if evidence.schema != "CMFD_PRODUCTION_V4_ACTIVATION_V1" {
+    if !matches!(
+        evidence.schema,
+        "CMFD_PRODUCTION_V4_ACTIVATION_V1" | "CMFD_PRODUCTION_V4_RC_SINGLE_PRODUCER_ACTIVATION_V1"
+    ) {
         return Err("ProductionV4 activation evidence schema is unsupported");
     }
     if !is_nonzero_lower_hex(build_source_commit, 20)
@@ -658,6 +682,25 @@ pub fn validate_production_rc(
         }
     }
     validate_production_v4_approval_trust(evidence.approval_trust)?;
+    let schema_matches_trust = matches!(
+        (
+            evidence.schema,
+            evidence.approval_trust.contract_schema,
+            evidence.approval_trust.independent_reproducer,
+        ),
+        (
+            "CMFD_PRODUCTION_V4_ACTIVATION_V1",
+            "CMFD_PRODUCTION_V4_ACTIVATION_APPROVAL_SUBJECT_V1",
+            Some(_),
+        ) | (
+            "CMFD_PRODUCTION_V4_RC_SINGLE_PRODUCER_ACTIVATION_V1",
+            "CMFD_PRODUCTION_V4_RC_SINGLE_PRODUCER_APPROVAL_SUBJECT_V1",
+            None,
+        )
+    );
+    if !schema_matches_trust {
+        return Err("ProductionV4 activation evidence and approval policy do not match");
+    }
     let artifacts = profile
         .production_v4_artifacts
         .ok_or("ProductionV4 artifact identity pins are absent")?;
@@ -743,16 +786,28 @@ pub fn canonical_production_v4_activation_evidence_json(
         .production_v4_artifacts
         .ok_or("ProductionV4 artifact identity pins are absent")?;
     let trust = evidence.approval_trust;
+    let independent_reproducer = match trust.independent_reproducer {
+        Some(signer) => format!(
+            concat!(
+                "{{\"allowed_signers_sha256\":\"{}\",",
+                "\"key_blob_sha256\":\"{}\",",
+                "\"key_fingerprint\":\"{}\",",
+                "\"key_type\":\"{}\",",
+                "\"signer_identity\":\"{}\"}}"
+            ),
+            signer.allowed_signers_sha256,
+            signer.key_blob_sha256,
+            signer.key_fingerprint,
+            signer.key_type,
+            signer.signer_identity,
+        ),
+        None => "null".to_owned(),
+    };
     Ok(format!(
         concat!(
             "{{\"activation_approval_trust\":{{",
             "\"contract_schema\":\"{}\",",
-            "\"independent_reproducer\":{{",
-            "\"allowed_signers_sha256\":\"{}\",",
-            "\"key_blob_sha256\":\"{}\",",
-            "\"key_fingerprint\":\"{}\",",
-            "\"key_type\":\"{}\",",
-            "\"signer_identity\":\"{}\"}},",
+            "\"independent_reproducer\":{},",
             "\"producer\":{{",
             "\"allowed_signers_sha256\":\"{}\",",
             "\"key_blob_sha256\":\"{}\",",
@@ -777,11 +832,7 @@ pub fn canonical_production_v4_activation_evidence_json(
             "\"source_commit\":\"{}\"}}\n"
         ),
         trust.contract_schema,
-        trust.independent_reproducer.allowed_signers_sha256,
-        trust.independent_reproducer.key_blob_sha256,
-        trust.independent_reproducer.key_fingerprint,
-        trust.independent_reproducer.key_type,
-        trust.independent_reproducer.signer_identity,
+        independent_reproducer,
         trust.producer.allowed_signers_sha256,
         trust.producer.key_blob_sha256,
         trust.producer.key_fingerprint,
@@ -862,13 +913,13 @@ mod tests {
                 key_fingerprint: "SHA256:u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7s",
                 key_type: "ssh-ed25519",
             },
-            independent_reproducer: ProductionV4ActivationSignerTrust {
+            independent_reproducer: Some(ProductionV4ActivationSignerTrust {
                 signer_identity: "reproducer@example.invalid",
                 allowed_signers_sha256: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
                 key_blob_sha256: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
                 key_fingerprint: "SHA256:3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d0",
                 key_type: "ssh-ed25519",
-            },
+            }),
         };
     const V4_EVIDENCE: ProductionV4ActivationEvidence = ProductionV4ActivationEvidence {
         schema: "CMFD_PRODUCTION_V4_ACTIVATION_V1",
@@ -881,6 +932,18 @@ mod tests {
         proof_algebra_sha256: "8888888888888888888888888888888888888888888888888888888888888888",
         approval_trust: V4_APPROVAL_TRUST,
     };
+    const SINGLE_PRODUCER_V4_APPROVAL_TRUST: ProductionV4ActivationApprovalTrust =
+        ProductionV4ActivationApprovalTrust {
+            contract_schema: "CMFD_PRODUCTION_V4_RC_SINGLE_PRODUCER_APPROVAL_SUBJECT_V1",
+            independent_reproducer: None,
+            ..V4_APPROVAL_TRUST
+        };
+    const SINGLE_PRODUCER_V4_EVIDENCE: ProductionV4ActivationEvidence =
+        ProductionV4ActivationEvidence {
+            schema: "CMFD_PRODUCTION_V4_RC_SINGLE_PRODUCER_ACTIVATION_V1",
+            approval_trust: SINGLE_PRODUCER_V4_APPROVAL_TRUST,
+            ..V4_EVIDENCE
+        };
     const V4_ARTIFACTS: ProductionV4ArtifactIdentityPins = ProductionV4ArtifactIdentityPins {
         bank: ProductionV3FileIdentityPin {
             bytes: 1,
@@ -929,6 +992,13 @@ mod tests {
             production_v4_activation: Some(V4_EVIDENCE),
             production_v4_artifacts: Some(V4_ARTIFACTS),
             production_network_identity: Some(NETWORK_IDENTITY),
+        }
+    }
+
+    fn single_producer_v4_profile() -> CompiledReleaseProfile {
+        CompiledReleaseProfile {
+            production_v4_activation: Some(SINGLE_PRODUCER_V4_EVIDENCE),
+            ..v4_profile()
         }
     }
 
@@ -1110,7 +1180,7 @@ mod tests {
         let self_approved = CompiledReleaseProfile {
             production_v4_activation: Some(ProductionV4ActivationEvidence {
                 approval_trust: ProductionV4ActivationApprovalTrust {
-                    independent_reproducer: V4_APPROVAL_TRUST.producer,
+                    independent_reproducer: Some(V4_APPROVAL_TRUST.producer),
                     ..V4_APPROVAL_TRUST
                 },
                 ..V4_EVIDENCE
@@ -1181,22 +1251,25 @@ mod tests {
         }
 
         for duplicate in ["identity", "policy", "key"] {
-            let independent_reproducer = match duplicate {
+            let reproducer = V4_APPROVAL_TRUST
+                .independent_reproducer
+                .expect("dual approval test trust has a reproducer");
+            let independent_reproducer = Some(match duplicate {
                 "identity" => ProductionV4ActivationSignerTrust {
                     signer_identity: V4_APPROVAL_TRUST.producer.signer_identity,
-                    ..V4_APPROVAL_TRUST.independent_reproducer
+                    ..reproducer
                 },
                 "policy" => ProductionV4ActivationSignerTrust {
                     allowed_signers_sha256: V4_APPROVAL_TRUST.producer.allowed_signers_sha256,
-                    ..V4_APPROVAL_TRUST.independent_reproducer
+                    ..reproducer
                 },
                 "key" => ProductionV4ActivationSignerTrust {
                     key_blob_sha256: V4_APPROVAL_TRUST.producer.key_blob_sha256,
                     key_fingerprint: V4_APPROVAL_TRUST.producer.key_fingerprint,
-                    ..V4_APPROVAL_TRUST.independent_reproducer
+                    ..reproducer
                 },
                 _ => unreachable!(),
-            };
+            });
             let not_distinct = ProductionV4ActivationApprovalTrust {
                 independent_reproducer,
                 ..V4_APPROVAL_TRUST
@@ -1226,6 +1299,59 @@ mod tests {
         assert_eq!(
             validate_production_rc(profile, ""),
             Err("trusted production RC build source commit is invalid")
+        );
+    }
+
+    #[test]
+    fn production_rc_gate_accepts_explicit_single_producer_rc_policy() {
+        assert_eq!(
+            validate_production_rc(single_producer_v4_profile(), BUILD_SOURCE_COMMIT),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn production_rc_gate_keeps_dual_and_single_producer_policies_distinct() {
+        let single_with_reproducer = CompiledReleaseProfile {
+            production_v4_activation: Some(ProductionV4ActivationEvidence {
+                approval_trust: ProductionV4ActivationApprovalTrust {
+                    independent_reproducer: V4_APPROVAL_TRUST.independent_reproducer,
+                    ..SINGLE_PRODUCER_V4_APPROVAL_TRUST
+                },
+                ..SINGLE_PRODUCER_V4_EVIDENCE
+            }),
+            ..single_producer_v4_profile()
+        };
+        assert_eq!(
+            validate_production_rc(single_with_reproducer, BUILD_SOURCE_COMMIT),
+            Err("ProductionV4 single-producer RC trust must not claim an independent reproducer")
+        );
+
+        let dual_without_reproducer = CompiledReleaseProfile {
+            production_v4_activation: Some(ProductionV4ActivationEvidence {
+                approval_trust: ProductionV4ActivationApprovalTrust {
+                    independent_reproducer: None,
+                    ..V4_APPROVAL_TRUST
+                },
+                ..V4_EVIDENCE
+            }),
+            ..v4_profile()
+        };
+        assert_eq!(
+            validate_production_rc(dual_without_reproducer, BUILD_SOURCE_COMMIT),
+            Err("ProductionV4 independent reproducer approval trust is absent")
+        );
+
+        let mismatched_schema = CompiledReleaseProfile {
+            production_v4_activation: Some(ProductionV4ActivationEvidence {
+                schema: SINGLE_PRODUCER_V4_EVIDENCE.schema,
+                ..V4_EVIDENCE
+            }),
+            ..v4_profile()
+        };
+        assert_eq!(
+            validate_production_rc(mismatched_schema, BUILD_SOURCE_COMMIT),
+            Err("ProductionV4 activation evidence and approval policy do not match")
         );
     }
 
@@ -1264,6 +1390,23 @@ mod tests {
                 "\"schema\":\"CMFD_PRODUCTION_V4_ACTIVATION_V1\",",
                 "\"source_commit\":\"5555555555555555555555555555555555555555\"}\n"
             )
+        );
+    }
+
+    #[test]
+    fn single_producer_v4_activation_evidence_encoding_is_canonical() {
+        let encoded = canonical_production_v4_activation_evidence_json(
+            single_producer_v4_profile(),
+            BUILD_SOURCE_COMMIT,
+        )
+        .unwrap();
+        let encoded = String::from_utf8(encoded).unwrap();
+        assert!(encoded.contains(
+            "\"contract_schema\":\"CMFD_PRODUCTION_V4_RC_SINGLE_PRODUCER_APPROVAL_SUBJECT_V1\""
+        ));
+        assert!(encoded.contains("\"independent_reproducer\":null"));
+        assert!(
+            encoded.contains("\"schema\":\"CMFD_PRODUCTION_V4_RC_SINGLE_PRODUCER_ACTIVATION_V1\"")
         );
     }
 

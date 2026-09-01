@@ -6642,7 +6642,14 @@ def _validate_production_v4_approval_trust_fields(
         },
         "ProductionV4 activation approval trust",
     )
-    if trust["contract_schema"] != activation_approval.SUBJECT_SCHEMA:
+    single_producer_rc = (
+        trust["contract_schema"]
+        == "CMFD_PRODUCTION_V4_RC_SINGLE_PRODUCER_APPROVAL_SUBJECT_V1"
+    )
+    if (
+        not single_producer_rc
+        and trust["contract_schema"] != activation_approval.SUBJECT_SCHEMA
+    ):
         raise IntegrityError("ProductionV4 activation approval contract schema is invalid")
     _require_hex256(
         trust["qualification_binding_sha256"],
@@ -6654,7 +6661,19 @@ def _validate_production_v4_approval_trust_fields(
         "ProductionV4 trusted OpenSSH verifier SHA-256",
         reject_repeated=False,
     )
-    for role in ("producer", "independent_reproducer"):
+    if single_producer_rc:
+        if trust["independent_reproducer"] is not None:
+            raise IntegrityError(
+                "ProductionV4 single-producer RC trust must not claim an independent reproducer"
+            )
+        roles = ("producer",)
+    else:
+        if not isinstance(trust["independent_reproducer"], dict):
+            raise IntegrityError(
+                "ProductionV4 dual-party approval trust requires an independent reproducer"
+            )
+        roles = ("producer", "independent_reproducer")
+    for role in roles:
         row = _require_exact_fields(
             trust[role],
             {
@@ -6695,9 +6714,9 @@ def _validate_production_v4_approval_trust_fields(
             )
     producer = trust["producer"]
     reproducer = trust["independent_reproducer"]
-    if not isinstance(producer, dict) or not isinstance(reproducer, dict):
+    if not isinstance(producer, dict):
         raise IntegrityError("ProductionV4 approval trust is malformed")
-    if any(
+    if isinstance(reproducer, dict) and any(
         producer[field] == reproducer[field]
         for field in (
             "signer_identity",
@@ -6742,9 +6761,15 @@ def _render_production_v4_activation_pin(pin_fields: dict[str, object]) -> bytes
     lines.append(f'        ssh_keygen_sha256: "{trust["ssh_keygen_sha256"]}",')
     for role in ("producer", "independent_reproducer"):
         signer = trust[role]
+        if role == "independent_reproducer" and signer is None:
+            lines.append("        independent_reproducer: None,")
+            continue
         if not isinstance(signer, dict):  # pragma: no cover - validated above.
             raise IntegrityError("ProductionV4 approval signer trust is unavailable")
-        lines.append(f"        {role}: ProductionV4ActivationSignerTrust {{")
+        value_prefix = "Some(" if role == "independent_reproducer" else ""
+        lines.append(
+            f"        {role}: {value_prefix}ProductionV4ActivationSignerTrust {{"
+        )
         for field in (
             "signer_identity",
             "allowed_signers_sha256",
@@ -6753,7 +6778,8 @@ def _render_production_v4_activation_pin(pin_fields: dict[str, object]) -> bytes
             "key_type",
         ):
             lines.append(f'            {field}: "{signer[field]}",')
-        lines.append("        },")
+        value_suffix = ")" if role == "independent_reproducer" else ""
+        lines.append(f"        }}{value_suffix},")
     lines.append("    },")
     lines.append("})")
     return ("\n".join(lines) + "\n").encode("utf-8")

@@ -322,6 +322,60 @@ enum Command {
         #[arg(long)]
         work_dir: PathBuf,
     },
+    /// Bind a nonce to an offline RCNet-1 qualification template.
+    #[cfg(feature = "production-v4-testnet")]
+    BindRcnet1Nonce {
+        #[arg(long)]
+        template: PathBuf,
+        #[arg(long)]
+        nonce: u64,
+        #[arg(long)]
+        fixed_record: PathBuf,
+        #[arg(long)]
+        coefficients_output: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Prepare a contiguous nonce batch for offline RCNet-1 qualification.
+    #[cfg(feature = "production-v4-testnet")]
+    PrepareRcnet1SearchBatch {
+        #[arg(long)]
+        template: PathBuf,
+        #[arg(long)]
+        start_nonce: u64,
+        #[arg(long)]
+        count: u32,
+        #[arg(long)]
+        fixed_record: PathBuf,
+        #[arg(long)]
+        coefficients_output: PathBuf,
+    },
+    /// Inspect an offline RCNet-1 nonce batch and retain its first winner.
+    #[cfg(feature = "production-v4-testnet")]
+    InspectRcnet1SearchBatch {
+        #[arg(long)]
+        template: PathBuf,
+        #[arg(long)]
+        start_nonce: u64,
+        #[arg(long)]
+        count: u32,
+        #[arg(long)]
+        final_activations: PathBuf,
+        #[arg(long)]
+        fixed_record: PathBuf,
+        #[arg(long)]
+        winner_final_output: PathBuf,
+    },
+    /// Report whether an offline RCNet-1 replay meets its frozen target.
+    #[cfg(feature = "production-v4-testnet")]
+    InspectRcnet1Work {
+        #[arg(long)]
+        template: PathBuf,
+        #[arg(long)]
+        final_activation: PathBuf,
+        #[arg(long)]
+        fixed_record: PathBuf,
+    },
     /// Bind another nonce to an already-frozen ProductionV4 block challenge.
     #[cfg(feature = "production-v4")]
     BindV4Nonce {
@@ -646,6 +700,64 @@ fn main() -> Result<()> {
             &fixed_record,
             &work_dir,
         ),
+        #[cfg(feature = "production-v4-testnet")]
+        Command::BindRcnet1Nonce {
+            template,
+            nonce,
+            fixed_record,
+            coefficients_output,
+            output,
+        } => bind_v4_nonce(
+            &template,
+            nonce,
+            &fixed_record,
+            &coefficients_output,
+            &output,
+            RCNET1_PROFILE.network_id,
+        ),
+        #[cfg(feature = "production-v4-testnet")]
+        Command::PrepareRcnet1SearchBatch {
+            template,
+            start_nonce,
+            count,
+            fixed_record,
+            coefficients_output,
+        } => prepare_v4_search_batch(
+            &template,
+            start_nonce,
+            count,
+            &fixed_record,
+            &coefficients_output,
+            RCNET1_PROFILE.network_id,
+        ),
+        #[cfg(feature = "production-v4-testnet")]
+        Command::InspectRcnet1SearchBatch {
+            template,
+            start_nonce,
+            count,
+            final_activations,
+            fixed_record,
+            winner_final_output,
+        } => inspect_v4_search_batch(
+            &template,
+            start_nonce,
+            count,
+            &final_activations,
+            &fixed_record,
+            &winner_final_output,
+            RCNET1_PROFILE.network_id,
+        ),
+        #[cfg(feature = "production-v4-testnet")]
+        Command::InspectRcnet1Work {
+            template,
+            final_activation,
+            fixed_record,
+        } => inspect_v4_work(
+            &template,
+            &final_activation,
+            &fixed_record,
+            RCNET1_PROFILE.network_id,
+        ),
         #[cfg(feature = "production-v4")]
         Command::BindV4Nonce {
             template,
@@ -659,6 +771,7 @@ fn main() -> Result<()> {
             &fixed_record,
             &coefficients_output,
             &output,
+            COMPILED_NETWORK_PROFILE.network_id,
         ),
         #[cfg(feature = "production-v4")]
         Command::PrepareV4SearchBatch {
@@ -673,6 +786,7 @@ fn main() -> Result<()> {
             count,
             &fixed_record,
             &coefficients_output,
+            COMPILED_NETWORK_PROFILE.network_id,
         ),
         #[cfg(feature = "production-v4")]
         Command::InspectV4SearchBatch {
@@ -689,13 +803,19 @@ fn main() -> Result<()> {
             &final_activations,
             &fixed_record,
             &winner_final_output,
+            COMPILED_NETWORK_PROFILE.network_id,
         ),
         #[cfg(feature = "production-v4")]
         Command::InspectV4Work {
             template,
             final_activation,
             fixed_record,
-        } => inspect_v4_work(&template, &final_activation, &fixed_record),
+        } => inspect_v4_work(
+            &template,
+            &final_activation,
+            &fixed_record,
+            COMPILED_NETWORK_PROFILE.network_id,
+        ),
         #[cfg(feature = "production-v4")]
         Command::SubmitV4Template {
             peer,
@@ -1542,6 +1662,7 @@ fn bind_v4_nonce(
     fixed_record_path: &Path,
     coefficients_output: &Path,
     output: &Path,
+    expected_network_id: [u8; 32],
 ) -> Result<()> {
     ensure_production_v4_tool()?;
     ensure_existing_absolute_file(template_path, "ProductionV4 source template")?;
@@ -1563,7 +1684,7 @@ fn bind_v4_nonce(
         bail!("ProductionV4 source template is not canonical JSON");
     }
     frozen.clone().into_mining_template()?;
-    if frozen.challenge.network_id != COMPILED_NETWORK_PROFILE.network_id {
+    if frozen.challenge.network_id != expected_network_id {
         bail!("ProductionV4 source template belongs to another network");
     }
 
@@ -1610,6 +1731,7 @@ fn prepare_v4_search_batch(
     count: u32,
     fixed_record_path: &Path,
     coefficients_output: &Path,
+    expected_network_id: [u8; 32],
 ) -> Result<()> {
     ensure_production_v4_tool()?;
     validate_v4_search_batch_range(start_nonce, count)?;
@@ -1631,7 +1753,7 @@ fn prepare_v4_search_batch(
         bail!("ProductionV4 source template is not canonical JSON");
     }
     frozen.clone().into_mining_template()?;
-    if frozen.challenge.network_id != COMPILED_NETWORK_PROFILE.network_id {
+    if frozen.challenge.network_id != expected_network_id {
         bail!("ProductionV4 source template belongs to another network");
     }
 
@@ -1678,6 +1800,7 @@ fn inspect_v4_search_batch(
     final_activations_path: &Path,
     fixed_record_path: &Path,
     winner_final_output: &Path,
+    expected_network_id: [u8; 32],
 ) -> Result<()> {
     ensure_production_v4_tool()?;
     validate_v4_search_batch_range(start_nonce, count)?;
@@ -1701,7 +1824,7 @@ fn inspect_v4_search_batch(
         bail!("ProductionV4 source template is not canonical JSON");
     }
     frozen.clone().into_mining_template()?;
-    if frozen.challenge.network_id != COMPILED_NETWORK_PROFILE.network_id {
+    if frozen.challenge.network_id != expected_network_id {
         bail!("ProductionV4 source template belongs to another network");
     }
 
@@ -1786,6 +1909,7 @@ fn inspect_v4_work(
     template_path: &Path,
     final_activation_path: &Path,
     fixed_record_path: &Path,
+    expected_network_id: [u8; 32],
 ) -> Result<()> {
     ensure_production_v4_tool()?;
     ensure_existing_absolute_file(template_path, "ProductionV4 template")?;
@@ -1803,7 +1927,7 @@ fn inspect_v4_work(
         bail!("ProductionV4 template is not canonical JSON");
     }
     frozen.clone().into_mining_template()?;
-    if frozen.challenge.network_id != COMPILED_NETWORK_PROFILE.network_id {
+    if frozen.challenge.network_id != expected_network_id {
         bail!("ProductionV4 template belongs to another network");
     }
 
@@ -5955,6 +6079,19 @@ mod tests {
             "prepare-v4-search-batch",
             "inspect-v4-search-batch",
             "inspect-v4-work",
+        ] {
+            assert!(Cli::try_parse_from(["cmfd-miner", command]).is_err());
+        }
+    }
+
+    #[cfg(feature = "production-v4-testnet")]
+    #[test]
+    fn offline_rcnet1_search_commands_require_bound_inputs() {
+        for command in [
+            "bind-rcnet1-nonce",
+            "prepare-rcnet1-search-batch",
+            "inspect-rcnet1-search-batch",
+            "inspect-rcnet1-work",
         ] {
             assert!(Cli::try_parse_from(["cmfd-miner", command]).is_err());
         }

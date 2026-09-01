@@ -47,6 +47,13 @@ target, virtual genesis, reward policy, nonce, and network ID are deterministic.
 coefficients first and `RCNET1-BLOCK1-QUALIFICATION-TEMPLATE.json` last as the completion marker.
 This command creates no proof, activation evidence, approval, or release pin.
 
+The same source-stage build exposes `prepare-rcnet1-search-batch`,
+`inspect-rcnet1-search-batch`, `bind-rcnet1-nonce`, and `inspect-rcnet1-work` for the
+offline qualification run. These commands accept only the compiled RCNet-1 network identity;
+the ordinary ProductionV4 commands remain bound to the build's Testnet-1 identity. The production
+RC feature and its activation gate are not needed or bypassed to search the frozen block-one
+template.
+
 The persistent and one-shot proof-worker forms are:
 
 ```text

@@ -3,7 +3,7 @@ import { defineConfig } from "vitest/config";
 
 const operatorProxy = {
   "/api": {
-    target: "http://127.0.0.1:22448",
+    target: "http://127.0.0.1:19448",
     changeOrigin: true,
   },
 };

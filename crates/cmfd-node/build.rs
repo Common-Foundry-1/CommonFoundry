@@ -35,11 +35,9 @@ fn main() {
     }
 
     let requested = env::var_os("CARGO_FEATURE_PRODUCTION_RC").is_some()
-        || ["CMFD_RELEASE_LABEL", "GITHUB_REF", "GITHUB_REF_NAME"]
-            .into_iter()
-            .filter_map(|variable| env::var(variable).ok())
-            .any(|label| release_gate::is_production_rc_label(&label))
-        || release_gate::is_production_rc_label(env!("CARGO_PKG_VERSION"));
+        || env::var("CMFD_RELEASE_LABEL")
+            .ok()
+            .is_some_and(|label| release_gate::is_production_rc_label(&label));
 
     if requested {
         let source_commit = env::var("CMFD_BUILD_SOURCE_COMMIT").unwrap_or_default();

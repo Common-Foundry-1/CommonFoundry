@@ -650,6 +650,8 @@ fn custody_error(error: WalletBackupError) -> NodeClientError {
         WalletBackupError::AuthenticationFailed => ("wallet_authentication_failed", 401),
         WalletBackupError::WrongNetwork => ("wallet_backup_wrong_network", 409),
         WalletBackupError::AlreadyEncrypted => ("wallet_already_encrypted", 409),
+        WalletBackupError::WalletKeyAlreadyExists => ("wallet_key_already_exists", 409),
+        WalletBackupError::OverlappingPaths => ("wallet_paths_overlap", 400),
         WalletBackupError::InvalidBackup | WalletBackupError::DestinationMismatch => {
             ("wallet_backup_invalid", 400)
         }
@@ -1208,7 +1210,7 @@ mod tests {
         );
     }
 
-    #[cfg(not(feature = "production-v4"))]
+    #[cfg(feature = "production-v3-testnet")]
     #[test]
     fn production_v3_no_argument_package_missing_and_partial_overrides_fail_closed() {
         let files = TestFiles::new();
@@ -1235,7 +1237,7 @@ mod tests {
         assert_eq!(error.code, "production_v3_configuration_missing");
     }
 
-    #[cfg(not(feature = "production-v4"))]
+    #[cfg(feature = "production-v3-testnet")]
     #[test]
     fn production_v3_no_argument_package_layout_resolves_fixed_sidecars() {
         let files = TestFiles::new();
@@ -1284,7 +1286,7 @@ mod tests {
         );
     }
 
-    #[cfg(not(feature = "production-v4"))]
+    #[cfg(feature = "production-v3-testnet")]
     #[test]
     fn production_v3_rejects_relative_paths_without_echoing_them() {
         let files = TestFiles::new();
@@ -1332,7 +1334,7 @@ mod tests {
         );
     }
 
-    #[cfg(not(feature = "production-v4"))]
+    #[cfg(feature = "production-v3-testnet")]
     #[test]
     fn production_v3_happy_path_is_canonical_and_passed_to_the_node_gate() {
         let files = TestFiles::new();

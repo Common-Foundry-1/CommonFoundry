@@ -20,13 +20,13 @@ with the exact TLS-pinned public pool URL:
 
 ```text
 --pool-dashboard-assets /srv/cmfd/dashboard
---pool-public-url cmfd+tls://203.0.113.20:22445?pin=<certificate-sha256>
---pool-dashboard-bind 127.0.0.1:22446
+--pool-public-url cmfd+tls://203.0.113.20:19445?pin=<certificate-sha256>
+--pool-dashboard-bind 127.0.0.1:19446
 ```
 
 The dashboard listener deliberately accepts only loopback addresses. Publish
 it through an authenticated reverse proxy or tunnel if a public web dashboard
-is wanted; expose TCP port 22445 separately for miner connections.
+is wanted; expose TCP port 19445 separately for miner connections.
 
 ## Operator packages
 
@@ -44,11 +44,11 @@ chmod +x START-POOL.sh PREPARE-V4-INPUTS.sh cmfd-node cmfd-v4-replay real_bank0_
 ```
 
 The first address is the public numeric address miners use. The second is the
-Linux host's private LAN address; forward public TCP 22445 to it. The launcher
+Linux host's private LAN address; forward public TCP 19445 to it. The launcher
 downloads and authenticates the ProductionV4 inputs, generates the TLS
 certificate on first run, prints the pinned miner URL, starts the native
 persistent CUDA replay/proof workers, enables Devnet payouts, and serves the
-dashboard on `127.0.0.1:22446`. It also enables authenticated public pool
+dashboard on `127.0.0.1:19446`. It also enables authenticated public pool
 clients; the node still requires the exact certificate pin and signed
 payout-key challenge from every worker.
 

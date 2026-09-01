@@ -1,11 +1,11 @@
 #requires -Version 5.1
 [CmdletBinding()]
 param(
-    [ValidateSet('Node', 'Miner')]
+    [ValidateSet('Node', 'Miner', 'PoolMiner')]
     [string]$Role = 'Miner',
     [string]$Destination = (Join-Path $PSScriptRoot 'inputs'),
-    [string]$ReleaseBase = 'https://downloads.commonfoundry.ai/v0.1.0-devnet.16',
-    [string]$FallbackReleaseBase = 'https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/download/v0.1.0-devnet.16',
+    [string]$ReleaseBase = 'https://downloads.commonfoundry.ai/v0.1.0-rc.1',
+    [string]$FallbackReleaseBase = 'https://github.com/Common-Foundry-1/CommonFoundry/releases/download/v0.1.0-rc.1',
     [ValidateRange(1, 16)]
     [int]$DownloadConcurrency = 16
 )
@@ -125,13 +125,13 @@ function Get-PartPaths {
 
 $manifestPath = Join-Path $PSScriptRoot 'V4-INPUT-CHUNKS.json'
 $manifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
-if ($manifest.schema_version -ne 1 -or $manifest.release -ne 'v0.1.0-devnet.16') {
+if ($manifest.schema_version -ne 1 -or $manifest.release -ne 'v0.1.0-rc.1') {
     throw 'Unsupported ProductionV4 input chunk manifest.'
 }
-$inputManifestPath = Join-Path $PSScriptRoot 'production-v4-testnet-1-inputs.json'
+$inputManifestPath = Join-Path $PSScriptRoot 'production-v4-rcnet-1-inputs.json'
 $inputManifest = Get-Content -Raw -LiteralPath $inputManifestPath | ConvertFrom-Json
 if ($inputManifest.schema_version -ne 1 -or
-    $inputManifest.network -cne 'CommonFoundry ProductionV4 Testnet-1') {
+    $inputManifest.network -cne 'CommonFoundry RCNet-1') {
     throw 'Unsupported ProductionV4 input manifest.'
 }
 $inputEntries = @{}
@@ -154,8 +154,9 @@ $destinationPath = [IO.Path]::GetFullPath($Destination)
 $partDirectory = Join-Path $destinationPath '.parts'
 New-Item -ItemType Directory -Force -Path $destinationPath, $partDirectory | Out-Null
 
+$manifestRole = if ($Role -ceq 'PoolMiner') { 'pool-miner' } else { $Role.ToLowerInvariant() }
 foreach ($file in $manifest.files) {
-    if (@($file.roles) -notcontains $Role.ToLowerInvariant()) { continue }
+    if (@($file.roles) -notcontains $manifestRole) { continue }
     $output = Join-Path $destinationPath ([string]$file.relative_path)
     $reusableCache = Test-ReusableCacheName ([string]$file.name)
     $ready = if ($reusableCache) {

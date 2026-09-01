@@ -13,19 +13,13 @@ The source tree now gives RCNet-1 the correct proof shape:
 - proof and block envelopes: the ProductionV4 network-specific limits
 - node, miner, wallet, and pool runtime: shared ProductionV4 feature
 
-The canonical `CMFD_RCNET_LAUNCH_CANDIDATE_V2` has now been generated and its
-network identity is pinned into the `production-rc` profile. The build still
-stops in `cmfd-node/build.rs` before a runnable binary is produced. At the time
-of this revision the first blocker is:
-
-```text
-production RC build gate: ProductionV4 activation evidence is absent
-```
-
-This is expected. The identity pin is not activation evidence and does not
-qualify a package, a seed host, reward-key custody, or RCNet operations. The
-missing activation record may be populated only from the completed independent
-reproduction and fresh-process verification outputs described below.
+The canonical `CMFD_RCNET_LAUNCH_CANDIDATE_V2` and signed single-producer RC
+activation are pinned into the `production-rc` profile. The activation was
+approved for an experimental release candidate only: it is not an external
+audit, independent reproduction, or mainnet authorization. Builds still fail
+closed unless `CMFD_BUILD_SOURCE_COMMIT` names the exact source commit being
+built and all pinned network, proof, verifier, artifact, and signer identities
+validate.
 
 ## Frozen ProductionV4 proof surface
 
@@ -78,17 +72,17 @@ close their governance, threshold custody, recovery, or beneficial-ownership
 gate. Private reward keys must not enter source, build automation, the seed
 host, or release artifacts.
 
-The remaining canonical activation inputs are the independently qualified
-source commit and manifest identities, the exact fresh-process Python verifier
-script and report identities, and the trusted release source commit supplied by
-build automation. The staged verifier evidence is named
+The canonical activation inputs are the qualified source commit and manifest
+identities, the exact fresh-process Python verifier script and report
+identities, the signed producer approval, and the trusted release source commit
+supplied by build automation. The staged verifier evidence is named
 `PRODUCTION-V4-FRESH-PROCESS-VERIFIER.py`; it must be byte-identical to the
 audited `production-v4-independent-verifier.py` entrypoint bound by the report.
 For activation-schema compatibility, the existing
 `fresh_process_verifier_binary_sha256` field hashes this exact executable
 verifier program, which is currently that Python script.
-These values must come from the independent process below; they must not be
-filled with local test output or invented values.
+These values are pinned to the preserved qualification bundle; they must not be
+filled with ad-hoc test output or invented values.
 
 ## Operational seed and service endpoints
 
@@ -124,8 +118,8 @@ larger storage plan remains required before long-running operation.
 
 ## Canonical activation evidence
 
-`CMFD_PRODUCTION_V4_ACTIVATION_V1` is the canonical evidence schema. Its JSON
-encoding is produced only by
+`CMFD_PRODUCTION_V4_RC_SINGLE_PRODUCER_ACTIVATION_V1` is the RCNet-1 activation
+schema. Its JSON encoding is produced only by
 `canonical_production_v4_activation_evidence_json` and binds:
 
 - exact bank and fixed-record identities
@@ -141,9 +135,15 @@ The trusted build commit is supplied by release automation through
 `CMFD_BUILD_SOURCE_COMMIT`; it is not embedded as a self-referential source
 constant.
 
-## Independent reproduction gate
+## RC activation policy and later independent reproduction
 
-Before launch pins are inserted, a second clean environment must reproduce:
+The RCNet-1 pin uses an explicit single-producer approval contract. The signed
+declarations state `experimental_release_candidate_only: true` and state that
+independent reproduction, external audit, and mainnet authorization are false.
+The finalizer accepts that contract only for the RC schema; the existing
+dual-party production contract remains separate.
+
+Before mainnet consideration, a second clean environment must reproduce:
 
 1. The model bank and fixed artifact record from the documented inputs.
 2. All byte counts, BLAKE3 digests, and SHA-256 digests.
@@ -154,8 +154,9 @@ Before launch pins are inserted, a second clean environment must reproduce:
 6. The exact qualification manifest and verifier report.
 
 The reproducer records OS, architecture, compiler versions, source commit,
-commands, inputs, outputs, and hashes. The original producer and independent
-reproducer then complete the role-separated, two-phase signature procedure in
+commands, inputs, outputs, and hashes. For a later dual-party activation, the
+original producer and independent reproducer complete the role-separated,
+two-phase signature procedure in
 [`production-v4-activation-approvals.md`](production-v4-activation-approvals.md).
 An unsigned report, two signatures from one identity or key, or signatures over
 the wrong activation phase cannot satisfy the release gate.
@@ -167,10 +168,10 @@ record and complete model bank independently of the Rust verifier, and requires
 one full cryptographic proof verification before it creates a canonical report.
 The output is create-new and must be signed separately by the reproducer.
 
-This report is explicitly a ProductionV4 Testnet-1 proof-system qualification.
-The supplied template network ID must match both the authenticated Testnet-1
-input manifest and the compiled Testnet-1 identity. It is not RCNet fresh-launch
-evidence and must not be presented as such.
+The preserved RC qualification is producer-generated and must be described as
+such. It demonstrates full cryptographic proof verification for the pinned
+candidate, but must not be presented as independent reproduction or an external
+audit.
 
 Without `--attest-fresh-generation`, the report is explicitly marked
 `reproduction_complete: false`; that mode is useful for a producer baseline but
@@ -194,7 +195,7 @@ cargo clippy -p cmfd-miner --features production-v4-testnet --all-targets
 cargo clippy -p common-foundry-wallet --features production-v4-testnet --all-targets
 ```
 
-The negative RC gate is also mandatory:
+The positive RC gate is also mandatory:
 
 ```powershell
 $env:CARGO_BUILD_JOBS = '4'
@@ -202,11 +203,9 @@ $env:CMFD_BUILD_SOURCE_COMMIT = '<trusted lowercase source commit>'
 cargo check -p cmfd-node --features production-rc
 ```
 
-With the identity pin present but canonical ProductionV4 activation evidence
-absent, that command must fail with the activation-evidence error before a node
-can open storage. After real activation evidence is pinned, the same command
-becomes a positive build gate and must bind the trusted source commit to that
-evidence.
+That command must succeed only when the trusted source commit is bound to the
+pinned RC activation evidence. Missing, malformed, or mismatched activation
+data must still stop the build before a node can open storage.
 
 ## RCNet-1 rehearsal acceptance
 

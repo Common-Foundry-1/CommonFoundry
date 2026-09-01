@@ -17,7 +17,7 @@ This is Devnet software. Credits and payouts have no monetary value.
 - At least 90 GB of free disk space for the authenticated 61 GB input set,
   resumable download parts, the chain, and scratch files.
 - A stable broadband connection and a public numeric IPv4 or IPv6 address.
-- TCP 22445 forwarded to the pool host for miners. TCP 22444 is the P2P port.
+- TCP 19445 forwarded to the pool host for miners. TCP 19444 is the P2P port.
 - Windows: Windows 11, WSL2, Ubuntu 22.04, and NVIDIA GPU support working inside
   WSL. The supplied Windows node starts the Linux CUDA workers through WSL.
 - Linux: x86-64 Linux, Python 3, curl, an NVIDIA driver, and the CUDA 12 runtime.
@@ -34,7 +34,7 @@ pinned byte lengths and SHA-256 hashes before the pool starts.
 3. Double-click `START-POOL.bat`.
 4. Enter the public numeric IP miners will use and this computer's private LAN
    IP when prompted.
-5. Allow inbound TCP 22444 and 22445 in Windows Firewall and forward those ports
+5. Allow inbound TCP 19444 and 19445 in Windows Firewall and forward those ports
    in the router when the host is behind NAT.
 
 The console prints the exact `cmfd+tls://...` miner URL after generating the
@@ -78,7 +78,7 @@ prompt is shown after the first successful start. Pass
 directory.
 
 Double-click `OPEN-OPERATOR-DASHBOARD.bat` to open the local operator console at
-<http://127.0.0.1:22448>. Keep its small console window open while using the web
+<http://127.0.0.1:19448>. Keep its small console window open while using the web
 controls. The page can start, gracefully stop, or restart the pool, view the
 latest log, and update the operator fee and PPLNS window used after the next
 start. Guarded stop and restart controls require an explicit confirmation.
@@ -96,7 +96,7 @@ The first argument is the public numeric IP and the second is the host's private
 LAN IP. Omitting either value prompts for it. The optional third argument is a
 custom pool data directory.
 
-Use `CMFD_POOL_PEER=IP:22444` and `CMFD_POOL_ALLOW_PUBLIC_PEERS=1` to configure a
+Use `CMFD_POOL_PEER=IP:19444` and `CMFD_POOL_ALLOW_PUBLIC_PEERS=1` to configure a
 static public P2P peer. Other operator overrides are listed near the top of
 `START-POOL.sh`.
 
@@ -133,14 +133,14 @@ pool process continues running.
 
 ## Dashboard and miner connections
 
-The dashboard is available on the pool host at <http://127.0.0.1:22446>. It
+The dashboard is available on the pool host at <http://127.0.0.1:19446>. It
 shows pool health, chain height, workers, accepted and rejected shares, PPLNS
 window size, per-block reward and fee accounting, matured operator fees,
 credit, and payout status. The dashboard is deliberately loopback-only. Publish
 it through an authenticated reverse proxy or tunnel if remote viewing is
 needed.
 
-The operator console is separately available at <http://127.0.0.1:22448> after
+The operator console is separately available at <http://127.0.0.1:19448> after
 running the supplied operator-dashboard launcher. It binds exclusively to
 `127.0.0.1`, validates the browser host and origin, and requires an in-memory
 same-origin request token for every mutation. It does not emit CORS permissions

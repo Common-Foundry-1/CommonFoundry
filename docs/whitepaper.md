@@ -2,13 +2,13 @@
 
 ## Matrix-Bound Proof of Work and Direct GPU Inference Markets
 
-Technical White Paper - ProductionV4 Testnet-1 and ForgeMatrix v2 Research Architecture
+Technical White Paper - RCNet-1 and ForgeMatrix v2 Research Architecture
 
 Version 0.2 - August 2026
 
 Common Foundry Research
 
-> **ProductionV4 Testnet-1 milestone.** Common Foundry `v0.1.0-devnet.16` runs the full 128 by 4,096 by 384 ForgeMatrix profile with a transparent BaseFold proof. ProductionV4 blocks have been created, CPU-verified, accepted through normal P2P admission, and independently downloaded and persisted by another node. The testnet and its coins are for research and testing.
+> **RCNet-1 release candidate.** Common Foundry `v0.1.0-rc.1` packages the full 128 by 4,096 by 384 ForgeMatrix profile with a transparent BaseFold proof. The pinned candidate proof passed full CPU cryptographic verification. RCNet-1 is a launch rehearsal; its coins are for research and testing and have no intended monetary value.
 
 ---
 
@@ -37,7 +37,7 @@ This paper uses the following labels as protocol terms:
 | **Production proposal** | Specified research design for a future consensus profile. |
 | **Activation milestone** | A measurable achievement on the path from testnet to a public-value profile. |
 
-This revision describes `v0.1.0-devnet.16`, an isolated ProductionV4 testnet that is incompatible with ProductionV3 Devnet-15. ProductionV4 uses separate network identity, ports, storage, artifact pins, proof tag, and network-specific frame limits. Windows and Linux releases include standalone node, GUI wallet, and GPU miner packages. The original tiny Devnet and the ProductionV3/Dory work remain useful research history, but they no longer describe the active proof path.
+This revision describes `v0.1.0-rc.1`, an isolated ProductionV4 release-candidate network that is incompatible with ProductionV3 Devnet-15 and ProductionV4 Testnet-1. RCNet-1 uses separate network identity, ports, storage, artifact pins, proof tag, and network-specific frame limits. Windows and Linux releases include standalone node, GUI wallet, and GPU miner packages. The original tiny Devnet and the ProductionV3/Dory work remain useful research history, but they no longer describe the active proof path.
 
 ### 1.1 ProductionV4 decision summary
 
@@ -65,7 +65,7 @@ This revision describes `v0.1.0-devnet.16`, an isolated ProductionV4 testnet tha
 | Hardware accessibility target | Named 16 GB GPUs | Keeps the reference proving path within a widely available consumer memory tier. |
 | CPU self-verification | Mandatory for every candidate | Gives miners an independent correctness check before spending bandwidth on submission. |
 
-This white paper describes the intended system, the rationale behind its choices, the exact consensus relations already specified, and the milestones ahead. ProductionV4 Testnet-1 and its coins are for research and testing.
+This white paper describes the intended system, the rationale behind its choices, the exact consensus relations already specified, and the milestones ahead. RCNet-1 and its coins are for research and testing.
 
 ## 2. Why Common Foundry is needed
 
@@ -196,10 +196,10 @@ The decoder rejects unknown tags or kinds, nonzero flags, excessive counts or le
 | Resource | Bound |
 |---|---:|
 | Block frame, networks before ProductionV4 | 1 MiB |
-| Block frame, ProductionV4 Testnet-1 only | 16 MiB |
+| Block frame, RCNet-1 only | 16 MiB |
 | Transaction frame | 64 KiB |
 | Proof frame, tags before ProductionV4 | 256 KiB |
-| Proof frame, ProductionV4 Testnet-1 only | 13 MiB |
+| Proof frame, RCNet-1 only | 13 MiB |
 | Transactions per block | 1,024 |
 | Inputs per transaction | 128 |
 | Outputs per transaction | 128 |
@@ -646,7 +646,7 @@ GPU replay and proving provide performance, while canonical verification provide
 
 The pre-ProductionV4 256 KiB proof frame remains a useful compact-proof bound for earlier networks. ProductionV4's measured transparent proof is exactly 12,025,320 bytes, so the V4 network has its own explicitly scoped transport envelope.
 
-ProductionV4 Testnet-1 therefore has a 13 MiB complete proof-frame cap and a 16 MiB complete block-frame cap. The extra block headroom carries the proof wrapper, coinbase, ordinary transactions, and framing. Both limits are selected by the full 32-byte network identity, so earlier networks retain their 256 KiB proof and 1 MiB block limits while ProductionV4 uses its dedicated proof tag and envelope.
+RCNet-1 therefore has a 13 MiB complete proof-frame cap and a 16 MiB complete block-frame cap. The extra block headroom carries the proof wrapper, coinbase, ordinary transactions, and framing. Both limits are selected by the full 32-byte network identity, so earlier networks retain their 256 KiB proof and 1 MiB block limits while ProductionV4 uses its dedicated proof tag and envelope.
 
 > **Reason for the V4 block bound:** 16 MiB provides clear transport headroom for the measured proof, its wrapper, the coinbase, ordinary transactions, and canonical framing. It is a maximum envelope, so blocks use only the bytes they actually contain.
 
@@ -663,7 +663,7 @@ The RTX 5090 result demonstrates a sub-20-second online proof on the fastest qua
 
 #### 8.7.3 Testnet operating surface
 
-Devnet-16 ships binary packages for Windows and Linux nodes, GUI wallets, and miners. Nodes and wallets acquire the approximately 6.4 GB model bank. Miners acquire approximately 61.2 GB of model and preprocessed prover inputs. Launchers resume interrupted transfers, download parts concurrently, and require pinned byte counts and SHA-256 identities before assembly or use.
+RCNet-1 ships binary packages for Windows and Linux nodes, GUI wallets, and miners. Nodes and wallets acquire the approximately 6.4 GB model bank. Miners acquire approximately 61.2 GB of model and preprocessed prover inputs. Launchers resume interrupted transfers, download parts concurrently, and require pinned byte counts and SHA-256 identities before assembly or use.
 
 The miner console intentionally reports compact operating statistics: accepted and rejected block submissions, average GPU wattage, accepted blocks per kWh, peak temperature, and last-attempt time. These are solo block-submission statistics, not pool shares. Full proof diagnostics are retained in per-attempt log files and are surfaced when an unexpected failure stops mining.
 
@@ -1001,7 +1001,7 @@ The next network layer adds authenticated peer discovery, reputation and ban pol
 | Governance | Fixed visible steward/community destinations and exact bootstrap percentages | Multisig operations, reporting, and a clear change process |
 | Review | Extensive internal tests and executable qualification | Two independent external audits |
 
-The earlier tiny-fixture, WHIR, and ProductionV3 Dory results document the research path that informed ProductionV4. Devnet-16 uses the implemented ProductionV4 path, while the earlier work remains useful for comparison and independent review.
+The earlier tiny-fixture, WHIR, and ProductionV3 Dory results document the research path that informed ProductionV4. RCNet-1 uses the implemented ProductionV4 path, while the earlier work remains useful for comparison and independent review.
 
 ## 14. Mainnet readiness roadmap
 
@@ -1066,7 +1066,7 @@ Burning every fee keeps scheduled issuance and service usage mechanically distin
 
 Common Foundry proposes a clear separation of concerns. A fixed, deterministic matrix relation secures ledger ordering. The proposed market would let customers and GPU providers negotiate real inference independently and settle bounded exposure through cumulative payment channels. A visible five-year funding stream supports miners, stewardship, and community work; all usage fees are burned; a miner-only tail sustains long-run proof-of-work issuance.
 
-ProductionV4 Testnet-1 demonstrates that these components can be made concrete
+The RCNet-1 candidate demonstrates that these components can be made concrete
 enough to test at the full ForgeMatrix shape: canonical encoding,
 network-bound signatures, chain-derived targets, exact GPU replay, transparent
 proof construction, mandatory CPU candidate verification, independent node
@@ -1083,12 +1083,12 @@ faster end-to-end packaging.
 
 The earlier Remainder, WHIR, and BLS12-381 Dory experiments supplied the
 correctness references and performance data that led to ProductionV4. The next
-milestones are sustained Devnet-16 participation, independent reproduction of
+milestones are sustained RCNet-1 participation, independent reproduction of
 the BaseFold statement and verifier, expanded GPU qualification, signed and
 reproducible releases, stronger public networking, production wallet and pool
 operations, and external review.
 
-Common Foundry advances through measured software, named hardware, canonical artifacts, and independently reproducible results. ProductionV4 Testnet-1 is the first full-shape network milestone on that path.
+Common Foundry advances through measured software, named hardware, canonical artifacts, and independently reproducible results. RCNet-1 is the first full-shape release-candidate milestone on that path.
 
 ## Appendix A. Consensus parameter summary
 
@@ -1111,10 +1111,10 @@ Common Foundry advances through measured software, named hardware, canonical art
 | Fees | Ordinary transaction fees | Burned |
 | Fees | Channel close fee | Burned |
 | Ledger | Maximum block frame, networks before ProductionV4 | 1 MiB |
-| Ledger | Maximum block frame, ProductionV4 Testnet-1 | 16 MiB |
+| Ledger | Maximum block frame, RCNet-1 | 16 MiB |
 | Ledger | Maximum transaction frame | 64 KiB |
 | Ledger | Maximum proof frame, tags before ProductionV4 | 256 KiB |
-| Ledger | Maximum proof frame, ProductionV4 Testnet-1 | 13 MiB |
+| Ledger | Maximum proof frame, RCNet-1 | 13 MiB |
 | Ledger | Transactions per block | 1,024 |
 | Ledger | Inputs/outputs per transaction | 128 / 128 |
 | Ledger | Signature checks per block | 2,048 |
@@ -1224,4 +1224,4 @@ The funding output contains the exact deposit and a `channel_id` commitment. Ful
 7. Bitcoin Improvement Proposal 340, *Schnorr Signatures for secp256k1*. https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki
 8. BLAKE3 team, *BLAKE3 Specification*. https://github.com/BLAKE3-team/BLAKE3-specs
 9. Srinath Setty, *Nova: Recursive Zero-Knowledge Arguments from Folding Schemes*, 2021. https://eprint.iacr.org/2021/370.pdf
-10. Common Foundry source and specifications, experimental prerelease `v0.1.0-devnet.16`; the release notes and source history identify the measured ProductionV4 testnet artifacts and results.
+10. Common Foundry source and specifications, experimental prerelease `v0.1.0-rc.1`; the release notes and source history identify the pinned RCNet-1 artifacts and qualification results.

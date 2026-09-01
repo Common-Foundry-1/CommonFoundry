@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param(
     [string]$Miner,
-    [string]$Peer = '107.214.187.2:22444',
+    [string]$Peer = '173.249.35.251:19444',
     [ValidateRange(0, [int]::MaxValue)]
     [int]$Blocks = 0,
     [string]$WslDistribution = 'Ubuntu-22.04'
@@ -10,7 +10,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 if ([string]::IsNullOrWhiteSpace($Miner)) {
-    Write-Host 'Paste the 64-character receive address shown by your Devnet-16 wallet.'
+    Write-Host 'Paste the 64-character receive address shown by your RCNet-1 wallet.'
     $Miner = (Read-Host 'Mining address').Trim()
 }
 if ($Miner -cnotmatch '^[0-9a-fA-F]{64}$') {
@@ -25,7 +25,7 @@ New-Item -ItemType Directory -Force -Path $work | Out-Null
     -Miner $Miner `
     -ModelBank (Join-Path $inputs 'MODEL-V2.bank') `
     -FixedArtifactDirectory (Join-Path $inputs 'fixed') `
-    -InputManifest (Join-Path $PSScriptRoot 'production-v4-testnet-1-inputs.json') `
+    -InputManifest (Join-Path $PSScriptRoot 'production-v4-rcnet-1-inputs.json') `
     -CmfdMiner (Join-Path $PSScriptRoot 'cmfd-miner.exe') `
     -ReplayBinary (Join-Path $PSScriptRoot 'cmfd-v4-replay') `
     -DynamicCommitmentBinary (Join-Path $PSScriptRoot 'real_dynamic_commitments') `

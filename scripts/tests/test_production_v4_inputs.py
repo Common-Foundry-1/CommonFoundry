@@ -22,6 +22,31 @@ def sha256(value: bytes) -> str:
 
 
 class ProductionV4InputTests(unittest.TestCase):
+    def test_pool_miner_role_requires_only_model_and_fixed_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = Path(temporary) / "chunks.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "release": INPUTS.EXPECTED_RELEASE,
+                        "files": [
+                            {"name": "MODEL-V2.bank", "roles": ["miner", "pool-miner"]},
+                            {
+                                "name": "FORGEMATRIX-V4-FIXED-BANK-0.tree",
+                                "roles": ["miner"],
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                INPUTS.required_input_names(manifest, "pool-miner"),
+                {"MODEL-V2.bank", INPUTS.FIXED_RECORD_NAME},
+            )
+
     def test_prepare_authenticates_parts_while_assembling(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

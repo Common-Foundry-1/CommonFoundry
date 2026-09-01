@@ -342,7 +342,7 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
                 aria-describedby="pool-url-help"
                 autoComplete="off"
                 spellCheck={false}
-                placeholder="cmfd+tls://107.214.187.2:22445?pin=64_HEX"
+                placeholder="cmfd+tls://173.249.35.251:19445?pin=64_HEX"
                 onChange={(event) => setPoolUrl(event.target.value)}
               />
               <span

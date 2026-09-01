@@ -460,7 +460,7 @@ export function App() {
         <div><FileText /><span><strong>Settings file</strong><code>{status.paths.settings_file}</code></span></div>
         <div><HardDrive /><span><strong>Data directory</strong><code>{status.paths.data_directory}</code></span></div>
         <div><TerminalSquare /><span><strong>Operator console</strong><code>{status.operator_bind}</code></span></div>
-        <div><Database /><span><strong>Public dashboard</strong><code>{status.settings?.dashboard_bind || "127.0.0.1:22446"}</code></span></div>
+        <div><Database /><span><strong>Public dashboard</strong><code>{status.settings?.dashboard_bind || "127.0.0.1:19446"}</code></span></div>
       </footer>
       <div className="machine-boundary"><ShieldCheck size={15} /> Operator access never leaves this machine.</div>
     </div>

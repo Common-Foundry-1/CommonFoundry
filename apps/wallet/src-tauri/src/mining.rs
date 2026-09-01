@@ -1414,10 +1414,10 @@ mod tests {
     }
 
     #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4")))]
-    fn pool_request(pool_url: String, worker: &str) -> MiningStartRequest {
+    fn pool_request(pool_url: String, worker: &str, payout: [u8; 32]) -> MiningStartRequest {
         MiningStartRequest {
             mode: MiningMode::Pool,
-            payout: hex::encode(default_miner_destination()),
+            payout: hex::encode(payout),
             pool_url: Some(pool_url),
             worker_name: Some(worker.to_owned()),
         }
@@ -1573,6 +1573,7 @@ mod tests {
         fs::create_dir_all(&certificate_dir).unwrap();
 
         let wallet_node = Arc::new(Mutex::new(Node::open(&wallet_path).unwrap()));
+        let wallet_payout = wallet_node.lock().unwrap().wallet_destination();
         let pool_node = Arc::new(Mutex::new(Node::open(&pool_path).unwrap()));
         let certificate = certificate_dir.join("pool.crt.der");
         let private_key = certificate_dir.join("pool.key.der");
@@ -1595,7 +1596,11 @@ mod tests {
         let manager = MiningManager::new(Arc::clone(&wallet_node));
 
         let starting = manager
-            .start(pool_request(pool_url.clone(), "wallet-worker"))
+            .start(pool_request(
+                pool_url.clone(),
+                "wallet-worker",
+                wallet_payout,
+            ))
             .unwrap();
         assert_eq!(starting.lifecycle, MiningLifecycle::Starting);
         assert_eq!(starting.mode, Some(MiningMode::Pool));
@@ -1634,7 +1639,11 @@ mod tests {
         assert!(pool_node.lock().unwrap().status().unwrap().accepted_height > 0);
 
         manager
-            .start(pool_request(pool_url, "wallet-worker-restart"))
+            .start(pool_request(
+                pool_url,
+                "wallet-worker-restart",
+                wallet_payout,
+            ))
             .unwrap();
         let restart_deadline = Instant::now() + Duration::from_secs(5);
         while !manager.status().unwrap().pool_connected {

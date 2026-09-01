@@ -37,7 +37,7 @@ for file in \
   "$dashboard/index.html" \
   "$operator_dashboard/index.html" \
   "$shared/V4-INPUT-CHUNKS.json" \
-  "$shared/production-v4-testnet-1-inputs.json" \
+  "$shared/production-v4-rcnet-1-inputs.json" \
   "$shared/FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json"; do
   if [[ ! -f "$file" ]]; then
     echo "ERROR: required package input is missing: $file" >&2
@@ -71,12 +71,12 @@ copy_common() {
   cp -- "$project_root/scripts/production-v4-pool-operator.py" "$stage/POOL-OPERATOR.py"
   cp -- "$project_root/scripts/production-v4-inputs.py" "$stage/production-v4-inputs.py"
   cp -- "$shared/V4-INPUT-CHUNKS.json" "$stage/V4-INPUT-CHUNKS.json"
-  cp -- "$shared/production-v4-testnet-1-inputs.json" "$stage/production-v4-testnet-1-inputs.json"
+  cp -- "$shared/production-v4-rcnet-1-inputs.json" "$stage/production-v4-rcnet-1-inputs.json"
   cp -- "$shared/FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json" "$stage/FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json"
   cp -- "$project_root/docs/production-v4-pool.md" "$stage/README.md"
   cp -- "$project_root/LICENSE" "$stage/LICENSE"
   cp -- "$project_root/THIRD_PARTY_NOTICES.md" "$stage/THIRD_PARTY_NOTICES.md"
-  cp -- "$project_root/docs/release-notes/v0.1.0-devnet.16.md" "$stage/RELEASE_NOTES.md"
+  cp -- "$project_root/docs/release-notes/v0.1.0-rc.1.md" "$stage/RELEASE_NOTES.md"
   cp -- "$prover_directory/cmfd-v4-replay" "$stage/cmfd-v4-replay"
   cp -- "$prover_directory/real_bank0_relations" "$stage/real_bank0_relations"
 }

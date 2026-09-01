@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "release": "v0.1.0-devnet.16",
+  "release": "v0.1.0-rc.1",
   "total_assembled_bytes": 61203808344,
   "files": [
     {
@@ -8,7 +8,8 @@
       "relative_path": "MODEL-V2.bank",
       "roles": [
         "node",
-        "miner"
+        "miner",
+        "pool-miner"
       ],
       "bytes": 6442975416,
       "sha256": "5f9b213c3bda51b74e4ebabb26607b67385d613aa8d99af915a48ab063e17d4e",

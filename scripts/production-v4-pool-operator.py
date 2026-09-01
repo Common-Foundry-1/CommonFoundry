@@ -545,7 +545,7 @@ def main() -> int:
     parser.add_argument("--bundle-dir", type=Path, default=Path(__file__).resolve().parent)
     parser.add_argument("--data-dir", type=Path)
     parser.add_argument("--assets-dir", type=Path)
-    parser.add_argument("--bind", type=_parse_bind, default=_parse_bind("127.0.0.1:22448"))
+    parser.add_argument("--bind", type=_parse_bind, default=_parse_bind("127.0.0.1:19448"))
     parser.add_argument("--open-browser", action="store_true")
     args = parser.parse_args()
     bundle_dir = args.bundle_dir.resolve()

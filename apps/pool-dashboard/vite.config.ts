@@ -3,7 +3,7 @@ import { defineConfig } from "vitest/config";
 
 const dashboardProxy = {
   "/api": {
-    target: "http://127.0.0.1:22446",
+    target: "http://127.0.0.1:19446",
     changeOrigin: true,
   },
 };

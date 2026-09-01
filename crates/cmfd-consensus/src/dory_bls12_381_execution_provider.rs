@@ -11,8 +11,9 @@ use std::{
     io::Read,
     path::Path,
     sync::atomic::{AtomicBool, Ordering},
-    time::Instant,
 };
+#[cfg(any(feature = "dory-v3-consensus-adapter", test))]
+use std::time::Instant;
 
 use rayon::prelude::*;
 use thiserror::Error;

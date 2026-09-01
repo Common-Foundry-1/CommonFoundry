@@ -8,13 +8,13 @@ const status: OperatorStatus = {
   ok: true,
   generated_at_unix_seconds: 1_788_000_000,
   platform: "windows",
-  operator_bind: "127.0.0.1:22448",
+  operator_bind: "127.0.0.1:19448",
   action_busy: false,
   pool: {
     running: true,
     pid: 14268,
     uptime_seconds: 5_122,
-    dashboard_url: "http://127.0.0.1:22446/",
+    dashboard_url: "http://127.0.0.1:19446/",
     dashboard_healthy: true,
     dashboard_error: null,
     log_file: "C:\\pool\\pool-data\\logs\\pool.log",
@@ -22,14 +22,14 @@ const status: OperatorStatus = {
   settings: {
     public_numeric_address: "107.214.187.2",
     private_bind_address: "192.168.68.32",
-    pool_port: 22445,
-    p2p_bind: "0.0.0.0:22444",
-    dashboard_bind: "127.0.0.1:22446",
+    pool_port: 19445,
+    p2p_bind: "0.0.0.0:19444",
+    dashboard_bind: "127.0.0.1:19446",
     operator_fee_bps: 300,
     pplns_window_shares: 0,
   },
   snapshot: {
-    public_pool_url: `cmfd+tls://107.214.187.2:22445?pin=${"ab".repeat(32)}`,
+    public_pool_url: `cmfd+tls://173.249.35.251:19445?pin=${"ab".repeat(32)}`,
     certificate_sha256: "ab".repeat(32),
     pool: {
       generated_at_unix_seconds: 1_788_000_000,
@@ -69,7 +69,7 @@ const status: OperatorStatus = {
     settings_file: "C:\\pool\\pool-data\\pool-control\\pool-settings.json",
   },
   events: [
-    { time_unix_seconds: 1_788_000_000, event: "Operator console started", details: "Listening on 127.0.0.1:22448", source: "Console" },
+    { time_unix_seconds: 1_788_000_000, event: "Operator console started", details: "Listening on 127.0.0.1:19448", source: "Console" },
   ],
 };
 

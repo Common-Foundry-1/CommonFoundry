@@ -337,7 +337,7 @@ export function App() {
               ))}
             </div>
             <ol className="connect-steps">
-              <li>Launch {platform === "windows" ? "START-WALLET.bat" : "./start-wallet.sh"} from the Devnet-16 wallet package.</li>
+              <li>Launch {platform === "windows" ? "START-WALLET.bat" : "./start-wallet.sh"} from the RCNet-1 wallet package.</li>
               <li>Open Mining, choose Pool mode, and paste the pool URL below.</li>
               <li>Enter a unique worker name; the wallet supplies its authenticated receive address.</li>
             </ol>

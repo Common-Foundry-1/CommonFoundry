@@ -5,13 +5,13 @@ import { App } from "./App";
 import type { DashboardDocument } from "./types";
 
 const fixture: DashboardDocument = {
-  public_pool_url: `cmfd+tls://107.214.187.2:22445?pin=${"ab".repeat(32)}`,
+  public_pool_url: `cmfd+tls://173.249.35.251:19445?pin=${"ab".repeat(32)}`,
   certificate_sha256: "ab".repeat(32),
   refresh_interval_seconds: 60,
   pool: {
     generated_at_unix_seconds: 1_788_000_000,
     network_name: "ProductionV4 Testnet-1",
-    network_short_name: "Devnet-16",
+    network_short_name: "RCNet-1",
     network_notice: "Test network",
     proof_profile: "production-v4",
     accepted_height: 212,
@@ -162,7 +162,7 @@ describe("pool dashboard", () => {
     await screen.findByRole("heading", { name: "ForgeMatrix Pool" });
 
     expect(container.querySelector(".connect-steps")).toHaveTextContent("START-WALLET.bat");
-    expect(screen.getByText(/Devnet-16 wallet package/)).toBeVisible();
+    expect(screen.getByText(/RCNet-1 wallet package/)).toBeVisible();
     expect(screen.queryByText(/miner package/)).not.toBeInTheDocument();
 
     await user.click(screen.getByRole("tab", { name: "Linux" }));

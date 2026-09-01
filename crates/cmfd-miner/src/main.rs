@@ -24,6 +24,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 #[cfg(feature = "production-v3")]
 use cmfd_consensus::ForgeMatrixV3WinningNonceClaim;
+#[cfg(feature = "production-v4-testnet")]
+use cmfd_consensus::PRODUCTION_V4_MODEL_MANIFEST_DIGEST;
 #[cfg(feature = "production-v3-testnet")]
 use cmfd_consensus::dory_v3_qualification::ProductionDoryV3QualificationSeed;
 #[cfg(feature = "production-v4")]
@@ -37,9 +39,8 @@ use cmfd_consensus::{
     FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES, ForgeMatrixV4CandidateProof,
     ForgeMatrixV4FixedArtifactRecordV1, PRODUCTION_V2_LAYERS,
     PRODUCTION_V4_FIXED_ARTIFACT_RECORD_DIGEST, PRODUCTION_V4_MAX_BLOCK_BYTES,
-    PRODUCTION_V4_MAX_PROOF_BYTES, PRODUCTION_V4_MODEL_MANIFEST_DIGEST, Transaction,
-    forgematrix_v4_challenge_digest, forgematrix_v4_proof_system_digest,
-    forgematrix_v4_work_digest,
+    PRODUCTION_V4_MAX_PROOF_BYTES, Transaction, forgematrix_v4_challenge_digest,
+    forgematrix_v4_proof_system_digest, forgematrix_v4_work_digest,
 };
 #[cfg(feature = "production-v3-testnet")]
 use cmfd_consensus::{
@@ -6916,23 +6917,21 @@ mod tests {
     }
 
     #[test]
-    fn packaged_launchers_use_thin_mining_with_local_wallet_then_bootstrap() {
-        let windows = include_str!("../../../packaging/standalone-miner/windows/START-MINER.bat");
-        let linux = include_str!("../../../packaging/standalone-miner/linux/start-miner.sh");
+    fn packaged_rc_launchers_use_certificate_pinned_pool_mining() {
+        let windows =
+            include_str!("../../../packaging/production-rc/miner/windows/START-MINER.ps1");
+        let linux = include_str!("../../../packaging/production-rc/miner/linux/start-miner.sh");
 
         for launcher in [windows, linux] {
-            let local = launcher.find("127.0.0.1:18444").unwrap();
-            let bootstrap = launcher.find("107.214.187.2:18444").unwrap();
-            assert!(local < bootstrap);
-            assert_eq!(launcher.matches("--peer").count(), 2);
-            assert!(launcher.contains("--allow-public-peers"));
+            assert!(launcher.contains("cmfd+tls://"));
+            assert!(launcher.contains(" pool"));
+            assert!(launcher.contains("--production-v4-bank"));
+            assert!(launcher.contains("--production-v4-replay-worker"));
+            assert!(launcher.contains("--production-v4-scratch"));
             assert!(launcher.contains("--stats-seconds"));
-            assert!(launcher.contains("--workers-per-gpu"));
-            assert!(launcher.contains("PAYOUT_ADDRESS"));
-            assert!(!launcher.contains("--data-dir"));
-            assert!(!launcher.contains("--p2p-bind"));
+            assert!(launcher.contains("pool-miner") || launcher.contains("PoolMiner"));
+            assert!(!launcher.contains("--allow-public-peers"));
         }
-        assert!(windows.contains("if not defined PAYOUT_ADDRESS"));
-        assert!(linux.contains("if [[ -z \"$PAYOUT_ADDRESS\" ]]"));
+        assert!(windows.contains("--production-v4-wsl-distribution"));
     }
 }

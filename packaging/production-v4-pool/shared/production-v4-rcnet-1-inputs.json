@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "network": "CommonFoundry ProductionV4 Testnet-1",
-  "network_id": "b9e55d5a5e80c8e3d73bf81b199bc643ac9367436962c28b6aacdc37f3809962",
-  "source_commit": "1dd8b90bfea8242cd6bb638cf62ccf66732c2479",
+  "network": "CommonFoundry RCNet-1",
+  "network_id": "3e99d45959c19c0053d8e9fef34875b57b46a8a1ce330637daddab515bc7b92d",
+  "source_commit": "6884823fa4794325d8d0ded6d83772ed6a7a52f9",
   "total_bytes": 61203815317,
   "files": [
     {
@@ -23,7 +23,7 @@
     {
       "name": "FORGEMATRIX-V4-FIXED-BANK-0.tree",
       "bytes": 1073741792,
-      "sha256": "6f55b1ddc9bc15426dbf23a662ab205e2f5396d92c7298c34885a22e34380085"
+      "sha256": "6f55b1ddc9bc15426dbf23a662ab205e2f5396d92d7298c34885a22e34380085"
     },
     {
       "name": "FORGEMATRIX-V4-FIXED-BANK-1.row-major.codeword",

@@ -5181,6 +5181,35 @@ class ProductionRcGateTests(unittest.TestCase):
                 stage_files=stage_files,
             )
 
+    def test_activation_history_allows_release_commits_after_pin_commit(self) -> None:
+        repository = GitFixture()
+        try:
+            pin_relative = integrity.PRODUCTION_V4_ACTIVATION_PIN_RELATIVE
+            repository.write(pin_relative, "None\n")
+            repository.git("add", "--", pin_relative)
+            repository.git("commit", "--quiet", "-m", "add activation slot")
+            qualification_commit = repository.commit
+
+            pin_bytes = b"Some(reviewed activation)\n"
+            repository.write(pin_relative, pin_bytes)
+            repository.git("add", "--", pin_relative)
+            repository.git("commit", "--quiet", "-m", "pin activation")
+
+            repository.write("RELEASE.md", "release metadata\n")
+            repository.git("add", "--", "RELEASE.md")
+            repository.git("commit", "--quiet", "-m", "prepare release")
+
+            integrity._validate_production_v4_activation_history(
+                phase="evidence",
+                repo=repository.root,
+                commit=repository.commit,
+                generation_commit=qualification_commit,
+                qualification_commit=qualification_commit,
+                pin_bytes=pin_bytes,
+            )
+        finally:
+            repository.close()
+
 
 class ProductionRcVersionTests(unittest.TestCase):
     def setUp(self) -> None:

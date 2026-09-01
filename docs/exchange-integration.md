@@ -45,10 +45,11 @@ implementation is certified by this repository.
 
 ## RCNet connectivity status
 
-The `CMFD_RCNET_LAUNCH_CANDIDATE_V2` network identity is pinned in source. That
-does not make the network or this custody preview production-ready. A
-`production-rc` build still fails closed because canonical ProductionV4
-activation evidence from the independent qualification process is absent.
+The `CMFD_RCNET_LAUNCH_CANDIDATE_V2` network identity and signed RC-only
+ProductionV4 activation are pinned in source. That does not make the network or
+this custody preview production-ready. The public seed remains disabled until
+the exact frozen RC package is installed and the two-node connectivity
+rehearsal passes.
 
 RCNet bootstrap is deliberately operational rather than consensus-bound. When
 the qualified build exists, a node started without `--peer` or

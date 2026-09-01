@@ -15,8 +15,9 @@ import sys
 
 
 BUFFER_BYTES = 8 * 1024 * 1024
-EXPECTED_RELEASE = "v0.1.0-devnet.16"
-EXPECTED_NETWORK = "CommonFoundry ProductionV4 Testnet-1"
+EXPECTED_RELEASE = "v0.1.0-rc.1"
+EXPECTED_NETWORK = "CommonFoundry RCNet-1"
+FIXED_RECORD_NAME = "FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json"
 
 
 def load_json(path: Path) -> dict:
@@ -120,7 +121,28 @@ def prepare_part(part: dict, part_directory: Path, release_bases: tuple[str, ...
     return part_path
 
 
-def prepare_inputs(args: argparse.Namespace) -> set[str]:
+def required_input_names(chunk_manifest: Path, role: str) -> set[str]:
+    manifest = load_json(chunk_manifest)
+    if manifest.get("schema_version") != 1 or manifest.get("release") != EXPECTED_RELEASE:
+        raise ValueError("unsupported ProductionV4 input chunk manifest")
+    names = {
+        str(entry["name"])
+        for entry in manifest.get("files", [])
+        if role in entry.get("roles", [])
+    }
+    if not names:
+        raise ValueError(f"ProductionV4 input manifest has no files for role {role}")
+    names.add(FIXED_RECORD_NAME)
+    return names
+
+
+def prepare_inputs(
+    args: argparse.Namespace, required_names: set[str] | None = None
+) -> set[str]:
+    if required_names is None:
+        required_names = required_input_names(
+            args.chunk_manifest, getattr(args, "role", "miner")
+        )
     manifest = load_json(args.chunk_manifest)
     if manifest.get("schema_version") != 1 or manifest.get("release") != EXPECTED_RELEASE:
         raise ValueError("unsupported ProductionV4 input chunk manifest")
@@ -137,9 +159,9 @@ def prepare_inputs(args: argparse.Namespace) -> set[str]:
 
     authenticated: set[str] = set()
     for entry in manifest.get("files", []):
-        if "miner" not in entry.get("roles", []):
-            continue
         name = str(entry["name"])
+        if name not in required_names:
+            continue
         output = destination / safe_relative_path(str(entry["relative_path"]))
         expected_size = int(entry["bytes"])
         expected_sha256 = str(entry["sha256"])
@@ -207,6 +229,7 @@ def validate_inputs(
     manifest_path: Path,
     authenticated: set[str] | None = None,
     prepared: bool = False,
+    required_names: set[str] | None = None,
 ) -> None:
     manifest = load_json(manifest_path)
     if manifest.get("schema_version") != 1 or manifest.get("network") != EXPECTED_NETWORK:
@@ -216,12 +239,16 @@ def validate_inputs(
         raise ValueError("ProductionV4 prover input manifest must contain exactly eight files")
 
     seen: set[str] = set()
-    total = 0
+    manifest_total = 0
+    validated_total = 0
     for entry in entries:
         name = str(entry["name"])
         if name in seen:
             raise ValueError(f"ProductionV4 prover input manifest repeats {name}")
         seen.add(name)
+        manifest_total += int(entry["bytes"])
+        if required_names is not None and name not in required_names:
+            continue
         path = final_input_path(destination, name)
         size = int(entry["bytes"])
         sha256 = str(entry["sha256"])
@@ -237,12 +264,16 @@ def validate_inputs(
         )
         if not valid:
             raise ValueError(f"input identity mismatch for {name}: {path}")
-        total += size
+        validated_total += size
         status = "Validated reusable cache" if reusable_cache else "Authenticated"
         print(f"{status} {name} ({size} bytes)", flush=True)
-    if total != int(manifest.get("total_bytes", -1)):
-        raise ValueError(f"input manifest total is invalid: authenticated {total} bytes")
-    print(f"Authenticated ProductionV4 input manifest: {total} bytes", flush=True)
+    if manifest_total != int(manifest.get("total_bytes", -1)):
+        raise ValueError(
+            f"input manifest total is invalid: declared files contain {manifest_total} bytes"
+        )
+    if required_names is not None and not required_names.issubset(seen):
+        raise ValueError("ProductionV4 role references an unknown input")
+    print(f"Authenticated ProductionV4 inputs: {validated_total} bytes", flush=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -254,6 +285,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--release-base", required=True)
     parser.add_argument("--fallback-release-base", action="append", default=[])
     parser.add_argument("--download-concurrency", type=int, choices=range(1, 17), default=16)
+    parser.add_argument("--role", choices=("node", "miner", "pool-miner"), default="miner")
     parser.add_argument("--validate-only", action="store_true")
     parser.add_argument("--prepared-inputs", action="store_true")
     return parser.parse_args()
@@ -266,14 +298,16 @@ def main() -> int:
             raise ValueError(f"required package file is missing: {path}")
     if args.prepared_inputs and not args.validate_only:
         raise ValueError("--prepared-inputs requires --validate-only")
+    required_names = required_input_names(args.chunk_manifest, args.role)
     authenticated = None
     if not args.validate_only:
-        authenticated = prepare_inputs(args)
+        authenticated = prepare_inputs(args, required_names)
     validate_inputs(
         args.destination.resolve(),
         args.input_manifest,
         authenticated,
         prepared=args.prepared_inputs,
+        required_names=required_names,
     )
     return 0
 

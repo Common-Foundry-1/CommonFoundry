@@ -22,6 +22,18 @@ static PROCESS_TEST_SERIAL: Mutex<()> = Mutex::new(());
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(15);
 const PROMPT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
+fn assert_status_state_equal(mut actual: Value, mut expected: Value) {
+    actual
+        .as_object_mut()
+        .expect("status must be an object")
+        .remove("startup_snapshot_used");
+    expected
+        .as_object_mut()
+        .expect("status must be an object")
+        .remove("startup_snapshot_used");
+    assert_eq!(actual, expected);
+}
+
 struct TestDir(PathBuf);
 
 impl TestDir {
@@ -413,7 +425,7 @@ fn interrupt_stops_rpc_and_p2p_releases_resources_and_preserves_replay() {
     assert_reusable(rpc_address);
     assert_reusable(p2p_address);
     let after = status(data_dir.path());
-    assert_eq!(after, before);
+    assert_status_state_equal(after, before);
 }
 
 #[test]
@@ -456,7 +468,7 @@ fn interrupt_stops_pool_and_p2p_then_releases_ports_and_data_lock() {
     assert_reusable(pool_address);
     assert_reusable(p2p_address);
     let after = status(data_dir.path());
-    assert_eq!(after, before);
+    assert_status_state_equal(after, before);
 }
 
 fn wait_for_failure_with_timeout(child: &mut Child, timeout: Duration, expected_error: &str) {
@@ -593,7 +605,7 @@ fn interrupt_stops_a_static_peer_session_stalled_after_connect() {
 
     assert_reusable(rpc_address);
     assert_reusable(p2p_address);
-    assert_eq!(status(data_dir.path()), before);
+    assert_status_state_equal(status(data_dir.path()), before);
 }
 
 #[cfg(unix)]
@@ -616,7 +628,7 @@ fn sigterm_exits_zero_and_releases_node_resources() {
 
     assert_reusable(rpc_address);
     assert_reusable(p2p_address);
-    assert_eq!(status(data_dir.path()), before);
+    assert_status_state_equal(status(data_dir.path()), before);
 }
 
 #[cfg(windows)]
@@ -642,5 +654,5 @@ fn literal_windows_ctrl_c_exits_zero_and_releases_node_resources() {
 
     assert_reusable(rpc_address);
     assert_reusable(p2p_address);
-    assert_eq!(status(data_dir.path()), before);
+    assert_status_state_equal(status(data_dir.path()), before);
 }

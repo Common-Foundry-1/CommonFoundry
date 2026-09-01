@@ -233,12 +233,17 @@ PRODUCTION_V4_FIXED_ARTIFACT_RECORD_DIGEST = (
     "2efd2c4244bbd7808547b85266987544233fbe339f445135b07843aa8893d45e"
 )
 PRODUCTION_RC_VERSION_FILES = (
+    "apps/explorer/package.json",
+    "apps/pool-dashboard/package.json",
+    "apps/pool-operator-dashboard/package.json",
     "apps/wallet/package.json",
     "apps/wallet/src-tauri/Cargo.toml",
     "apps/wallet/src-tauri/tauri.conf.json",
     "apps/wallet/src-tauri/tauri.rcnet.conf.json",
+    "crates/cmfd-cuda/Cargo.toml",
     "crates/cmfd-miner/Cargo.toml",
     "crates/cmfd-node/Cargo.toml",
+    "crates/cmfd-proof-accel/Cargo.toml",
     "crates/cmfd-proof-worker/Cargo.toml",
 )
 SOURCE_LOCK_FILES = (
@@ -3950,6 +3955,34 @@ def _validate_production_v4_rc_artifacts(
     validated_candidate = _validate_production_v4_rcnet_candidate(
         launch_candidate, network_info
     )
+    if evidence.get("schema") == "CMFD_PRODUCTION_V4_RC_SINGLE_PRODUCER_ACTIVATION_V1":
+        _validate_production_v4_single_producer_rc_artifacts(
+            version=version,
+            commit=commit,
+            stage_files=stage_files,
+            repo=repo,
+            activation_ssh_keygen=activation_ssh_keygen,
+            activation_ssh_keygen_sha256=activation_ssh_keygen_sha256,
+            network_info=network_info,
+            network_info_bytes=network_info_bytes,
+            launch_candidate=launch_candidate,
+            launch_candidate_bytes=launch_candidate_bytes,
+            validated_candidate=validated_candidate,
+            proof=proof,
+            evidence=evidence,
+            evidence_bytes=evidence_bytes,
+            qualification_manifest=qualification_manifest,
+            qualification_manifest_bytes=qualification_manifest_bytes,
+            verifier_script=verifier_script,
+            verifier_script_identity=(
+                verifier_script_size,
+                verifier_script_sha256,
+                verifier_script_blake3,
+            ),
+            verifier_report=verifier_report,
+            verifier_report_bytes=verifier_report_bytes,
+        )
+        return
 
     (
         qualification_source_commit,
@@ -4179,6 +4212,362 @@ def _validate_production_v4_rc_artifacts(
             raise IntegrityError(f"ProductionV4 staged approval input changed: {name}")
     if _sha256_file(verifier_script) != verifier_script_sha256:
         raise IntegrityError("ProductionV4 staged verifier script changed")
+
+
+def _validate_single_producer_file_identity(
+    value: object, label: str
+) -> dict[str, object]:
+    row = _require_exact_fields(
+        value, {"name", "bytes", "sha256", "blake3"}, label
+    )
+    if (
+        not isinstance(row["name"], str)
+        or not row["name"]
+        or not isinstance(row["bytes"], int)
+        or isinstance(row["bytes"], bool)
+        or row["bytes"] <= 0
+    ):
+        raise IntegrityError(f"{label} has an invalid name or byte count")
+    for field in ("sha256", "blake3"):
+        _require_hex256(row[field], f"{label} {field}", reject_repeated=False)
+    return row
+
+
+def _verify_single_producer_rc_signature(
+    *,
+    approval_bytes: bytes,
+    signature: Path,
+    allowed_signers: Path,
+    signer_identity: str,
+    ssh_keygen: Path,
+) -> None:
+    verifier_bytes = _regular_file(
+        ssh_keygen, "OpenSSH ProductionV4 approval verifier"
+    ).read_bytes()
+    policy_bytes = _regular_file(
+        allowed_signers, "producer allowed-signers authority"
+    ).read_bytes()
+    signature_bytes = _regular_file(
+        signature, "producer activation approval signature"
+    ).read_bytes()
+    suffix = ssh_keygen.suffix if os.name == "nt" else ""
+    try:
+        with tempfile.TemporaryDirectory(prefix="cmfd-v4-single-approval-") as directory:
+            root = Path(directory)
+            verifier_copy = root / f"ssh-keygen{suffix}"
+            policy_copy = root / "producer.allowed_signers"
+            signature_copy = root / "producer.approval.sig"
+            activation_approval._write_exclusive(
+                verifier_copy, verifier_bytes, executable=True
+            )
+            activation_approval._write_exclusive(policy_copy, policy_bytes)
+            activation_approval._write_exclusive(signature_copy, signature_bytes)
+            environment = activation_approval._verification_environment(
+                root, ssh_keygen
+            )
+            activation_approval._verify_signature(
+                verifier=verifier_copy,
+                allowed_signers=policy_copy,
+                signer_identity=signer_identity,
+                namespace=activation_approval.NAMESPACES[
+                    activation_approval.PRODUCER_ROLE
+                ],
+                signature=signature_copy,
+                payload=approval_bytes,
+                environment=environment,
+            )
+    except activation_approval.ApprovalError as error:
+        raise IntegrityError(str(error)) from error
+
+
+def _validate_production_v4_single_producer_rc_artifacts(
+    *,
+    version: str,
+    commit: str,
+    stage_files: dict[str, Path],
+    repo: Path | None,
+    activation_ssh_keygen: Path | None,
+    activation_ssh_keygen_sha256: str | None,
+    network_info: dict[str, object],
+    network_info_bytes: bytes,
+    launch_candidate: dict[str, object],
+    launch_candidate_bytes: bytes,
+    validated_candidate: dict[str, object],
+    proof: dict[str, object],
+    evidence: dict[str, object],
+    evidence_bytes: bytes,
+    qualification_manifest: dict[str, object],
+    qualification_manifest_bytes: bytes,
+    verifier_script: Path,
+    verifier_script_identity: tuple[int, str, str],
+    verifier_report: dict[str, object],
+    verifier_report_bytes: bytes,
+) -> None:
+    declarations = {
+        "experimental_release_candidate_only": True,
+        "external_audit": False,
+        "independent_reproduction": False,
+        "mainnet_authorization": False,
+    }
+    qualification = _require_exact_fields(
+        qualification_manifest,
+        {
+            "schema",
+            "activation_source_commit",
+            "artifacts",
+            "declarations",
+            "network",
+            "verification",
+        },
+        "single-producer RC qualification manifest",
+    )
+    source_commit = _full_commit(qualification["activation_source_commit"])
+    if (
+        qualification["schema"]
+        != "CMFD_PRODUCTION_V4_RC_SINGLE_PRODUCER_QUALIFICATION_V1"
+        or qualification["declarations"] != declarations
+        or qualification["network"]
+        != _production_v4_approval_network(launch_candidate, validated_candidate)
+        or qualification["verification"]
+        != {
+            "candidate_claims_verified": True,
+            "full_cryptographic_proof_verified": True,
+            "target_met": True,
+        }
+    ):
+        raise IntegrityError("single-producer RC qualification policy is invalid")
+    artifacts = _require_exact_fields(
+        qualification["artifacts"],
+        {
+            "fixed_artifact_record",
+            "fresh_verifier_entrypoint",
+            "launch_candidate",
+            "model_bank",
+            "proof_generation_log",
+            "proof_template",
+            "qualification_proof",
+            "strict_statement",
+            "verifier_report",
+        },
+        "single-producer RC qualification artifacts",
+    )
+    identities = {
+        role: _validate_single_producer_file_identity(value, f"RC {role}")
+        for role, value in artifacts.items()
+    }
+    actual_identities = {
+        "launch_candidate": _production_v4_approval_identity(
+            identities["launch_candidate"]["name"], launch_candidate_bytes
+        ),
+        "fresh_verifier_entrypoint": _production_v4_approval_identity(
+            identities["fresh_verifier_entrypoint"]["name"],
+            verifier_script.read_bytes(),
+        ),
+        "verifier_report": _production_v4_approval_identity(
+            identities["verifier_report"]["name"], verifier_report_bytes
+        ),
+    }
+    for role, actual in actual_identities.items():
+        if identities[role] != actual:
+            raise IntegrityError(f"single-producer RC {role} identity is invalid")
+    compiled_artifacts = proof.get("artifacts")
+    if not isinstance(compiled_artifacts, dict):
+        raise IntegrityError("compiled ProductionV4 artifact pins are unavailable")
+    for qualified_role, compiled_role in (
+        ("model_bank", "bank"),
+        ("fixed_artifact_record", "fixed_record"),
+    ):
+        qualified = identities[qualified_role]
+        compiled = compiled_artifacts.get(compiled_role)
+        if not isinstance(compiled, dict) or any(
+            qualified[field]
+            != (int(compiled[field]) if field == "bytes" else compiled[field])
+            for field in ("bytes", "sha256", "blake3")
+        ):
+            raise IntegrityError(
+                f"single-producer RC {qualified_role} does not match compiled pins"
+            )
+    qualification_proof = identities["qualification_proof"]
+    if (
+        qualification_proof["bytes"] != 12_025_320
+        or qualification_proof["sha256"]
+        != "de364b2811846a6247aa152e48746ad037d38bf4170354c3b17617d312da2607"
+    ):
+        raise IntegrityError("single-producer RC qualification proof is not the reviewed proof")
+
+    report = _require_exact_fields(
+        verifier_report,
+        {
+            "schema",
+            "activation_source_commit",
+            "template_derivation_result",
+            "strict_statement_result",
+        },
+        "single-producer RC verifier report",
+    )
+    strict_result = report["strict_statement_result"]
+    if (
+        report["schema"]
+        != "CMFD_PRODUCTION_V4_RC_SINGLE_PRODUCER_VERIFIER_REPORT_V1"
+        or report["activation_source_commit"] != source_commit
+        or not isinstance(strict_result, dict)
+        or strict_result.get("candidate_claims_verified") is not True
+        or strict_result.get("full_cryptographic_proof_verified") is not True
+        or strict_result.get("target_met") is not True
+        or strict_result.get("remaining_stages") != []
+    ):
+        raise IntegrityError("single-producer RC verifier report is not a full verification")
+    reported_proof = strict_result.get("proof")
+    if (
+        not isinstance(reported_proof, dict)
+        or reported_proof.get("bytes") != qualification_proof["bytes"]
+        or reported_proof.get("sha256") != qualification_proof["sha256"]
+    ):
+        raise IntegrityError("single-producer RC verifier report proof identity is invalid")
+
+    trust = _validate_production_v4_approval_trust_fields(
+        evidence.get("activation_approval_trust")
+    )
+    expected_evidence, expected_evidence_bytes = _production_v4_activation_evidence(
+        validated={"artifacts": proof["artifacts"]},
+        pin_fields={
+            "schema": evidence["schema"],
+            "qualification_source_commit": source_commit,
+            "qualification_manifest_sha256": _sha256_bytes(
+                qualification_manifest_bytes
+            ),
+            "fresh_process_verifier_binary_sha256": verifier_script_identity[1],
+            "fresh_process_verifier_report_sha256": _sha256_bytes(
+                verifier_report_bytes
+            ),
+            "core_spec_sha256": PRODUCTION_V4_CORE_SPEC_SHA256,
+            "core_vector_sha256": PRODUCTION_V4_CORE_VECTOR_SHA256,
+            "proof_algebra_sha256": PRODUCTION_V4_PROOF_ALGEBRA_SHA256,
+            "approval_trust": trust,
+        },
+        commit=commit,
+    )
+    if evidence != expected_evidence or evidence_bytes != expected_evidence_bytes:
+        raise IntegrityError("single-producer RC activation evidence is not canonical or exact")
+    if proof["activation_evidence_sha256"] != _sha256_bytes(evidence_bytes):
+        raise IntegrityError("compiled ProductionV4 selection is not bound to RC evidence")
+    canonical_network_info = (
+        json.dumps(network_info, indent=2, ensure_ascii=False) + "\n"
+    ).encode("utf-8")
+    if network_info_bytes != canonical_network_info:
+        raise IntegrityError("compiled ProductionV4 NETWORK-INFO.json is not canonical")
+
+    approval_names = {
+        PRODUCTION_V4_PRODUCER_APPROVAL_NAME,
+        PRODUCTION_V4_PRODUCER_APPROVAL_SIGNATURE_NAME,
+        PRODUCTION_V4_PRODUCER_ALLOWED_SIGNERS_NAME,
+    }
+    if approval_names - set(stage_files):
+        raise IntegrityError("single-producer RC activation approval files are missing")
+    if any(
+        name in stage_files
+        for name in (
+            PRODUCTION_V4_REPRODUCER_APPROVAL_NAME,
+            PRODUCTION_V4_REPRODUCER_APPROVAL_SIGNATURE_NAME,
+            PRODUCTION_V4_REPRODUCER_ALLOWED_SIGNERS_NAME,
+        )
+    ):
+        raise IntegrityError("single-producer RC must not claim reproducer approval")
+    if (
+        repo is None
+        or activation_ssh_keygen is None
+        or activation_ssh_keygen_sha256 is None
+        or trust["ssh_keygen_sha256"] != activation_ssh_keygen_sha256
+        or _sha256_file(activation_ssh_keygen) != activation_ssh_keygen_sha256
+    ):
+        raise IntegrityError("single-producer RC OpenSSH verifier is not the pinned verifier")
+
+    pin_fields = {
+        "schema": evidence["schema"],
+        "qualification_source_commit": source_commit,
+        "qualification_manifest_sha256": _sha256_bytes(qualification_manifest_bytes),
+        "fresh_process_verifier_binary_sha256": verifier_script_identity[1],
+        "fresh_process_verifier_report_sha256": _sha256_bytes(verifier_report_bytes),
+        "core_spec_sha256": PRODUCTION_V4_CORE_SPEC_SHA256,
+        "core_vector_sha256": PRODUCTION_V4_CORE_VECTOR_SHA256,
+        "proof_algebra_sha256": PRODUCTION_V4_PROOF_ALGEBRA_SHA256,
+        "approval_trust": trust,
+    }
+    pin_bytes = _render_production_v4_activation_pin(pin_fields)
+    if _tracked_blob(repo, PRODUCTION_V4_ACTIVATION_PIN_RELATIVE) != pin_bytes:
+        raise IntegrityError("tracked single-producer RC activation pin is not exact")
+    _validate_production_v4_activation_history(
+        phase="evidence",
+        repo=repo,
+        commit=commit,
+        generation_commit=source_commit,
+        qualification_commit=source_commit,
+        pin_bytes=pin_bytes,
+    )
+
+    approval_path = stage_files[PRODUCTION_V4_PRODUCER_APPROVAL_NAME]
+    approval, approval_bytes = _bounded_json_object(
+        approval_path, "single-producer RC approval"
+    )
+    if approval_bytes != _canonical_json(approval):
+        raise IntegrityError("single-producer RC approval is not canonical JSON")
+    producer_trust = trust["producer"]
+    if not isinstance(producer_trust, dict):
+        raise IntegrityError("single-producer RC producer trust is unavailable")
+    signer_identity = producer_trust["signer_identity"]
+    policy = stage_files[PRODUCTION_V4_PRODUCER_ALLOWED_SIGNERS_NAME]
+    try:
+        authority = activation_approval.parse_allowed_signers_authority(
+            policy.read_bytes(),
+            signer_identity=signer_identity,
+            role=activation_approval.PRODUCER_ROLE,
+        )
+    except activation_approval.ApprovalError as error:
+        raise IntegrityError(str(error)) from error
+    if producer_trust != {"signer_identity": signer_identity, **authority}:
+        raise IntegrityError("single-producer RC allowed-signers authority is not pinned")
+    expected_subject = {
+        "schema": "CMFD_PRODUCTION_V4_RC_SINGLE_PRODUCER_APPROVAL_SUBJECT_V1",
+        "activation_source_commit": source_commit,
+        "declarations": declarations,
+        "network": qualification["network"],
+        "qualification_manifest": _production_v4_approval_identity(
+            "RCNET1-SINGLE-PRODUCER-QUALIFICATION.json",
+            qualification_manifest_bytes,
+        ),
+        "fresh_verifier_report": _production_v4_approval_identity(
+            identities["verifier_report"]["name"], verifier_report_bytes
+        ),
+        "strict_statement": identities["strict_statement"],
+        "pin_fields": _production_v4_approval_identity(
+            "RCNET1-SINGLE-PRODUCER-PIN-FIELDS.json", _canonical_json(pin_fields)
+        ),
+        "proposed_activation_pin": _production_v4_approval_identity(
+            "RCNET1-PROPOSED-ACTIVATION-PIN.inc.rs", pin_bytes
+        ),
+    }
+    if approval != {
+        "schema": "CMFD_PRODUCTION_V4_RC_SINGLE_PRODUCER_ROLE_APPROVAL_V1",
+        "role": activation_approval.PRODUCER_ROLE,
+        "namespace": activation_approval.NAMESPACES[activation_approval.PRODUCER_ROLE],
+        "signer_identity": signer_identity,
+        "trusted_authority": authority,
+        "subject": expected_subject,
+    }:
+        raise IntegrityError("single-producer RC approval does not bind the staged evidence")
+    _verify_single_producer_rc_signature(
+        approval_bytes=approval_bytes,
+        signature=stage_files[PRODUCTION_V4_PRODUCER_APPROVAL_SIGNATURE_NAME],
+        allowed_signers=policy,
+        signer_identity=signer_identity,
+        ssh_keygen=activation_ssh_keygen,
+    )
+    validate_production_rc_runtime_packages(
+        stage_files=stage_files,
+        staged_network_info=network_info,
+        commit=commit,
+        version=version,
+    )
 
 
 def validate_production_rc_artifacts(
@@ -6132,7 +6521,19 @@ def _validate_production_v4_activation_history(
             raise IntegrityError(
                 "tracked ProductionV4 activation pin does not match validated evidence"
             )
-        revision = _run_git(repo, "rev-list", "--parents", "-n", "1", commit).split()
+        pin_commit = _run_git(
+            repo,
+            "rev-list",
+            "-1",
+            commit,
+            "--",
+            PRODUCTION_V4_ACTIVATION_PIN_RELATIVE,
+        )
+        if not pin_commit:
+            raise IntegrityError("ProductionV4 activation pin has no tracked history")
+        revision = _run_git(
+            repo, "rev-list", "--parents", "-n", "1", pin_commit
+        ).split()
         if len(revision) != 2:
             raise IntegrityError(
                 "ProductionV4 activation commit must have exactly one parent"
@@ -6145,7 +6546,7 @@ def _validate_production_v4_activation_history(
             "--name-only",
             "--no-renames",
             "-r",
-            commit,
+            pin_commit,
         ).splitlines()
         if changed != [PRODUCTION_V4_ACTIVATION_PIN_RELATIVE]:
             raise IntegrityError(
@@ -6154,11 +6555,20 @@ def _validate_production_v4_activation_history(
         if (
             _tracked_blob_at(repo, ancestry_tip, PRODUCTION_V4_ACTIVATION_PIN_RELATIVE)
             != b"None\n"
-            or _tracked_blob(repo, PRODUCTION_V4_ACTIVATION_PIN_RELATIVE) != pin_bytes
+            or _tracked_blob_at(
+                repo, pin_commit, PRODUCTION_V4_ACTIVATION_PIN_RELATIVE
+            )
+            != pin_bytes
         ):
             raise IntegrityError(
                 "ProductionV4 activation commit is not the exact None-to-reviewed-pin transition"
             )
+        _require_production_v4_ancestor(
+            repo,
+            pin_commit,
+            commit,
+            "ProductionV4 activation commit",
+        )
     _require_production_v4_ancestor(
         repo,
         qualification_commit,

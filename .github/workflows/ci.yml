@@ -14,6 +14,9 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  CMFD_BUILD_SOURCE_COMMIT: ${{ github.sha }}
+
 jobs:
   msrv:
     runs-on: ubuntu-22.04
@@ -88,6 +91,7 @@ jobs:
       - run: cargo clippy -p cmfd-consensus --all-targets --features production-whir-candidate --locked -- -D warnings
       - run: cargo clippy -p cmfd-consensus --all-targets --features production-whir-candidate,gpu-proof-prover --locked --no-deps -- -D warnings
       - run: cargo test --workspace --all-targets --locked
+      - run: cargo test -p common-foundry-wallet --lib --features production-v3-testnet --locked
       - run: >-
           cargo test -p cmfd-consensus --lib --no-default-features
           --features dory-v3-consensus-adapter --locked pow::tests::
@@ -106,17 +110,8 @@ jobs:
         run: |
           cargo check --locked -p cmfd-node --bin cmfd-node --features production-v4
           cargo test --locked -p cmfd-node --lib --features production-v4 production_v4_
-      - name: Keep production RC fail-closed without ProductionV4 activation evidence
-        shell: bash
-        run: |
-          set -euo pipefail
-          export CMFD_BUILD_SOURCE_COMMIT="$(git rev-parse HEAD)"
-          if output="$(cargo check --locked -p cmfd-node --bin cmfd-node --features production-rc 2>&1)"; then
-            echo "production RC unexpectedly built without ProductionV4 activation evidence" >&2
-            exit 1
-          fi
-          printf '%s\n' "$output"
-          grep -Fq "production RC build gate: ProductionV4 activation evidence is absent" <<<"$output"
+      - name: Build the pinned ProductionV4 RC profile
+        run: cargo check --locked -p cmfd-node --bin cmfd-node --features production-rc
 
   proof-codec:
     strategy:
@@ -210,14 +205,14 @@ jobs:
           - os: windows-latest
             artifact: common-foundry-wallet-windows
             package-paths: |
-              target/release/bundle/nsis/Common Foundry Wallet_0.1.0-devnet.16_x64-setup.exe
+              target/release/bundle/nsis/Common Foundry Wallet RCNet_0.1.0-rc.1_x64-setup.exe
             binary-path: target/release/common-foundry-wallet.exe
             node-path: target/release/cmfd-node.exe
           - os: ubuntu-22.04
             artifact: common-foundry-wallet-linux
             package-paths: |
-              target/release/bundle/appimage/Common Foundry Wallet_0.1.0-devnet.16_amd64.AppImage
-              target/release/bundle/deb/Common Foundry Wallet_0.1.0-devnet.16_amd64.deb
+              target/release/bundle/appimage/Common Foundry Wallet RCNet_0.1.0-rc.1_amd64.AppImage
+              target/release/bundle/deb/Common Foundry Wallet RCNet_0.1.0-rc.1_amd64.deb
             binary-path: target/release/common-foundry-wallet
             node-path: target/release/cmfd-node
     runs-on: ${{ matrix.os }}
@@ -251,18 +246,21 @@ jobs:
         working-directory: apps/wallet
       - name: Build static Windows node CLI
         if: runner.os == 'Windows'
-        run: cargo build --release --locked -p cmfd-node
+        run: cargo build --release --locked -p cmfd-node --features production-rc
         env:
           RUSTFLAGS: -C target-feature=+crt-static
       - name: Build Linux node CLI
         if: runner.os == 'Linux'
-        run: cargo build --release --locked -p cmfd-node
+        run: cargo build --release --locked -p cmfd-node --features production-rc
       - name: Install pinned Tauri AppImage tools
         if: runner.os == 'Linux'
         env:
           CMFD_RELEASE_COMMIT: ${{ github.sha }}
         run: bash scripts/prepare-tauri-appimage-tools.sh "$CMFD_RELEASE_COMMIT" prepare
-      - run: npm run desktop:build -- --ci -- --locked
+      - run: >-
+          npm run desktop:build -- --ci
+          --config src-tauri/tauri.rcnet.conf.json
+          --features production-rc -- --locked
         working-directory: apps/wallet
       - name: Verify pinned Tauri AppImage tools
         if: runner.os == 'Linux'
@@ -275,18 +273,18 @@ jobs:
           CMFD_RELEASE_COMMIT: ${{ github.sha }}
         run: >-
           bash scripts/normalize-linux-appimage.sh
-          "target/release/bundle/appimage/Common Foundry Wallet_0.1.0-devnet.16_amd64.AppImage"
+          "target/release/bundle/appimage/Common Foundry Wallet RCNet_0.1.0-rc.1_amd64.AppImage"
           "$CMFD_RELEASE_COMMIT"
-          "0.1.0-devnet.16"
+          "0.1.0-rc.1"
       - name: Normalize Linux deb package
         if: runner.os == 'Linux'
         env:
           CMFD_RELEASE_COMMIT: ${{ github.sha }}
         run: >-
           bash scripts/normalize-linux-deb.sh
-          "target/release/bundle/deb/Common Foundry Wallet_0.1.0-devnet.16_amd64.deb"
+          "target/release/bundle/deb/Common Foundry Wallet RCNet_0.1.0-rc.1_amd64.deb"
           "$CMFD_RELEASE_COMMIT"
-          "0.1.0-devnet.16"
+          "0.1.0-rc.1"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.artifact }}

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-PEER="107.214.187.2:22444"
+PEER="173.249.35.251:19444"
 MINER=""
 BLOCKS=0
 CUDA_DEVICE=0
@@ -66,7 +66,7 @@ done
 
 MODEL_BANK="$SCRIPT_DIR/inputs/MODEL-V2.bank"
 FIXED_DIRECTORY="$SCRIPT_DIR/inputs/fixed"
-INPUT_MANIFEST="$SCRIPT_DIR/production-v4-testnet-1-inputs.json"
+INPUT_MANIFEST="$SCRIPT_DIR/production-v4-rcnet-1-inputs.json"
 FIXED_RECORD="$FIXED_DIRECTORY/FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json"
 CMFD_MINER="$SCRIPT_DIR/cmfd-miner"
 REPLAY_BINARY="$SCRIPT_DIR/cmfd-v4-replay"
@@ -86,8 +86,8 @@ input_validation=(
   --input-manifest "$INPUT_MANIFEST"
   --fixed-record "$SCRIPT_DIR/FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json"
   --destination "$SCRIPT_DIR/inputs"
-  --release-base "https://downloads.commonfoundry.ai/v0.1.0-devnet.16"
-  --fallback-release-base "https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/download/v0.1.0-devnet.16"
+  --release-base "https://downloads.commonfoundry.ai/v0.1.0-rc.1"
+  --fallback-release-base "https://github.com/Common-Foundry-1/CommonFoundry/releases/download/v0.1.0-rc.1"
   --validate-only
 )
 if ((INPUTS_PREPARED != 0)); then

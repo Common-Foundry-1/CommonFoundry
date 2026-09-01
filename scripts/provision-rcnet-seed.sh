@@ -48,13 +48,13 @@ if [[ ! -e ${wallet_passphrase} ]]; then
     trap 'rm -f -- "${temporary_passphrase}"' EXIT
     dd if=/dev/urandom bs=48 count=1 status=none | base64 -w 0 >"${temporary_passphrase}"
     printf '\n' >>"${temporary_passphrase}"
-    chown root:commonfoundry "${temporary_passphrase}"
-    chmod 0640 "${temporary_passphrase}"
+    chown root:root "${temporary_passphrase}"
+    chmod 0600 "${temporary_passphrase}"
     mv -T "${temporary_passphrase}" "${wallet_passphrase}"
     trap - EXIT
 fi
-chown root:commonfoundry "${wallet_passphrase}"
-chmod 0640 "${wallet_passphrase}"
+chown root:root "${wallet_passphrase}"
+chmod 0600 "${wallet_passphrase}"
 
 # Contabo's first-boot NoCloud image contains an always-run bootcmd that
 # rewrites SSH policy and exits nonzero when its final pkill matches nothing.

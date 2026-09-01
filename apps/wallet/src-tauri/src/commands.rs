@@ -43,10 +43,10 @@ where
 }
 
 fn request_passphrase(passphrase: String) -> Result<Zeroizing<Vec<u8>>, NodeClientError> {
+    let character_count = passphrase.chars().count();
     let passphrase = Zeroizing::new(passphrase.into_bytes());
-    if (cmfd_node::wallet_backup::MINIMUM_PASSPHRASE_BYTES
-        ..=cmfd_node::wallet_backup::MAXIMUM_PASSPHRASE_BYTES)
-        .contains(&passphrase.len())
+    if character_count >= 12
+        && passphrase.len() <= cmfd_node::wallet_backup::MAXIMUM_PASSPHRASE_BYTES
     {
         Ok(passphrase)
     } else {
@@ -54,7 +54,8 @@ fn request_passphrase(passphrase: String) -> Result<Zeroizing<Vec<u8>>, NodeClie
             code: "wallet_passphrase_invalid",
             status: 400,
             retryable: false,
-            message: "Wallet passphrases must contain between 12 and 1024 bytes.".to_owned(),
+            message: "Use a passphrase containing at least 12 characters. Shorten unusually long passphrases."
+                .to_owned(),
         })
     }
 }
@@ -246,4 +247,15 @@ pub async fn restore_wallet(
         runtime.restore(&path, &passphrase)
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::request_passphrase;
+
+    #[test]
+    fn wallet_passphrase_minimum_counts_characters() {
+        assert!(request_passphrase("é".repeat(6)).is_err());
+        assert!(request_passphrase("é".repeat(12)).is_ok());
+    }
 }

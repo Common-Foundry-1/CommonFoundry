@@ -33,6 +33,10 @@ function passphraseBytes(value: string) {
   return new TextEncoder().encode(value).length;
 }
 
+function passphraseCharacters(value: string) {
+  return Array.from(value).length;
+}
+
 export function WalletSecurityDialog({
   open,
   required,
@@ -66,6 +70,14 @@ export function WalletSecurityDialog({
       ? document.activeElement
       : null;
     const frame = requestAnimationFrame(() => dialogRef.current?.focus());
+    return () => {
+      cancelAnimationFrame(frame);
+      previousFocus?.focus();
+    };
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
@@ -74,9 +86,7 @@ export function WalletSecurityDialog({
     };
     document.addEventListener("keydown", onKeyDown);
     return () => {
-      cancelAnimationFrame(frame);
       document.removeEventListener("keydown", onKeyDown);
-      previousFocus?.focus();
     };
   }, [busy, onClose, open, required]);
 
@@ -91,9 +101,12 @@ export function WalletSecurityDialog({
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setError(null);
-    const bytes = passphraseBytes(passphrase);
-    if (bytes < 12 || bytes > 1_024) {
-      setError("Use a passphrase containing between 12 and 1024 bytes.");
+    if (passphraseCharacters(passphrase) < 12) {
+      setError("Use a passphrase containing at least 12 characters.");
+      return;
+    }
+    if (passphraseBytes(passphrase) > 1_024) {
+      setError("That passphrase is too long. Use fewer characters.");
       return;
     }
     if (needsConfirmation && confirmation !== passphrase) {
@@ -254,7 +267,7 @@ export function WalletSecurityDialog({
               autoComplete={needsConfirmation ? "new-password" : "current-password"}
               disabled={busy}
             />
-            <small>At least 12 bytes. Store it separately from the encrypted backup.</small>
+            <small>At least 12 characters. Store it separately from the encrypted backup.</small>
           </div>
 
           {needsConfirmation ? (

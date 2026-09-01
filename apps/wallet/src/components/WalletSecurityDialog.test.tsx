@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -67,6 +67,44 @@ describe("WalletSecurityDialog", () => {
     expect(apiMocks.unlockWallet).toHaveBeenCalledWith("correct horse battery staple");
     expect(passphrase).toHaveValue("");
     await waitFor(() => expect(onStatusChange).toHaveBeenCalledWith(unlocked));
+  });
+
+  it("keeps the passphrase field focused across parent polling renders", async () => {
+    const user = userEvent.setup();
+    const props = {
+      open: true,
+      required: true,
+      status: locked,
+      statusError: null,
+      onStatusChange: vi.fn(),
+      onCompleted: vi.fn(),
+      onRefresh: vi.fn(),
+    };
+    const view = render(<WalletSecurityDialog {...props} onClose={() => undefined} />);
+    await waitFor(() => expect(screen.getByRole("dialog", { name: "Unlock wallet" })).toHaveFocus());
+    const passphrase = screen.getByLabelText("Wallet passphrase");
+    await user.click(passphrase);
+    await user.type(passphrase, "correct horse");
+
+    view.rerender(<WalletSecurityDialog {...props} onClose={() => undefined} />);
+    await act(async () => {
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    });
+
+    expect(passphrase).toHaveFocus();
+    expect(passphrase).toHaveValue("correct horse");
+  });
+
+  it("describes and validates the minimum in characters", async () => {
+    const user = userEvent.setup();
+    renderDialog(locked);
+
+    expect(screen.getByText(/At least 12 characters/)).toBeInTheDocument();
+    await user.type(screen.getByLabelText("Wallet passphrase"), "éééééé");
+    await user.click(screen.getByRole("button", { name: "Unlock wallet" }));
+
+    expect(apiMocks.unlockWallet).not.toHaveBeenCalled();
+    expect(screen.getByRole("alert")).toHaveTextContent("Use a passphrase containing at least 12 characters.");
   });
 
   it("requires a no-overwrite backup path and confirmation before migration", async () => {

@@ -99,7 +99,7 @@ validate_tree_shape() {
     "$root/AppRun" \
     "$root/AppRun.wrapped" \
     "$root/usr/bin/common-foundry-wallet" \
-    "$root/usr/share/applications/Common Foundry Wallet.desktop"; do
+    "$root/usr/share/applications/Common Foundry Wallet RCNet.desktop"; do
     if [[ ! -f "$required_path" || -L "$required_path" ]]; then
       printf 'The AppImage is missing a required regular file: %s\n' "$required_path" >&2
       return 1
@@ -185,7 +185,7 @@ normalize_tree() {
     "$root/AppRun" \
     "$root/AppRun.wrapped" \
     "$root/usr/bin/common-foundry-wallet"
-  chmod 0644 "$root/usr/share/applications/Common Foundry Wallet.desktop"
+  chmod 0644 "$root/usr/share/applications/Common Foundry Wallet RCNet.desktop"
   while IFS= read -r -d '' path; do
     touch --no-dereference --date="@$SOURCE_DATE_EPOCH_VALUE" -- "$path"
   done < <(find -P "$root" -xdev -depth -print0)
@@ -208,7 +208,7 @@ validate_normalized_tree() {
   if [[ "$(stat -c '%a' "$root/AppRun")" != '755' ||
     "$(stat -c '%a' "$root/AppRun.wrapped")" != '755' ||
     "$(stat -c '%a' "$root/usr/bin/common-foundry-wallet")" != '755' ||
-    "$(stat -c '%a' "$root/usr/share/applications/Common Foundry Wallet.desktop")" != '644' ]]; then
+    "$(stat -c '%a' "$root/usr/share/applications/Common Foundry Wallet RCNet.desktop")" != '644' ]]; then
     echo 'The normalized AppImage entrypoint or desktop-file modes are incorrect.' >&2
     return 1
   fi

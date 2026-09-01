@@ -73,6 +73,10 @@ pub enum WalletBackupError {
     DestinationMismatch,
     #[error("wallet key is already encrypted")]
     AlreadyEncrypted,
+    #[error("wallet key already exists")]
+    WalletKeyAlreadyExists,
+    #[error("wallet key and backup paths must be distinct")]
+    OverlappingPaths,
 }
 
 fn io_error(operation: &'static str, path: &Path, source: io::Error) -> WalletBackupError {
@@ -376,6 +380,61 @@ pub fn create_encrypted_wallet_backup(
     Ok(info)
 }
 
+/// Creates a new encrypted wallet and an independently randomized encrypted
+/// backup for an explicit network identity. The backup is made durable before
+/// the live wallet is published, so an interrupted live-key write cannot lose
+/// the newly generated secret.
+pub fn create_encrypted_wallet(
+    data_dir: &Path,
+    backup_output: &Path,
+    network_id: [u8; 32],
+    passphrase: &[u8],
+) -> Result<WalletBackupInfo, WalletBackupError> {
+    validate_passphrase(passphrase)?;
+    let _data_dir_lock = DataDirLock::acquire(data_dir)?;
+    if inspect_wallet_key_storage(data_dir)? != WalletKeyStorage::Missing {
+        return Err(WalletBackupError::WalletKeyAlreadyExists);
+    }
+
+    let wallet_path = data_dir.join(WALLET_KEY_FILE);
+    let wallet_parent = fs::canonicalize(data_dir)
+        .map_err(|source| io_error("resolve wallet directory", data_dir, source))?;
+    let backup_parent = backup_output
+        .parent()
+        .ok_or(WalletBackupError::OverlappingPaths)?;
+    let backup_parent = fs::canonicalize(backup_parent)
+        .map_err(|source| io_error("resolve wallet backup directory", backup_parent, source))?;
+    let backup_name = backup_output
+        .file_name()
+        .ok_or(WalletBackupError::OverlappingPaths)?;
+    if wallet_parent.join(WALLET_KEY_FILE) == backup_parent.join(backup_name) {
+        return Err(WalletBackupError::OverlappingPaths);
+    }
+
+    let mut secret = Zeroizing::new([0_u8; SECRET_BYTES]);
+    loop {
+        getrandom::fill(secret.as_mut()).map_err(|source| {
+            io_error(
+                "generate wallet secret",
+                &wallet_path,
+                io::Error::other(source.to_string()),
+            )
+        })?;
+        if SigningKey::from_bytes(secret.as_ref()).is_ok() {
+            break;
+        }
+    }
+
+    let (backup, info) = encrypt_wallet_key_bytes(&secret, network_id, passphrase)?;
+    let (live_key, live_info) = encrypt_wallet_key_bytes(&secret, network_id, passphrase)?;
+    if live_info.destination != info.destination {
+        return Err(WalletBackupError::DestinationMismatch);
+    }
+    write_private_create_new(backup_output, &backup)?;
+    write_private_create_new(&wallet_path, &live_key)?;
+    Ok(info)
+}
+
 pub fn restore_encrypted_wallet_backup(
     input: &Path,
     data_dir: &Path,
@@ -513,6 +572,80 @@ mod tests {
         let _ = fs::remove_file(backup);
         let _ = fs::remove_dir_all(source);
         let _ = fs::remove_dir_all(restored);
+    }
+
+    #[test]
+    fn new_encrypted_wallet_has_independent_recoverable_backup() {
+        let source = test_dir("new-wallet-source");
+        let backup_dir = test_dir("new-wallet-backup");
+        let restored = test_dir("new-wallet-restored");
+        fs::create_dir_all(&backup_dir).unwrap();
+        let backup = backup_dir.join("wallet.cmfd-backup");
+        let network_id = [0x91; 32];
+        let passphrase = b"correct horse battery staple";
+
+        let created = create_encrypted_wallet(&source, &backup, network_id, passphrase).unwrap();
+        assert_eq!(created.network_id, network_id);
+        assert_eq!(
+            inspect_wallet_key_storage(&source).unwrap(),
+            WalletKeyStorage::Encrypted
+        );
+        assert_ne!(
+            fs::read(source.join(WALLET_KEY_FILE)).unwrap(),
+            fs::read(&backup).unwrap()
+        );
+
+        let recovered =
+            restore_encrypted_wallet_backup(&backup, &restored, network_id, passphrase).unwrap();
+        assert_eq!(recovered.destination, created.destination);
+        assert_eq!(
+            inspect_wallet_key_storage(&restored).unwrap(),
+            WalletKeyStorage::Encrypted
+        );
+
+        fs::remove_dir_all(source).unwrap();
+        fs::remove_dir_all(backup_dir).unwrap();
+        fs::remove_dir_all(restored).unwrap();
+    }
+
+    #[test]
+    fn new_encrypted_wallet_refuses_overwrite_and_overlapping_backup() {
+        let source = test_dir("new-wallet-overwrite");
+        let backup_dir = test_dir("new-wallet-overwrite-backup");
+        fs::create_dir_all(&backup_dir).unwrap();
+        let first_backup = backup_dir.join("first.cmfd-backup");
+        let second_backup = backup_dir.join("second.cmfd-backup");
+        let network_id = [0x92; 32];
+        let passphrase = b"correct horse battery staple";
+
+        create_encrypted_wallet(&source, &first_backup, network_id, passphrase).unwrap();
+        let original_wallet = fs::read(source.join(WALLET_KEY_FILE)).unwrap();
+        assert!(matches!(
+            create_encrypted_wallet(&source, &second_backup, network_id, passphrase),
+            Err(WalletBackupError::WalletKeyAlreadyExists)
+        ));
+        assert_eq!(
+            fs::read(source.join(WALLET_KEY_FILE)).unwrap(),
+            original_wallet
+        );
+        assert!(!second_backup.exists());
+
+        let overlapping = test_dir("new-wallet-overlap");
+        fs::create_dir_all(&overlapping).unwrap();
+        assert!(matches!(
+            create_encrypted_wallet(
+                &overlapping,
+                &overlapping.join(WALLET_KEY_FILE),
+                network_id,
+                passphrase
+            ),
+            Err(WalletBackupError::OverlappingPaths)
+        ));
+        assert!(!overlapping.join(WALLET_KEY_FILE).exists());
+
+        fs::remove_dir_all(source).unwrap();
+        fs::remove_dir_all(backup_dir).unwrap();
+        fs::remove_dir_all(overlapping).unwrap();
     }
 
     #[test]

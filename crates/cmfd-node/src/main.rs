@@ -9,6 +9,8 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use cmfd_consensus::forgematrix::target_with_leading_zero_bits;
+#[cfg(feature = "production-v4-testnet")]
+use cmfd_node::RCNET1_PROFILE;
 use cmfd_node::exchange_acl_qualification::{qualify_fixture, qualify_installed_host};
 use cmfd_node::exchange_custody_tools::{
     ArchiveRestoreVerifyConfig, CanceledArchiveApplyConfig, CanceledArchivePlanConfig,
@@ -56,6 +58,8 @@ use cmfd_node::seed_peers::{SystemSeedResolver, production_rc_seed_set};
 use cmfd_node::storage::{inspect_block_log, repair_partial_block_log_tail};
 #[cfg(test)]
 use cmfd_node::wallet_backup::MAXIMUM_PASSPHRASE_BYTES;
+#[cfg(feature = "production-v4-testnet")]
+use cmfd_node::wallet_backup::create_encrypted_wallet;
 use cmfd_node::wallet_backup::{
     create_encrypted_wallet_backup, read_wallet_passphrase_file, restore_encrypted_wallet_backup,
 };
@@ -85,6 +89,56 @@ fn parse_hex32(value: &str) -> Result<[u8; 32], String> {
         .map_err(|_| "expected a 32-byte hexadecimal value".to_owned())?
         .try_into()
         .map_err(|_| "expected a 32-byte hexadecimal value".to_owned())
+}
+
+#[cfg(feature = "production-v4-testnet")]
+fn load_authenticated_rcnet_wallet_passphrase(
+    data_dir: &Path,
+    candidate: &Path,
+    passphrase_file: &Path,
+) -> Result<Zeroizing<Vec<u8>>, Box<dyn std::error::Error>> {
+    for (path, label) in [
+        (data_dir, "--data-dir"),
+        (candidate, "--candidate"),
+        (passphrase_file, "--passphrase-file"),
+    ] {
+        if !path.is_absolute() {
+            return Err(format!("{label} must be absolute").into());
+        }
+    }
+    if passphrase_file.starts_with(data_dir) {
+        return Err("--passphrase-file must be outside --data-dir".into());
+    }
+    let candidate_metadata = std::fs::symlink_metadata(candidate)?;
+    let passphrase_metadata = std::fs::symlink_metadata(passphrase_file)?;
+    #[cfg(windows)]
+    let unsafe_reparse_point = |metadata: &std::fs::Metadata| {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    };
+    #[cfg(not(windows))]
+    let unsafe_reparse_point = |_: &std::fs::Metadata| false;
+    if !candidate_metadata.is_file()
+        || candidate_metadata.file_type().is_symlink()
+        || unsafe_reparse_point(&candidate_metadata)
+        || candidate_metadata.len() == 0
+        || candidate_metadata.len() > 64 * 1024
+    {
+        return Err("--candidate must be a bounded regular non-symlink file".into());
+    }
+    if !passphrase_metadata.is_file()
+        || passphrase_metadata.file_type().is_symlink()
+        || unsafe_reparse_point(&passphrase_metadata)
+    {
+        return Err("--passphrase-file must be a regular non-symlink file".into());
+    }
+    let candidate_bytes = std::fs::read(candidate)?;
+    if candidate_bytes.len() as u64 != candidate_metadata.len() {
+        return Err("--candidate changed while being read".into());
+    }
+    RcnetLaunchCandidate::parse_exact_compiled_rcnet1(&candidate_bytes)?;
+    Ok(read_wallet_passphrase_file(passphrase_file)?)
 }
 
 #[derive(Debug, Parser)]
@@ -178,6 +232,32 @@ enum Command {
         steward_reward_destination: [u8; 32],
         #[arg(long, value_parser = parse_hex32)]
         community_reward_destination: [u8; 32],
+    },
+    /// Create a dedicated encrypted RCNet-1 wallet and independent backup offline.
+    #[cfg(feature = "production-v4-testnet")]
+    RcnetWalletCreate {
+        /// Exact canonical RCNet-1 Candidate V2 document.
+        #[arg(long)]
+        candidate: PathBuf,
+        /// Absolute create-new path for the independently randomized encrypted backup.
+        #[arg(long)]
+        backup_output: PathBuf,
+        /// Absolute path to a passphrase file outside --data-dir.
+        #[arg(long)]
+        passphrase_file: PathBuf,
+    },
+    /// Restore a dedicated encrypted RCNet-1 wallet backup offline.
+    #[cfg(feature = "production-v4-testnet")]
+    RcnetWalletRestore {
+        /// Exact canonical RCNet-1 Candidate V2 document.
+        #[arg(long)]
+        candidate: PathBuf,
+        /// Absolute path to the encrypted RCNet-1 wallet backup.
+        #[arg(long)]
+        input: PathBuf,
+        /// Absolute path to a passphrase file outside --data-dir.
+        #[arg(long)]
+        passphrase_file: PathBuf,
     },
     /// Run loopback RPC and bounded P2P services.
     Run {
@@ -788,6 +868,72 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         write_candidate_create_new(output, &candidate)?;
         return Ok(());
     }
+    #[cfg(feature = "production-v4-testnet")]
+    if let Command::RcnetWalletCreate {
+        candidate,
+        backup_output,
+        passphrase_file,
+    } = &cli.command
+    {
+        if !backup_output.is_absolute() {
+            return Err("--backup-output must be absolute".into());
+        }
+        let passphrase =
+            load_authenticated_rcnet_wallet_passphrase(&cli.data_dir, candidate, passphrase_file)?;
+        let info = create_encrypted_wallet(
+            &cli.data_dir,
+            backup_output,
+            RCNET1_PROFILE.network_id,
+            passphrase.as_slice(),
+        )?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "status": "created",
+                "format": "CommonFoundry encrypted RCNet-1 wallet v1",
+                "network": RCNET1_PROFILE.short_name(),
+                "network_id": hex::encode(info.network_id),
+                "destination": hex::encode(info.destination),
+                "bytes": info.bytes,
+                "wallet_data_dir": cli.data_dir,
+                "backup": backup_output,
+            }))?
+        );
+        return Ok(());
+    }
+    #[cfg(feature = "production-v4-testnet")]
+    if let Command::RcnetWalletRestore {
+        candidate,
+        input,
+        passphrase_file,
+    } = &cli.command
+    {
+        if !input.is_absolute() {
+            return Err("--input must be absolute".into());
+        }
+        let passphrase =
+            load_authenticated_rcnet_wallet_passphrase(&cli.data_dir, candidate, passphrase_file)?;
+        let info = restore_encrypted_wallet_backup(
+            input,
+            &cli.data_dir,
+            RCNET1_PROFILE.network_id,
+            passphrase.as_slice(),
+        )?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "status": "restored",
+                "format": "CommonFoundry encrypted RCNet-1 wallet v1",
+                "network": RCNET1_PROFILE.short_name(),
+                "network_id": hex::encode(info.network_id),
+                "destination": hex::encode(info.destination),
+                "bytes": info.bytes,
+                "wallet_data_dir": cli.data_dir,
+                "backup": input,
+            }))?
+        );
+        return Ok(());
+    }
     if let Command::WalletBackup {
         output,
         passphrase_file,
@@ -908,6 +1054,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(feature = "production-v4")]
         Command::RcnetCandidate { .. } => {
             unreachable!("RCNet candidate generation exits before node initialization")
+        }
+        #[cfg(feature = "production-v4-testnet")]
+        Command::RcnetWalletCreate { .. } | Command::RcnetWalletRestore { .. } => {
+            unreachable!("RCNet wallet maintenance exits before node initialization")
         }
         Command::ExchangeWithdrawalKeygen { .. } => {
             unreachable!("withdrawal journal key generation exits before node initialization")
@@ -2730,6 +2880,60 @@ mod tests {
         assert!(matches!(restore.command, Command::WalletRestore { .. }));
         assert!(Cli::try_parse_from(["cmfd-node", "wallet-backup"]).is_err());
         assert!(Cli::try_parse_from(["cmfd-node", "wallet-restore"]).is_err());
+    }
+
+    #[cfg(feature = "production-v4-testnet")]
+    #[test]
+    fn rcnet_wallet_create_requires_candidate_backup_and_passphrase() {
+        let create = Cli::try_parse_from([
+            "cmfd-node",
+            "--data-dir",
+            "C:/custody/wallet",
+            "rcnet-wallet-create",
+            "--candidate",
+            "C:/artifacts/RCNET1-LAUNCH-CANDIDATE-V2.json",
+            "--backup-output",
+            "D:/backups/rcnet-wallet.cmfd-backup",
+            "--passphrase-file",
+            "C:/custody-secrets/rcnet-wallet.passphrase",
+        ])
+        .unwrap();
+        assert!(matches!(
+            create.command,
+            Command::RcnetWalletCreate {
+                candidate,
+                backup_output,
+                passphrase_file,
+            } if candidate == Path::new("C:/artifacts/RCNET1-LAUNCH-CANDIDATE-V2.json")
+                && backup_output == Path::new("D:/backups/rcnet-wallet.cmfd-backup")
+                && passphrase_file == Path::new("C:/custody-secrets/rcnet-wallet.passphrase")
+        ));
+        assert!(Cli::try_parse_from(["cmfd-node", "rcnet-wallet-create"]).is_err());
+
+        let restore = Cli::try_parse_from([
+            "cmfd-node",
+            "--data-dir",
+            "C:/custody/restored-wallet",
+            "rcnet-wallet-restore",
+            "--candidate",
+            "C:/artifacts/RCNET1-LAUNCH-CANDIDATE-V2.json",
+            "--input",
+            "D:/backups/rcnet-wallet.cmfd-backup",
+            "--passphrase-file",
+            "C:/custody-secrets/rcnet-wallet.passphrase",
+        ])
+        .unwrap();
+        assert!(matches!(
+            restore.command,
+            Command::RcnetWalletRestore {
+                candidate,
+                input,
+                passphrase_file,
+            } if candidate == Path::new("C:/artifacts/RCNET1-LAUNCH-CANDIDATE-V2.json")
+                && input == Path::new("D:/backups/rcnet-wallet.cmfd-backup")
+                && passphrase_file == Path::new("C:/custody-secrets/rcnet-wallet.passphrase")
+        ));
+        assert!(Cli::try_parse_from(["cmfd-node", "rcnet-wallet-restore"]).is_err());
     }
 
     #[test]

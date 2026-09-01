@@ -25,6 +25,32 @@ mode `0600` or stricter. Store the encrypted backup and passphrase separately,
 then test recovery into a fresh data directory and compare the reported wallet
 destination before relying on the backup.
 
+Before ProductionV4 activation, the isolated qualification build provides an
+offline RCNet-1 custody path. It authenticates the exact canonical Candidate V2
+document, generates a new OS-CSPRNG Schnorr key, and binds both independently
+randomized encrypted copies to the candidate's compiled RCNet-1 network ID. It
+does not start RPC, P2P, mining, or the production-RC runtime.
+
+```text
+cmfd-node --data-dir <absolute-private-wallet-data> rcnet-wallet-create \
+  --candidate <absolute-canonical-candidate-v2> \
+  --backup-output <absolute-offline-path>/wallet.cmfd-backup \
+  --passphrase-file <absolute-private-passphrase-file>
+
+cmfd-node --data-dir <absolute-fresh-restore-data> rcnet-wallet-restore \
+  --candidate <absolute-canonical-candidate-v2> \
+  --input <absolute-offline-path>/wallet.cmfd-backup \
+  --passphrase-file <absolute-private-passphrase-file>
+```
+
+These commands exist only in the `production-v4-testnet` source-stage build.
+They print the x-only public destination but never the private key or
+passphrase. Both operations require absolute paths; the passphrase must be a
+regular non-symlink file outside the wallet data directory. The create and
+restore destinations use no-overwrite semantics. On Windows, create the wallet,
+passphrase, and backup parent directories with inherited access disabled and
+grant access only to the operator account and `SYSTEM` before running them.
+
 The v1 reader is deliberately strict: it accepts one exact file length and one
 set of Argon2id parameters, rejects another network before writing, authenticates
 all metadata and ciphertext, validates the recovered Schnorr key, and creates

@@ -38,6 +38,24 @@ install -d -m 0750 -o root -g commonfoundry /opt/commonfoundry/artifacts
 install -d -m 0750 -o root -g commonfoundry /etc/commonfoundry
 install -d -m 0750 -o commonfoundry -g commonfoundry /var/lib/commonfoundry
 
+wallet_passphrase=/etc/commonfoundry/wallet-passphrase
+if [[ -L ${wallet_passphrase} || ( -e ${wallet_passphrase} && ! -f ${wallet_passphrase} ) ]]; then
+    echo "wallet passphrase path is not a regular file: ${wallet_passphrase}" >&2
+    exit 1
+fi
+if [[ ! -e ${wallet_passphrase} ]]; then
+    temporary_passphrase=$(mktemp /etc/commonfoundry/.wallet-passphrase.XXXXXX)
+    trap 'rm -f -- "${temporary_passphrase}"' EXIT
+    dd if=/dev/urandom bs=48 count=1 status=none | base64 -w 0 >"${temporary_passphrase}"
+    printf '\n' >>"${temporary_passphrase}"
+    chown root:commonfoundry "${temporary_passphrase}"
+    chmod 0640 "${temporary_passphrase}"
+    mv -T "${temporary_passphrase}" "${wallet_passphrase}"
+    trap - EXIT
+fi
+chown root:commonfoundry "${wallet_passphrase}"
+chmod 0640 "${wallet_passphrase}"
+
 # Contabo's first-boot NoCloud image contains an always-run bootcmd that
 # rewrites SSH policy and exits nonzero when its final pkill matches nothing.
 # Preserve the remaining standard cloud-init modules but retire that completed

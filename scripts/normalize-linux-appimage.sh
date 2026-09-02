@@ -13,7 +13,7 @@ EXPECTED_COMMIT="$(cmfd_release_commit "${2:-}")"
 EXPECTED_VERSION="${3:?Pass the expected package version.}"
 CACHE_ROOT="${XDG_CACHE_HOME:-${HOME:?HOME must be set.}/.cache}"
 TAURI_APPIMAGE_PLUGIN="$CACHE_ROOT/tauri/linuxdeploy-plugin-appimage.AppImage"
-TAURI_APPIMAGE_PLUGIN_SHA256='a45d3e227bc7f397e9cf6bfa4c9507494efa2293357b6e86690a3de2ca992e79'
+TAURI_APPIMAGE_PLUGIN_SHA256='0441769ab38009504d2678c38cd7e526955388dd30a215b4a20afaa5471652f2'
 
 cmfd_require_linux_glibc_x86_64
 for command_name in chmod cmp cp env find git grep id mktemp mv python3 realpath rm sed sha256sum stat touch unsquashfs; do

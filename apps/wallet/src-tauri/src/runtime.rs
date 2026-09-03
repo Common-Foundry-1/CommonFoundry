@@ -978,6 +978,15 @@ fn sanitize_node_startup_error(profile: NetworkProfile, error: NodeError) -> Nod
             ),
             false,
         ),
+        (ProofProfile::ProductionV4, "production_v4_artifacts_missing") => startup_error(
+            client.code,
+            format!(
+                "{} ({}) cannot start because its authenticated runtime files are missing. Place production-v4/MODEL-V2.bank and production-v4/FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json beside the wallet executable, or complete the RCNet runtime preparation first, then reopen the wallet.",
+                profile.short_name(),
+                profile.proof.profile_name()
+            ),
+            false,
+        ),
         (ProofProfile::ProductionV4, "proof_verifier_configuration") => startup_error(
             client.code,
             format!(
@@ -1457,5 +1466,20 @@ mod tests {
         let configured = configured_rc(&files, sha256(b"bounded worker fixture"));
         let error = security_error(prepare_for_test(profile, &configured, &files.root));
         assert_eq!(error.code, "production_v4_configuration_unexpected");
+    }
+
+    #[cfg(feature = "production-v4")]
+    #[test]
+    fn production_v4_missing_artifacts_explain_runtime_setup() {
+        let error =
+            sanitize_node_startup_error(RCNET1_PROFILE, NodeError::ProductionV4ArtifactsMissing);
+        assert_eq!(error.code, "production_v4_artifacts_missing");
+        assert!(error.message.contains("production-v4/MODEL-V2.bank"));
+        assert!(
+            error
+                .message
+                .contains("FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json")
+        );
+        assert!(error.message.contains("RCNet runtime preparation"));
     }
 }

@@ -67,6 +67,22 @@ common-foundry-wallet \
   --wallet-passphrase-file <private-passphrase-file>
 ```
 
+For RCNet-1, complete the authenticated runtime preparation before starting
+the desktop wallet. The RCNet runtime bootstrap archive contains the native
+wallet and node plus a resumable downloader. It expects
+`production-v4/MODEL-V2.bank` and
+`production-v4/FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json` beside its
+executable and acquires the approximately 6.4 GB model bank from the pinned
+RCNet input distribution. If either file is absent, wallet creation is blocked
+before any key is written and the wallet reports that the RCNet runtime setup
+is incomplete.
+
+For `v0.1.0-rc.3`, use the platform archive named
+`commonfoundry-rc-runtime-bootstrap-windows-x86_64-v0.1.0-rc.3.zip` or
+`commonfoundry-rc-runtime-bootstrap-linux-x86_64-v0.1.0-rc.3.tar.gz` from the
+release page. Extract it to a writable directory and run its platform wallet
+launcher; no private key or passphrase is involved in runtime preparation.
+
 Supplying that option for a new data directory creates an encrypted live
 `wallet.key`. Existing Devnet plaintext keys remain readable for compatibility;
 they are not silently rewritten. RCNet refuses plaintext live keys and requires

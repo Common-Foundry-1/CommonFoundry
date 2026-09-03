@@ -64,6 +64,9 @@ jobs:
           bash -n scripts/normalize-linux-appimage.sh
           bash -n scripts/normalize-linux-deb.sh
           bash -n scripts/package-standalone-miner.sh
+          bash -n scripts/package-wallet-runtime-bootstrap.sh
+          bash -n packaging/production-rc/runtime/linux/prepare-rcnet-runtime.sh
+          bash -n packaging/production-rc/runtime/linux/start-wallet.sh
       - name: Install Linux desktop dependencies
         run: |
           sudo apt-get update
@@ -208,21 +211,22 @@ jobs:
           - os: windows-latest
             artifact: common-foundry-wallet-windows
             package-paths: |
-              target/release/bundle/nsis/Common Foundry Wallet RCNet_0.1.0-rc.2_x64-setup.exe
+              target/release/bundle/nsis/Common Foundry Wallet RCNet_0.1.0-rc.3_x64-setup.exe
+              target/runtime-bootstrap/commonfoundry-rc-runtime-bootstrap-windows-x86_64-v0.1.0-rc.3.zip
             binary-path: target/release/common-foundry-wallet.exe
             node-path: target/release/cmfd-node.exe
           - os: ubuntu-22.04
             artifact: common-foundry-wallet-linux
             package-paths: |
-              target/release/bundle/appimage/Common Foundry Wallet RCNet_0.1.0-rc.2_amd64.AppImage
-              target/release/bundle/deb/Common Foundry Wallet RCNet_0.1.0-rc.2_amd64.deb
+              target/release/bundle/appimage/Common Foundry Wallet RCNet_0.1.0-rc.3_amd64.AppImage
+              target/release/bundle/deb/Common Foundry Wallet RCNet_0.1.0-rc.3_amd64.deb
+              target/runtime-bootstrap/commonfoundry-rc-runtime-bootstrap-linux-x86_64-v0.1.0-rc.3.tar.gz
             binary-path: target/release/common-foundry-wallet
             node-path: target/release/cmfd-node
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        if: runner.os == 'Linux'
         with:
           python-version: "3.11"
       - name: Install Linux desktop dependencies
@@ -280,18 +284,33 @@ jobs:
           CMFD_RELEASE_COMMIT: ${{ github.sha }}
         run: >-
           bash scripts/normalize-linux-appimage.sh
-          "target/release/bundle/appimage/Common Foundry Wallet RCNet_0.1.0-rc.2_amd64.AppImage"
+          "target/release/bundle/appimage/Common Foundry Wallet RCNet_0.1.0-rc.3_amd64.AppImage"
           "$CMFD_RELEASE_COMMIT"
-          "0.1.0-rc.2"
+          "0.1.0-rc.3"
       - name: Normalize Linux deb package
         if: runner.os == 'Linux'
         env:
           CMFD_RELEASE_COMMIT: ${{ github.sha }}
         run: >-
           bash scripts/normalize-linux-deb.sh
-          "target/release/bundle/deb/Common Foundry Wallet RCNet_0.1.0-rc.2_amd64.deb"
+          "target/release/bundle/deb/Common Foundry Wallet RCNet_0.1.0-rc.3_amd64.deb"
           "$CMFD_RELEASE_COMMIT"
-          "0.1.0-rc.2"
+          "0.1.0-rc.3"
+      - name: Package complete RCNet runtime bootstrap (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: >-
+          ./scripts/package-wallet-runtime-bootstrap.ps1
+          -ExpectedCommit "${{ github.sha }}"
+          -Version "0.1.0-rc.3"
+          -OutputDirectory "target/runtime-bootstrap"
+      - name: Package complete RCNet runtime bootstrap (Linux)
+        if: runner.os == 'Linux'
+        run: >-
+          bash scripts/package-wallet-runtime-bootstrap.sh
+          "${{ github.sha }}"
+          "0.1.0-rc.3"
+          "target/runtime-bootstrap"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.artifact }}

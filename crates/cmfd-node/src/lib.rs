@@ -432,7 +432,9 @@ pub enum NodeError {
     ),
     #[error("the compiled ProductionV4 network requires its in-process verifier authority")]
     ProductionV4Unavailable,
-    #[error("ProductionV4 requires the release-pinned model bank and fixed artifact record")]
+    #[error(
+        "ProductionV4 runtime files are missing: production-v4/MODEL-V2.bank and production-v4/FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json"
+    )]
     ProductionV4ArtifactsMissing,
     #[error("ProductionV4 verifier artifacts were supplied for another proof profile")]
     ProductionV4ArtifactsUnexpected,
@@ -617,8 +619,8 @@ impl NodeError {
             #[cfg(feature = "production-v3")]
             Self::ProductionV3Artifacts(_) => ("proof_verifier_configuration", 500, false),
             Self::ProductionV4Unavailable => ("production_v4_unavailable", 503, false),
-            Self::ProductionV4ArtifactsMissing
-            | Self::ProductionV4ArtifactsUnexpected
+            Self::ProductionV4ArtifactsMissing => ("production_v4_artifacts_missing", 500, false),
+            Self::ProductionV4ArtifactsUnexpected
             | Self::ProductionV4ArtifactPinsMissing
             | Self::ProductionV4ActivationEvidence(_)
             | Self::ProductionV4ArtifactIdentityMismatch(_)
@@ -724,6 +726,9 @@ impl NodeError {
         let message = match self {
             Self::DataDirLocked(_) => "node data directory is already in use".to_owned(),
             Self::Io { .. } => "node storage operation failed; inspect the node logs".to_owned(),
+            Self::ProductionV4ArtifactsMissing => {
+                "required ProductionV4 runtime files are missing; complete RCNet runtime setup before starting the node".to_owned()
+            }
             Self::CorruptLog(_) => {
                 "block log is corrupt; inspect the node logs before restarting".to_owned()
             }
@@ -4262,8 +4267,13 @@ fn open_production_v4_pinned_reader(
     if pin.bytes == 0 || pin.blake3 == [0; 32] || pin.sha256 == [0; 32] {
         return Err(NodeError::ProductionV4ArtifactPinsMissing);
     }
-    let file =
-        File::open(path).map_err(|source| io_error("open ProductionV4 artifact", path, source))?;
+    let file = File::open(path).map_err(|source| {
+        if source.kind() == io::ErrorKind::NotFound {
+            NodeError::ProductionV4ArtifactsMissing
+        } else {
+            io_error("open ProductionV4 artifact", path, source)
+        }
+    })?;
     let metadata = file
         .metadata()
         .map_err(|source| io_error("inspect ProductionV4 artifact", path, source))?;
@@ -4271,6 +4281,40 @@ fn open_production_v4_pinned_reader(
         return Err(NodeError::ProductionV4ArtifactIdentityMismatch(name));
     }
     Ok(ProductionV4PinnedReader::new(file))
+}
+
+#[cfg(all(test, feature = "production-v4"))]
+mod production_v4_artifact_tests {
+    use super::*;
+
+    #[test]
+    fn missing_packaged_artifact_has_actionable_client_classification() {
+        let path = std::env::temp_dir().join(format!(
+            "cmfd-production-v4-missing-{}-artifact.bank",
+            std::process::id()
+        ));
+        let error = match open_production_v4_pinned_reader(
+            &path,
+            release_gate::ProductionV3FileIdentityPin {
+                bytes: 1,
+                blake3: [1; 32],
+                sha256: [2; 32],
+            },
+            "model bank",
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("missing artifact unexpectedly opened"),
+        };
+
+        assert!(matches!(error, NodeError::ProductionV4ArtifactsMissing));
+        let client = error.client_error();
+        assert_eq!(client.code, "production_v4_artifacts_missing");
+        assert_eq!(
+            client.message,
+            "required ProductionV4 runtime files are missing; complete RCNet runtime setup before starting the node"
+        );
+        assert!(!client.message.contains(path.to_string_lossy().as_ref()));
+    }
 }
 
 /// Hashes the same stream that supplies verifier state. This closes both

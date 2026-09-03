@@ -2,6 +2,7 @@
 setlocal
 title Common Foundry Wallet RCNet-1
 set "ROOT=%~dp0"
+cd /d "%ROOT%"
 set "POWERSHELL_EXE=powershell.exe"
 where pwsh.exe >nul 2>&1
 if not errorlevel 1 set "POWERSHELL_EXE=pwsh.exe"

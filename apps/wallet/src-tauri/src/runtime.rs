@@ -2,10 +2,14 @@ use std::fs;
 use std::net::TcpListener;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
+#[cfg(all(feature = "production-rc", target_os = "windows"))]
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+#[cfg(all(feature = "production-rc", target_os = "windows"))]
+use std::{io, os::windows::process::CommandExt};
 
 use cmfd_node::p2p::{InboundPeerHandle, PeerDiscovery, spawn_inbound_listener_with_discovery};
 use cmfd_node::peer::{PeerAddressPolicy, PeerLimits};
@@ -618,7 +622,7 @@ fn wallet_locked_error() -> NodeClientError {
 fn node_starting_error() -> NodeClientError {
     startup_error(
         "node_starting",
-        "Opening wallet: authenticating proof inputs and replaying local chain history.",
+        "Opening wallet: preparing and authenticating proof inputs, then replaying local chain history. The first RCNet run may download about 6.4 GB.",
         true,
     )
 }
@@ -683,6 +687,7 @@ fn prepare_node_security(
             false,
         )
     })?;
+    prepare_packaged_rcnet_runtime(profile, &package_executable)?;
     let expected_worker_sha256 = if profile.proof == ProofProfile::ProductionV3 {
         Some(
             compiled_production_v3_worker_sha256()
@@ -692,6 +697,74 @@ fn prepare_node_security(
         None
     };
     prepare_node_security_with_package(profile, config, &package_executable, expected_worker_sha256)
+}
+
+#[cfg(all(feature = "production-rc", target_os = "windows"))]
+fn prepare_packaged_rcnet_runtime(
+    profile: NetworkProfile,
+    package_executable: &Path,
+) -> Result<(), NodeClientError> {
+    if profile.proof != ProofProfile::ProductionV4 {
+        return Ok(());
+    }
+    let artifacts = production_v4_package_artifacts(package_executable)
+        .map_err(|error| sanitize_node_startup_error(profile, error))?;
+    if artifacts.bank.is_file() && artifacts.fixed_record.is_file() {
+        return Ok(());
+    }
+    let package_directory = package_executable.parent().ok_or_else(|| {
+        sanitize_node_startup_error(profile, NodeError::ProductionV4ArtifactsMissing)
+    })?;
+    let preparation = package_directory.join("PREPARE-RCNET-RUNTIME.ps1");
+    if !preparation.is_file() {
+        return Ok(());
+    }
+    const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+    let status = Command::new("powershell.exe")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&preparation)
+        .arg("-Destination")
+        .arg(
+            artifacts
+                .bank
+                .parent()
+                .expect("packaged ProductionV4 bank has a parent directory"),
+        )
+        .creation_flags(CREATE_NEW_CONSOLE)
+        .status()
+        .map_err(rcnet_runtime_preparation_error)?;
+    if !status.success() {
+        return Err(startup_error(
+            "rcnet_runtime_preparation_failed",
+            format!(
+                "RCNet-1 runtime preparation stopped with exit code {}. Reopen the wallet to resume the authenticated download.",
+                status
+                    .code()
+                    .map_or_else(|| "unknown".to_owned(), |code| code.to_string())
+            ),
+            true,
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "production-rc", target_os = "windows"))]
+fn rcnet_runtime_preparation_error(error: io::Error) -> NodeClientError {
+    startup_error(
+        "rcnet_runtime_preparation_failed",
+        format!(
+            "RCNet-1 runtime preparation could not start ({error}). Reopen the wallet to retry, or run PREPARE-RCNET-RUNTIME.ps1 from the installation directory."
+        ),
+        true,
+    )
+}
+
+#[cfg(not(all(feature = "production-rc", target_os = "windows")))]
+fn prepare_packaged_rcnet_runtime(
+    _profile: NetworkProfile,
+    _package_executable: &Path,
+) -> Result<(), NodeClientError> {
+    Ok(())
 }
 
 fn prepare_node_security_with_package(

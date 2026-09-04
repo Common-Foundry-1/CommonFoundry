@@ -1,5 +1,6 @@
 *.pdf binary
 crates/cmfd-consensus/data/bls_dory_blake3_preprocessing_record_v1.json text eol=lf
+packaging/production-v4-pool/shared/*.json text eol=lf
 scripts/*.sh text eol=lf
 scripts/release_integrity.py text eol=lf
 packaging/releases/*.inventory text eol=lf

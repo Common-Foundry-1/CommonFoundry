@@ -4,6 +4,11 @@
   "identifier": "org.commonfoundry.wallet.rcnet1",
   "bundle": {
     "shortDescription": "Common Foundry RCNet desktop wallet",
-    "longDescription": "Native desktop wallet and embedded node for the Common Foundry RCNet release-candidate rehearsal network."
+    "longDescription": "Native desktop wallet and embedded node for the Common Foundry RCNet release-candidate rehearsal network.",
+    "resources": {
+      "../../../packaging/production-rc/runtime/windows/PREPARE-RCNET-RUNTIME.ps1": "PREPARE-RCNET-RUNTIME.ps1",
+      "../../../packaging/production-v4-pool/shared/V4-INPUT-CHUNKS.json": "V4-INPUT-CHUNKS.json",
+      "../../../packaging/production-v4-pool/shared/FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json": "FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json"
+    }
   }
 }

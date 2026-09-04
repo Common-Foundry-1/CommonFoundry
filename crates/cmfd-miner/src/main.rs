@@ -8,7 +8,9 @@ use std::io::BufReader;
 use std::io::Write;
 #[cfg(any(feature = "production-v3-testnet", feature = "production-v4"))]
 use std::io::{Read, Seek, SeekFrom};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
+#[cfg(feature = "production-v4")]
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 #[cfg(any(feature = "production-v3-testnet", feature = "production-v4"))]
 use std::sync::atomic::AtomicU64;
@@ -2777,7 +2779,7 @@ impl SessionStatistics {
     }
 
     /// Total completed nonce evaluations across every GPU this session.
-    #[cfg_attr(feature = "production-v4", allow(dead_code))]
+    #[cfg(feature = "production-v3")]
     fn total_attempts(&self) -> u64 {
         self.totals
             .values()

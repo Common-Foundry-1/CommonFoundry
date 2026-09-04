@@ -231,18 +231,21 @@ pub fn canonical_dory_v3_model_record_v2_json(
 /// bank and reproduced every commitment in the enclosed immutable record.
 #[must_use]
 #[derive(Debug)]
+#[cfg_attr(not(feature = "dory-v3-consensus-adapter"), allow(dead_code))]
 pub struct BankAuthenticatedDoryV3ModelCommitmentRecordV2 {
     record: DoryV3ModelCommitmentRecordV2,
     origin: DoryV3ModelCommitmentAuthorityOrigin,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "dory-v3-consensus-adapter"), allow(dead_code))]
 enum DoryV3ModelCommitmentAuthorityOrigin {
     ReproducedFromBank,
     ReleasePinnedRecord,
     ReleasePinnedBankIdentity,
 }
 
+#[cfg_attr(not(feature = "dory-v3-consensus-adapter"), allow(dead_code))]
 impl BankAuthenticatedDoryV3ModelCommitmentRecordV2 {
     pub const fn record(&self) -> &DoryV3ModelCommitmentRecordV2 {
         &self.record

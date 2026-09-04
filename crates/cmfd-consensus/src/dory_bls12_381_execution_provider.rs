@@ -2888,10 +2888,12 @@ fn reserved_dory_v3_vector<T>(capacity: usize) -> Result<Vec<T>, BlsDoryV3Winnin
 /// against the CPU-committed fixed-model weights and the finished candidate
 /// is self-verified, so a wrong accelerator value costs the candidate and
 /// can never produce a valid proof.
+#[cfg_attr(not(feature = "dory-v3-consensus-adapter"), allow(dead_code))]
 pub struct BlsDoryV3AcceleratedReplayAccumulators {
     layer_accumulators: Vec<i32>,
 }
 
+#[cfg_attr(not(feature = "dory-v3-consensus-adapter"), allow(dead_code))]
 impl BlsDoryV3AcceleratedReplayAccumulators {
     pub fn new(layer_accumulators: Vec<i32>) -> Self {
         Self { layer_accumulators }
@@ -2910,6 +2912,7 @@ impl BlsDoryV3AcceleratedReplayAccumulators {
 /// this path's own reader exactly as in the CPU replay, and the artifact
 /// remains provisional until everything has authenticated.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(feature = "dory-v3-consensus-adapter"), allow(dead_code))]
 pub(crate) fn replay_dory_v3_winning_nonce_from_bank_authenticated_record_accelerated<R: Read>(
     authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
     transcript: DoryV3TranscriptContext,
@@ -2965,6 +2968,7 @@ fn replay_dory_v3_winning_nonce_from_bank_authenticated_record_accelerated_for_t
     )
 }
 
+#[cfg_attr(not(feature = "dory-v3-consensus-adapter"), allow(dead_code))]
 fn execute_dory_v3_accelerated_with_context<R: Read>(
     authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
     context: BlsDoryV3ExecutionAccumulatorArtifactContext,
@@ -3010,6 +3014,7 @@ fn execute_dory_v3_accelerated_with_context<R: Read>(
 /// transition is still derived and range-checked per cell, every accumulator
 /// is bound-checked before it is written, and the final activation is derived
 /// on the CPU from the last accepted column.
+#[cfg_attr(not(feature = "dory-v3-consensus-adapter"), allow(dead_code))]
 struct DoryV3AcceleratedWinningNonceReplaySink<'a> {
     context: BlsDoryV3ExecutionAccumulatorArtifactContext,
     expected_manifest: ModelBankManifest,
@@ -3031,6 +3036,7 @@ struct DoryV3AcceleratedWinningNonceReplaySink<'a> {
     pending_initial_accumulators: Vec<i32>,
 }
 
+#[cfg_attr(not(feature = "dory-v3-consensus-adapter"), allow(dead_code))]
 impl<'a> DoryV3AcceleratedWinningNonceReplaySink<'a> {
     fn new(
         context: BlsDoryV3ExecutionAccumulatorArtifactContext,

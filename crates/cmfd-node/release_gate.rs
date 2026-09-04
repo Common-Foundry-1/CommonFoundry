@@ -493,16 +493,13 @@ fn validate_production_v4_approval_trust(
             return Err("ProductionV4 activation approval key type is invalid");
         }
     }
-    if let Some(reproducer) = independent_reproducer {
-        if trust.producer.signer_identity == reproducer.signer_identity
+    if let Some(reproducer) = independent_reproducer
+        && (trust.producer.signer_identity == reproducer.signer_identity
             || trust.producer.allowed_signers_sha256 == reproducer.allowed_signers_sha256
             || trust.producer.key_blob_sha256 == reproducer.key_blob_sha256
-            || trust.producer.key_fingerprint == reproducer.key_fingerprint
-        {
-            return Err(
-                "ProductionV4 producer and reproducer approval authorities are not distinct",
-            );
-        }
+            || trust.producer.key_fingerprint == reproducer.key_fingerprint)
+    {
+        return Err("ProductionV4 producer and reproducer approval authorities are not distinct");
     }
     Ok(())
 }

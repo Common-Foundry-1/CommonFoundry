@@ -25,4 +25,4 @@ that do not match the compiled RCNet-1 identities.
 
 The model-bank parts are served from `downloads.commonfoundry.ai` with the
 public RC1 GitHub release as a fallback. The RC1 label identifies the immutable
-ProductionV4 input set; the wallet and node binaries in this package are RC3.
+ProductionV4 input set; the wallet and node binaries in this package are RC4.

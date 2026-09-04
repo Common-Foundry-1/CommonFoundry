@@ -1,6 +1,6 @@
 {
   "productName": "Common Foundry Wallet RCNet",
-  "version": "0.1.0-rc.3",
+  "version": "0.1.0-rc.4",
   "identifier": "org.commonfoundry.wallet.rcnet1",
   "bundle": {
     "shortDescription": "Common Foundry RCNet desktop wallet",

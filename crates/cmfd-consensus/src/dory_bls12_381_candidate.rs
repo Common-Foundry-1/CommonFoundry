@@ -99,11 +99,13 @@ thread_local! {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(feature = "whir-prototype"), allow(dead_code))]
 pub(crate) fn reset_layout_v5_relation_dispatches_for_test() {
     LAYOUT_V5_RELATION_DISPATCHES.with(|count| count.set(0));
 }
 
 #[cfg(test)]
+#[cfg_attr(not(feature = "whir-prototype"), allow(dead_code))]
 pub(crate) fn layout_v5_relation_dispatches_for_test() -> u64 {
     LAYOUT_V5_RELATION_DISPATCHES.with(Cell::get)
 }

@@ -218,6 +218,14 @@ impl AuthenticatedInput {
         parent.validate_child(path)?;
         parent.recheck()?;
         let opened = (|| {
+            let path_metadata =
+                fs::symlink_metadata(path).map_err(|source| CeremonyFsError::OpenInput {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+            if metadata_is_reparse_point(&path_metadata) {
+                return Err(CeremonyFsError::InputReparsePoint(path.to_path_buf()));
+            }
             let file = open_input_no_follow(path).map_err(|source| CeremonyFsError::OpenInput {
                 path: path.to_path_buf(),
                 source,

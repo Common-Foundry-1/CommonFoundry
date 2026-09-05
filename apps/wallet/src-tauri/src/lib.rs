@@ -93,6 +93,7 @@ pub fn run() -> i32 {
     };
 
     let app = match tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.unminimize();
@@ -134,6 +135,7 @@ pub fn run() -> i32 {
             commands::unlock_wallet,
             commands::lock_wallet,
             commands::backup_wallet,
+            commands::choose_wallet_backup_path,
             commands::migrate_wallet_encryption,
             commands::restore_wallet,
         ])

@@ -2,6 +2,17 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const COIN: u64 = 100_000_000;
+/// Flat minimum burn per non-coinbase transaction on RCNet-1, starting with RC5.
+pub const MIN_TRANSACTION_FEE_ATOMS: u64 = COIN / 10;
+
+/// Historical development networks retain their original transaction rules.
+pub fn minimum_transaction_fee(network_id: [u8; 32]) -> u64 {
+    if network_id == crate::PRODUCTION_V4_RCNET1_NETWORK_ID {
+        MIN_TRANSACTION_FEE_ATOMS
+    } else {
+        0
+    }
+}
 pub const BLOCKS_PER_365_DAY_YEAR: u64 = 365 * 24 * 60;
 pub const INITIAL_EMISSION_YEARS: u64 = 5;
 pub const INITIAL_EMISSION_BLOCKS: u64 = BLOCKS_PER_365_DAY_YEAR * INITIAL_EMISSION_YEARS;

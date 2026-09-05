@@ -138,6 +138,14 @@ impl NetworkParams {
         hasher.update(&TARGET_SPACING_SECONDS.to_le_bytes());
         hasher.update(&WIRE_VERSION.to_le_bytes());
 
+        // RC5 changes RCNet transaction validity. Old peers and state caches must
+        // not silently identify themselves as compatible with the new rules.
+        let minimum_fee = crate::economics::minimum_transaction_fee(self.network_id);
+        if minimum_fee != 0 {
+            hasher.update(b"CMFD/MINIMUM-TRANSACTION-FEE/V1");
+            hasher.update(&minimum_fee.to_le_bytes());
+        }
+
         Ok(*hasher.finalize().as_bytes())
     }
 

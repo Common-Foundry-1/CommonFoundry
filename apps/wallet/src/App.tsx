@@ -18,7 +18,7 @@ import type { WalletCustodyStatus } from "./types";
 const TITLES: Record<ViewName, { eyebrow: string; title: string }> = {
   overview: { eyebrow: "Common Foundry Wallet", title: "Overview" },
   transactions: { eyebrow: "Wallet ledger", title: "Transactions" },
-  mining: { eyebrow: "ForgeMatrix reference engine", title: "Mining" },
+  mining: { eyebrow: "ForgeMatrix mining engine", title: "Mining" },
   network: { eyebrow: "Network operations", title: "Network" },
 };
 

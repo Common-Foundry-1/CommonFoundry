@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 
 import { sendWalletTransaction } from "../api/nodeClient";
 import { formatAtoms, parseCmfd, shortenHash } from "../lib/amount";
+import { DEFAULT_TRANSACTION_FEE, MIN_TRANSACTION_FEE_ATOMS, MINIMUM_FEE_MESSAGE } from "../lib/fees";
 import type { WalletSendResult, WalletSnapshot } from "../types";
 
 interface SendDialogProps {
@@ -21,7 +22,7 @@ interface SendErrors {
 
 type SendPhase = "edit" | "review" | "complete";
 
-const DEFAULT_FEE = "0.00001000";
+const DEFAULT_FEE = DEFAULT_TRANSACTION_FEE;
 const PUBLIC_KEY_PATTERN = /^[0-9a-fA-F]{64}$/;
 
 function getErrorMessage(error: unknown): string {
@@ -131,8 +132,8 @@ export function SendDialog({
     if (parsedAmount === null || parsedAmount <= 0n) {
       nextErrors.amount = "Enter an amount greater than zero with no more than 8 decimals.";
     }
-    if (parsedFee === null || parsedFee <= 0n) {
-      nextErrors.fee = "Enter a fee greater than zero with no more than 8 decimals.";
+    if (parsedFee === null || parsedFee < MIN_TRANSACTION_FEE_ATOMS) {
+      nextErrors.fee = MINIMUM_FEE_MESSAGE;
     }
     if (
       available !== null
@@ -288,7 +289,7 @@ export function SendDialog({
               {errors.fee ? (
                 <p className="form-error" id="send-fee-error">{errors.fee}</p>
               ) : (
-                <p className="form-help" id="send-fee-help">Transaction fees are permanently burned.</p>
+                <p className="form-help" id="send-fee-help">Minimum 0.1 CMFD. Transaction fees are permanently burned.</p>
               )}
             </div>
 

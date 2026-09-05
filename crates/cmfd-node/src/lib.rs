@@ -4918,7 +4918,13 @@ impl Node {
         let log_path = data_dir.join(BLOCK_LOG_FILE);
         let log = open_block_log(&log_path)?;
         let fingerprint = params.fingerprint()?;
-        let metadata = load_metadata(&data_dir, fingerprint, &log, &log_path)?;
+        let metadata = load_metadata(
+            &data_dir,
+            fingerprint,
+            &log,
+            &log_path,
+            profile.network_id == cmfd_consensus::PRODUCTION_V4_RCNET1_NETWORK_ID,
+        )?;
         let (wallet_signing_key, legacy_shared_wallet) = load_or_create_wallet_key(
             &data_dir,
             profile,
@@ -5639,6 +5645,7 @@ impl Node {
         change_destination: [u8; 32],
     ) -> Result<WalletPaymentPlan, NodeError> {
         VerifyingKey::from_bytes(&recipient).map_err(|_| NodeError::InvalidWalletRecipient)?;
+        validate_wallet_minimum_fee(self.params.network_id, fee_burned)?;
         if amount == 0 {
             return Err(NodeError::WalletZeroAmount);
         }
@@ -6031,6 +6038,7 @@ impl Node {
         fee_burned: u64,
         max_inputs: usize,
     ) -> Result<WalletConsolidateResponse, NodeError> {
+        validate_wallet_minimum_fee(self.params.network_id, fee_burned)?;
         if self.exchange_custody_v3_wallet_state.locks_native_wallet() {
             return Err(NodeError::ExchangeCustodyV3WalletExclusive);
         }
@@ -7245,6 +7253,14 @@ fn validate_mempool_transaction(
     Ok(validation.total_burned_fees)
 }
 
+fn validate_wallet_minimum_fee(network_id: [u8; 32], actual: u64) -> Result<(), NodeError> {
+    let required = cmfd_consensus::economics::minimum_transaction_fee(network_id);
+    if actual < required {
+        return Err(NodeError::MempoolFeeTooLow { required, actual });
+    }
+    Ok(())
+}
+
 fn required_relay_fee(encoded_bytes: usize) -> u64 {
     let kib = encoded_bytes.saturating_add(1023) / 1024;
     u64::try_from(kib)
@@ -7252,6 +7268,9 @@ fn required_relay_fee(encoded_bytes: usize) -> u64 {
         .and_then(|kib| kib.checked_mul(MIN_RELAY_FEE_PER_KIB))
         .unwrap_or(u64::MAX)
         .max(MIN_RELAY_FEE_PER_KIB)
+        .max(cmfd_consensus::economics::minimum_transaction_fee(
+            COMPILED_NETWORK_PROFILE.network_id,
+        ))
 }
 
 pub(crate) fn signed_wallet_payment_size(
@@ -9076,7 +9095,13 @@ enum MetadataState {
     Missing,
     Legacy,
     Current,
+    EmptyRc4Upgrade,
 }
+
+const RC4_FINGERPRINT: [u8; 32] = [
+    0xfa, 0xdb, 0x0d, 0x51, 0xf3, 0xdf, 0x9a, 0x33, 0xa4, 0x14, 0xda, 0xc2, 0xb8, 0xa8, 0x2f, 0x8c,
+    0x6f, 0x17, 0xb8, 0x4c, 0x8a, 0xb6, 0x65, 0xaa, 0xe9, 0xda, 0x07, 0xc4, 0x06, 0xd2, 0x15, 0xd4,
+];
 
 fn io_error(operation: &'static str, path: impl AsRef<Path>, source: io::Error) -> NodeError {
     NodeError::Io {
@@ -9110,6 +9135,7 @@ fn load_metadata(
     fingerprint: [u8; 32],
     block_log: &File,
     block_log_path: &Path,
+    allow_empty_rc4_upgrade: bool,
 ) -> Result<MetadataState, NodeError> {
     let path = data_dir.join(METADATA_FILE);
     match OpenOptions::new().read(true).open(&path) {
@@ -9138,6 +9164,19 @@ fn load_metadata(
                 return Err(NodeError::InvalidMetadata);
             }
             if bytes[8..40] != fingerprint {
+                if allow_empty_rc4_upgrade
+                    && bytes[8..40] == RC4_FINGERPRINT
+                    && flags == METADATA_WALLET_KEY_FLAG
+                    && block_log
+                        .metadata()
+                        .map_err(|source| {
+                            io_error("inspect retained block log", block_log_path, source)
+                        })?
+                        .len()
+                        == 0
+                {
+                    return Ok(MetadataState::EmptyRc4Upgrade);
+                }
                 return Err(NodeError::FingerprintMismatch);
             }
             if flags & METADATA_WALLET_KEY_FLAG == 0 {
@@ -9167,6 +9206,35 @@ fn write_metadata(
     metadata: MetadataState,
 ) -> Result<(), NodeError> {
     let path = data_dir.join(METADATA_FILE);
+    if metadata == MetadataState::EmptyRc4Upgrade {
+        let previous = fs::read(&path)
+            .map_err(|source| io_error("read RC4 metadata for upgrade", &path, source))?;
+        let backup = data_dir.join("network.meta.rc4");
+        let temporary = data_dir.join("network.meta.rc5.tmp");
+        let mut upgraded = previous.clone();
+        upgraded[8..40].copy_from_slice(&fingerprint);
+        for (target, contents) in [(&backup, &previous), (&temporary, &upgraded)] {
+            match OpenOptions::new().write(true).create_new(true).open(target) {
+                Ok(mut file) => {
+                    file.write_all(contents)
+                        .and_then(|()| file.sync_all())
+                        .map_err(|source| io_error("write RC4 metadata upgrade", target, source))?;
+                }
+                Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+                    if fs::read(target)
+                        .map_err(|source| io_error("read prior RC4 upgrade file", target, source))?
+                        != *contents
+                    {
+                        return Err(NodeError::FingerprintMismatch);
+                    }
+                }
+                Err(source) => return Err(io_error("create RC4 upgrade file", target, source)),
+            }
+        }
+        fs::rename(&temporary, &path)
+            .map_err(|source| io_error("publish RC4 metadata upgrade", &path, source))?;
+        return sync_parent_directory(&path);
+    }
     if metadata == MetadataState::Legacy {
         let mut file = OpenOptions::new()
             .read(true)
@@ -9247,7 +9315,10 @@ fn load_or_create_wallet_key(
             Ok((key, legacy))
         }
         Err(source) if source.kind() == io::ErrorKind::NotFound => {
-            if metadata == MetadataState::Current {
+            if matches!(
+                metadata,
+                MetadataState::Current | MetadataState::EmptyRc4Upgrade
+            ) {
                 return Err(NodeError::InvalidWalletKey);
             }
             let legacy = metadata == MetadataState::Legacy
@@ -14987,6 +15058,53 @@ mod tests {
             Node::open(&path),
             Err(NodeError::FingerprintMismatch)
         ));
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn empty_rc4_metadata_upgrade_preserves_keys_and_rejects_nonempty_logs() {
+        let path = test_dir("empty-rc4-upgrade");
+        clean_test_dir(&path);
+        let node = Node::open(&path).unwrap();
+        let fingerprint = node.fingerprint;
+        let destination = node.wallet_destination();
+        drop(node);
+        let key_before = fs::read(path.join(WALLET_KEY_FILE)).unwrap();
+        let metadata_path = path.join(METADATA_FILE);
+        let mut previous = fs::read(&metadata_path).unwrap();
+        previous[8..40].copy_from_slice(&RC4_FINGERPRINT);
+        fs::write(&metadata_path, &previous).unwrap();
+        let log_path = path.join(BLOCK_LOG_FILE);
+        let mut log = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&log_path)
+            .unwrap();
+        assert!(matches!(
+            load_metadata(&path, fingerprint, &log, &log_path, false),
+            Err(NodeError::FingerprintMismatch)
+        ));
+        log.write_all(&[1]).unwrap();
+        assert!(matches!(
+            load_metadata(&path, fingerprint, &log, &log_path, true),
+            Err(NodeError::FingerprintMismatch)
+        ));
+        log.set_len(0).unwrap();
+        assert_eq!(
+            load_metadata(&path, fingerprint, &log, &log_path, true).unwrap(),
+            MetadataState::EmptyRc4Upgrade
+        );
+        write_metadata(&path, fingerprint, MetadataState::EmptyRc4Upgrade).unwrap();
+        assert_eq!(fs::read(path.join("network.meta.rc4")).unwrap(), previous);
+        assert_eq!(fs::read(path.join(WALLET_KEY_FILE)).unwrap(), key_before);
+        assert_eq!(
+            load_metadata(&path, fingerprint, &log, &log_path, true).unwrap(),
+            MetadataState::Current
+        );
+        drop(log);
+        let reopened = Node::open(&path).unwrap();
+        assert_eq!(reopened.wallet_destination(), destination);
+        drop(reopened);
         clean_test_dir(&path);
     }
 

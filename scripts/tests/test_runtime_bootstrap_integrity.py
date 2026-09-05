@@ -16,21 +16,23 @@ class RuntimeBootstrapIntegrityTests(unittest.TestCase):
     def test_release_inventory_is_canonical_and_complete(self):
         repo = Path(__file__).resolve().parents[2]
         names, _ = integrity._inventory_names(
-            repo / "packaging/releases/v0.1.0-rc.4.inventory"
+            repo / "packaging/releases/v0.1.0-rc.5.inventory"
         )
-        self.assertEqual(len(names), 24)
+        self.assertEqual(len(names), 26)
         for platform, extension in (("linux-x86_64", ".tar.gz"), ("windows-x86_64", ".zip")):
-            self.assertIn(f"commonfoundry-rc-runtime-bootstrap-{platform}-v0.1.0-rc.4{extension}", names)
+            self.assertIn(f"commonfoundry-rc-runtime-bootstrap-{platform}-v0.1.0-rc.5{extension}", names)
             self.assertIn(f"RUNTIME-ATTESTATION-{platform.upper()}.json", names)
-        self.assertIn("commonfoundry-miner-v0.1.0-rc.4-linux-x86_64-gnu.tar.gz", names)
-        self.assertIn("commonfoundry-miner-v0.1.0-rc.4-windows-x86_64-wsl2.zip", names)
+        self.assertIn("commonfoundry-miner-v0.1.0-rc.5-linux-x86_64-gnu.tar.gz", names)
+        self.assertIn("commonfoundry-miner-v0.1.0-rc.5-windows-x86_64-wsl2.zip", names)
+        self.assertIn("cmfd-v4-replay", names)
+        self.assertIn("real_bank0_relations", names)
 
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.repo = Path(__file__).resolve().parents[2]
-        self.version = "0.1.0-rc.4"
+        self.version = "0.1.0-rc.5"
         self.commit = "1" * 40
         self.epoch = 1_700_000_000
         shared = "packaging/production-v4-pool/shared"
@@ -38,6 +40,8 @@ class RuntimeBootstrapIntegrityTests(unittest.TestCase):
         common = {
             "README.md": f"{runtime}/README.md", "LICENSE": "LICENSE",
             "THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md",
+            "MINING-WORKERS.json": f"{runtime}/MINING-WORKERS.json",
+            "production-v4-inputs.py": "scripts/production-v4-inputs.py",
             "V4-INPUT-CHUNKS.json": f"{shared}/V4-INPUT-CHUNKS.json",
             "production-v4-rcnet-1-inputs.json": f"{shared}/production-v4-rcnet-1-inputs.json",
             integrity.PRODUCTION_V4_PACKAGE_FIXED_RECORD: f"{shared}/{integrity.PRODUCTION_V4_PACKAGE_FIXED_RECORD}",
@@ -60,17 +64,30 @@ class RuntimeBootstrapIntegrityTests(unittest.TestCase):
         self.files = {}
         self.packages = {}
         self.sources = {}
+        workers = []
+        for name in ("cmfd-v4-replay", "real_bank0_relations"):
+            data = elf_x86_64_fixture(name.encode())
+            path = self.root / name
+            path.write_bytes(data)
+            self.files[name] = path
+            workers.append({"name": name, "bytes": len(data), "sha256": integrity._sha256_bytes(data)})
         for platform, suffix, extension, fixture, scripts in (
-            ("windows-x86_64", ".exe", ".zip", pe_x86_64_fixture, ("PREPARE-RCNET-RUNTIME.ps1", "START-WALLET.bat")),
-            ("linux-x86_64", "", ".tar.gz", elf_x86_64_fixture, ("prepare-rcnet-runtime.sh", "start-wallet.sh")),
+            ("windows-x86_64", ".exe", ".zip", pe_x86_64_fixture, ("PREPARE-RCNET-RUNTIME.ps1", "START-WALLET.bat", "PREPARE-MINING.bat", "PREPARE-MINING.ps1")),
+            ("linux-x86_64", "", ".tar.gz", elf_x86_64_fixture, ("prepare-rcnet-runtime.sh", "start-wallet.sh", "prepare-mining.sh")),
         ):
             name = f"commonfoundry-rc-runtime-bootstrap-{platform}-v{self.version}"
             package = self.root / name
             package.mkdir()
             paths = dict(common)
             paths.update({name: f"{runtime}/{'windows' if suffix else 'linux'}/{name}" for name in scripts})
+            if suffix:
+                paths["PREPARE-V4-INPUTS.ps1"] = "packaging/production-v4-testnet/windows/PREPARE-V4-INPUTS.ps1"
             for name, relative in paths.items():
                 data = (self.repo / relative).read_bytes().replace(b"\r\n", b"\n")
+                if name == "MINING-WORKERS.json":
+                    manifest = json.loads(data)
+                    manifest["workers"] = workers
+                    data = integrity._canonical_json(manifest)
                 self.sources[relative] = data
                 (package / name).write_bytes(data)
             binaries = {}
@@ -111,6 +128,19 @@ class RuntimeBootstrapIntegrityTests(unittest.TestCase):
         _, archive, _ = self.packages["linux-x86_64"]
         del self.files[archive.name]
         with self.assertRaisesRegex(integrity.IntegrityError, "incomplete"):
+            self.verify()
+
+    def test_missing_mining_worker_is_rejected(self):
+        del self.files["real_bank0_relations"]
+        with self.assertRaisesRegex(integrity.IntegrityError, "missing mining worker"):
+            self.verify()
+
+    def test_changed_mining_worker_is_rejected(self):
+        path = self.files["cmfd-v4-replay"]
+        data = bytearray(path.read_bytes())
+        data[-1] ^= 1
+        path.write_bytes(data)
+        with self.assertRaisesRegex(integrity.IntegrityError, "hash mismatch"):
             self.verify()
 
     def test_changed_bundled_downloader_is_rejected(self):

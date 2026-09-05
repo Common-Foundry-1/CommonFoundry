@@ -1,6 +1,6 @@
 [package]
 name = "common-foundry-wallet"
-version = "0.1.0-rc.4"
+version = "0.1.0-rc.5"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -43,6 +43,7 @@ serde.workspace = true
 serde_json.workspace = true
 tauri = { version = "=2.11.5", features = [] }
 tauri-plugin-single-instance = "=2.4.3"
+tauri-plugin-dialog = "=2.7.3"
 zeroize.workspace = true
 
 [dev-dependencies]

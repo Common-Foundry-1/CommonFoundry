@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -7,6 +7,7 @@ import { WalletSecurityDialog } from "./WalletSecurityDialog";
 
 const apiMocks = vi.hoisted(() => ({
   backupWallet: vi.fn(),
+  chooseWalletBackupPath: vi.fn(),
   lockWallet: vi.fn(),
   migrateWalletEncryption: vi.fn(),
   restoreWallet: vi.fn(),
@@ -55,10 +56,67 @@ describe("WalletSecurityDialog", () => {
 
   afterEach(cleanup);
 
+  it("backs up to the selected path without requiring typed paths", async () => {
+    const user = userEvent.setup();
+    const selected = "D:\\My Backups\\wallet.cmfd-backup";
+    apiMocks.chooseWalletBackupPath.mockResolvedValue(selected);
+    apiMocks.backupWallet.mockResolvedValue(locked);
+    renderDialog(unlocked);
+    expect(screen.getByLabelText("New backup file")).toHaveAttribute("readonly");
+    await user.click(screen.getByRole("button", { name: "Choose save location…" }));
+    expect(apiMocks.chooseWalletBackupPath).toHaveBeenCalledWith(false);
+    expect(screen.getByLabelText("New backup file")).toHaveValue(selected);
+    await user.type(screen.getByLabelText("Wallet passphrase"), "correct horse battery staple");
+    await user.click(screen.getByRole("button", { name: "Back up wallet" }));
+    expect(apiMocks.backupWallet).toHaveBeenCalledWith(selected, "correct horse battery staple");
+  });
+
+  it("cancelling the picker retains the prior selection and never creates a backup", async () => {
+    const user = userEvent.setup();
+    apiMocks.chooseWalletBackupPath.mockResolvedValueOnce("D:\\wallet.cmfd-backup").mockResolvedValueOnce(null);
+    renderDialog(unlocked);
+    await user.click(screen.getByRole("button", { name: "Choose save location…" }));
+    await user.click(screen.getByRole("button", { name: "Choose save location…" }));
+    expect(screen.getByLabelText("New backup file")).toHaveValue("D:\\wallet.cmfd-backup");
+    expect(apiMocks.backupWallet).not.toHaveBeenCalled();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("requires a selection if the first save dialog is cancelled", async () => {
+    const user = userEvent.setup();
+    apiMocks.chooseWalletBackupPath.mockResolvedValue(null);
+    renderDialog(unlocked);
+    await user.click(screen.getByRole("button", { name: "Choose save location…" }));
+    expect(screen.getByLabelText("New backup file")).toHaveValue("");
+    await user.type(screen.getByLabelText("Wallet passphrase"), "correct horse battery staple");
+    await user.click(screen.getByRole("button", { name: "Back up wallet" }));
+    expect(screen.getByRole("alert")).toHaveTextContent("Choose where to save your backup.");
+    expect(apiMocks.backupWallet).not.toHaveBeenCalled();
+  });
+
+  it("opens the restore picker and shows picker errors without using an invalid path", async () => {
+    const user = userEvent.setup();
+    renderDialog({ ...locked, storage: "missing", can_restore: true });
+    await user.click(screen.getByRole("button", { name: "Restore backup" }));
+    apiMocks.chooseWalletBackupPath.mockRejectedValueOnce(new Error("The file picker could not open."));
+    await user.click(screen.getByRole("button", { name: "Choose backup file…" }));
+    expect(apiMocks.chooseWalletBackupPath).toHaveBeenCalledWith(true);
+    expect(screen.getByRole("alert")).toHaveTextContent("The file picker could not open.");
+    expect(apiMocks.restoreWallet).not.toHaveBeenCalled();
+    apiMocks.chooseWalletBackupPath.mockResolvedValue("D:\\wallet.cmfd-backup");
+    apiMocks.restoreWallet.mockResolvedValue(locked);
+    await user.click(screen.getByRole("button", { name: "Choose backup file…" }));
+    expect(screen.getByLabelText("Backup file to restore")).toHaveValue("D:\\wallet.cmfd-backup");
+    await user.type(screen.getByLabelText("Wallet passphrase"), "correct horse battery staple");
+    await user.click(screen.getByRole("button", { name: "Restore wallet" }));
+    expect(apiMocks.restoreWallet).toHaveBeenCalledWith("D:\\wallet.cmfd-backup", "correct horse battery staple");
+  });
+
   it("unlocks an encrypted wallet without retaining the submitted passphrase", async () => {
     const user = userEvent.setup();
     apiMocks.unlockWallet.mockResolvedValue(unlocked);
     const { onStatusChange } = renderDialog(locked);
+    await waitFor(() => expect(screen.getByRole("dialog", { name: "Unlock wallet" })).toHaveFocus());
     const passphrase = screen.getByLabelText("Wallet passphrase");
 
     await user.type(passphrase, "correct horse battery staple");
@@ -119,9 +177,8 @@ describe("WalletSecurityDialog", () => {
     const { onStatusChange } = renderDialog(plaintext);
     await waitFor(() => expect(screen.getByRole("dialog", { name: "Encrypt existing wallet" })).toHaveFocus());
 
-    fireEvent.change(screen.getByLabelText("New backup file"), {
-      target: { value: "D:\\Offline\\wallet.cmfd-backup" },
-    });
+    apiMocks.chooseWalletBackupPath.mockResolvedValue("D:\\Offline\\wallet.cmfd-backup");
+    await user.click(screen.getByRole("button", { name: "Choose save location…" }));
     await user.type(screen.getByLabelText("New wallet passphrase"), "correct horse battery staple");
     await user.type(screen.getByLabelText("Confirm passphrase"), "correct horse battery staple");
     await user.click(screen.getByRole("button", { name: "Encrypt existing wallet" }));

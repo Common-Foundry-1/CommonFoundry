@@ -33,6 +33,10 @@ Copy-Item -LiteralPath $Wallet -Destination (Join-Path $stage 'common-foundry-wa
 Copy-Item -LiteralPath $Node -Destination (Join-Path $stage 'cmfd-node.exe')
 Copy-Item -LiteralPath (Join-Path $runtime 'windows\PREPARE-RCNET-RUNTIME.ps1') -Destination $stage
 Copy-Item -LiteralPath (Join-Path $runtime 'windows\START-WALLET.bat') -Destination $stage
+Copy-Item -LiteralPath (Join-Path $runtime 'windows\PREPARE-MINING.bat'), (Join-Path $runtime 'windows\PREPARE-MINING.ps1') -Destination $stage
+Copy-Item -LiteralPath (Join-Path $projectRoot 'packaging\production-v4-testnet\windows\PREPARE-V4-INPUTS.ps1') -Destination $stage
+Copy-Item -LiteralPath (Join-Path $runtime 'MINING-WORKERS.json') -Destination $stage
+Copy-Item -LiteralPath (Join-Path $projectRoot 'scripts\production-v4-inputs.py') -Destination $stage
 Copy-Item -LiteralPath (Join-Path $runtime 'README.md') -Destination $stage
 Copy-Item -LiteralPath (Join-Path $shared 'V4-INPUT-CHUNKS.json') -Destination $stage
 Copy-Item -LiteralPath (Join-Path $shared 'production-v4-rcnet-1-inputs.json') -Destination $stage

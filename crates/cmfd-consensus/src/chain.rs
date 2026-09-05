@@ -378,6 +378,8 @@ pub enum ChainError {
     InvalidSignature,
     #[error("transaction outputs exceed transaction inputs")]
     CreatesValue,
+    #[error("transaction fee is {actual} atoms; minimum is {required} atoms (0.1 CMFD on RCNet-1)")]
+    FeeTooLow { required: u64, actual: u64 },
     #[error("amount arithmetic overflow")]
     AmountOverflow,
     #[error("block height leaves no representable coinbase maturity or successor height")]
@@ -775,6 +777,7 @@ impl<'a> UtxoOverlay<'a> {
         if output_total > input_total {
             return Err(ChainError::CreatesValue);
         }
+        validate_transaction_fee(network_id, input_total - output_total)?;
 
         for input in &transaction.inputs {
             self.stage_output(input.previous, None);
@@ -879,6 +882,7 @@ impl<'a> UtxoOverlay<'a> {
             return Err(ChainError::ChannelCloseShape);
         }
 
+        validate_transaction_fee(network_id, fee)?;
         self.stage_output(input.previous, None);
         self.stage_active_channel(channel_id, false);
         self.stage_retired_channel(channel_id, true);
@@ -1404,6 +1408,14 @@ fn validate_transaction_resources(
     })
 }
 
+fn validate_transaction_fee(network_id: [u8; 32], actual: u64) -> Result<(), ChainError> {
+    let required = crate::economics::minimum_transaction_fee(network_id);
+    if actual < required {
+        return Err(ChainError::FeeTooLow { required, actual });
+    }
+    Ok(())
+}
+
 fn validate_coinbase(
     coinbase: &Coinbase,
     allocation: crate::Allocation,
@@ -1871,6 +1883,116 @@ mod tests {
             1_000
         );
         assert!(utxos.get(&previous).is_none());
+    }
+
+    #[test]
+    fn rcnet_minimum_fee_is_per_transaction_and_rejection_is_atomic() {
+        use crate::economics::MIN_TRANSACTION_FEE_ATOMS as FLOOR;
+        let mut params = network_params();
+        params.network_id = crate::PRODUCTION_V4_RCNET1_NETWORK_ID;
+        let key = signing_key(1);
+        // A second, generously paying transaction must never subsidize a low-fee one.
+        for fee in [0, 1_000, FLOOR - 1, FLOOR, FLOOR + 1] {
+            let mut utxos = UtxoSet::default();
+            let mut transactions = Vec::new();
+            for (index, burn) in [FLOOR * 2, fee].into_iter().enumerate() {
+                let previous = OutPoint {
+                    txid: [9 + index as u8; 32],
+                    index: 0,
+                };
+                utxos.insert_for_testing(
+                    previous,
+                    TxOutput {
+                        value: FLOOR * 4,
+                        lock: OutputLock::Key(owner(&key)),
+                        spendable_height: 0,
+                    },
+                );
+                let mut transaction =
+                    signed_key_spend(previous, &key, FLOOR * 4 - burn, owner(&signing_key(5)));
+                transaction.network_id = params.network_id;
+                transaction.sign_all(&[&key]).unwrap();
+                transactions.push(transaction);
+            }
+            let before = utxos.clone();
+            let total_fee = FLOOR * 2 + fee;
+            // Exercise the exact transaction-set validator used for mempool
+            // and candidate block construction, without generating a V4 proof.
+            let mut state = ChainState::new(params, legacy_verifier()).unwrap();
+            state.utxos = utxos;
+            let result = state
+                .validate_transactions_for_next_block(&transactions)
+                .map(|validation| validation.total_burned_fees);
+            if fee < FLOOR {
+                assert_eq!(
+                    result,
+                    Err(ChainError::FeeTooLow {
+                        required: FLOOR,
+                        actual: fee
+                    })
+                );
+                assert_eq!(state.utxos.outputs, before.outputs);
+            } else {
+                assert_eq!(result, Ok(total_fee));
+            }
+        }
+    }
+
+    #[test]
+    fn rcnet_channel_refund_also_enforces_the_minimum_burn() {
+        use crate::economics::MIN_TRANSACTION_FEE_ATOMS as FLOOR;
+        for fee in [FLOOR - 1, FLOOR] {
+            let mut terms = channel_terms(&signing_key(10), &signing_key(11));
+            terms.network_id = crate::PRODUCTION_V4_RCNET1_NETWORK_ID;
+            terms.deposit = FLOOR * 4;
+            terms.close_fee_burn = fee;
+            let previous = OutPoint {
+                txid: [13; 32],
+                index: 0,
+            };
+            let mut utxos = UtxoSet::default();
+            utxos.insert_for_testing(
+                previous,
+                TxOutput {
+                    value: terms.deposit,
+                    lock: OutputLock::InferenceChannel {
+                        channel_id: terms.channel_id().unwrap(),
+                    },
+                    spendable_height: 0,
+                },
+            );
+            let transaction = Transaction {
+                network_id: terms.network_id,
+                version: TRANSACTION_VERSION,
+                inputs: vec![TxInput {
+                    previous,
+                    witness: InputWitness::InferenceRefund {
+                        terms: terms.clone(),
+                    },
+                }],
+                outputs: channel_outputs(
+                    0,
+                    terms.provider_key,
+                    terms.deposit - fee,
+                    terms.customer_key,
+                    500,
+                ),
+            };
+            let result =
+                utxos.apply_transaction(&transaction, 500, terms.network_id, &mut HashSet::new());
+            if fee < FLOOR {
+                assert_eq!(
+                    result,
+                    Err(ChainError::FeeTooLow {
+                        required: FLOOR,
+                        actual: fee
+                    })
+                );
+                assert!(utxos.get(&previous).is_some());
+            } else {
+                assert_eq!(result, Ok(FLOOR));
+            }
+        }
     }
 
     #[test]

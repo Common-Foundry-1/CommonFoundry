@@ -36,7 +36,7 @@ const rateFormatter = new Intl.NumberFormat(undefined, {
 
 const lifecycleCopy: Record<MiningLifecycle, string> = {
   stopped: "Ready",
-  starting: "Starting reference miner",
+  starting: "Starting miner",
   running: "Mining solo",
   stopping: "Stopping miner",
   error: "Miner needs attention",
@@ -74,13 +74,14 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
   const networkName = nodeStatus?.network_short_name ?? "Network";
   const proofProfile = nodeStatus?.proof_profile ?? "Unknown proof profile";
   const productionV4PoolAvailable = proofProfile === "ProductionV4";
+  const productionSoloAvailable = productionV4PoolAvailable && mining.status?.production_solo_available === true;
   const canStartBase = !mining.loading
     && mining.status !== null
     && wallet !== null
     && nodeStatus !== null
     && !isActive
     && !isBusy;
-  const canStartSolo = mode === "solo" && canStartBase && referenceMiningAvailable;
+  const canStartSolo = mode === "solo" && canStartBase && (referenceMiningAvailable || productionSoloAvailable);
   const canStartPool = mode === "pool"
     && canStartBase
     && (referenceMiningAvailable || productionV4PoolAvailable)
@@ -132,7 +133,7 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
   };
 
   const buttonText = mining.action === "starting"
-    ? "Starting reference miner…"
+    ? "Starting miner…"
     : mining.action === "stopping" || lifecycle === "stopping"
       ? "Stopping miner…"
       : isActive
@@ -154,7 +155,7 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
         <section className="mining-status-card" aria-live="polite">
           <div className="section-heading mining-heading">
             <div>
-              <span>{cudaActive ? "CUDA engine" : "Reference engine"}</span>
+              <span>{cudaActive || productionV4PoolAvailable ? "CUDA engine" : "Reference engine"}</span>
               <h2>ForgeMatrix mining</h2>
             </div>
             <span className={`mining-state${statusClass}`}>
@@ -257,6 +258,7 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
               <div>
                 <strong>{productionV4PoolAvailable && poolSelected
                   ? "CUDA ProductionV4 pool search"
+                  : productionV4PoolAvailable ? "CUDA ProductionV4 solo miner"
                   : (cudaActive ? "CUDA INT8 matrix engine" : "CPU reference engine")}</strong>
                 <p>{productionV4PoolAvailable && poolSelected
                   ? "Searches server-issued jobs with persistent batched CUDA; the pool independently replays every submitted nonce before crediting it."
@@ -264,7 +266,9 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
                   ? (cudaActive
                     ? `Runs the ${nodeStatus?.proof_of_work ?? proofProfile} matrix stage on ${metricsStatus?.device ?? "the selected NVIDIA GPU"}; Rust recomputes every candidate before submission.`
                     : `Runs the ${nodeStatus?.proof_of_work ?? proofProfile} profile for ${networkName} testing.`)
-                  : `${proofProfile} solo mining requires the standalone production miner.`}</p>
+                  : productionV4PoolAvailable
+                    ? "Uses persistent batched GPU search, proves winning nonces, and submits CPU-verified blocks to the embedded node."
+                    : `${proofProfile} solo mining requires the standalone production miner.`}</p>
               </div>
             </div>
             <div>
@@ -293,10 +297,10 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
           ? `Submit ForgeMatrix shares to a pinned CMFD pool endpoint for ${networkName} session accounting.`
           : "Mine directly against the embedded node and send accepted block rewards to this wallet."}</p>
 
-        {!referenceMiningAvailable && !(poolSelected && productionV4PoolAvailable) ? (
+        {!referenceMiningAvailable && !productionSoloAvailable && !(poolSelected && productionV4PoolAvailable) ? (
           <div className="info-inline" role="status">
             <ShieldAlert aria-hidden="true" size={17} />
-            <span>{proofProfile} solo mining uses the standalone production miner. Select Pool to connect this wallet to the ProductionV4 test pool.</span>
+            <span>{mining.status?.production_solo_setup ?? `${proofProfile} solo mining runtime is not installed. Prepare the solo mining runtime, or select Pool.`}</span>
           </div>
         ) : null}
 
@@ -376,7 +380,7 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
               </span>
             </label>
             <div className="miner-destination pool-credit-destination">
-              <span>Demo credit destination</span>
+              <span>Pool payout destination</span>
               <code title={wallet?.destination}>{wallet
                 ? shortenHash(wallet.destination, 10, 10)
                 : "Waiting for wallet"}</code>
@@ -396,12 +400,14 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
                 <span>Engine</span>
                 <strong>{cudaActive
                   ? metricsStatus?.device ?? "CUDA accelerator"
-                  : "CPU reference evaluator"}</strong>
+                  : productionV4PoolAvailable ? "ProductionV4 CUDA (NVIDIA)" : "CPU reference evaluator"}</strong>
               </div>
             </div>
           </>
         )}
 
+        {mining.status?.stage ? <p role="status">{mining.status.stage}</p> : null}
+        {lifecycle === "stopping" ? <p role="status">Finishing the current GPU operation; no further work will be submitted.</p> : null}
         {mining.error ? (
           <div className="form-error mining-error" role="alert">
             <span>{mining.error}</span>
@@ -425,7 +431,7 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
         </button>
         <small>{poolSelected
           ? `${networkName} · pool session statistics · ${productionV4PoolAvailable ? "CUDA search + server-verified replay" : (cudaActive ? "CUDA matrix stage" : "CPU reference")}`
-          : `${networkName} · solo mining · ${cudaActive ? "CUDA matrix stage" : "CPU reference"}`}</small>
+          : `${networkName} · solo mining · ${productionV4PoolAvailable ? "CUDA search + CPU-verified proof" : cudaActive ? "CUDA matrix stage" : "CPU reference"}`}</small>
       </aside>
     </div>
   );

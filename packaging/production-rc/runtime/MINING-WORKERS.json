@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "release_base": "https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/download/v0.1.0-rc.5",
+  "workers": [
+    {"name": "cmfd-v4-replay", "bytes": 1352808, "sha256": "d963d838ec319d4471722335a2c2da17f9cee7a777ab4e9218d3c224f4bb7728"},
+    {"name": "real_bank0_relations", "bytes": 35707304, "sha256": "756888af48757cdafb81cf88bb62937e9dbfc32d01139b541646c40dedf64b13"}
+  ]
+}

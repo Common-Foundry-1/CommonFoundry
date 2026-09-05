@@ -170,7 +170,7 @@ describe("MiningView", () => {
     expect(workerInput).toBeDisabled();
   });
 
-  it("enables the server-verified ProductionV4 pool path while keeping solo disabled", async () => {
+  it("enables the server-verified ProductionV4 pool path while solo runtime is absent", async () => {
     const user = userEvent.setup();
     render(<MiningView wallet={wallet} nodeStatus={productionV4NodeStatus} />);
     await screen.findByRole("button", { name: "Start Solo Mining" });
@@ -183,6 +183,19 @@ describe("MiningView", () => {
     expect(screen.getByRole("button", { name: "Start Pool Mining" })).toBeEnabled();
     expect(screen.getByText("CUDA ProductionV4 pool search")).toBeInTheDocument();
     expect(screen.getByText(/persistent batched CUDA/)).toBeInTheDocument();
+  });
+
+  it("starts ProductionV4 solo only when the native runtime reports readiness", async () => {
+    const user = userEvent.setup();
+    apiMocks.getMiningStatus.mockResolvedValue({ ...stoppedStatus, production_solo_available: true });
+    apiMocks.startMining.mockResolvedValue({ ...runningStatus, stage: "Searching ProductionV4 nonces on GPU" });
+    render(<MiningView wallet={wallet} nodeStatus={productionV4NodeStatus} />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Start Solo Mining" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "Start Solo Mining" }));
+    expect(apiMocks.startMining).toHaveBeenCalledWith({ mode: "solo", payout });
+    expect(await screen.findByText("Searching ProductionV4 nonces on GPU")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Stop Mining" }));
+    expect(apiMocks.stopMining).toHaveBeenCalledTimes(1);
   });
 
   it("does not present a completed Pool session as Solo work", async () => {

@@ -66,7 +66,7 @@ pub const POOL_MAX_LEDGER_BLOCKS: usize = 65_536;
 pub const POOL_MAX_LEDGER_PAYOUT_TRANSACTIONS: usize = 65_536;
 pub const POOL_MAX_EARNING_EVENTS: usize = 65_536;
 pub const DEFAULT_POOL_MINIMUM_PAYOUT_ATOMS: u64 = 100;
-pub const DEFAULT_POOL_PAYOUT_FEE_ATOMS: u64 = 1;
+pub const DEFAULT_POOL_PAYOUT_FEE_ATOMS: u64 = cmfd_consensus::economics::MIN_TRANSACTION_FEE_ATOMS;
 pub const DEFAULT_POOL_OPERATOR_FEE_BPS: u16 = 300;
 pub const DEFAULT_PPLNS_WINDOW_SHARES: usize = 0;
 pub const POOL_MAX_PPLNS_WINDOW_SHARES: usize = 65_536;
@@ -2345,7 +2345,16 @@ pub fn spawn_pool_server(
         return Err(PoolError::InvalidShareVerificationQueueLimit);
     }
     if let Some(policy) = config.payout_policy {
-        if policy.minimum_payout_atoms == 0 || policy.fee_atoms == 0 {
+        if policy.minimum_payout_atoms == 0
+            || policy.fee_atoms == 0
+            || policy.fee_atoms
+                < cmfd_consensus::economics::minimum_transaction_fee(
+                    node.lock()
+                        .map_err(|_| PoolError::SharedStatePoisoned)?
+                        .params
+                        .network_id,
+                )
+        {
             return Err(PoolError::InvalidPayoutPolicy);
         }
         if config.block_destination != wallet_destination {

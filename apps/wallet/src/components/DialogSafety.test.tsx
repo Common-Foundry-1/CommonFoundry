@@ -82,6 +82,22 @@ function deferredResponse() {
 }
 
 describe("wallet dialog safety", () => {
+  it.each(["0", "0.00001000", "0.09999999"])("rejects a send fee below 0.1 CMFD: %s", async (fee) => {
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByText("125.00");
+    await user.click(screen.getAllByRole("button", { name: "Send" })[0]);
+    await waitFor(() => expect(screen.getByRole("dialog", { name: "Send CMFD" })).toHaveFocus());
+    const input = screen.getByRole("textbox", { name: "Fee to burn" });
+    expect(input).toHaveValue("0.10000000");
+    await user.type(screen.getByRole("textbox", { name: "Recipient" }), destination);
+    await user.type(screen.getByRole("textbox", { name: "Amount" }), "1");
+    await user.clear(input);
+    await user.type(input, fee);
+    await user.click(screen.getByRole("button", { name: "Review transaction" }));
+    expect(screen.getByText(/The minimum transaction fee is 0.1 CMFD/)).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "Review transaction" })).not.toBeInTheDocument();
+  });
   beforeEach(() => {
     vi.stubGlobal("fetch", vi.fn(defaultFetch));
   });

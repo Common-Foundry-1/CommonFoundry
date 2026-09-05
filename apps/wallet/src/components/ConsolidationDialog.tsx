@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 
 import { consolidateWallet } from "../api/nodeClient";
 import { formatAtoms, parseCmfd, shortenHash } from "../lib/amount";
+import { DEFAULT_TRANSACTION_FEE, MIN_TRANSACTION_FEE_ATOMS, MINIMUM_FEE_MESSAGE } from "../lib/fees";
 import type { ConsolidationResult, WalletSnapshot } from "../types";
 
 interface ConsolidationDialogProps {
@@ -20,7 +21,7 @@ interface ConsolidationErrors {
 
 type ConsolidationPhase = "edit" | "review" | "complete";
 
-const DEFAULT_FEE = "0.00001000";
+const DEFAULT_FEE = DEFAULT_TRANSACTION_FEE;
 
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "The consolidation could not be submitted.";
@@ -138,8 +139,8 @@ export function ConsolidationDialog({
     if (!maximumIsValid) {
       nextErrors.maxInputs = "Choose a whole number from 2 through 128.";
     }
-    if (parsedFee === null || parsedFee <= 0n) {
-      nextErrors.fee = "Enter a fee greater than zero with no more than 8 decimals.";
+    if (parsedFee === null || parsedFee < MIN_TRANSACTION_FEE_ATOMS) {
+      nextErrors.fee = MINIMUM_FEE_MESSAGE;
     } else if (availableAtoms !== null && parsedFee >= availableAtoms) {
       nextErrors.fee = "The burned fee must be smaller than the available input value.";
     }
@@ -292,7 +293,7 @@ export function ConsolidationDialog({
               {errors.fee ? (
                 <p className="form-error" id="consolidation-fee-error">{errors.fee}</p>
               ) : (
-                <p className="form-help" id="consolidation-fee-help">This fee is permanently burned.</p>
+                <p className="form-help" id="consolidation-fee-help">Minimum 0.1 CMFD. This fee is permanently burned.</p>
               )}
             </div>
 

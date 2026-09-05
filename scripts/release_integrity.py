@@ -1992,6 +1992,26 @@ def _validate_runtime_bootstrap_packages(
         PRODUCTION_V4_PACKAGE_FIXED_RECORD: f"{shared}/{PRODUCTION_V4_PACKAGE_FIXED_RECORD}",
     }
     sources = {name: _tracked_blob(repo, relative) for name, relative in source_paths.items()}
+    mining_bootstrap = _tracked_blob(repo, f"{runtime}/MINING-WORKERS.json")
+    sources["MINING-WORKERS.json"] = mining_bootstrap
+    sources["production-v4-inputs.py"] = _tracked_blob(repo, "scripts/production-v4-inputs.py")
+    worker_manifest = _json_object_bytes(mining_bootstrap, "mining worker manifest")
+    workers = worker_manifest.get("workers", [])
+    if (worker_manifest.get("schema_version") != 1
+        or worker_manifest.get("release_base") != f"https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/download/v{version}"
+        or not isinstance(workers, list) or len(workers) != 2
+        or {row.get("name") for row in workers} != {"cmfd-v4-replay", "real_bank0_relations"}):
+        raise IntegrityError("mining worker manifest does not match the release")
+    for worker in workers:
+        name = worker["name"]
+        if name not in stage_files:
+            raise IntegrityError(f"release is missing mining worker: {name}")
+        with _stable_regular_handle(stage_files[name], f"staged {name}") as (_, source, opened):
+            if opened.st_size != worker["bytes"] or opened.st_size > MAX_RUNTIME_BINARY_BYTES:
+                raise IntegrityError(f"mining worker size mismatch: {name}")
+            _validate_elf_x86_64(source.read(MAX_EXECUTABLE_HEADER_BYTES), opened.st_size, name)
+        if _sha256_file(stage_files[name]) != worker["sha256"]:
+            raise IntegrityError(f"mining worker hash mismatch: {name}")
     chunks = _json_object_bytes(sources["V4-INPUT-CHUNKS.json"], "runtime chunk manifest")
     inputs = _json_object_bytes(sources["production-v4-rcnet-1-inputs.json"], "runtime input manifest")
     bank_rows = [row for row in chunks.get("files", []) if row.get("name") == "MODEL-V2.bank"]
@@ -2011,10 +2031,14 @@ def _validate_runtime_bootstrap_packages(
         ("windows-x86_64", ".exe", ".zip", {
             "PREPARE-RCNET-RUNTIME.ps1": f"{runtime}/windows/PREPARE-RCNET-RUNTIME.ps1",
             "START-WALLET.bat": f"{runtime}/windows/START-WALLET.bat",
+            "PREPARE-MINING.bat": f"{runtime}/windows/PREPARE-MINING.bat",
+            "PREPARE-MINING.ps1": f"{runtime}/windows/PREPARE-MINING.ps1",
+            "PREPARE-V4-INPUTS.ps1": "packaging/production-v4-testnet/windows/PREPARE-V4-INPUTS.ps1",
         }),
         ("linux-x86_64", "", ".tar.gz", {
             "prepare-rcnet-runtime.sh": f"{runtime}/linux/prepare-rcnet-runtime.sh",
             "start-wallet.sh": f"{runtime}/linux/start-wallet.sh",
+            "prepare-mining.sh": f"{runtime}/linux/prepare-mining.sh",
         }),
     ):
         root_name = f"commonfoundry-rc-runtime-bootstrap-{platform}-v{version}"

@@ -3,6 +3,16 @@ import type { NativeInvoke } from "./nodeClient";
 import { NodeApiError, createTauriNodeTransport } from "./nodeClient";
 
 describe("Tauri node transport", () => {
+  it("uses the native save/open picker and preserves cancellation", async () => {
+    const invokeMock = vi.fn().mockResolvedValueOnce("D:\\My Backups\\wallet.cmfd-backup").mockResolvedValueOnce(null);
+    const transport = createTauriNodeTransport(invokeMock);
+    await expect(transport.chooseWalletBackupPath(false)).resolves.toBe("D:\\My Backups\\wallet.cmfd-backup");
+    await expect(transport.chooseWalletBackupPath(true)).resolves.toBeNull();
+    expect(invokeMock.mock.calls).toEqual([
+      ["choose_wallet_backup_path", { restore: false }],
+      ["choose_wallet_backup_path", { restore: true }],
+    ]);
+  });
   it("maps all native commands without retrying mutations", async () => {
     const invokeMock = vi.fn().mockResolvedValue({ ok: true });
     const invoke: NativeInvoke = (command, args) => invokeMock(command, args);

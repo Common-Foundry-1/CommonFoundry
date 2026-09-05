@@ -13,7 +13,7 @@ param(
     [string]$DashboardBind = '127.0.0.1:19446',
     [uint16]$ShareLeadingZeroBits = 7,
     [uint64]$MinimumPayoutAtoms = 100,
-    [uint64]$PayoutFeeAtoms = 1,
+    [uint64]$PayoutFeeAtoms = 10000000,
     [ValidateRange(0, 10000)][uint16]$OperatorFeeBps = 300,
     [ValidateRange(0, 65536)][uint32]$PplnsWindowShares = 0,
     [switch]$IgnoreSavedSettings

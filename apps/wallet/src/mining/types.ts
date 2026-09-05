@@ -38,4 +38,7 @@ export interface MiningStatus {
   current_height: number;
   last_block: MinedBlockSummary | null;
   last_error: string | null;
+  production_solo_available?: boolean;
+  production_solo_setup?: string | null;
+  stage?: string | null;
 }

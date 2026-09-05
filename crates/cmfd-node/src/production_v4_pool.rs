@@ -150,11 +150,79 @@ pub fn production_v4_pool_searcher_config(
 
 #[derive(Debug)]
 pub struct ProductionV4PersistentPoolVerifier {
+    searcher: ProductionV4PersistentPoolSearcher,
     expected_network_id: [u8; 32],
     scratch_directory: PathBuf,
     worker_scratch_directory: String,
     startup_id: [u8; 8],
     state: Mutex<WorkerState>,
+}
+
+/// Reuse the authenticated production worker protocol for embedded solo mining.
+/// No worker is spawned by this path-resolution step.
+pub fn production_v4_solo_config(
+    replay_worker: &Path,
+    proof_worker: &Path,
+    model_bank: &Path,
+    fixed_directory: &Path,
+    scratch_directory: &Path,
+    wsl_distribution: Option<&str>,
+) -> Result<ProductionV4PoolVerifierConfig, PoolError> {
+    let proof_worker = canonical_worker_file(proof_worker, "ProductionV4 solo proof worker")?;
+    let fixed_directory =
+        crate::plain_package_path(fs::canonicalize(fixed_directory).map_err(replay_error)?);
+    let search = production_v4_pool_searcher_config(
+        replay_worker,
+        model_bank,
+        scratch_directory,
+        32,
+        wsl_distribution,
+    )?;
+    let bank = canonical_worker_file(model_bank, "ProductionV4 model bank")?;
+    let proof = match wsl_distribution {
+        None => ProductionV4PoolWorkerCommand {
+            program: proof_worker,
+            arguments: vec![
+                "--server".into(),
+                hex::encode(COMPILED_NETWORK_PROFILE.network_id).into(),
+                bank.into_os_string(),
+                fixed_directory.into_os_string(),
+            ],
+        },
+        Some(distribution) => {
+            #[cfg(not(windows))]
+            {
+                let _ = distribution;
+                return Err(pool_replay_failure("WSL solo mining requires Windows"));
+            }
+            #[cfg(windows)]
+            {
+                let wsl = &search.replay.program;
+                ProductionV4PoolWorkerCommand {
+                    program: wsl.clone(),
+                    arguments: vec![
+                        "-d".into(),
+                        distribution.into(),
+                        "--exec".into(),
+                        "env".into(),
+                        "CUDA_VISIBLE_DEVICES=0".into(),
+                        "LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64".into(),
+                        wsl_path(wsl, distribution, &proof_worker)?.into(),
+                        "--server".into(),
+                        hex::encode(COMPILED_NETWORK_PROFILE.network_id).into(),
+                        wsl_path(wsl, distribution, &bank)?.into(),
+                        wsl_path(wsl, distribution, &fixed_directory)?.into(),
+                    ],
+                }
+            }
+        }
+    };
+    Ok(ProductionV4PoolVerifierConfig {
+        replay: search.replay,
+        proof,
+        scratch_directory: search.scratch_directory,
+        worker_scratch_directory: search.worker_scratch_directory,
+    })
 }
 
 #[derive(Debug)]
@@ -169,7 +237,6 @@ pub struct ProductionV4PersistentPoolSearcher {
 
 #[derive(Debug)]
 struct WorkerState {
-    replay: PersistentWorker,
     proof: PersistentWorker,
     next_attempt: u64,
 }
@@ -214,10 +281,14 @@ impl ProductionV4PersistentPoolVerifier {
         validate_expected_network_id(expected_network_id)?;
         validate_scratch_paths(&config.scratch_directory, &config.worker_scratch_directory)?;
         fs::create_dir_all(&config.scratch_directory).map_err(replay_error)?;
-        let replay = PersistentWorker::start(
-            &config.replay,
-            "CMFD_V4_REPLAY_READY",
-            "ProductionV4 replay worker",
+        let searcher = ProductionV4PersistentPoolSearcher::start_for_network(
+            expected_network_id,
+            ProductionV4PoolSearcherConfig {
+                replay: config.replay,
+                scratch_directory: config.scratch_directory.clone(),
+                worker_scratch_directory: config.worker_scratch_directory.clone(),
+                batch_size: 32,
+            },
         )?;
         let proof = PersistentWorker::start(
             &config.proof,
@@ -227,12 +298,12 @@ impl ProductionV4PersistentPoolVerifier {
         let mut startup_id = [0_u8; 8];
         getrandom::fill(&mut startup_id).map_err(replay_error)?;
         Ok(Self {
+            searcher,
             expected_network_id,
             scratch_directory: config.scratch_directory,
             worker_scratch_directory: config.worker_scratch_directory,
             startup_id,
             state: Mutex::new(WorkerState {
-                replay,
                 proof,
                 next_attempt: 0,
             }),
@@ -246,6 +317,11 @@ impl ProductionV4PersistentPoolVerifier {
         nonce: u64,
         share_target: [u8; 32],
     ) -> Result<ProductionV4PoolShareEvaluation, PoolError> {
+        let mut search_state = self
+            .searcher
+            .state
+            .lock()
+            .map_err(|_| pool_replay_failure("persistent search worker lock is poisoned"))?;
         if template.challenge.network_id != self.expected_network_id {
             return Err(pool_replay_failure(
                 "pool replay received a template for another network",
@@ -293,7 +369,7 @@ impl ProductionV4PersistentPoolVerifier {
             &serde_json::to_vec(&frozen).map_err(replay_error)?,
         )?;
 
-        state.replay.invoke(
+        search_state.replay.invoke(
             &[
                 "RUN".to_owned(),
                 "search".to_owned(),
@@ -323,7 +399,7 @@ impl ProductionV4PersistentPoolVerifier {
         let full_prefix = files.path("full");
         let full_final_path = files.path("full-final-activation.bin");
         let proof_path = files.path("transparent-proof.bin");
-        state.replay.invoke(
+        search_state.replay.invoke(
             &[
                 "RUN".to_owned(),
                 "full".to_owned(),
@@ -376,6 +452,17 @@ impl ProductionV4PersistentPoolVerifier {
             work_digest,
             chain_proof: Some(proof),
         })
+    }
+
+    /// Solo mining uses the same persistent replay worker and CPU-checked
+    /// batched search as pool mining, then proves only a chain-winning nonce.
+    pub fn search(
+        &self,
+        job: &PoolJob,
+        start_nonce: u64,
+        stop: &std::sync::atomic::AtomicBool,
+    ) -> Result<PoolWorkSearchResult, PoolError> {
+        self.searcher.search(job, start_nonce, stop)
     }
 
     fn worker_path(&self, local_path: &Path) -> Result<String, PoolError> {

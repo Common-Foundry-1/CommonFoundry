@@ -19,6 +19,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::cuda::CudaMiner;
 
+#[cfg(feature = "production-v4")]
+mod production_solo;
+
 const SEARCH_BATCH_ATTEMPTS: u64 = 4_096;
 const POOL_RECONNECT_INITIAL: Duration = Duration::from_millis(250);
 const POOL_RECONNECT_MAX: Duration = Duration::from_secs(4);
@@ -83,6 +86,9 @@ pub struct MiningStatus {
     pub current_height: u64,
     pub last_block: Option<MinedBlockSummary>,
     pub last_error: Option<String>,
+    pub production_solo_available: bool,
+    pub production_solo_setup: Option<String>,
+    pub stage: Option<String>,
 }
 
 struct ActiveMiner {
@@ -153,6 +159,9 @@ impl MiningManager {
                 current_height,
                 last_block: None,
                 last_error: None,
+                production_solo_available: false,
+                production_solo_setup: None,
+                stage: None,
             })),
             control: Mutex::new(MinerControl {
                 worker: None,
@@ -176,7 +185,22 @@ impl MiningManager {
     pub fn status(&self) -> Result<MiningStatus, NodeClientError> {
         self.status
             .lock()
-            .map(|status| status.clone())
+            .map(|status| {
+                let snapshot = status.clone();
+                #[cfg(feature = "production-v4")]
+                if COMPILED_NETWORK_PROFILE.proof == ProofProfile::ProductionV4 {
+                    let setup = self.production_v4_pool_search.as_ref().map_or_else(
+                        || Some("ProductionV4 mining runtime is missing.".to_owned()),
+                        |assets| production_solo::check_assets(assets).err(),
+                    );
+                    return MiningStatus {
+                        production_solo_available: setup.is_none(),
+                        production_solo_setup: setup,
+                        ..snapshot
+                    };
+                }
+                snapshot
+            })
             .map_err(|_| {
                 manager_error(
                     "mining_state_unavailable",
@@ -201,7 +225,21 @@ impl MiningManager {
             .map_err(|error| error.client_error())?;
         let production_v4_pool = request.mode == MiningMode::Pool
             && COMPILED_NETWORK_PROFILE.proof == ProofProfile::ProductionV4;
-        if !node_status.bounded_reference_mining && !production_v4_pool {
+        let production_v4_solo = request.mode == MiningMode::Solo
+            && COMPILED_NETWORK_PROFILE.proof == ProofProfile::ProductionV4;
+        #[cfg(feature = "production-v4")]
+        if production_v4_solo {
+            let assets = self.production_v4_pool_search.as_ref().ok_or_else(|| {
+                manager_error(
+                    "mining_runtime_missing",
+                    "ProductionV4 mining runtime is missing.",
+                    false,
+                )
+            })?;
+            production_solo::check_assets(assets)
+                .map_err(|message| manager_error("mining_runtime_missing", message, false))?;
+        }
+        if !node_status.bounded_reference_mining && !production_v4_pool && !production_v4_solo {
             return Err(manager_error(
                 "production_mining_unavailable",
                 format!(
@@ -329,6 +367,9 @@ impl MiningManager {
                 current_height,
                 last_block: None,
                 last_error: None,
+                production_solo_available: production_v4_solo,
+                production_solo_setup: None,
+                stage: None,
             };
             status.clone()
         };
@@ -353,7 +394,16 @@ impl MiningManager {
                     #[cfg(feature = "production-v4")]
                     production_v4_pool_search,
                 ),
-                None => mining_loop(node, status, thread_stop, payout),
+                None => {
+                    #[cfg(feature = "production-v4")]
+                    if production_v4_solo {
+                        if let Some(assets) = production_v4_pool_search {
+                            production_solo::run(node, status, thread_stop, payout, assets);
+                        }
+                        return;
+                    }
+                    mining_loop(node, status, thread_stop, payout);
+                }
             })
             .map_err(|_| {
                 if let Ok(mut status) = self.status.lock() {

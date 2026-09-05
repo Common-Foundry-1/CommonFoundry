@@ -3,6 +3,7 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 
 import {
   backupWallet,
+  chooseWalletBackupPath,
   lockWallet,
   migrateWalletEncryption,
   restoreWallet,
@@ -100,6 +101,7 @@ export function WalletSecurityDialog({
 
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    if (busy) return;
     setError(null);
     if (passphraseCharacters(passphrase) < 12) {
       setError("Use a passphrase containing at least 12 characters.");
@@ -114,7 +116,7 @@ export function WalletSecurityDialog({
       return;
     }
     if (needsPath && !path.trim()) {
-      setError("Enter an absolute backup path.");
+      setError(action === "restore" ? "Choose the backup file to restore." : "Choose where to save your backup.");
       return;
     }
 
@@ -126,10 +128,10 @@ export function WalletSecurityDialog({
       const next = action === "unlock" || action === "create"
         ? await unlockWallet(submittedPassphrase)
         : action === "backup"
-          ? await backupWallet(path.trim(), submittedPassphrase)
+          ? await backupWallet(path, submittedPassphrase)
           : action === "migrate"
-            ? await migrateWalletEncryption(path.trim(), submittedPassphrase)
-            : await restoreWallet(path.trim(), submittedPassphrase);
+            ? await migrateWalletEncryption(path, submittedPassphrase)
+            : await restoreWallet(path, submittedPassphrase);
       onStatusChange(next);
       onCompleted(action === "backup"
         ? "Encrypted wallet backup created. The wallet is locked."
@@ -142,6 +144,20 @@ export function WalletSecurityDialog({
       setPath("");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "The wallet security operation failed.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const choosePath = async () => {
+    if (busy) return;
+    setError(null);
+    setBusy(true);
+    try {
+      const selected = await chooseWalletBackupPath(action === "restore");
+      if (selected !== null) setPath(selected);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "The file picker could not open.");
     } finally {
       setBusy(false);
     }
@@ -247,13 +263,16 @@ export function WalletSecurityDialog({
                 id="custody-path"
                 className="form-input form-input-mono"
                 value={path}
-                onChange={(event) => setPath(event.target.value)}
-                placeholder={action === "restore" ? "C:\\Backups\\wallet.cmfd-backup" : "D:\\Offline\\wallet.cmfd-backup"}
+                readOnly
+                placeholder="No file selected"
                 autoComplete="off"
                 spellCheck={false}
                 disabled={busy}
               />
-              <small>Use an absolute path. Existing files are never overwritten.</small>
+              <button className="button-secondary" type="button" onClick={() => void choosePath()} disabled={busy}>
+                {action === "restore" ? "Choose backup file…" : "Choose save location…"}
+              </button>
+              <small>{action === "restore" ? "Choose your encrypted Common Foundry backup." : "Select a folder and filename. Existing files are never overwritten."}</small>
             </div>
           ) : null}
 

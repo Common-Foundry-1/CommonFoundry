@@ -211,6 +211,38 @@ pub async fn lock_wallet(
 }
 
 #[tauri::command]
+pub async fn choose_wallet_backup_path(
+    window: tauri::WebviewWindow,
+    restore: bool,
+) -> Result<Option<String>, NodeClientError> {
+    use tauri_plugin_dialog::DialogExt;
+    let dialog = window
+        .dialog()
+        .file()
+        .set_parent(&window)
+        .add_filter("Common Foundry encrypted backup", &["cmfd-backup"]);
+    tauri::async_runtime::spawn_blocking(move || {
+        let selected = if restore {
+            dialog.set_title("Open encrypted wallet backup").blocking_pick_file()
+        } else {
+            dialog.set_title("Save encrypted wallet backup")
+                .set_file_name("wallet.cmfd-backup").blocking_save_file()
+        };
+        selected.map(|file| {
+            let path = file.into_path().map_err(|_| startup_error(
+                "backup_path_invalid", "Choose a file on a local or mounted drive.", false))?;
+            if !restore && path.exists() {
+                return Err(startup_error("backup_exists",
+                    "That file already exists. Choose a new filename; existing backups are never overwritten.", false));
+            }
+            path.to_str().map(str::to_owned).ok_or_else(|| startup_error(
+                "backup_path_invalid", "Choose a filename that can be displayed as Unicode.", false))
+        }).transpose()
+    }).await.map_err(|_| startup_error(
+        "backup_picker_failed", "The file picker could not open. Please try again.", true))?
+}
+
+#[tauri::command]
 pub async fn backup_wallet(
     state: State<'_, RuntimeState>,
     request: WalletFileRequest,

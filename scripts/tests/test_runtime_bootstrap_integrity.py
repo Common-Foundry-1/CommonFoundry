@@ -13,6 +13,18 @@ from test_release_integrity import pe_x86_64_fixture, elf_x86_64_fixture
 
 
 class RuntimeBootstrapIntegrityTests(unittest.TestCase):
+    def test_release_inventory_is_canonical_and_complete(self):
+        repo = Path(__file__).resolve().parents[2]
+        names, _ = integrity._inventory_names(
+            repo / "packaging/releases/v0.1.0-rc.4.inventory"
+        )
+        self.assertEqual(len(names), 24)
+        for platform, extension in (("linux-x86_64", ".tar.gz"), ("windows-x86_64", ".zip")):
+            self.assertIn(f"commonfoundry-rc-runtime-bootstrap-{platform}-v0.1.0-rc.4{extension}", names)
+            self.assertIn(f"RUNTIME-ATTESTATION-{platform.upper()}.json", names)
+        self.assertIn("commonfoundry-miner-v0.1.0-rc.4-linux-x86_64-gnu.tar.gz", names)
+        self.assertIn("commonfoundry-miner-v0.1.0-rc.4-windows-x86_64-wsl2.zip", names)
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

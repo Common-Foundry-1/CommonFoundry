@@ -13056,6 +13056,13 @@ mod tests {
                 .unwrap();
         assert_eq!(params.network_id, RCNET1_PROFILE.network_id);
         assert_eq!(params.pow, PowParameters::V4Candidate(parameters));
+        let fingerprint = hex::encode(params.fingerprint().unwrap());
+        assert_ne!(fingerprint, hex::encode(RC4_FINGERPRINT));
+        assert!(
+            include_str!("../../../scripts/release_integrity.py")
+                .contains(&format!("\"{fingerprint}\"")),
+            "Release verification must pin the RC5 consensus fingerprint: {fingerprint}"
+        );
 
         assert!(matches!(
             network_params_from_pow(

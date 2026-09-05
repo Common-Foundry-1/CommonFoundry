@@ -45,6 +45,7 @@ jobs:
       - run: cargo test --locked -p cmfd-consensus --lib --features forgematrix-v4-verifier forgematrix_v4_
       - run: cargo test --locked -p cmfd-node --lib
       - run: cargo test --locked -p cmfd-node --lib --features production-v4 production_v4_
+      - run: cargo test --locked -p cmfd-node --lib --features production-v4 rcnet_v4_
       - run: cargo test --locked -p common-foundry-wallet --lib
       - run: cargo clippy --locked -p common-foundry-wallet --all-targets --features production-rc -- -D warnings
 

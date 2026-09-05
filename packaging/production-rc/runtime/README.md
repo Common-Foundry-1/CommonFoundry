@@ -19,7 +19,8 @@ Extract the archive, make the launcher executable if needed, and run
 `./start-wallet.sh`. `curl` and Python 3 are required for the authenticated
 download.
 
-Keep at least 8 GB free in the extraction directory. Do not edit or replace the
+Keep at least 16 GB free during preparation; downloaded chunks and the assembled
+bank temporarily coexist. Do not edit or replace the
 manifest, fixed record, or downloaded bank: the wallet and node reject files
 that do not match the compiled RCNet-1 identities.
 

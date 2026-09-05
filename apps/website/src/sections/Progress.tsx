@@ -3,7 +3,8 @@ import { ArrowIcon, ProgressGlyph } from "../components/Icons";
 import {
   implementedItems,
   nextItems,
-  WHITEPAPER_URL,
+  RELEASE_URL,
+  RELEASE_VERSION,
   type ProgressItem,
 } from "../content";
 
@@ -38,16 +39,17 @@ export function Progress() {
     <section id="progress" className="progress section-shell" aria-labelledby="progress-heading">
       <div className="section-heading progress__heading">
         <div>
-          <h2 id="progress-heading">ProductionV4 is live and testable today.</h2>
+          <h2 id="progress-heading">From proof design to a release you can run.</h2>
           <p>
-            The full-shape proof, network admission, consumer-GPU path, and
-            cross-platform tester packages are working now.
+            RC5 brings the node, encrypted wallet and GPU mining path together.
+            Native backup dialogs and authenticated runtime setup turn the
+            cryptographic foundation into a more usable RCNet experience.
           </p>
         </div>
         <p className="release-line">
-          <strong>Current testnet release</strong>
+          <strong>Current release candidate</strong>
           <span>·</span>
-          <code>v0.1.0-devnet.16</code>
+          <code>{RELEASE_VERSION}</code>
         </p>
       </div>
 
@@ -60,7 +62,7 @@ export function Progress() {
         } as CSSProperties}
       >
         <div className="progress__group progress__group--implemented">
-          <h3>Achieved in ProductionV4</h3>
+          <h3>Built and shipped</h3>
           <ProgressList items={implementedItems} tone="implemented" />
         </div>
 
@@ -90,9 +92,9 @@ export function Progress() {
       </div>
 
       <div className="progress__close">
-        <p>Measured proof. Working testnet.</p>
-        <a href={WHITEPAPER_URL} target="_blank" rel="noopener noreferrer">
-          <span>Read the white paper</span>
+        <p>Complete runtime packages. Clear setup instructions.</p>
+        <a href={RELEASE_URL} target="_blank" rel="noopener noreferrer">
+          <span>Release notes and setup</span>
           <ArrowIcon />
         </a>
       </div>

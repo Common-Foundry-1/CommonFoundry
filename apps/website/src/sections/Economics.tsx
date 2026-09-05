@@ -33,10 +33,12 @@ export function Economics() {
   return (
     <section id="economics" className="economics section-shell" aria-labelledby="economics-heading">
       <div className="section-heading">
-        <h2 id="economics-heading">Transparent economics, disclosed from block one.</h2>
+        <h2 id="economics-heading">A long-term monetary thesis. Explicit rules.</h2>
         <p>
-          A five-year linear bootstrap funds miners and continued development,
-          followed by a permanent miner-only tail.
+          Declining issuance reduces new supply over the bootstrap. Burned fees
+          remove coins from circulation. A permanent miner-only tail supports
+          the security budget. These are the foundations of our store-of-value
+          thesis; lasting value depends on adoption and execution.
         </p>
       </div>
 
@@ -138,9 +140,10 @@ export function Economics() {
         </div>
 
         <aside className="economics__disclosures" aria-label="Economic disclosures">
-          <p><FlameIcon /><span>All transaction and channel-close fees are burned.</span></p>
+          <p><FlameIcon /><span>100% of transaction and channel-close fees are burned. RC5 enforces a 0.1 CMFD minimum.</span></p>
           <p><ShieldIcon /><span>The 25% stewardship and 5% community allocations end with the bootstrap; the permanent 5 CMFD tail goes only to miners.</span></p>
           <p className="economics__plain"><span>No premine. No token sale. All usage fees burned.</span></p>
+          <p className="economics__plain"><span>The tail is perpetual, not a hard supply cap. Net supply depends on issuance and actual fee burning.</span></p>
           <a href={EMISSION_URL} target="_blank" rel="noopener noreferrer">
             <span>Inspect the emission rules</span>
             <ArrowIcon />

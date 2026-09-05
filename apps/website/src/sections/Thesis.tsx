@@ -11,10 +11,12 @@ export function Thesis() {
     <section id="thesis" className="thesis section-shell" aria-labelledby="thesis-heading">
       <div className="section-heading section-heading--split">
         <div>
-          <h2 id="thesis-heading">One hardware base. Two economic roles.</h2>
+          <h2 id="thesis-heading">The case for Common Foundry.</h2>
           <p>
-            Common Foundry separates consensus work from customer inference so
-            each can do one job well.
+            A distinctive proof system. Monetary rules you can inspect. A
+            community built around consumer GPUs. The long-term thesis combines
+            verifiable network security with an open-compute ecosystem, starting
+            with a working release candidate.
           </p>
         </div>
       </div>
@@ -34,8 +36,9 @@ export function Thesis() {
           <span className="thesis-path__copy">
             <strong>Secure the ledger</strong>
             <span>
-              ForgeMatrix uses deterministic, matrix-heavy work to order blocks
-              and secure UTXO settlement.
+              ForgeMatrix proves a 384-layer matrix computation. Its transparent
+              BaseFold-based proof needs no trusted setup; nodes verify the
+              committed work independently instead of trusting the miner.
             </span>
           </span>
         </button>
@@ -63,17 +66,18 @@ export function Thesis() {
             {[0, 1, 2, 3].map((item) => <i key={item} />)}
           </span>
           <span className="thesis-path__copy">
-            <strong>Serve inference</strong>
+            <strong>Build toward open inference</strong>
             <span>
-              GPU providers can separately accept customer jobs and settle
-              progressive payments through prepaid channels.
+              The next economic layer is customer-paid GPU inference with
+              prepaid settlement channels. This is a separate development path,
+              not a claim that mining already serves customer AI jobs.
             </span>
           </span>
         </button>
       </div>
 
       <div className="thesis__close">
-        <p>Consensus stays deterministic. Inference stays market-driven.</p>
+        <p>One hardware base. Distinct roles for consensus and customer compute.</p>
         <a href="#technology">
           <span>Explore the architecture</span>
           <ArrowIcon />

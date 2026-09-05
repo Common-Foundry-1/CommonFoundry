@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { DISCORD_URL, navItems, type SectionId } from "../content";
+import { RELEASE_URL, navItems, type SectionId } from "../content";
 import { ArrowIcon, CloseIcon, MenuIcon } from "./Icons";
 
 function useActiveSection() {
@@ -93,11 +93,11 @@ export function Header() {
 
       <a
         className="header-cta"
-        href={DISCORD_URL}
+        href={RELEASE_URL}
         target="_blank"
         rel="noopener noreferrer"
       >
-        <span>Join the Devnet</span>
+        <span>Get RC5</span>
         <ArrowIcon />
       </a>
 
@@ -130,12 +130,12 @@ export function Header() {
         </nav>
         <a
           className="mobile-menu__cta"
-          href={DISCORD_URL}
+          href={RELEASE_URL}
           target="_blank"
           rel="noopener noreferrer"
           onClick={closeMenu}
         >
-          <span>Join the Devnet</span>
+          <span>Get RC5</span>
           <ArrowIcon />
         </a>
       </div>

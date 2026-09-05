@@ -1,6 +1,8 @@
 export const DISCORD_URL = "https://discord.gg/XGuutqWMWP";
 export const GITHUB_URL = "https://github.com/Common-Foundry-1";
 export const X_URL = "https://x.com/CommonFoundry1";
+export const RELEASE_VERSION = "v0.1.0-rc.5";
+export const RELEASE_URL = `https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/tag/${RELEASE_VERSION}`;
 export const WHITEPAPER_URL = "/docs/Common-Foundry-Technical-Whitepaper-v0.2.pdf";
 export const SECURITY_URL = "/docs/SECURITY.md";
 export const EMISSION_URL = "/docs/emission.md";
@@ -39,11 +41,11 @@ export interface ProgressItem {
 }
 
 export const implementedItems: readonly ProgressItem[] = [
-  { label: "Full 384-layer ForgeMatrix profile", icon: "ledger" },
-  { label: "Transparent ProductionV4 proof", icon: "network" },
-  { label: "6.093-second RTX 5090 online proof", icon: "wallet" },
-  { label: "Verified RTX 5070 Ti 16 GB path", icon: "burn" },
-  { label: "Windows and Linux tester packages", icon: "channel" },
+  { label: "384-layer proof with CPU verification", icon: "ledger" },
+  { label: "RTX 5090 and 5070 Ti 16 GB proof paths", icon: "network" },
+  { label: "Wallet-integrated GPU solo mining", icon: "wallet" },
+  { label: "Native encrypted backup and restore", icon: "lock" },
+  { label: "Signed release manifests and runtime setup", icon: "channel" },
 ];
 
 export const nextItems: readonly ProgressItem[] = [
@@ -51,7 +53,7 @@ export const nextItems: readonly ProgressItem[] = [
   { label: "Broader GPU and driver qualification", icon: "lock" },
   { label: "Expanded public testnet participation", icon: "lock" },
   { label: "Independent implementations and review", icon: "lock" },
-  { label: "Wallet, pool, and distribution polish", icon: "lock" },
+  { label: "Mainnet readiness and operator adoption", icon: "lock" },
 ];
 
 export interface RoadmapGate {
@@ -71,9 +73,9 @@ export const roadmapGates: readonly RoadmapGate[] = [
   },
   {
     number: "02",
-    title: "Consumer-GPU testnet packages",
+    title: "RC5 wallet and mining release",
     detail:
-      "Windows and Linux node, wallet, and miner packages support the qualified RTX 5090 and physical RTX 5070 Ti 16 GB paths.",
+      "RC5 ships Windows and Linux runtime setup, wallet-integrated solo mining, native backup dialogs and a network-enforced 0.1 CMFD minimum fee burn. Initial mining packages target NVIDIA RTX 50-series; platform prerequisites are in the release guide.",
     phase: "active",
   },
   {
@@ -92,9 +94,9 @@ export const roadmapGates: readonly RoadmapGate[] = [
   },
   {
     number: "05",
-    title: "Independent review and release hardening",
+    title: "Mainnet diligence and ecosystem growth",
     detail:
-      "Expand canonical vectors, independent implementations, cryptographic review, and reproducible signed releases.",
+      "Build on reproducible releases with independent cryptographic review, broader operator testing and exchange-integration diligence. Mainnet and any exchange availability remain future milestones, not announced launches.",
     phase: "future",
   },
 ];

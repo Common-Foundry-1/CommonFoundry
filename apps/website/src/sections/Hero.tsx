@@ -2,7 +2,7 @@ import { useRef, type PointerEvent } from "react";
 import heroApparatus from "../assets/hero-apparatus.png";
 import { ButtonLink } from "../components/ButtonLink";
 import { ShieldIcon } from "../components/Icons";
-import { DISCORD_URL } from "../content";
+import { RELEASE_URL } from "../content";
 
 export function Hero() {
   const visualRef = useRef<HTMLDivElement>(null);
@@ -25,21 +25,22 @@ export function Hero() {
     <section id="top" className="hero section-grid" aria-labelledby="hero-heading">
       <div className="hero__copy">
         <h1 id="hero-heading">
-          Open GPU infrastructure for work, settlement, and inference.
+          Verifiable work. A new monetary frontier.
         </h1>
         <p>
-          ProductionV4 turns the full 384-layer ForgeMatrix workload into a
-          transparent GPU proof, with independent CPU and node verification and
-          a separate market path for customer inference.
+          Open GPU infrastructure with serious cryptography and deliberate
+          monetary design. ForgeMatrix pairs consumer-GPU proof of work with
+          independent verification, declining issuance and permanently burned
+          fees. RC5 puts that vision into software you can run.
         </p>
 
         <div className="hero__actions">
           <ButtonLink
-            href={DISCORD_URL}
+            href={RELEASE_URL}
             target="_blank"
             rel="noopener noreferrer"
           >
-            Join the Devnet
+            Download RC5
           </ButtonLink>
           <ButtonLink href="#thesis" variant="secondary">
             Read the thesis
@@ -48,7 +49,7 @@ export function Hero() {
 
         <div className="trust-note">
           <ShieldIcon />
-          <span>ProductionV4 Testnet-1 is live for open research and testing. No token sale.</span>
+          <span>RCNet-1 release candidate · No premine · No token sale</span>
         </div>
       </div>
 
@@ -76,7 +77,7 @@ export function Hero() {
       </div>
 
       <a className="section-preview" href="#thesis">
-        <span>One hardware base. Two economic roles.</span>
+        <span>Built to verify. Designed for the long term.</span>
         <i aria-hidden="true">+</i>
       </a>
     </section>

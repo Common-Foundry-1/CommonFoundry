@@ -1,5 +1,13 @@
 # Security policy
 
+## RC5 release context — September 5, 2026
+
+The current public release is [RC5 for RCNet-1](https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/tag/v0.1.0-rc.5), with the full ProductionV4 proof, an encrypted wallet and GPU mining integration. RCNet is a test network, not a public-value mainnet. Independent review and mainnet qualification remain separate milestones.
+
+The material below is the archived early-Devnet security policy. Its descriptions of disabled production proofs, private networking and prototype pool counters are historical, not a description of the RC5 release. The current release notes specify supported packages, setup requirements and network compatibility; the original research boundaries below are preserved for reference.
+
+## Archived early-Devnet policy
+
 ForgeMatrix and the CMFD monetary rules are consensus-critical research code.
 Do not deploy this repository as a public-value mainnet.
 

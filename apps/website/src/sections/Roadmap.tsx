@@ -5,6 +5,7 @@ import { ArrowIcon, DocumentIcon, ShieldIcon, XIcon } from "../components/Icons"
 import {
   DISCORD_URL,
   GITHUB_URL,
+  RELEASE_URL,
   roadmapGates,
   SECURITY_URL,
   WHITEPAPER_URL,
@@ -26,8 +27,8 @@ export function Roadmap() {
       />
       <div className="roadmap__content section-shell">
         <div className="section-heading">
-          <h2 id="roadmap-heading">From working testnet to broader public infrastructure.</h2>
-          <p>Each milestone builds on measured ProductionV4 results.</p>
+          <h2 id="roadmap-heading">The foundation is built. The opportunity is ahead.</h2>
+          <p>Shipped cryptography and RC5 today. Broader adoption and independent review next.</p>
         </div>
 
         <ol className="roadmap__rail">
@@ -53,10 +54,10 @@ export function Roadmap() {
 
         <div className="conversion-band">
           <div>
-            <h3>Run ProductionV4.<br />Help shape the next milestone.</h3>
+            <h3>Get in early.<br />Build with the Foundry.</h3>
             <p>
-              Join Devnet-16 and help produce the reproducible evidence that moves
-              Common Foundry forward.
+              Miners, developers and long-term supporters: explore the release,
+              examine the monetary design and help shape what comes next.
             </p>
           </div>
           <div className="conversion-band__actions">
@@ -66,20 +67,20 @@ export function Roadmap() {
                 target="_blank"
                 rel="noopener noreferrer"
               >
-                Join the Devnet
+                Join the community
               </ButtonLink>
               <ButtonLink
-                href={WHITEPAPER_URL}
+                href={RELEASE_URL}
                 target="_blank"
                 rel="noopener noreferrer"
                 variant="secondary"
               >
-                Read the white paper
+                Explore RC5
               </ButtonLink>
             </div>
             <p className="trust-note">
               <ShieldIcon />
-              <span>Full-shape proof. Consumer-GPU testing. No token sale.</span>
+              <span>RCNet is a test network, not mainnet. Its coins have no intended monetary value.</span>
             </p>
           </div>
         </div>
@@ -95,7 +96,7 @@ export function Roadmap() {
             <a href={SECURITY_URL} target="_blank" rel="noopener noreferrer"><ShieldIcon /><span>Security</span></a>
             <a href={X_URL} target="_blank" rel="noopener noreferrer"><XIcon /><span>X @CommonFoundry1</span></a>
           </nav>
-          <p>Open-source research for an open GPU economy.</p>
+          <p>Open compute. Verifiable work. A maker-built GPU economy.</p>
         </footer>
       </div>
     </section>

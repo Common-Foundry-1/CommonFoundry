@@ -1,0 +1,26 @@
+name: RC4 Linux public runtime cold start
+on:
+  push:
+    branches: [packaging/rc4-linux-cold-start]
+permissions:
+  contents: read
+jobs:
+  public-runtime-download:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 6d8f1acd4a0a9bee8bd93067b8e19975e53f3af3
+      - name: Download and authenticate the runtime into an empty directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/rc4-cold-start"
+          test ! -e "$stage"
+          mkdir "$stage"
+          cp packaging/production-rc/runtime/linux/prepare-rcnet-runtime.sh "$stage/"
+          cp packaging/production-v4-pool/shared/FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json "$stage/"
+          bash "$stage/prepare-rcnet-runtime.sh"
+          sha256sum "$stage/production-v4/MODEL-V2.bank" "$stage/production-v4/FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json"
+          bash "$stage/prepare-rcnet-runtime.sh"

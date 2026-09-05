@@ -1969,13 +1969,111 @@ def _validate_runtime_attestation(
             )
 
 
+def _validate_runtime_bootstrap_packages(
+    *,
+    stage_files: dict[str, Path],
+    staged_network_info: dict[str, object],
+    commit: str,
+    version: str,
+    repo: Path,
+) -> dict[str, dict[str, dict[str, object]]]:
+    """Verify downloader packages against exact source and native runtime evidence."""
+    proof = staged_network_info.get("proof_of_work", {})
+    if proof.get("selection") != "ProductionV4":
+        raise IntegrityError("runtime bootstrap packages require ProductionV4")
+    shared = "packaging/production-v4-pool/shared"
+    runtime = "packaging/production-rc/runtime"
+    source_paths = {
+        "README.md": f"{runtime}/README.md",
+        "LICENSE": "LICENSE",
+        "THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md",
+        "V4-INPUT-CHUNKS.json": f"{shared}/V4-INPUT-CHUNKS.json",
+        "production-v4-rcnet-1-inputs.json": f"{shared}/production-v4-rcnet-1-inputs.json",
+        PRODUCTION_V4_PACKAGE_FIXED_RECORD: f"{shared}/{PRODUCTION_V4_PACKAGE_FIXED_RECORD}",
+    }
+    sources = {name: _tracked_blob(repo, relative) for name, relative in source_paths.items()}
+    chunks = _json_object_bytes(sources["V4-INPUT-CHUNKS.json"], "runtime chunk manifest")
+    inputs = _json_object_bytes(sources["production-v4-rcnet-1-inputs.json"], "runtime input manifest")
+    bank_rows = [row for row in chunks.get("files", []) if row.get("name") == "MODEL-V2.bank"]
+    if len(bank_rows) != 1 or inputs.get("network_id") != staged_network_info["network"]["network_id"]:
+        raise IntegrityError("runtime downloader manifest is not bound to RCNet-1")
+    bank = bank_rows[0]
+    compiled_bank = proof["artifacts"]["bank"]
+    if bank.get("bytes") != int(compiled_bank["bytes"]) or bank.get("sha256") != compiled_bank["sha256"]:
+        raise IntegrityError("runtime downloader model bank does not match compiled identity")
+    fixed = sources[PRODUCTION_V4_PACKAGE_FIXED_RECORD]
+    compiled_fixed = proof["artifacts"]["fixed_record"]
+    if len(fixed) != int(compiled_fixed["bytes"]) or _sha256_bytes(fixed) != compiled_fixed["sha256"]:
+        raise IntegrityError("runtime bootstrap fixed record does not match compiled identity")
+    epoch = _source_date_epoch(repo, None)
+    result = {}
+    for platform, suffix, extension, platform_sources in (
+        ("windows-x86_64", ".exe", ".zip", {
+            "PREPARE-RCNET-RUNTIME.ps1": f"{runtime}/windows/PREPARE-RCNET-RUNTIME.ps1",
+            "START-WALLET.bat": f"{runtime}/windows/START-WALLET.bat",
+        }),
+        ("linux-x86_64", "", ".tar.gz", {
+            "prepare-rcnet-runtime.sh": f"{runtime}/linux/prepare-rcnet-runtime.sh",
+            "start-wallet.sh": f"{runtime}/linux/start-wallet.sh",
+        }),
+    ):
+        root_name = f"commonfoundry-rc-runtime-bootstrap-{platform}-v{version}"
+        archive_name = root_name + extension
+        attestation_name = f"RUNTIME-ATTESTATION-{platform.upper()}.json"
+        binary_names = (f"cmfd-node{suffix}", f"common-foundry-wallet{suffix}")
+        required = {archive_name, attestation_name, *binary_names}
+        if required - set(stage_files):
+            raise IntegrityError(f"runtime bootstrap package is incomplete: {sorted(required - set(stage_files))}")
+        with tempfile.TemporaryDirectory(prefix="cmfd-bootstrap-verify-") as temporary:
+            expected = Path(temporary) / root_name
+            expected.mkdir()
+            for name, data in sources.items():
+                _write_new(expected / name, data)
+            for name, relative in platform_sources.items():
+                _write_new(expected / name, _tracked_blob(repo, relative))
+            rows = {}
+            for name in binary_names:
+                with _stable_regular_handle(stage_files[name], f"staged {name}") as (_, source, opened):
+                    if opened.st_size > MAX_RUNTIME_BINARY_BYTES:
+                        raise IntegrityError(f"runtime binary exceeds size limit: {name}")
+                    header = source.read(MAX_EXECUTABLE_HEADER_BYTES)
+                    if suffix:
+                        _validate_pe_x86_64(header, opened.st_size, name)
+                    else:
+                        _validate_elf_x86_64(header, opened.st_size, name)
+                    source.seek(0)
+                    with (expected / name).open("xb") as destination:
+                        shutil.copyfileobj(source, destination, length=1024 * 1024)
+                    rows[name] = {"sha256": _sha256_file(expected / name)}
+            if suffix:
+                verify_deterministic_zip(expected, stage_files[archive_name], epoch)
+            else:
+                verify_deterministic_tar_gz(expected, stage_files[archive_name], epoch)
+            _validate_runtime_attestation(
+                path=stage_files[attestation_name], platform=platform, commit=commit,
+                version=version, rows=rows, staged_network_info=staged_network_info,
+            )
+            result[platform] = rows
+    return result
+
+
 def validate_production_rc_runtime_packages(
     *,
     stage_files: dict[str, Path],
     staged_network_info: dict[str, object],
     commit: str,
     version: str,
+    repo: Path | None = None,
 ) -> dict[str, dict[str, dict[str, object]]]:
+    if any(name.startswith("commonfoundry-rc-runtime-bootstrap-") for name in stage_files):
+        if repo is None:
+            raise IntegrityError("runtime bootstrap validation requires exact source")
+        if {PRODUCTION_RC_WINDOWS_RUNTIME_PACKAGE_NAME, PRODUCTION_RC_LINUX_RUNTIME_PACKAGE_NAME} & set(stage_files):
+            raise IntegrityError("release cannot mix full and bootstrap runtime packages")
+        return _validate_runtime_bootstrap_packages(
+            stage_files=stage_files, staged_network_info=staged_network_info,
+            commit=commit, version=version, repo=repo,
+        )
     missing = [
         name
         for name in (
@@ -4033,6 +4131,7 @@ def _validate_production_v4_rc_artifacts(
         staged_network_info=network_info,
         commit=commit,
         version=version,
+        repo=repo,
     )
     approval_names = {
         PRODUCTION_V4_PRODUCER_APPROVAL_NAME,
@@ -4567,6 +4666,7 @@ def _validate_production_v4_single_producer_rc_artifacts(
         staged_network_info=network_info,
         commit=commit,
         version=version,
+        repo=repo,
     )
 
 

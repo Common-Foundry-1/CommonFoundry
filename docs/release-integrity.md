@@ -6,6 +6,15 @@ or mixed build inputs. These are identity and consistency guards. A native
 build receipt is self-recorded metadata; it does not authenticate the compiler,
 prove that the recorded command ran, or establish who built the library.
 
+RC4 uses the versioned Windows and Linux runtime bootstrap archives. The release
+gate verifies their exact source-derived file inventory, download manifests,
+compiled model-bank and fixed-record identities, native executable bytes, and
+fresh node/wallet runtime attestations. The model bank is downloaded and
+authenticated on first use, not embedded in these small archives. Bootstrap and
+full-runtime archive formats cannot be mixed in one release. RC4 still includes
+both miner packages and the complete activation, qualification and signed
+release evidence listed in its tracked inventory.
+
 The release commit must be supplied from the intended candidate or signed tag.
 The build and package scripts never select a release commit from the checkout's
 current `HEAD`. Windows scripts require `-ExpectedCommit`; Linux builders accept

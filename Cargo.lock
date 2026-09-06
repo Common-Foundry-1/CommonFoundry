@@ -1030,7 +1030,7 @@ dependencies = [
 
 [[package]]
 name = "cmfd-miner"
-version = "0.1.0-rc.5"
+version = "0.1.0-rc.5-miner.2"
 dependencies = [
  "anyhow",
  "blake3",

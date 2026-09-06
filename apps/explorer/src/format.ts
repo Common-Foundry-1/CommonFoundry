@@ -15,9 +15,11 @@ export const formatAtoms = (atoms: string) => {
 };
 
 export const formatAge = (timestamp: number) => {
-  const seconds = Math.max(0, Math.floor(Date.now() / 1000) - timestamp);
-  if (seconds < 60) return `${seconds}s ago`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
-  return `${Math.floor(seconds / 86400)}d ago`;
+  const difference = Math.floor(Date.now() / 1000) - timestamp;
+  const seconds = Math.abs(difference);
+  const duration = seconds < 60 ? `${seconds}s`
+    : seconds < 3600 ? `${Math.floor(seconds / 60)}m`
+    : seconds < 86400 ? `${Math.floor(seconds / 3600)}h`
+    : `${Math.floor(seconds / 86400)}d`;
+  return difference < 0 ? `in ${duration}` : `${duration} ago`;
 };

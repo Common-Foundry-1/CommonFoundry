@@ -30,6 +30,7 @@ export const demoSnapshot: ExplorerSnapshot = {
     previous_block: hex(`${height - 1}bc7`),
     transaction_root: hex(`${height}7aa`),
     timestamp: now - 34 - index * 64,
+    accepted_at: now - 34 - index * 64,
     target: "000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
     nonce: String(89211 + index * 941),
     work_digest: hex(`000${index + 1}d9`),

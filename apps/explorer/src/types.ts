@@ -17,6 +17,7 @@ export type ExplorerBlock = {
   previous_block: string;
   transaction_root: string;
   timestamp: number;
+  accepted_at?: number;
   target: string;
   nonce: string;
   work_digest: string;

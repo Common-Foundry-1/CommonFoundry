@@ -14,6 +14,8 @@ pub struct ExplorerBlock {
     pub previous_block: String,
     pub transaction_root: String,
     pub timestamp: u64,
+    /// This node's persisted block admission time in Unix seconds, not consensus time.
+    pub accepted_at: u64,
     pub target: String,
     pub nonce: String,
     pub work_digest: String,
@@ -97,13 +99,18 @@ impl Node {
             .map(|(position, block_id)| (position, *block_id))
             .collect();
         for (position, block_id) in active_ids {
-            let block = self.read_explorer_block(block_id)?;
+            let (block, accepted_at) = self.read_explorer_block(block_id)?;
             let encoded_bytes = encode_block(&block)?.len();
             let confirmations =
                 u64::try_from(self.index.active_chain.len() - position).map_err(|_| {
                     NodeError::CorruptLog("explorer confirmation depth does not fit u64".to_owned())
                 })?;
-            latest_blocks.push(block_summary(&block, encoded_bytes, confirmations)?);
+            latest_blocks.push(block_summary(
+                &block,
+                accepted_at,
+                encoded_bytes,
+                confirmations,
+            )?);
             for transaction in &block.transactions {
                 if recent_transactions.len() >= EXPLORER_TRANSACTION_LIMIT {
                     break;
@@ -154,7 +161,7 @@ impl Node {
         if position == 0 {
             return Ok(None);
         }
-        let block = self.read_explorer_block(block_id)?;
+        let (block, accepted_at) = self.read_explorer_block(block_id)?;
         let encoded_bytes = encode_block(&block)?.len();
         let confirmations =
             u64::try_from(self.index.active_chain.len() - position).map_err(|_| {
@@ -175,7 +182,7 @@ impl Node {
             })
             .collect::<Result<Vec<_>, NodeError>>()?;
         Ok(Some(ExplorerBlockDetail {
-            block: block_summary(&block, encoded_bytes, confirmations)?,
+            block: block_summary(&block, accepted_at, encoded_bytes, confirmations)?,
             coinbase_outputs: block.coinbase.outputs.len(),
             transactions_detail,
         }))
@@ -209,7 +216,7 @@ impl Node {
             .copied()
             .collect();
         for block_id in active_ids {
-            let block = self.read_explorer_block(block_id)?;
+            let (block, _) = self.read_explorer_block(block_id)?;
             if let Some(transaction) = block
                 .transactions
                 .iter()
@@ -243,7 +250,7 @@ impl Node {
             .map(|position| (position, block_id))
     }
 
-    fn read_explorer_block(&mut self, block_id: [u8; 32]) -> Result<Block, NodeError> {
+    fn read_explorer_block(&mut self, block_id: [u8; 32]) -> Result<(Block, u64), NodeError> {
         let indexed = self.index.blocks.get(&block_id).cloned().ok_or_else(|| {
             NodeError::CorruptLog("active explorer lookup refers to an absent block".to_owned())
         })?;
@@ -255,12 +262,14 @@ impl Node {
             self.params.network_id,
             matches!(self.profile.proof, ProofProfile::ProductionV3),
         );
-        self.latch_authenticated_storage_failure(result)
+        let block = self.latch_authenticated_storage_failure(result)?;
+        Ok((block, indexed.accepted_at()))
     }
 }
 
 fn block_summary(
     block: &Block,
+    accepted_at: u64,
     encoded_bytes: usize,
     confirmations: u64,
 ) -> Result<ExplorerBlock, NodeError> {
@@ -280,6 +289,7 @@ fn block_summary(
         previous_block: hex::encode(block.challenge.previous_block),
         transaction_root: hex::encode(block.challenge.transaction_root),
         timestamp: block.challenge.timestamp,
+        accepted_at,
         target: hex::encode(block.challenge.target),
         nonce: nonce.to_string(),
         work_digest: hex::encode(work_digest),
@@ -347,7 +357,10 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
-    use crate::{DEVNET_PROFILE, RpcRequest, route_rpc_request};
+    use crate::{
+        BLOCK_VERSION, DEFAULT_MINING_ATTEMPTS, DEVNET_PROFILE, RpcRequest,
+        default_miner_destination, route_rpc_request,
+    };
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
 
@@ -365,6 +378,69 @@ mod tests {
             assert!(EXPLORER_TRANSACTION_LIMIT <= 64);
             assert!(EXPLORER_TRANSACTION_LOOKBACK <= 4_096);
         }
+    }
+
+    #[test]
+    fn explorer_acceptance_time_is_distinct_persisted_and_authenticated() {
+        let path = std::env::temp_dir().join(format!(
+            "cmfd-explorer-acceptance-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut node = Node::open_with_profile(&path, DEVNET_PROFILE).unwrap();
+        let timestamp = DEVNET_PROFILE.virtual_genesis_timestamp + 60;
+        let accepted_at = timestamp - 3_600;
+        let template = node
+            .build_template(default_miner_destination(), timestamp)
+            .unwrap();
+        let proof = node
+            .verifier
+            .mine(&template.challenge, 0, DEFAULT_MINING_ATTEMPTS)
+            .unwrap();
+        let block = Block {
+            version: BLOCK_VERSION,
+            challenge: template.challenge,
+            proof,
+            coinbase: template.coinbase,
+            transactions: Vec::new(),
+        };
+        let block_id = block.block_id();
+        node.submit_block(block, accepted_at).unwrap();
+
+        for reopened in [false, true] {
+            if reopened {
+                drop(node);
+                node = Node::open_with_profile(&path, DEVNET_PROFILE).unwrap();
+            }
+            let snapshot = node.explorer_snapshot().unwrap();
+            let summary = &snapshot.latest_blocks[0];
+            assert_eq!(summary.timestamp, timestamp);
+            assert_eq!(summary.accepted_at, accepted_at);
+            let detail = node.explorer_block("1").unwrap().unwrap();
+            assert_eq!(detail.block, *summary);
+            let response = route_rpc_request(
+                RpcRequest {
+                    method: "GET".to_owned(),
+                    target: "/v1/explorer/block/1".to_owned(),
+                    content_type: None,
+                    body: Vec::new(),
+                },
+                &mut node,
+            );
+            assert_eq!(response.status, 200);
+            let document: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(document["timestamp"], timestamp);
+            assert_eq!(document["accepted_at"], accepted_at);
+        }
+
+        // The API must authenticate the record before exposing its acceptance time.
+        std::sync::Arc::make_mut(node.index.blocks.get_mut(&block_id).unwrap())
+            .locator
+            .accepted_at += 1;
+        assert!(node.explorer_block("1").is_err());
+        assert!(node.storage_faulted);
+        drop(node);
+        fs::remove_dir_all(&path).unwrap();
     }
 
     #[test]

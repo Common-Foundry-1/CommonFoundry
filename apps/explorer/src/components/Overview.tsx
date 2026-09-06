@@ -35,7 +35,7 @@ export function Overview({ snapshot, preview, onBlock, onTransaction }: Overview
           <div className="section-heading"><div><p className="eyebrow">Canonical history</p><h2>Latest blocks</h2></div><Boxes size={21} /></div>
           <div className="table-scroll"><table><thead><tr><th>Height</th><th>Block</th><th>Age</th><th className="numeric">Transactions</th><th className="numeric">Size</th></tr></thead>
             <tbody>{snapshot.latest_blocks.map((block) => <tr key={block.block_id} onClick={() => onBlock(block)} tabIndex={0} onKeyDown={(event) => event.key === "Enter" && onBlock(block)}>
-              <td className="height-cell">#{block.height}</td><td><code>{shortHash(block.block_id, 12, 8)}</code></td><td><Clock3 size={13} /> {formatAge(block.timestamp)}</td><td className="numeric">{block.transactions}</td><td className="numeric">{formatBytes(block.encoded_bytes)}</td>
+              <td className="height-cell">#{block.height}</td><td><code>{shortHash(block.block_id, 12, 8)}</code></td><td title={block.accepted_at === undefined ? "Block timestamp; explorer acceptance time is unavailable." : "Time since this explorer node accepted the block."}><Clock3 size={13} /> {formatAge(block.accepted_at ?? block.timestamp)}</td><td className="numeric">{block.transactions}</td><td className="numeric">{formatBytes(block.encoded_bytes)}</td>
             </tr>)}</tbody></table></div>
         </section>
 

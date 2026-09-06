@@ -29,6 +29,12 @@ The node provides bounded read-only endpoints at `/v1/explorer`,
 currently bounded to the newest 4,096 canonical blocks; a persistent address and transaction index
 is the next scale-out step before public mainnet deployment.
 
+Block `timestamp` is the unchanged consensus header time. Block `accepted_at` is the
+explorer node's authenticated, persisted admission time in Unix seconds; it survives
+node restarts but can differ across nodes that synchronize at different times. The
+UI uses `accepted_at` for block age and shows both times in block details. Older
+nodes without that field fall back to header time, including explicit future dates.
+
 ## Devnet deployment
 
 The public Devnet explorer is deployed as a Cloudflare Worker with static assets. Its edge handler

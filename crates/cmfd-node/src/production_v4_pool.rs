@@ -915,8 +915,8 @@ fn final_activation_digest_from_bytes(
                 "ProductionV4 final activation contains a noncanonical field value",
             ));
         }
-        hasher.update(encoded);
     }
+    hasher.update(final_activation);
     Ok(*hasher.finalize().as_bytes())
 }
 
@@ -1000,6 +1000,35 @@ mod tests {
         assert!(validate_scratch_paths(local, "/mnt/c/cmfd-pool-scratch").is_ok());
         assert!(validate_scratch_paths(local, "/tmp/bad\nRUN\tfull").is_err());
         assert!(validate_scratch_paths(Path::new("relative"), "/tmp/pool").is_err());
+    }
+
+    #[test]
+    fn final_activation_digest_matches_consensus_and_rejects_noncanonical_fields() {
+        let challenge_digest = [0x6b; 32];
+        let mut values = (0..FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES / size_of::<u32>())
+            .map(|index| {
+                ((index as u64 * 1_000_003 + 97) % u64::from(FORGEMATRIX_V4_FIELD_MODULUS)) as u32
+            })
+            .collect::<Vec<_>>();
+        values[..3].copy_from_slice(&[0, 1, FORGEMATRIX_V4_FIELD_MODULUS - 1]);
+        let mut encoded = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let fields: Vec<cmfd_consensus::forgematrix_v4_basefold::ForgeMatrixV4Field> =
+            serde_json::from_value(serde_json::to_value(&values).unwrap()).unwrap();
+        assert_eq!(
+            final_activation_digest_from_bytes(challenge_digest, &encoded).unwrap(),
+            forgematrix_v4_final_activation_digest(challenge_digest, &fields)
+        );
+        for index in [0, values.len() - 1] {
+            let offset = index * size_of::<u32>();
+            encoded[offset..offset + size_of::<u32>()]
+                .copy_from_slice(&FORGEMATRIX_V4_FIELD_MODULUS.to_le_bytes());
+            assert!(final_activation_digest_from_bytes(challenge_digest, &encoded).is_err());
+            encoded[offset..offset + size_of::<u32>()]
+                .copy_from_slice(&values[index].to_le_bytes());
+        }
     }
 
     #[test]

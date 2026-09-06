@@ -43,7 +43,7 @@ using TensorCoreGemm = cutlass::gemm::device::Gemm<
     cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, 2>;
 
 // SM 12.0 supports the larger integer MMA and asynchronous copy pipeline.
-// Keep the qualified Turing path for other devices and compute_75 PTX JIT.
+// Keep the qualified Turing path for unqualified devices and compute_75 PTX JIT.
 using BlackwellTensorCoreGemm = cutlass::gemm::device::Gemm<
     int8_t, cutlass::layout::RowMajor, int8_t, cutlass::layout::ColumnMajor,
     int32_t, cutlass::layout::RowMajor, int32_t, cutlass::arch::OpClassTensorOp,
@@ -53,6 +53,18 @@ using BlackwellTensorCoreGemm = cutlass::gemm::device::Gemm<
     cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, 3>;
 
 bool use_blackwell_gemm = false;
+
+// Group adjacent output-column tiles so Ada reuses activation rows before
+// sweeping the full batch again. The wider tile further reduces those sweeps.
+using AdaTensorCoreGemm = cutlass::gemm::device::Gemm<
+    int8_t, cutlass::layout::RowMajor, int8_t, cutlass::layout::ColumnMajor,
+    int32_t, cutlass::layout::RowMajor, int32_t, cutlass::arch::OpClassTensorOp,
+    cutlass::arch::Sm80, cutlass::gemm::GemmShape<128, 256, 64>,
+    cutlass::gemm::GemmShape<64, 64, 64>, cutlass::gemm::GemmShape<16, 8, 32>,
+    cutlass::epilogue::thread::LinearCombinationClamp<int32_t, 4, int32_t, int32_t>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<8>, 3>;
+
+bool use_ada_gemm = false;
 
 void cuda_check(cudaError_t result, const char* operation) {
     if (result != cudaSuccess) {
@@ -322,6 +334,9 @@ void launch_stacked_limb_gemm(const int8_t* limbs, const int8_t* weights,
                               uint32_t width) {
     if (use_blackwell_gemm) {
         launch_gemm<BlackwellTensorCoreGemm>(
+            limbs, weights, limb_accumulators, 4 * rows, width);
+    } else if (use_ada_gemm) {
+        launch_gemm<AdaTensorCoreGemm>(
             limbs, weights, limb_accumulators, 4 * rows, width);
     } else {
         launch_gemm<TensorCoreGemm>(
@@ -967,9 +982,17 @@ int main(int argc, char** argv) {
             // A compute_75 fallback image cannot execute the SM80 pipeline,
             // even when the driver JIT compiles it for a newer physical GPU.
             use_blackwell_gemm = attributes.ptxVersion >= 80;
+        } else if (properties.major == 8 && properties.minor == 9) {
+            cudaFuncAttributes attributes{};
+            cuda_check(cudaFuncGetAttributes(
+                           &attributes,
+                           cutlass::Kernel<AdaTensorCoreGemm::GemmKernel>),
+                       "read Ada Tensor Core kernel target");
+            use_ada_gemm = attributes.ptxVersion >= 80;
         }
         std::printf("gemm_backend=%s\n",
-                    use_blackwell_gemm ? "sm80_m16n8k32_multistage" : "sm75_m8n8k16");
+                    use_blackwell_gemm ? "sm80_m16n8k32_multistage" :
+                    use_ada_gemm ? "sm80_m16n8k32_128x256_sw8" : "sm75_m8n8k16");
         run_small_differential();
         if (argc > 1 && std::string(argv[1]) == "--server") {
             if (argc != 3) throw std::runtime_error("usage: --server MODEL");

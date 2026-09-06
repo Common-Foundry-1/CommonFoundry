@@ -10,7 +10,8 @@ SM12.0 now selects the SM80-compatible `16x8x32` integer MMA with a
 `128x128x128` threadblock and a three-stage asynchronous pipeline. Integer
 accumulation, field reduction, activation, model bytes, and protocol are unchanged.
 
-Other GPU architectures retain the original kernel. A kernel image compiled
+SM89 now has a separately qualified [Ada kernel](miner-ada-performance.md).
+Remaining GPU architectures retain the original kernel. A kernel image compiled
 from compute_75 PTX also retains the original kernel, even on an SM12.0 GPU:
 dispatch checks the loaded function's PTX virtual architecture before selecting
 the newer implementation. Both paths run the existing CPU differential check.

@@ -42,6 +42,18 @@ using TensorCoreGemm = cutlass::gemm::device::Gemm<
     cutlass::epilogue::thread::LinearCombinationClamp<int32_t, 4, int32_t, int32_t>,
     cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, 2>;
 
+// SM 12.0 supports the larger integer MMA and asynchronous copy pipeline.
+// Keep the qualified Turing path for other devices and compute_75 PTX JIT.
+using BlackwellTensorCoreGemm = cutlass::gemm::device::Gemm<
+    int8_t, cutlass::layout::RowMajor, int8_t, cutlass::layout::ColumnMajor,
+    int32_t, cutlass::layout::RowMajor, int32_t, cutlass::arch::OpClassTensorOp,
+    cutlass::arch::Sm80, cutlass::gemm::GemmShape<128, 128, 128>,
+    cutlass::gemm::GemmShape<64, 64, 128>, cutlass::gemm::GemmShape<16, 8, 32>,
+    cutlass::epilogue::thread::LinearCombinationClamp<int32_t, 4, int32_t, int32_t>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, 3>;
+
+bool use_blackwell_gemm = false;
+
 void cuda_check(cudaError_t result, const char* operation) {
     if (result != cudaSuccess) {
         throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(result));
@@ -286,12 +298,13 @@ __global__ void reduce_layer_batch(
     write_centered_limbs(value, limbs + lane * 4 * cells, cells, within_lane);
 }
 
+template <typename Gemm>
 void launch_gemm(const int8_t* activation, const int8_t* weights,
                  int32_t* accumulators, uint32_t rows, uint32_t width) {
     const cutlass::gemm::GemmCoord problem_size(static_cast<int>(rows),
                                                  static_cast<int>(width),
                                                  static_cast<int>(width));
-    typename TensorCoreGemm::Arguments arguments{
+    typename Gemm::Arguments arguments{
         problem_size,
         {activation, static_cast<int>(width)},
         {weights, static_cast<int>(width)},
@@ -299,7 +312,7 @@ void launch_gemm(const int8_t* activation, const int8_t* weights,
         {accumulators, static_cast<int>(width)},
         {int32_t{1}, int32_t{0}},
         1};
-    TensorCoreGemm operation;
+    Gemm operation;
     cutlass_check(operation.can_implement(arguments), "validate Tensor Core GEMM");
     cutlass_check(operation(arguments), "launch Tensor Core GEMM");
 }
@@ -307,7 +320,13 @@ void launch_gemm(const int8_t* activation, const int8_t* weights,
 void launch_stacked_limb_gemm(const int8_t* limbs, const int8_t* weights,
                               int32_t* limb_accumulators, uint32_t rows,
                               uint32_t width) {
-    launch_gemm(limbs, weights, limb_accumulators, 4 * rows, width);
+    if (use_blackwell_gemm) {
+        launch_gemm<BlackwellTensorCoreGemm>(
+            limbs, weights, limb_accumulators, 4 * rows, width);
+    } else {
+        launch_gemm<TensorCoreGemm>(
+            limbs, weights, limb_accumulators, 4 * rows, width);
+    }
 }
 
 std::vector<uint32_t> make_coefficients(uint32_t layers) {
@@ -939,6 +958,18 @@ int main(int argc, char** argv) {
         cuda_check(cudaGetDeviceProperties(&properties, 0), "read CUDA device");
         std::printf("device=%s compute=%d.%d\n", properties.name, properties.major,
                     properties.minor);
+        if (properties.major == 12 && properties.minor == 0) {
+            cudaFuncAttributes attributes{};
+            cuda_check(cudaFuncGetAttributes(
+                           &attributes,
+                           cutlass::Kernel<BlackwellTensorCoreGemm::GemmKernel>),
+                       "read Tensor Core kernel target");
+            // A compute_75 fallback image cannot execute the SM80 pipeline,
+            // even when the driver JIT compiles it for a newer physical GPU.
+            use_blackwell_gemm = attributes.ptxVersion >= 80;
+        }
+        std::printf("gemm_backend=%s\n",
+                    use_blackwell_gemm ? "sm80_m16n8k32_multistage" : "sm75_m8n8k16");
         run_small_differential();
         if (argc > 1 && std::string(argv[1]) == "--server") {
             if (argc != 3) throw std::runtime_error("usage: --server MODEL");

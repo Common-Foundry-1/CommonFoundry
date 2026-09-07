@@ -3,7 +3,7 @@ export const GITHUB_URL = "https://github.com/Common-Foundry-1";
 export const X_URL = "https://x.com/CommonFoundry1";
 export const RELEASE_VERSION = "v0.1.0-rc.5";
 export const RELEASE_URL = `https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/tag/${RELEASE_VERSION}`;
-export const WHITEPAPER_URL = "/docs/Common-Foundry-Technical-Whitepaper-v0.2.pdf";
+export const WHITEPAPER_URL = "/docs/Common-Foundry-Technical-Whitepaper-v0.3.pdf";
 export const SECURITY_URL = "/docs/SECURITY.md";
 export const EMISSION_URL = "/docs/emission.md";
 

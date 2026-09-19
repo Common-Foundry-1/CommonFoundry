@@ -52,8 +52,8 @@ Do not broaden the allowed-signers namespace restriction.
    those records; it is not a substitute for retaining or publishing them.
 5. After all qualification/review requirements are satisfied, the mainnet pin
    configuration must include the verified manifest digest and matching proof
-   trust. Pin generation/application and final release signing are separate
-   operations; this tool does not perform them.
+   trust. Generate candidates with `scripts/generate_mainnet_pins.py` as described
+   below. Application and final release signing remain separate operations.
 6. Assemble with `--approval-manifest` and run the four-package preflight. The
    packaged manifest must match the compiled digest, plan and proof authority
    descriptors. Only the two explicit mainnet pin files may change after the
@@ -64,3 +64,30 @@ No future beacon signature is included in an approval request. The pinned
 October schedule and genesis policy are approved, while the live beacon is
 verified separately at activation. Passing signature checks is not proof that
 deployment, recovery, mining/payouts or the final launch rehearsal are complete.
+
+## Generate the two pin candidates
+
+Supply the same clean review checkout, canonical plan, qualification subject,
+trust document, both role policies/requests/signatures and pinned SSH verifier.
+Also provide `--proof-pin` (the canonical dual-party ProductionV4 review target)
+and `--approval-manifest` (the verified MAINNET-APPROVALS.json). Use a new absolute
+`--output` directory outside the source repository.
+
+The proof target must come from the existing qualified proof workflow and must
+match the source-pin digest in the signed qualification subject. Do not reset
+or overwrite the active RC proof pin to prepare mainnet. RC single-producer
+targets cannot be used here. All actual qualification and reviewer evidence
+remains required; syntactically valid hashes are not such evidence.
+
+The generator re-verifies both mainnet signatures. It accepts only the existing
+canonical literal format, never evaluates arbitrary Rust, and checks the report,
+specification and authority bindings. It emits mainnet_release_pin.inc.rs,
+mainnet_network_id.inc.rs and PIN-REVIEW.json. It neither applies them nor starts
+a node. Existing output directories are not overwritten; failure cleanup removes
+only files created by this invocation and preserves any concurrent operator file.
+
+After independently reviewing the candidate hashes and contents, apply only the
+two generated includes in the intended source locations, commit them, build the
+mainnet-feature binaries, and run the native identity/packaging checks. Full
+mainnet plan parsing and the signed-package rehearsal are still required. A Rust
+syntax/type smoke test of a generated include is not a release authorization.

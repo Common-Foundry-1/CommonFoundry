@@ -172,9 +172,19 @@ def validate_info(data: bytes, plan: dict, commit: str) -> dict:
                 "mining_start_utc": LAUNCH_UTC, "launch_plan": plan,
                 "genesis_policy": "requires_verified_launch_beacon", "beacon_round": BEACON_ROUND}
     expected["activation_evidence_sha256"] = info.get("activation_evidence_sha256")
+    expected["mainnet_approval_manifest_sha256"] = info.get("mainnet_approval_manifest_sha256")
+    expected["proof_approval_trust"] = info.get("proof_approval_trust")
     if canonical(info) != canonical(expected):
         raise Error("runtime does not match the mainnet plan and source commit")
     nonzero_hex(info["activation_evidence_sha256"], 64, "activation evidence digest")
+    nonzero_hex(info["mainnet_approval_manifest_sha256"], 64, "mainnet approval manifest digest")
+    trust = info["proof_approval_trust"]
+    if not isinstance(trust, dict) or trust.get("contract_schema") != "CMFD_PRODUCTION_V4_ACTIVATION_APPROVAL_SUBJECT_V1":
+        raise Error("runtime proof approval trust is absent or not dual-role")
+    nonzero_hex(trust.get("qualification_binding_sha256"), 64, "proof qualification binding")
+    nonzero_hex(trust.get("ssh_keygen_sha256"), 64, "proof approval verifier pin")
+    if not isinstance(trust.get("producer"), dict) or not isinstance(trust.get("independent_reproducer"), dict):
+        raise Error("runtime lacks distinct producer/reproducer trust")
     return info
 
 
@@ -192,6 +202,32 @@ def validate_schedule(schedule: dict, plan: dict) -> None:
     for key in ("chain_hash", "public_key", "scheme"):
         if schedule.get("beacon_" + key) != plan["payload"]["beacon"].get(key):
             raise Error("launch helper uses another beacon")
+
+
+def validate_plan_approvals(data: bytes, plan_bytes: bytes) -> dict:
+    import mainnet_plan_approval
+    try:
+        return mainnet_plan_approval.validate_manifest(data, plan_bytes)
+    except integrity.activation_approval.ApprovalError as error:
+        raise Error(str(error)) from error
+
+
+def bind_plan_approvals(manifest: dict, data: bytes, info: dict) -> None:
+    import mainnet_plan_approval
+    try:
+        mainnet_plan_approval.bind_manifest_to_runtime(manifest, data, info)
+    except integrity.activation_approval.ApprovalError as error:
+        raise Error(str(error)) from error
+
+
+def validate_review_ancestry(repo: Path, review_commit: str, release_commit: str) -> None:
+    nonzero_hex(review_commit, 40, "review source commit")
+    nonzero_hex(release_commit, 40, "release source commit")
+    integrity._run_git(repo, "merge-base", "--is-ancestor", review_commit, release_commit)
+    changed = set(integrity._run_git(repo, "diff", "--name-only", "--no-renames", review_commit, release_commit, "--").splitlines())
+    allowed = {"crates/cmfd-node/mainnet_release_pin.inc.rs", "crates/cmfd-consensus/mainnet_network_id.inc.rs"}
+    if changed - allowed:
+        raise Error("release source changed beyond the reviewed mainnet pin files; fresh review is required")
 
 
 def package_sources(platform: str, kind: str) -> dict[str, str]:
@@ -307,6 +343,9 @@ def assemble(args: argparse.Namespace) -> Path:
         raise Error("miner packages require only the miner executable")
     plan_bytes = read_regular(args.plan, 32 * 1024, "mainnet plan")
     plan = validate_plan(plan_bytes)
+    manifest_bytes = read_regular(args.approval_manifest, MAX_INFO, "mainnet approval manifest")
+    manifest = validate_plan_approvals(manifest_bytes, plan_bytes)
+    validate_review_ancestry(args.repo, manifest["subject"]["review_source_commit"], commit)
     source_paths = package_sources(args.platform, args.kind)
     sources, epoch = source_snapshot(args.repo, commit, source_paths, args.version)
     validate_catalog(sources, plan)
@@ -328,6 +367,7 @@ def assemble(args: argparse.Namespace) -> Path:
         sidecar = stage / "production-mainnet"
         sidecar.mkdir()
         (sidecar / "MAINNET-PLAN.json").write_bytes(plan_bytes)
+        (sidecar / "MAINNET-APPROVALS.json").write_bytes(manifest_bytes)
         extension = ".exe" if args.platform == "windows-x86_64" else ""
         binaries = {"cmfd-launch": args.launch}
         if args.kind == "runtime":
@@ -369,6 +409,7 @@ def assemble(args: argparse.Namespace) -> Path:
                 except (ValueError, TypeError) as error:
                     raise Error("invalid wallet identity encoding") from error
             info = validate_info(data, plan, commit)
+            bind_plan_approvals(manifest, manifest_bytes, info)
             if common_info is not None and info != common_info:
                 raise Error("runtime activation identities disagree")
             common_info = info
@@ -396,7 +437,7 @@ def main() -> None:
     parser.add_argument("--kind", choices=("runtime", "miner"), required=True)
     parser.add_argument("--commit", required=True)
     parser.add_argument("--version", required=True)
-    for name in ("plan", "output", "launch", "replay-worker", "relation-worker"):
+    for name in ("plan", "approval-manifest", "output", "launch", "replay-worker", "relation-worker"):
         parser.add_argument("--" + name, type=Path, required=True)
     for name in ("node", "wallet", "miner"):
         parser.add_argument("--" + name, type=Path)

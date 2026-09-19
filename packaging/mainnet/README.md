@@ -56,6 +56,7 @@ version/commit supplied by the operator:
 ```powershell
 py -3 scripts/package_mainnet.py --platform windows-x86_64 --kind runtime `
   --commit $FrozenCommit --version $MainnetVersion --plan $ApprovedPlan `
+  --approval-manifest $VerifiedPlanApprovals `
   --output $OutputDirectory --node $NodeBinary --wallet $WalletBinary `
   --launch $LaunchBinary --replay-worker $ReplayWorker --relation-worker $RelationWorker
 ```
@@ -70,6 +71,12 @@ the wallet's distinct `CMFD_WALLET_PRELAUNCH_IDENTITY_V1` wrapper. None of these
 checks needs the future beacon or the downloaded model bank. The exact source
 catalog bytes are retained as artifact provenance and checked against the plan.
 Linux workers are bundled even in the Windows package, where mining uses WSL2.
+
+Every archive includes production-mainnet/MAINNET-APPROVALS.json. Its digest,
+qualification binding and signer authority descriptors must match the compiled
+prelaunch identity, not merely a caller-supplied label. Source history after the
+manifest's reviewed commit may change only mainnet_release_pin.inc.rs and
+mainnet_network_id.inc.rs; other changes require fresh review.
 
 All package files are hashed into MAINNET-PACKAGE.json. Archive metadata is
 normalized to the frozen commit's timestamp, and existing outputs are never

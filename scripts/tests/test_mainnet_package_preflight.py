@@ -33,6 +33,7 @@ class MainnetPreflightTests(unittest.TestCase):
 
     def verify(self, archives=None):
         with mock.patch.object(package, "source_snapshot", side_effect=self.fixture.sources), \
+             mock.patch.object(package, "validate_review_ancestry"), \
              mock.patch.object(package, "native_output", side_effect=AssertionError("preflight executed an archive member")):
             return preflight.verify_set(self.fixture.repo, self.fixture.commit, "1.0.0", self.fixture.plan_path, self.archives if archives is None else archives)
 
@@ -98,6 +99,10 @@ class MainnetPreflightTests(unittest.TestCase):
         self.fixture.repo = frozen
         self.fixture.commit = git("rev-parse", "HEAD")
         self.fixture.info["source_commit"] = self.fixture.commit
+        self.fixture.approval_subject["review_source_commit"] = self.fixture.commit
+        self.fixture.approval_manifest["subject_sha256"] = hashlib.sha256(package.canonical(self.fixture.approval_subject)).hexdigest()
+        self.fixture.approval_path.write_bytes(package.canonical(self.fixture.approval_manifest))
+        self.fixture.info["mainnet_approval_manifest_sha256"] = hashlib.sha256(self.fixture.approval_path.read_bytes()).hexdigest()
         archives = {}
         for platform in package.PLATFORMS:
             for kind in ("runtime", "miner"):
@@ -185,6 +190,15 @@ class MainnetPreflightTests(unittest.TestCase):
         with self.assertRaisesRegex(package.Error, "missing, reordered, or unexpected"):
             self.verify()
 
+    def test_replaced_approval_manifest_is_rejected_even_if_receipted(self):
+        def change(files):
+            manifest = json.loads(files[preflight.APPROVALS])
+            manifest["approvals"]["producer"]["signature_sha256"] = "e" * 64
+            files[preflight.APPROVALS] = package.canonical(manifest)
+        self.rewrite(("linux-x86_64", "miner"), change, refresh_receipt=True)
+        with self.assertRaisesRegex(package.Error, "compiled pin"):
+            self.verify()
+
     def test_zip_and_gzip_trailers_are_rejected(self):
         for platform in package.PLATFORMS:
             archive = self.archives[platform, "miner"]
@@ -247,7 +261,7 @@ class MainnetPreflightTests(unittest.TestCase):
                 archive = self.archives["linux-x86_64", "miner"]
                 archive.write_bytes(archive.read_bytes() + b"changed after inspection")
             return self.fixture.sources(*args)
-        with mock.patch.object(package, "source_snapshot", side_effect=snapshot):
+        with mock.patch.object(package, "source_snapshot", side_effect=snapshot), mock.patch.object(package, "validate_review_ancestry"):
             with self.assertRaisesRegex(package.Error, "set changed"):
                 preflight.verify_set(self.fixture.repo, self.fixture.commit, "1.0.0", self.fixture.plan_path, self.archives)
 

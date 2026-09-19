@@ -121,6 +121,7 @@ and api3.drand.sh on 2026-09-19. Historical round 123 is the offline positive ve
 | Mainnet network/consensus identity | Shared identity registry and mainnet build feature implemented; final pin values pending | Final pinned plan and mainnet profile, distinct from RC |
 | Reward receiving addresses and custody | Awaiting owner decision | Public destinations plus custody/recovery evidence |
 | Independent reproduction and review | No accepted independent record located yet | Named reproducer, signed report, independent crypto/wallet review |
+| Plan approval binding | Dedicated mainnet requests/signature verification and compiled/package binding implemented | Actual role approvals, reviewed source history and final pin application |
 | Dependency audit | rustls updated to 0.23.45 for RUSTSEC-2026-0285; 44 pool/TLS tests pass and cargo-audit reports zero vulnerabilities | Final build audit plus review of remaining informational dependency warnings |
 | Windows/Linux release packages | Native assembler and four package layouts implemented; actual builds await final configuration | Clean installs, signature/checksum verification, matching runtime identity |
 | Four-package release consistency | Offline archive/source/receipt reconciliation implemented | Actual four-archive preflight report followed by independent reproduction and signing |
@@ -209,6 +210,25 @@ The new verifier exposed a portable-mode issue: archives assembled on Windows
 did not mark extensionless Linux workers as executable. Canonical archive modes
 now explicitly cover the launch helper, miner and both GPU workers; existing
 published RC archives have not been changed.
+
+Mainnet plan approvals now use distinct subject/role-payload schemas and the
+existing dedicated V4 activation authorities/namespaces. Requests bind the exact
+canonical plan bytes, review commit, qualification subject/binding and committed
+trust policy, including the trusted SSH verifier digest. The tool does not sign
+or choose reviewers. Packages include MAINNET-APPROVALS.json and reject a manifest
+whose hash, proof qualification binding or signer descriptors disagree with the
+compiled prelaunch identity. Changes after the reviewed source commit are limited
+to the two mainnet pin files; other source changes require fresh review.
+Real temporary OpenSSH keys exercised signature verification, rewritten-payload
+replay rejection, role swaps and verifier substitution. These disposable test
+keys do not constitute actual mainnet approvals or independent review. Final pin
+generation/application, real signed evidence and release signing remain pending.
+Validation for this binding layer: eight mainnet approval tests using temporary
+SSH keys and 33 assembly/preflight tests pass on Windows and Linux. The existing
+V4 approval tests still pass (one Windows symlink test is skipped), as do the
+existing release-integrity/bootstrap suites. Seven focused mainnet runtime tests
+and strict node/miner/wallet Clippy checks pass. The actual mainnet build still
+rejects the absent final pins; no fixture key or approval has been installed.
 
 Current local evidence: 19 release-set preflight tests and 12 assembler tests
 pass on Windows and Linux, including the real CLI against a temporary frozen

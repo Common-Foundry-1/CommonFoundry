@@ -8,6 +8,9 @@ Extract the complete archive to a folder you can write to. Keep its files
 together. Verify the release signatures and SHA256 checksums before running it.
 The embedded MAINNET-PACKAGE.json records the producer's package inventory and
 native identity checks; it is not an independent approval or a signature.
+production-mainnet/MAINNET-APPROVALS.json identifies the plan-review records
+bound into the compiled release. Full signed review evidence and the release
+checksum signature must be verified through the published release materials.
 
 ## Wallet and node
 

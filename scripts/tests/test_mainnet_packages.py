@@ -17,6 +17,8 @@ import zipfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import package_mainnet as packages
+import mainnet_plan_approval as mainnet_approval
+import production_v4_activation_approval as signature_contract
 from test_release_integrity import pe_x86_64_fixture, elf_x86_64_fixture
 
 
@@ -43,11 +45,40 @@ class MainnetPackageTests(unittest.TestCase):
         self.plan["network_id"] = packages.integrity._rcnet_v2_derived_hash("CMFD/MAINNET/NETWORK-ID/V1", bytes.fromhex(self.plan["launch_plan_digest"])).hex()
         self.plan_path = self.root / "MAINNET-PLAN.json"
         self.plan_path.write_bytes((json.dumps(self.plan, indent=2) + "\n").encode())
+        # Synthetic producer records for archive tests, not real approvals.
+        authorities = {}
+        approvals = {}
+        for index, role in enumerate(signature_contract.ROLES, 1):
+            key_hash = str(index) * 64
+            authority = {"signer_identity": role + "@example.invalid", "key_blob_sha256": key_hash,
+                         "allowed_signers_sha256": str(index + 2) * 64, "key_type": "ssh-ed25519",
+                         "key_fingerprint": "SHA256:" + base64.b64encode(bytes.fromhex(key_hash)).decode().rstrip("=")}
+            authorities[role] = authority
+            approvals[role] = {**authority, "namespace": signature_contract.NAMESPACES[role],
+                               "approval_sha256": str(index + 4) * 64, "signature_sha256": str(index + 6) * 64}
+        self.approval_subject = {
+            "schema": mainnet_approval.SUBJECT_SCHEMA, "phase": "mainnet_plan", "review_source_commit": self.commit,
+            "launch_plan_sha256": hashlib.sha256(self.plan_path.read_bytes()).hexdigest(),
+            "launch_plan_bytes": self.plan_path.stat().st_size, "launch_plan_digest": self.plan["launch_plan_digest"],
+            "network_id": self.plan["network_id"], "source_release_unix_seconds": packages.SOURCE_TIME,
+            "mining_start_unix_seconds": packages.LAUNCH_TIME, "genesis_policy": "requires_verified_launch_beacon",
+            "proof_qualification_subject_sha256": "9" * 64, "qualification_binding_sha256": "b" * 64,
+            "approval_trust_sha256": hashlib.sha256(signature_contract.canonical_json({**authorities, "ssh_keygen_sha256": "c" * 64})).hexdigest(),
+        }
+        self.approval_manifest = {"schema": mainnet_approval.MANIFEST_SCHEMA, "subject": self.approval_subject,
+                                  "subject_sha256": hashlib.sha256(signature_contract.canonical_json(self.approval_subject)).hexdigest(),
+                                  "approvals": approvals}
+        self.approval_path = self.root / "MAINNET-APPROVALS.json"
+        self.approval_path.write_bytes(signature_contract.canonical_json(self.approval_manifest))
         self.info = {"format": "commonfoundry-mainnet-launch-info", "format_version": 1,
                      "source_commit": self.commit, "source_release_utc": packages.SOURCE_UTC,
                      "mining_start_utc": packages.LAUNCH_UTC, "launch_plan": self.plan,
                      "genesis_policy": "requires_verified_launch_beacon", "beacon_round": packages.BEACON_ROUND,
-                     "activation_evidence_sha256": "3" * 64}
+                     "activation_evidence_sha256": "3" * 64,
+                     "mainnet_approval_manifest_sha256": hashlib.sha256(self.approval_path.read_bytes()).hexdigest(),
+                     "proof_approval_trust": {"contract_schema": signature_contract.SUBJECT_SCHEMA,
+                                               "qualification_binding_sha256": "b" * 64, "ssh_keygen_sha256": "c" * 64,
+                                               **authorities}}
         self.calls = []
 
     def args(self, platform="windows-x86_64", kind="runtime", output="output"):
@@ -60,7 +91,7 @@ class MainnetPackageTests(unittest.TestCase):
         for role in ("cmfd-v4-replay", "real_bank0_relations"):
             (binaries / role).write_bytes(elf_x86_64_fixture(role.encode()))
         return argparse.Namespace(repo=self.repo, platform=platform, kind=kind, commit=self.commit,
-                                  version="1.0.0", plan=self.plan_path, output=self.root / output,
+                                  version="1.0.0", plan=self.plan_path, approval_manifest=self.approval_path, output=self.root / output,
                                   node=binaries / "cmfd-node" if kind == "runtime" else None,
                                   wallet=binaries / "common-foundry-wallet" if kind == "runtime" else None,
                                   miner=binaries / "cmfd-miner" if kind == "miner" else None,
@@ -89,6 +120,7 @@ class MainnetPackageTests(unittest.TestCase):
 
     def assemble(self, args, output=None, sources=None):
         with mock.patch.object(packages.integrity, "_require_native_runtime_platform"), \
+             mock.patch.object(packages, "validate_review_ancestry"), \
              mock.patch.object(packages, "source_snapshot", side_effect=sources or self.sources), \
              mock.patch.object(packages, "native_output", side_effect=output or self.output):
             return packages.assemble(args)
@@ -225,6 +257,24 @@ class MainnetPackageTests(unittest.TestCase):
         with self.assertRaisesRegex(packages.Error, "same binary"):
             self.assemble(args)
         self.assertEqual(self.calls, [])
+
+    def test_plan_approval_manifest_must_match_compiled_pin_and_trust(self):
+        args = self.args()
+        changed = copy.deepcopy(self.approval_manifest)
+        changed["approvals"]["producer"]["signature_sha256"] = "e" * 64
+        args.approval_manifest.write_bytes(signature_contract.canonical_json(changed))
+        with self.assertRaisesRegex(packages.Error, "compiled pin"):
+            self.assemble(args)
+        args.approval_manifest.write_bytes(signature_contract.canonical_json(self.approval_manifest))
+        def wrong_trust(executable, arguments):
+            data = self.output(executable, arguments)
+            if arguments == ["mainnet-launch-info"]:
+                info = json.loads(data)
+                info["proof_approval_trust"]["qualification_binding_sha256"] = "d" * 64
+                return packages.canonical(info)
+            return data
+        with self.assertRaisesRegex(packages.Error, "qualification/trust"):
+            self.assemble(args, output=wrong_trust)
 
     def test_plan_mutation_duplicate_keys_and_noncanonical_documents_are_rejected(self):
         packages.validate_plan(self.plan_path.read_bytes())

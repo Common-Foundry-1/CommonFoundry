@@ -647,6 +647,35 @@ def verify_approval_pair(
         reproducer_allowed_signers=reproducer_allowed_signers,
         reproducer_signer_identity=reproducer_signer_identity,
     )
+    return _verify_prepared_pair(
+        subject=subject, prepared=prepared,
+        producer_approval=producer_approval, producer_signature=producer_signature,
+        producer_allowed_signers=producer_allowed_signers,
+        producer_signer_identity=producer_signer_identity,
+        reproducer_approval=reproducer_approval, reproducer_signature=reproducer_signature,
+        reproducer_allowed_signers=reproducer_allowed_signers,
+        reproducer_signer_identity=reproducer_signer_identity,
+        ssh_keygen=ssh_keygen, expected_verifier_sha256=expected_verifier_sha256,
+        expected_trust=expected_trust,
+    )
+
+
+def _verify_prepared_pair(
+    *, subject: dict[str, object], prepared: dict[str, object],
+    producer_approval: Path, producer_signature: Path,
+    producer_allowed_signers: Path, producer_signer_identity: str,
+    reproducer_approval: Path, reproducer_signature: Path,
+    reproducer_allowed_signers: Path, reproducer_signer_identity: str,
+    ssh_keygen: Path, expected_verifier_sha256: str,
+    expected_trust: dict[str, object] | None,
+) -> dict[str, object]:
+    """Shared signature mechanics; callers must build their exact typed subject.
+
+    The public V4 entry point above retains its RC-only subject validation.
+    Mainnet plan approvals use a distinct subject and role-payload schema, while
+    retaining the dedicated V4 activation key authorities and SSH namespaces.
+    """
+    _hex256(expected_verifier_sha256, "trusted OpenSSH verifier SHA-256")
     authorities = prepared["authorities"]
     payloads = prepared["payloads"]
     if not isinstance(authorities, dict) or not isinstance(payloads, dict):

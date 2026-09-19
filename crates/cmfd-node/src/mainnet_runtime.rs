@@ -168,6 +168,7 @@ pub fn canonical_mainnet_launch_info_json() -> Result<Vec<u8>, NodeError> {
         commit,
     )
     .map_err(NodeError::MainnetLaunchEvidence)?;
+    let approval_document: serde_json::Value = serde_json::from_slice(&approval)?;
     let document = serde_json::json!({
         "format": "commonfoundry-mainnet-launch-info", "format_version": 1,
         "source_commit": commit,
@@ -175,6 +176,8 @@ pub fn canonical_mainnet_launch_info_json() -> Result<Vec<u8>, NodeError> {
         "mining_start_utc": cmfd_launch::MAINNET_LAUNCH_UTC,
         "launch_plan": plan,
         "activation_evidence_sha256": hex::encode(Sha256::digest(approval)),
+        "mainnet_approval_manifest_sha256": pin.approval_manifest_sha256,
+        "proof_approval_trust": approval_document["proof_activation"]["activation_approval_trust"],
         "genesis_policy": "requires_verified_launch_beacon",
         "beacon_round": cmfd_launch::MAINNET_BEACON_ROUND,
     });

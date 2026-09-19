@@ -20,6 +20,7 @@ integrity = package.integrity
 Error = package.Error
 RECEIPT = "MAINNET-PACKAGE.json"
 PLAN = "production-mainnet/MAINNET-PLAN.json"
+APPROVALS = "production-mainnet/MAINNET-APPROVALS.json"
 MAX_ARCHIVE_BYTES = 3 * 1024 ** 3
 
 
@@ -34,6 +35,7 @@ def expected_layout(platform: str, kind: str, sources: dict[str, bytes], plan: b
     for name in executable_platforms:
         expected[name] = None
     expected[RECEIPT] = None
+    expected[APPROVALS] = None
     for name, data in list(expected.items()):
         if name.endswith(".bat"):
             expected[name] = data.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
@@ -53,7 +55,7 @@ def member_mode(name: str, directory: bool, executables: dict[str, str]) -> int:
 def member_limit(name: str, expected: dict, executables: dict) -> int:
     if name in executables:
         return integrity.MAX_RUNTIME_BINARY_BYTES
-    if name == RECEIPT:
+    if name in (RECEIPT, APPROVALS):
         return package.MAX_INFO
     return len(expected[name])
 
@@ -70,7 +72,7 @@ def read_member(stream, name: str, size: int, expected: dict, executables: dict)
     if name in executables:
         check = integrity._validate_pe_x86_64 if executables[name] == "windows-x86_64" else integrity._validate_elf_x86_64
         check(data, size, name)
-    return {"bytes": size, "sha256": sha256, "captured": data if name == RECEIPT else None}
+    return {"bytes": size, "sha256": sha256, "captured": data if name in (RECEIPT, APPROVALS) else None}
 
 
 def inspect_archive(path: Path, platform: str, root: str, expected: dict, directories: set, executables: dict, epoch: int):
@@ -190,6 +192,10 @@ def inspect_package(path: Path, repo: Path, platform: str, kind: str, plan_bytes
         raise Error("mainnet package filename does not match its requested role/platform/version")
     rows, identity = inspect_archive(path, platform, root, expected, directories, executables, epoch)
     receipt, info = validate_receipt(rows, platform, kind, plan, commit, version, epoch)
+    manifest_data = rows[APPROVALS]["captured"]
+    manifest = package.validate_plan_approvals(manifest_data, plan_bytes)
+    package.validate_review_ancestry(repo, manifest["subject"]["review_source_commit"], commit)
+    package.bind_plan_approvals(manifest, manifest_data, info)
     return {"name": path.name, **identity, "receipt": receipt, "info": info}
 
 
@@ -228,6 +234,7 @@ def verify_set(repo: Path, commit: str, version: str, plan_path: Path, archives:
     return {"schema": "CMFD_MAINNET_PACKAGE_PREFLIGHT_V1", "source_commit": commit, "package_version": version,
             "launch_plan_digest": plan["launch_plan_digest"], "network_id": plan["network_id"],
             "activation_evidence_sha256": common_info["activation_evidence_sha256"],
+            "mainnet_approval_manifest_sha256": common_info["mainnet_approval_manifest_sha256"],
             "packages": [{key: row[key] for key in ("name", "bytes", "sha256")} for row in packages.values()],
             "mining_workers": workers, "consistent": True, "release_approved": False,
             "independent_reproduction_verified": False}

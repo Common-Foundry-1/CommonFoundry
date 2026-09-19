@@ -52,7 +52,8 @@ use cmfd_node::production_v4_pool::{
 };
 #[cfg(feature = "production-v4")]
 use cmfd_node::rcnet_candidate::{
-    RcnetLaunchCandidate, RcnetLaunchConfiguration, write_candidate_create_new,
+    MainnetLaunchPlan, RcnetLaunchCandidate, RcnetLaunchConfiguration, write_candidate_create_new,
+    write_mainnet_plan_create_new,
 };
 use cmfd_node::seed_peers::{SystemSeedResolver, production_rc_seed_set};
 use cmfd_node::storage::{inspect_block_log, repair_partial_block_log_tail};
@@ -215,6 +216,19 @@ struct Cli {
 enum Command {
     /// Print the compiled network identity and consensus manifest.
     NetworkInfo,
+    /// Write the October mainnet plan from release-pinned artifacts and explicit
+    /// reward addresses. Does not activate mainnet or alter RCNet storage.
+    #[cfg(feature = "production-v4")]
+    MainnetPlan {
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long, value_parser = parse_hex32)]
+        pow_limit: [u8; 32],
+        #[arg(long, value_parser = parse_hex32)]
+        steward_reward_destination: [u8; 32],
+        #[arg(long, value_parser = parse_hex32)]
+        community_reward_destination: [u8; 32],
+    },
     /// Derive a canonical RCNet identity candidate from authenticated ProductionV4 artifacts.
     #[cfg(feature = "production-v4")]
     RcnetCandidate {
@@ -843,6 +857,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     #[cfg(feature = "production-v4")]
+    if let Command::MainnetPlan {
+        output,
+        pow_limit,
+        steward_reward_destination,
+        community_reward_destination,
+    } = &cli.command
+    {
+        let plan = MainnetLaunchPlan::from_release_artifacts(
+            *pow_limit,
+            cmfd_consensus::FixedRewardDestinations {
+                steward: *steward_reward_destination,
+                community: *community_reward_destination,
+            },
+        )?;
+        write_mainnet_plan_create_new(output, &plan)?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "schema": "CMFD_MAINNET_PLAN_WRITTEN_V1",
+                "launch_plan_digest": hex::encode(plan.digest()?),
+                "network_id": hex::encode(plan.network_id()?),
+                "mainnet_activation_authorized": false
+            }))?
+        );
+        return Ok(());
+    }
+    #[cfg(feature = "production-v4")]
     if let Command::RcnetCandidate {
         model_bank,
         fixed_record,
@@ -1051,6 +1092,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _log_guard = cmfd_node::logging::init_tracing(&cli.data_dir, cli.verbose);
     match cli.command {
         Command::NetworkInfo => unreachable!("network-info exits before node initialization"),
+        #[cfg(feature = "production-v4")]
+        Command::MainnetPlan { .. } => {
+            unreachable!("mainnet plan generation exits before node initialization")
+        }
         #[cfg(feature = "production-v4")]
         Command::RcnetCandidate { .. } => {
             unreachable!("RCNet candidate generation exits before node initialization")

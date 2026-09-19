@@ -27,8 +27,15 @@ The proposed mainnet genesis is SHA-256 over this exact byte sequence:
 || verified_compressed_G1_signature[48]
 ```
 
-The launch plan must bind finalized economic parameters, proof identities,
-reward destinations, the schedule, and the beacon policy before source release.
+The launch plan binds finalized economic parameters, the minimum transaction
+burn, proof and artifact identities, reward destinations, the schedule, and
+the beacon policy before source release. `cmfd-node mainnet-plan` derives it
+from compiled artifact/rule identities plus explicitly supplied starting target
+and reward receiving addresses. It will not silently select the RC addresses.
+The digest in the formula is SHA-256 of the ASCII domain
+`CMFD/MAINNET/LAUNCH-PLAN/V1` followed by a zero byte and compact serialized
+`payload` bytes. The independent network ID uses its own mainnet BLAKE3 domain.
+Final runtime plan parsing also requires the exact release-pinned plan digest.
 The exact quicknet round is **32,747,812**. Its scheduled time is precisely the
 announced start; it is not the latest round, the preceding round, or a selectable
 fallback. If the round is late or unavailable, nodes wait for that same round.
@@ -46,7 +53,7 @@ It does not guarantee equal Internet latency or equal mining hardware. It preven
 useful advance work only when the authenticated genesis is required by every
 node, pool, wallet, mining, replay, and block-validation entry point.
 
-The cryptographic component and CLI are the first implementation increment.
+The cryptographic component, canonical plan builder, and CLIs are the first implementation increment.
 **Runtime/mainnet integration is not complete.** Existing RCNet identities and
 consensus remain unchanged. A successful CLI verification is not mainnet approval.
 
@@ -63,7 +70,7 @@ and api3.drand.sh on 2026-09-19. Historical round 123 is the offline positive ve
 | One canonical source baseline | Readiness branch created from miner.2 | Final frozen source commit and source publication target |
 | Exact UTC release/mining schedule | Pinned in cmfd-launch | Schedule CLI and timestamp tests |
 | Signed launch-time entropy | Verifier component implemented; integration pending | Signature mutation vectors plus node/miner replay and anti-precomputation tests |
-| Mainnet network/consensus identity | Pending | Canonical plan and mainnet profile, distinct from RC |
+| Mainnet network/consensus identity | Canonical plan builder implemented; final parameters and runtime profile pending | Final pinned plan and mainnet profile, distinct from RC |
 | Reward receiving addresses and custody | Awaiting owner decision | Public destinations plus custody/recovery evidence |
 | Independent reproduction and review | No accepted independent record located yet | Named reproducer, signed report, independent crypto/wallet review |
 | Windows/Linux release packages | Pending mainnet configuration | Clean installs, signature/checksum verification, matching runtime identity |
@@ -78,3 +85,18 @@ OTC completion is deferred until mainnet and is not part of launch activation.
 Carry forward successful unchanged RC evidence; repeat affected checks and the
 final end-to-end launch rehearsal. Do not mark this checklist complete merely
 because the component tests pass.
+
+## Reproducible local checks
+
+```powershell
+$env:CARGO_BUILD_JOBS = '4'
+cargo test --locked -p cmfd-launch
+cargo clippy --locked -p cmfd-launch --all-targets -- -D warnings
+cargo run --locked -p cmfd-launch -- schedule
+cargo test --locked -p cmfd-node --lib --features production-v4-testnet rcnet_candidate::
+```
+
+The launch tests include a real historical BLS signature, every signature-byte
+mutation, old-round substitution under a future local clock, strict document
+bounds, and independently calculated SHA-256 vectors. They do not claim to
+possess or test the future October 3 signature.

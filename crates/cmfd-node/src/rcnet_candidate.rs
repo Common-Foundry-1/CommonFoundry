@@ -33,6 +33,9 @@ const NETWORK_ID_DOMAIN: &str = "CMFD/RCNET/NETWORK-ID/V2";
 const VIRTUAL_GENESIS_DOMAIN: &str = "CMFD/RCNET/VIRTUAL-GENESIS/V2";
 const MAX_FIXED_RECORD_BYTES: u64 = 1024 * 1024;
 
+mod mainnet;
+pub use mainnet::{MainnetLaunchPlan, write_mainnet_plan_create_new};
+
 const INSECURE_DEV_DESTINATIONS: [[u8; 32]; 2] = [
     [
         0x4f, 0x35, 0x5b, 0xdc, 0xb7, 0xcc, 0x0a, 0xf7, 0x28, 0xef, 0x3c, 0xce, 0xb9, 0x61, 0x5d,
@@ -518,7 +521,14 @@ fn validate_file_identity(
 }
 
 fn validate_payload(payload: &RcnetLaunchPayload) -> Result<(), RcnetCandidateError> {
-    if payload.profile != PROFILE_NAME {
+    validate_payload_for_profile(payload, PROFILE_NAME)
+}
+
+fn validate_payload_for_profile(
+    payload: &RcnetLaunchPayload,
+    expected_profile: &str,
+) -> Result<(), RcnetCandidateError> {
+    if payload.profile != expected_profile {
         return Err(RcnetCandidateError::InvalidField("profile"));
     }
     validate_file_identity(&payload.artifacts.bank, "model bank file identity")?;

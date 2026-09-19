@@ -13,7 +13,7 @@ existing authenticated model-input preparation tools under the names below.
 - Each package contains `production-mainnet/MAINNET-PLAN.json`. The future
   beacon is downloaded as `production-mainnet/LAUNCH-BEACON.json` after launch.
 
-All launchers validate the package identity before downloads, prepare the
+All launchers validate the package identity before downloads and prepare the
 model inputs. Node/miner launchers then run the cancellable beacon helper;
 the wallet opens immediately for offline encrypted-key creation, backup, restore,
 and authenticated address display. Its own cancellable background worker acquires
@@ -40,5 +40,40 @@ are preserved and reported instead of silently overwritten. A crash may leave
 an unused temporary file, which is never treated as a certificate. This is
 process-interruption protection, not a claim of power-loss qualification.
 
-The final mainnet package builder, manifests, approval pins, and full launch
-rehearsal remain required. Source launcher tests are not packaged qualification.
+## Native package assembly
+
+`scripts/package_mainnet.py` assembles the runtime (wallet + node) and standalone
+miner archives on each native platform. It requires an exact clean frozen source
+commit, matching package versions, a canonical plan, mainnet-feature binaries,
+the launch helper, and both Linux GPU workers. It does not build the executables.
+Use Python 3.11 or newer and install the pinned dependencies from
+scripts/requirements-release-integrity.txt. This is a packaging-host requirement,
+not an additional Windows wallet-user requirement.
+
+Example argument shape for Windows, with real absolute paths and the finalized
+version/commit supplied by the operator:
+
+```powershell
+py -3 scripts/package_mainnet.py --platform windows-x86_64 --kind runtime `
+  --commit $FrozenCommit --version $MainnetVersion --plan $ApprovedPlan `
+  --output $OutputDirectory --node $NodeBinary --wallet $WalletBinary `
+  --launch $LaunchBinary --replay-worker $ReplayWorker --relation-worker $RelationWorker
+```
+
+For a miner archive, use `--kind miner --miner $MinerBinary` instead of the node
+and wallet arguments. On Linux use python3 and `--platform linux-x86_64`.
+The source node/wallet/miner versions must match; RC versions are not accepted.
+
+The assembler executes only read-only native identity/version commands, with
+bounded output and deadlines. Node/miner `mainnet-launch-info` must agree with
+the wallet's distinct `CMFD_WALLET_PRELAUNCH_IDENTITY_V1` wrapper. None of these
+checks needs the future beacon or the downloaded model bank. The exact source
+catalog bytes are retained as artifact provenance and checked against the plan.
+Linux workers are bundled even in the Windows package, where mining uses WSL2.
+
+All package files are hashed into MAINNET-PACKAGE.json. Archive metadata is
+normalized to the frozen commit's timestamp, and existing outputs are never
+overwritten. The receipt explicitly does not grant release approval. Final
+cross-platform reconciliation, independent approval, signing/checksum inventory,
+and full signed-package launch rehearsal remain required. Fixture archive tests
+are not qualification of actual mainnet binaries.

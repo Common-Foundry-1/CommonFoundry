@@ -2179,8 +2179,8 @@
 
 .custody-action-switch button.is-active {
   color: #fff;
-  background: var(--ink-800);
-  border-color: var(--ink-800);
+  background: var(--ink-900);
+  border-color: var(--ink-900);
 }
 
 .custody-error {

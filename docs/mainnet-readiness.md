@@ -97,7 +97,7 @@ consistency has a regression test. Node seed defaults now select the compiled
 network's port rather than hard-coding the RC port.
 
 **Mainnet integration remains incomplete.** Final pin values, accepted review
-evidence, mainnet release packaging and finalization, and the real launch
+evidence, actual mainnet package builds and release finalization, and the real launch
 rehearsal are still pending. The runtime
 explicitly refuses legacy wire/fee defaults for a new mainnet ID.
 The proposed service ports are 29443/29444/29445, separate from RC; the current
@@ -122,11 +122,12 @@ and api3.drand.sh on 2026-09-19. Historical round 123 is the offline positive ve
 | Reward receiving addresses and custody | Awaiting owner decision | Public destinations plus custody/recovery evidence |
 | Independent reproduction and review | No accepted independent record located yet | Named reproducer, signed report, independent crypto/wallet review |
 | Dependency audit | rustls updated to 0.23.45 for RUSTSEC-2026-0285; 44 pool/TLS tests pass and cargo-audit reports zero vulnerabilities | Final build audit plus review of remaining informational dependency warnings |
-| Windows/Linux release packages | Pending mainnet configuration | Clean installs, signature/checksum verification, matching runtime identity |
+| Windows/Linux release packages | Native assembler and four package layouts implemented; actual builds await final configuration | Clean installs, signature/checksum verification, matching runtime identity |
 | Wallet preparation before activation | Encrypted creation with backup, restore, public address display and launch-wait UI implemented | Native custody tests plus rendered fixture checks; final signed-package rehearsal pending |
 | Seeds, discovery, explorer | RC evidence needs mainnet rehearsal | Independent node results and mainnet service configuration |
 | Pool payout and reorg lifecycle | Evidence collection pending | Mature-reward payout and reorg/restart reconciliation logs |
 | Storage capacity | Existing unpruned proof load needs a mainnet plan | Measured growth and provisioned capacity/retention decision |
+| Model download availability | Primary host returned HTTP 200 and expected Content-Length for all 40 parts on September 19; GitHub fallback has only 4 model-bank parts | Full download/hash check during packaged rehearsal and a complete independent solo-input mirror |
 | Recovery and update | Rehearsal pending | Backup/restore, interrupted append, restart, upgrade/rollback results |
 | Final launch rehearsal | Pending | Exact intended packages, future-round start, delayed-beacon handling, fresh-wallet transfers |
 | Source release 24 hours early | Not yet executed | Public source and matching package timestamps at agreed release time |
@@ -161,7 +162,7 @@ including generated Windows console executables; it proves ordering and failure
 behavior without mining or contacting a pool. These checks do not substitute
 for the final signed-package launch rehearsal.
 
-Wallet preparation checks: 81 frontend tests and 32 ProductionV4 desktop library
+Wallet preparation checks: 82 frontend tests and 33 ProductionV4 desktop library
 tests passed (the explicit hardware-only mining test was not run). Wrong
 passphrases, another network and altered encrypted-key headers are rejected.
 Offline creation/restore expose no node, peer manager or mining manager and do
@@ -170,3 +171,26 @@ Playwright exercised the actual app at 1440x1000 and 390x844 using simulated
 Tauri responses: create/backup, address/QR copy, and launch-ready display; no
 console errors or horizontal overflow. Those UI fixtures do not demonstrate a
 live mainnet, native file-picker behavior, or the future activation signature.
+
+Package assembly now uses the exact clean source commit and validates each
+native executable's prelaunch identity against the same plan. The wallet has a
+distinct prelaunch schema so this does not masquerade as an activated-chain
+attestation. Four deterministic archive layouts (Windows/Linux runtime and miner)
+include the launch helper, both mining workers, authenticated input catalogs,
+and user instructions. Eleven package tests cover mixed identities, legacy RC
+wallets, changed schedules, wrong architectures, missing workers, downloader path
+traversal, process output/time limits, staging side effects and no-overwrite
+publication. These use fixture executables, not mainnet approval records. A real
+Rust-generated test plan also agreed with the Python canonical/digest checks and
+artifact catalog; its test destinations are not final reward decisions.
+
+The previous CI wallet failure was a delayed dialog-focus callback interrupting
+typing. The callback now preserves focus inside the dialog, with an explicitly
+delayed-frame regression and rendered interaction check. Full CI must still be
+observed on the resulting commit; local test results are not a CI-success claim.
+Visual QA also found that the selected custody-action tab referenced an undefined
+color token; it now uses the existing dark-ink token for readable contrast.
+The Linux desktop CI job also built RC5 successfully but then attempted to
+normalize a hard-coded RC4 AppImage path. Desktop artifact paths and packaging
+arguments now derive from matching Cargo/Tauri/npm versions instead of an old
+literal. The resulting CI job still needs to complete before claiming success.

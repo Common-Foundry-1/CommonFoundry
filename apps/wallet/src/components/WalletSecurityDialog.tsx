@@ -71,7 +71,12 @@ export function WalletSecurityDialog({
     const previousFocus = document.activeElement instanceof HTMLElement
       ? document.activeElement
       : null;
-    const frame = requestAnimationFrame(() => dialogRef.current?.focus());
+    const frame = requestAnimationFrame(() => {
+      const dialog = dialogRef.current;
+      // The user may already have selected an input before this frame runs.
+      // Do not interrupt typing by moving focus back to the dialog container.
+      if (dialog && !dialog.contains(document.activeElement)) dialog.focus();
+    });
     return () => {
       cancelAnimationFrame(frame);
       previousFocus?.focus();

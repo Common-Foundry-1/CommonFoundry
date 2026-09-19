@@ -74,6 +74,24 @@ describe("WalletSecurityDialog", () => {
 
   afterEach(cleanup);
 
+  it("does not steal input focus when the opening animation frame arrives late", () => {
+    let pending: FrameRequestCallback | undefined;
+    const frame = vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      pending = callback;
+      return 1;
+    });
+    try {
+      renderDialog(locked);
+      const input = screen.getByLabelText("Wallet passphrase");
+      input.focus();
+      expect(pending).toBeDefined();
+      act(() => pending!(0));
+      expect(input).toHaveFocus();
+    } finally {
+      frame.mockRestore();
+    }
+  });
+
   it("backs up to the selected path without requiring typed paths", async () => {
     const user = userEvent.setup();
     const selected = "D:\\My Backups\\wallet.cmfd-backup";

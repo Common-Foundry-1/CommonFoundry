@@ -32,6 +32,12 @@ fn canonical_runtime_identity_json() -> Result<Vec<u8>, String> {
     if COMPILED_NETWORK_PROFILE.proof != ProofProfile::ProductionV4 {
         return Err("runtime identity is available only in a ProductionV4 wallet build".to_owned());
     }
+    #[cfg(feature = "production-v4")]
+    if COMPILED_NETWORK_PROFILE.kind == cmfd_node::NetworkProfileKind::Mainnet {
+        let info = cmfd_node::mainnet_runtime::canonical_mainnet_launch_info_json()
+            .map_err(|error| format!("cannot authenticate mainnet launch plan: {error}"))?;
+        return canonical_prelaunch_identity_json(&info);
+    }
     let executable = std::env::current_exe()
         .map_err(|error| format!("cannot resolve the packaged wallet executable: {error}"))?;
     let artifacts = production_v4_package_artifacts(&executable)
@@ -39,6 +45,20 @@ fn canonical_runtime_identity_json() -> Result<Vec<u8>, String> {
     let network_info = canonical_network_info_json_with_v4_artifacts(&artifacts)
         .map_err(|error| format!("cannot authenticate packaged ProductionV4 artifacts: {error}"))?;
     canonical_runtime_identity_json_for_network_info(&network_info)
+}
+
+#[cfg(any(feature = "production-v4", test))]
+fn canonical_prelaunch_identity_json(launch_info: &[u8]) -> Result<Vec<u8>, String> {
+    // Separate schema: a prelaunch plan is not an activated network identity.
+    let mut encoded = serde_json::to_vec(&serde_json::json!({
+        "schema": "CMFD_WALLET_PRELAUNCH_IDENTITY_V1",
+        "role": WALLET_RUNTIME_ROLE,
+        "package_version": env!("CARGO_PKG_VERSION"),
+        "launch_info_base64": base64::engine::general_purpose::STANDARD.encode(launch_info),
+    }))
+    .map_err(|error| error.to_string())?;
+    encoded.push(b'\n');
+    Ok(encoded)
 }
 
 fn canonical_runtime_identity_json_for_network_info(
@@ -172,6 +192,25 @@ fn allow_navigation(url: &tauri::Url) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prelaunch_identity_is_distinct_from_activated_network_identity() {
+        let info = b"{\"format\":\"commonfoundry-mainnet-launch-info\"}\n";
+        let bytes = canonical_prelaunch_identity_json(info).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["schema"], "CMFD_WALLET_PRELAUNCH_IDENTITY_V1");
+        assert_eq!(value["role"], WALLET_RUNTIME_ROLE);
+        assert!(value.get("network_info_base64").is_none());
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(value["launch_info_base64"].as_str().unwrap())
+                .unwrap(),
+            info
+        );
+        let mut canonical = serde_json::to_vec(&value).unwrap();
+        canonical.push(b'\n');
+        assert_eq!(bytes, canonical);
+    }
 
     #[test]
     fn runtime_identity_encoding_is_canonical_and_binds_network_bytes() {

@@ -77,3 +77,23 @@ overwritten. The receipt explicitly does not grant release approval. Final
 cross-platform reconciliation, independent approval, signing/checksum inventory,
 and full signed-package launch rehearsal remain required. Fixture archive tests
 are not qualification of actual mainnet binaries.
+
+## Offline four-package preflight
+
+After both native platforms assemble their runtime and miner archives, use
+`scripts/verify_mainnet_packages.py` with the same `--repo`, `--commit`,
+`--version`, and `--plan`, plus absolute paths for `--windows-runtime`,
+`--windows-miner`, `--linux-runtime`, `--linux-miner`, and a new `--output` report.
+This requires Python 3.11+ and the same pinned dependencies as assembly.
+
+The verifier does not execute or extract packaged files. It checks canonical
+ZIP/USTAR/gzip structure, bounded member sizes, exact source-script bytes,
+executable architectures and permissions, plan bytes and producer receipt hashes.
+The four native identity records must agree, both packages on a platform must
+have the same launch-helper binary, and all four must contain identical Linux/WSL
+workers. Extra files (including wallet keys or a preloaded beacon), missing roles,
+symlinks, duplicate members, noncanonical trailers and changed archives fail.
+
+The output binds the four archive hashes and explicitly remains unapproved and
+not independently reproduced. It is input to independent reproduction, review
+and final signing, not a substitute for those steps. It never uploads anything.

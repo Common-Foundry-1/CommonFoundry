@@ -5423,7 +5423,10 @@ def _archive_entries(stage: Path) -> list[tuple[Path, str, bool]]:
 
 def _canonical_file_mode(path: Path) -> int:
     executable_suffixes = {".bat", ".cmd", ".dll", ".exe", ".sh", ".so"}
-    executable_names = {"cmfd-node", "common-foundry-wallet", "cmfd-proof-worker"}
+    executable_names = {
+        "cmfd-node", "common-foundry-wallet", "cmfd-proof-worker", "cmfd-miner",
+        "cmfd-launch", "cmfd-v4-replay", "real_bank0_relations",
+    }
     if path.suffix.lower() in executable_suffixes or path.name in executable_names:
         return 0o755
     try:

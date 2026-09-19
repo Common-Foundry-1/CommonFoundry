@@ -123,6 +123,7 @@ and api3.drand.sh on 2026-09-19. Historical round 123 is the offline positive ve
 | Independent reproduction and review | No accepted independent record located yet | Named reproducer, signed report, independent crypto/wallet review |
 | Dependency audit | rustls updated to 0.23.45 for RUSTSEC-2026-0285; 44 pool/TLS tests pass and cargo-audit reports zero vulnerabilities | Final build audit plus review of remaining informational dependency warnings |
 | Windows/Linux release packages | Native assembler and four package layouts implemented; actual builds await final configuration | Clean installs, signature/checksum verification, matching runtime identity |
+| Four-package release consistency | Offline archive/source/receipt reconciliation implemented | Actual four-archive preflight report followed by independent reproduction and signing |
 | Wallet preparation before activation | Encrypted creation with backup, restore, public address display and launch-wait UI implemented | Native custody tests plus rendered fixture checks; final signed-package rehearsal pending |
 | Seeds, discovery, explorer | RC evidence needs mainnet rehearsal | Independent node results and mainnet service configuration |
 | Pool payout and reorg lifecycle | Evidence collection pending | Mature-reward payout and reorg/restart reconciliation logs |
@@ -177,7 +178,7 @@ native executable's prelaunch identity against the same plan. The wallet has a
 distinct prelaunch schema so this does not masquerade as an activated-chain
 attestation. Four deterministic archive layouts (Windows/Linux runtime and miner)
 include the launch helper, both mining workers, authenticated input catalogs,
-and user instructions. Eleven package tests cover mixed identities, legacy RC
+and user instructions. Twelve assembler tests cover mixed identities, legacy RC
 wallets, changed schedules, wrong architectures, missing workers, downloader path
 traversal, process output/time limits, staging side effects and no-overwrite
 publication. These use fixture executables, not mainnet approval records. A real
@@ -194,3 +195,26 @@ The Linux desktop CI job also built RC5 successfully but then attempted to
 normalize a hard-coded RC4 AppImage path. Desktop artifact paths and packaging
 arguments now derive from matching Cargo/Tauri/npm versions instead of an old
 literal. The resulting CI job still needs to complete before claiming success.
+
+The release-set preflight streams the four archives without extraction or
+executing their contents. It checks exact frozen-source files, canonical archive
+framing and permissions, receipt hashes and native role identities. It rejects
+mixed activation evidence, different mining workers or same-platform launch
+helpers, duplicated executable roles, preloaded beacons and extra files. It also
+rechecks archive hashes after the whole reconciliation. Its report explicitly
+does not claim independent reproduction or release approval. Real mainnet
+archives, independent build evidence and signed finalization remain pending.
+
+The new verifier exposed a portable-mode issue: archives assembled on Windows
+did not mark extensionless Linux workers as executable. Canonical archive modes
+now explicitly cover the launch helper, miner and both GPU workers; existing
+published RC archives have not been changed.
+
+Current local evidence: 19 release-set preflight tests and 12 assembler tests
+pass on Windows and Linux, including the real CLI against a temporary frozen
+Git fixture. The existing 153-test release-integrity suite passes on Linux;
+Windows passes 150 with three filesystem/platform-specific skips. These remain
+fixture-based packaging checks, not approval of actual mainnet builds.
+On CI commit `83c24f3`, both desktop jobs, wallet tests, MSRV, proof-codec and
+node-shutdown jobs passed; the full Rust job was still running at the last
+September 19 check. Do not infer its final outcome from those completed jobs.

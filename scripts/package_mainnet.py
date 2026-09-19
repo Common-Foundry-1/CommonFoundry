@@ -29,6 +29,15 @@ LAUNCH_TIME = 1791046800
 SOURCE_UTC = "2026-10-02T17:00:00Z"
 LAUNCH_UTC = "2026-10-03T17:00:00Z"
 BEACON_ROUND = 32747812
+BEACON_POLICY = {
+    "chain_hash": "52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971",
+    "public_key": "83cf0f2896adee7eb8b5f01fcad3912212c437e0073e911fb90022d3e760183c8c4b450b6a0a6c3ac6a5776a2d1064510d1"
+                  "fec758c921cc22b0e17e63aaf4bcb5ed66304de9cf809bd274ca73bab4af5a6e9c76a4bc09e76eae8991ef5ece45a",
+    "scheme": "bls-unchained-g1-rfc9380",
+    "genesis_time": 1692803367,
+    "period_seconds": 3,
+    "round": BEACON_ROUND,
+}
 MAX_INFO = 128 * 1024
 FIXED = "FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json"
 SHARED = "packaging/production-v4-pool/shared"
@@ -141,6 +150,8 @@ def validate_plan(data: bytes) -> dict:
     payload = plan["payload"]
     if not isinstance(payload, dict) or set(payload) != {"rules", "minimum_transaction_fee_atoms", "source_release_unix_seconds", "beacon"}:
         raise Error("invalid mainnet plan payload")
+    if canonical(payload["beacon"]) != canonical(BEACON_POLICY):
+        raise Error("mainnet plan has an unrecognized beacon policy")
     digest = hashlib.sha256(b"CMFD/MAINNET/LAUNCH-PLAN/V1\0" + json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
     if digest != root or integrity._rcnet_v2_derived_hash("CMFD/MAINNET/NETWORK-ID/V1", bytes.fromhex(root)).hex() != network:
         raise Error("mainnet plan derived identity mismatch")
@@ -160,10 +171,27 @@ def validate_info(data: bytes, plan: dict, commit: str) -> dict:
                 "source_commit": commit, "source_release_utc": SOURCE_UTC,
                 "mining_start_utc": LAUNCH_UTC, "launch_plan": plan,
                 "genesis_policy": "requires_verified_launch_beacon", "beacon_round": BEACON_ROUND}
-    if set(info) != set(expected) | {"activation_evidence_sha256"} or any(info.get(key) != value for key, value in expected.items()):
+    expected["activation_evidence_sha256"] = info.get("activation_evidence_sha256")
+    if canonical(info) != canonical(expected):
         raise Error("runtime does not match the mainnet plan and source commit")
     nonzero_hex(info["activation_evidence_sha256"], 64, "activation evidence digest")
     return info
+
+
+def validate_schedule(schedule: dict, plan: dict) -> None:
+    expected = {
+        "schema": "CMFD_MAINNET_LAUNCH_SCHEDULE_V1",
+        "source_release_unix_seconds": SOURCE_TIME,
+        "mining_start_unix_seconds": LAUNCH_TIME,
+        "source_release_utc": SOURCE_UTC,
+        "mining_start_utc": LAUNCH_UTC,
+        "beacon_round": BEACON_ROUND,
+    }
+    if any(schedule.get(key) != value for key, value in expected.items()) or schedule.get("mainnet_activation_authorized") is not False:
+        raise Error("launch helper uses another schedule")
+    for key in ("chain_hash", "public_key", "scheme"):
+        if schedule.get("beacon_" + key) != plan["payload"]["beacon"].get(key):
+            raise Error("launch helper uses another beacon")
 
 
 def package_sources(platform: str, kind: str) -> dict[str, str]:
@@ -307,6 +335,12 @@ def assemble(args: argparse.Namespace) -> Path:
         copy_executable(args.replay_worker, worker_root / "cmfd-v4-replay", "linux-x86_64")
         copy_executable(args.relation_worker, worker_root / "real_bank0_relations", "linux-x86_64")
         before = {path.relative_to(stage).as_posix(): file_identity(path) for path in stage.rglob("*") if path.is_file()}
+        executable_names = [role + extension for role in binaries] + [
+            ("production-v4/" if args.kind == "runtime" else "") + worker
+            for worker in ("cmfd-v4-replay", "real_bank0_relations")
+        ]
+        if len({before[name]["sha256"] for name in executable_names}) != len(executable_names):
+            raise Error("different executable roles must not reuse the same binary")
         directories = {path.relative_to(stage).as_posix() for path in stage.rglob("*") if path.is_dir()}
         identities = {}
         common_info = None
@@ -314,14 +348,7 @@ def assemble(args: argparse.Namespace) -> Path:
             executable = stage / (role + extension)
             if role == "cmfd-launch":
                 schedule = strict_json(native_output(executable, ["schedule"]), "launch schedule")
-                if schedule.get("schema") != "CMFD_MAINNET_LAUNCH_SCHEDULE_V1" or any(schedule.get(key) != value for key, value in {
-                    "source_release_unix_seconds": SOURCE_TIME, "mining_start_unix_seconds": LAUNCH_TIME,
-                    "source_release_utc": SOURCE_UTC, "mining_start_utc": LAUNCH_UTC,
-                    "beacon_round": BEACON_ROUND, "mainnet_activation_authorized": False,
-                }.items()):
-                    raise Error("launch helper uses another schedule")
-                if any(schedule.get("beacon_" + key) != value for key, value in plan["payload"]["beacon"].items() if key in ("chain_hash", "public_key", "scheme")):
-                    raise Error("launch helper uses another beacon")
+                validate_schedule(schedule, plan)
                 identities[role] = schedule
                 continue
             version = native_output(executable, ["--version"]).decode().strip().split()

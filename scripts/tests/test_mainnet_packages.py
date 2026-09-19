@@ -36,7 +36,7 @@ class MainnetPackageTests(unittest.TestCase):
                           "artifacts": {role: {"bytes": assets[name]["bytes"], "sha256": assets[name]["sha256"]}
                                         for role, name in (("bank", "MODEL-V2.bank"), ("fixed_record", packages.FIXED))}},
                 "minimum_transaction_fee_atoms": 1, "source_release_unix_seconds": packages.SOURCE_TIME,
-                "beacon": {"round": packages.BEACON_ROUND, "chain_hash": "1" * 64, "public_key": "2" * 192, "scheme": "bls-unchained-g1-rfc9380"},
+                "beacon": copy.deepcopy(packages.BEACON_POLICY),
             }, "launch_plan_digest": "", "network_id": "",
         }
         self.plan["launch_plan_digest"] = hashlib.sha256(b"CMFD/MAINNET/LAUNCH-PLAN/V1\0" + json.dumps(self.plan["payload"], separators=(",", ":")).encode()).hexdigest()
@@ -218,6 +218,13 @@ class MainnetPackageTests(unittest.TestCase):
         args.version = "0.1.0-rc.5"
         with self.assertRaisesRegex(packages.Error, "mainnet version"):
             self.assemble(args)
+
+    def test_distinct_worker_roles_require_distinct_binary_content(self):
+        args = self.args()
+        args.relation_worker.write_bytes(args.replay_worker.read_bytes())
+        with self.assertRaisesRegex(packages.Error, "same binary"):
+            self.assemble(args)
+        self.assertEqual(self.calls, [])
 
     def test_plan_mutation_duplicate_keys_and_noncanonical_documents_are_rejected(self):
         packages.validate_plan(self.plan_path.read_bytes())

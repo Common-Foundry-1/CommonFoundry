@@ -17,5 +17,7 @@ docs/consensus/production-v4-proof-algebra-v1.md text eol=lf
 packaging/standalone-miner/linux/start-miner.sh text eol=lf
 packaging/standalone-miner/windows/*.bat text eol=crlf
 packaging/mainnet/linux/*.sh text eol=lf
+packaging/mainnet/linux/*.service text eol=lf
+packaging/mainnet/linux/*.timer text eol=lf
 packaging/mainnet/windows/*.ps1 text eol=lf
 packaging/mainnet/windows/*.bat text eol=crlf

@@ -1,0 +1,16 @@
+[Unit]
+Description=Common Foundry mainnet storage reserve check
+
+[Service]
+Type=oneshot
+User=commonfoundry-mainnet
+Group=commonfoundry-mainnet
+ExecStart=/usr/bin/python3 /opt/commonfoundry-mainnet/current/mainnet-storage-readiness.py --data-dir /var/lib/commonfoundry-mainnet --enforce-reserve
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX
+StandardOutput=journal
+StandardError=journal

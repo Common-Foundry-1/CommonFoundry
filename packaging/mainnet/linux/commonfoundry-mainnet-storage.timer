@@ -1,0 +1,11 @@
+[Unit]
+Description=Check Common Foundry mainnet storage reserve every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=commonfoundry-mainnet-storage.service
+
+[Install]
+WantedBy=timers.target

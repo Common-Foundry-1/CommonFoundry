@@ -1,0 +1,52 @@
+[Unit]
+Description=Common Foundry mainnet seed node
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=commonfoundry-mainnet
+Group=commonfoundry-mainnet
+WorkingDirectory=/opt/commonfoundry-mainnet/current
+StateDirectory=commonfoundry-mainnet
+StateDirectoryMode=0700
+RuntimeDirectory=commonfoundry-mainnet
+RuntimeDirectoryMode=0700
+LoadCredential=wallet-passphrase:/etc/commonfoundry-mainnet/wallet-passphrase
+ExecStartPre=/opt/commonfoundry-mainnet/current/cmfd-node mainnet-launch-info
+ExecStartPre=/usr/bin/python3 /opt/commonfoundry-mainnet/current/mainnet-storage-readiness.py --data-dir /var/lib/commonfoundry-mainnet --enforce-reserve
+ExecStartPre=/usr/bin/install --mode=0600 %d/wallet-passphrase /run/commonfoundry-mainnet/wallet-passphrase
+ExecStartPre=/opt/commonfoundry-mainnet/current/cmfd-launch fetch --runtime /opt/commonfoundry-mainnet/current/cmfd-node --wait
+ExecStart=/opt/commonfoundry-mainnet/current/cmfd-node --data-dir /var/lib/commonfoundry-mainnet --wallet-passphrase-file /run/commonfoundry-mainnet/wallet-passphrase run --bind 127.0.0.1:29443 --p2p-bind 0.0.0.0:29444 --allow-public-peers --no-default-seeds
+TimeoutStartSec=infinity
+TimeoutStopSec=90
+Restart=on-failure
+RestartSec=15
+UMask=0077
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/commonfoundry-mainnet /opt/commonfoundry-mainnet/current/production-mainnet
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=commonfoundry-mainnet-node
+
+[Install]
+WantedBy=multi-user.target

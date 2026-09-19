@@ -203,7 +203,12 @@ def package_sources(platform: str, kind: str) -> dict[str, str]:
     windows = platform == "windows-x86_64"
     directory = "windows" if windows else "linux"
     if kind == "runtime":
+        sources["mainnet-storage-readiness.py"] = "scripts/mainnet_storage_readiness.py"
         launchers = ("START-WALLET.bat", "START-NODE.bat", "START-RUNTIME.ps1", "PREPARE-RUNTIME.ps1", "PREPARE-MINING.ps1", "PREPARE-MINING.bat") if windows else ("start-wallet.sh", "start-node.sh", "prepare-runtime.sh", "prepare-mining.sh")
+        if not windows:
+            sources["SERVICE-SETUP.md"] = "packaging/mainnet/linux/SERVICE-SETUP.md"
+            for name in ("commonfoundry-mainnet-node.service", "commonfoundry-mainnet-storage.service", "commonfoundry-mainnet-storage.timer"):
+                sources[name] = f"packaging/mainnet/linux/{name}"
     else:
         launchers = ("START-MINER.bat", "START-MINER.ps1") if windows else ("start-miner.sh",)
     sources.update({name: f"packaging/mainnet/{directory}/{name}" for name in launchers})

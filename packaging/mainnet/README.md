@@ -97,3 +97,9 @@ symlinks, duplicate members, noncanonical trailers and changed archives fail.
 The output binds the four archive hashes and explicitly remains unapproved and
 not independently reproduced. It is input to independent reproduction, review
 and final signing, not a substitute for those steps. It never uploads anything.
+
+Linux runtime packages also include isolated mainnet systemd templates and
+SERVICE-SETUP.md. They are not automatically installed or enabled. The bundled
+mainnet-storage-readiness.py is a read-only capacity planner/reserve check;
+it never prunes data. The existing RC seed and its credentials must remain
+untouched while preparing the separate mainnet directories and service account.

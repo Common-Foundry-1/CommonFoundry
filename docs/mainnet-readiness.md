@@ -125,9 +125,9 @@ and api3.drand.sh on 2026-09-19. Historical round 123 is the offline positive ve
 | Windows/Linux release packages | Native assembler and four package layouts implemented; actual builds await final configuration | Clean installs, signature/checksum verification, matching runtime identity |
 | Four-package release consistency | Offline archive/source/receipt reconciliation implemented | Actual four-archive preflight report followed by independent reproduction and signing |
 | Wallet preparation before activation | Encrypted creation with backup, restore, public address display and launch-wait UI implemented | Native custody tests plus rendered fixture checks; final signed-package rehearsal pending |
-| Seeds, discovery, explorer | RC evidence needs mainnet rehearsal | Independent node results and mainnet service configuration |
+| Seeds, discovery, explorer | Live RC seed checked healthy September 19; isolated mainnet service templates staged, not deployed | Independent node results and mainnet service configuration |
 | Pool payout and reorg lifecycle | Evidence collection pending | Mature-reward payout and reorg/restart reconciliation logs |
-| Storage capacity | Existing unpruned proof load needs a mainnet plan | Measured growth and provisioned capacity/retention decision |
+| Storage capacity | Live seed has about 274 GiB free; larger archival capacity versus pruning awaits owner decision | Measured growth and provisioned capacity/retention decision |
 | Model download availability | Primary host returned HTTP 200 and expected Content-Length for all 40 parts on September 19; GitHub fallback has only 4 model-bank parts | Full download/hash check during packaged rehearsal and a complete independent solo-input mirror |
 | Recovery and update | Rehearsal pending | Backup/restore, interrupted append, restart, upgrade/rollback results |
 | Final launch rehearsal | Pending | Exact intended packages, future-round start, delayed-beacon handling, fresh-wallet transfers |
@@ -218,3 +218,34 @@ fixture-based packaging checks, not approval of actual mainnet builds.
 On CI commit `83c24f3`, both desktop jobs, wallet tests, MSRV, proof-codec and
 node-shutdown jobs passed; the full Rust job was still running at the last
 September 19 check. Do not infer its final outcome from those completed jobs.
+
+## Read-only seed and capacity check (September 19)
+
+The established RC seed at `173.249.35.251` was checked without changing its
+services or files. At 21:51 UTC it was active, reported healthy storage at
+height 92, and had a 1,106,437,356-byte block log. The data filesystem had
+294,038,712,320 bytes available (about 274 GiB) out of 310,911,414,272 bytes.
+
+The new read-only storage tool derives a sizing scenario from the current
+12,025,320-byte proof, 16 MiB block limit, 1 MiB undo limit, 88-byte record
+overhead and 60-second target spacing. Proof payload alone projects to
+16.1272 GiB/day. Using maximum-sized records with a 1.25 record multiplier,
+a 20 GiB reserve and an additional copy of node model inputs gives a 30-day
+scenario requiring 990,515,338,869 available bytes. The observed host is short
+by 696,476,626,549 bytes in that scenario, reaching the reserve in about 8.29
+days. These are planning assumptions, not a hard arrival/disk-usage bound;
+checkpoints, backups and unrelated growth can require more space.
+
+Separate mainnet systemd templates use their own account, directories,
+credentials and ports. They authenticate the plan and wait for the exact beacon
+before node startup. A startup reserve check and a five-minute read-only storage
+timer are included. The timer reports pressure but does not stop a running node
+or prevent external disk consumption. No service, firewall, account or storage
+purchase has been applied. Operator capacity, alert delivery, the real sandbox
+and restart behavior still need qualification before deployment.
+The mainnet unit was confirmed `not-found` and its proposed TCP ports had no
+listeners. The RC service PID and September 12 start time remained unchanged
+throughout the audit. Nine storage/service tests pass on Linux; Windows passes
+eight and skips the Linux-only systemd parser check. The expanded 31 package
+tests still pass. Syntax checks use executable stubs and are not a live-service
+rehearsal.

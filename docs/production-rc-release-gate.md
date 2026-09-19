@@ -103,10 +103,10 @@ The currently provisioned RCNet-1 cold-start endpoint is
 
 Peer exchange can provide additional peers after first contact, so the seed is
 a cold-start aid rather than a permanent authority or consensus dependency.
-The host has been provisioned and the system service is staged but deliberately
-disabled. There is no live qualified RCNet seed until a release-gated binary
-and its authenticated ProductionV4 artifacts are installed, the service is
-enabled, and an external node proves public reachability and peer exchange.
+The initial host handoff staged the system service without enabling it. A later
+read-only check on September 19, 2026 confirmed the deployed RCNet service active,
+with healthy storage and height 92. That observation is RC operational evidence,
+not mainnet qualification; the October mainnet service remains separate.
 
 The seed's 300 GB disk is suitable only for a bounded RC rehearsal. At the
 measured 12,025,320-byte proof and 60-second target spacing, proof payload alone

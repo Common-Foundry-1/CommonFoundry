@@ -53,6 +53,7 @@ export interface NodeTransport {
   unlockWallet(passphrase: string): Promise<WalletCustodyStatus>;
   lockWallet(): Promise<WalletCustodyStatus>;
   backupWallet(path: string, passphrase: string): Promise<WalletCustodyStatus>;
+  createWallet(path: string, passphrase: string): Promise<WalletCustodyStatus>;
   chooseWalletBackupPath(restore: boolean): Promise<string | null>;
   migrateWalletEncryption(path: string, passphrase: string): Promise<WalletCustodyStatus>;
   restoreWallet(path: string, passphrase: string): Promise<WalletCustodyStatus>;
@@ -124,6 +125,7 @@ export const httpNodeTransport: NodeTransport = {
   unlockWallet: () => custodyUnavailable(),
   lockWallet: () => custodyUnavailable(),
   backupWallet: () => custodyUnavailable(),
+  createWallet: () => custodyUnavailable(),
   chooseWalletBackupPath: () => custodyUnavailable(),
   migrateWalletEncryption: () => custodyUnavailable(),
   restoreWallet: () => custodyUnavailable(),
@@ -261,6 +263,9 @@ export function createTauriNodeTransport(invoke: NativeInvoke): NodeTransport {
       "backup_wallet",
       { request: { path, passphrase } },
     ),
+    createWallet: (path, passphrase) => nativeCall<WalletCustodyStatus>(
+      invoke, "create_wallet", { request: { path, passphrase } },
+    ),
     migrateWalletEncryption: (path, passphrase) => nativeCall<WalletCustodyStatus>(
       invoke,
       "migrate_wallet_encryption",
@@ -331,6 +336,10 @@ export function lockWallet(): Promise<WalletCustodyStatus> {
 
 export function backupWallet(path: string, passphrase: string): Promise<WalletCustodyStatus> {
   return transport.backupWallet(path, passphrase);
+}
+
+export function createWallet(path: string, passphrase: string): Promise<WalletCustodyStatus> {
+  return transport.createWallet(path, passphrase);
 }
 
 export function chooseWalletBackupPath(restore: boolean): Promise<string | null> {

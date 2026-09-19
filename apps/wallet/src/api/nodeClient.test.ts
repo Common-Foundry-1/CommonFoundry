@@ -27,6 +27,7 @@ describe("Tauri node transport", () => {
     await transport.consolidateWallet({ fee: "0.00000001", max_inputs: 12 });
     await transport.mineDevnetBlock("22".repeat(32), 50);
     await transport.getWalletCustodyStatus();
+    await transport.createWallet("C:\\offline\\new.cmfd-backup", "correct horse battery staple");
     await transport.unlockWallet("correct horse battery staple");
     await transport.lockWallet();
     await transport.backupWallet("C:\\offline\\wallet.cmfd-backup", "correct horse battery staple");
@@ -43,6 +44,7 @@ describe("Tauri node transport", () => {
       ["consolidate_wallet", { request: { fee: "0.00000001", max_inputs: 12 } }],
       ["mine_devnet_block", { request: { miner: "22".repeat(32), attempts: 50 } }],
       ["get_wallet_custody_status", undefined],
+      ["create_wallet", { request: { path: "C:\\offline\\new.cmfd-backup", passphrase: "correct horse battery staple" } }],
       ["unlock_wallet", { request: { passphrase: "correct horse battery staple" } }],
       ["lock_wallet", undefined],
       ["backup_wallet", { request: { path: "C:\\offline\\wallet.cmfd-backup", passphrase: "correct horse battery staple" } }],

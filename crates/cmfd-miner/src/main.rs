@@ -176,6 +176,9 @@ struct ProductionV3Cli {
 enum Command {
     /// Print the canonical identity compiled into this miner without opening CUDA or artifacts.
     NetworkInfo,
+    /// Verify packaged mainnet identity without starting workers or waiting for genesis.
+    #[cfg(feature = "production-v4")]
+    MainnetLaunchInfo,
     /// List CUDA devices visible to the standalone miner.
     Devices {
         /// Path to the ForgeMatrix CUDA library. Defaults beside this executable.
@@ -600,11 +603,22 @@ struct WorkerThreadError {
 
 fn main() -> Result<()> {
     let command = Cli::parse().command;
+    #[cfg(feature = "production-v4")]
+    if matches!(&command, Command::MainnetLaunchInfo) {
+        std::io::stdout()
+            .lock()
+            .write_all(&cmfd_node::mainnet_runtime::canonical_mainnet_launch_info_json()?)?;
+        return Ok(());
+    }
     if !matches!(&command, Command::NetworkInfo | Command::Devices { .. }) {
         cmfd_node::mainnet_runtime::ensure_compiled_launch_ready()?;
     }
     match command {
         Command::NetworkInfo => write_miner_network_info(),
+        #[cfg(feature = "production-v4")]
+        Command::MainnetLaunchInfo => {
+            unreachable!("mainnet-launch-info exits before work dispatch")
+        }
         Command::Devices { cuda_library } => list_devices(cuda_library.as_deref()),
         Command::Mine {
             peers,

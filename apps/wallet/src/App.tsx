@@ -6,6 +6,7 @@ import { MobileNav } from "./components/MobileNav";
 import { MiningView } from "./components/MiningView";
 import { NetworkView } from "./components/NetworkView";
 import { Overview } from "./components/Overview";
+import { PrelaunchWallet } from "./components/PrelaunchWallet";
 import { ReceiveDialog } from "./components/ReceiveDialog";
 import { SendDialog } from "./components/SendDialog";
 import { Sidebar, type ViewName } from "./components/Sidebar";
@@ -64,8 +65,26 @@ export function App() {
     if (!data.starting) void refreshCustody();
   }, [data.starting, refreshCustody]);
 
+  const preparingLaunch = Boolean(custody?.launch && !custody.unlocked);
+  useEffect(() => {
+    if (!preparingLaunch) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const poll = async () => {
+      await refreshCustody();
+      if (!cancelled) timer = setTimeout(() => void poll(), 5_000);
+    };
+    timer = setTimeout(() => void poll(), 5_000);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [preparingLaunch, refreshCustody]);
+
   const custodyRequired = usesEmbeddedNode && custody !== null && !custody.unlocked;
   const custodyNeedsAttention = usesEmbeddedNode && (custody?.requires_migration || custodyRequired);
+
+  if (preparingLaunch && custody) {
+    return <PrelaunchWallet status={custody} statusError={custodyError} onStatusChange={setCustody}
+      onRefresh={async () => { await Promise.allSettled([data.refresh(), refreshCustody()]); }} />;
+  }
 
   if (data.starting || (data.loading && data.status === null && data.error === null)) {
     return <StartupScreen />;

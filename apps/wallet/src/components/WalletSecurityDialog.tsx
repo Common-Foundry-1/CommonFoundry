@@ -3,6 +3,7 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 
 import {
   backupWallet,
+  createWallet,
   chooseWalletBackupPath,
   lockWallet,
   migrateWalletEncryption,
@@ -27,7 +28,7 @@ interface WalletSecurityDialogProps {
 function defaultAction(status: WalletCustodyStatus | null): CustodyAction {
   if (!status || status.storage === "missing") return "create";
   if (status.storage === "plaintext") return "migrate";
-  return status.unlocked ? "backup" : "unlock";
+  return status.unlocked || (status.launch && !status.launch.ready && status.destination) ? "backup" : "unlock";
 }
 
 function passphraseBytes(value: string) {
@@ -93,7 +94,7 @@ export function WalletSecurityDialog({
 
   if (!open) return null;
 
-  const needsPath = action === "backup" || action === "migrate" || action === "restore";
+  const needsPath = action === "create" || action === "backup" || action === "migrate" || action === "restore";
   const needsConfirmation = action === "create" || action === "migrate";
   const passphraseLabel = action === "unlock" || action === "restore" || action === "backup"
     ? "Wallet passphrase"
@@ -125,7 +126,9 @@ export function WalletSecurityDialog({
     setConfirmation("");
     setBusy(true);
     try {
-      const next = action === "unlock" || action === "create"
+      const next = action === "create"
+        ? await createWallet(path, submittedPassphrase)
+        : action === "unlock"
         ? await unlockWallet(submittedPassphrase)
         : action === "backup"
           ? await backupWallet(path, submittedPassphrase)
@@ -139,9 +142,14 @@ export function WalletSecurityDialog({
           ? "Wallet encrypted and backup created. Unlock it to resume the node."
           : action === "restore"
             ? "Encrypted wallet restored. Unlock it to resume the node."
-            : "Wallet unlocked and the embedded node started.");
+            : next.unlocked
+              ? "Wallet unlocked and the embedded node started."
+              : action === "create"
+                ? "Encrypted wallet and backup created. Your signing key remains locked."
+                : "Receiving address verified. The signing key remains locked until you connect after launch.");
       await Promise.resolve(onRefresh()).catch(() => undefined);
       setPath("");
+      if (next.launch && !required) onClose();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "The wallet security operation failed.");
     } finally {
@@ -181,7 +189,7 @@ export function WalletSecurityDialog({
   const title = action === "create"
     ? "Create an encrypted wallet"
     : action === "unlock"
-      ? "Unlock wallet"
+      ? (status?.launch && !status.launch.ready ? "Show receiving address" : "Unlock wallet")
       : action === "backup"
         ? "Back up wallet"
         : action === "migrate"
@@ -236,8 +244,9 @@ export function WalletSecurityDialog({
           </div>
         ) : null}
 
-        {status?.storage === "encrypted" && status.unlocked ? (
+        {status?.storage === "encrypted" && (status.unlocked || status.launch) ? (
           <div className="custody-action-switch" role="group" aria-label="Wallet security choice">
+            {!status.unlocked ? <button className={action === "unlock" ? "is-active" : ""} type="button" onClick={() => setAction("unlock")} disabled={busy}>{status.launch?.ready ? "Unlock and connect" : "Show address"}</button> : null}
             <button className={action === "backup" ? "is-active" : ""} type="button" onClick={() => setAction("backup")} disabled={busy}>Create backup</button>
             <button type="button" onClick={() => void lockNow()} disabled={busy}>
               <LockKeyhole aria-hidden="true" size={14} /> Lock now
@@ -247,7 +256,9 @@ export function WalletSecurityDialog({
 
         <form className="form-stack" onSubmit={(event) => void submit(event)} noValidate>
           <p className="dialog-description">
-            {action === "migrate"
+            {action === "create"
+              ? "Create an encrypted wallet and a separate encrypted backup before connecting. No signing key is kept unlocked during preparation."
+              : action === "migrate"
               ? "This creates a separate authenticated backup first, then atomically replaces the local plaintext key with an encrypted copy."
               : action === "backup"
                 ? "The backup is independently encrypted and created with no-overwrite protection. The wallet locks while the backup is made."

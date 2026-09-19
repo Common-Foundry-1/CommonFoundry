@@ -17,6 +17,7 @@ commands.allow = [
   "unlock_wallet",
   "lock_wallet",
   "backup_wallet",
+  "create_wallet",
   "choose_wallet_backup_path",
   "migrate_wallet_encryption",
   "restore_wallet",

@@ -1037,11 +1037,13 @@ name = "cmfd-launch"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "ctrlc",
  "drand-verify",
  "hex",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "thiserror 2.0.20",
 ]
 
@@ -1169,6 +1171,7 @@ dependencies = [
  "base64 0.22.1",
  "cmfd-consensus",
  "cmfd-cuda",
+ "cmfd-launch",
  "cmfd-node",
  "cmfd-proof-worker",
  "hex",

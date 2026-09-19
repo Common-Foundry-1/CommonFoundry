@@ -7,6 +7,7 @@ import { WalletSecurityDialog } from "./WalletSecurityDialog";
 
 const apiMocks = vi.hoisted(() => ({
   backupWallet: vi.fn(),
+  createWallet: vi.fn(),
   chooseWalletBackupPath: vi.fn(),
   lockWallet: vi.fn(),
   migrateWalletEncryption: vi.fn(),
@@ -50,6 +51,23 @@ function renderDialog(status: WalletCustodyStatus) {
 }
 
 describe("WalletSecurityDialog", () => {
+  it("creates an encrypted wallet and backup without starting the node", async () => {
+    const user = userEvent.setup();
+    const prepared = { ...locked, destination: "11".repeat(32) };
+    apiMocks.chooseWalletBackupPath.mockResolvedValue("D:\\new-wallet.cmfd-backup");
+    apiMocks.createWallet.mockResolvedValue(prepared);
+    const { onStatusChange } = renderDialog({ ...locked, storage: "missing", can_restore: true });
+    await user.type(screen.getByLabelText("New wallet passphrase"), "correct horse battery staple");
+    await user.type(screen.getByLabelText("Confirm passphrase"), "correct horse battery staple");
+    await user.click(screen.getByRole("button", { name: "Create an encrypted wallet" }));
+    expect(apiMocks.createWallet).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "Choose save location…" }));
+    await user.click(screen.getByRole("button", { name: "Create an encrypted wallet" }));
+    expect(apiMocks.createWallet).toHaveBeenCalledWith("D:\\new-wallet.cmfd-backup", "correct horse battery staple");
+    expect(apiMocks.unlockWallet).not.toHaveBeenCalled();
+    expect(screen.getByLabelText("New wallet passphrase")).toHaveValue("");
+    expect(onStatusChange).toHaveBeenCalledWith(prepared);
+  });
   beforeEach(() => {
     for (const mock of Object.values(apiMocks)) mock.mockReset();
   });

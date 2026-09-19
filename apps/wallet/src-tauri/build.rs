@@ -11,8 +11,32 @@ fn main() {
         "get_mining_status",
         "start_mining",
         "stop_mining",
+        "get_wallet_custody_status",
+        "unlock_wallet",
+        "lock_wallet",
+        "backup_wallet",
+        "create_wallet",
+        "choose_wallet_backup_path",
+        "migrate_wallet_encryption",
+        "restore_wallet",
     ];
 
+    let registered: Vec<_> = include_str!("src/lib.rs")
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("commands::"))
+        .map(|command| command.trim_end_matches(','))
+        .collect();
+    assert_eq!(
+        registered.len(),
+        COMMANDS.len(),
+        "desktop command inventory drifted"
+    );
+    for command in registered {
+        assert!(
+            COMMANDS.contains(&command),
+            "desktop manifest is missing {command}"
+        );
+    }
     let wallet_permissions = include_str!("permissions/wallet-commands.toml");
     for command in COMMANDS {
         let permission = format!("\"{command}\",");

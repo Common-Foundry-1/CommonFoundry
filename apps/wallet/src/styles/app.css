@@ -2059,6 +2059,58 @@
   width: min(590px, 100%);
 }
 
+.prelaunch-wallet {
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
+.prelaunch-panel {
+  width: min(720px, 100%);
+  padding: clamp(20px, 4vw, 36px);
+  color: var(--ink-900);
+  background: var(--mineral-50);
+  border: 1px solid var(--mineral-300);
+  border-radius: 8px;
+  box-shadow: var(--shadow-dialog);
+}
+
+.prelaunch-panel .dialog-title {
+  font-size: 30px;
+}
+
+.prelaunch-panel .dialog-description {
+  margin: 16px 0;
+  font-size: 14px;
+}
+
+.prelaunch-panel .custody-summary {
+  margin: 24px 0;
+}
+
+.prelaunch-panel .custody-summary strong {
+  font-size: 14px;
+}
+
+.prelaunch-panel .custody-summary span,
+.prelaunch-panel .form-status {
+  font-size: 12px;
+}
+
+.prelaunch-panel .dialog-address-label,
+.prelaunch-panel .dialog-address {
+  margin: 12px 0;
+  font-size: 12px;
+}
+
+.prelaunch-panel .dialog-actions {
+  flex-wrap: wrap;
+  justify-content: flex-start;
+  margin: 24px 0 0;
+  padding: 20px 0 0;
+}
+
 .custody-summary {
   display: flex;
   align-items: center;

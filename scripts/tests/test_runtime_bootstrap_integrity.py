@@ -1,5 +1,6 @@
 """Bounded package fixtures exercise the downloader release gate, not real keys."""
 import base64
+import hashlib
 import json
 import sys
 import tempfile
@@ -13,6 +14,21 @@ from test_release_integrity import pe_x86_64_fixture, elf_x86_64_fixture
 
 
 class RuntimeBootstrapIntegrityTests(unittest.TestCase):
+    def test_source_input_manifest_matches_every_download_chunk_identity(self):
+        shared = Path(__file__).resolve().parents[2] / "packaging/production-v4-pool/shared"
+        inputs = json.loads((shared / "production-v4-rcnet-1-inputs.json").read_bytes())
+        chunks = json.loads((shared / "V4-INPUT-CHUNKS.json").read_bytes())
+        indexed = {item["name"]: item for item in chunks["files"]}
+        for item in inputs["files"]:
+            if item["name"] == integrity.PRODUCTION_V4_PACKAGE_FIXED_RECORD:
+                bundled = (shared / item["name"]).read_bytes()
+                self.assertEqual(item["bytes"], len(bundled))
+                self.assertEqual(item["sha256"], hashlib.sha256(bundled).hexdigest())
+                continue
+            self.assertIn(item["name"], indexed)
+            self.assertEqual(item["bytes"], indexed[item["name"]]["bytes"])
+            self.assertEqual(item["sha256"], indexed[item["name"]]["sha256"])
+
     def test_release_inventory_is_canonical_and_complete(self):
         repo = Path(__file__).resolve().parents[2]
         names, _ = integrity._inventory_names(

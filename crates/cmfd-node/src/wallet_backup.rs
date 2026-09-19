@@ -380,6 +380,23 @@ pub fn create_encrypted_wallet_backup(
     Ok(info)
 }
 
+/// Authenticate an existing encrypted key and return only its public destination.
+/// No node, chain storage, or network service is opened; the decrypted secret is
+/// zeroized on return. Header bytes alone are never trusted as an address.
+pub fn authenticate_encrypted_wallet(
+    data_dir: &Path,
+    network_id: [u8; 32],
+    passphrase: &[u8],
+) -> Result<[u8; 32], WalletBackupError> {
+    validate_passphrase(passphrase)?;
+    let _data_dir_lock = DataDirLock::acquire(data_dir)?;
+    if inspect_wallet_key_storage(data_dir)? != WalletKeyStorage::Encrypted {
+        return Err(WalletBackupError::InvalidWalletKey);
+    }
+    let (_secret, destination) = read_wallet_secret(data_dir, network_id, passphrase)?;
+    Ok(destination)
+}
+
 /// Creates a new encrypted wallet and an independently randomized encrypted
 /// backup for an explicit network identity. The backup is made durable before
 /// the live wallet is published, so an interrupted live-key write cannot lose
@@ -527,6 +544,42 @@ mod tests {
         let key = SigningKey::from_bytes(&[byte; 32]).unwrap();
         write_private_create_new(&data_dir.join(WALLET_KEY_FILE), &key.to_bytes()).unwrap();
         key.verifying_key().to_bytes().into()
+    }
+
+    #[test]
+    fn offline_authentication_requires_encryption_network_and_passphrase() {
+        let source = test_dir("offline-address");
+        let backup = source.with_extension("cmfd-backup");
+        let network = [0x92; 32];
+        let passphrase = b"correct horse battery staple";
+        let expected = create_encrypted_wallet(&source, &backup, network, passphrase).unwrap();
+        let before = fs::read(source.join(WALLET_KEY_FILE)).unwrap();
+        assert_eq!(
+            authenticate_encrypted_wallet(&source, network, passphrase).unwrap(),
+            expected.destination
+        );
+        assert!(matches!(
+            authenticate_encrypted_wallet(&source, network, b"wrong long passphrase"),
+            Err(WalletBackupError::AuthenticationFailed)
+        ));
+        assert!(matches!(
+            authenticate_encrypted_wallet(&source, [0x93; 32], passphrase),
+            Err(WalletBackupError::WrongNetwork)
+        ));
+        assert_eq!(fs::read(source.join(WALLET_KEY_FILE)).unwrap(), before);
+        let mut tampered = before;
+        tampered[HEADER_BYTES - 1] ^= 1;
+        fs::write(source.join(WALLET_KEY_FILE), tampered).unwrap();
+        assert!(authenticate_encrypted_wallet(&source, network, passphrase).is_err());
+        let plaintext = test_dir("offline-plaintext");
+        write_test_key(&plaintext, 0x42);
+        assert!(matches!(
+            authenticate_encrypted_wallet(&plaintext, network, passphrase),
+            Err(WalletBackupError::InvalidWalletKey)
+        ));
+        fs::remove_dir_all(source).unwrap();
+        fs::remove_dir_all(plaintext).unwrap();
+        fs::remove_file(backup).unwrap();
     }
 
     #[test]

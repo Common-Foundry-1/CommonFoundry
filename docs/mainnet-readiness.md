@@ -79,9 +79,26 @@ beacons are retryable and never cached; a successful authenticated result is
 retained immutably for the process. No caller-selected key, round, clock, or
 plan hash can override the compiled mainnet loader.
 
+`cmfd-launch fetch --runtime ABSOLUTE-NODE-OR-MINER-PATH --wait` now validates
+the package's pre-launch identity, waits for the exact start, and tries the
+three fixed drand relays for the same round. It verifies before publication,
+reuses valid cached certificates, preserves invalid existing files, and handles
+Ctrl+C, child-process timeouts and oversized responses. Mainnet Windows/Linux
+node/miner launchers prepare inputs before waiting and start only after the gate
+succeeds. The wallet opens its offline preparation interface before activation,
+creates an encrypted wallet with a separate backup, and authenticates existing
+keys before exposing their public receiving address. No decrypted signing key is
+retained by preparation. A cancellable background worker retrieves the beacon;
+the user explicitly unlocks and connects after verification. Node startup remains
+independently gated, including direct executable starts. Standalone nodes accept
+an external wallet passphrase file.
+The source checksum typo for fixed-bank-0.tree is corrected and cross-manifest
+consistency has a regression test. Node seed defaults now select the compiled
+network's port rather than hard-coding the RC port.
+
 **Mainnet integration remains incomplete.** Final pin values, accepted review
-evidence, beacon retrieval/waiting launchers, mainnet release packaging and
-finalization, and the real launch rehearsal are still pending. The runtime
+evidence, mainnet release packaging and finalization, and the real launch
+rehearsal are still pending. The runtime
 explicitly refuses legacy wire/fee defaults for a new mainnet ID.
 The proposed service ports are 29443/29444/29445, separate from RC; the current
 RC seed host is only a prospective endpoint until mainnet service provisioning
@@ -100,12 +117,13 @@ and api3.drand.sh on 2026-09-19. Historical round 123 is the offline positive ve
 |---|---|---|
 | One canonical source baseline | Readiness branch created from miner.2 | Final frozen source commit and source publication target |
 | Exact UTC release/mining schedule | Pinned in cmfd-launch | Schedule CLI and timestamp tests |
-| Signed launch-time entropy | Verifier and node/miner startup wiring implemented; retrieval/waiting launchers pending | Signature mutation vectors plus actual packaged replay and anti-precomputation rehearsal |
+| Signed launch-time entropy | Verifier, node/miner startup wiring and retrieval/waiting launchers implemented; packaged rehearsal pending | Signature mutation vectors plus actual packaged replay and anti-precomputation rehearsal |
 | Mainnet network/consensus identity | Shared identity registry and mainnet build feature implemented; final pin values pending | Final pinned plan and mainnet profile, distinct from RC |
 | Reward receiving addresses and custody | Awaiting owner decision | Public destinations plus custody/recovery evidence |
 | Independent reproduction and review | No accepted independent record located yet | Named reproducer, signed report, independent crypto/wallet review |
 | Dependency audit | rustls updated to 0.23.45 for RUSTSEC-2026-0285; 44 pool/TLS tests pass and cargo-audit reports zero vulnerabilities | Final build audit plus review of remaining informational dependency warnings |
 | Windows/Linux release packages | Pending mainnet configuration | Clean installs, signature/checksum verification, matching runtime identity |
+| Wallet preparation before activation | Encrypted creation with backup, restore, public address display and launch-wait UI implemented | Native custody tests plus rendered fixture checks; final signed-package rehearsal pending |
 | Seeds, discovery, explorer | RC evidence needs mainnet rehearsal | Independent node results and mainnet service configuration |
 | Pool payout and reorg lifecycle | Evidence collection pending | Mature-reward payout and reorg/restart reconciliation logs |
 | Storage capacity | Existing unpruned proof load needs a mainnet plan | Measured growth and provisioned capacity/retention decision |
@@ -127,9 +145,28 @@ cargo clippy --locked -p cmfd-launch --all-targets -- -D warnings
 cargo run --locked -p cmfd-launch -- schedule
 cargo test --locked -p cmfd-node --lib --features production-v4-testnet rcnet_candidate::
 cargo test --locked -p cmfd-node --lib --features production-v4-testnet mainnet_runtime::
+python -m unittest discover -s scripts/tests -p test_mainnet_launchers.py -v
+python -m unittest discover -s scripts/tests -p test_runtime_bootstrap_integrity.py -v
 ```
 
 The launch tests include a real historical BLS signature, every signature-byte
 mutation, old-round substitution under a future local clock, strict document
 bounds, and independently calculated SHA-256 vectors. They do not claim to
 possess or test the future October 3 signature.
+
+Beacon acquisition tests passed natively on Windows and Linux. The ignored
+`child_probe` is a subprocess fixture invoked by the deadline and output-limit
+tests, not a skipped readiness check. The launcher suite uses local stubs,
+including generated Windows console executables; it proves ordering and failure
+behavior without mining or contacting a pool. These checks do not substitute
+for the final signed-package launch rehearsal.
+
+Wallet preparation checks: 81 frontend tests and 32 ProductionV4 desktop library
+tests passed (the explicit hardware-only mining test was not run). Wrong
+passphrases, another network and altered encrypted-key headers are rejected.
+Offline creation/restore expose no node, peer manager or mining manager and do
+not create a block log. Strict desktop Clippy passes with default and V4 features.
+Playwright exercised the actual app at 1440x1000 and 390x844 using simulated
+Tauri responses: create/backup, address/QR copy, and launch-ready display; no
+console errors or horizontal overflow. Those UI fixtures do not demonstrate a
+live mainnet, native file-picker behavior, or the future activation signature.

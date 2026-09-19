@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+pub mod acquire;
+
 mod schedule;
 pub use schedule::*;
 pub const QUICKNET_GENESIS: u64 = 1_692_803_367;

@@ -1,6 +1,10 @@
 use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
@@ -22,6 +26,16 @@ struct Cli {
 enum Command {
     /// Print the exact release/start schedule and immutable beacon identity.
     Schedule,
+    /// Acquire the exact launch beacon after the packaged runtime verifies its
+    /// mainnet plan. Requires system curl; never contacts a latest-round URL.
+    Fetch {
+        /// Absolute path to the packaged cmfd-node or cmfd-miner executable.
+        #[arg(long)]
+        runtime: PathBuf,
+        /// Wait for launch and retry unavailable relays until Ctrl+C.
+        #[arg(long)]
+        wait: bool,
+    },
     /// Authenticate an offline beacon response against the frozen mainnet round.
     /// This tool does not activate a node or authorize mainnet release.
     Verify {
@@ -35,6 +49,13 @@ enum Command {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     match Cli::parse().command {
+        Command::Fetch { runtime, wait } => {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let handler = Arc::clone(&cancel);
+            ctrlc::set_handler(move || handler.store(true, Ordering::Release))?;
+            let path = cmfd_launch::acquire::acquire_for_runtime(&runtime, wait, &cancel)?;
+            println!("Verified launch beacon is ready: {}", path.display());
+        }
         Command::Schedule => println!(
             "{}",
             serde_json::to_string_pretty(&json!({

@@ -243,6 +243,19 @@ pub async fn choose_wallet_backup_path(
 }
 
 #[tauri::command]
+pub async fn create_wallet(
+    state: State<'_, RuntimeState>,
+    request: WalletFileRequest,
+) -> Result<WalletCustodyStatus, NodeClientError> {
+    let path = PathBuf::from(request.path);
+    let passphrase = request_passphrase(request.passphrase)?;
+    with_runtime(state.handle(), move |runtime| {
+        runtime.create(&path, &passphrase)
+    })
+    .await
+}
+
+#[tauri::command]
 pub async fn backup_wallet(
     state: State<'_, RuntimeState>,
     request: WalletFileRequest,

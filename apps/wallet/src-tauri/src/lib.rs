@@ -135,6 +135,7 @@ pub fn run() -> i32 {
             commands::unlock_wallet,
             commands::lock_wallet,
             commands::backup_wallet,
+            commands::create_wallet,
             commands::choose_wallet_backup_path,
             commands::migrate_wallet_encryption,
             commands::restore_wallet,

@@ -5,7 +5,7 @@ import type { WalletSnapshot } from "../types";
 
 interface ReceiveDialogProps {
   open: boolean;
-  wallet: WalletSnapshot | null;
+  wallet: Pick<WalletSnapshot, "destination" | "network" | "insecure_demo_wallet" | "warning"> | null;
   onClose: () => void;
 }
 

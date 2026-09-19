@@ -29,6 +29,7 @@ export interface WalletCustodyStatus {
   can_restore: boolean;
   data_directory: string;
   destination: string | null;
+  launch?: { mining_start_utc: string; ready: boolean; error: string | null } | null;
 }
 
 export interface ProofAdmissionClassTelemetry {

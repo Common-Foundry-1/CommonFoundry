@@ -55,7 +55,7 @@ use cmfd_node::rcnet_candidate::{
     MainnetLaunchPlan, RcnetLaunchCandidate, RcnetLaunchConfiguration, write_candidate_create_new,
     write_mainnet_plan_create_new,
 };
-use cmfd_node::seed_peers::{SystemSeedResolver, production_rc_seed_set};
+use cmfd_node::seed_peers::{SeedSet, SystemSeedResolver};
 use cmfd_node::storage::{inspect_block_log, repair_partial_block_log_tail};
 #[cfg(test)]
 use cmfd_node::wallet_backup::MAXIMUM_PASSPHRASE_BYTES;
@@ -2507,7 +2507,11 @@ fn effective_operational_peers(
         peers,
         allow_public_peers,
         no_default_seeds,
-        cfg!(feature = "production-rc"),
+        cfg!(any(
+            feature = "production-rc",
+            feature = "production-mainnet"
+        ))
+        .then(|| COMPILED_NETWORK_PROFILE.bootstrap_peer()),
     )
 }
 
@@ -2515,10 +2519,13 @@ fn effective_operational_peers_for_build(
     mut peers: Vec<SocketAddr>,
     mut allow_public_peers: bool,
     no_default_seeds: bool,
-    use_production_rc_seed: bool,
+    default_seed: Option<SocketAddr>,
 ) -> Result<(Vec<SocketAddr>, bool), Box<dyn std::error::Error>> {
-    if peers.is_empty() && !no_default_seeds && use_production_rc_seed {
-        peers = production_rc_seed_set().resolve(&SystemSeedResolver)?;
+    if peers.is_empty()
+        && !no_default_seeds
+        && let Some(seed) = default_seed
+    {
+        peers = SeedSet::new(vec![seed.to_string().parse()?])?.resolve(&SystemSeedResolver)?;
         allow_public_peers = true;
     }
     Ok((peers, allow_public_peers))
@@ -2736,22 +2743,36 @@ mod tests {
 
     #[test]
     fn production_rc_seed_defaults_are_explicit_replaceable_and_disableable() {
+        let seed = Some(cmfd_node::seed_peers::PRODUCTION_RC_SEED);
         let (defaults, public) =
-            effective_operational_peers_for_build(Vec::new(), false, false, true).unwrap();
+            effective_operational_peers_for_build(Vec::new(), false, false, seed).unwrap();
         assert_eq!(defaults, vec![cmfd_node::seed_peers::PRODUCTION_RC_SEED]);
         assert!(public);
 
         let explicit = vec!["10.1.2.3:19444".parse().unwrap()];
         assert_eq!(
-            effective_operational_peers_for_build(explicit.clone(), false, false, true).unwrap(),
+            effective_operational_peers_for_build(explicit.clone(), false, false, seed).unwrap(),
             (explicit, false)
         );
         assert_eq!(
-            effective_operational_peers_for_build(Vec::new(), false, true, true).unwrap(),
+            effective_operational_peers_for_build(Vec::new(), false, true, seed).unwrap(),
             (Vec::new(), false)
         );
         assert_eq!(
-            effective_operational_peers_for_build(Vec::new(), false, false, false).unwrap(),
+            effective_operational_peers_for_build(Vec::new(), false, false, None).unwrap(),
+            (Vec::new(), false)
+        );
+    }
+
+    #[test]
+    fn mainnet_seed_selection_keeps_the_mainnet_port() {
+        let seed = "173.249.35.251:29444".parse().unwrap();
+        let (peers, public) =
+            effective_operational_peers_for_build(Vec::new(), false, false, Some(seed)).unwrap();
+        assert_eq!(peers, vec![seed]);
+        assert!(public);
+        assert_eq!(
+            effective_operational_peers_for_build(Vec::new(), false, true, Some(seed)).unwrap(),
             (Vec::new(), false)
         );
     }

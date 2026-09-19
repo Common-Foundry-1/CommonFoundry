@@ -37,6 +37,7 @@ tauri-build = { version = "=2.6.3", features = [] }
 base64 = "0.22"
 cmfd-consensus = { path = "../../../crates/cmfd-consensus" }
 cmfd-cuda = { path = "../../../crates/cmfd-cuda" }
+cmfd-launch = { path = "../../../crates/cmfd-launch" }
 cmfd-node = { path = "../../../crates/cmfd-node" }
 cmfd-proof-worker = { path = "../../../crates/cmfd-proof-worker" }
 hex.workspace = true

@@ -14,9 +14,9 @@ use std::{io, os::windows::process::CommandExt};
 use cmfd_node::p2p::{InboundPeerHandle, PeerDiscovery, spawn_inbound_listener_with_discovery};
 use cmfd_node::peer::{PeerAddressPolicy, PeerLimits};
 use cmfd_node::wallet_backup::{
-    WalletBackupError, WalletKeyStorage, create_encrypted_wallet_backup,
-    inspect_wallet_key_storage, migrate_plaintext_wallet_key, read_wallet_passphrase_file,
-    restore_encrypted_wallet_backup,
+    WalletBackupError, WalletKeyStorage, authenticate_encrypted_wallet, create_encrypted_wallet,
+    create_encrypted_wallet_backup, inspect_wallet_key_storage, migrate_plaintext_wallet_key,
+    read_wallet_passphrase_file, restore_encrypted_wallet_backup,
 };
 use cmfd_node::{
     COMPILED_NETWORK_PROFILE, NetworkProfile, Node, NodeClientError, NodeError,
@@ -32,6 +32,7 @@ use crate::mining::MiningManager;
 use crate::mining::ProductionV4PoolSearchAssets;
 
 mod config;
+mod launch;
 mod peers;
 
 pub(crate) use config::{ConfigError, NodeRuntimeConfig, ProcessCommand};
@@ -73,6 +74,8 @@ struct RuntimeParts {
     mining: Option<Arc<MiningManager>>,
     peers: Option<Arc<PeerManager>>,
     services: Option<ServiceHandles>,
+    // Public data only; offline preparation never keeps an unlocked signing key.
+    prepared_destination: Option<[u8; 32]>,
 }
 
 #[derive(Clone)]
@@ -82,6 +85,7 @@ pub(crate) struct RuntimeHandle {
     stopping: Arc<AtomicBool>,
     config: NodeRuntimeConfig,
     data_dir: Result<PathBuf, NodeClientError>,
+    launch: Arc<launch::LaunchPreparation>,
 }
 
 pub struct RuntimeState {
@@ -100,6 +104,7 @@ pub(crate) struct WalletCustodyStatus {
     pub can_restore: bool,
     pub data_directory: String,
     pub destination: Option<String>,
+    pub launch: Option<launch::WalletLaunchStatus>,
 }
 
 impl RuntimeParts {
@@ -109,6 +114,7 @@ impl RuntimeParts {
             mining: None,
             peers: None,
             services: None,
+            prepared_destination: None,
         }
     }
 
@@ -127,6 +133,7 @@ impl RuntimeParts {
             node: NodeAvailability::Ready(started.node),
             peers: Some(started.peers),
             services: Some(started.services),
+            prepared_destination: None,
         }
     }
 
@@ -136,6 +143,7 @@ impl RuntimeParts {
             mining: None,
             peers: None,
             services: None,
+            prepared_destination: None,
         }
     }
 }
@@ -166,13 +174,16 @@ impl RuntimeState {
             .as_ref()
             .ok()
             .map(|path| cmfd_node::logging::init_tracing(path, config.verbose));
+        let stopping = Arc::new(AtomicBool::new(false));
+        let launch = Arc::new(launch::LaunchPreparation::start(Arc::clone(&stopping)));
         let handle = RuntimeHandle {
             inner: Arc::new(Mutex::new(match &data_dir {
                 Ok(_) => RuntimeParts::starting(),
                 Err(error) => RuntimeParts::failed(error.clone()),
             })),
             operation: Arc::new(Mutex::new(())),
-            stopping: Arc::new(AtomicBool::new(false)),
+            stopping,
+            launch,
             config: config.clone(),
             data_dir: data_dir.clone(),
         };
@@ -290,6 +301,7 @@ impl RuntimeState {
 
     pub fn stop_services(&self) {
         self.handle.stopping.store(true, Ordering::Release);
+        self.handle.launch.stop();
         if let Ok(mut runtime) = self.handle.inner.lock() {
             stop_runtime_parts(&mut runtime);
         }
@@ -307,6 +319,7 @@ impl RuntimeState {
                 operation: Arc::new(Mutex::new(())),
                 stopping: Arc::new(AtomicBool::new(false)),
                 config: NodeRuntimeConfig::default_for_test(),
+                launch: Arc::default(),
                 data_dir: Err(startup_error(
                     "data_directory_unavailable",
                     "test data directory unavailable",
@@ -325,6 +338,7 @@ impl RuntimeState {
                 operation: Arc::new(Mutex::new(())),
                 stopping: Arc::new(AtomicBool::new(false)),
                 config: NodeRuntimeConfig::default_for_test(),
+                launch: Arc::default(),
                 data_dir: Ok(PathBuf::from("test-wallet-data")),
             },
             _log_guard: None,
@@ -339,6 +353,7 @@ impl RuntimeHandle {
     }
 
     fn custody_status_inner(&self) -> Result<WalletCustodyStatus, NodeClientError> {
+        let launch = self.launch.status()?;
         let data_dir = self.data_dir.as_ref().map_err(Clone::clone)?;
         let storage = inspect_wallet_key_storage(data_dir).map_err(custody_error)?;
         let runtime = self.inner.lock().map_err(|_| runtime_state_error())?;
@@ -349,7 +364,7 @@ impl RuntimeHandle {
                     .map_err(|_| runtime_state_error())?
                     .wallet_destination(),
             )),
-            NodeAvailability::Failed(_) => None,
+            NodeAvailability::Failed(_) => runtime.prepared_destination.map(hex::encode),
         };
         Ok(WalletCustodyStatus {
             network: COMPILED_NETWORK_PROFILE.name.to_owned(),
@@ -363,6 +378,7 @@ impl RuntimeHandle {
             can_restore: storage == WalletKeyStorage::Missing,
             data_directory: data_dir.display().to_string(),
             destination,
+            launch,
         })
     }
 
@@ -394,6 +410,19 @@ impl RuntimeHandle {
                 "Encrypt and back up this wallet before using lock controls.",
                 false,
             ));
+        }
+        if self.launch.status()?.is_some_and(|launch| !launch.ready) {
+            let destination = authenticate_encrypted_wallet(
+                data_dir,
+                COMPILED_NETWORK_PROFILE.network_id,
+                passphrase,
+            )
+            .map_err(custody_error)?;
+            self.inner
+                .lock()
+                .map_err(|_| runtime_state_error())?
+                .prepared_destination = Some(destination);
+            return self.custody_status_inner();
         }
         let started = start_embedded_node(data_dir, &self.config, Some(passphrase))?;
         let mut runtime = self.inner.lock().map_err(|_| runtime_state_error())?;
@@ -437,6 +466,30 @@ impl RuntimeHandle {
         self.custody_status_inner()
     }
 
+    pub(crate) fn create(
+        &self,
+        backup_output: &Path,
+        passphrase: &[u8],
+    ) -> Result<WalletCustodyStatus, NodeClientError> {
+        require_absolute_custody_path(backup_output)?;
+        let _operation = self.operation.lock().map_err(|_| runtime_state_error())?;
+        self.launch.status()?;
+        let data_dir = self.data_dir.as_ref().map_err(Clone::clone)?;
+        self.stop_and_mark_locked()?;
+        let info = create_encrypted_wallet(
+            data_dir,
+            backup_output,
+            COMPILED_NETWORK_PROFILE.network_id,
+            passphrase,
+        )
+        .map_err(custody_error)?;
+        self.inner
+            .lock()
+            .map_err(|_| runtime_state_error())?
+            .prepared_destination = Some(info.destination);
+        self.custody_status_inner()
+    }
+
     pub(crate) fn migrate(
         &self,
         backup_output: &Path,
@@ -465,13 +518,18 @@ impl RuntimeHandle {
         let _operation = self.operation.lock().map_err(|_| runtime_state_error())?;
         let data_dir = self.data_dir.as_ref().map_err(Clone::clone)?;
         self.stop_and_mark_locked()?;
-        restore_encrypted_wallet_backup(
+        self.launch.status()?;
+        let info = restore_encrypted_wallet_backup(
             input,
             data_dir,
             COMPILED_NETWORK_PROFILE.network_id,
             passphrase,
         )
         .map_err(custody_error)?;
+        self.inner
+            .lock()
+            .map_err(|_| runtime_state_error())?
+            .prepared_destination = Some(info.destination);
         self.custody_status_inner()
     }
 
@@ -491,6 +549,9 @@ fn start_embedded_node(
     config: &NodeRuntimeConfig,
     wallet_passphrase: Option<&[u8]>,
 ) -> Result<EmbeddedNode, NodeClientError> {
+    // Resolve launch authority before expensive artifact loading or any node I/O.
+    cmfd_node::mainnet_runtime::ensure_compiled_launch_ready()
+        .map_err(|error| error.client_error())?;
     let security = prepare_node_security(COMPILED_NETWORK_PROFILE, config)?;
     let PreparedNodeSecurity {
         production_v3_record,
@@ -1236,6 +1297,37 @@ mod tests {
         let expected = (profile.proof == ProofProfile::ProductionV3)
             .then(|| sha256(b"bounded worker fixture"));
         prepare_node_security_with_package(profile, config, &package_executable, expected)
+    }
+
+    #[test]
+    fn offline_create_and_restore_expose_only_public_destination() {
+        let files = TestFiles::new();
+        let state = RuntimeState::failed_for_test(wallet_locked_error());
+        let mut handle = state.handle();
+        handle.data_dir = Ok(files.root.join("wallet"));
+        let passphrase = b"correct horse battery staple";
+        let backup = files.root.join("wallet.cmfd-backup");
+        let created = handle.create(&backup, passphrase).unwrap();
+        assert_eq!(created.storage, "encrypted");
+        assert!(!created.unlocked);
+        assert!(created.destination.is_some());
+        assert!(state.node().is_err());
+        assert!(state.mining().is_err());
+        assert!(state.peers().is_err());
+        let original = fs::read(files.root.join("wallet/wallet.key")).unwrap();
+        assert!(handle.create(&backup, passphrase).is_err());
+        assert_eq!(
+            fs::read(files.root.join("wallet/wallet.key")).unwrap(),
+            original
+        );
+        let locked = handle.lock().unwrap();
+        assert!(locked.destination.is_none());
+        handle.data_dir = Ok(files.root.join("restored"));
+        let restored = handle.restore(&backup, passphrase).unwrap();
+        assert_eq!(restored.destination, created.destination);
+        assert!(!restored.unlocked);
+        assert!(state.node().is_err());
+        assert!(!files.root.join("restored/blocks.log").exists());
     }
 
     #[test]

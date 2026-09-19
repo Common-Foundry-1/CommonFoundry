@@ -70,6 +70,7 @@ pub(crate) mod exchange_withdrawal;
 pub(crate) mod exchange_withdrawal_v3;
 pub mod explorer;
 pub mod logging;
+pub mod mainnet_runtime;
 pub mod network_info;
 pub mod network_profile;
 pub mod p2p;
@@ -432,6 +433,10 @@ pub enum NodeError {
     ),
     #[error("the compiled ProductionV4 network requires its in-process verifier authority")]
     ProductionV4Unavailable,
+    #[error("mainnet startup requires the authenticated launch plan and beacon")]
+    MainnetLaunchRequired,
+    #[error("mainnet launch evidence is invalid: {0}")]
+    MainnetLaunchEvidence(&'static str),
     #[error(
         "ProductionV4 runtime files are missing: production-v4/MODEL-V2.bank and production-v4/FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json"
     )]
@@ -619,6 +624,8 @@ impl NodeError {
             #[cfg(feature = "production-v3")]
             Self::ProductionV3Artifacts(_) => ("proof_verifier_configuration", 500, false),
             Self::ProductionV4Unavailable => ("production_v4_unavailable", 503, false),
+            Self::MainnetLaunchRequired => ("mainnet_launch_required", 503, true),
+            Self::MainnetLaunchEvidence(_) => ("mainnet_launch_evidence", 500, false),
             Self::ProductionV4ArtifactsMissing => ("production_v4_artifacts_missing", 500, false),
             Self::ProductionV4ArtifactsUnexpected
             | Self::ProductionV4ArtifactPinsMissing
@@ -4162,6 +4169,21 @@ pub(crate) fn network_params_and_verifier_for_profile(
     production_v3_record: Option<&ProductionV3VerifierRecord>,
     production_v4_artifacts: Option<&ProductionV4VerifierArtifacts>,
 ) -> Result<(NetworkParams, ConsensusPowVerifier), NodeError> {
+    network_params_and_verifier_with_launch(
+        profile,
+        production_v3_record,
+        production_v4_artifacts,
+        None,
+    )
+}
+
+fn network_params_and_verifier_with_launch(
+    profile: NetworkProfile,
+    production_v3_record: Option<&ProductionV3VerifierRecord>,
+    production_v4_artifacts: Option<&ProductionV4VerifierArtifacts>,
+    launch: Option<&mainnet_runtime::AuthenticatedMainnetRuntime>,
+) -> Result<(NetworkParams, ConsensusPowVerifier), NodeError> {
+    mainnet_runtime::require_authenticated_profile(profile, launch)?;
     let verifier = match profile.proof {
         ProofProfile::DevnetV2Reference => {
             if production_v3_record.is_some() || production_v4_artifacts.is_some() {
@@ -4255,7 +4277,8 @@ pub(crate) fn network_params_and_verifier_for_profile(
             }
         }
     };
-    network_params_from_verifier(profile, verifier)
+    let params = network_params_from_pow_with_launch(profile, verifier.parameters(), launch)?;
+    Ok((params, verifier))
 }
 
 #[cfg(feature = "production-v4")]
@@ -4375,6 +4398,7 @@ impl<R: Read> Read for ProductionV4PinnedReader<R> {
     }
 }
 
+#[cfg(feature = "production-v3")]
 fn network_params_from_verifier(
     profile: NetworkProfile,
     verifier: ConsensusPowVerifier,
@@ -4384,10 +4408,20 @@ fn network_params_from_verifier(
     Ok((params, verifier))
 }
 
+#[cfg(any(feature = "production-v3", feature = "production-v4"))]
 fn network_params_from_pow(
     profile: NetworkProfile,
     pow: PowParameters,
 ) -> Result<NetworkParams, NodeError> {
+    network_params_from_pow_with_launch(profile, pow, None)
+}
+
+fn network_params_from_pow_with_launch(
+    profile: NetworkProfile,
+    pow: PowParameters,
+    launch: Option<&mainnet_runtime::AuthenticatedMainnetRuntime>,
+) -> Result<NetworkParams, NodeError> {
+    mainnet_runtime::require_authenticated_profile(profile, launch)?;
     let params = NetworkParams {
         network_id: profile.network_id,
         protocol_version: NETWORK_PROTOCOL_VERSION,
@@ -4662,6 +4696,28 @@ fn build_template_from_state(
 }
 
 impl Node {
+    /// Open mainnet only with the opaque result of plan/beacon authentication.
+    /// The same immutable parameters govern startup replay and live admission.
+    #[cfg(feature = "production-v4")]
+    pub fn open_with_authenticated_mainnet(
+        data_dir: impl AsRef<Path>,
+        launch: &mainnet_runtime::AuthenticatedMainnetRuntime,
+        artifacts: &ProductionV4VerifierArtifacts,
+        wallet_passphrase: Option<&[u8]>,
+    ) -> Result<Self, NodeError> {
+        Self::open_with_profile_artifacts_worker_exchange_and_launch(
+            data_dir,
+            launch.profile(),
+            None,
+            None,
+            Some(artifacts),
+            None,
+            wallet_passphrase,
+            None,
+            Some(launch),
+        )
+    }
+
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self, NodeError> {
         Self::open_with_profile(data_dir, COMPILED_NETWORK_PROFILE)
     }
@@ -4893,10 +4949,36 @@ impl Node {
         wallet_passphrase: Option<&[u8]>,
         exchange_withdrawal_security: Option<&ExchangeWithdrawalSecurityConfig>,
     ) -> Result<Self, NodeError> {
-        let (params, verifier) = network_params_and_verifier_for_profile(
+        Self::open_with_profile_artifacts_worker_exchange_and_launch(
+            data_dir,
+            profile,
+            production_v3_record,
+            production_v3_artifacts,
+            production_v4_artifacts,
+            verifier_worker,
+            wallet_passphrase,
+            exchange_withdrawal_security,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_with_profile_artifacts_worker_exchange_and_launch(
+        data_dir: impl AsRef<Path>,
+        profile: NetworkProfile,
+        production_v3_record: Option<&ProductionV3VerifierRecord>,
+        production_v3_artifacts: Option<ProductionV3VerifierArtifacts>,
+        production_v4_artifacts: Option<&ProductionV4VerifierArtifacts>,
+        verifier_worker: Option<VerifierWorkerConfig>,
+        wallet_passphrase: Option<&[u8]>,
+        exchange_withdrawal_security: Option<&ExchangeWithdrawalSecurityConfig>,
+        launch: Option<&mainnet_runtime::AuthenticatedMainnetRuntime>,
+    ) -> Result<Self, NodeError> {
+        let (params, verifier) = network_params_and_verifier_with_launch(
             profile,
             production_v3_record,
             production_v4_artifacts,
+            launch,
         )?;
         let block_preverifier = BlockPreverifier::new(verifier.clone(), profile.proof);
         let external_replay = verifier_worker.is_some();
@@ -9286,7 +9368,10 @@ fn load_or_create_wallet_key(
                 .map_err(|source| io_error("inspect wallet key", &path, source))?
                 .len();
             if length == 32 {
-                if matches!(profile.kind, NetworkProfileKind::Rcnet) {
+                if matches!(
+                    profile.kind,
+                    NetworkProfileKind::Rcnet | NetworkProfileKind::Mainnet
+                ) {
                     return Err(NodeError::WalletKeyEncryptionRequired);
                 }
                 let mut secret = Zeroizing::new([0_u8; 32]);
@@ -9334,14 +9419,22 @@ fn load_or_create_wallet_key(
             } else {
                 random_wallet_signing_key()?
             };
-            if matches!(profile.kind, NetworkProfileKind::Rcnet) && legacy {
+            if matches!(
+                profile.kind,
+                NetworkProfileKind::Rcnet | NetworkProfileKind::Mainnet
+            ) && legacy
+            {
                 return Err(NodeError::InvalidWalletKey);
             }
             match wallet_passphrase {
                 Some(passphrase) => {
                     write_encrypted_wallet_key(&path, &key, profile.network_id, passphrase)?
                 }
-                None if matches!(profile.kind, NetworkProfileKind::Rcnet) => {
+                None if matches!(
+                    profile.kind,
+                    NetworkProfileKind::Rcnet | NetworkProfileKind::Mainnet
+                ) =>
+                {
                     return Err(NodeError::WalletLocked);
                 }
                 None => write_wallet_key(&path, &key)?,

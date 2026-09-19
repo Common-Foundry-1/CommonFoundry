@@ -40,6 +40,7 @@ pub enum NetworkProfileKind {
     ProductionV3Testnet,
     ProductionV4Testnet,
     Rcnet,
+    Mainnet,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +68,7 @@ impl NetworkProfile {
             NetworkProfileKind::ProductionV3Testnet => "ProductionV3 Testnet-1",
             NetworkProfileKind::ProductionV4Testnet => "ProductionV4 Testnet-1",
             NetworkProfileKind::Rcnet => "RCNet-1",
+            NetworkProfileKind::Mainnet => "Mainnet",
         }
     }
 
@@ -80,6 +82,7 @@ impl NetworkProfile {
                 "Private ProductionV4 latency test network · Not RCNet or mainnet"
             }
             NetworkProfileKind::Rcnet => "Release-candidate rehearsal network · Not mainnet",
+            NetworkProfileKind::Mainnet => "Common Foundry mainnet",
         }
     }
 
@@ -89,6 +92,7 @@ impl NetworkProfile {
             NetworkProfileKind::ProductionV3Testnet => "ProductionV3 end-to-end testing",
             NetworkProfileKind::ProductionV4Testnet => "ProductionV4 latency and admission testing",
             NetworkProfileKind::Rcnet => "Launch rehearsal",
+            NetworkProfileKind::Mainnet => "Mainnet",
         }
     }
 
@@ -106,6 +110,7 @@ impl NetworkProfile {
                 "Common Foundry Wallet — ProductionV4 Testnet-1"
             }
             NetworkProfileKind::Rcnet => "Common Foundry Wallet — RCNet-1",
+            NetworkProfileKind::Mainnet => "Common Foundry Wallet — Mainnet",
         }
     }
 
@@ -135,6 +140,12 @@ impl NetworkProfile {
             (NetworkProfileKind::Rcnet, false) => {
                 "RCNet-1 release-candidate wallet: back up wallet.key before testing recovery. This is not mainnet."
             }
+            (NetworkProfileKind::Mainnet, true) => {
+                "Mainnet cannot use a legacy shared development wallet key."
+            }
+            (NetworkProfileKind::Mainnet, false) => {
+                "Common Foundry mainnet wallet. Keep an encrypted backup in a separate location."
+            }
         }
     }
 
@@ -144,6 +155,7 @@ impl NetworkProfile {
             NetworkProfileKind::ProductionV3Testnet => "commonfoundry-miner-production-v3-testnet1",
             NetworkProfileKind::ProductionV4Testnet => "commonfoundry-miner-production-v4-testnet1",
             NetworkProfileKind::Rcnet => "commonfoundry-miner-rcnet1",
+            NetworkProfileKind::Mainnet => "commonfoundry-miner-mainnet",
         }
     }
 

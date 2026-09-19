@@ -366,7 +366,9 @@ fn canonical_network_info_json_for_profile(
                     )
                 }
                 NetworkProfileKind::ProductionV3Testnet => (None, None),
-                NetworkProfileKind::Devnet | NetworkProfileKind::ProductionV4Testnet => {
+                NetworkProfileKind::Devnet
+                | NetworkProfileKind::ProductionV4Testnet
+                | NetworkProfileKind::Mainnet => {
                     unreachable!("only ProductionV3 profiles can select ProductionV3 parameters")
                 }
             };
@@ -435,7 +437,9 @@ fn canonical_network_info_json_for_profile(
                     )
                 }
                 NetworkProfileKind::ProductionV4Testnet => (None, None),
-                NetworkProfileKind::Devnet | NetworkProfileKind::ProductionV3Testnet => {
+                NetworkProfileKind::Devnet
+                | NetworkProfileKind::ProductionV3Testnet
+                | NetworkProfileKind::Mainnet => {
                     unreachable!("only ProductionV4 profiles can select ProductionV4 parameters")
                 }
             };

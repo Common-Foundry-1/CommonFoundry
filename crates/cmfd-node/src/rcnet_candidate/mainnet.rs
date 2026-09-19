@@ -195,6 +195,46 @@ impl MainnetLaunchPlan {
             now_unix_seconds,
         )?)
     }
+
+    pub(crate) fn profile_after_launch(
+        &self,
+        launch: &AuthenticatedLaunch,
+    ) -> Result<crate::NetworkProfile, RcnetCandidateError> {
+        if launch.launch_plan_digest() != self.digest()? || launch.round() != MAINNET_BEACON_ROUND {
+            return Err(RcnetCandidateError::DerivedIdentityMismatch);
+        }
+        Ok(crate::NetworkProfile {
+            kind: crate::NetworkProfileKind::Mainnet,
+            proof: crate::ProofProfile::ProductionV4,
+            name: MAINNET_PROFILE,
+            network_id: self.network_id()?,
+            virtual_genesis_hash: launch.genesis_hash(),
+            virtual_genesis_timestamp: MAINNET_LAUNCH_UNIX_SECONDS,
+            pow_limit: decode_hex32(&self.payload.rules.proof_of_work.pow_limit)?,
+            rewards: crate::network_profile::RewardDestinations {
+                steward: decode_hex32(
+                    &self
+                        .payload
+                        .rules
+                        .reward_destinations
+                        .steward_xonly_public_key,
+                )?,
+                community: decode_hex32(
+                    &self
+                        .payload
+                        .rules
+                        .reward_destinations
+                        .community_xonly_public_key,
+                )?,
+            },
+            rpc_port: 29_443,
+            p2p_port: 29_444,
+            pool_port: 29_445,
+            bootstrap_ipv4: crate::network_profile::PRODUCTION_RC_SEED_IPV4,
+            default_data_dir_identity: "commonfoundry-mainnet",
+            wallet_data_dir_identity: "mainnet",
+        })
+    }
 }
 
 fn payload_digest(payload: &MainnetLaunchPayload) -> Result<[u8; 32], RcnetCandidateError> {

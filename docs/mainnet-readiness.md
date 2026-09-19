@@ -53,9 +53,21 @@ It does not guarantee equal Internet latency or equal mining hardware. It preven
 useful advance work only when the authenticated genesis is required by every
 node, pool, wallet, mining, replay, and block-validation entry point.
 
-The cryptographic component, canonical plan builder, and CLIs are the first implementation increment.
-**Runtime/mainnet integration is not complete.** Existing RCNet identities and
-consensus remain unchanged. A successful CLI verification is not mainnet approval.
+The verifier, canonical plan builder, and opaque mainnet runtime context now
+exist. The shared node-opening path requires that context before opening any
+artifacts or chain storage. Its authenticated genesis feeds the same immutable
+parameters used by replay, block admission, and the thin-miner parameter API.
+Bare public mainnet profiles and mutated contexts are rejected. Mainnet wallet
+keys follow the encrypted-key requirement.
+
+**Runtime/mainnet integration is not complete.** Final plan/approval pins,
+consensus network-ID registration for V4 frame limits and the fee floor, CLI/GUI
+startup wiring, miner wiring, and the real launch rehearsal are still pending.
+The runtime explicitly refuses legacy wire/fee defaults for a new mainnet ID.
+The proposed service ports are 29443/29444/29445, separate from RC; the current
+RC seed host is only a prospective endpoint until mainnet service provisioning
+is verified. Existing RCNet identities and consensus remain unchanged.
+A successful CLI verification is not mainnet approval.
 
 Primary references: [drand specification](https://docs.drand.love/docs/specification/),
 [drand security model](https://docs.drand.love/docs/security-model/), and
@@ -69,10 +81,11 @@ and api3.drand.sh on 2026-09-19. Historical round 123 is the offline positive ve
 |---|---|---|
 | One canonical source baseline | Readiness branch created from miner.2 | Final frozen source commit and source publication target |
 | Exact UTC release/mining schedule | Pinned in cmfd-launch | Schedule CLI and timestamp tests |
-| Signed launch-time entropy | Verifier component implemented; integration pending | Signature mutation vectors plus node/miner replay and anti-precomputation tests |
+| Signed launch-time entropy | Verifier and authenticated node-opening boundary implemented; launcher/miner wiring pending | Signature mutation vectors plus node/miner replay and anti-precomputation tests |
 | Mainnet network/consensus identity | Canonical plan builder implemented; final parameters and runtime profile pending | Final pinned plan and mainnet profile, distinct from RC |
 | Reward receiving addresses and custody | Awaiting owner decision | Public destinations plus custody/recovery evidence |
 | Independent reproduction and review | No accepted independent record located yet | Named reproducer, signed report, independent crypto/wallet review |
+| Dependency audit | rustls updated to 0.23.45 for RUSTSEC-2026-0285; 44 pool/TLS tests pass and cargo-audit reports zero vulnerabilities | Final build audit plus review of remaining informational dependency warnings |
 | Windows/Linux release packages | Pending mainnet configuration | Clean installs, signature/checksum verification, matching runtime identity |
 | Seeds, discovery, explorer | RC evidence needs mainnet rehearsal | Independent node results and mainnet service configuration |
 | Pool payout and reorg lifecycle | Evidence collection pending | Mature-reward payout and reorg/restart reconciliation logs |
@@ -94,6 +107,7 @@ cargo test --locked -p cmfd-launch
 cargo clippy --locked -p cmfd-launch --all-targets -- -D warnings
 cargo run --locked -p cmfd-launch -- schedule
 cargo test --locked -p cmfd-node --lib --features production-v4-testnet rcnet_candidate::
+cargo test --locked -p cmfd-node --lib --features production-v4-testnet mainnet_runtime::
 ```
 
 The launch tests include a real historical BLS signature, every signature-byte

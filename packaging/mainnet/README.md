@@ -110,3 +110,9 @@ SERVICE-SETUP.md. They are not automatically installed or enabled. The bundled
 mainnet-storage-readiness.py is a read-only capacity planner/reserve check;
 it never prunes data. The existing RC seed and its credentials must remain
 untouched while preparing the separate mainnet directories and service account.
+
+Final publication additionally requires the signed binary-reproduction statement
+and the mainnet-specific checks in the standard release finalizer. See
+docs/mainnet-plan-approvals.md in the source checkout for exact evidence filenames
+and the preparation/signing sequence. Neither archive assembly nor an unsigned
+preflight report authorizes a public release.

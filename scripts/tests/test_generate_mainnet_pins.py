@@ -24,7 +24,8 @@ class MainnetPinGenerationTests(unittest.TestCase):
         self.root = self.fixture.root
         self.repo = self.root / "pin-review-source"
         self.repo.mkdir()
-        self.trust_path = self.repo / "approval-trust.json"
+        self.trust_path = self.repo / "packaging/mainnet/APPROVAL-TRUST.json"
+        self.trust_path.parent.mkdir(parents=True, exist_ok=True)
         self.trust_path.write_bytes(self.fixture.trust_bytes)
         self.source_pins = []
         for relative in ("crates/cmfd-node/mainnet_release_pin.inc.rs", "crates/cmfd-consensus/mainnet_network_id.inc.rs"):

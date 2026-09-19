@@ -4703,6 +4703,20 @@ def validate_production_rc_artifacts(
     activation_ssh_keygen: Path | None = None,
     activation_ssh_keygen_sha256: str | None = None,
 ) -> None:
+    """Enforce network-specific gates; retain the historical entry-point name."""
+    mainnet_assets = any(name.startswith(("commonfoundry-mainnet-", "MAINNET-")) for name in stage_files)
+    if mainnet_assets or ("mainnet" in version.lower() and not is_production_rc_label(version)):
+        if repo is None or activation_ssh_keygen is None or activation_ssh_keygen_sha256 is None:
+            raise IntegrityError("mainnet finalization requires source and the pinned approval verifier")
+        # Lazy import avoids loading the mainnet-only tooling for RC releases.
+        import mainnet_release
+        try:
+            mainnet_release.validate_release(repo=repo, commit=commit, version=version,
+                                             files=stage_files, verifier=activation_ssh_keygen,
+                                             expected_verifier_sha256=activation_ssh_keygen_sha256)
+        except (mainnet_release.Error, activation_approval.ApprovalError) as error:
+            raise IntegrityError(str(error)) from error
+        return
     if not is_production_rc_label(version):
         return
     reject_production_rc_source_assets(

@@ -25,6 +25,8 @@ prove organizational independence or the quality of a review.
   `signer_identity`, `allowed_signers_sha256`, `key_blob_sha256`, `key_fingerprint`
   and `key_type`. Derive these from the actual public allowed-signers files and
   the trusted OpenSSH executable; never fill in guessed hashes or fixture values.
+  For final release tooling, commit it at `packaging/mainnet/APPROVAL-TRUST.json`
+  before freezing the review commit.
 - A clean, exact review checkout with final versions and code. Both qualifying
   source history and trust policy must belong to that checkout.
 
@@ -91,3 +93,39 @@ two generated includes in the intended source locations, commit them, build the
 mainnet-feature binaries, and run the native identity/packaging checks. Full
 mainnet plan parsing and the signed-package rehearsal are still required. A Rust
 syntax/type smoke test of a generated include is not a release authorization.
+
+## Final binary reproduction and release gate
+
+After both native package sets have been independently built, prepare a release
+stage with the four archives and these exact public evidence filenames:
+
+- MAINNET-PLAN.json, MAINNET-APPROVALS.json
+- MAINNET-QUALIFICATION-SUBJECT.json, MAINNET-APPROVAL-TRUST.json
+- PRODUCTION-V4-REVIEWED-PIN.review
+- MAINNET-PLAN-PRODUCER-APPROVAL.json and its .sig
+- MAINNET-PLAN-REPRODUCER-APPROVAL.json and its .sig
+- MAINNET-PRODUCER.allowed_signers, MAINNET-REPRODUCER.allowed_signers
+
+Use `scripts/mainnet_release.py` with `--repo`, `--commit`, `--version`,
+`--producer-stage`, `--reproducer-stage`, `--ssh-keygen`,
+`--ssh-keygen-sha256` and a new `--output` file. Both stages are fully inspected;
+the same directory or hardlinked archives cannot stand in for two builds.
+The output is an unsigned first-person reproduction statement. Matching bytes
+alone do not establish independence. Only the actual independent reproducer
+should sign it after genuinely rebuilding and checking those packages.
+
+Stage the exact statement as MAINNET-REPRODUCTION.json and its detached signature
+as MAINNET-REPRODUCTION.json.sig. Its signature uses the already committed
+independent-reproducer authority and namespace. A producer signature cannot
+replace it. Include every staged artifact/evidence filename in the release
+inventory, committed before the review freeze.
+
+The normal `release_integrity.py finalize` and `verify` commands now dispatch
+mainnet artifacts through this gate, including plain version labels such as
+1.0.0. Supply the pinned `--activation-ssh-keygen` and
+`--activation-ssh-keygen-sha256`. The gate rechecks plan signatures, exact applied
+pins, four-package consistency, public evidence and the reproduction statement.
+The ordinary finalizer then produces BUILDINFO, source SBOM, provenance and
+checksums. It does not sign those checksums or publish anything. The normal
+offline release-signing/download-verification step remains required, together
+with the deployment and launch rehearsal.

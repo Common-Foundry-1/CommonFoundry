@@ -172,8 +172,11 @@ def bind_manifest_to_runtime(manifest: dict, data: bytes, runtime: dict) -> None
     signatures._expected_trust_matches(manifest["approvals"], expected)
 
 
-def load_inputs(repo: Path, review_commit: str, plan: Path, qualification: Path, trust: Path):
-    package.integrity._assert_clean_exact_repo(repo, review_commit)
+def load_inputs(repo: Path, review_commit: str, plan: Path, qualification: Path, trust: Path,
+                release_commit: str | None = None):
+    package.integrity._assert_clean_exact_repo(repo, release_commit or review_commit)
+    if release_commit is not None:
+        package.validate_review_ancestry(repo, review_commit, release_commit)
     trust_relative = trust.resolve(strict=True).relative_to(repo.resolve(strict=True)).as_posix()
     snapshots = {
         "plan": signatures._snapshot(plan, "mainnet plan", 32 * 1024),

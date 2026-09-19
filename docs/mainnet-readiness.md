@@ -125,6 +125,7 @@ and api3.drand.sh on 2026-09-19. Historical round 123 is the offline positive ve
 | Dependency audit | rustls updated to 0.23.45 for RUSTSEC-2026-0285; 44 pool/TLS tests pass and cargo-audit reports zero vulnerabilities | Final build audit plus review of remaining informational dependency warnings |
 | Windows/Linux release packages | Native assembler and four package layouts implemented; actual builds await final configuration | Clean installs, signature/checksum verification, matching runtime identity |
 | Four-package release consistency | Offline archive/source/receipt reconciliation implemented | Actual four-archive preflight report followed by independent reproduction and signing |
+| Mainnet release finalization | Generic finalizer dispatches mainnet assets through exact-pin, plan-signature and signed-reproduction checks | Real independently built archives and signed evidence, then final checksums/signature |
 | Wallet preparation before activation | Encrypted creation with backup, restore, public address display and launch-wait UI implemented | Native custody tests plus rendered fixture checks; final signed-package rehearsal pending |
 | Seeds, discovery, explorer | Live RC seed checked healthy September 19; isolated mainnet service templates staged, not deployed | Independent node results and mainnet service configuration |
 | Pool payout and reorg lifecycle | Evidence collection pending | Mature-reward payout and reorg/restart reconciliation logs |
@@ -237,6 +238,27 @@ outside the source tree. Eight tests pass on Windows and Linux, including the
 CLI, interrupted-publication cleanup and compilation against the actual release
 struct definitions. This uses synthetic qualification data and disposable keys;
 it is not an actual mainnet pin/application or qualification run.
+
+The ordinary release finalizer previously skipped network activation checks for
+non-RC labels. Mainnet markers now select a dedicated gate instead. It validates
+the committed trust policy, freshly verifies plan signatures, compares applied
+source pins with exact reviewed candidates and rechecks the four archives. A
+separate independently signed build statement binds those archives and their
+public review evidence. Statement preparation never signs or asserts that the
+caller is independent; the real reproducer must make that attestation.
+The release-gate tests use synthetic packages and
+disposable keys, including the normal finalizer/verify CLI, checksum/SBOM
+generation, role substitution, unsigned statements, altered source pins,
+different reproduced binaries and late archive replacement.
+All nine pass on Windows and Linux. The legacy 153-test release-integrity suite
+also passes (three platform-specific skips on Windows); plan approval and pin
+generation regressions remain green.
+No actual release metadata or approvals have been generated for mainnet.
+
+The readiness branch now queues a newer CI run instead of cancelling its current
+one. Other branches/PRs retain the existing cancellation behavior. No test was
+removed or shortened; only workflow concurrency changed, allowing periodic
+private checkpoint pushes without discarding an active proof-test run.
 
 Current local evidence: 19 release-set preflight tests and 12 assembler tests
 pass on Windows and Linux, including the real CLI against a temporary frozen

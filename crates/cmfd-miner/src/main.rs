@@ -599,7 +599,11 @@ struct WorkerThreadError {
 }
 
 fn main() -> Result<()> {
-    match Cli::parse().command {
+    let command = Cli::parse().command;
+    if !matches!(&command, Command::NetworkInfo | Command::Devices { .. }) {
+        cmfd_node::mainnet_runtime::ensure_compiled_launch_ready()?;
+    }
+    match command {
         Command::NetworkInfo => write_miner_network_info(),
         Command::Devices { cuda_library } => list_devices(cuda_library.as_deref()),
         Command::Mine {

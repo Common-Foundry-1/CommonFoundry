@@ -115,6 +115,7 @@ pub mod forgematrix_v4_proof;
 pub mod forgematrix_v4_proof_codec;
 #[cfg(feature = "forgematrix-v4-verifier")]
 pub mod forgematrix_v4_relations;
+pub mod mainnet_network;
 pub mod model_bank;
 #[cfg(feature = "gpu-proof-prover")]
 pub mod model_whir_sources;

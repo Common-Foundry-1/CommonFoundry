@@ -1,5 +1,9 @@
 //! Build-time identity gate for artifacts presented as production release candidates.
 
+#[path = "../cmfd-launch/src/schedule.rs"]
+#[allow(dead_code)]
+pub(crate) mod mainnet_schedule;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompiledNetworkProfile {
     #[cfg_attr(
@@ -16,6 +20,8 @@ pub enum CompiledNetworkProfile {
     #[cfg_attr(not(feature = "production-v4-testnet"), allow(dead_code))]
     ProductionV4Testnet,
     Rcnet,
+    #[allow(dead_code)]
+    Mainnet,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,6 +143,27 @@ pub struct CompiledReleaseProfile {
     pub production_network_identity: Option<ProductionRcNetworkIdentityPin>,
 }
 
+/// Mainnet cannot inherit the RC single-producer approval or fixed RC genesis.
+/// The launch-time genesis is authenticated separately at runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct MainnetReleaseConfiguration {
+    pub launch_plan_digest: [u8; 32],
+    pub network_id: [u8; 32],
+    pub pow_limit: [u8; 32],
+    pub steward_reward_destination: [u8; 32],
+    pub community_reward_destination: [u8; 32],
+    pub approval_manifest_sha256: &'static str,
+    pub activation: ProductionV4ActivationEvidence,
+}
+
+#[allow(dead_code)]
+pub const MAINNET_NETWORK_ID: Option<[u8; 32]> =
+    include!("../cmfd-consensus/mainnet_network_id.inc.rs");
+#[allow(dead_code)]
+pub const MAINNET_RELEASE_CONFIGURATION: Option<MainnetReleaseConfiguration> =
+    include!("mainnet_release_pin.inc.rs");
+
 /// The exact ceremony artifacts accepted by the private ProductionV3 test
 /// network. `RCNET1-MODEL-V2.bank` and its manifest are the miner-side inputs;
 /// `RCNET1-MODEL-RECORD-V2.json` is the small verifier record carried by nodes
@@ -223,7 +250,7 @@ pub const COMPILED_RELEASE_PROFILE: CompiledReleaseProfile = CompiledReleaseProf
 /// Exact verifier inputs accepted by the isolated ProductionV4 latency
 /// testnet. The fixed record binds all three fixed commitments; the complete
 /// model bank is authenticated before its base-input prefix is retained.
-#[cfg(any(feature = "production-v4-testnet", feature = "production-rc"))]
+#[cfg(feature = "production-v4")]
 #[allow(dead_code)] // build.rs includes this module without loading verifier artifacts.
 pub const PRODUCTION_V4_ARTIFACT_PINS: ProductionV4ArtifactIdentityPins =
     ProductionV4ArtifactIdentityPins {
@@ -321,6 +348,21 @@ pub const COMPILED_RELEASE_PROFILE: CompiledReleaseProfile = CompiledReleaseProf
     production_network_identity: Some(PRODUCTION_RC_NETWORK_IDENTITY),
 };
 
+#[cfg(feature = "production-mainnet")]
+pub const COMPILED_RELEASE_PROFILE: CompiledReleaseProfile = CompiledReleaseProfile {
+    network: CompiledNetworkProfile::Mainnet,
+    proof: ConsensusProofSelection::ProductionV4,
+    activation: None,
+    production_v3_artifacts: None,
+    production_v3_verifier_workers: None,
+    production_v4_activation: match MAINNET_RELEASE_CONFIGURATION {
+        Some(pin) => Some(pin.activation),
+        None => None,
+    },
+    production_v4_artifacts: Some(PRODUCTION_V4_ARTIFACT_PINS),
+    production_network_identity: None,
+};
+
 /// The identity selected by an ordinary source-tree build.
 ///
 /// A production RC build may change these values only together with the real
@@ -331,7 +373,8 @@ pub const COMPILED_RELEASE_PROFILE: CompiledReleaseProfile = CompiledReleaseProf
 #[cfg(not(any(
     feature = "production-v3-testnet",
     feature = "production-v4-testnet",
-    feature = "production-rc"
+    feature = "production-rc",
+    feature = "production-mainnet"
 )))]
 pub const COMPILED_RELEASE_PROFILE: CompiledReleaseProfile = CompiledReleaseProfile {
     network: CompiledNetworkProfile::Devnet,
@@ -370,6 +413,16 @@ pub fn is_production_rc_label(label: &str) -> bool {
                     !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit())
                 })
         })
+}
+
+pub fn is_mainnet_label(label: &str) -> bool {
+    let label = label.trim().to_ascii_lowercase();
+    !label.contains("devnet")
+        && !label.contains("testnet")
+        && !is_production_rc_label(&label)
+        && label
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|token| token == "mainnet")
 }
 
 fn is_nonzero_lower_hex(value: &str, bytes: usize) -> bool {
@@ -629,6 +682,13 @@ pub fn validate_production_rc(
             .production_network_identity
             .ok_or("production RC network identity pin is absent")?,
     )?;
+    validate_v4_evidence_and_artifacts(profile, build_source_commit)
+}
+
+fn validate_v4_evidence_and_artifacts(
+    profile: CompiledReleaseProfile,
+    build_source_commit: &str,
+) -> Result<(), &'static str> {
     let evidence = profile
         .production_v4_activation
         .ok_or("ProductionV4 activation evidence is absent")?;
@@ -708,6 +768,72 @@ pub fn validate_production_rc(
     Ok(())
 }
 
+pub fn validate_mainnet_release(
+    profile: CompiledReleaseProfile,
+    configuration: Option<MainnetReleaseConfiguration>,
+    consensus_network_id: Option<[u8; 32]>,
+    build_source_commit: &str,
+) -> Result<(), &'static str> {
+    if profile.network != CompiledNetworkProfile::Mainnet
+        || profile.proof != ConsensusProofSelection::ProductionV4
+    {
+        return Err("compiled network/proof profile is not mainnet ProductionV4");
+    }
+    let pin = configuration.ok_or("final mainnet launch plan and approval pins are absent")?;
+    if [
+        crate::network_profile::DEVNET_PROFILE.network_id,
+        crate::network_profile::PRODUCTION_V3_TESTNET_PROFILE.network_id,
+        crate::network_profile::PRODUCTION_V4_TESTNET_PROFILE.network_id,
+        crate::network_profile::RCNET1_PROFILE.network_id,
+    ]
+    .contains(&pin.network_id)
+    {
+        return Err("mainnet cannot reuse a development or RC network identity");
+    }
+    if !valid_binary_identity_pin(pin.launch_plan_digest)
+        || !valid_binary_identity_pin(pin.network_id)
+        || consensus_network_id != Some(pin.network_id)
+        || pin.launch_plan_digest == pin.network_id
+    {
+        return Err("mainnet plan/network pins are invalid or disagree with consensus");
+    }
+    if pin.pow_limit == [0; 32] {
+        return Err("mainnet initial proof-of-work target is zero");
+    }
+    for destination in [
+        pin.steward_reward_destination,
+        pin.community_reward_destination,
+    ] {
+        if !valid_binary_identity_pin(destination)
+            || [
+                INSECURE_DEV_STEWARD_DESTINATION,
+                INSECURE_DEV_COMMUNITY_DESTINATION,
+            ]
+            .contains(&destination)
+        {
+            return Err("mainnet reward destination is invalid or a development key");
+        }
+    }
+    if !is_nonzero_lower_hex(pin.approval_manifest_sha256, 32) {
+        return Err("mainnet approval manifest pin is absent or invalid");
+    }
+    if pin.activation.schema != "CMFD_PRODUCTION_V4_ACTIVATION_V1"
+        || pin.activation.approval_trust.contract_schema
+            != "CMFD_PRODUCTION_V4_ACTIVATION_APPROVAL_SUBJECT_V1"
+        || pin
+            .activation
+            .approval_trust
+            .independent_reproducer
+            .is_none()
+    {
+        return Err("mainnet requires distinct producer and independent-reproducer approvals");
+    }
+    if profile.production_v4_activation != Some(pin.activation) {
+        return Err("mainnet activation profile does not match its release pin");
+    }
+    validate_v4_evidence_and_artifacts(profile, build_source_commit)
+}
+
 /// Exact activation-evidence bytes hashed into the compiled ProductionV3
 /// network manifest and staged by the release finalizer.
 ///
@@ -776,6 +902,46 @@ pub fn canonical_production_v4_activation_evidence_json(
     build_source_commit: &str,
 ) -> Result<Vec<u8>, &'static str> {
     validate_production_rc(profile, build_source_commit)?;
+    canonical_v4_evidence_json(profile, build_source_commit, "RCNet-1")
+}
+
+#[allow(dead_code)]
+pub fn canonical_mainnet_activation_evidence_json(
+    profile: CompiledReleaseProfile,
+    configuration: MainnetReleaseConfiguration,
+    consensus_network_id: Option<[u8; 32]>,
+    build_source_commit: &str,
+) -> Result<Vec<u8>, &'static str> {
+    validate_mainnet_release(
+        profile,
+        Some(configuration),
+        consensus_network_id,
+        build_source_commit,
+    )?;
+    let proof = canonical_v4_evidence_json(profile, build_source_commit, "Mainnet")?;
+    let proof = std::str::from_utf8(&proof)
+        .map_err(|_| "invalid mainnet evidence encoding")?
+        .trim_end_matches('\n');
+    Ok(format!(
+        concat!(
+            "{{\"schema\":\"CMFD_MAINNET_ACTIVATION_V1\",",
+            "\"launch_plan_digest\":\"{}\",\"network_id\":\"{}\",",
+            "\"approval_manifest_sha256\":\"{}\",",
+            "\"proof_activation\":{}}}\n"
+        ),
+        lower_hex(configuration.launch_plan_digest),
+        lower_hex(configuration.network_id),
+        configuration.approval_manifest_sha256,
+        proof
+    )
+    .into_bytes())
+}
+
+fn canonical_v4_evidence_json(
+    profile: CompiledReleaseProfile,
+    build_source_commit: &str,
+    network_profile: &str,
+) -> Result<Vec<u8>, &'static str> {
     let evidence = profile
         .production_v4_activation
         .ok_or("ProductionV4 activation evidence is absent")?;
@@ -820,7 +986,7 @@ pub fn canonical_production_v4_activation_evidence_json(
             "\"core_vector_sha256\":\"{}\",",
             "\"fresh_process_verifier_binary_sha256\":\"{}\",",
             "\"fresh_process_verifier_report_sha256\":\"{}\",",
-            "\"network_profile\":\"RCNet-1\",",
+            "\"network_profile\":\"{}\",",
             "\"proof_algebra_sha256\":\"{}\",",
             "\"proof_selection\":\"ProductionV4\",",
             "\"qualification_manifest_sha256\":\"{}\",",
@@ -847,6 +1013,7 @@ pub fn canonical_production_v4_activation_evidence_json(
         evidence.core_vector_sha256,
         evidence.fresh_process_verifier_binary_sha256,
         evidence.fresh_process_verifier_report_sha256,
+        network_profile,
         evidence.proof_algebra_sha256,
         evidence.qualification_manifest_sha256,
         evidence.qualification_source_commit,
@@ -997,6 +1164,175 @@ mod tests {
             production_v4_activation: Some(SINGLE_PRODUCER_V4_EVIDENCE),
             ..v4_profile()
         }
+    }
+
+    fn mainnet_fixture() -> (CompiledReleaseProfile, MainnetReleaseConfiguration) {
+        let configuration = MainnetReleaseConfiguration {
+            launch_plan_digest: varied(33),
+            network_id: varied(2),
+            pow_limit: NETWORK_IDENTITY.pow_limit,
+            steward_reward_destination: NETWORK_IDENTITY.steward_reward_destination,
+            community_reward_destination: NETWORK_IDENTITY.community_reward_destination,
+            approval_manifest_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            activation: V4_EVIDENCE,
+        };
+        (
+            CompiledReleaseProfile {
+                network: CompiledNetworkProfile::Mainnet,
+                production_network_identity: None,
+                ..v4_profile()
+            },
+            configuration,
+        )
+    }
+
+    #[test]
+    fn mainnet_labels_require_the_mainnet_gate_without_reclassifying_rcnet() {
+        assert!(is_mainnet_label("v1.0.0-mainnet"));
+        assert!(is_mainnet_label("Mainnet"));
+        for label in [
+            "v0.1.0-rc.5",
+            "mainnet-rc1",
+            "devnet-mainnet-test",
+            "testnet-mainnet",
+            "v1.0.0",
+        ] {
+            assert!(!is_mainnet_label(label));
+        }
+    }
+
+    #[test]
+    fn mainnet_requires_distinct_release_and_consensus_pins() {
+        let (profile, configuration) = mainnet_fixture();
+        assert!(
+            validate_mainnet_release(
+                profile,
+                Some(configuration),
+                Some(configuration.network_id),
+                BUILD_SOURCE_COMMIT
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_mainnet_release(
+                profile,
+                None,
+                Some(configuration.network_id),
+                BUILD_SOURCE_COMMIT
+            )
+            .is_err()
+        );
+        assert!(
+            validate_mainnet_release(profile, Some(configuration), None, BUILD_SOURCE_COMMIT)
+                .is_err()
+        );
+        assert!(
+            validate_mainnet_release(
+                profile,
+                Some(configuration),
+                Some(varied(3)),
+                BUILD_SOURCE_COMMIT
+            )
+            .is_err()
+        );
+        for network in [
+            crate::network_profile::RCNET1_PROFILE.network_id,
+            crate::network_profile::PRODUCTION_V4_TESTNET_PROFILE.network_id,
+        ] {
+            let changed = MainnetReleaseConfiguration {
+                network_id: network,
+                ..configuration
+            };
+            assert!(
+                validate_mainnet_release(
+                    profile,
+                    Some(changed),
+                    Some(network),
+                    BUILD_SOURCE_COMMIT
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn rc_approval_cannot_authorize_mainnet_by_relabelling() {
+        let (mut profile, mut configuration) = mainnet_fixture();
+        configuration.activation = SINGLE_PRODUCER_V4_EVIDENCE;
+        profile.production_v4_activation = Some(configuration.activation);
+        assert_eq!(
+            validate_mainnet_release(
+                profile,
+                Some(configuration),
+                Some(configuration.network_id),
+                BUILD_SOURCE_COMMIT
+            ),
+            Err("mainnet requires distinct producer and independent-reproducer approvals")
+        );
+        configuration.activation = V4_EVIDENCE;
+        configuration
+            .activation
+            .approval_trust
+            .independent_reproducer = Some(V4_APPROVAL_TRUST.producer);
+        profile.production_v4_activation = Some(configuration.activation);
+        assert!(
+            validate_mainnet_release(
+                profile,
+                Some(configuration),
+                Some(configuration.network_id),
+                BUILD_SOURCE_COMMIT
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn mainnet_template_never_invents_a_genesis_or_configured_release() {
+        let (_, configuration) = mainnet_fixture();
+        assert!(crate::network_profile::mainnet_profile_template(None).is_none());
+        let profile =
+            crate::network_profile::mainnet_profile_template(Some(configuration)).unwrap();
+        assert_eq!(
+            profile.kind,
+            crate::network_profile::NetworkProfileKind::Mainnet
+        );
+        assert_eq!(profile.virtual_genesis_hash, [0; 32]);
+        assert_eq!(
+            profile.virtual_genesis_timestamp,
+            mainnet_schedule::MAINNET_LAUNCH_UNIX_SECONDS
+        );
+        assert_eq!(profile.network_id, configuration.network_id);
+        assert_ne!(
+            profile.default_data_dir_identity,
+            crate::network_profile::RCNET1_PROFILE.default_data_dir_identity
+        );
+    }
+
+    #[test]
+    fn mainnet_evidence_binds_the_new_plan_and_cannot_be_an_rc_record() {
+        let (profile, configuration) = mainnet_fixture();
+        let bytes = canonical_mainnet_activation_evidence_json(
+            profile,
+            configuration,
+            Some(configuration.network_id),
+            BUILD_SOURCE_COMMIT,
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["schema"], "CMFD_MAINNET_ACTIVATION_V1");
+        assert_eq!(
+            value["launch_plan_digest"],
+            lower_hex(configuration.launch_plan_digest)
+        );
+        assert_eq!(value["network_id"], lower_hex(configuration.network_id));
+        assert_eq!(value["proof_activation"]["network_profile"], "Mainnet");
+        assert!(
+            !value["proof_activation"]["activation_approval_trust"]["independent_reproducer"]
+                .is_null()
+        );
+        assert!(
+            canonical_production_v4_activation_evidence_json(profile, BUILD_SOURCE_COMMIT).is_err()
+        );
     }
 
     #[test]

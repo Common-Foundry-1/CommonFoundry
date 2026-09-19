@@ -7,7 +7,9 @@ pub const MIN_TRANSACTION_FEE_ATOMS: u64 = COIN / 10;
 
 /// Historical development networks retain their original transaction rules.
 pub fn minimum_transaction_fee(network_id: [u8; 32]) -> u64 {
-    if network_id == crate::PRODUCTION_V4_RCNET1_NETWORK_ID {
+    if network_id == crate::PRODUCTION_V4_RCNET1_NETWORK_ID
+        || crate::mainnet_network::is_mainnet_network(network_id)
+    {
         MIN_TRANSACTION_FEE_ATOMS
     } else {
         0

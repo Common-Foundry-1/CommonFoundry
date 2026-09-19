@@ -60,10 +60,29 @@ parameters used by replay, block admission, and the thin-miner parameter API.
 Bare public mainnet profiles and mutated contexts are rejected. Mainnet wallet
 keys follow the encrypted-key requirement.
 
-**Runtime/mainnet integration is not complete.** Final plan/approval pins,
-consensus network-ID registration for V4 frame limits and the fee floor, CLI/GUI
-startup wiring, miner wiring, and the real launch rehearsal are still pending.
-The runtime explicitly refuses legacy wire/fee defaults for a new mainnet ID.
+`production-mainnet` is now a distinct node/wallet/miner build feature. It
+requires a finalized `mainnet_release_pin.inc.rs` and the matching shared
+consensus `mainnet_network_id.inc.rs`. Both remain `None` until the owner confirms
+the parameters and the required approvals are accepted. Builds reject absent
+pins and reject single-producer RC approvals as mainnet authorization.
+
+The shared node-opening path and thin-miner handshake resolve the verified
+runtime context automatically in a mainnet build. Miner work commands require
+the same context before opening workers; device listing and static miner
+identity remain available during setup. Wallet builds have a distinct mainnet
+application identifier. `cmfd-node mainnet-launch-info` checks the pinned plan
+before launch without needing the future beacon or opening chain storage.
+
+The runtime sidecars are `production-mainnet/MAINNET-PLAN.json` and
+`production-mainnet/LAUNCH-BEACON.json` beside each executable. Missing/early
+beacons are retryable and never cached; a successful authenticated result is
+retained immutably for the process. No caller-selected key, round, clock, or
+plan hash can override the compiled mainnet loader.
+
+**Mainnet integration remains incomplete.** Final pin values, accepted review
+evidence, beacon retrieval/waiting launchers, mainnet release packaging and
+finalization, and the real launch rehearsal are still pending. The runtime
+explicitly refuses legacy wire/fee defaults for a new mainnet ID.
 The proposed service ports are 29443/29444/29445, separate from RC; the current
 RC seed host is only a prospective endpoint until mainnet service provisioning
 is verified. Existing RCNet identities and consensus remain unchanged.
@@ -81,8 +100,8 @@ and api3.drand.sh on 2026-09-19. Historical round 123 is the offline positive ve
 |---|---|---|
 | One canonical source baseline | Readiness branch created from miner.2 | Final frozen source commit and source publication target |
 | Exact UTC release/mining schedule | Pinned in cmfd-launch | Schedule CLI and timestamp tests |
-| Signed launch-time entropy | Verifier and authenticated node-opening boundary implemented; launcher/miner wiring pending | Signature mutation vectors plus node/miner replay and anti-precomputation tests |
-| Mainnet network/consensus identity | Canonical plan builder implemented; final parameters and runtime profile pending | Final pinned plan and mainnet profile, distinct from RC |
+| Signed launch-time entropy | Verifier and node/miner startup wiring implemented; retrieval/waiting launchers pending | Signature mutation vectors plus actual packaged replay and anti-precomputation rehearsal |
+| Mainnet network/consensus identity | Shared identity registry and mainnet build feature implemented; final pin values pending | Final pinned plan and mainnet profile, distinct from RC |
 | Reward receiving addresses and custody | Awaiting owner decision | Public destinations plus custody/recovery evidence |
 | Independent reproduction and review | No accepted independent record located yet | Named reproducer, signed report, independent crypto/wallet review |
 | Dependency audit | rustls updated to 0.23.45 for RUSTSEC-2026-0285; 44 pool/TLS tests pass and cargo-audit reports zero vulnerabilities | Final build audit plus review of remaining informational dependency warnings |

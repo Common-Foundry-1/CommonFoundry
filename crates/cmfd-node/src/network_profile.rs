@@ -384,6 +384,36 @@ pub const RCNET1_PROFILE: NetworkProfile = NetworkProfile {
 };
 
 /// Network identity selected into every node-dependent artifact.
+/// Mainnet's zero genesis is an unactivated marker, never a valid chain parent.
+/// It is replaced only through AuthenticatedMainnetRuntime after beacon verification.
+pub(crate) const fn mainnet_profile_template(
+    configuration: Option<crate::release_gate::MainnetReleaseConfiguration>,
+) -> Option<NetworkProfile> {
+    match configuration {
+        Some(pin) => Some(NetworkProfile {
+            kind: NetworkProfileKind::Mainnet,
+            proof: ProofProfile::ProductionV4,
+            name: "CommonFoundry Mainnet",
+            network_id: pin.network_id,
+            virtual_genesis_hash: [0; 32],
+            virtual_genesis_timestamp:
+                crate::release_gate::mainnet_schedule::MAINNET_LAUNCH_UNIX_SECONDS,
+            pow_limit: pin.pow_limit,
+            rewards: RewardDestinations {
+                steward: pin.steward_reward_destination,
+                community: pin.community_reward_destination,
+            },
+            rpc_port: 29_443,
+            p2p_port: 29_444,
+            pool_port: 29_445,
+            bootstrap_ipv4: PRODUCTION_RC_SEED_IPV4,
+            default_data_dir_identity: "commonfoundry-mainnet",
+            wallet_data_dir_identity: "mainnet",
+        }),
+        None => None,
+    }
+}
+
 pub const COMPILED_NETWORK_PROFILE: NetworkProfile = match (
     COMPILED_RELEASE_PROFILE.network,
     COMPILED_RELEASE_PROFILE.proof,
@@ -396,6 +426,12 @@ pub const COMPILED_NETWORK_PROFILE: NetworkProfile = match (
         PRODUCTION_V4_TESTNET_PROFILE
     }
     (CompiledNetworkProfile::Rcnet, ConsensusProofSelection::ProductionV4) => RCNET1_PROFILE,
+    (CompiledNetworkProfile::Mainnet, ConsensusProofSelection::ProductionV4) => {
+        match mainnet_profile_template(crate::release_gate::MAINNET_RELEASE_CONFIGURATION) {
+            Some(profile) => profile,
+            None => panic!("final mainnet launch plan and approval pins are absent"),
+        }
+    }
     _ => panic!("compiled network and consensus proof selections are inconsistent"),
 };
 
@@ -511,7 +547,8 @@ mod tests {
         #[cfg(not(any(
             feature = "production-v3-testnet",
             feature = "production-v4-testnet",
-            feature = "production-rc"
+            feature = "production-rc",
+            feature = "production-mainnet"
         )))]
         {
             assert_eq!(COMPILED_NETWORK_PROFILE, DEVNET_PROFILE);

@@ -433,7 +433,7 @@ pub enum NodeError {
     ),
     #[error("the compiled ProductionV4 network requires its in-process verifier authority")]
     ProductionV4Unavailable,
-    #[error("mainnet startup requires the authenticated launch plan and beacon")]
+    #[error("mainnet awaits its verified launch beacon: October 3, 2026 at 17:00 UTC (noon US Central)")]
     MainnetLaunchRequired,
     #[error("mainnet launch evidence is invalid: {0}")]
     MainnetLaunchEvidence(&'static str),
@@ -734,7 +734,11 @@ impl NodeError {
             Self::DataDirLocked(_) => "node data directory is already in use".to_owned(),
             Self::Io { .. } => "node storage operation failed; inspect the node logs".to_owned(),
             Self::ProductionV4ArtifactsMissing => {
-                "required ProductionV4 runtime files are missing; complete RCNet runtime setup before starting the node".to_owned()
+                if COMPILED_NETWORK_PROFILE.kind == NetworkProfileKind::Mainnet {
+                    "required ProductionV4 runtime files are missing; complete mainnet runtime setup before starting the node".to_owned()
+                } else {
+                    "required ProductionV4 runtime files are missing; complete RCNet runtime setup before starting the node".to_owned()
+                }
             }
             Self::CorruptLog(_) => {
                 "block log is corrupt; inspect the node logs before restarting".to_owned()
@@ -4169,11 +4173,12 @@ pub(crate) fn network_params_and_verifier_for_profile(
     production_v3_record: Option<&ProductionV3VerifierRecord>,
     production_v4_artifacts: Option<&ProductionV4VerifierArtifacts>,
 ) -> Result<(NetworkParams, ConsensusPowVerifier), NodeError> {
+    let (profile, launch) = mainnet_runtime::resolve_compiled_profile(profile)?;
     network_params_and_verifier_with_launch(
         profile,
         production_v3_record,
         production_v4_artifacts,
-        None,
+        launch,
     )
 }
 
@@ -4456,6 +4461,10 @@ fn network_params_for_profile(profile: NetworkProfile) -> Result<NetworkParams, 
 }
 
 pub(crate) fn thin_miner_network_params() -> Result<NetworkParams, NodeError> {
+    #[cfg(feature = "production-v4")]
+    if COMPILED_NETWORK_PROFILE.kind == NetworkProfileKind::Mainnet {
+        return mainnet_runtime::compiled_mainnet_runtime()?.network_parameters();
+    }
     match COMPILED_NETWORK_PROFILE.proof {
         ProofProfile::DevnetV2Reference => network_params_for_profile(COMPILED_NETWORK_PROFILE),
         ProofProfile::ProductionV3 => Err(NodeError::ProductionV3Unavailable),
@@ -4949,6 +4958,7 @@ impl Node {
         wallet_passphrase: Option<&[u8]>,
         exchange_withdrawal_security: Option<&ExchangeWithdrawalSecurityConfig>,
     ) -> Result<Self, NodeError> {
+        let (profile, launch) = mainnet_runtime::resolve_compiled_profile(profile)?;
         Self::open_with_profile_artifacts_worker_exchange_and_launch(
             data_dir,
             profile,
@@ -4958,7 +4968,7 @@ impl Node {
             verifier_worker,
             wallet_passphrase,
             exchange_withdrawal_security,
-            None,
+            launch,
         )
     }
 

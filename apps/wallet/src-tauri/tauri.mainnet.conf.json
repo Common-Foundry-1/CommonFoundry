@@ -1,0 +1,8 @@
+{
+  "productName": "Common Foundry Wallet",
+  "identifier": "org.commonfoundry.wallet.mainnet",
+  "bundle": {
+    "shortDescription": "Common Foundry mainnet wallet",
+    "longDescription": "Common Foundry desktop wallet and embedded mainnet node."
+  }
+}

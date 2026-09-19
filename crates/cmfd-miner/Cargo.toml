@@ -23,6 +23,7 @@ production-v4 = [
 ]
 production-v4-testnet = ["production-v4", "cmfd-node/production-v4-testnet"]
 production-rc = ["production-v4", "cmfd-node/production-rc"]
+production-mainnet = ["production-v4", "cmfd-node/production-mainnet"]
 
 [dependencies]
 anyhow.workspace = true

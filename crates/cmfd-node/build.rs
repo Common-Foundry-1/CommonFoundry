@@ -12,6 +12,7 @@ fn main() {
         "GITHUB_REF",
         "GITHUB_REF_NAME",
         "CARGO_FEATURE_PRODUCTION_RC",
+        "CARGO_FEATURE_PRODUCTION_MAINNET",
         "CARGO_FEATURE_PRODUCTION_V3_TESTNET",
         "CARGO_FEATURE_PRODUCTION_V4_TESTNET",
         "CMFD_BUILD_SOURCE_COMMIT",
@@ -20,10 +21,14 @@ fn main() {
     }
     println!("cargo:rerun-if-changed=release_gate.rs");
     println!("cargo:rerun-if-changed=production_v4_activation_pin.inc.rs");
+    println!("cargo:rerun-if-changed=mainnet_release_pin.inc.rs");
+    println!("cargo:rerun-if-changed=../cmfd-consensus/mainnet_network_id.inc.rs");
+    println!("cargo:rerun-if-changed=../cmfd-launch/src/schedule.rs");
     println!("cargo:rerun-if-changed=src/network_profile.rs");
 
     let mutually_exclusive_profiles = [
         env::var_os("CARGO_FEATURE_PRODUCTION_RC").is_some(),
+        env::var_os("CARGO_FEATURE_PRODUCTION_MAINNET").is_some(),
         env::var_os("CARGO_FEATURE_PRODUCTION_V3_TESTNET").is_some(),
         env::var_os("CARGO_FEATURE_PRODUCTION_V4_TESTNET").is_some(),
     ]
@@ -31,7 +36,24 @@ fn main() {
     .filter(|selected| *selected)
     .count();
     if mutually_exclusive_profiles > 1 {
-        panic!("production-rc and production testnet profiles are mutually exclusive");
+        panic!("mainnet, production-rc and production testnet profiles are mutually exclusive");
+    }
+
+    if env::var_os("CARGO_FEATURE_PRODUCTION_MAINNET").is_some()
+        || env::var("CMFD_RELEASE_LABEL")
+            .ok()
+            .is_some_and(|label| release_gate::is_mainnet_label(&label))
+    {
+        let source_commit = env::var("CMFD_BUILD_SOURCE_COMMIT").unwrap_or_default();
+        release_gate::validate_mainnet_release(
+            release_gate::COMPILED_RELEASE_PROFILE,
+            release_gate::MAINNET_RELEASE_CONFIGURATION,
+            release_gate::MAINNET_NETWORK_ID,
+            &source_commit,
+        )
+        .unwrap_or_else(|error| panic!("production mainnet build gate: {error}"));
+        println!("cargo:rustc-env=CMFD_BUILD_SOURCE_COMMIT={source_commit}");
+        return;
     }
 
     let requested = env::var_os("CARGO_FEATURE_PRODUCTION_RC").is_some()

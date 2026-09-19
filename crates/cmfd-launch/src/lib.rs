@@ -10,11 +10,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-pub const SOURCE_RELEASE_UNIX_SECONDS: u64 = 1_790_960_400;
-pub const MAINNET_LAUNCH_UNIX_SECONDS: u64 = 1_791_046_800;
-pub const SOURCE_RELEASE_UTC: &str = "2026-10-02T17:00:00Z";
-pub const MAINNET_LAUNCH_UTC: &str = "2026-10-03T17:00:00Z";
-pub const LOCAL_TIME_ZONE: &str = "America/Chicago";
+mod schedule;
+pub use schedule::*;
 pub const QUICKNET_GENESIS: u64 = 1_692_803_367;
 pub const QUICKNET_PERIOD_SECONDS: u64 = 3;
 pub const MAINNET_BEACON_ROUND: u64 = 32_747_812;

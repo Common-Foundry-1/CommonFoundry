@@ -4,6 +4,11 @@
 use crate::{NetworkProfile, NetworkProfileKind, NodeError, ProofProfile};
 #[cfg(feature = "production-v4")]
 use cmfd_consensus::{NetworkParams, PowParameters};
+#[cfg(feature = "production-v4")]
+use std::{fs::File, io::Read, path::Path, sync::OnceLock};
+
+#[cfg(feature = "production-v4")]
+static COMPILED_MAINNET_RUNTIME: OnceLock<AuthenticatedMainnetRuntime> = OnceLock::new();
 
 /// Created only after checking the pinned plan and the exact launch signature.
 /// Private fields and the absence of Deserialize prevent a transport response
@@ -68,6 +73,166 @@ impl AuthenticatedMainnetRuntime {
     }
 }
 
+/// Load the release-pinned plan and exact launch beacon beside the executable.
+/// No command-line hash, network, key, round, or clock override is accepted.
+#[cfg(feature = "production-v4")]
+pub fn compiled_mainnet_runtime() -> Result<&'static AuthenticatedMainnetRuntime, NodeError> {
+    if crate::COMPILED_NETWORK_PROFILE.kind != NetworkProfileKind::Mainnet {
+        return Err(NodeError::MainnetLaunchEvidence(
+            "compiled profile is not mainnet",
+        ));
+    }
+    if let Some(runtime) = COMPILED_MAINNET_RUNTIME.get() {
+        return Ok(runtime);
+    }
+    let pin = compiled_release_pin()?;
+    let now = crate::unix_time_seconds()?;
+    if now < cmfd_launch::MAINNET_LAUNCH_UNIX_SECONDS {
+        return Err(NodeError::MainnetLaunchRequired);
+    }
+    let executable = std::env::current_exe()
+        .map_err(|_| NodeError::MainnetLaunchEvidence("cannot resolve package directory"))?;
+    let directory = executable
+        .parent()
+        .ok_or(NodeError::MainnetLaunchEvidence(
+            "package directory is absent",
+        ))?
+        .join("production-mainnet");
+    let plan = read_bounded_file(&directory.join("MAINNET-PLAN.json"), 32 * 1024)?;
+    let beacon = read_bounded_file(
+        &directory.join("LAUNCH-BEACON.json"),
+        cmfd_launch::MAX_BEACON_DOCUMENT_BYTES,
+    )?;
+    let runtime =
+        AuthenticatedMainnetRuntime::authenticate(&plan, &beacon, pin.launch_plan_digest, now)?;
+    let mut expected_profile = crate::COMPILED_NETWORK_PROFILE;
+    expected_profile.virtual_genesis_hash = runtime.profile.virtual_genesis_hash;
+    if runtime.profile != expected_profile {
+        return Err(NodeError::MainnetLaunchEvidence(
+            "launch plan disagrees with compiled runtime parameters",
+        ));
+    }
+    require_authenticated_profile(runtime.profile, Some(&runtime))?;
+    // Concurrent starts authenticate the same immutable release and unique BLS
+    // signature. An error is never cached, so a missing beacon can be retried.
+    let _ = COMPILED_MAINNET_RUNTIME.set(runtime);
+    COMPILED_MAINNET_RUNTIME
+        .get()
+        .ok_or(NodeError::MainnetLaunchRequired)
+}
+
+#[cfg(feature = "production-v4")]
+fn compiled_release_pin() -> Result<crate::release_gate::MainnetReleaseConfiguration, NodeError> {
+    let pin = crate::release_gate::MAINNET_RELEASE_CONFIGURATION.ok_or(
+        NodeError::MainnetLaunchEvidence("compiled mainnet release pin is absent"),
+    )?;
+    crate::release_gate::validate_mainnet_release(
+        crate::release_gate::COMPILED_RELEASE_PROFILE,
+        Some(pin),
+        cmfd_consensus::mainnet_network::MAINNET_NETWORK_ID,
+        option_env!("CMFD_BUILD_SOURCE_COMMIT").unwrap_or_default(),
+    )
+    .map_err(NodeError::MainnetLaunchEvidence)?;
+    Ok(pin)
+}
+
+/// Static package identity for the October 2 publication window. It never
+/// requires the future beacon and never opens node storage or a wallet.
+#[cfg(feature = "production-v4")]
+pub fn canonical_mainnet_launch_info_json() -> Result<Vec<u8>, NodeError> {
+    use sha2::{Digest, Sha256};
+    let pin = compiled_release_pin()?;
+    let executable = std::env::current_exe()
+        .map_err(|_| NodeError::MainnetLaunchEvidence("cannot resolve package directory"))?;
+    let directory = executable
+        .parent()
+        .ok_or(NodeError::MainnetLaunchEvidence(
+            "package directory is absent",
+        ))?
+        .join("production-mainnet");
+    let bytes = read_bounded_file(&directory.join("MAINNET-PLAN.json"), 32 * 1024)?;
+    let plan =
+        crate::rcnet_candidate::MainnetLaunchPlan::parse_pinned(&bytes, pin.launch_plan_digest)
+            .map_err(|_| NodeError::MainnetLaunchEvidence("plan does not match the release pin"))?;
+    plan.validate_profile_template(crate::COMPILED_NETWORK_PROFILE)
+        .map_err(|_| {
+            NodeError::MainnetLaunchEvidence(
+                "launch plan disagrees with compiled runtime parameters",
+            )
+        })?;
+    let commit = option_env!("CMFD_BUILD_SOURCE_COMMIT").unwrap_or_default();
+    let approval = crate::release_gate::canonical_mainnet_activation_evidence_json(
+        crate::release_gate::COMPILED_RELEASE_PROFILE,
+        pin,
+        cmfd_consensus::mainnet_network::MAINNET_NETWORK_ID,
+        commit,
+    )
+    .map_err(NodeError::MainnetLaunchEvidence)?;
+    let document = serde_json::json!({
+        "format": "commonfoundry-mainnet-launch-info", "format_version": 1,
+        "source_commit": commit,
+        "source_release_utc": cmfd_launch::SOURCE_RELEASE_UTC,
+        "mining_start_utc": cmfd_launch::MAINNET_LAUNCH_UTC,
+        "launch_plan": plan,
+        "activation_evidence_sha256": hex::encode(Sha256::digest(approval)),
+        "genesis_policy": "requires_verified_launch_beacon",
+        "beacon_round": cmfd_launch::MAINNET_BEACON_ROUND,
+    });
+    let mut encoded = serde_json::to_vec(&document)?;
+    encoded.push(b'\n');
+    Ok(encoded)
+}
+
+#[cfg(feature = "production-v4")]
+fn read_bounded_file(path: &Path, limit: usize) -> Result<Vec<u8>, NodeError> {
+    let file = File::open(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            NodeError::MainnetLaunchRequired
+        } else {
+            NodeError::MainnetLaunchEvidence("cannot read launch sidecar")
+        }
+    })?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| NodeError::MainnetLaunchEvidence("cannot inspect launch sidecar"))?;
+    if !metadata.is_file() || metadata.len() > limit as u64 {
+        return Err(NodeError::MainnetLaunchEvidence(
+            "launch sidecar is not a bounded regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take((limit + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| NodeError::MainnetLaunchEvidence("cannot read launch sidecar"))?;
+    if bytes.len() > limit {
+        return Err(NodeError::MainnetLaunchEvidence(
+            "launch sidecar exceeds its byte limit",
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Resolve only the compiled template. An arbitrary Mainnet struct still has
+/// no authority and is rejected by the shared parameter constructor.
+pub(crate) fn resolve_compiled_profile(
+    profile: NetworkProfile,
+) -> Result<(NetworkProfile, Option<&'static AuthenticatedMainnetRuntime>), NodeError> {
+    if profile.kind != NetworkProfileKind::Mainnet || profile != crate::COMPILED_NETWORK_PROFILE {
+        return Ok((profile, None));
+    }
+    #[cfg(feature = "production-v4")]
+    {
+        let runtime = compiled_mainnet_runtime()?;
+        Ok((runtime.profile, Some(runtime)))
+    }
+    #[cfg(not(feature = "production-v4"))]
+    Err(NodeError::MainnetLaunchRequired)
+}
+
+pub fn ensure_compiled_launch_ready() -> Result<(), NodeError> {
+    resolve_compiled_profile(crate::COMPILED_NETWORK_PROFILE).map(|_| ())
+}
+
 pub(crate) fn require_authenticated_profile(
     profile: NetworkProfile,
     launch: Option<&AuthenticatedMainnetRuntime>,
@@ -117,6 +282,40 @@ mod tests {
             name: "CommonFoundry Mainnet",
             ..RCNET1_PROFILE
         }
+    }
+
+    #[test]
+    fn development_startup_does_not_require_launch_sidecars() {
+        if crate::COMPILED_NETWORK_PROFILE.kind != NetworkProfileKind::Mainnet {
+            assert!(ensure_compiled_launch_ready().is_ok());
+            let (profile, launch) =
+                resolve_compiled_profile(crate::COMPILED_NETWORK_PROFILE).unwrap();
+            assert_eq!(profile, crate::COMPILED_NETWORK_PROFILE);
+            assert!(launch.is_none());
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "production-v4")]
+    fn package_reader_is_bounded_and_missing_files_are_retryable() {
+        use std::fs;
+        let path = std::env::temp_dir().join(format!(
+            "cmfd-launch-bounded-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert!(matches!(
+            read_bounded_file(&path, 32),
+            Err(NodeError::MainnetLaunchRequired)
+        ));
+        fs::write(&path, [0_u8; 33]).unwrap();
+        assert!(read_bounded_file(&path, 32).is_err());
+        fs::write(&path, b"exact").unwrap();
+        assert_eq!(read_bounded_file(&path, 5).unwrap(), b"exact");
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

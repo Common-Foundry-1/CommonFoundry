@@ -138,7 +138,7 @@ fn is_production_v4_network(network_id: [u8; 32]) -> bool {
     matches!(
         network_id,
         PRODUCTION_V4_TESTNET_NETWORK_ID | PRODUCTION_V4_RCNET1_NETWORK_ID
-    )
+    ) || crate::mainnet_network::is_mainnet_network(network_id)
 }
 
 /// Derives the four-byte frame discriminator from all 32 bytes of a network ID.

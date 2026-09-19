@@ -216,6 +216,9 @@ struct Cli {
 enum Command {
     /// Print the compiled network identity and consensus manifest.
     NetworkInfo,
+    /// Print pinned mainnet launch identity before the future beacon is available.
+    #[cfg(feature = "production-v4")]
+    MainnetLaunchInfo,
     /// Write the October mainnet plan from release-pinned artifacts and explicit
     /// reward addresses. Does not activate mainnet or alter RCNet storage.
     #[cfg(feature = "production-v4")]
@@ -857,6 +860,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     #[cfg(feature = "production-v4")]
+    if matches!(&cli.command, Command::MainnetLaunchInfo) {
+        io::stdout()
+            .lock()
+            .write_all(&cmfd_node::mainnet_runtime::canonical_mainnet_launch_info_json()?)?;
+        return Ok(());
+    }
+    #[cfg(feature = "production-v4")]
     if let Command::MainnetPlan {
         output,
         pow_limit,
@@ -1092,6 +1102,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _log_guard = cmfd_node::logging::init_tracing(&cli.data_dir, cli.verbose);
     match cli.command {
         Command::NetworkInfo => unreachable!("network-info exits before node initialization"),
+        #[cfg(feature = "production-v4")]
+        Command::MainnetLaunchInfo => {
+            unreachable!("mainnet-launch-info exits before node initialization")
+        }
         #[cfg(feature = "production-v4")]
         Command::MainnetPlan { .. } => {
             unreachable!("mainnet plan generation exits before node initialization")

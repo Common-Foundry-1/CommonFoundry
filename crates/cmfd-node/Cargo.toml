@@ -20,6 +20,7 @@ production-v4 = [
 ]
 production-v4-testnet = ["production-v4"]
 production-rc = ["production-v4"]
+production-mainnet = ["production-v4"]
 
 [dependencies]
 argon2.workspace = true

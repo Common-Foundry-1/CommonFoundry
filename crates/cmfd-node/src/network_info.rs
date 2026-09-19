@@ -27,7 +27,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{
     COMPILED_NETWORK_PROFILE, NetworkProfile, NodeError, ProductionV4VerifierArtifacts,
-    network_params_and_verifier_for_profile,
+    network_params_and_verifier_with_launch,
 };
 
 const NETWORK_INFO_FORMAT: &str = "commonfoundry-network-info";
@@ -300,10 +300,12 @@ fn canonical_network_info_json_for_profile(
     production_v3_record: Option<&ProductionV3VerifierRecord>,
     production_v4_artifacts: Option<&ProductionV4VerifierArtifacts>,
 ) -> Result<Vec<u8>, NodeError> {
-    let (params, verifier) = network_params_and_verifier_for_profile(
+    let (profile, launch) = crate::mainnet_runtime::resolve_compiled_profile(profile)?;
+    let (params, verifier) = network_params_and_verifier_with_launch(
         profile,
         production_v3_record,
         production_v4_artifacts,
+        launch,
     )?;
     let proof_of_work = match verifier.parameters() {
         PowParameters::V2Reference(descriptor) => {
@@ -437,9 +439,28 @@ fn canonical_network_info_json_for_profile(
                     )
                 }
                 NetworkProfileKind::ProductionV4Testnet => (None, None),
-                NetworkProfileKind::Devnet
-                | NetworkProfileKind::ProductionV3Testnet
-                | NetworkProfileKind::Mainnet => {
+                NetworkProfileKind::Mainnet => {
+                    let build_source_commit = option_env!("CMFD_BUILD_SOURCE_COMMIT").ok_or(
+                        NodeError::MainnetLaunchEvidence("trusted build source commit is absent"),
+                    )?;
+                    let configuration = crate::release_gate::MAINNET_RELEASE_CONFIGURATION.ok_or(
+                        NodeError::MainnetLaunchEvidence(
+                            "compiled release configuration is absent",
+                        ),
+                    )?;
+                    let evidence = crate::release_gate::canonical_mainnet_activation_evidence_json(
+                        release_profile,
+                        configuration,
+                        cmfd_consensus::mainnet_network::MAINNET_NETWORK_ID,
+                        build_source_commit,
+                    )
+                    .map_err(NodeError::MainnetLaunchEvidence)?;
+                    (
+                        Some(build_source_commit),
+                        Some(hex::encode(Sha256::digest(evidence))),
+                    )
+                }
+                NetworkProfileKind::Devnet | NetworkProfileKind::ProductionV3Testnet => {
                     unreachable!("only ProductionV4 profiles can select ProductionV4 parameters")
                 }
             };

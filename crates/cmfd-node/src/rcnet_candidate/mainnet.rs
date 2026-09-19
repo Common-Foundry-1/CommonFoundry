@@ -235,6 +235,43 @@ impl MainnetLaunchPlan {
             wallet_data_dir_identity: "mainnet",
         })
     }
+
+    /// Pre-launch packaging can check every fixed identity without inventing
+    /// the future beacon-derived genesis hash or starting a chain database.
+    pub(crate) fn validate_profile_template(
+        &self,
+        profile: crate::NetworkProfile,
+    ) -> Result<(), RcnetCandidateError> {
+        self.validate()?;
+        if profile.kind != crate::NetworkProfileKind::Mainnet
+            || profile.proof != crate::ProofProfile::ProductionV4
+            || profile.network_id != self.network_id()?
+            || profile.virtual_genesis_hash != [0; 32]
+            || profile.virtual_genesis_timestamp != MAINNET_LAUNCH_UNIX_SECONDS
+            || profile.pow_limit != decode_hex32(&self.payload.rules.proof_of_work.pow_limit)?
+            || profile.rewards.steward
+                != decode_hex32(
+                    &self
+                        .payload
+                        .rules
+                        .reward_destinations
+                        .steward_xonly_public_key,
+                )?
+            || profile.rewards.community
+                != decode_hex32(
+                    &self
+                        .payload
+                        .rules
+                        .reward_destinations
+                        .community_xonly_public_key,
+                )?
+        {
+            return Err(RcnetCandidateError::InvalidField(
+                "compiled mainnet profile disagrees with launch plan",
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn payload_digest(payload: &MainnetLaunchPayload) -> Result<[u8; 32], RcnetCandidateError> {

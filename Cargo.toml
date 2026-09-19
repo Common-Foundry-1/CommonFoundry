@@ -3,6 +3,7 @@ members = [
     "apps/wallet/src-tauri",
     "crates/cmfd-consensus",
     "crates/cmfd-cuda",
+    "crates/cmfd-launch",
     "crates/cmfd-marketplace",
     "crates/cmfd-miner",
     "crates/cmfd-node",

@@ -1,5 +1,6 @@
 """Storage projections and isolated service-template contracts; no live changes."""
 import ast
+import os
 from fractions import Fraction
 from pathlib import Path
 import re
@@ -112,12 +113,57 @@ class StorageReadinessTests(unittest.TestCase):
         self.assertIn("--enforce-reserve", prestart[1])
         self.assertIn("cmfd-launch fetch", prestart[-1])
         self.assertIn("--wait", prestart[-1])
+        credential_copy = next(index for index, line in enumerate(prestart) if "/usr/bin/install " in line)
+        models = "/opt/commonfoundry-mainnet/current/production-v4/"
+        for name in ("MODEL-V2.bank", "FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json"):
+            for flag in ("-f", "-r"):
+                probe = "ExecStartPre=/usr/bin/test " + flag + " " + models + name
+                self.assertIn(probe, prestart)
+                self.assertLess(prestart.index(probe), len(prestart) - 1)
+                self.assertLess(prestart.index(probe), credential_copy)
         self.assertIn("--bind 127.0.0.1:29443 --p2p-bind 0.0.0.0:29444", source)
         self.assertIn("User=commonfoundry-mainnet\n", source)
         self.assertIn("TimeoutStartSec=infinity", source)
         self.assertNotIn("/opt/commonfoundry/", source)
         self.assertNotIn("/var/lib/commonfoundry ", source)
         self.assertNotIn("19444", source)
+
+    @unittest.skipUnless(sys.platform.startswith("linux") and hasattr(os, "geteuid") and os.geteuid() == 0,
+                         "effective service-identity permission check requires an isolated Linux root test process")
+    def test_root_prepared_models_need_read_only_service_group_access(self):
+        import pwd
+        identity = pwd.getpwnam("nobody")
+        with tempfile.TemporaryDirectory(prefix="cmfd-service-permissions-") as temporary:
+            root = Path(temporary)
+            root.chmod(0o755)
+            models = root / "production-v4"
+            models.mkdir(mode=0o700)
+            files = [models / "MODEL-V2.bank", models / "FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json"]
+            for path in files:
+                path.write_bytes(b"public model fixture")
+                path.chmod(0o600)
+
+            def probe(flag, path):
+                return subprocess.run(["/usr/bin/test", flag, str(path)],
+                    user=identity.pw_uid, group=identity.pw_gid, extra_groups=[],
+                    capture_output=True, timeout=5).returncode
+
+            for path in files:
+                self.assertNotEqual(probe("-r", path), 0)
+            os.chown(models, 0, identity.pw_gid)
+            models.chmod(0o750)
+            for path in files:
+                os.chown(path, 0, identity.pw_gid)
+                path.chmod(0o640)
+                self.assertEqual(probe("-f", path), 0)
+                self.assertEqual(probe("-r", path), 0)
+                self.assertNotEqual(probe("-w", path), 0)
+                opened = subprocess.run(["/usr/bin/head", "-c", "1", str(path)],
+                    user=identity.pw_uid, group=identity.pw_gid, extra_groups=[],
+                    capture_output=True, timeout=5)
+                self.assertEqual(opened.returncode, 0, opened.stderr)
+                self.assertEqual(opened.stdout, b"p")
+            self.assertNotEqual(probe("-w", models), 0)
 
     @unittest.skipUnless(sys.platform.startswith("linux") and shutil.which("systemd-analyze"), "systemd syntax verification is Linux-only")
     def test_systemd_parser_accepts_templates_without_installing_them(self):

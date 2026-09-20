@@ -299,8 +299,10 @@ not changed to accommodate that unrelated host-toolchain drift.
 Both fault classification and the exited-worker regression are now included in
 the shorter Windows/Linux CI jobs rather than being discovered only after the
 long workspace proof suite. At the latest check on `d049be9`, all jobs except
-the still-running full Rust job had passed. Full CI on the repaired source
-remains required; no running qualification job was cancelled.
+the then-running full Rust job had passed. That old run later failed in the same
+already-repaired fault fixture; the corrected `9bdd269` checkpoint has now started
+its full run. Full CI on the final source remains required; no running
+qualification job was cancelled.
 
 ## Offline recovery identity and CLI rehearsal
 
@@ -502,7 +504,22 @@ purchase has been applied. Operator capacity, alert delivery, the real sandbox
 and restart behavior still need qualification before deployment.
 The mainnet unit was confirmed `not-found` and its proposed TCP ports had no
 listeners. The RC service PID and September 12 start time remained unchanged
-throughout the audit. Nine storage/service tests pass on Linux; Windows passes
-eight and skips the Linux-only systemd parser check. The expanded 31 package
-tests still pass. Syntax checks use executable stubs and are not a live-service
-rehearsal.
+throughout the audit.
+
+The model preparer creates a 0700 destination. When run by root during service
+installation, that default prevents the unprivileged service from reading the
+model. Setup now explicitly requires root-owned, service-group-readable model
+directories/files while preserving non-writability and executable permissions.
+The service template checks the bank and root fixed-record paths for regular-file
+type and readability before copying its runtime credential or waiting for the
+launch beacon, so access errors are surfaced during preparation rather than at
+launch time.
+
+Ten storage/service tests pass on Linux, including a real dropped-privilege
+fixture: root-created 0700 inputs are unreadable to `nobody`; the documented
+group permissions allow reads but not file or directory writes. This uses only
+temporary public-data fixtures and creates no account or service. The same
+isolated test is scheduled explicitly on Linux CI. Windows passes eight checks
+and skips the two Linux-only cases. All 33 package/preflight checks still pass on
+both platforms. The separate systemd syntax check uses executable stubs; neither
+it nor the permission fixture qualifies a live service or its full sandbox.

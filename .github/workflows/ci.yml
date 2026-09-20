@@ -200,6 +200,12 @@ jobs:
           cargo test --locked -p cmfd-consensus --lib difficulty::tests::
       - name: Verify mainnet launcher success and failure ordering
         run: python -m unittest discover -s scripts/tests -p 'test_mainnet_launchers.py' -v
+      - name: Verify model access under an isolated unprivileged identity
+        if: runner.os == 'Linux'
+        run: >-
+          sudo --non-interactive env PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3
+          -m unittest discover -s scripts/tests -p 'test_mainnet_storage.py'
+          -k root_prepared_models -v
       - name: Verify authenticated model-input mirror fallback
         run: |
           python -m unittest discover -s scripts/tests -p 'test_production_v4_inputs.py' -v

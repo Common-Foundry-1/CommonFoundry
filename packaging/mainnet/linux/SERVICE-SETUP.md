@@ -9,13 +9,46 @@ mainnet release, configuration, runtime and data directories:
 - `/var/lib/commonfoundry-mainnet` (dedicated service user, 0700)
 - `/run/commonfoundry-mainnet` (systemd runtime directory, 0700)
 
-Create the dedicated unprivileged `commonfoundry-mainnet` account before
-installation. Verify the signed release, four-package preflight and final
+Create the dedicated unprivileged `commonfoundry-mainnet` account and matching
+group before installation. Verify the signed release, four-package preflight and final
 mainnet plan before copying the runtime package. Prepare and authenticate the
 model inputs before enabling a service. Keep the executables, Python/scripts,
 model files and configuration root-owned and not writable by the service user.
 Do not run the RC provisioning script on this host again; it changes host-wide
 SSH, firewall and account settings.
+
+### Make the prepared inputs readable by the service
+
+The input preparer creates its destination with mode 0700. If an administrator
+runs it as root, the service account cannot traverse that directory until the
+deployment permissions are adjusted. Do this before enabling the service, not
+after the launch wait finishes.
+
+For the separate mainnet release copy, use root:commonfoundry-mainnet ownership
+with 0750 (or read-only 0550) on the release/model directories and 0640 (or 0440)
+on MODEL-V2.bank and both copies of the fixed record. The node reads the record
+directly under `production-v4`; the preparer also keeps a copy under
+`production-v4/fixed`. Preserve executable permission on the packaged binaries
+and scripts. All parent directories must permit the service account to traverse
+them. The service account must not be able to replace the model, plan, binaries,
+or parent directory entries.
+
+Do not recursively change permissions on an RC installation or its shared
+hardlinks. Use a separate mainnet copy. Inspect the resolved versioned release
+path and ownership before applying permissions; the root-owned `current` link
+should select only that verified release.
+
+After preparation, check access as the actual service account:
+
+```sh
+sudo -u commonfoundry-mainnet test -r /opt/commonfoundry-mainnet/current/production-v4/MODEL-V2.bank
+sudo -u commonfoundry-mainnet test -r /opt/commonfoundry-mainnet/current/production-v4/FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json
+```
+
+The unit also tests that these paths are regular, readable files before copying
+the runtime credential or waiting for the beacon. These are accessibility checks,
+not substitutes for the signed-package and artifact hash checks. The node still
+authenticates the complete inputs before opening its services.
 
 The launch helper must publish its certificate into `production-mainnet` beside
 the executable. On this Linux service deployment, make that directory

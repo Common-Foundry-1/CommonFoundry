@@ -131,7 +131,7 @@ and api3.drand.sh on 2026-09-19. Historical round 123 is the offline positive ve
 | Seeds, discovery, explorer | Live RC seed checked healthy September 19; isolated mainnet service templates staged, not deployed | Independent node results and mainnet service configuration |
 | Pool payout and reorg lifecycle | Isolated real-chain maturity/payout/restart tests pass; deep-reorg funding-loss handling remains incomplete | Agreed loss policy, corresponding adversarial tests, and actual packaged mature-reward payout/recovery logs |
 | Storage capacity | Live seed has about 274 GiB free; larger archival capacity versus pruning awaits owner decision | Measured growth and provisioned capacity/retention decision |
-| Model download availability | Fresh full node-model downloads/hash checks pass from primary and anonymous GitHub; GitHub still lacks 36 solo-input parts | Final packaged preparation rehearsal and a complete independent solo-input mirror |
+| Model download availability | Full 61.2 GB solo-input set verified from primary; node-model downloads verified from both hosts; GitHub still lacks 36 solo-input parts | Final packaged preparation rehearsal and a complete independent solo-input mirror |
 | Recovery and update | Offline CLI backup/restore/tail-repair rehearsal passes on Windows/Linux; mainnet storage tools now authenticate launch identity | Final signed-package and service-identity rehearsal, upgrade/rollback results |
 | Final launch rehearsal | Pending | Exact intended packages, future-round start, delayed-beacon handling, fresh-wallet transfers |
 | Source release 24 hours early | Not yet executed | Public source and matching package timestamps at agreed release time |
@@ -417,9 +417,22 @@ They are computation inputs, not mainnet binaries or activation approvals.
 
 The inventory has 40 parts. GitHub's existing RC1 mirror has exactly the four
 node-model parts, with matching published lengths/digests, but lacks the 36
-solo-mining parts. The primary's other parts previously passed HEAD/length
-checks only; this turn did not re-download the entire 61 GB solo set. Completing
-an independent solo-input mirror remains a launch gate. The owner has been asked
+solo-mining parts. The remaining primary-host files were subsequently downloaded
+in a fresh, sequential miner-role preparation. All 36 additional parts and all
+assembled files passed their hashes. A separate native Windows SHA-256 readback
+then checked all eight files against the input manifest, including the three
+row-major codeword caches: **61,203,815,317 bytes** in total. This audit did not
+rely on the normal length-only reuse rule for those caches.
+
+An offline artifact-load smoke test with the current ProductionV4 test-profile
+node also passed. It was repeated against the node-only GitHub download directory
+without the solo caches; both returned the same test-profile fingerprint and
+created no node storage. These are CPU-only compatibility checks, not mainnet
+activation, GPU/proof qualification, release performance, or a signed-package
+rehearsal. The full input set remains in isolated local staging; the running RC
+installation was not changed.
+
+Completing an independent solo-input mirror remains a launch gate. The owner has been asked
 whether to publish a separate data-only mirror release of those already-public
 inputs now or stage it until the source-release date. No public assets were
 added, replaced or re-signed.
@@ -442,6 +455,13 @@ native PowerShell); three run on Linux with four Windows-only cases skipped ther
 All 11 existing runtime-bootstrap and 33 mainnet package/preflight checks pass on
 both platforms. These bounded transport/package tests do not replace rehearsal
 of the final signed packages or independent reproduction.
+
+For review handoff, the readiness head at `a0494a1` was 508 commits ahead of
+`main`, including accumulated RC development. Relative to the verified RC5
+miner.2 baseline `08e63ad`, the mainnet-preparation delta was 18 commits across
+106 files. That focused comparison is useful for reviewers but does not qualify
+the underlying proof/consensus implementation. No reviewer was assigned and no
+additional PR-triggered full CI run was started during this audit.
 
 ## Read-only seed and capacity check (September 19)
 

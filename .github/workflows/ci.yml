@@ -201,6 +201,10 @@ jobs:
         run: cargo test --locked -p cmfd-node --lib stalled_
       - name: Exercise operating-system shutdown signals
         run: cargo test --locked -p cmfd-node --test graceful_shutdown -- --test-threads=1
+      - name: Exercise offline backup, restore, and storage recovery
+        run: |
+          cargo test --locked -p cmfd-node --lib storage::tests:: -- --test-threads=1
+          cargo test --locked -p cmfd-node --test offline_recovery
       - name: Exercise pool maturity, payout reservations, and durable restart
         run: >-
           cargo test --locked -p cmfd-node --lib pool::tests:: -- --test-threads=1

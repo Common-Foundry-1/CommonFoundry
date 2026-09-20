@@ -17,6 +17,18 @@ artifacts or starting network services:
 cmfd-node --data-dir <node-data> storage-inspect
 ```
 
+For mainnet, inspection and repair first resolve the authenticated launch
+profile from the release-pinned plan and verified beacon beside the executable.
+The compiled zero-genesis placeholder is never used as the first block's parent.
+Keep `production-mainnet/MAINNET-PLAN.json` and the verified
+`production-mainnet/LAUNCH-BEACON.json` with the matching release. If the beacon
+must be reacquired after launch, use `cmfd-launch fetch --runtime <absolute-node-path>`
+or restore the same public certificate from the recovery bundle. There is no
+operator-supplied genesis override. Missing or invalid launch authority is
+rejected before taking a data-directory lock or creating quarantine evidence.
+These commands do not load model inputs or start network services themselves;
+normal `status`/startup still performs the required consensus validation.
+
 `healthy` means the log ends exactly after its last authenticated record.
 `recoverable_partial_tail` identifies only an incomplete final header, block,
 reversible-state delta, or checksum. A checksum mismatch, broken record-digest

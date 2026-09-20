@@ -132,7 +132,7 @@ and api3.drand.sh on 2026-09-19. Historical round 123 is the offline positive ve
 | Pool payout and reorg lifecycle | Isolated real-chain maturity/payout/restart tests pass; deep-reorg funding-loss handling remains incomplete | Agreed loss policy, corresponding adversarial tests, and actual packaged mature-reward payout/recovery logs |
 | Storage capacity | Live seed has about 274 GiB free; larger archival capacity versus pruning awaits owner decision | Measured growth and provisioned capacity/retention decision |
 | Model download availability | Primary host returned HTTP 200 and expected Content-Length for all 40 parts on September 19; GitHub fallback has only 4 model-bank parts | Full download/hash check during packaged rehearsal and a complete independent solo-input mirror |
-| Recovery and update | Rehearsal pending | Backup/restore, interrupted append, restart, upgrade/rollback results |
+| Recovery and update | Offline CLI backup/restore/tail-repair rehearsal passes on Windows/Linux; mainnet storage tools now authenticate launch identity | Final signed-package and service-identity rehearsal, upgrade/rollback results |
 | Final launch rehearsal | Pending | Exact intended packages, future-round start, delayed-beacon handling, fresh-wallet transfers |
 | Source release 24 hours early | Not yet executed | Public source and matching package timestamps at agreed release time |
 
@@ -300,6 +300,40 @@ the shorter Windows/Linux CI jobs rather than being discovered only after the
 long workspace proof suite. At the latest check on `d049be9`, all jobs except
 the still-running full Rust job had passed. Full CI on the repaired source
 remains required; no running qualification job was cancelled.
+
+## Offline recovery identity and CLI rehearsal
+
+Inspection and partial-tail repair previously used the compiled profile directly.
+For mainnet that profile contains the unactivated zero genesis, whereas node
+startup uses the verified beacon-derived genesis. A healthy first block could
+therefore be rejected as having an unknown parent. The same entry points also
+allowed an unauthenticated public Mainnet profile to inspect an empty log or
+repair a partial first record. Unauthenticated inspection and repair were both
+reproduced with disposable fixtures before the repair.
+
+The storage commands now resolve and require the same authenticated mainnet
+profile as node startup, before taking a data lock or opening a block log. No
+genesis override or caller-supplied authority was added. Six storage checks pass
+on Windows and Linux with ProductionV4 enabled, covering rejected bare profiles
+without file changes, correct resolved-parent scanning, exact tail quarantine,
+and refusal of checksum corruption. A real future mainnet certificate is not
+available yet; these checks do not claim to exercise the October 3 signature.
+
+The new offline CLI rehearsal also passes on both platforms. It creates a
+disposable encrypted wallet and three-block reference chain, checks that a live
+data-directory lock blocks backup, restores to a separate path containing spaces,
+rejects a wrong passphrase and overwrite, preserves the exact interrupted bytes,
+and replays the repaired chain without a copied checkpoint. Receiving address,
+chain tip, height, consensus fingerprint, UTXO count, original source log and
+restored encrypted wallet bytes are retained/checked. No network service or GPU
+is used. Strict node Clippy checks pass with the pinned Rust 1.94.1.
+
+Runtime package layouts now include RECOVERY.md and STORAGE-RECOVERY.md from the
+frozen source; all 33 assembly/preflight checks pass on Windows and Linux. These
+are fixture archives, not newly published mainnet binaries. Operators must still
+rehearse the final signed packages under the intended service identity, including
+permissions, full backups, restart, and upgrade/rollback. Existing RC services,
+keys and chain data were not changed.
 
 ## Pool payout lifecycle evidence and remaining loss-policy gate
 

@@ -40,10 +40,20 @@ pub struct StorageRepairReport {
     pub repaired_log_bytes: u64,
 }
 
+fn authenticated_storage_profile(profile: NetworkProfile) -> Result<NetworkProfile, NodeError> {
+    // Mainnet's compiled profile contains an unactivated zero genesis. Use
+    // exactly the same verified plan/beacon authority as node startup before
+    // taking a data lock or deciding which log prefix may be retained.
+    let (profile, launch) = super::mainnet_runtime::resolve_compiled_profile(profile)?;
+    super::mainnet_runtime::require_authenticated_profile(profile, launch)?;
+    Ok(profile)
+}
+
 pub fn inspect_block_log(
     data_dir: &Path,
     profile: NetworkProfile,
 ) -> Result<StorageInspection, NodeError> {
+    let profile = authenticated_storage_profile(profile)?;
     require_existing_data_directory(data_dir)?;
     let _lock = DataDirLock::acquire(data_dir)?;
     let path = data_dir.join(BLOCK_LOG_FILE);
@@ -62,6 +72,7 @@ pub fn repair_partial_block_log_tail(
     profile: NetworkProfile,
     quarantine: &Path,
 ) -> Result<Option<StorageRepairReport>, NodeError> {
+    let profile = authenticated_storage_profile(profile)?;
     require_existing_data_directory(data_dir)?;
     let _lock = DataDirLock::acquire(data_dir)?;
     let path = data_dir.join(BLOCK_LOG_FILE);
@@ -285,6 +296,82 @@ mod tests {
     use crate::{DEFAULT_MINING_ATTEMPTS, DEVNET_GENESIS_TIMESTAMP, DEVNET_PROFILE, Node};
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+
+    struct OwnedTestDirectory(PathBuf);
+
+    impl OwnedTestDirectory {
+        fn new() -> Self {
+            let mut identity = [0; 16];
+            getrandom::fill(&mut identity).unwrap();
+            let path =
+                std::env::temp_dir().join(format!("cmfd-storage-launch-{}", hex::encode(identity)));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for OwnedTestDirectory {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    fn unactivated_mainnet_profile() -> NetworkProfile {
+        NetworkProfile {
+            kind: crate::NetworkProfileKind::Mainnet,
+            virtual_genesis_hash: [0; 32],
+            name: "CommonFoundry Mainnet",
+            ..crate::RCNET1_PROFILE
+        }
+    }
+
+    #[test]
+    fn mainnet_storage_inspection_requires_launch_before_opening_data() {
+        let root = OwnedTestDirectory::new();
+        let result = inspect_block_log(&root.0, unactivated_mainnet_profile());
+        assert!(
+            matches!(result, Err(NodeError::MainnetLaunchRequired)),
+            "an unauthenticated mainnet profile must not inspect storage: {result:?}"
+        );
+        assert_eq!(fs::read_dir(&root.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn mainnet_storage_repair_requires_launch_before_mutating_files() {
+        let root = OwnedTestDirectory::new();
+        let path = root.0.join(BLOCK_LOG_FILE);
+        let quarantine = root.0.join("must-not-create.quarantine");
+        fs::write(&path, b"CMF").unwrap();
+        let result =
+            repair_partial_block_log_tail(&root.0, unactivated_mainnet_profile(), &quarantine);
+        assert!(
+            matches!(result, Err(NodeError::MainnetLaunchRequired)),
+            "an unauthenticated mainnet profile must not repair storage: {result:?}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"CMF");
+        assert!(!quarantine.exists());
+        assert_eq!(fs::read_dir(&root.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn storage_scan_requires_the_resolved_genesis_not_an_unactivated_placeholder() {
+        let root = OwnedTestDirectory::new();
+        let expected_length = create_one_block_log(&root.0);
+        let path = root.0.join(BLOCK_LOG_FILE);
+        let mut file = File::open(&path).unwrap();
+        let placeholder = NetworkProfile {
+            virtual_genesis_hash: [0; 32],
+            ..DEVNET_PROFILE
+        };
+        assert!(matches!(
+            scan_block_log(&mut file, &path, placeholder),
+            Err(NodeError::CorruptLog(message)) if message.contains("parent")
+        ));
+        let inspection = scan_block_log(&mut file, &path, DEVNET_PROFILE).unwrap();
+        assert!(inspection.is_healthy());
+        assert_eq!(inspection.records, 1);
+        assert_eq!(inspection.last_valid_offset, expected_length);
+    }
 
     fn test_dir(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(

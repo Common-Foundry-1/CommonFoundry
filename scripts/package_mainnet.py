@@ -239,6 +239,8 @@ def package_sources(platform: str, kind: str) -> dict[str, str]:
     windows = platform == "windows-x86_64"
     directory = "windows" if windows else "linux"
     if kind == "runtime":
+        sources["RECOVERY.md"] = "packaging/mainnet/RECOVERY.md"
+        sources["STORAGE-RECOVERY.md"] = "docs/storage-recovery.md"
         sources["mainnet-storage-readiness.py"] = "scripts/mainnet_storage_readiness.py"
         launchers = ("START-WALLET.bat", "START-NODE.bat", "START-RUNTIME.ps1", "PREPARE-RUNTIME.ps1", "PREPARE-MINING.ps1", "PREPARE-MINING.bat") if windows else ("start-wallet.sh", "start-node.sh", "prepare-runtime.sh", "prepare-mining.sh")
         if not windows:

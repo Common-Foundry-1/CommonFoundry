@@ -144,6 +144,10 @@ class MainnetPackageTests(unittest.TestCase):
                     self.assertEqual(receipt["files"], {name: {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()} for name, data in content.items()})
                     self.assertEqual(content["production-mainnet/MAINNET-PLAN.json"], self.plan_path.read_bytes())
                     self.assertNotIn("production-mainnet/LAUNCH-BEACON.json", content)
+                    if kind == "runtime":
+                        # The fixture models frozen Git blobs, not checkout CRLF.
+                        self.assertEqual(content["RECOVERY.md"], (self.repo / "packaging/mainnet/RECOVERY.md").read_bytes().replace(b"\r\n", b"\n"))
+                        self.assertEqual(content["STORAGE-RECOVERY.md"], (self.repo / "docs/storage-recovery.md").read_bytes().replace(b"\r\n", b"\n"))
                     worker = "production-v4/" if kind == "runtime" else ""
                     self.assertIn(worker + "cmfd-v4-replay", content)
                     self.assertIn(worker + "real_bank0_relations", content)

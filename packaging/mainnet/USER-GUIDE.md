@@ -32,6 +32,10 @@ for activation before starting the node. On Linux, that file must be readable
 only by its owner (0600). Forward only the mainnet P2P port TCP 29444 when you
 want inbound peers. RPC uses localhost:29443. Do not reuse RC data directories.
 
+Runtime archives include [RECOVERY.md](RECOVERY.md) for offline backup and
+restore, and [STORAGE-RECOVERY.md](STORAGE-RECOVERY.md) for interrupted-log repair.
+Rehearse a restore into a separate directory before relying on the backup.
+
 ## Mining
 
 The standalone miner connects to your chosen mainnet pool. Fill in the wallet

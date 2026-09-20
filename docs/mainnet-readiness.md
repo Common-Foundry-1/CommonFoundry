@@ -335,6 +335,30 @@ rehearse the final signed packages under the intended service identity, includin
 permissions, full backups, restart, and upgrade/rollback. Existing RC services,
 keys and chain data were not changed.
 
+## Remaining launch-identity consumers
+
+A source audit of node, miner and desktop runtime genesis consumers found one
+more direct use of the compiled placeholder in the node's offline keyring
+tools. Stored network metadata supplied a fingerprint, but the binding combined
+it with the compiled zero genesis. Mainnet bindings now resolve the authenticated
+runtime first, use its actual genesis/network ID, and require the stored
+fingerprint to match its derived network parameters before making a keyring or
+journal binding. This reads no model inputs and adds no genesis/clock override.
+RC/development metadata behavior is unchanged.
+
+The three new decoder tests pass with ProductionV4 enabled on Windows and Linux:
+resolved-genesis preservation, rejection of missing/zero launch identity and
+changed fingerprints, and strict metadata framing. They use synthetic decoder
+inputs, not actual launch authority or independent approvals. All 19 existing
+and new offline-keyring tests and strict ProductionV4 node Clippy checks pass
+on both Windows and Linux. The compile-time
+DEVNET_GENESIS_HASH compatibility alias is now explicitly documented as a
+template, never mainnet's activated genesis. Network-info and live RPC use node
+parameters; thin-miner parameters and wallet startup already resolve the opaque
+launch authority. This bounded source audit does not replace independent review
+or the final signed-package rehearsal. No real keyring, anchor, policy, or OTC
+application was changed.
+
 ## Pool payout lifecycle evidence and remaining loss-policy gate
 
 The payout reconciliation review found a temporary mempool input conflict was

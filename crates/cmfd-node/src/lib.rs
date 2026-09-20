@@ -102,6 +102,9 @@ pub use network_profile::{
 };
 
 pub const DEVNET_NETWORK_ID: [u8; 32] = COMPILED_NETWORK_PROFILE.network_id;
+/// Compile-time template only. Mainnet intentionally has a zero value here
+/// before activation; obtain its authenticated genesis from the launched
+/// [`Node::network_profile`] or [`mainnet_runtime::AuthenticatedMainnetRuntime`].
 pub const DEVNET_GENESIS_HASH: [u8; 32] = COMPILED_NETWORK_PROFILE.virtual_genesis_hash;
 pub const DEVNET_GENESIS_TIMESTAMP: u64 = COMPILED_NETWORK_PROFILE.virtual_genesis_timestamp;
 pub const DEFAULT_RPC_ADDRESS: SocketAddr = COMPILED_NETWORK_PROFILE.rpc_address();

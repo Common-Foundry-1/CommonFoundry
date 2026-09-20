@@ -2471,6 +2471,22 @@ fn journal_binding_from_node(node: &Node) -> JournalBindingV3 {
 }
 
 fn stored_journal_binding(data_dir: &Path) -> Result<JournalBindingV3, ExchangeCustodyToolError> {
+    let (profile, launch) =
+        crate::mainnet_runtime::resolve_compiled_profile(crate::COMPILED_NETWORK_PROFILE)
+            .map_err(operation)?;
+    crate::mainnet_runtime::require_authenticated_profile(profile, launch).map_err(operation)?;
+    #[cfg(feature = "production-v4")]
+    let expected_fingerprint = launch
+        .map(|runtime| {
+            runtime
+                .network_parameters()
+                .and_then(|params| params.fingerprint().map_err(crate::NodeError::from))
+        })
+        .transpose()
+        .map_err(operation)?;
+    #[cfg(not(feature = "production-v4"))]
+    let expected_fingerprint = None;
+
     let metadata_path = resolve_existing_file(
         &data_dir.join(crate::METADATA_FILE),
         "node network metadata",
@@ -2480,6 +2496,24 @@ fn stored_journal_binding(data_dir: &Path) -> Result<JournalBindingV3, ExchangeC
         crate::METADATA_BYTES,
         "node network metadata",
     )?;
+    parse_stored_journal_binding(&bytes, profile, expected_fingerprint)
+}
+
+fn parse_stored_journal_binding(
+    bytes: &[u8],
+    profile: crate::NetworkProfile,
+    expected_fingerprint: Option<[u8; 32]>,
+) -> Result<JournalBindingV3, ExchangeCustodyToolError> {
+    // A mainnet binding may be formed only from the authenticated runtime
+    // resolved above, never the compiled zero-genesis template or metadata
+    // alone. This parser is private; it does not introduce an operator override.
+    if profile.kind == crate::NetworkProfileKind::Mainnet
+        && (expected_fingerprint.is_none() || profile.virtual_genesis_hash == [0; 32])
+    {
+        return Err(ExchangeCustodyToolError::InvalidDocument(
+            "mainnet custody binding lacks authenticated launch identity",
+        ));
+    }
     if bytes.len() != crate::METADATA_BYTES
         || bytes[..4] != crate::METADATA_MAGIC
         || u16::from_le_bytes([bytes[4], bytes[5]]) != crate::METADATA_VERSION
@@ -2496,10 +2530,15 @@ fn stored_journal_binding(data_dir: &Path) -> Result<JournalBindingV3, ExchangeC
             "node consensus fingerprint is zero",
         ));
     }
+    if expected_fingerprint.is_some_and(|expected| expected != consensus_fingerprint) {
+        return Err(ExchangeCustodyToolError::InvalidDocument(
+            "node consensus fingerprint disagrees with authenticated mainnet launch",
+        ));
+    }
     Ok(JournalBindingV3 {
-        network_id: crate::COMPILED_NETWORK_PROFILE.network_id,
+        network_id: profile.network_id,
         consensus_fingerprint,
-        genesis: crate::COMPILED_NETWORK_PROFILE.virtual_genesis_hash,
+        genesis: profile.virtual_genesis_hash,
     })
 }
 
@@ -3031,6 +3070,84 @@ mod tests {
 
     fn marker(value: u8) -> [u8; 32] {
         [value; 32]
+    }
+
+    fn binding_metadata(fingerprint: [u8; 32]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(crate::METADATA_BYTES);
+        bytes.extend_from_slice(&crate::METADATA_MAGIC);
+        bytes.extend_from_slice(&crate::METADATA_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&crate::METADATA_WALLET_KEY_FLAG.to_le_bytes());
+        bytes.extend_from_slice(&fingerprint);
+        bytes
+    }
+
+    #[test]
+    fn stored_binding_uses_resolved_mainnet_genesis_and_checks_fingerprint() {
+        // Pure decoder vectors are not mainnet launch authority. The public
+        // operator path obtains these values only from the verified runtime.
+        let profile = crate::NetworkProfile {
+            kind: crate::NetworkProfileKind::Mainnet,
+            network_id: marker(0xa2),
+            virtual_genesis_hash: marker(0xa3),
+            ..crate::RCNET1_PROFILE
+        };
+        let bytes = binding_metadata(marker(0xa1));
+        let binding = parse_stored_journal_binding(&bytes, profile, Some(marker(0xa1))).unwrap();
+        assert_eq!(binding.network_id, profile.network_id);
+        assert_eq!(binding.genesis, profile.virtual_genesis_hash);
+        assert_eq!(binding.consensus_fingerprint, marker(0xa1));
+        assert_eq!(
+            keyring_binding_from_journal(binding).genesis_hash,
+            profile.virtual_genesis_hash
+        );
+        assert!(matches!(
+            parse_stored_journal_binding(&bytes, profile, Some(marker(0xa4))),
+            Err(ExchangeCustodyToolError::InvalidDocument(
+                "node consensus fingerprint disagrees with authenticated mainnet launch"
+            ))
+        ));
+        let mut changed = bytes.clone();
+        changed[8] ^= 1;
+        assert!(parse_stored_journal_binding(&changed, profile, Some(marker(0xa1))).is_err());
+    }
+
+    #[test]
+    fn stored_binding_rejects_unactivated_or_unchecked_mainnet_profiles() {
+        let profile = crate::NetworkProfile {
+            kind: crate::NetworkProfileKind::Mainnet,
+            virtual_genesis_hash: marker(0xa3),
+            ..crate::RCNET1_PROFILE
+        };
+        let bytes = binding_metadata(marker(0xa1));
+        assert!(parse_stored_journal_binding(&bytes, profile, None).is_err());
+        let unactivated = crate::NetworkProfile {
+            virtual_genesis_hash: [0; 32],
+            ..profile
+        };
+        assert!(parse_stored_journal_binding(&bytes, unactivated, Some(marker(0xa1))).is_err());
+    }
+
+    #[test]
+    fn stored_binding_preserves_development_profiles_and_strict_metadata_framing() {
+        let bytes = binding_metadata(marker(0xa1));
+        let binding = parse_stored_journal_binding(&bytes, DEVNET_PROFILE, None).unwrap();
+        assert_eq!(binding.genesis, DEVNET_PROFILE.virtual_genesis_hash);
+        assert_eq!(binding.network_id, DEVNET_PROFILE.network_id);
+        assert_eq!(binding.consensus_fingerprint, marker(0xa1));
+        for length in 0..bytes.len() {
+            assert!(parse_stored_journal_binding(&bytes[..length], DEVNET_PROFILE, None).is_err());
+        }
+        for index in 0..8 {
+            let mut changed = bytes.clone();
+            changed[index] ^= 0x80;
+            assert!(parse_stored_journal_binding(&changed, DEVNET_PROFILE, None).is_err());
+        }
+        assert!(
+            parse_stored_journal_binding(&binding_metadata([0; 32]), DEVNET_PROFILE, None).is_err()
+        );
+        let mut extended = bytes;
+        extended.push(0);
+        assert!(parse_stored_journal_binding(&extended, DEVNET_PROFILE, None).is_err());
     }
 
     fn signing_key(value: u8) -> SigningKey {

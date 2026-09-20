@@ -189,6 +189,17 @@ and node wallet key are operator secrets. Restoring both directories preserves
 the advertised certificate pin, pool identity, chain, credits, and payout
 journal. The large `inputs` directory can be downloaded and verified again.
 
+A payout reserved in the journal remains reserved during a temporary mempool
+input conflict. Reconciliation retries that exact signed transaction after the
+conflict clears; it must not release the credit and generate a replacement merely
+because another unconfirmed transaction is using the same input.
+
+Before mainnet, deep-reorganization loss handling remains a required change:
+the current PPLNS implementation prevents credit before maturity, but does not
+reverse credit if an already-distributed funding block is later orphaned. Do not
+interpret the restart and ordinary payout tests as qualification of that case.
+See [the mainnet payout gate](mainnet-readiness.md#pool-payout-lifecycle-evidence-and-remaining-loss-policy-gate).
+
 Each start writes a timestamped log under `pool-data/logs`; the status command
 prints the active log path. A clean shutdown preserves the ledger. On the next
 start, authenticated inputs and saved operator settings are reused, and the

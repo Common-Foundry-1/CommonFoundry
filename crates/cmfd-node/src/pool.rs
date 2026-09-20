@@ -3316,28 +3316,34 @@ fn reconcile_pool_payouts(shared: &SharedServer, create_new: bool) -> Result<(),
             .collect::<HashSet<_>>();
         let active_confirmations = node.active_transaction_confirmations_for(&txids)?;
         for (txid, record) in records {
-            let (state, confirmations) = if let Some(confirmations) =
-                active_confirmations.get(&txid)
-            {
-                (PoolPayoutTransactionState::Confirmed, *confirmations)
-            } else if node.mempool_contains_transaction(txid) {
-                (PoolPayoutTransactionState::Broadcast, 0)
-            } else if record.state == PoolPayoutTransactionState::Abandoned {
-                (PoolPayoutTransactionState::Abandoned, 0)
-            } else {
-                match node.submit_transaction(record.transaction.clone()) {
-                    Ok(_) | Err(NodeError::DuplicateMempoolTransaction(_)) => {
-                        (PoolPayoutTransactionState::Broadcast, 0)
+            let (state, confirmations) =
+                if let Some(confirmations) = active_confirmations.get(&txid) {
+                    (PoolPayoutTransactionState::Confirmed, *confirmations)
+                } else if node.mempool_contains_transaction(txid) {
+                    (PoolPayoutTransactionState::Broadcast, 0)
+                } else if record.state == PoolPayoutTransactionState::Abandoned {
+                    (PoolPayoutTransactionState::Abandoned, 0)
+                } else {
+                    match node.submit_transaction(record.transaction.clone()) {
+                        Ok(_) | Err(NodeError::DuplicateMempoolTransaction(_)) => {
+                            (PoolPayoutTransactionState::Broadcast, 0)
+                        }
+                        Err(
+                            NodeError::MempoolTransactionLimit
+                            | NodeError::MempoolByteLimit
+                            | NodeError::MempoolInputConflict(_),
+                        ) => {
+                            // A conflicting mempool transaction can disappear.
+                            // Keep this exact signed payout and its reserved credit;
+                            // releasing it here could fund a second valid payment.
+                            (PoolPayoutTransactionState::Prepared, 0)
+                        }
+                        Err(NodeError::MempoolUnconfirmedInput(_)) => {
+                            (PoolPayoutTransactionState::Abandoned, 0)
+                        }
+                        Err(error) => return Err(PoolError::Node(error)),
                     }
-                    Err(NodeError::MempoolTransactionLimit | NodeError::MempoolByteLimit) => {
-                        (PoolPayoutTransactionState::Prepared, 0)
-                    }
-                    Err(
-                        NodeError::MempoolUnconfirmedInput(_) | NodeError::MempoolInputConflict(_),
-                    ) => (PoolPayoutTransactionState::Abandoned, 0),
-                    Err(error) => return Err(PoolError::Node(error)),
-                }
-            };
+                };
             if state != record.state || confirmations != record.confirmations {
                 updates.push((txid, state, confirmations));
             }
@@ -3415,12 +3421,12 @@ fn reconcile_pool_payouts(shared: &SharedServer, create_new: bool) -> Result<(),
             Ok(_) | Err(NodeError::DuplicateMempoolTransaction(_)) => {
                 PoolPayoutTransactionState::Broadcast
             }
-            Err(NodeError::MempoolTransactionLimit | NodeError::MempoolByteLimit) => {
-                PoolPayoutTransactionState::Prepared
-            }
-            Err(NodeError::MempoolUnconfirmedInput(_) | NodeError::MempoolInputConflict(_)) => {
-                PoolPayoutTransactionState::Abandoned
-            }
+            Err(
+                NodeError::MempoolTransactionLimit
+                | NodeError::MempoolByteLimit
+                | NodeError::MempoolInputConflict(_),
+            ) => PoolPayoutTransactionState::Prepared,
+            Err(NodeError::MempoolUnconfirmedInput(_)) => PoolPayoutTransactionState::Abandoned,
             Err(error) => return Err(PoolError::Node(error)),
         };
         if state != PoolPayoutTransactionState::Prepared {
@@ -5093,6 +5099,8 @@ fn decode_hex_32(value: &str) -> Result<[u8; 32], PoolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    include!("pool_lifecycle_tests.rs");
 
     #[derive(Debug)]
     struct FixedProductionV4ShareVerifier {

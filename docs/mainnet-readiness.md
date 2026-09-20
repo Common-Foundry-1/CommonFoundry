@@ -129,7 +129,7 @@ and api3.drand.sh on 2026-09-19. Historical round 123 is the offline positive ve
 | Mainnet release finalization | Generic finalizer dispatches mainnet assets through exact-pin, plan-signature and signed-reproduction checks | Real independently built archives and signed evidence, then final checksums/signature |
 | Wallet preparation before activation | Encrypted creation with backup, restore, public address display and launch-wait UI implemented | Native custody tests plus rendered fixture checks; final signed-package rehearsal pending |
 | Seeds, discovery, explorer | Live RC seed checked healthy September 19; isolated mainnet service templates staged, not deployed | Independent node results and mainnet service configuration |
-| Pool payout and reorg lifecycle | Evidence collection pending | Mature-reward payout and reorg/restart reconciliation logs |
+| Pool payout and reorg lifecycle | Isolated real-chain maturity/payout/restart tests pass; deep-reorg funding-loss handling remains incomplete | Agreed loss policy, corresponding adversarial tests, and actual packaged mature-reward payout/recovery logs |
 | Storage capacity | Live seed has about 274 GiB free; larger archival capacity versus pruning awaits owner decision | Measured growth and provisioned capacity/retention decision |
 | Model download availability | Primary host returned HTTP 200 and expected Content-Length for all 40 parts on September 19; GitHub fallback has only 4 model-bank parts | Full download/hash check during packaged rehearsal and a complete independent solo-input mirror |
 | Recovery and update | Rehearsal pending | Backup/restore, interrupted append, restart, upgrade/rollback results |
@@ -300,6 +300,49 @@ the shorter Windows/Linux CI jobs rather than being discovered only after the
 long workspace proof suite. At the latest check on `d049be9`, all jobs except
 the still-running full Rust job had passed. Full CI on the repaired source
 remains required; no running qualification job was cancelled.
+
+## Pool payout lifecycle evidence and remaining loss-policy gate
+
+The payout reconciliation review found a temporary mempool input conflict was
+being treated as permanent abandonment. That released reserved miner credit
+even though the original signed payout could become valid again when the
+conflicting mempool transaction disappeared. The new regression failed with
+`abandoned` instead of `prepared` before the repair. Both submission paths now
+retain the exact prepared transaction and its reserved credit for this transient
+case. This does not change payout amounts, fees, or existing on-chain transfers.
+Previously abandoned journal entries are not automatically reopened: the old
+format does not retain enough information to infer why they were abandoned.
+
+The new conflict/restart test uses two mature funding outputs, a real signed
+conflicting transaction, durable preparation, repeated reconciliation, node and
+ledger restart, and canonical confirmation of the original payout. It verifies
+that no second payout is journaled or paid. The maturity lifecycle test submits
+an ordinary share and a winning share over pinned TLS, advances the actual local
+chain to one confirmation before maturity, restarts the node and ledger,
+changes only the future fee/window, reaches maturity, and confirms the exact
+payout across further restarts. The original block's allocation and fee remain
+frozen and its credit is applied once.
+
+The 46-test pool suite passes on Windows and Linux; enabling ProductionV4 adds
+five worker/protocol checks, with all 51 passing on both platforms. Strict
+ProductionV4 node Clippy checks also pass on both with Rust 1.94.1.
+These tests use disposable
+keys and the tiny reference proof with the real node, transaction signatures,
+pool transport and durable accounting. They are not a ProductionV4 GPU proof
+qualification or a rehearsal of the final signed mainnet packages. They also
+do not supply independent review or evidence of a live RC pool payout.
+
+**Unresolved mainnet gate:** once a PPLNS block has already been distributed,
+block reconciliation updates its orphan/confirmation status but does not revoke
+that reward's credited balance. A deep reorganization can therefore leave
+unbacked credit available for automatic payment. The existing legacy-credit
+reorg test does not cover this funding relationship. The owner has been asked
+whether to pause automatic payouts for review or recover the shortfall from
+future earnings; neither policy has been silently selected or deployed. The
+chosen behavior must cover already-paid rewards, payouts whose funding returns,
+restart persistence, and reorganization below maturity, and must be implemented
+and tested before mainnet approval. The mempool-conflict repair does not close
+this separate funding-loss gate.
 
 ## Read-only seed and capacity check (September 19)
 

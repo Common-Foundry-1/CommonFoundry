@@ -201,6 +201,8 @@ jobs:
         run: cargo test --locked -p cmfd-node --lib stalled_
       - name: Exercise operating-system shutdown signals
         run: cargo test --locked -p cmfd-node --test graceful_shutdown -- --test-threads=1
+      - name: Exercise pool maturity, payout reservations, and durable restart
+        run: cargo test --locked -p cmfd-node --lib pool::tests:: -- --test-threads=1
       - name: Exercise persistent verifier containment and restart
         run: cargo test --locked -p cmfd-proof-worker --test verifier_worker -- --test-threads=1
       - name: Exercise persistent verifier fault classification and exited-worker rejection

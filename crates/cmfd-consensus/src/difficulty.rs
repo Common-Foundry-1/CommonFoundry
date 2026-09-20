@@ -124,6 +124,47 @@ mod tests {
     }
 
     #[test]
+    fn startup_retargets_before_the_full_window_is_populated() {
+        let limit = target(900_000);
+        let mut startup = vec![HeaderWork {
+            timestamp: 0,
+            target: limit,
+        }];
+        assert_eq!(next_work_target(&startup, limit).unwrap(), limit);
+        startup.push(HeaderWork {
+            timestamp: 1,
+            target: limit,
+        });
+        assert!(startup.len() < DGW_WINDOW);
+        assert_eq!(next_work_target(&startup, limit).unwrap(), target(300_000));
+        // Effective median timestamps may repeat during startup. The positive
+        // clamped span still yields a defined, nonzero next target.
+        startup.push(HeaderWork {
+            timestamp: 1,
+            target: target(300_000),
+        });
+        assert_eq!(next_work_target(&startup, limit).unwrap(), target(233_333));
+    }
+
+    #[test]
+    fn startup_pow_limit_is_also_the_easiest_target_after_slow_blocks() {
+        for limit in [target(900_000), target(300_000)] {
+            assert_eq!(next_work_target(&[], limit).unwrap(), limit);
+            let startup = [
+                HeaderWork {
+                    timestamp: 0,
+                    target: limit,
+                },
+                HeaderWork {
+                    timestamp: 86_400,
+                    target: limit,
+                },
+            ];
+            assert_eq!(next_work_target(&startup, limit).unwrap(), limit);
+        }
+    }
+
+    #[test]
     fn fast_blocks_make_work_harder() {
         assert_eq!(
             next_work_target(&history(30, 1_000_000), target(10_000_000)).unwrap(),

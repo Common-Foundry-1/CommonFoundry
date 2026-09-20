@@ -119,6 +119,7 @@ and api3.drand.sh on 2026-09-19. Historical round 123 is the offline positive ve
 | Exact UTC release/mining schedule | Pinned in cmfd-launch | Schedule CLI and timestamp tests |
 | Signed launch-time entropy | Verifier, node/miner startup wiring and retrieval/waiting launchers implemented; packaged rehearsal pending | Signature mutation vectors plus actual packaged replay and anti-precomputation rehearsal |
 | Mainnet network/consensus identity | Shared identity registry and mainnet build feature implemented; final pin values pending | Final pinned plan and mainnet profile, distinct from RC |
+| Starting difficulty | Initial target and easiest permitted target are coupled; historical-rate calibration documented | Approved floor plus complete-block startup/hash-rate-drop rehearsal |
 | Reward receiving addresses and custody | Awaiting owner decision | Public destinations plus custody/recovery evidence |
 | Independent reproduction and review | No accepted independent record located yet | Named reproducer, signed report, independent crypto/wallet review |
 | Plan approval binding | Dedicated requests, signature verification, package binding and candidate pin generation implemented | Actual role approvals, reviewed source history and final pin application |
@@ -334,6 +335,18 @@ are fixture archives, not newly published mainnet binaries. Operators must still
 rehearse the final signed packages under the intended service identity, including
 permissions, full backups, restart, and upgrade/rollback. Existing RC services,
 keys and chain data were not changed.
+
+## Starting target and retarget calibration
+
+[Starting-difficulty notes](mainnet-starting-difficulty.md) record the actual
+warmup behavior and the coupled launch/floor parameter. New regression checks
+confirm that adjustment begins with the short startup history and that even very
+slow blocks cannot produce a target easier than the configured limit. All eight
+difficulty tests pass on Windows and Linux. Historical
+RC5 miner.2 console rates give search-only estimates, not a forecast for mainnet
+block production. No launch target or consensus behavior was changed. Complete
+proof latency, pool capacity, propagation and hash-rate-drop behavior still need
+to be included when approving the final parameter.
 
 ## Remaining launch-identity consumers
 

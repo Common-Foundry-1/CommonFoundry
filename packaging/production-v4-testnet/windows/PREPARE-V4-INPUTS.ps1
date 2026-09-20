@@ -5,7 +5,7 @@ param(
     [string]$Role = 'Miner',
     [string]$Destination = (Join-Path $PSScriptRoot 'inputs'),
     [string]$ReleaseBase = 'https://downloads.commonfoundry.ai/v0.1.0-rc.1',
-    [string]$FallbackReleaseBase = 'https://github.com/Common-Foundry-1/CommonFoundry/releases/download/v0.1.0-rc.1',
+    [string]$FallbackReleaseBase = 'https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/download/v0.1.0-rc.1',
     [ValidateRange(1, 16)]
     [int]$DownloadConcurrency = 16
 )
@@ -91,19 +91,42 @@ function Get-PartPaths {
                 } else { [uint64]0 }
                 Write-Host "Downloading $($item.Part.name) ($existingBytes of $($item.Part.bytes) bytes already present)"
                 $job = Start-Job -ScriptBlock {
-                    param($CurlPath, $UrlList, $Output)
+                    param($CurlPath, $UrlList, $Output, [uint64]$ExpectedBytes, [string]$ExpectedSha256)
                     $downloaded = $false
+                    $lastFailure = 'no source authenticated'
                     foreach ($url in @($UrlList -split "`n")) {
-                        & $CurlPath --location --fail --silent --show-error --retry 5 --retry-delay 3 `
-                            --connect-timeout 30 --speed-limit 1024 --speed-time 30 --continue-at - `
-                            --output $Output $url
-                        if ($LASTEXITCODE -eq 0) {
-                            $downloaded = $true
-                            break
+                        for ($attempt = 0; $attempt -lt 2; $attempt++) {
+                            $resumedBytes = if (Test-Path -LiteralPath $Output -PathType Leaf) {
+                                [uint64](Get-Item -LiteralPath $Output).Length
+                            } else { [uint64]0 }
+                            # A recovered source failure must not remain in the
+                            # job error stream and poison Receive-Job later.
+                            # Exit status and content authentication decide success.
+                            $null = & $CurlPath --disable --location --fail --silent --show-error --retry 5 --retry-delay 3 `
+                                --connect-timeout 30 --speed-limit 1024 --speed-time 30 --continue-at - `
+                                --output $Output $url 2>&1
+                            if ($LASTEXITCODE -ne 0) {
+                                $lastFailure = "curl exit $LASTEXITCODE"
+                                break
+                            }
+                            if ((Test-Path -LiteralPath $Output -PathType Leaf) -and
+                                [uint64](Get-Item -LiteralPath $Output).Length -eq $ExpectedBytes -and
+                                (Get-FileHash -Algorithm SHA256 -LiteralPath $Output).Hash.ToLowerInvariant() -ceq $ExpectedSha256) {
+                                $downloaded = $true
+                                break
+                            }
+                            # Do not pass known-invalid complete bytes to a mirror.
+                            # One fresh retry can repair an inherited corrupt prefix.
+                            $lastFailure = 'part size or SHA-256 mismatch'
+                            if (Test-Path -LiteralPath $Output -PathType Leaf) {
+                                Remove-Item -LiteralPath $Output -Force -ErrorAction Stop
+                            }
+                            if ($resumedBytes -eq 0) { break }
                         }
+                        if ($downloaded) { break }
                     }
-                    if (-not $downloaded) { throw 'All download sources failed.' }
-                } -ArgumentList $curlPath, ([string]::Join("`n", $item.Urls)), $item.Download
+                    if (-not $downloaded) { throw "All download sources failed authentication ($lastFailure)." }
+                } -ArgumentList $curlPath, ([string]::Join("`n", $item.Urls)), $item.Download, ([uint64]$item.Part.bytes), ([string]$item.Part.sha256)
                 $active += [pscustomobject]@{ Job = $job; Item = $item }
             }
             if ($active.Count -gt 0) {
@@ -149,6 +172,12 @@ foreach ($file in @($manifest.files)) {
         [string]$inputEntries[$name].sha256 -cne [string]$file.sha256) {
         throw "ProductionV4 input manifests disagree about $name"
     }
+}
+$fixedName = 'FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json'
+$fixedSource = Join-Path $PSScriptRoot $fixedName
+if (-not $inputEntries.ContainsKey($fixedName) -or
+    -not (Test-Identity $fixedSource ([uint64]$inputEntries[$fixedName].bytes) ([string]$inputEntries[$fixedName].sha256))) {
+    throw 'Bundled fixed artifact record failed authentication.'
 }
 $destinationPath = [IO.Path]::GetFullPath($Destination)
 $partDirectory = Join-Path $destinationPath '.parts'
@@ -208,8 +237,10 @@ foreach ($file in $manifest.files) {
     Write-Host "Prepared $($file.name)"
 }
 
-$fixedSource = Join-Path $PSScriptRoot 'FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json'
 $fixedTarget = Join-Path $destinationPath 'fixed\FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json'
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $fixedTarget) | Out-Null
 Copy-Item -LiteralPath $fixedSource -Destination $fixedTarget -Force
+if (-not (Test-Identity $fixedTarget ([uint64]$inputEntries[$fixedName].bytes) ([string]$inputEntries[$fixedName].sha256))) {
+    throw 'Prepared fixed artifact record failed authentication.'
+}
 Write-Host "ProductionV4 $Role inputs are ready under $destinationPath"

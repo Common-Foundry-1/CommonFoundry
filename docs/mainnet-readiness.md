@@ -131,7 +131,7 @@ and api3.drand.sh on 2026-09-19. Historical round 123 is the offline positive ve
 | Seeds, discovery, explorer | Live RC seed checked healthy September 19; isolated mainnet service templates staged, not deployed | Independent node results and mainnet service configuration |
 | Pool payout and reorg lifecycle | Isolated real-chain maturity/payout/restart tests pass; deep-reorg funding-loss handling remains incomplete | Agreed loss policy, corresponding adversarial tests, and actual packaged mature-reward payout/recovery logs |
 | Storage capacity | Live seed has about 274 GiB free; larger archival capacity versus pruning awaits owner decision | Measured growth and provisioned capacity/retention decision |
-| Model download availability | Primary host returned HTTP 200 and expected Content-Length for all 40 parts on September 19; GitHub fallback has only 4 model-bank parts | Full download/hash check during packaged rehearsal and a complete independent solo-input mirror |
+| Model download availability | Fresh full node-model downloads/hash checks pass from primary and anonymous GitHub; GitHub still lacks 36 solo-input parts | Final packaged preparation rehearsal and a complete independent solo-input mirror |
 | Recovery and update | Offline CLI backup/restore/tail-repair rehearsal passes on Windows/Linux; mainnet storage tools now authenticate launch identity | Final signed-package and service-identity rehearsal, upgrade/rollback results |
 | Final launch rehearsal | Pending | Exact intended packages, future-round start, delayed-beacon handling, fresh-wallet transfers |
 | Source release 24 hours early | Not yet executed | Public source and matching package timestamps at agreed release time |
@@ -401,6 +401,47 @@ chosen behavior must cover already-paid rewards, payouts whose funding returns,
 restart persistence, and reorganization below maturity, and must be implemented
 and tested before mainnet approval. The mempool-conflict repair does not close
 this separate funding-loss gate.
+
+## Model distribution and authenticated fallback
+
+Fresh node-role preparation was exercised against the primary download service
+and, separately, the public GitHub binary repository without authentication.
+Each downloaded all four model-bank parts and verified their hashes, then
+assembled and authenticated the 6,442,975,416-byte MODEL-V2.bank. Its SHA-256 is
+`5f9b213c3bda51b74e4ebabb26607b67385d613aa8d99af915a48ab063e17d4e`.
+The bundled 6,973-byte fixed record also authenticated, with SHA-256
+`ea218831aa567e486426ded77c84a5752a817329c496e3557c6d43577f0afe79`.
+Native Windows hashing additionally confirmed the primary download. The real
+downloads ran on the Windows host in isolated staging, not in live RC storage.
+They are computation inputs, not mainnet binaries or activation approvals.
+
+The inventory has 40 parts. GitHub's existing RC1 mirror has exactly the four
+node-model parts, with matching published lengths/digests, but lacks the 36
+solo-mining parts. The primary's other parts previously passed HEAD/length
+checks only; this turn did not re-download the entire 61 GB solo set. Completing
+an independent solo-input mirror remains a launch gate. The owner has been asked
+whether to publish a separate data-only mirror release of those already-public
+inputs now or stage it until the source-release date. No public assets were
+added, replaced or re-signed.
+
+Downloader review found that HTTP success followed by a bad hash did not try
+the fallback, and that a corrupt resumed prefix could poison a healthy mirror's
+response. Both preparers now authenticate before accepting a source, discard
+known-invalid complete bytes, and permit one fresh retry after a corrupt resumed
+prefix. Windows also captures a recovered curl failure inside the background job
+so Receive-Job does not discard a subsequently authenticated fallback. All-source
+failure still stops preparation; parent-side and assembled-file hash checks
+remain in place. The Windows preparer now checks the bundled fixed record before
+downloads and rechecks its copied output. Curl configuration files are disabled
+for reproducible transport options; source overrides still work.
+
+The reusable Windows/Linux launchers now default to the public binary repository,
+not the private development repository. Eight downloader unit checks pass on both
+platforms. Seven real-loopback transport cases pass on Windows (Python/curl and
+native PowerShell); three run on Linux with four Windows-only cases skipped there.
+All 11 existing runtime-bootstrap and 33 mainnet package/preflight checks pass on
+both platforms. These bounded transport/package tests do not replace rehearsal
+of the final signed packages or independent reproduction.
 
 ## Read-only seed and capacity check (September 19)
 

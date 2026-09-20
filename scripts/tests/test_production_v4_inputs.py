@@ -22,6 +22,14 @@ def sha256(value: bytes) -> str:
 
 
 class ProductionV4InputTests(unittest.TestCase):
+    def test_default_mirror_uses_the_public_binary_repository(self) -> None:
+        root = SCRIPT.parents[1]
+        expected = "https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/download/v0.1.0-rc.1"
+        for relative in ("windows/PREPARE-V4-INPUTS.ps1", "linux/PREPARE-V4-INPUTS.sh"):
+            script = (root / "packaging/production-v4-testnet" / relative).read_text(encoding="utf-8")
+            self.assertIn(expected, script)
+            self.assertNotIn("github.com/Common-Foundry-1/CommonFoundry/releases/download", script)
+
     def test_pool_miner_role_requires_only_model_and_fixed_record(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             manifest = Path(temporary) / "chunks.json"
@@ -172,6 +180,66 @@ class ProductionV4InputTests(unittest.TestCase):
                     "https://fallback.example/part-01",
                 ],
             )
+
+    def test_authenticated_fallback_replaces_a_successful_but_corrupt_primary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            value = b"authenticated-part"
+            part = {"name": "part-01", "bytes": len(value), "sha256": sha256(value)}
+            urls = []
+
+            def fake_download(url, output):
+                urls.append(url)
+                self.assertFalse(output.exists())
+                output.write_bytes(b"x" * len(value) if len(urls) == 1 else value)
+
+            with mock.patch.object(INPUTS, "download", side_effect=fake_download):
+                result = INPUTS.prepare_part(part, root, ("https://primary.example", "https://fallback.example"))
+            self.assertEqual(result.read_bytes(), value)
+            self.assertEqual(len(urls), 2)
+            self.assertIn("fallback.example", urls[-1])
+
+    def test_mirror_retries_once_from_zero_after_a_poisoned_resumed_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            value = b"authenticated-part"
+            part = {"name": "part-01", "bytes": len(value), "sha256": sha256(value)}
+            calls = []
+
+            def fake_download(url, output):
+                offset = output.stat().st_size if output.exists() else 0
+                calls.append((url, offset))
+                if "primary.example" in url:
+                    output.write_bytes(b"wrong")
+                    raise OSError("primary interrupted")
+                with output.open("ab") as target:
+                    target.write(value[offset:])
+
+            with mock.patch.object(INPUTS, "download", side_effect=fake_download):
+                result = INPUTS.prepare_part(part, root, ("https://primary.example", "https://fallback.example"))
+            self.assertEqual(result.read_bytes(), value)
+            self.assertEqual(calls, [
+                ("https://primary.example/part-01", 0),
+                ("https://fallback.example/part-01", 5),
+                ("https://fallback.example/part-01", 0),
+            ])
+
+    def test_invalid_mirrors_are_bounded_and_never_publish_a_part(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            part = {"name": "part-01", "bytes": 4, "sha256": sha256(b"good")}
+            urls = []
+
+            def fake_download(url, output):
+                urls.append(url)
+                output.write_bytes(b"evil")
+
+            with mock.patch.object(INPUTS, "download", side_effect=fake_download):
+                with self.assertRaisesRegex(OSError, "all download sources failed"):
+                    INPUTS.prepare_part(part, root, ("https://primary.example", "https://fallback.example"))
+            self.assertEqual(len(urls), 2)
+            self.assertFalse((root / "part-01").exists())
+            self.assertFalse((root / "part-01.download").exists())
 
     def test_validation_treats_only_row_major_files_as_untrusted_caches(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -65,6 +65,7 @@ def download(url: str, output: Path) -> None:
     subprocess.run(
         [
             "curl",
+            "--disable",
             "--location",
             "--fail",
             "--silent",
@@ -106,19 +107,25 @@ def prepare_part(part: dict, part_directory: Path, release_bases: tuple[str, ...
     print(f"Downloading {name} ({downloaded} of {size} bytes already present)", flush=True)
     errors: list[BaseException] = []
     for release_base in release_bases:
-        try:
-            download(f"{release_base.rstrip('/')}/{name}", temporary)
-            break
-        except (OSError, subprocess.CalledProcessError) as error:
-            errors.append(error)
-    else:
-        raise OSError(f"all download sources failed for {name}") from errors[-1]
-    if not identity_matches(temporary, size, sha256):
-        temporary.unlink(missing_ok=True)
-        raise ValueError(f"downloaded part failed authentication: {name}")
-    os.replace(temporary, part_path)
-    print(f"Authenticated {name}", flush=True)
-    return part_path
+        # A completed HTTP transfer is not success until its bytes authenticate.
+        # If a resumed prefix was corrupt, allow one clean retry of that source
+        # before moving on. Never carry known-invalid complete bytes to a mirror.
+        for _ in range(2):
+            resumed_bytes = temporary.stat().st_size if temporary.is_file() else 0
+            try:
+                download(f"{release_base.rstrip('/')}/{name}", temporary)
+            except (OSError, subprocess.CalledProcessError) as error:
+                errors.append(error)
+                break
+            if identity_matches(temporary, size, sha256):
+                os.replace(temporary, part_path)
+                print(f"Authenticated {name}", flush=True)
+                return part_path
+            errors.append(ValueError(f"downloaded part failed authentication: {name}"))
+            temporary.unlink(missing_ok=True)
+            if resumed_bytes == 0:
+                break
+    raise OSError(f"all download sources failed for {name}") from (errors[-1] if errors else None)
 
 
 def required_input_names(chunk_manifest: Path, role: str) -> set[str]:

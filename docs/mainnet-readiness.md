@@ -123,6 +123,7 @@ and api3.drand.sh on 2026-09-19. Historical round 123 is the offline positive ve
 | Independent reproduction and review | No accepted independent record located yet | Named reproducer, signed report, independent crypto/wallet review |
 | Plan approval binding | Dedicated requests, signature verification, package binding and candidate pin generation implemented | Actual role approvals, reviewed source history and final pin application |
 | Dependency audit | rustls updated to 0.23.45 for RUSTSEC-2026-0285; 44 pool/TLS tests pass and cargo-audit reports zero vulnerabilities | Final build audit plus review of remaining informational dependency warnings |
+| Full cross-platform CI | Proof-worker fault-fixture race reproduced and corrected; targeted Windows/Linux suites pass | Completed successful full run on the final source, not only selected jobs |
 | Windows/Linux release packages | Native assembler and four package layouts implemented; actual builds await final configuration | Clean installs, signature/checksum verification, matching runtime identity |
 | Four-package release consistency | Offline archive/source/receipt reconciliation implemented | Actual four-archive preflight report followed by independent reproduction and signing |
 | Mainnet release finalization | Generic finalizer dispatches mainnet assets through exact-pin, plan-signature and signed-reproduction checks | Real independently built archives and signed evidence, then final checksums/signature |
@@ -266,8 +267,39 @@ Git fixture. The existing 153-test release-integrity suite passes on Linux;
 Windows passes 150 with three filesystem/platform-specific skips. These remain
 fixture-based packaging checks, not approval of actual mainnet builds.
 On CI commit `83c24f3`, both desktop jobs, wallet tests, MSRV, proof-codec and
-node-shutdown jobs passed; the full Rust job was still running at the last
-September 19 check. Do not infer its final outcome from those completed jobs.
+node-shutdown jobs passed, but the full Rust job failed in the
+`persistent_fault_worker` response-classification fixture. Pinning that fixture
+to one CPU reproduced the failure locally: its child flushed an error frame and
+exited immediately, so the parent's liveness check correctly returned
+`DispatchedRequest(Process(WorkerExited))` instead of the expected protocol or
+worker-reported error. The fixture now waits for parent teardown after sending
+the fault response, and explicitly closes each worker after the assertion input
+is collected. The expected error variants and production liveness checks are
+unchanged. A deterministic regression separately confirms that a buffered
+success response from an already exited worker is rejected.
+
+Windows validation also exposed an overlong test-only profile moniker: its
+diagnostic label produced a 258-character cleanup filename for a six-digit PID.
+The fixture now uses the production moniker shape and tests both the current PID
+and `u32::MAX`. It still proves that existing registrations are neither adopted
+nor deleted, and that only the fixture's owned registrations are removed.
+Production profile generation, cleanup-ledger encoding and access rules did not
+change.
+
+After these repairs, Linux passes 70 library tests and 17 worker integration
+tests; Windows passes 96 library tests and 16 worker integration tests. The
+standalone fault matrix passes on both platforms and in three consecutive Linux
+single-CPU runs. Two opt-in CUDA hardware tests per platform were not run; these
+results are process/transport regression evidence, not a new GPU qualification.
+Strict Clippy passes on Windows and Linux with the CI-pinned Rust 1.94.1.
+The initial Linux check used the host's Rust 1.98.0 and hit newer lint rules in
+unchanged proof-acceleration code; the release toolchain and lint policy were
+not changed to accommodate that unrelated host-toolchain drift.
+Both fault classification and the exited-worker regression are now included in
+the shorter Windows/Linux CI jobs rather than being discovered only after the
+long workspace proof suite. At the latest check on `d049be9`, all jobs except
+the still-running full Rust job had passed. Full CI on the repaired source
+remains required; no running qualification job was cancelled.
 
 ## Read-only seed and capacity check (September 19)
 

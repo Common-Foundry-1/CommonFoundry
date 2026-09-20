@@ -2706,12 +2706,11 @@ mod tests {
         }
     }
 
-    fn random_profile_name(label: &str) -> Vec<u16> {
+    fn random_profile_name(process_id: u32) -> Vec<u16> {
         let mut random = [0_u8; 12];
         getrandom::fill(&mut random).expect("generate a randomized test profile moniker");
         nul_terminated(OsStr::new(&format!(
-            "CMFD.Verifier.{label}.{}.{}",
-            std::process::id(),
+            "CMFD.Verifier.{process_id}.{}",
             hex::encode(random)
         )))
         .expect("randomized test profile moniker is valid")
@@ -4229,41 +4228,47 @@ mod tests {
     #[test]
     fn appcontainer_profile_collision_is_not_adopted_and_created_profiles_are_removed() {
         let _ledger = isolated_appcontainer_ledger_test();
-        let name = random_profile_name("profile-regression");
         let display = nul_terminated(OsStr::new("Common Foundry profile regression")).unwrap();
         let description = nul_terminated(OsStr::new("Owned test profile")).unwrap();
 
-        let mut unrelated = try_create_untracked_test_profile(name.clone(), &display, &description)
-            .unwrap()
-            .expect("create an RAII-owned unrelated profile registration");
+        // Match the production moniker shape, including the widest possible
+        // PID. Adding a diagnostic label here used to expand the UTF-16/hex
+        // ledger filename beyond 255 characters once Windows PIDs had 6 digits.
+        for process_id in [std::process::id(), u32::MAX] {
+            let name = random_profile_name(process_id);
+            let mut unrelated =
+                try_create_untracked_test_profile(name.clone(), &display, &description)
+                    .unwrap()
+                    .expect("create an RAII-owned unrelated profile registration");
 
-        retry_pending_appcontainer_profile_cleanup().unwrap();
-        assert!(
-            try_create_profile(name.clone(), &display, &description)
+            retry_pending_appcontainer_profile_cleanup().unwrap();
+            assert!(
+                try_create_profile(name.clone(), &display, &description)
+                    .unwrap()
+                    .is_none(),
+                "an existing profile must be reported as a collision"
+            );
+            assert!(
+                try_create_profile(name.clone(), &display, &description)
+                    .unwrap()
+                    .is_none(),
+                "the collision path deleted or adopted the unrelated existing profile"
+            );
+
+            unrelated
+                .delete_registration()
+                .expect("delete the attested unrelated registration");
+
+            let mut recreated = try_create_profile(name, &display, &description)
                 .unwrap()
-                .is_none(),
-            "an existing profile must be reported as a collision"
-        );
-        assert!(
-            try_create_profile(name.clone(), &display, &description)
-                .unwrap()
-                .is_none(),
-            "the collision path deleted or adopted the unrelated existing profile"
-        );
-
-        unrelated
-            .delete_registration()
-            .expect("delete the attested unrelated registration");
-
-        let mut recreated = try_create_profile(name, &display, &description)
-            .unwrap()
-            .expect("deleted profile name is immediately reusable");
-        recreated
-            .registration
-            .as_mut()
-            .expect("recreated registration")
-            .delete()
-            .expect("delete recreated profile without leaving registration state");
+                .expect("deleted profile name is immediately reusable");
+            recreated
+                .registration
+                .as_mut()
+                .expect("recreated registration")
+                .delete()
+                .expect("delete recreated profile without leaving registration state");
+        }
     }
 
     #[test]

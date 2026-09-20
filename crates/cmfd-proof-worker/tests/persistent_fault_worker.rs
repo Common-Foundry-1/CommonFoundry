@@ -48,7 +48,10 @@ fn run_matrix() {
     )
     .err()
     .expect("a mismatched startup self-test must fail authentication");
-    assert!(matches!(&error, VerifierWorkerError::Startup(_)));
+    assert!(
+        matches!(&error, VerifierWorkerError::Startup(_)),
+        "unexpected authentication failure: {error:?}"
+    );
     assert!(!error.is_dispatched_proof_failure());
 
     let normal_memory = memory_candidates()
@@ -64,11 +67,15 @@ fn run_matrix() {
     let error = worker
         .verify_block(&block)
         .expect_err("malformed request response must fail closed");
-    assert!(matches!(
-        &error,
-        VerifierWorkerError::DispatchedRequest(source)
-            if matches!(source.as_ref(), VerifierWorkerError::Protocol(_))
-    ));
+    worker.close();
+    assert!(
+        matches!(
+            &error,
+            VerifierWorkerError::DispatchedRequest(source)
+                if matches!(source.as_ref(), VerifierWorkerError::Protocol(_))
+        ),
+        "unexpected malformed-response failure: {error:?}"
+    );
     assert!(error.is_dispatched_proof_failure());
 
     let (verifier, block) = candidate_block(WORKER_FAILURE_MARKER);
@@ -81,14 +88,18 @@ fn run_matrix() {
     let error = worker
         .verify_block(&block)
         .expect_err("request-scoped worker error must fail closed");
-    assert!(matches!(
-        &error,
-        VerifierWorkerError::DispatchedRequest(source)
-            if matches!(
-                source.as_ref(),
-                VerifierWorkerError::WorkerReported { code: ERROR_INTERNAL, .. }
-            )
-    ));
+    worker.close();
+    assert!(
+        matches!(
+            &error,
+            VerifierWorkerError::DispatchedRequest(source)
+                if matches!(
+                    source.as_ref(),
+                    VerifierWorkerError::WorkerReported { code: ERROR_INTERNAL, .. }
+                )
+        ),
+        "unexpected worker-reported failure: {error:?}"
+    );
     assert!(error.is_dispatched_proof_failure());
 }
 
@@ -205,6 +216,10 @@ fn run_fault_server() -> Result<i32, ()> {
         return Err(());
     };
     write_frame(&mut output, &response).map_err(|_| ())?;
+    // This fixture tests the response classification, not process-exit races.
+    // Stay alive until the parent tears down the failed generation; otherwise
+    // its mandatory liveness check may correctly return WorkerExited first.
+    let _ = read_frame(&mut input);
     Ok(0)
 }
 

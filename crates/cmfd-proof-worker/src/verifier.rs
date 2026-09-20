@@ -3898,6 +3898,72 @@ mod tests {
         }
     }
 
+    #[test]
+    fn persistent_exited_worker_rejects_even_a_buffered_success_response() {
+        let (verifier, block) = candidate_block();
+        let binding = verifier
+            .external_preverification_binding(&block.challenge, &block.proof)
+            .unwrap();
+        let response = encode_success_response(binding, VerifierSandboxStatus::Unconfined, [0; 32]);
+        let mut frame = Vec::new();
+        write_frame(&mut frame, &response).unwrap();
+
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", "tests::child_fast_exit_helper"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = spawn_contained(&mut command, None).unwrap();
+        let transport_poisoned = Arc::new(AtomicBool::new(false));
+        let teardown_failures = Arc::new(AtomicU64::new(0));
+        let mut process = PersistentVerifierProcess::new(
+            child,
+            1,
+            Arc::clone(&transport_poisoned),
+            Arc::clone(&teardown_failures),
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = process.child.try_wait().unwrap() {
+                assert!(status.success(), "exit fixture failed: {status}");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "exit fixture did not finish"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        // Make the response available only after authoritative exit, without
+        // relying on thread scheduling or sleeps to choose the race winner.
+        process.stdin = Some(Box::new(io::sink()));
+        process.stdout = Some(Box::new(io::Cursor::new(frame)));
+        let error = process
+            .exchange(
+                Vec::new(),
+                Duration::from_secs(10),
+                MAX_VERIFIER_RESPONSE_BYTES,
+                PersistentExchangePhase::Request,
+            )
+            .expect_err("an exited worker must not issue a proof capability");
+        assert!(
+            matches!(
+                &error,
+                VerifierWorkerError::DispatchedRequest(source)
+                    if matches!(source.as_ref(), VerifierWorkerError::Process(
+                        ProofWorkerError::WorkerExited { code: Some(0), .. }
+                    ))
+            ),
+            "unexpected exited-worker failure: {error:?}"
+        );
+        assert!(error.is_dispatched_proof_failure());
+        assert!(!transport_poisoned.load(Ordering::Acquire));
+        assert_eq!(teardown_failures.load(Ordering::Acquire), 0);
+    }
+
     fn forced_cleanup_persistent_process() -> (PersistentVerifierProcess, Arc<AtomicBool>) {
         let mut command = Command::new(std::env::current_exe().unwrap());
         command

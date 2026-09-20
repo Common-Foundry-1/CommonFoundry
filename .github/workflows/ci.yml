@@ -203,6 +203,10 @@ jobs:
         run: cargo test --locked -p cmfd-node --test graceful_shutdown -- --test-threads=1
       - name: Exercise persistent verifier containment and restart
         run: cargo test --locked -p cmfd-proof-worker --test verifier_worker -- --test-threads=1
+      - name: Exercise persistent verifier fault classification and exited-worker rejection
+        run: |
+          cargo test --locked -p cmfd-proof-worker --test persistent_fault_worker
+          cargo test --locked -p cmfd-proof-worker --lib verifier::tests::persistent_exited_worker_rejects_even_a_buffered_success_response -- --exact
       - name: Exercise Windows ProductionV3 proof-worker boundary
         if: runner.os == 'Windows'
         run: >-

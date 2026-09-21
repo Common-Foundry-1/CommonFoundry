@@ -1,9 +1,22 @@
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import App from "./App";
-import { DISCORD_URL, EMISSION_URL, RELEASE_URL, RELEASE_VERSION, SECURITY_URL, WHITEPAPER_URL } from "./content";
+import { DISCORD_URL, EMISSION_URL, MAINNET_LAUNCH_AT, SOURCE_RELEASE_AT, RELEASE_URL, RELEASE_VERSION, SECURITY_URL, WHITEPAPER_URL } from "./content";
 
 describe("investor website", () => {
+  it("announces the mainnet target and a 24-hour preparation window without presenting RC downloads as mainnet", () => {
+    render(<App />);
+    const launch = screen.getByRole("region", { name: "Two dates. One shared start." });
+    expect(within(launch).getByText("October 2, 2026")).toHaveAttribute("datetime", SOURCE_RELEASE_AT);
+    expect(within(launch).getByText("October 3, 2026")).toHaveAttribute("datetime", MAINNET_LAUNCH_AT);
+    expect(Date.parse(MAINNET_LAUNCH_AT) - Date.parse(SOURCE_RELEASE_AT)).toBe(86_400_000);
+    expect(within(launch).getAllByText(/12:00 PM CDT · 17:00 UTC/)).toHaveLength(2);
+    expect(within(launch).getByText(/Mainnet is not live yet; current RC5 downloads connect to RCNet/)).toBeVisible();
+    expect(screen.getByRole("link", { name: "See the launch plan" })).toHaveAttribute("href", "#launch");
+    expect(screen.queryByRole("link", { name: /download mainnet/i })).not.toBeInTheDocument();
+    expect(screen.queryByText(/not announced launches/i)).not.toBeInTheDocument();
+  });
+
   it("links RC5 downloads and the community through their correct destinations", () => {
     render(<App />);
 

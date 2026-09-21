@@ -6,6 +6,8 @@ export const RELEASE_URL = `https://github.com/JustAResearcher/CommonFoundry-Bin
 export const WHITEPAPER_URL = "/docs/Common-Foundry-Technical-Whitepaper-v0.3.pdf";
 export const SECURITY_URL = "/docs/SECURITY.md";
 export const EMISSION_URL = "/docs/emission.md";
+export const MAINNET_LAUNCH_AT = "2026-10-03T17:00:00Z";
+export const SOURCE_RELEASE_AT = "2026-10-02T17:00:00Z";
 
 export type SectionId =
   | "thesis"
@@ -94,9 +96,9 @@ export const roadmapGates: readonly RoadmapGate[] = [
   },
   {
     number: "05",
-    title: "Mainnet diligence and ecosystem growth",
+    title: "October 3 mainnet launch target",
     detail:
-      "Build on reproducible releases with independent cryptographic review, broader operator testing and exchange-integration diligence. Mainnet and any exchange availability remain future milestones, not announced launches.",
+      "Mainnet is planned for October 3, 2026 at noon Central (CDT / 17:00 UTC), with source and matching launch packages planned 24 hours earlier. Final release checks, independent review and the launch rehearsal remain in progress. Exchange availability is a separate milestone.",
     phase: "future",
   },
 ];

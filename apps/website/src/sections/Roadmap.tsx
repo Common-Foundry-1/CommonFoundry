@@ -28,7 +28,7 @@ export function Roadmap() {
       <div className="roadmap__content section-shell">
         <div className="section-heading">
           <h2 id="roadmap-heading">The foundation is built. The opportunity is ahead.</h2>
-          <p>Shipped cryptography and RC5 today. Broader adoption and independent review next.</p>
+          <p>RC5 today. Preparing for the October 3 mainnet launch target, with final qualification and independent review still ahead.</p>
         </div>
 
         <ol className="roadmap__rail">
@@ -54,7 +54,7 @@ export function Roadmap() {
 
         <div className="conversion-band">
           <div>
-            <h3>Get in early.<br />Build with the Foundry.</h3>
+            <h3>Get ready.<br />Build with the Foundry.</h3>
             <p>
               Miners, developers and long-term supporters: explore the release,
               examine the monetary design and help shape what comes next.
@@ -80,7 +80,7 @@ export function Roadmap() {
             </div>
             <p className="trust-note">
               <ShieldIcon />
-              <span>RCNet is a test network, not mainnet. Its coins have no intended monetary value.</span>
+              <span>RCNet is a test network, not mainnet. Mainnet launch updates are published above.</span>
             </p>
           </div>
         </div>

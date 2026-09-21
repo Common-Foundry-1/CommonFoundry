@@ -24,32 +24,29 @@ export function Hero() {
   return (
     <section id="top" className="hero section-grid" aria-labelledby="hero-heading">
       <div className="hero__copy">
+        <a className="hero__launch-label" href="#launch">Mainnet coming October 3, 2026 <span aria-hidden="true">↗</span></a>
         <h1 id="hero-heading">
-          Verifiable work. A new monetary frontier.
+          Verifiable work.<br />A new chapter begins.
         </h1>
         <p>
           Open GPU infrastructure with serious cryptography and deliberate
           monetary design. ForgeMatrix pairs consumer-GPU proof of work with
           independent verification, declining issuance and permanently burned
-          fees. RC5 puts that vision into software you can run.
+          fees. Mainnet is coming. Get ready for the next chapter of Common Foundry.
         </p>
 
         <div className="hero__actions">
-          <ButtonLink
-            href={RELEASE_URL}
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Download RC5
+          <ButtonLink href="#launch">
+            See the launch plan
           </ButtonLink>
-          <ButtonLink href="#thesis" variant="secondary">
-            Read the thesis
+          <ButtonLink href={RELEASE_URL} target="_blank" rel="noopener noreferrer" variant="secondary">
+            Test RC5
           </ButtonLink>
         </div>
 
         <div className="trust-note">
           <ShieldIcon />
-          <span>RCNet-1 release candidate · No premine · No token sale</span>
+          <span>No premine · No token sale · GPU proof of work</span>
         </div>
       </div>
 

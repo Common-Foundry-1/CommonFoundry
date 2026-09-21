@@ -548,3 +548,43 @@ exercised 67 combinations of successful, failed, skipped, cancelled and missing
 job results. Only the complete all-success case passes. This is workflow
 validation, not a successful replacement CI run, GPU hardware qualification,
 or mainnet release approval; the new full run must still finish successfully.
+
+## AI01 pool-host qualification (September 21)
+
+AI01 was explicitly dedicated to the pool after a fresh Vast check showed no
+running, resident, on-demand or reserved rentals and no allocated customer
+storage. It is unlisted, its Vast/owner-mining services are disabled, and their
+files were retained. The host has an RTX 4090 (24 GB), an EPYC 7K62, 64 GB RAM
+and a 2 TB SATA SSD. The separate RC pool runs as an unprivileged service with
+root-owned read-only software/model inputs, systemd credentials, a private
+dashboard, boot autostart and local health/disk checks. No public pool routing
+or existing pool identity/ledger was migrated.
+
+The signed RC5 node was authenticated against the previously trusted release
+policy. All eight model/proving files were rehashed on AI01. SM89 replay and
+proof workers were built privately from the pinned SP1/CUTLASS sources and
+checked-in SP1 patch; the published RC5 full-proof worker is SM120-only.
+These private workers are not new signed release artifacts.
+
+The first test ran a separate miner on the same GPU and exhausted VRAM during
+proving. A diagnostic-only example, `qualify_single_gpu_pool`, now releases its
+test search worker before submitting a chain-winning nonce. It uses the normal
+pool client, GPU searcher, nonce replay, full proof and block-admission paths;
+it does not change targets or accept synthetic proofs. The pool GPU should be
+dedicated to pool work, not shared with an additional miner.
+
+The optimized example completed successfully at 21:37 UTC: the pool accepted
+block 93, `61f446875d5dc1b4263454e5cbce9a3101cc0e7f42ba5ac7c06801583344ceff`.
+The independent VPS seed reached the same height and tip. The proof was
+12,025,320 bytes; the prover reported 7.349706 seconds of online proving and
+0.626312 seconds for its complete CPU self-verification. These are one-run
+phase measurements, not a sustained pool-throughput guarantee or the whole
+mining/submission latency. The pool journal retained 170 accepted shares and
+one canonical block; the temporary test client exited.
+
+Encrypted wallet backup/restore was checked locally on AI01 and a service
+restart preserved the wallet, chain and accounting. Export of encrypted wallet
+key material to the operator's PC remains awaiting explicit approval. Mainnet
+package qualification, public routing, off-host alert/custody arrangements,
+sustained load, mature payout and deep-reorganization tests remain separate
+requirements. No mainnet keys, parameters, pins or launch time were changed.

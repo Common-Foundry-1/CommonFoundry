@@ -523,3 +523,28 @@ isolated test is scheduled explicitly on Linux CI. Windows passes eight checks
 and skips the two Linux-only cases. All 33 package/preflight checks still pass on
 both platforms. The separate systemd syntax check uses executable stubs; neither
 it nor the permission fixture qualifies a live service or its full sandbox.
+
+## CI runner capacity correction (September 21)
+
+Completed runs `35484303102` (`9bdd269`) and `35486936551` (`716c4c1`)
+both have GitHub runner annotations reporting `System.IO.IOException: No space
+left on device`. Their job logs were not retrievable after the runner failed.
+For `716c4c1`, the step records show that default workspace tests, wallet V3
+tests, Dory tests and the complete WHIR suite passed before the runner failed
+at the GPU-proof test step. That is not evidence that the GPU suite passed or
+that its failure was a proof rejection. All other jobs in that run succeeded,
+including both desktop builds, both shutdown/recovery jobs and both codec jobs.
+
+The former single Rust job now runs the base workspace, Dory, WHIR, GPU-proof
+and ProductionV4 groups on five independent runner disks. Incremental build
+caches are disabled only for those CI jobs. Initial/final disk usage is logged;
+no source, tests, model files or user caches are deleted. All 46 pre-existing
+validation commands from the Rust job are preserved, as are the unrelated
+workflow jobs. Feature matrix failures do not cancel other matrix members.
+
+The existing `rust` check is retained as an aggregate that requires every split
+job to succeed. Local validation compared the old/new command inventories and
+exercised 67 combinations of successful, failed, skipped, cancelled and missing
+job results. Only the complete all-success case passes. This is workflow
+validation, not a successful replacement CI run, GPU hardware qualification,
+or mainnet release approval; the new full run must still finish successfully.

@@ -212,6 +212,70 @@ struct Cli {
     command: Command,
 }
 
+#[cfg(feature = "production-v4")]
+#[derive(Debug, clap::Args)]
+struct MainnetCustodyPaths {
+    /// Absolute, create-new directory outside Git worktrees; contains two wallets.
+    #[arg(long)]
+    wallets_directory: PathBuf,
+    /// Separate absolute, create-new directory for the two encrypted backups.
+    #[arg(long)]
+    backups_directory: PathBuf,
+    /// Separate absolute, create-new directory containing only public plan/report files.
+    #[arg(long)]
+    public_directory: PathBuf,
+    /// Protected passphrase file outside all output directories. Contents are never printed.
+    #[arg(
+        long,
+        required_unless_present = "shared_passphrase_stdin",
+        conflicts_with = "shared_passphrase_stdin"
+    )]
+    steward_passphrase_file: Option<PathBuf>,
+    #[arg(
+        long,
+        required_unless_present = "shared_passphrase_stdin",
+        conflicts_with = "shared_passphrase_stdin"
+    )]
+    community_passphrase_file: Option<PathBuf>,
+    /// Read one shared password as raw UTF-8 bytes from stdin (no added newline).
+    /// Intended for a local hidden-password launcher; never put secrets in arguments.
+    #[arg(long)]
+    shared_passphrase_stdin: bool,
+}
+
+#[cfg(feature = "production-v4")]
+impl MainnetCustodyPaths {
+    fn runtime_paths(&self) -> cmfd_node::mainnet_custody::RewardCustodyPaths {
+        cmfd_node::mainnet_custody::RewardCustodyPaths {
+            wallets_directory: self.wallets_directory.clone(),
+            backups_directory: self.backups_directory.clone(),
+            public_directory: self.public_directory.clone(),
+            steward_passphrase_file: self.steward_passphrase_file.clone().unwrap_or_default(),
+            community_passphrase_file: self.community_passphrase_file.clone().unwrap_or_default(),
+        }
+    }
+
+    fn read_stdin_password(
+        &self,
+    ) -> Result<Option<Zeroizing<Vec<u8>>>, Box<dyn std::error::Error>> {
+        if !self.shared_passphrase_stdin {
+            return Ok(None);
+        }
+        let mut bytes = Zeroizing::new(Vec::new());
+        io::stdin()
+            .lock()
+            .take((cmfd_node::wallet_backup::MAXIMUM_PASSPHRASE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        if !(cmfd_node::wallet_backup::MINIMUM_PASSPHRASE_BYTES
+            ..=cmfd_node::wallet_backup::MAXIMUM_PASSPHRASE_BYTES)
+            .contains(&bytes.len())
+        {
+            return Err("stdin password must contain 12 to 1024 bytes".into());
+        }
+        Ok(Some(bytes))
+    }
+}
+
 #[derive(Debug, Subcommand)]
 #[allow(clippy::large_enum_variant)] // Parsed once at startup; boxing CLI fields adds needless indirection.
 enum Command {
@@ -220,6 +284,25 @@ enum Command {
     /// Print pinned mainnet launch identity before the future beacon is available.
     #[cfg(feature = "production-v4")]
     MainnetLaunchInfo,
+    /// Prepare fresh encrypted reward wallets, backups and their candidate plan
+    /// offline. Does not approve or activate mainnet or change any release pins.
+    #[cfg(feature = "production-v4")]
+    MainnetCustodyPrepare {
+        #[arg(long, value_parser = parse_hex32)]
+        pow_limit: [u8; 32],
+        #[arg(long, value_parser = parse_hex32)]
+        initial_target: [u8; 32],
+        #[command(flatten)]
+        paths: MainnetCustodyPaths,
+    },
+    /// Authenticate prepared reward wallets/backups against the selected plan.
+    #[cfg(feature = "production-v4")]
+    MainnetCustodyVerify {
+        #[arg(long, value_parser = parse_hex32)]
+        expected_plan_digest: [u8; 32],
+        #[command(flatten)]
+        paths: MainnetCustodyPaths,
+    },
     /// Write the October mainnet plan from release-pinned artifacts and explicit
     /// reward addresses. Does not activate mainnet or alter RCNet storage.
     #[cfg(feature = "production-v4")]
@@ -899,6 +982,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     #[cfg(feature = "production-v4")]
+    if let Command::MainnetCustodyPrepare {
+        pow_limit,
+        initial_target,
+        paths,
+    } = &cli.command
+    {
+        let password = paths.read_stdin_password()?;
+        let report = match password.as_ref() {
+            Some(password) => cmfd_node::mainnet_custody::prepare_reward_custody_with_password(
+                &paths.runtime_paths(),
+                *pow_limit,
+                *initial_target,
+                password,
+            )?,
+            None => cmfd_node::mainnet_custody::prepare_reward_custody(
+                &paths.runtime_paths(),
+                *pow_limit,
+                *initial_target,
+            )?,
+        };
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    #[cfg(feature = "production-v4")]
+    if let Command::MainnetCustodyVerify {
+        expected_plan_digest,
+        paths,
+    } = &cli.command
+    {
+        let password = paths.read_stdin_password()?;
+        let report = match password.as_ref() {
+            Some(password) => cmfd_node::mainnet_custody::verify_reward_custody_with_password(
+                &paths.runtime_paths(),
+                *expected_plan_digest,
+                password,
+            )?,
+            None => cmfd_node::mainnet_custody::verify_reward_custody(
+                &paths.runtime_paths(),
+                *expected_plan_digest,
+            )?,
+        };
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    #[cfg(feature = "production-v4")]
     if let Command::MainnetPlan {
         output,
         pow_limit,
@@ -1141,7 +1269,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             unreachable!("mainnet-launch-info exits before node initialization")
         }
         #[cfg(feature = "production-v4")]
-        Command::MainnetPlan { .. } => {
+        Command::MainnetPlan { .. }
+        | Command::MainnetCustodyPrepare { .. }
+        | Command::MainnetCustodyVerify { .. } => {
             unreachable!("mainnet plan generation exits before node initialization")
         }
         #[cfg(feature = "production-v4")]

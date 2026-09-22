@@ -187,6 +187,11 @@ jobs:
         run: |
           cargo check --locked -p cmfd-node --bin cmfd-node --features production-v4
           cargo test --locked -p cmfd-node --lib --features production-v4 production_v4_
+      - name: Qualify offline mainnet reward custody and plan commands
+        run: |
+          cargo test --locked -p cmfd-node --lib --features production-v4 mainnet_custody::tests -- --test-threads=2
+          cargo test --locked -p cmfd-node --test mainnet_plan --features production-v4
+          cargo test --locked -p cmfd-node --test mainnet_custody --features production-v4 -- --test-threads=2
       - name: Build the pinned ProductionV4 RC profile
         run: cargo check --locked -p cmfd-node --bin cmfd-node --features production-rc
       - name: Report final disk use
@@ -321,6 +326,24 @@ jobs:
         run: >-
           cargo test --locked -p cmfd-proof-worker --features production-v3
           --lib --test verifier_worker --no-fail-fast -- --test-threads=1
+
+      # Keep the earlier 1.88/MSRV checks unchanged; switch only for this
+      # separately bounded ProductionV4 custody qualification at the job's end.
+      - name: Install the ProductionV4 custody-check toolchain on Windows
+        if: runner.os == 'Windows'
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.94.1
+      - name: Verify Windows reward-wallet custody and guided password pipe
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo +1.94.1 test --locked -p cmfd-node --features production-v4 --lib mainnet_custody::tests -- --test-threads=2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo +1.94.1 test --locked -p cmfd-node --features production-v4 --test mainnet_custody --test mainnet_plan -- --test-threads=2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:CMFD_CUSTODY_TEST_NODE = (Resolve-Path target/debug/cmfd-node.exe).Path
+          python -m unittest discover -s scripts/tests -p test_mainnet_reward_custody_launcher.py -v
 
   wallet:
     runs-on: ubuntu-latest

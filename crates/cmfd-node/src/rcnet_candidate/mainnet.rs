@@ -195,6 +195,26 @@ impl MainnetLaunchPlan {
         decode_hex32(&self.network_id)
     }
 
+    pub fn reward_destinations(&self) -> Result<FixedRewardDestinations, RcnetCandidateError> {
+        self.validate()?;
+        Ok(FixedRewardDestinations {
+            steward: decode_hex32(
+                &self
+                    .payload
+                    .rules
+                    .reward_destinations
+                    .steward_xonly_public_key,
+            )?,
+            community: decode_hex32(
+                &self
+                    .payload
+                    .rules
+                    .reward_destinations
+                    .community_xonly_public_key,
+            )?,
+        })
+    }
+
     pub fn authenticate_genesis(
         &self,
         certificate: &BeaconCertificate,

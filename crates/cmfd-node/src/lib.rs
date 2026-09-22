@@ -72,6 +72,8 @@ pub(crate) mod exchange_withdrawal;
 pub(crate) mod exchange_withdrawal_v3;
 pub mod explorer;
 pub mod logging;
+#[cfg(feature = "production-v4")]
+pub mod mainnet_custody;
 pub mod mainnet_runtime;
 pub mod network_info;
 pub mod network_profile;

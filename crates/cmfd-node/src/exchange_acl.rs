@@ -8,6 +8,8 @@ use std::ffi::c_void;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::mem::size_of;
+#[cfg(feature = "production-v4")]
+use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
@@ -513,6 +515,60 @@ fn validate_windows_custody_directory_handle_acl(
         }
     }
     sid_string(descriptor.owner, directory_path)
+}
+
+/// Create a new directory with a protected owner/SYSTEM/Administrators DACL
+/// from the first instant it exists. Never changes an existing directory.
+#[cfg(feature = "production-v4")]
+pub(crate) fn create_private_custody_directory(path: &Path) -> Result<(), WindowsCustodyAclError> {
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+    let token = ProcessToken::open(path)?;
+    let current_user = sid_string(token.user_sid, path)?;
+    let sddl = format!("D:P(A;OICI;FA;;;{current_user})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)");
+    let encoded = sddl.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+    let mut raw_descriptor = null_mut::<c_void>();
+    // SAFETY: NUL-terminated SDDL and a valid output pointer. RAII frees the
+    // returned LocalAlloc descriptor after CreateDirectoryW has copied it.
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            encoded.as_ptr(),
+            SDDL_REVISION_1,
+            &mut raw_descriptor,
+            null_mut(),
+        )
+    } == 0
+    {
+        return Err(last_io_error("build private custody directory DACL", path));
+    }
+    let descriptor = LocalAllocation(raw_descriptor);
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.0,
+        bInheritHandle: 0,
+    };
+    let encoded_path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    if encoded_path[..encoded_path.len() - 1].contains(&0) {
+        return Err(policy_error(
+            path,
+            "directory path contains an embedded NUL",
+        ));
+    }
+    // SAFETY: both inputs are valid for this synchronous call. CreateDirectoryW
+    // fails if the path already exists; no overwrite or ACL broadening occurs.
+    if unsafe { CreateDirectoryW(encoded_path.as_ptr(), &attributes) } == 0 {
+        return Err(last_io_error("create private custody directory", path));
+    }
+    validate_windows_custody_directory_acl(
+        path,
+        WindowsCustodyFilePolicy::JournalKey,
+        CustodyObjectKind::Directory,
+        None,
+    )
 }
 
 /// Replaces the inherited DACL on a newly created, still-empty node-owned file

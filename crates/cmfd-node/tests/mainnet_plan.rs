@@ -31,6 +31,8 @@ fn cli_emits_only_a_new_plan_without_opening_node_or_wallet_storage() {
             .arg(&output)
             .arg("--pow-limit")
             .arg(hex::encode(profile.pow_limit))
+            .arg("--initial-target")
+            .arg("000ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccb")
             .arg("--steward-reward-destination")
             .arg(hex::encode(profile.rewards.steward))
             .arg("--community-reward-destination")
@@ -75,4 +77,5 @@ fn cli_has_no_implicit_mainnet_reward_destinations() {
     assert!(message.contains("--steward-reward-destination"));
     assert!(message.contains("--community-reward-destination"));
     assert!(message.contains("--pow-limit"));
+    assert!(message.contains("--initial-target"));
 }

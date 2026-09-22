@@ -5834,12 +5834,13 @@ mod tests {
     #[test]
     fn pool_handles_default_per_source_authenticated_load() {
         let (_root, server, _node, pin) = server("bounded-load");
-        let start = Arc::new(std::sync::Barrier::new(
-            DEFAULT_POOL_CONNECTIONS_PER_SOURCE + 1,
-        ));
+        let (ready, all_ready) = std::sync::mpsc::sync_channel(DEFAULT_POOL_CONNECTIONS_PER_SOURCE);
         let mut workers = Vec::new();
+        let mut starts = Vec::new();
         for index in 0..DEFAULT_POOL_CONNECTIONS_PER_SOURCE {
-            let start = Arc::clone(&start);
+            let ready = ready.clone();
+            let (start, wait) = std::sync::mpsc::sync_channel(1);
+            starts.push(start);
             let address = server.local_addr();
             workers.push(thread::spawn(move || {
                 let mut client = client(address, pin, &format!("load-{index}"));
@@ -5847,12 +5848,21 @@ mod tests {
                 // occasionally wins a block and makes other workers' jobs stale.
                 let work = client.current_work().unwrap();
                 let nonce = find_share_from(&work, client.current_nonce_origin(), false);
-                start.wait();
+                ready.send(()).unwrap();
+                // A failed TLS/search setup in any worker must fail the test,
+                // not strand the entire CI run on an unbounded barrier.
+                wait.recv_timeout(Duration::from_secs(30)).unwrap();
                 let job_id = client.current_job().job_id;
                 client.submit_share(job_id, nonce).unwrap()
             }));
         }
-        start.wait();
+        drop(ready);
+        for _ in 0..DEFAULT_POOL_CONNECTIONS_PER_SOURCE {
+            all_ready.recv_timeout(Duration::from_secs(30)).unwrap();
+        }
+        for start in starts {
+            let _ = start.send(());
+        }
         let results = workers
             .into_iter()
             .map(|worker| worker.join().unwrap())

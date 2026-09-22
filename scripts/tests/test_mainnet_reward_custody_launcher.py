@@ -43,6 +43,8 @@ class GuidedRewardCustodyTests(unittest.TestCase):
         confirm = PASSWORD + ("-wrong" if wrong_confirmation else "")
         code = (
             "$ErrorActionPreference='Stop'; "
+            # Reproduce the UTF-8 BOM console mode on the Windows CI runner.
+            "[Console]::InputEncoding=New-Object Text.UTF8Encoding($true); "
             f"$a=ConvertTo-SecureString {ps_literal(PASSWORD)} -AsPlainText -Force; "
             f"$b=ConvertTo-SecureString {ps_literal(confirm)} -AsPlainText -Force; "
             f"$result=& {ps_literal(str(SCRIPT))} -NodePath {ps_literal(str(self.node))} "

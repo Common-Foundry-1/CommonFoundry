@@ -49,7 +49,16 @@ function Invoke-CustodyCommand([string[]]$Arguments, [byte[]]$PasswordBytes) {
     $process = New-Object Diagnostics.Process
     $process.StartInfo = $start
     try {
-        [void]$process.Start()
+        # Windows PowerShell 5.1 builds the redirected stdin writer from the
+        # console encoding. A UTF-8 encoding with a BOM would change the wallet
+        # password bytes when that writer is closed, even for BaseStream writes.
+        $originalInputEncoding = [Console]::InputEncoding
+        try {
+            [Console]::InputEncoding = New-Object Text.UTF8Encoding($false, $true)
+            [void]$process.Start()
+        } finally {
+            [Console]::InputEncoding = $originalInputEncoding
+        }
         $stdout = $process.StandardOutput.ReadToEndAsync()
         $stderr = $process.StandardError.ReadToEndAsync()
         $process.StandardInput.BaseStream.Write($PasswordBytes, 0, $PasswordBytes.Length)

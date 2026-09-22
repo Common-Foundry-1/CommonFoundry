@@ -59,6 +59,8 @@ pub(crate) mod exchange_custody_engine;
 mod exchange_custody_rehearsal;
 pub(crate) mod exchange_custody_runtime_v3;
 pub use exchange_custody_runtime_v3::ExchangeCustodyV3Config;
+#[cfg(all(test, feature = "production-v4-testnet", target_os = "linux"))]
+mod difficulty_gpu_rehearsal;
 pub mod exchange_custody_tools;
 pub(crate) mod exchange_custody_v3;
 pub(crate) mod exchange_index;
@@ -4436,6 +4438,7 @@ fn network_params_from_pow_with_launch(
         genesis_hash: profile.virtual_genesis_hash,
         genesis_timestamp: profile.virtual_genesis_timestamp,
         pow_limit: profile.pow_limit,
+        initial_target: profile.initial_target,
         pow,
         monetary_policy: DEFAULT_MONETARY_POLICY,
         rewards: FixedRewardDestinations {
@@ -13091,6 +13094,7 @@ mod tests {
             virtual_genesis_hash: [0x48; 32],
             virtual_genesis_timestamp: DEVNET_GENESIS_TIMESTAMP + 1,
             pow_limit: DEVNET_PROFILE.pow_limit,
+            initial_target: None,
             rewards: DEVNET_PROFILE.rewards,
             rpc_port: 28_443,
             p2p_port: 28_444,

@@ -39,6 +39,9 @@ pub struct NetworkParams {
     pub genesis_hash: [u8; 32],
     pub genesis_timestamp: u64,
     pub pow_limit: [u8; 32],
+    /// Optional distinct first-block target. None preserves existing networks.
+    /// This value is consensus-bound and must never come from an untrusted peer.
+    pub initial_target: Option<[u8; 32]>,
     pub pow: PowParameters,
     pub monetary_policy: MonetaryPolicy,
     pub rewards: FixedRewardDestinations,
@@ -60,6 +63,8 @@ pub enum NetworkError {
     ZeroGenesisHash,
     #[error("proof-of-work limit must be nonzero")]
     ZeroPowLimit,
+    #[error("initial work target must be nonzero and no easier than the proof-of-work limit")]
+    InvalidInitialTarget,
     #[error("maximum future timestamp offset must be nonzero")]
     ZeroFutureOffset,
     #[error("maximum future timestamp offset exceeds the 24-hour implementation limit")]
@@ -81,6 +86,10 @@ pub enum NetworkError {
 }
 
 impl NetworkParams {
+    pub fn initial_work_target(&self) -> [u8; 32] {
+        self.initial_target.unwrap_or(self.pow_limit)
+    }
+
     pub fn validate(&self) -> Result<(), NetworkError> {
         self.validate_without_pow()?;
         self.pow
@@ -99,6 +108,10 @@ impl NetworkParams {
         hasher.update(&self.genesis_hash);
         hasher.update(&self.genesis_timestamp.to_le_bytes());
         hasher.update(&self.pow_limit);
+        if let Some(initial_target) = self.initial_target {
+            hasher.update(b"CMFD/INITIAL-WORK-TARGET/V1");
+            hasher.update(&initial_target);
+        }
 
         self.pow
             .absorb(self.network_id, &mut hasher)
@@ -178,6 +191,9 @@ impl NetworkParams {
         if self.pow_limit == [0; 32] {
             return Err(NetworkError::ZeroPowLimit);
         }
+        if self.initial_work_target() == [0; 32] || self.initial_work_target() > self.pow_limit {
+            return Err(NetworkError::InvalidInitialTarget);
+        }
         if self.max_future_offset_secs == 0 {
             return Err(NetworkError::ZeroFutureOffset);
         }
@@ -242,6 +258,7 @@ mod tests {
             genesis_hash: [0x22; 32],
             genesis_timestamp: 1_777_777_777,
             pow_limit: [0xff; 32],
+            initial_target: None,
             pow: PowParameters::V1Legacy(TEST_PROFILE),
             monetary_policy: DEFAULT_MONETARY_POLICY,
             rewards: FixedRewardDestinations {
@@ -250,6 +267,30 @@ mod tests {
             },
             max_future_offset_secs: 2 * 60 * 60,
         }
+    }
+
+    #[test]
+    fn explicit_initial_target_is_bounded_and_fingerprint_bound() {
+        let mut candidate = params();
+        let legacy = candidate.fingerprint().unwrap();
+        assert_eq!(candidate.initial_work_target(), candidate.pow_limit);
+        candidate.initial_target = Some([0x20; 32]);
+        candidate.validate_without_pow().unwrap();
+        assert_ne!(legacy, candidate.fingerprint().unwrap());
+        let explicit = candidate.fingerprint().unwrap();
+        candidate.initial_target = Some([0x10; 32]);
+        assert_ne!(explicit, candidate.fingerprint().unwrap());
+        candidate.initial_target = Some([0; 32]);
+        assert_eq!(
+            candidate.validate_without_pow(),
+            Err(NetworkError::InvalidInitialTarget)
+        );
+        candidate.pow_limit = [0x10; 32];
+        candidate.initial_target = Some([0x20; 32]);
+        assert_eq!(
+            candidate.validate_without_pow(),
+            Err(NetworkError::InvalidInitialTarget)
+        );
     }
 
     #[test]

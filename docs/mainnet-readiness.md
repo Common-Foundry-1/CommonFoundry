@@ -33,7 +33,7 @@ the beacon policy before source release. `cmfd-node mainnet-plan` derives it
 from compiled artifact/rule identities plus explicitly supplied starting target
 and reward receiving addresses. It will not silently select the RC addresses.
 The digest in the formula is SHA-256 of the ASCII domain
-`CMFD/MAINNET/LAUNCH-PLAN/V1` followed by a zero byte and compact serialized
+`CMFD/MAINNET/LAUNCH-PLAN/V2` followed by a zero byte and compact serialized
 `payload` bytes. The independent network ID uses its own mainnet BLAKE3 domain.
 Final runtime plan parsing also requires the exact release-pinned plan digest.
 The exact quicknet round is **32,747,812**. Its scheduled time is precisely the
@@ -96,7 +96,7 @@ The source checksum typo for fixed-bank-0.tree is corrected and cross-manifest
 consistency has a regression test. Node seed defaults now select the compiled
 network's port rather than hard-coding the RC port.
 
-**Mainnet integration remains incomplete.** Final pin values, accepted review
+**Mainnet integration remains incomplete.** Final pin values, actual release-approval
 evidence, actual mainnet package builds and release finalization, and the real launch
 rehearsal are still pending. The runtime
 explicitly refuses legacy wire/fee defaults for a new mainnet ID.
@@ -119,18 +119,18 @@ and api3.drand.sh on 2026-09-19. Historical round 123 is the offline positive ve
 | Exact UTC release/mining schedule | Pinned in cmfd-launch | Schedule CLI and timestamp tests |
 | Signed launch-time entropy | Verifier, node/miner startup wiring and retrieval/waiting launchers implemented; packaged rehearsal pending | Signature mutation vectors plus actual packaged replay and anti-precomputation rehearsal |
 | Mainnet network/consensus identity | Shared identity registry and mainnet build feature implemented; final pin values pending | Final pinned plan and mainnet profile, distinct from RC |
-| Starting difficulty | Initial target and easiest permitted target are coupled; historical-rate calibration documented | Approved floor plus complete-block startup/hash-rate-drop rehearsal |
-| Reward receiving addresses and custody | Awaiting owner decision | Public destinations plus custody/recovery evidence |
-| Independent reproduction and review | No accepted independent record located yet | Named reproducer, signed report, independent crypto/wallet review |
+| Starting difficulty | Separate 5x start / RC minimum passed isolated full-proof and recovery tests; V2 plan/pin/package binding implemented locally | Final recovery policy plus controlled hashrate-drop and exact-package rehearsal |
+| Reward receiving addresses and custody | Owner will control both wallets; actual mainnet addresses/backups still needed | Public destinations plus custody/recovery evidence |
+| Build reproduction and validation reporting | Owner declined seeking an external cryptographer; validation must be described as internal | Reproducible build records and accurate test/approval evidence, without claiming an external cryptographic audit |
 | Plan approval binding | Dedicated requests, signature verification, package binding and candidate pin generation implemented | Actual role approvals, reviewed source history and final pin application |
 | Dependency audit | rustls updated to 0.23.45 for RUSTSEC-2026-0285; 44 pool/TLS tests pass and cargo-audit reports zero vulnerabilities | Final build audit plus review of remaining informational dependency warnings |
-| Full cross-platform CI | Proof-worker fault-fixture race reproduced and corrected; targeted Windows/Linux suites pass | Completed successful full run on the final source, not only selected jobs |
+| Full cross-platform CI | Baseline a0e3595 run 35658638655 passed all jobs; newer local target integration has focused Windows/Linux checks | Completed successful full run on the final source, not only selected jobs |
 | Windows/Linux release packages | Native assembler and four package layouts implemented; actual builds await final configuration | Clean installs, signature/checksum verification, matching runtime identity |
 | Four-package release consistency | Offline archive/source/receipt reconciliation implemented | Actual four-archive preflight report followed by independent reproduction and signing |
 | Mainnet release finalization | Generic finalizer dispatches mainnet assets through exact-pin, plan-signature and signed-reproduction checks | Real independently built archives and signed evidence, then final checksums/signature |
 | Wallet preparation before activation | Encrypted creation with backup, restore, public address display and launch-wait UI implemented | Native custody tests plus rendered fixture checks; final signed-package rehearsal pending |
 | Seeds, discovery, explorer | Live RC seed checked healthy September 19; isolated mainnet service templates staged, not deployed | Independent node results and mainnet service configuration |
-| Pool payout and reorg lifecycle | Isolated real-chain maturity/payout/restart tests pass; deep-reorg funding-loss handling remains incomplete | Agreed loss policy, corresponding adversarial tests, and actual packaged mature-reward payout/recovery logs |
+| Pool payout and reorg lifecycle | Owner chose pausing affected automatic payouts and reconciling shortfalls; implementation remains pending | Persistent holds, controlled reconciliation, adversarial tests and packaged mature-reward payout/recovery logs |
 | Storage capacity | Live seed has about 274 GiB free; larger archival capacity versus pruning awaits owner decision | Measured growth and provisioned capacity/retention decision |
 | Model download availability | Full 61.2 GB solo-input set verified from primary; node-model downloads verified from both hosts; GitHub still lacks 36 solo-input parts | Final packaged preparation rehearsal and a complete independent solo-input mirror |
 | Recovery and update | Offline CLI backup/restore/tail-repair rehearsal passes on Windows/Linux; mainnet storage tools now authenticate launch identity | Final signed-package and service-identity rehearsal, upgrade/rollback results |
@@ -409,9 +409,10 @@ do not supply independent review or evidence of a live RC pool payout.
 block reconciliation updates its orphan/confirmation status but does not revoke
 that reward's credited balance. A deep reorganization can therefore leave
 unbacked credit available for automatic payment. The existing legacy-credit
-reorg test does not cover this funding relationship. The owner has been asked
-whether to pause automatic payouts for review or recover the shortfall from
-future earnings; neither policy has been silently selected or deployed. The
+reorg test does not cover this funding relationship. On September 22 the owner
+selected pausing affected automatic payouts and reconciling the shortfall; see
+[the selected policy](pool-deep-reorg-policy.md). No automatic future-earnings
+charge was authorized, and the policy is not yet deployed. The
 chosen behavior must cover already-paid rewards, payouts whose funding returns,
 restart persistence, and reorganization below maturity, and must be implemented
 and tested before mainnet approval. The mempool-conflict repair does not close

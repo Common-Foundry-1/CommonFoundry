@@ -42,6 +42,9 @@ MAX_INFO = 128 * 1024
 FIXED = "FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json"
 SHARED = "packaging/production-v4-pool/shared"
 PLATFORMS = ("windows-x86_64", "linux-x86_64")
+PLAN_SCHEMA = "CMFD_MAINNET_LAUNCH_PLAN_V2"
+PLAN_DOMAIN = b"CMFD/MAINNET/LAUNCH-PLAN/V2\0"
+NETWORK_DOMAIN = "CMFD/MAINNET/NETWORK-ID/V2"
 
 
 def canonical(value: object) -> bytes:
@@ -141,21 +144,25 @@ def native_output(executable: Path, arguments: list[str], timeout_seconds: float
 
 def validate_plan(data: bytes) -> dict:
     plan = strict_json(data, "mainnet plan", 32 * 1024)
-    if set(plan) != {"schema", "payload", "launch_plan_digest", "network_id"} or plan["schema"] != "CMFD_MAINNET_LAUNCH_PLAN_V1":
+    if set(plan) != {"schema", "payload", "launch_plan_digest", "network_id"} or plan["schema"] != PLAN_SCHEMA:
         raise Error("unsupported mainnet plan")
     if (json.dumps(plan, indent=2, ensure_ascii=False) + "\n").encode() != data:
         raise Error("mainnet plan is not canonical")
     root = nonzero_hex(plan["launch_plan_digest"], 64, "plan digest")
     network = nonzero_hex(plan["network_id"], 64, "mainnet network ID")
     payload = plan["payload"]
-    if not isinstance(payload, dict) or set(payload) != {"rules", "minimum_transaction_fee_atoms", "source_release_unix_seconds", "beacon"}:
+    if not isinstance(payload, dict) or set(payload) != {"rules", "initial_target", "minimum_transaction_fee_atoms", "source_release_unix_seconds", "beacon"}:
         raise Error("invalid mainnet plan payload")
     if canonical(payload["beacon"]) != canonical(BEACON_POLICY):
         raise Error("mainnet plan has an unrecognized beacon policy")
-    digest = hashlib.sha256(b"CMFD/MAINNET/LAUNCH-PLAN/V1\0" + json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
-    if digest != root or integrity._rcnet_v2_derived_hash("CMFD/MAINNET/NETWORK-ID/V1", bytes.fromhex(root)).hex() != network:
+    digest = hashlib.sha256(PLAN_DOMAIN + json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+    if digest != root or integrity._rcnet_v2_derived_hash(NETWORK_DOMAIN, bytes.fromhex(root)).hex() != network:
         raise Error("mainnet plan derived identity mismatch")
     try:
+        initial_target = nonzero_hex(payload["initial_target"], 64, "mainnet initial target")
+        pow_limit = nonzero_hex(payload["rules"]["proof_of_work"]["pow_limit"], 64, "mainnet easiest target")
+        if int(initial_target, 16) > int(pow_limit, 16):
+            raise Error("mainnet initial target exceeds the easiest target")
         if payload["rules"]["profile"] != "CommonFoundry Mainnet" or payload["source_release_unix_seconds"] != SOURCE_TIME or payload["rules"]["virtual_genesis_timestamp_unix_seconds"] != LAUNCH_TIME or payload["beacon"]["round"] != BEACON_ROUND:
             raise Error("mainnet plan schedule or profile mismatch")
     except (KeyError, TypeError) as error:

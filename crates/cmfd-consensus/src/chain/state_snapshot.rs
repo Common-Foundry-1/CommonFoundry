@@ -267,7 +267,7 @@ fn validate_snapshot_state(state: &ChainState) -> Result<(), ChainStateSnapshotE
         || state.history.first()
             != Some(&HeaderWork {
                 timestamp: state.params.genesis_timestamp,
-                target: state.params.pow_limit,
+                target: state.params.initial_work_target(),
             })
         || state.raw_timestamps.first() != Some(&state.params.genesis_timestamp)
     {

@@ -95,6 +95,8 @@ class MainnetPinGenerationTests(unittest.TestCase):
         for name, row in report["files"].items():
             data = (self.root / "candidates" / name).read_bytes()
             self.assertEqual(row, {"bytes": len(data), "sha256": approval.digest(data)})
+        rendered = (self.root / "candidates" / "mainnet_release_pin.inc.rs").read_text()
+        self.assertIn("initial_target: " + pins.byte_array(self.plan["payload"]["initial_target"]), rendered)
         with self.assertRaises(FileExistsError):
             self.generate()
 
@@ -104,6 +106,13 @@ class MainnetPinGenerationTests(unittest.TestCase):
                      self.proof_bytes.replace(b'"CMFD_PRODUCTION_V4_ACTIVATION_V1"', b'include!("elsewhere.rs")')):
             with self.subTest(data=data[:40]), self.assertRaises((pins.Error, signatures.ApprovalError)):
                 pins.parse_reviewed_proof_pin(data)
+
+    def test_pin_renderer_rejects_zero_or_too_easy_initial_target(self):
+        for value in ("00" * 32, "ff" * 32):
+            changed = copy.deepcopy(self.plan)
+            changed["payload"]["initial_target"] = value
+            with self.subTest(value=value), self.assertRaises(pins.Error):
+                pins.render_mainnet_pins(changed, self.manifest_path.read_bytes(), self.proof_bytes)
 
     def test_changed_signed_target_or_qualification_binding_is_rejected(self):
         changed = copy.deepcopy(self.fields)

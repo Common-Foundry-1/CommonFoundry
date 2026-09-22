@@ -112,6 +112,8 @@ struct ProductionV4ProofOfWorkIdentity {
     activation_evidence_sha256: Option<String>,
     wire_type: u16,
     pow_limit: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    initial_target: Option<String>,
     algorithm_version: u32,
     proof_version: u32,
     proof_system_digest: String,
@@ -471,6 +473,7 @@ fn canonical_network_info_json_for_profile(
                 activation_evidence_sha256,
                 wire_type: POW_TYPE_V4_CANDIDATE,
                 pow_limit: hex::encode(params.pow_limit),
+                initial_target: params.initial_target.map(hex::encode),
                 algorithm_version: parameters.algorithm_version(),
                 proof_version: parameters.proof_version(),
                 proof_system_digest: hex::encode(parameters.proof_system_digest()),
@@ -583,7 +586,12 @@ fn production_v4_file_identity(
 mod tests {
     use super::*;
 
-    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4-testnet")))]
+    #[cfg(not(any(
+        feature = "production-v3-testnet",
+        feature = "production-v4-testnet",
+        feature = "production-rc",
+        feature = "production-mainnet"
+    )))]
     const EXPECTED_DEVNET_NETWORK_INFO: &str = r#"{
   "format": "commonfoundry-network-info",
   "format_version": 1,
@@ -669,13 +677,27 @@ mod tests {
 }
 "#;
 
-    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4-testnet")))]
+    #[cfg(not(any(
+        feature = "production-v3-testnet",
+        feature = "production-v4-testnet",
+        feature = "production-rc",
+        feature = "production-mainnet"
+    )))]
     #[test]
     fn current_network_info_bytes_are_exact() {
         assert_eq!(
             canonical_network_info_json().unwrap(),
             EXPECTED_DEVNET_NETWORK_INFO.as_bytes()
         );
+    }
+
+    #[cfg(feature = "production-rc")]
+    #[test]
+    fn production_rc_network_info_does_not_fall_back_to_devnet_without_artifacts() {
+        assert!(matches!(
+            canonical_network_info_json(),
+            Err(NodeError::ProductionV4ArtifactsMissing)
+        ));
     }
 
     #[cfg(feature = "production-v3-testnet")]

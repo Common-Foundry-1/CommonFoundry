@@ -326,6 +326,7 @@ mod tests {
     fn public_authentication_requires_exact_plan_and_future_round() {
         let plan = crate::rcnet_candidate::MainnetLaunchPlan::from_release_artifacts(
             RCNET1_PROFILE.pow_limit,
+            RCNET1_PROFILE.pow_limit,
             cmfd_consensus::FixedRewardDestinations {
                 steward: RCNET1_PROFILE.rewards.steward,
                 community: RCNET1_PROFILE.rewards.community,
@@ -395,7 +396,7 @@ mod tests {
             launch_plan_digest: [1; 32],
         };
         assert!(require_authenticated_profile(DEVNET_PROFILE, Some(&launch)).is_err());
-        for field in 0..5 {
+        for field in 0..6 {
             let mut profile = launch.profile;
             match field {
                 0 => profile.virtual_genesis_hash[0] ^= 1,
@@ -403,6 +404,7 @@ mod tests {
                 2 => profile.pow_limit[0] ^= 1,
                 3 => profile.rewards.steward[0] ^= 1,
                 4 => profile.virtual_genesis_timestamp += 1,
+                5 => profile.initial_target = Some([1; 32]),
                 _ => unreachable!(),
             }
             assert!(require_authenticated_profile(profile, Some(&launch)).is_err());

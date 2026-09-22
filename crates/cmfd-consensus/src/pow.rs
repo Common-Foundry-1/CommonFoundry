@@ -2901,6 +2901,7 @@ mod tests {
             genesis_hash: challenge.previous_block,
             genesis_timestamp: 0,
             pow_limit: challenge.target,
+            initial_target: None,
             pow: verifier.parameters(),
             monetary_policy: DEFAULT_MONETARY_POLICY,
             rewards,

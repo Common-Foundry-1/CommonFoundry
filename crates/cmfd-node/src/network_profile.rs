@@ -25,6 +25,7 @@ pub struct NetworkProfile {
     pub virtual_genesis_hash: [u8; 32],
     pub virtual_genesis_timestamp: u64,
     pub pow_limit: [u8; 32],
+    pub initial_target: Option<[u8; 32]>,
     pub rewards: RewardDestinations,
     pub rpc_port: u16,
     pub p2p_port: u16,
@@ -215,6 +216,7 @@ pub const DEVNET_PROFILE: NetworkProfile = NetworkProfile {
     network_id: [0x63; 32],
     virtual_genesis_hash: [0x47; 32],
     virtual_genesis_timestamp: 1_700_000_000,
+    initial_target: None,
     pow_limit: [
         0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
         0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
@@ -266,6 +268,7 @@ pub const PRODUCTION_V3_TESTNET_PROFILE: NetworkProfile = NetworkProfile {
     // Deliberately easy so a small private tester group can exercise complete
     // proof generation, external verification, and block admission quickly.
     pow_limit: [0xff; 32],
+    initial_target: None,
     rewards: RewardDestinations {
         // Deterministic test-only x-only public keys derived from the
         // CMFD/PRODUCTION-V3-TESTNET/V1/{STEWARD,COMMUNITY} labels. They are
@@ -311,6 +314,7 @@ pub const PRODUCTION_V4_TESTNET_PROFILE: NetworkProfile = NetworkProfile {
         0xbb, 0xa6,
     ],
     virtual_genesis_timestamp: 1_787_788_800, // 2026-08-27T00:00:00Z
+    initial_target: None,
     pow_limit: [0xff; 32],
     rewards: RewardDestinations {
         // Deterministic test-only x-only public keys derived from the V4
@@ -356,6 +360,7 @@ pub const RCNET1_PROFILE: NetworkProfile = NetworkProfile {
         0x6b, 0x71,
     ],
     virtual_genesis_timestamp: 1_788_800_400, // 2026-09-07T17:00:00Z
+    initial_target: None,
     pow_limit: [
         0x00, 0x3f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
         0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
@@ -399,6 +404,7 @@ pub(crate) const fn mainnet_profile_template(
             virtual_genesis_timestamp:
                 crate::release_gate::mainnet_schedule::MAINNET_LAUNCH_UNIX_SECONDS,
             pow_limit: pin.pow_limit,
+            initial_target: Some(pin.initial_target),
             rewards: RewardDestinations {
                 steward: pin.steward_reward_destination,
                 community: pin.community_reward_destination,

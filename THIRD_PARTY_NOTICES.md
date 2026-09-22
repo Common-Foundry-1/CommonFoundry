@@ -1,5 +1,19 @@
 # Third-party notices
 
+## Offline ASERT arithmetic reference
+
+The non-active difficulty comparison examples use the documented ASERT formula
+and polynomial constants from Bitcoin Cash Node's `src/pow.cpp`.
+
+Copyright (c) 2017-2020 The Bitcoin developers.
+SPDX-License-Identifier: MIT. The MIT permission and disclaimer are reproduced
+in this repository's `LICENSE`.
+
+Reference: https://github.com/bitcoin-cash-node/bitcoin-cash-node/blob/master/src/pow.cpp
+
+This comparison does not change the deployed matrix proof-of-work or select
+ASERT as an active consensus rule.
+
 ## NVIDIA CUTLASS v3.9.2
 
 The optional production CUDA tensor-core backend is compiled from CUTLASS

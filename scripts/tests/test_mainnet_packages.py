@@ -32,17 +32,19 @@ class MainnetPackageTests(unittest.TestCase):
         catalog = json.loads((self.repo / packages.SHARED / "production-v4-rcnet-1-inputs.json").read_bytes())
         assets = {row["name"]: row for row in catalog["files"]}
         self.plan = {
-            "schema": "CMFD_MAINNET_LAUNCH_PLAN_V1",
+            "schema": packages.PLAN_SCHEMA,
             "payload": {
                 "rules": {"profile": "CommonFoundry Mainnet", "virtual_genesis_timestamp_unix_seconds": packages.LAUNCH_TIME,
+                          "proof_of_work": {"pow_limit": "003f" + "ff" * 30},
                           "artifacts": {role: {"bytes": assets[name]["bytes"], "sha256": assets[name]["sha256"]}
                                         for role, name in (("bank", "MODEL-V2.bank"), ("fixed_record", packages.FIXED))}},
+                "initial_target": f"{(2**246 // 5) - 1:064x}",
                 "minimum_transaction_fee_atoms": 1, "source_release_unix_seconds": packages.SOURCE_TIME,
                 "beacon": copy.deepcopy(packages.BEACON_POLICY),
             }, "launch_plan_digest": "", "network_id": "",
         }
-        self.plan["launch_plan_digest"] = hashlib.sha256(b"CMFD/MAINNET/LAUNCH-PLAN/V1\0" + json.dumps(self.plan["payload"], separators=(",", ":")).encode()).hexdigest()
-        self.plan["network_id"] = packages.integrity._rcnet_v2_derived_hash("CMFD/MAINNET/NETWORK-ID/V1", bytes.fromhex(self.plan["launch_plan_digest"])).hex()
+        self.plan["launch_plan_digest"] = hashlib.sha256(packages.PLAN_DOMAIN + json.dumps(self.plan["payload"], separators=(",", ":")).encode()).hexdigest()
+        self.plan["network_id"] = packages.integrity._rcnet_v2_derived_hash(packages.NETWORK_DOMAIN, bytes.fromhex(self.plan["launch_plan_digest"])).hex()
         self.plan_path = self.root / "MAINNET-PLAN.json"
         self.plan_path.write_bytes((json.dumps(self.plan, indent=2) + "\n").encode())
         # Synthetic producer records for archive tests, not real approvals.
@@ -97,6 +99,27 @@ class MainnetPackageTests(unittest.TestCase):
                                   miner=binaries / "cmfd-miner" if kind == "miner" else None,
                                   launch=binaries / "cmfd-launch", replay_worker=binaries / "cmfd-v4-replay",
                                   relation_worker=binaries / "real_bank0_relations")
+
+    def test_starting_target_is_explicit_bounded_and_not_an_old_plan_default(self):
+        def encode(plan):
+            root = hashlib.sha256(packages.PLAN_DOMAIN + json.dumps(plan["payload"], separators=(",", ":")).encode()).digest()
+            plan["launch_plan_digest"] = root.hex()
+            plan["network_id"] = packages.integrity._rcnet_v2_derived_hash(packages.NETWORK_DOMAIN, root).hex()
+            return (json.dumps(plan, indent=2) + "\n").encode()
+        self.assertEqual(packages.validate_plan(encode(copy.deepcopy(self.plan))), self.plan)
+        for target in ("00" * 32, "ff" * 32, True, "0", None):
+            changed = copy.deepcopy(self.plan)
+            changed["payload"]["initial_target"] = target
+            with self.subTest(target=target), self.assertRaises(packages.Error):
+                packages.validate_plan(encode(changed))
+        for mutation in ("missing", "old_schema"):
+            changed = copy.deepcopy(self.plan)
+            if mutation == "missing":
+                del changed["payload"]["initial_target"]
+            else:
+                changed["schema"] = "CMFD_MAINNET_LAUNCH_PLAN_V1"
+            with self.subTest(mutation=mutation), self.assertRaises(packages.Error):
+                packages.validate_plan(encode(changed))
 
     def sources(self, repo, commit, paths, version):
         return {name: (repo / relative).read_bytes().replace(b"\r\n", b"\n") for name, relative in paths.items()}, 1789840000

@@ -225,8 +225,12 @@ enum Command {
     MainnetPlan {
         #[arg(long)]
         output: PathBuf,
+        /// Largest/easiest target that retargeting may ever select.
         #[arg(long, value_parser = parse_hex32)]
         pow_limit: [u8; 32],
+        /// First-block target; must be nonzero and no larger than pow-limit.
+        #[arg(long, value_parser = parse_hex32)]
+        initial_target: [u8; 32],
         #[arg(long, value_parser = parse_hex32)]
         steward_reward_destination: [u8; 32],
         #[arg(long, value_parser = parse_hex32)]
@@ -870,12 +874,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Command::MainnetPlan {
         output,
         pow_limit,
+        initial_target,
         steward_reward_destination,
         community_reward_destination,
     } = &cli.command
     {
         let plan = MainnetLaunchPlan::from_release_artifacts(
             *pow_limit,
+            *initial_target,
             cmfd_consensus::FixedRewardDestinations {
                 steward: *steward_reward_destination,
                 community: *community_reward_destination,
@@ -885,7 +891,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
-                "schema": "CMFD_MAINNET_PLAN_WRITTEN_V1",
+                "schema": "CMFD_MAINNET_PLAN_WRITTEN_V2",
                 "launch_plan_digest": hex::encode(plan.digest()?),
                 "network_id": hex::encode(plan.network_id()?),
                 "mainnet_activation_authorized": false

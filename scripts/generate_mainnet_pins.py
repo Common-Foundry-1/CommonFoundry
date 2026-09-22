@@ -101,7 +101,10 @@ def byte_array(value: str) -> str:
 def render_mainnet_pins(plan: dict, manifest_bytes: bytes, proof_pin_bytes: bytes) -> dict[str, bytes]:
     fields = parse_reviewed_proof_pin(proof_pin_bytes)
     rules = plan["payload"]["rules"]
-    pow_limit = package.nonzero_hex(rules["proof_of_work"]["pow_limit"], 64, "mainnet starting target")
+    pow_limit = package.nonzero_hex(rules["proof_of_work"]["pow_limit"], 64, "mainnet easiest target")
+    initial_target = package.nonzero_hex(plan["payload"]["initial_target"], 64, "mainnet starting target")
+    if int(initial_target, 16) > int(pow_limit, 16):
+        raise Error("mainnet starting target exceeds the easiest target")
     rewards = rules["reward_destinations"]
     steward = integrity._require_xonly_public_key(rewards["steward_xonly_public_key"], "steward reward key")
     community = integrity._require_xonly_public_key(rewards["community_xonly_public_key"], "community reward key")
@@ -110,7 +113,7 @@ def render_mainnet_pins(plan: dict, manifest_bytes: bytes, proof_pin_bytes: byte
     proof_expression = integrity._render_production_v4_activation_pin(fields).decode()[5:-2]
     lines = ["Some(MainnetReleaseConfiguration {"]
     for name, value in (("launch_plan_digest", plan["launch_plan_digest"]), ("network_id", plan["network_id"]),
-                        ("pow_limit", pow_limit), ("steward_reward_destination", steward),
+                        ("pow_limit", pow_limit), ("initial_target", initial_target), ("steward_reward_destination", steward),
                         ("community_reward_destination", community)):
         lines.append(f"    {name}: {byte_array(value)},")
     lines.append(f'    approval_manifest_sha256: "{approval.digest(manifest_bytes)}",')

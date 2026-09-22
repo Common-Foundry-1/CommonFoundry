@@ -1037,6 +1037,7 @@ mod tests {
             genesis_hash: [7; 32],
             genesis_timestamp: 0,
             pow_limit: [0xff; 32],
+            initial_target: None,
             pow: PowParameters::V1Legacy(TEST_PROFILE),
             monetary_policy: DEFAULT_MONETARY_POLICY,
             rewards: FixedRewardDestinations {

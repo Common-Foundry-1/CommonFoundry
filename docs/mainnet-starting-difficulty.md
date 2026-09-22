@@ -4,12 +4,23 @@ This is a planning note, not an approved parameter or a changed network setting.
 The mainnet pin remains unset. Calculations use the existing target comparison
 and the historical RC5 miner.2 console measurements, not current network telemetry.
 
+On September 21 the owner selected **5x RC starting difficulty with the RC
+minimum**, expects approximately 5-20 participating GPUs, and can supply reserve
+GPU capacity. This selects the candidate, not final qualification. The subsequent
+[statistical pre-screen](mainnet-difficulty-rehearsal-20260921.md) found slow
+unassisted recovery and startup overshoot. Full-block sign-off is **not approved**;
+the parameter split and actual packaged proof/recovery run remain outstanding.
+
 ## What the current code does
 
-`pow_limit` has two roles: it is the starting target and the largest/easiest
-target the retarget algorithm can ever produce. There is no separate initial
-target parameter. Consequently, a smaller/harder launch limit cannot later
-be relaxed beyond itself when fewer miners join or hash rate leaves.
+Released RC builds use `pow_limit` for both the starting target and the
+largest/easiest target the retarget algorithm can ever produce. A harder limit
+cannot later be relaxed beyond itself when fewer miners join or hash rate leaves.
+The September 21 local qualification work adds a separately validated,
+fingerprint-bound `initial_target` to consensus parameters and node profiles;
+existing released profiles retain `None`, preserving their prior behavior.
+The two-node full-proof/restart test exercised the actual 5x start / 1x minimum.
+Mainnet plan/pin/packaging integration and final qualification are still pending.
 
 The target is recalculated using up to 180 effective median timestamps and
 targets. The history includes the virtual genesis. It does not wait for 180
@@ -53,9 +64,10 @@ measure complete block production and recovery after a hash-rate drop. Check
 the larger-network startup burst separately. A floor chosen from an optimistic
 fleet estimate cannot rely on the retarget to rescue an underpopulated launch.
 
-If the desired launch needs a harder initial target but a lower minimum
-difficulty, separating those parameters is a deliberate protocol/manifest
-change requiring review and rehearsal; it is not an existing configuration
-switch. No such change has been made here. The final target, reward destinations
+Separating the starting target from the minimum difficulty is a deliberate
+protocol/manifest change requiring review and rehearsal; it is not an existing
+released configuration switch. The locally tested consensus/profile support
+must still be integrated with the authenticated mainnet plan and release pins.
+The final target, reward destinations
 and full economic/rule configuration must be reviewed and signed together in
 the canonical mainnet launch plan.

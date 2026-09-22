@@ -1026,13 +1026,13 @@ impl ChainState {
         }
         let genesis_timestamp = params.genesis_timestamp;
         let genesis_hash = params.genesis_hash;
-        let pow_limit = params.pow_limit;
+        let initial_target = params.initial_work_target();
         Ok(Self {
             params,
             utxos: UtxoSet::default(),
             history: vec![HeaderWork {
                 timestamp: genesis_timestamp,
-                target: pow_limit,
+                target: initial_target,
             }],
             raw_timestamps: vec![genesis_timestamp],
             tip: genesis_hash,
@@ -1626,11 +1626,43 @@ mod tests {
             genesis_hash: [7; 32],
             genesis_timestamp: 0,
             pow_limit: [0xff; 32],
+            initial_target: None,
             pow: PowParameters::V1Legacy(TEST_PROFILE),
             monetary_policy: DEFAULT_MONETARY_POLICY,
             rewards: fixed_destinations(),
             max_future_offset_secs: 7_200,
         }
+    }
+
+    #[test]
+    fn distinct_initial_target_survives_snapshot_and_can_retarget_easier() {
+        let mut params = network_params();
+        params.initial_target = Some([0x10; 32]);
+        let state = chain_state(params);
+        assert_eq!(state.expected_target().unwrap(), [0x10; 32]);
+        let bytes = state.encode_local_snapshot().unwrap();
+        let restored =
+            ChainState::decode_local_snapshot(&bytes, params, state.verifier.clone()).unwrap();
+        assert_eq!(restored.expected_target().unwrap(), [0x10; 32]);
+        let mut incompatible = params;
+        incompatible.initial_target = None;
+        assert!(
+            ChainState::decode_local_snapshot(&bytes, incompatible, state.verifier.clone())
+                .is_err()
+        );
+        let history = [
+            HeaderWork {
+                timestamp: 0,
+                target: [0x10; 32],
+            },
+            HeaderWork {
+                timestamp: 180,
+                target: [0x10; 32],
+            },
+        ];
+        assert!(
+            next_work_target(&history, params.pow_limit).unwrap() > params.initial_work_target()
+        );
     }
 
     #[test]

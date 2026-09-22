@@ -279,9 +279,9 @@ class MainnetPreflightTests(unittest.TestCase):
     def test_substituted_beacon_key_cannot_be_accepted_as_a_new_plan(self):
         value = copy.deepcopy(self.fixture.plan)
         value["payload"]["beacon"]["public_key"] = "4" * 192
-        root = hashlib.sha256(b"CMFD/MAINNET/LAUNCH-PLAN/V1\0" + json.dumps(value["payload"], separators=(",", ":")).encode()).digest()
+        root = hashlib.sha256(package.PLAN_DOMAIN + json.dumps(value["payload"], separators=(",", ":")).encode()).digest()
         value["launch_plan_digest"] = root.hex()
-        value["network_id"] = package.integrity._rcnet_v2_derived_hash("CMFD/MAINNET/NETWORK-ID/V1", root).hex()
+        value["network_id"] = package.integrity._rcnet_v2_derived_hash(package.NETWORK_DOMAIN, root).hex()
         with self.assertRaisesRegex(package.Error, "beacon policy"):
             package.validate_plan((json.dumps(value, indent=2) + "\n").encode())
 

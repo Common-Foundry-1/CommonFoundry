@@ -151,6 +151,7 @@ pub struct MainnetReleaseConfiguration {
     pub launch_plan_digest: [u8; 32],
     pub network_id: [u8; 32],
     pub pow_limit: [u8; 32],
+    pub initial_target: [u8; 32],
     pub steward_reward_destination: [u8; 32],
     pub community_reward_destination: [u8; 32],
     pub approval_manifest_sha256: &'static str,
@@ -798,7 +799,10 @@ pub fn validate_mainnet_release(
         return Err("mainnet plan/network pins are invalid or disagree with consensus");
     }
     if pin.pow_limit == [0; 32] {
-        return Err("mainnet initial proof-of-work target is zero");
+        return Err("mainnet proof-of-work limit is zero");
+    }
+    if pin.initial_target == [0; 32] || pin.initial_target > pin.pow_limit {
+        return Err("mainnet initial proof-of-work target is zero or exceeds the limit");
     }
     for destination in [
         pin.steward_reward_destination,
@@ -1171,6 +1175,7 @@ mod tests {
             launch_plan_digest: varied(33),
             network_id: varied(2),
             pow_limit: NETWORK_IDENTITY.pow_limit,
+            initial_target: NETWORK_IDENTITY.pow_limit,
             steward_reward_destination: NETWORK_IDENTITY.steward_reward_destination,
             community_reward_destination: NETWORK_IDENTITY.community_reward_destination,
             approval_manifest_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -1248,6 +1253,27 @@ mod tests {
                     profile,
                     Some(changed),
                     Some(network),
+                    BUILD_SOURCE_COMMIT
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn mainnet_release_checks_initial_target_bounds() {
+        let (profile, configuration) = mainnet_fixture();
+        for (initial_target, pow_limit) in [([0; 32], [0xff; 32]), ([0x30; 32], [0x20; 32])] {
+            let invalid = MainnetReleaseConfiguration {
+                initial_target,
+                pow_limit,
+                ..configuration
+            };
+            assert!(
+                validate_mainnet_release(
+                    profile,
+                    Some(invalid),
+                    Some(invalid.network_id),
                     BUILD_SOURCE_COMMIT
                 )
                 .is_err()

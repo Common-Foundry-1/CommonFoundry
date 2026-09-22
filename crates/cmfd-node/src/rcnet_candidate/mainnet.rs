@@ -12,10 +12,10 @@ use cmfd_launch::{
 
 use super::*;
 
-const MAINNET_SCHEMA: &str = "CMFD_MAINNET_LAUNCH_PLAN_V1";
+const MAINNET_SCHEMA: &str = "CMFD_MAINNET_LAUNCH_PLAN_V2";
 const MAINNET_PROFILE: &str = "CommonFoundry Mainnet";
-const PLAN_DOMAIN: &[u8] = b"CMFD/MAINNET/LAUNCH-PLAN/V1\0";
-const MAINNET_NETWORK_DOMAIN: &str = "CMFD/MAINNET/NETWORK-ID/V1";
+const PLAN_DOMAIN: &[u8] = b"CMFD/MAINNET/LAUNCH-PLAN/V2\0";
+const MAINNET_NETWORK_DOMAIN: &str = "CMFD/MAINNET/NETWORK-ID/V2";
 const MAX_MAINNET_PLAN_BYTES: usize = 32 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,6 +31,7 @@ pub struct MainnetLaunchPlan {
 #[serde(deny_unknown_fields)]
 struct MainnetLaunchPayload {
     rules: RcnetLaunchPayload,
+    initial_target: String,
     minimum_transaction_fee_atoms: u64,
     source_release_unix_seconds: u64,
     beacon: MainnetBeaconPolicy,
@@ -61,10 +62,12 @@ impl MainnetBeaconPolicy {
 }
 
 impl MainnetLaunchPlan {
-    /// Uses release-pinned model artifacts. Reward destinations and the starting
-    /// target are required explicitly; no RC custody keys are selected by default.
+    /// Uses release-pinned model artifacts. Reward destinations, the starting
+    /// target and the easiest target are required explicitly; no RC custody keys
+    /// or implicit difficulty defaults are selected.
     pub fn from_release_artifacts(
         pow_limit: [u8; 32],
+        initial_target: [u8; 32],
         rewards: FixedRewardDestinations,
     ) -> Result<Self, RcnetCandidateError> {
         let pins = crate::release_gate::PRODUCTION_V4_ARTIFACT_PINS;
@@ -91,6 +94,7 @@ impl MainnetLaunchPlan {
         };
         let payload = MainnetLaunchPayload {
             rules,
+            initial_target: hex::encode(initial_target),
             minimum_transaction_fee_atoms: cmfd_consensus::economics::MIN_TRANSACTION_FEE_ATOMS,
             source_release_unix_seconds: SOURCE_RELEASE_UNIX_SECONDS,
             beacon: MainnetBeaconPolicy::compiled(),
@@ -111,6 +115,13 @@ impl MainnetLaunchPlan {
             return Err(RcnetCandidateError::InvalidField("mainnet plan schema"));
         }
         validate_payload_for_profile(&self.payload.rules, MAINNET_PROFILE)?;
+        let initial_target = decode_hex32(&self.payload.initial_target)?;
+        let pow_limit = decode_hex32(&self.payload.rules.proof_of_work.pow_limit)?;
+        if initial_target == [0; 32] || initial_target > pow_limit {
+            return Err(RcnetCandidateError::InvalidField(
+                "mainnet initial target bounds",
+            ));
+        }
         if self.payload.source_release_unix_seconds != SOURCE_RELEASE_UNIX_SECONDS
             || self.payload.rules.virtual_genesis_timestamp_unix_seconds
                 != MAINNET_LAUNCH_UNIX_SECONDS
@@ -211,6 +222,7 @@ impl MainnetLaunchPlan {
             virtual_genesis_hash: launch.genesis_hash(),
             virtual_genesis_timestamp: MAINNET_LAUNCH_UNIX_SECONDS,
             pow_limit: decode_hex32(&self.payload.rules.proof_of_work.pow_limit)?,
+            initial_target: Some(decode_hex32(&self.payload.initial_target)?),
             rewards: crate::network_profile::RewardDestinations {
                 steward: decode_hex32(
                     &self
@@ -249,6 +261,7 @@ impl MainnetLaunchPlan {
             || profile.virtual_genesis_hash != [0; 32]
             || profile.virtual_genesis_timestamp != MAINNET_LAUNCH_UNIX_SECONDS
             || profile.pow_limit != decode_hex32(&self.payload.rules.proof_of_work.pow_limit)?
+            || profile.initial_target != Some(decode_hex32(&self.payload.initial_target)?)
             || profile.rewards.steward
                 != decode_hex32(
                     &self
@@ -300,6 +313,7 @@ mod tests {
         let rc = crate::RCNET1_PROFILE;
         MainnetLaunchPlan::from_release_artifacts(
             rc.pow_limit,
+            rc.pow_limit,
             FixedRewardDestinations {
                 steward: rc.rewards.steward,
                 community: rc.rewards.community,
@@ -331,6 +345,7 @@ mod tests {
         let mut target = crate::RCNET1_PROFILE.pow_limit;
         target[1] ^= 1;
         let changed = MainnetLaunchPlan::from_release_artifacts(
+            target,
             target,
             FixedRewardDestinations {
                 steward: crate::RCNET1_PROFILE.rewards.community,
@@ -386,5 +401,89 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn initial_target_is_required_bounded_and_part_of_the_plan_identity() {
+        let original = plan();
+        let mut changed = original.clone();
+        let initial = (((primitive_types::U256::one() << 246) / primitive_types::U256::from(5u8))
+            - primitive_types::U256::one())
+        .to_big_endian();
+        changed.payload.initial_target = hex::encode(initial);
+        let digest = payload_digest(&changed.payload).unwrap();
+        changed.launch_plan_digest = hex::encode(digest);
+        changed.network_id = hex::encode(derive(MAINNET_NETWORK_DOMAIN, &digest));
+        changed.validate().unwrap();
+        assert_ne!(changed.digest().unwrap(), original.digest().unwrap());
+        assert_ne!(
+            changed.network_id().unwrap(),
+            original.network_id().unwrap()
+        );
+        assert!(
+            MainnetLaunchPlan::parse_pinned(
+                &changed.canonical_json().unwrap(),
+                original.digest().unwrap()
+            )
+            .is_err()
+        );
+        for invalid in [[0; 32], [0xff; 32]] {
+            let mut invalid_plan = changed.clone();
+            invalid_plan.payload.initial_target = hex::encode(invalid);
+            assert!(invalid_plan.validate().is_err());
+        }
+        let mut missing: serde_json::Value =
+            serde_json::from_slice(&original.canonical_json().unwrap()).unwrap();
+        missing["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("initial_target");
+        assert!(serde_json::from_value::<MainnetLaunchPlan>(missing).is_err());
+        let mut old_schema = original;
+        old_schema.schema = "CMFD_MAINNET_LAUNCH_PLAN_V1".into();
+        assert!(old_schema.validate().is_err());
+    }
+
+    #[test]
+    fn compiled_template_must_match_both_difficulty_targets() {
+        let rc = crate::RCNET1_PROFILE;
+        let initial = (((primitive_types::U256::one() << 246) / primitive_types::U256::from(5u8))
+            - primitive_types::U256::one())
+        .to_big_endian();
+        let candidate = MainnetLaunchPlan::from_release_artifacts(
+            rc.pow_limit,
+            initial,
+            FixedRewardDestinations {
+                steward: rc.rewards.steward,
+                community: rc.rewards.community,
+            },
+        )
+        .unwrap();
+        let profile = crate::NetworkProfile {
+            kind: crate::NetworkProfileKind::Mainnet,
+            name: MAINNET_PROFILE,
+            network_id: candidate.network_id().unwrap(),
+            virtual_genesis_hash: [0; 32],
+            virtual_genesis_timestamp: MAINNET_LAUNCH_UNIX_SECONDS,
+            initial_target: Some(initial),
+            ..rc
+        };
+        candidate.validate_profile_template(profile).unwrap();
+        for changed in [
+            crate::NetworkProfile {
+                initial_target: None,
+                ..profile
+            },
+            crate::NetworkProfile {
+                initial_target: Some(rc.pow_limit),
+                ..profile
+            },
+            crate::NetworkProfile {
+                pow_limit: initial,
+                ..profile
+            },
+        ] {
+            assert!(candidate.validate_profile_template(changed).is_err());
+        }
     }
 }

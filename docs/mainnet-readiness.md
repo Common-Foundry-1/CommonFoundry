@@ -132,7 +132,7 @@ and api3.drand.sh on 2026-09-19. Historical round 123 is the offline positive ve
 | Seeds, discovery, explorer | Live RC seed checked healthy September 19; isolated mainnet service templates staged, not deployed | Independent node results and mainnet service configuration |
 | Pool payout and reorg lifecycle | Persistent holds, funded offline reconciliation and dashboard reporting implemented and tested; live rollout remains pending | Packaged mature-reward payout/recovery rehearsal and authorized service upgrade |
 | Storage capacity | Live seed has about 274 GiB free; larger archival capacity versus pruning awaits owner decision | Measured growth and provisioned capacity/retention decision |
-| Model download availability | Full 61.2 GB solo-input set verified from primary; node-model downloads verified from both hosts; GitHub still lacks 36 solo-input parts | Final packaged preparation rehearsal and a complete independent solo-input mirror |
+| Model download availability | Full 61.2 GB solo-input set verified from primary; public Devnet-16 release now exposes all 40 manifest-named parts with matching published sizes, and mainnet fallback launchers select it | Authenticate a complete miner-role download from the fallback and rehearse the exact package |
 | Recovery and update | Offline CLI backup/restore/tail-repair rehearsal passes on Windows/Linux; mainnet storage tools now authenticate launch identity | Final signed-package and service-identity rehearsal, upgrade/rollback results |
 | Final launch rehearsal | Pending | Exact intended packages, future-round start, delayed-beacon handling, fresh-wallet transfers |
 | Source release 24 hours early | Not yet executed | Public source and matching package timestamps at agreed release time |
@@ -437,11 +437,13 @@ Native Windows hashing additionally confirmed the primary download. The real
 downloads ran on the Windows host in isolated staging, not in live RC storage.
 They are computation inputs, not mainnet binaries or activation approvals.
 
-The inventory has 40 parts. GitHub's existing RC1 mirror has exactly the four
-node-model parts, with matching published lengths/digests, but lacks the 36
-solo-mining parts. The remaining primary-host files were subsequently downloaded
-in a fresh, sequential miner-role preparation. All 36 additional parts and all
-assembled files passed their hashes. A separate native Windows SHA-256 readback
+The inventory has 40 parts. GitHub's earlier RC1 release has only the four
+node-model parts. The existing public Devnet-16 release exposes all 40 expected
+part names and lengths; its published chunk manifest matches the local RC1
+content identifiers. The mainnet launcher fallback now selects Devnet-16 while
+the RC1 source catalog continues to identify the authenticated bytes. A separate
+primary-host miner-role preparation downloaded the remaining files. All 36
+additional parts and all assembled files passed their hashes. A separate native Windows SHA-256 readback
 then checked all eight files against the input manifest, including the three
 row-major codeword caches: **61,203,815,317 bytes** in total. This audit did not
 rely on the normal length-only reuse rule for those caches.
@@ -454,10 +456,10 @@ activation, GPU/proof qualification, release performance, or a signed-package
 rehearsal. The full input set remains in isolated local staging; the running RC
 installation was not changed.
 
-Completing an independent solo-input mirror remains a launch gate. The owner has been asked
-whether to publish a separate data-only mirror release of those already-public
-inputs now or stage it until the source-release date. No public assets were
-added, replaced or re-signed.
+An independent full miner-role download from that fallback and an exact packaged
+preparation rehearsal remain launch gates. A sampled Devnet-16 part returned the
+expected public size, but catalog/asset metadata alone is not a 61.2 GB byte
+audit. No public assets were added, replaced or re-signed for this change.
 
 Downloader review found that HTTP success followed by a bad hash did not try
 the fallback, and that a corrupt resumed prefix could poison a healthy mirror's

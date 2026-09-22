@@ -19,7 +19,7 @@ $miner = Join-Path $PSScriptRoot 'cmfd-miner.exe'
 & $miner mainnet-launch-info
 if ($LASTEXITCODE -ne 0) { throw 'The miner mainnet identity could not be verified.' }
 & (Join-Path $PSScriptRoot 'PREPARE-V4-INPUTS.ps1') -Role PoolMiner `
-    -FallbackReleaseBase 'https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/download/v0.1.0-rc.1'
+    -FallbackReleaseBase 'https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/download/v0.1.0-devnet.16'
 if (-not $?) { throw 'Mining input preparation failed.' }
 & (Join-Path $PSScriptRoot 'cmfd-launch.exe') fetch --runtime $miner --wait
 if ($LASTEXITCODE -ne 0) { throw 'Launch preparation stopped. Mining was not started.' }

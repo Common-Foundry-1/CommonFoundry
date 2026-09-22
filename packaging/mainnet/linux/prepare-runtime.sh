@@ -13,6 +13,6 @@ python3 "$SCRIPT_DIR/production-v4-inputs.py" \
   --fixed-record "$SCRIPT_DIR/FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json" \
   --destination "$DESTINATION" --role "$ROLE" \
   --release-base 'https://downloads.commonfoundry.ai/v0.1.0-rc.1' \
-  --fallback-release-base 'https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/download/v0.1.0-rc.1'
+  --fallback-release-base 'https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/download/v0.1.0-devnet.16'
 cp -- "$DESTINATION/fixed/FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json" "$DESTINATION/"
 echo 'Mainnet model inputs are ready. This does not activate the network.'

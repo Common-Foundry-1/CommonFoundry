@@ -24,6 +24,16 @@ export interface PoolPayout {
   reserved_payout_atoms: number;
   confirmed_payout_atoms: number;
   available_payout_atoms: number;
+  payout_on_hold?: boolean;
+  held_payout_atoms?: number;
+}
+
+export interface PoolPayoutProtection {
+  requires_reconciliation: boolean;
+  all_payouts_paused: boolean;
+  affected_payouts: string[];
+  unresolved_incidents: { id: number; reason: string; block_id: string | null; payout_txid: string | null; detected_tip: string; detected_height: number }[];
+  resolved_incidents: number;
 }
 
 export interface PoolBlock {
@@ -68,6 +78,7 @@ export interface PoolLedger {
   payouts: PoolPayout[];
   blocks: PoolBlock[];
   payout_transactions: PoolPayoutTransaction[];
+  payout_protection?: PoolPayoutProtection;
 }
 
 export interface PoolSnapshot {

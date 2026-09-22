@@ -74,6 +74,7 @@ copy_common() {
   cp -- "$shared/production-v4-rcnet-1-inputs.json" "$stage/production-v4-rcnet-1-inputs.json"
   cp -- "$shared/FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json" "$stage/FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json"
   cp -- "$project_root/docs/production-v4-pool.md" "$stage/README.md"
+  cp -- "$project_root/docs/pool-deep-reorg-policy.md" "$stage/pool-deep-reorg-policy.md"
   cp -- "$project_root/LICENSE" "$stage/LICENSE"
   cp -- "$project_root/THIRD_PARTY_NOTICES.md" "$stage/THIRD_PARTY_NOTICES.md"
   cp -- "$project_root/docs/release-notes/v0.1.0-rc.1.md" "$stage/RELEASE_NOTES.md"

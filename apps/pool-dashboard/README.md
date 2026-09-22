@@ -8,6 +8,14 @@ summaries from `/api/v1/pool`. All share verification and settlement remain
 inside the pool node. Work-rate telemetry and earning estimates are display
 data only and never affect PPLNS weights, credit, or payouts.
 
+Payout protection is reported by the node's optional `ledger.payout_protection`
+field (older servers remain display-compatible). Active holds override the
+automatic-settlement label and show the affected accounts' held unreserved
+credit and pending reserved payments. Chain transaction status is not rewritten:
+already-broadcast payments may still confirm. The page has no reconciliation or
+resume action; those are offline node/operator commands documented in
+`docs/pool-deep-reorg-policy.md`.
+
 Build the static dashboard:
 
 ```text

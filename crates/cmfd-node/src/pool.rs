@@ -22,6 +22,7 @@ use cmfd_consensus::{
     ForgeMatrixV2AcceleratorBatch, ForgeMatrixV2AcceleratorModel, ForgeMatrixV2Error, OutputLock,
     PowError, Transaction, block_work, v2_reference_for_network,
 };
+use fs2::FileExt;
 use k256::schnorr::{
     Signature, SigningKey, VerifyingKey,
     signature::{Signer, Verifier},
@@ -99,6 +100,14 @@ const LEGACY_POOL_LEDGER_FILE_PREFIX: &str = "pool-ledger-v1";
 const LEGACY_POOL_LEDGER_CHECKSUM_DOMAIN: &str = "CMFD/POOL/LEDGER/V1";
 const POOL_LEDGER_MAX_BYTES: usize = 64 * 1024 * 1024;
 const POOL_MAX_PAYOUTS_PER_TIP: usize = 16;
+const POOL_LEDGER_GUARD_FILE: &str = "pool-ledger-payout-guard-v1.json";
+
+#[path = "pool_payout_protection.rs"]
+mod payout_protection;
+pub use payout_protection::{
+    PoolPayoutProtectionReport, PoolPayoutProtectionSnapshot, PoolPayoutReconciliationRequest,
+    inspect_pool_payout_protection, reconcile_pool_payout_protection, require_existing_pool_ledger,
+};
 
 #[derive(Debug, Error)]
 pub enum PoolError {
@@ -136,6 +145,8 @@ pub enum PoolError {
     InvalidShareVerificationQueueLimit,
     #[error("pool payout policy requires nonzero minimum and fee amounts")]
     InvalidPayoutPolicy,
+    #[error("automatic pool payouts require a durable ledger directory")]
+    PayoutLedgerRequired,
     #[error("pool operator fee must not exceed 10000 basis points")]
     InvalidOperatorFee,
     #[error(
@@ -180,6 +191,14 @@ pub enum PoolError {
     LedgerCapacity,
     #[error("pool ledger storage is corrupt: {0}")]
     LedgerCorrupt(String),
+    #[error("pool ledger is already in use; stop the pool before running offline payout controls")]
+    LedgerInUse,
+    #[error(
+        "pool ledger write failed; restart only after recovering its payout guard and snapshot"
+    )]
+    LedgerFaulted,
+    #[error("pool payout reconciliation refused: {0}")]
+    Reconciliation(String),
     #[error("operating-system random number generation failed: {0}")]
     Random(String),
     #[error("pool I/O failed: {0}")]
@@ -462,6 +481,10 @@ pub struct PoolPayoutStats {
     pub reserved_payout_atoms: u64,
     pub confirmed_payout_atoms: u64,
     pub available_payout_atoms: u64,
+    #[serde(default)]
+    pub payout_on_hold: bool,
+    #[serde(default)]
+    pub held_payout_atoms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -512,6 +535,8 @@ pub struct PoolLedgerSnapshot {
     pub payouts: Vec<PoolPayoutStats>,
     pub blocks: Vec<PoolBlockStats>,
     pub payout_transactions: Vec<PoolPayoutTransactionStats>,
+    #[serde(default)]
+    pub payout_protection: PoolPayoutProtectionSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -839,6 +864,7 @@ struct ServerState {
 #[derive(Clone, Default)]
 struct Ledger {
     generation: u64,
+    guard_version: u16,
     accepted_shares: u64,
     rejected_shares: u64,
     stale_shares: u64,
@@ -853,6 +879,7 @@ struct Ledger {
     operator_fee_atoms: u64,
     earning_history_started_at_unix_seconds: u64,
     earning_events: VecDeque<EarningRecord>,
+    payout_protection: payout_protection::ProtectionState,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -949,6 +976,8 @@ struct PplnsBlockRecord {
     window_work: Vec<u8>,
     allocations: Vec<PplnsAllocationRecord>,
     distributed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_backing_mature: Option<bool>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -999,12 +1028,24 @@ struct PayoutTransactionRecord {
 struct DurableLedger {
     state: Mutex<Ledger>,
     store: Option<LedgerStore>,
+    faulted: AtomicBool,
 }
 
 struct LedgerStore {
     directory: PathBuf,
     network_id: [u8; 32],
     consensus_fingerprint: [u8; 32],
+    _lock: std::fs::File,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LedgerGuard {
+    format_version: u16,
+    generation: u64,
+    network_id: [u8; 32],
+    consensus_fingerprint: [u8; 32],
+    payload_blake3: [u8; 32],
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1021,6 +1062,8 @@ struct StoredLedgerV1 {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StoredLedgerPayloadV1 {
+    #[serde(default, skip_serializing_if = "is_zero_u16")]
+    guard_version: u16,
     accepted_shares: u64,
     rejected_shares: u64,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
@@ -1041,6 +1084,11 @@ struct StoredLedgerPayloadV1 {
     earning_history_started_at_unix_seconds: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     earning_events: Vec<EarningRecord>,
+    #[serde(
+        default,
+        skip_serializing_if = "payout_protection::ProtectionState::is_empty"
+    )]
+    payout_protection: payout_protection::ProtectionState,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1111,17 +1159,42 @@ impl DurableLedger {
             return Ok(Self {
                 state: Mutex::new(Ledger::default()),
                 store: None,
+                faulted: AtomicBool::new(false),
             });
         };
+        fs::create_dir_all(&directory)?;
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(directory.join("pool-ledger.lock"))?;
+        if let Err(source) = FileExt::try_lock_exclusive(&lock) {
+            let expected = fs2::lock_contended_error();
+            let contended = match (source.raw_os_error(), expected.raw_os_error()) {
+                (Some(actual), Some(expected)) => actual == expected,
+                _ => source.kind() == expected.kind(),
+            };
+            if contended {
+                return Err(PoolError::LedgerInUse);
+            }
+            return Err(PoolError::Io(source));
+        }
         let store = LedgerStore {
             directory,
             network_id,
             consensus_fingerprint,
+            _lock: lock,
         };
-        let state = store.load()?;
+        let mut state = store.load()?;
+        if state.guard_version == 0 {
+            state.guard_version = 1;
+            store.persist(&state)?;
+        }
         Ok(Self {
             state: Mutex::new(state),
             store: Some(store),
+            faulted: AtomicBool::new(false),
         })
     }
 
@@ -1146,6 +1219,9 @@ impl DurableLedger {
             .state
             .lock()
             .map_err(|_| PoolError::SharedStatePoisoned)?;
+        if self.faulted.load(Ordering::Acquire) {
+            return Err(PoolError::LedgerFaulted);
+        }
         let mut candidate = current.clone();
         let output = update(&mut candidate)?;
         candidate.generation = current
@@ -1153,8 +1229,11 @@ impl DurableLedger {
             .checked_add(1)
             .ok_or_else(|| PoolError::LedgerCorrupt("ledger generation exhausted".to_owned()))?;
         validate_ledger(&candidate)?;
-        if let Some(store) = &self.store {
-            store.persist(&candidate)?;
+        if let Some(store) = &self.store
+            && let Err(error) = store.persist(&candidate)
+        {
+            self.faulted.store(true, Ordering::Release);
+            return Err(error);
         }
         *current = candidate;
         Ok(output)
@@ -1170,6 +1249,7 @@ impl LedgerStore {
                 self.directory.display()
             )));
         }
+        let guard = self.load_guard()?;
         let mut valid = Vec::new();
         let mut errors = Vec::new();
         for slot in 0..=1 {
@@ -1179,11 +1259,43 @@ impl LedgerStore {
                 Err(error) => errors.push(error.to_string()),
             }
         }
-        if let Some(ledger) = valid.into_iter().max_by_key(|ledger| ledger.generation) {
-            return Ok(ledger);
+        if let Some(guard) = guard {
+            if valid.iter().any(|(ledger, digest)| {
+                ledger.generation > guard.generation
+                    || (ledger.generation == guard.generation && *digest != guard.payload_blake3)
+            }) {
+                return Err(PoolError::LedgerCorrupt(
+                    "payout guard is older than or conflicts with a valid snapshot".into(),
+                ));
+            }
+            return valid
+                .into_iter()
+                .find_map(|(ledger, digest)| {
+                    (ledger.guard_version == 1
+                        && ledger.generation == guard.generation
+                        && digest == guard.payload_blake3)
+                        .then_some(ledger)
+                })
+                .ok_or_else(|| {
+                    PoolError::LedgerCorrupt(
+                        "no snapshot matches the durable payout guard; refusing older payout state"
+                            .into(),
+                    )
+                });
         }
         if !errors.is_empty() {
             return Err(PoolError::LedgerCorrupt(errors.join("; ")));
+        }
+        if valid.iter().any(|(ledger, _)| ledger.guard_version != 0) {
+            return Err(PoolError::LedgerCorrupt(
+                "protected ledger is missing its payout guard".into(),
+            ));
+        }
+        if let Some((ledger, _)) = valid
+            .into_iter()
+            .max_by_key(|(ledger, _)| ledger.generation)
+        {
+            return Ok(ledger);
         }
 
         let mut legacy = Vec::new();
@@ -1194,18 +1306,16 @@ impl LedgerStore {
                 Err(error) => errors.push(error.to_string()),
             }
         }
-        if let Some(ledger) = legacy.into_iter().max_by_key(|ledger| ledger.generation) {
-            self.persist(&ledger)?;
-            return Ok(ledger);
+        if !errors.is_empty() {
+            return Err(PoolError::LedgerCorrupt(errors.join("; ")));
         }
-        if errors.is_empty() {
-            Ok(Ledger::default())
-        } else {
-            Err(PoolError::LedgerCorrupt(errors.join("; ")))
-        }
+        Ok(legacy
+            .into_iter()
+            .max_by_key(|ledger| ledger.generation)
+            .unwrap_or_default())
     }
 
-    fn load_slot(&self, slot: u8) -> Result<Option<Ledger>, PoolError> {
+    fn load_slot(&self, slot: u8) -> Result<Option<(Ledger, [u8; 32])>, PoolError> {
         let path = self.slot_path(slot);
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
@@ -1245,7 +1355,62 @@ impl LedgerStore {
         for session in ledger.sessions.values_mut() {
             session.connected = false;
         }
-        Ok(Some(ledger))
+        Ok(Some((ledger, stored.payload_blake3)))
+    }
+
+    fn load_guard(&self) -> Result<Option<LedgerGuard>, PoolError> {
+        let path = self.directory.join(POOL_LEDGER_GUARD_FILE);
+        let file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let mut bytes = Vec::new();
+        file.take(4097).read_to_end(&mut bytes)?;
+        if bytes.len() > 4096 {
+            return Err(PoolError::LedgerCorrupt("oversized payout guard".into()));
+        }
+        let guard: LedgerGuard = serde_json::from_slice(&bytes).map_err(|_| {
+            PoolError::LedgerCorrupt("invalid payout guard; refusing snapshot rollback".into())
+        })?;
+        if guard.format_version != 1
+            || guard.network_id != self.network_id
+            || guard.consensus_fingerprint != self.consensus_fingerprint
+        {
+            return Err(PoolError::LedgerCorrupt(
+                "payout guard identity mismatch".into(),
+            ));
+        }
+        Ok(Some(guard))
+    }
+
+    fn write_guard(&self, ledger: &StoredLedgerV1) -> Result<(), PoolError> {
+        let path = self.directory.join(POOL_LEDGER_GUARD_FILE);
+        if let Ok(metadata) = fs::symlink_metadata(&path)
+            && !metadata.file_type().is_file()
+        {
+            return Err(PoolError::LedgerCorrupt(
+                "payout guard must be a regular file".into(),
+            ));
+        }
+        let guard = LedgerGuard {
+            format_version: 1,
+            generation: ledger.generation,
+            network_id: self.network_id,
+            consensus_fingerprint: self.consensus_fingerprint,
+            payload_blake3: ledger.payload_blake3,
+        };
+        // Write-ahead intent: an interrupted update must stop settlement, never
+        // silently fall back to a snapshot that predates a signed payout/hold.
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        file.write_all(&serde_json::to_vec(&guard)?)?;
+        file.sync_all()?;
+        sync_ledger_directory(&self.directory)?;
+        Ok(())
     }
 
     fn persist(&self, ledger: &Ledger) -> Result<(), PoolError> {
@@ -1267,6 +1432,7 @@ impl LedgerStore {
         if bytes.len() > POOL_LEDGER_MAX_BYTES {
             return Err(PoolError::LedgerCapacity);
         }
+        self.write_guard(&stored)?;
         let slot = (ledger.generation & 1) as u8;
         let destination = self.slot_path(slot);
         let mut random = [0_u8; 8];
@@ -1341,6 +1507,7 @@ impl LedgerStore {
             )));
         }
         let payload = StoredLedgerPayloadV1 {
+            guard_version: 0,
             accepted_shares: stored.payload.accepted_shares,
             rejected_shares: stored.payload.rejected_shares,
             stale_shares: 0,
@@ -1355,6 +1522,7 @@ impl LedgerStore {
             operator_fee_atoms: 0,
             earning_history_started_at_unix_seconds: 0,
             earning_events: Vec::new(),
+            payout_protection: payout_protection::ProtectionState::default(),
         };
         let mut ledger = ledger_from_payload(stored.generation, payload)?;
         for session in ledger.sessions.values_mut() {
@@ -1366,6 +1534,7 @@ impl LedgerStore {
 
 fn ledger_payload(ledger: &Ledger) -> StoredLedgerPayloadV1 {
     StoredLedgerPayloadV1 {
+        guard_version: ledger.guard_version,
         accepted_shares: ledger.accepted_shares,
         rejected_shares: ledger.rejected_shares,
         stale_shares: ledger.stale_shares,
@@ -1415,6 +1584,7 @@ fn ledger_payload(ledger: &Ledger) -> StoredLedgerPayloadV1 {
         operator_fee_atoms: ledger.operator_fee_atoms,
         earning_history_started_at_unix_seconds: ledger.earning_history_started_at_unix_seconds,
         earning_events: ledger.earning_events.iter().cloned().collect(),
+        payout_protection: ledger.payout_protection.clone(),
     }
 }
 
@@ -1467,6 +1637,7 @@ fn ledger_from_payload(
     }
     let ledger = Ledger {
         generation,
+        guard_version: payload.guard_version,
         accepted_shares: payload.accepted_shares,
         rejected_shares: payload.rejected_shares,
         stale_shares: payload.stale_shares,
@@ -1481,6 +1652,7 @@ fn ledger_from_payload(
         operator_fee_atoms: payload.operator_fee_atoms,
         earning_history_started_at_unix_seconds: payload.earning_history_started_at_unix_seconds,
         earning_events: payload.earning_events.into(),
+        payout_protection: payload.payout_protection,
     };
     validate_ledger(&ledger)?;
     Ok(ledger)
@@ -1507,6 +1679,10 @@ const fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
 
+const fn is_zero_u16(value: &u16) -> bool {
+    *value == 0
+}
+
 fn legacy_ledger_payload_checksum(
     generation: u64,
     network_id: [u8; 32],
@@ -1525,6 +1701,12 @@ fn legacy_ledger_payload_checksum(
 }
 
 fn validate_ledger(ledger: &Ledger) -> Result<(), PoolError> {
+    if ledger.guard_version > 1 {
+        return Err(PoolError::LedgerCorrupt(
+            "unsupported payout guard version".into(),
+        ));
+    }
+    payout_protection::validate(ledger)?;
     if ledger.sessions.len() > POOL_MAX_LEDGER_SESSIONS
         || ledger.payouts.len() > POOL_MAX_LEDGER_PAYOUTS
         || ledger.blocks.len() > POOL_MAX_LEDGER_BLOCKS
@@ -2359,6 +2541,9 @@ pub fn spawn_pool_server(
         }
         if config.block_destination != wallet_destination {
             return Err(PoolError::PayoutWalletMismatch);
+        }
+        if config.ledger_directory.is_none() {
+            return Err(PoolError::PayoutLedgerRequired);
         }
     }
     if let Some(policy) = config.pplns_policy {
@@ -3207,8 +3392,19 @@ fn reconcile_pool_blocks_with_recovery(
     shared: &SharedServer,
     recover_missing_pending: bool,
 ) -> Result<(), PoolError> {
-    let block_ids = shared
-        .ledger
+    let node = shared
+        .node
+        .lock()
+        .map_err(|_| PoolError::SharedStatePoisoned)?;
+    reconcile_pool_blocks_for_node(&shared.ledger, &node, recover_missing_pending)
+}
+
+fn reconcile_pool_blocks_for_node(
+    ledger: &DurableLedger,
+    node: &Node,
+    recover_missing_pending: bool,
+) -> Result<(), PoolError> {
+    let block_ids = ledger
         .state
         .lock()
         .map_err(|_| PoolError::SharedStatePoisoned)?
@@ -3219,10 +3415,6 @@ fn reconcile_pool_blocks_with_recovery(
     if block_ids.is_empty() {
         return Ok(());
     }
-    let node = shared
-        .node
-        .lock()
-        .map_err(|_| PoolError::SharedStatePoisoned)?;
     let updates = block_ids
         .into_iter()
         .map(|block_id| {
@@ -3235,10 +3427,8 @@ fn reconcile_pool_blocks_with_recovery(
             }
         })
         .collect::<Vec<_>>();
-    drop(node);
     let changed = {
-        let ledger = shared
-            .ledger
+        let ledger = ledger
             .state
             .lock()
             .map_err(|_| PoolError::SharedStatePoisoned)?;
@@ -3249,6 +3439,12 @@ fn reconcile_pool_blocks_with_recovery(
                 } else {
                     record.state != *state
                         || record.confirmations != *confirmations
+                        || payout_protection::backing_changed(
+                            &ledger,
+                            *block_id,
+                            *state,
+                            *confirmations,
+                        )
                         || (*state == PoolBlockState::Canonical
                             && *confirmations >= COINBASE_MATURITY
                             && ledger
@@ -3262,7 +3458,7 @@ fn reconcile_pool_blocks_with_recovery(
     if !changed {
         return Ok(());
     }
-    shared.ledger.transaction(|ledger| {
+    ledger.transaction(|ledger| {
         for (block_id, state, confirmations) in updates {
             let record = *ledger.blocks.get(&block_id).ok_or_else(|| {
                 PoolError::LedgerCorrupt("pool block disappeared during reconciliation".to_owned())
@@ -3286,6 +3482,7 @@ fn reconcile_pool_blocks_with_recovery(
             if state == PoolBlockState::Canonical && confirmations >= COINBASE_MATURITY {
                 distribute_mature_pplns_block(ledger, block_id)?;
             }
+            payout_protection::observe_backing(ledger, node, block_id)?;
         }
         Ok(())
     })
@@ -3295,6 +3492,19 @@ fn reconcile_pool_payouts(shared: &SharedServer, create_new: bool) -> Result<(),
     let Some(policy) = shared.payout_policy else {
         return Ok(());
     };
+    if shared.ledger.faulted.load(Ordering::Acquire) {
+        return Err(PoolError::LedgerFaulted);
+    }
+    // Node -> ledger is the only nested lock order. Hold the node lock through
+    // reconciliation, funding checks, signing and submission so a reorg cannot
+    // slip between checking backing and creating a payment.
+    let mut node = shared
+        .node
+        .lock()
+        .map_err(|_| PoolError::SharedStatePoisoned)?;
+    reconcile_pool_blocks_for_node(&shared.ledger, &node, true)?;
+    payout_protection::refresh_payment_states(&shared.ledger, &mut node)?;
+    payout_protection::check_funding(&shared.ledger, &node, policy.fee_atoms)?;
     let records = shared
         .ledger
         .state
@@ -3304,87 +3514,89 @@ fn reconcile_pool_payouts(shared: &SharedServer, create_new: bool) -> Result<(),
         .iter()
         .map(|(txid, record)| (*txid, record.clone()))
         .collect::<Vec<_>>();
-    let mut updates = Vec::with_capacity(records.len());
-    {
-        let mut node = shared
-            .node
+    let held = {
+        let ledger = shared
+            .ledger
+            .state
             .lock()
             .map_err(|_| PoolError::SharedStatePoisoned)?;
-        let txids = records
-            .iter()
-            .map(|(txid, _)| *txid)
-            .collect::<HashSet<_>>();
-        let active_confirmations = node.active_transaction_confirmations_for(&txids)?;
-        for (txid, record) in records {
-            let (state, confirmations) =
-                if let Some(confirmations) = active_confirmations.get(&txid) {
-                    (PoolPayoutTransactionState::Confirmed, *confirmations)
-                } else if node.mempool_contains_transaction(txid) {
-                    (PoolPayoutTransactionState::Broadcast, 0)
-                } else if record.state == PoolPayoutTransactionState::Abandoned {
-                    (PoolPayoutTransactionState::Abandoned, 0)
-                } else {
-                    match node.submit_transaction(record.transaction.clone()) {
-                        Ok(_) | Err(NodeError::DuplicateMempoolTransaction(_)) => {
-                            (PoolPayoutTransactionState::Broadcast, 0)
-                        }
-                        Err(
-                            NodeError::MempoolTransactionLimit
-                            | NodeError::MempoolByteLimit
-                            | NodeError::MempoolInputConflict(_),
-                        ) => {
-                            // A conflicting mempool transaction can disappear.
-                            // Keep this exact signed payout and its reserved credit;
-                            // releasing it here could fund a second valid payment.
-                            (PoolPayoutTransactionState::Prepared, 0)
-                        }
-                        Err(NodeError::MempoolUnconfirmedInput(_)) => {
-                            (PoolPayoutTransactionState::Abandoned, 0)
-                        }
-                        Err(error) => return Err(PoolError::Node(error)),
-                    }
-                };
-            if state != record.state || confirmations != record.confirmations {
-                updates.push((txid, state, confirmations));
-            }
+        payout_protection::holds(&ledger)
+    };
+    for (txid, record) in records {
+        if record.state != PoolPayoutTransactionState::Prepared || held.blocks(record.payout) {
+            continue;
         }
-    }
-    if !updates.is_empty() {
-        shared.ledger.transaction(|ledger| {
-            for (txid, state, confirmations) in updates {
-                let record = ledger.payout_transactions.get_mut(&txid).ok_or_else(|| {
-                    PoolError::LedgerCorrupt(
-                        "payout transaction disappeared during reconciliation".to_owned(),
-                    )
-                })?;
-                record.state = state;
-                record.confirmations = confirmations;
+        let submitted = {
+            // Serialize the final send decision with all ledger writers. A
+            // concurrent persistence failure must not be followed by a send.
+            let _ledger = shared
+                .ledger
+                .state
+                .lock()
+                .map_err(|_| PoolError::SharedStatePoisoned)?;
+            if shared.ledger.faulted.load(Ordering::Acquire) {
+                return Err(PoolError::LedgerFaulted);
             }
-            Ok(())
-        })?;
+            node.submit_transaction(record.transaction.clone())
+        };
+        match submitted {
+            Ok(_) | Err(NodeError::DuplicateMempoolTransaction(_)) => {
+                shared.ledger.transaction(|ledger| {
+                    ledger
+                        .payout_transactions
+                        .get_mut(&txid)
+                        .ok_or_else(|| PoolError::LedgerCorrupt("payout disappeared".into()))?
+                        .state = PoolPayoutTransactionState::Broadcast;
+                    Ok(())
+                })?;
+            }
+            Err(
+                NodeError::MempoolTransactionLimit
+                | NodeError::MempoolByteLimit
+                | NodeError::MempoolInputConflict(_),
+            ) => (),
+            Err(NodeError::MempoolUnconfirmedInput(_)) => {
+                // A previously signed transaction can become valid again on a
+                // later reorg. Keep its reservation; never create a replacement.
+                payout_protection::missing_funding(&shared.ledger, &node, txid)?;
+                return Ok(());
+            }
+            Err(error) => return Err(PoolError::Node(error)),
+        }
     }
     if !create_new {
         return Ok(());
     }
 
     for _ in 0..POOL_MAX_PAYOUTS_PER_TIP {
+        payout_protection::check_funding(&shared.ledger, &node, policy.fee_atoms)?;
         let Some((payout, amount)) = next_payout_candidate(&shared.ledger, policy)? else {
             break;
         };
-        let mut node = shared
-            .node
+        let reserved_inputs = shared
+            .ledger
+            .state
             .lock()
-            .map_err(|_| PoolError::SharedStatePoisoned)?;
-        let (transaction, _) =
-            match node.prepare_dev_wallet_payment(payout, amount, policy.fee_atoms) {
-                Ok(prepared) => prepared,
-                Err(
-                    NodeError::WalletFundsImmature { .. }
-                    | NodeError::WalletInsufficientFunds { .. }
-                    | NodeError::WalletInputLimit { .. },
-                ) => break,
-                Err(error) => return Err(PoolError::Node(error)),
-            };
+            .map_err(|_| PoolError::SharedStatePoisoned)?
+            .payout_transactions
+            .values()
+            .filter(|record| record.state != PoolPayoutTransactionState::Confirmed)
+            .flat_map(|record| record.transaction.inputs.iter().map(|input| input.previous))
+            .collect();
+        let (transaction, _) = match node.prepare_pool_wallet_payment(
+            payout,
+            amount,
+            policy.fee_atoms,
+            &reserved_inputs,
+        ) {
+            Ok(prepared) => prepared,
+            Err(
+                NodeError::WalletFundsImmature { .. }
+                | NodeError::WalletInsufficientFunds { .. }
+                | NodeError::WalletInputLimit { .. },
+            ) => break,
+            Err(error) => return Err(PoolError::Node(error)),
+        };
         let txid = transaction.txid();
         let journaled = shared.ledger.transaction(|ledger| {
             if payout_available_atoms(ledger, payout)? < amount {
@@ -3417,7 +3629,18 @@ fn reconcile_pool_payouts(shared: &SharedServer, create_new: bool) -> Result<(),
         if !journaled {
             continue;
         }
-        let state = match node.submit_transaction(transaction) {
+        let submitted = {
+            let _ledger = shared
+                .ledger
+                .state
+                .lock()
+                .map_err(|_| PoolError::SharedStatePoisoned)?;
+            if shared.ledger.faulted.load(Ordering::Acquire) {
+                return Err(PoolError::LedgerFaulted);
+            }
+            node.submit_transaction(transaction)
+        };
+        let state = match submitted {
             Ok(_) | Err(NodeError::DuplicateMempoolTransaction(_)) => {
                 PoolPayoutTransactionState::Broadcast
             }
@@ -3426,7 +3649,10 @@ fn reconcile_pool_payouts(shared: &SharedServer, create_new: bool) -> Result<(),
                 | NodeError::MempoolByteLimit
                 | NodeError::MempoolInputConflict(_),
             ) => PoolPayoutTransactionState::Prepared,
-            Err(NodeError::MempoolUnconfirmedInput(_)) => PoolPayoutTransactionState::Abandoned,
+            Err(NodeError::MempoolUnconfirmedInput(_)) => {
+                payout_protection::missing_funding(&shared.ledger, &node, txid)?;
+                PoolPayoutTransactionState::Prepared
+            }
             Err(error) => return Err(PoolError::Node(error)),
         };
         if state != PoolPayoutTransactionState::Prepared {
@@ -3451,7 +3677,11 @@ fn next_payout_candidate(
         .lock()
         .map_err(|_| PoolError::SharedStatePoisoned)?;
     let totals = payout_transaction_totals(&ledger)?;
+    let held = payout_protection::holds(&ledger);
     for payout in ledger.payouts.keys().copied() {
+        if held.blocks(payout) {
+            continue;
+        }
         let credited = ledger.payouts[&payout].credited_devnet_atoms;
         let reserved = totals.get(&payout).map_or(0, |totals| totals.0);
         let available = credited.checked_sub(reserved).ok_or_else(|| {
@@ -3465,6 +3695,9 @@ fn next_payout_candidate(
 }
 
 fn payout_available_atoms(ledger: &Ledger, payout: [u8; 32]) -> Result<u64, PoolError> {
+    if payout_protection::holds(ledger).blocks(payout) {
+        return Ok(0);
+    }
     let credited = ledger
         .payouts
         .get(&payout)
@@ -3659,6 +3892,7 @@ fn reserve_pending_pool_block(
                         window_work: encode_work(window_work),
                         allocations,
                         distributed: false,
+                        last_backing_mature: None,
                     },
                 )
                 .is_some()
@@ -4230,11 +4464,16 @@ fn session_snapshot(
 
 fn snapshot_ledger(ledger: &DurableLedger) -> Result<PoolLedgerSnapshot, PoolError> {
     let persistence = ledger_persistence(ledger).to_owned();
-    let ledger = ledger
+    let state = ledger
         .state
         .lock()
         .map_err(|_| PoolError::SharedStatePoisoned)?;
+    if ledger.faulted.load(Ordering::Acquire) {
+        return Err(PoolError::LedgerFaulted);
+    }
+    let ledger = state;
     let payout_transaction_totals = payout_transaction_totals(&ledger)?;
+    let payout_holds = payout_protection::holds(&ledger);
     let sessions = ledger
         .sessions
         .iter()
@@ -4263,7 +4502,17 @@ fn snapshot_ledger(ledger: &DurableLedger) -> Result<PoolLedgerSnapshot, PoolErr
                 credited_devnet_atoms: record.credited_devnet_atoms,
                 reserved_payout_atoms,
                 confirmed_payout_atoms,
-                available_payout_atoms,
+                available_payout_atoms: if payout_holds.blocks(*payout) {
+                    0
+                } else {
+                    available_payout_atoms
+                },
+                payout_on_hold: payout_holds.blocks(*payout),
+                held_payout_atoms: if payout_holds.blocks(*payout) {
+                    available_payout_atoms
+                } else {
+                    0
+                },
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -4336,6 +4585,7 @@ fn snapshot_ledger(ledger: &DurableLedger) -> Result<PoolLedgerSnapshot, PoolErr
         payouts,
         blocks,
         payout_transactions,
+        payout_protection: payout_protection::snapshot(&ledger),
     })
 }
 
@@ -5101,6 +5351,7 @@ mod tests {
     use super::*;
 
     include!("pool_lifecycle_tests.rs");
+    include!("pool_payout_protection_tests.rs");
 
     #[derive(Debug)]
     struct FixedProductionV4ShareVerifier {
@@ -5592,9 +5843,12 @@ mod tests {
             let address = server.local_addr();
             workers.push(thread::spawn(move || {
                 let mut client = client(address, pin, &format!("load-{index}"));
+                // Admission/load test, not a block race. A random nonce origin
+                // occasionally wins a block and makes other workers' jobs stale.
+                let work = client.current_work().unwrap();
+                let nonce = find_share_from(&work, client.current_nonce_origin(), false);
                 start.wait();
                 let job_id = client.current_job().job_id;
-                let nonce = client.current_nonce_origin();
                 client.submit_share(job_id, nonce).unwrap()
             }));
         }
@@ -5607,7 +5861,7 @@ mod tests {
         assert!(results.iter().all(|result| {
             matches!(
                 result.code.as_str(),
-                "share_accepted" | "low_difficulty_share" | "share_verifier_busy"
+                "share_accepted" | "share_verifier_busy"
             )
         }));
         let snapshot = server.ledger_snapshot().unwrap();
@@ -5817,7 +6071,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_ledger_recovers_the_newest_valid_network_bound_slot() {
+    fn durable_ledger_refuses_rollback_when_latest_network_bound_slot_is_corrupt() {
         let root = TestRoot::new("durable-ledger");
         let directory = root.path().join("ledger");
         let network_id = [0x31; 32];
@@ -5843,10 +6097,10 @@ mod tests {
         drop(recovered);
 
         fs::write(directory.join("pool-ledger-v2.0.json"), b"corrupt").unwrap();
-        let fallback =
-            DurableLedger::open(Some(directory.clone()), network_id, fingerprint).unwrap();
-        assert_eq!(snapshot_ledger(&fallback).unwrap().accepted_shares, 0);
-        drop(fallback);
+        assert!(matches!(
+            DurableLedger::open(Some(directory.clone()), network_id, fingerprint),
+            Err(PoolError::LedgerCorrupt(_))
+        ));
 
         fs::write(directory.join("pool-ledger-v2.1.json"), b"also-corrupt").unwrap();
         assert!(matches!(
@@ -6500,10 +6754,23 @@ mod tests {
         }
         reconcile_pool_payouts(&server.shared, false).unwrap();
         let reorganized = server.ledger_snapshot().unwrap();
-        assert_eq!(reorganized.payout_transactions[0].state, "abandoned");
+        assert_eq!(reorganized.payout_transactions[0].state, "prepared");
         assert_eq!(reorganized.payout_transactions[0].confirmations, 0);
         assert_eq!(reorganized.payouts[0].confirmed_payout_atoms, 0);
-        assert_eq!(reorganized.payouts[0].available_payout_atoms, 120);
+        assert_eq!(reorganized.payouts[0].available_payout_atoms, 0);
+        assert_eq!(reorganized.payouts[0].reserved_payout_atoms, 120);
+        assert!(reorganized.payouts[0].payout_on_hold);
+        assert!(reorganized.payout_protection.requires_reconciliation);
+        for _ in 0..3 {
+            reconcile_pool_payouts(&server.shared, true).unwrap();
+            assert_eq!(
+                snapshot_ledger(&server.shared.ledger)
+                    .unwrap()
+                    .payout_transactions
+                    .len(),
+                1
+            );
+        }
 
         server.stop().unwrap();
         let params = devnet_pool_params().unwrap();
@@ -6515,9 +6782,11 @@ mod tests {
         .unwrap();
         let recovered = snapshot_ledger(&recovered).unwrap();
         assert_eq!(recovered.payout_transactions.len(), 1);
-        assert_eq!(recovered.payout_transactions[0].state, "abandoned");
+        assert_eq!(recovered.payout_transactions[0].state, "prepared");
         assert_eq!(recovered.payouts[0].confirmed_payout_atoms, 0);
-        assert_eq!(recovered.payouts[0].available_payout_atoms, 120);
+        assert_eq!(recovered.payouts[0].available_payout_atoms, 0);
+        assert_eq!(recovered.payouts[0].reserved_payout_atoms, 120);
+        assert!(recovered.payouts[0].payout_on_hold);
     }
 
     #[test]
@@ -6625,6 +6894,7 @@ mod tests {
         let ledger = DurableLedger {
             state: Mutex::new(Ledger::default()),
             store: None,
+            faulted: AtomicBool::new(false),
         };
         for session_id in 1..=(POOL_MAX_LEDGER_SESSIONS as u64 + 1) {
             register_session(&ledger, session_id, format!("w{session_id}"), [0x22; 32]).unwrap();
@@ -6645,6 +6915,7 @@ mod tests {
         let payout_ledger = DurableLedger {
             state: Mutex::new(Ledger::default()),
             store: None,
+            faulted: AtomicBool::new(false),
         };
         {
             let mut ledger = payout_ledger.state.lock().unwrap();

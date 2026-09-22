@@ -5694,6 +5694,28 @@ impl Node {
         Ok((transaction, plan.change_atoms))
     }
 
+    /// Pool payments must also exclude inputs of journaled payments that are
+    /// not currently in the mempool (including held signed transactions).
+    pub(crate) fn prepare_pool_wallet_payment(
+        &self,
+        recipient: [u8; 32],
+        amount: u64,
+        fee_burned: u64,
+        reserved: &HashSet<OutPoint>,
+    ) -> Result<(Transaction, u64), NodeError> {
+        let destination = self.wallet_destination();
+        let plan = self.plan_wallet_payment_for_destinations(
+            recipient,
+            amount,
+            fee_burned,
+            &[destination],
+            destination,
+            reserved,
+        )?;
+        let transaction = self.sign_wallet_payment_plan(&plan, false)?;
+        Ok((transaction, plan.change_atoms))
+    }
+
     /// Selects inputs and fixes the exact payment semantics without using the
     /// wallet signing key. Exchange custody persists this intent and installs
     /// its digest-bound reservations before calling
@@ -5711,6 +5733,7 @@ impl Node {
             fee_burned,
             &[destination],
             destination,
+            &HashSet::new(),
         )
     }
 
@@ -5731,6 +5754,7 @@ impl Node {
             fee_burned,
             input_destinations,
             change_destination,
+            &HashSet::new(),
         )
     }
 
@@ -5741,6 +5765,7 @@ impl Node {
         fee_burned: u64,
         input_destinations: &[[u8; 32]],
         change_destination: [u8; 32],
+        additional_reserved: &HashSet<OutPoint>,
     ) -> Result<WalletPaymentPlan, NodeError> {
         VerifyingKey::from_bytes(&recipient).map_err(|_| NodeError::InvalidWalletRecipient)?;
         validate_wallet_minimum_fee(self.params.network_id, fee_burned)?;
@@ -5767,7 +5792,8 @@ impl Node {
         let required = amount
             .checked_add(fee_burned)
             .ok_or(NodeError::WalletAmountOverflow)?;
-        let reserved = self.wallet_reserved_inputs();
+        let mut reserved = self.wallet_reserved_inputs();
+        reserved.extend(additional_reserved);
         let mut candidates = Vec::new();
         let mut immature = 0_u64;
         for (outpoint, output) in self.state.utxos().iter() {

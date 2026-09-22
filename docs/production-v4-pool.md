@@ -194,11 +194,15 @@ input conflict. Reconciliation retries that exact signed transaction after the
 conflict clears; it must not release the credit and generate a replacement merely
 because another unconfirmed transaction is using the same input.
 
-Before mainnet, deep-reorganization loss handling remains a required change:
-the current PPLNS implementation prevents credit before maturity, but does not
-reverse credit if an already-distributed funding block is later orphaned. Do not
-interpret the restart and ordinary payout tests as qualification of that case.
-See [the mainnet payout gate](mainnet-readiness.md#pool-payout-lifecycle-evidence-and-remaining-loss-policy-gate).
+The shared source now persists payout holds when an already-distributed PPLNS
+reward loses mature canonical backing. Earned credits and signed-payment
+reservations are preserved; affected new payments/retries pause, and a shared
+funding shortfall pauses all automatic payouts. Restart or restored backing does
+not clear a hold. Offline `pool-payout-status` and `pool-payout-reconcile` commands
+provide exact-tip/generation and funding-checked operator recovery without
+sending payments. See [the operator procedure and storage restrictions](pool-deep-reorg-policy.md).
+This source change still requires packaging/rehearsal and an authorized upgrade;
+it has not changed the running RC pool.
 
 Each start writes a timestamped log under `pool-data/logs`; the status command
 prints the active log path. A clean shutdown preserves the ledger. On the next

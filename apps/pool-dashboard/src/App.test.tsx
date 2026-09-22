@@ -112,6 +112,28 @@ afterEach(() => {
 });
 
 describe("pool dashboard", () => {
+  it.each([false, true])("shows scoped or global holds and clears them on a fresh snapshot (global=%s)", async (global) => {
+    const held = structuredClone(fixture);
+    const recipient = "78".repeat(32);
+    held.pool.ledger.payout_protection = { requires_reconciliation: true, all_payouts_paused: global, affected_payouts: [recipient], unresolved_incidents: [], resolved_incidents: 0 };
+    held.pool.ledger.payouts = [{ payout: recipient, accepted_shares: 1, rejected_shares: 0, stale_shares: 0, pool_blocks: 1, credited_devnet_atoms: 200_000_000, reserved_payout_atoms: 100_000_000, confirmed_payout_atoms: 0, available_payout_atoms: 0, payout_on_hold: true, held_payout_atoms: 100_000_000 }];
+    held.pool.ledger.payout_transactions = [{ txid: "99".repeat(32), payout: recipient, amount_atoms: 100_000_000, fee_atoms: 1_000, state: "prepared", confirmations: 0 }];
+    vi.stubGlobal("fetch", vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify(held), { status: 200 }))
+      .mockImplementation(() => Promise.resolve(new Response(JSON.stringify(fixture), { status: 200 }))));
+    const user = userEvent.setup();
+    render(<App />);
+    expect(await screen.findByRole("alert", { name: "Payout protection" })).toHaveTextContent(global ? "Automatic payouts paused" : "Affected payouts on hold");
+    expect(screen.queryByText("automatic settlement on")).not.toBeInTheDocument();
+    expect(screen.getByRole("table", { name: "Held payout accounts" })).toHaveTextContent("Held unreserved credit");
+    expect(screen.getByText("Prepared")).toBeVisible();
+    expect(screen.getByText("On hold")).toBeVisible();
+    expect(screen.queryByRole("button", { name: /resume|reconcile|clear hold/i })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /refresh/i }));
+    await waitFor(() => expect(screen.queryByRole("alert", { name: "Payout protection" })).not.toBeInTheDocument());
+    expect(screen.getByText("automatic settlement on")).toBeVisible();
+  });
+
   it("renders live pool totals and worker data", async () => {
     vi.stubGlobal(
       "fetch",

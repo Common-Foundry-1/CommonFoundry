@@ -39,8 +39,9 @@ use cmfd_node::pool::{
     DEFAULT_POOL_MINIMUM_PAYOUT_ATOMS, DEFAULT_POOL_OPERATOR_FEE_BPS,
     DEFAULT_POOL_PAYOUT_FEE_ATOMS, DEFAULT_POOL_QUEUED_SHARE_VERIFICATIONS,
     DEFAULT_POOL_SOCKET_ADDRESS, DEFAULT_PPLNS_WINDOW_SHARES, DEFAULT_SHARE_LEADING_ZERO_BITS,
-    PoolPayoutPolicy, PoolPplnsPolicy, PoolServerConfig, certificate_sha256,
-    generate_pool_certificate, spawn_pool_server,
+    PoolPayoutPolicy, PoolPayoutReconciliationRequest, PoolPplnsPolicy, PoolServerConfig,
+    certificate_sha256, generate_pool_certificate, inspect_pool_payout_protection,
+    reconcile_pool_payout_protection, require_existing_pool_ledger, spawn_pool_server,
 };
 use cmfd_node::pool_dashboard::{
     DEFAULT_POOL_DASHBOARD_ADDRESS, PoolDashboardConfig, spawn_pool_dashboard,
@@ -556,6 +557,27 @@ enum Command {
     },
     /// Replay storage and write a locally authenticated fast-start checkpoint.
     StorageCheckpoint,
+    /// Offline pool accounting inspection; records holds but never sends payments.
+    PoolPayoutStatus {
+        /// Use the same fee as pool-serve. Amount is in atomic units.
+        #[arg(long)]
+        pool_payout_fee_atoms: u64,
+    },
+    /// Resolve funded payout holds offline without sending or replacing payments.
+    PoolPayoutReconcile {
+        #[arg(long)]
+        pool_payout_fee_atoms: u64,
+        #[arg(long, value_parser = parse_hex32)]
+        expected_tip: [u8; 32],
+        #[arg(long)]
+        expected_ledger_generation: u64,
+        /// Local audit note; never exposed on the public dashboard.
+        #[arg(long)]
+        note: String,
+        /// Confirm that the incident and all outstanding signed payments were reviewed.
+        #[arg(long, required = true)]
+        acknowledge_reconciliation: bool,
+    },
     /// Generate a self-signed TLS certificate and print its required SHA-256 pin.
     PoolCertificate {
         /// Output path for the DER-encoded self-signed certificate.
@@ -677,6 +699,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let cli = parse_cli()?;
     validate_exchange_withdrawal_cli(&cli)?;
+    if matches!(
+        &cli.command,
+        Command::PoolPayoutStatus { .. } | Command::PoolPayoutReconcile { .. }
+    ) {
+        require_existing_pool_ledger(&cli.data_dir)?;
+    }
     if let Command::ExchangeV3AclQualify { config, output } = &cli.command {
         let evidence = qualify_installed_host(config, output)?;
         println!("{}", serde_json::to_string_pretty(&evidence)?);
@@ -1514,6 +1542,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 exchange_withdrawal_security.as_ref(),
             )?;
             println!("{}", serde_json::to_string_pretty(&node.status()?)?);
+            Ok(())
+        }
+        Command::PoolPayoutStatus {
+            pool_payout_fee_atoms,
+        } => {
+            let mut node = open_node(
+                &cli.data_dir,
+                production_v3_record.as_ref(),
+                production_v4_artifacts.as_ref(),
+                verifier_worker.as_ref(),
+                wallet_passphrase.as_ref().map(|value| value.as_slice()),
+                exchange_withdrawal_security.as_ref(),
+            )?;
+            let report = inspect_pool_payout_protection(&mut node, pool_payout_fee_atoms)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(())
+        }
+        Command::PoolPayoutReconcile {
+            pool_payout_fee_atoms,
+            expected_tip,
+            expected_ledger_generation,
+            note,
+            acknowledge_reconciliation,
+        } => {
+            if !acknowledge_reconciliation {
+                return Err("payout reconciliation must be acknowledged".into());
+            }
+            let mut node = open_node(
+                &cli.data_dir,
+                production_v3_record.as_ref(),
+                production_v4_artifacts.as_ref(),
+                verifier_worker.as_ref(),
+                wallet_passphrase.as_ref().map(|value| value.as_slice()),
+                exchange_withdrawal_security.as_ref(),
+            )?;
+            let report = reconcile_pool_payout_protection(
+                &mut node,
+                PoolPayoutReconciliationRequest {
+                    expected_tip,
+                    expected_ledger_generation,
+                    fee_atoms: pool_payout_fee_atoms,
+                    operator_note: note,
+                },
+            )?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }
         Command::StorageCheckpoint => {
@@ -2745,6 +2818,42 @@ mod tests {
         assert_eq!(pool_dashboard_bind, DEFAULT_POOL_DASHBOARD_ADDRESS);
         assert_eq!(pool_operator_fee_bps, 300);
         assert_eq!(pool_pplns_window_shares, 0);
+    }
+
+    #[test]
+    fn pool_payout_reconciliation_cli_requires_exact_state_and_acknowledgment() {
+        assert!(Cli::try_parse_from(["cmfd-node", "pool-payout-status"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "cmfd-node",
+                "pool-payout-status",
+                "--pool-payout-fee-atoms",
+                "1"
+            ])
+            .is_ok()
+        );
+        let tip = "11".repeat(32);
+        let arguments = [
+            "cmfd-node",
+            "pool-payout-reconcile",
+            "--pool-payout-fee-atoms",
+            "1",
+            "--expected-tip",
+            &tip,
+            "--expected-ledger-generation",
+            "2",
+            "--note",
+            "Funding reconciled",
+        ];
+        assert!(Cli::try_parse_from(arguments).is_err());
+        assert!(
+            Cli::try_parse_from(
+                arguments
+                    .into_iter()
+                    .chain(["--acknowledge-reconciliation"])
+            )
+            .is_ok()
+        );
     }
 
     #[test]

@@ -18,6 +18,10 @@ Rehearse with disposable wallets first; keep the real source data intact.
 - For a pool, the matching stopped accounting ledger, saved configuration and
   TLS identity/private key. Restoring only the wallet does not reconstruct pool
   liabilities. Do not mix ledger slots from different backups.
+  Include `pool-ledger-payout-guard-v1.json`; do not delete it or downgrade to a
+  binary that ignores it. A guard/snapshot mismatch must stop settlement.
+  A coherent old backup can still omit subsequent payments: reconcile all later
+  signed/on-chain payment history before enabling payouts after a restore.
 
 Model inputs may be downloaded and hash-verified again. They are not wallet
 backups. Keep at least one independently stored copy of the encrypted backup

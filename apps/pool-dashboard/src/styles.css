@@ -201,6 +201,12 @@ td code { color: var(--ink-500); font-size: 0.66rem; }
 .state-badge { display: inline-flex; padding: 5px 8px; color: var(--ink-700); background: var(--mineral-150); border-radius: 3px; font-size: 0.67rem; font-weight: 750; }
 .state-confirmed, .state-canonical, .state-settled { color: var(--green-600); background: var(--green-100); }
 .state-orphaned, .state-failed { color: var(--red-600); background: var(--red-100); }
+.state-held { margin-left: 6px; color: #80561b; background: #fff0d5; }
+.payout-hold-banner { display: flex; align-items: flex-start; gap: 12px; padding: 18px; margin-bottom: 24px; border: 1px solid #dfc08e; border-radius: 6px; background: #fff5e5; color: #68491e; }
+.payout-hold-banner > svg { flex-shrink: 0; margin-top: 2px; }
+.payout-hold-banner h2 { margin: 0 0 6px; font-size: 1rem; }
+.payout-hold-banner p { margin: 0 0 8px; max-width: 90ch; line-height: 1.6; }
+.payout-hold-banner a { color: inherit; font-weight: 650; text-decoration: underline; }
 .empty-table { display: flex; min-height: 160px; align-items: center; justify-content: center; gap: 9px; padding: 30px; color: var(--ink-500); font-size: 0.82rem; text-align: center; }
 .empty-table svg { color: var(--copper-600); }
 

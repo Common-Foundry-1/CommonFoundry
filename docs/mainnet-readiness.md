@@ -405,18 +405,24 @@ pool transport and durable accounting. They are not a ProductionV4 GPU proof
 qualification or a rehearsal of the final signed mainnet packages. They also
 do not supply independent review or evidence of a live RC pool payout.
 
-**Unresolved mainnet gate:** once a PPLNS block has already been distributed,
-block reconciliation updates its orphan/confirmation status but does not revoke
-that reward's credited balance. A deep reorganization can therefore leave
-unbacked credit available for automatic payment. The existing legacy-credit
-reorg test does not cover this funding relationship. On September 22 the owner
-selected pausing affected automatic payouts and reconciling the shortfall; see
-[the selected policy](pool-deep-reorg-policy.md). No automatic future-earnings
-charge was authorized, and the policy is not yet deployed. The
-chosen behavior must cover already-paid rewards, payouts whose funding returns,
-restart persistence, and reorganization below maturity, and must be implemented
-and tested before mainnet approval. The mempool-conflict repair does not close
-this separate funding-loss gate.
+**Funding-loss implementation complete; deployment gate remains:** the September
+22 owner-selected policy now persists affected payout holds when a distributed
+reward loses mature canonical backing, retains signed transactions/reservations,
+and pauses all automatic settlement when shared funding cannot cover outstanding
+credits plus fees. Offline reconciliation requires the exact inspected chain tip
+and ledger generation, complete mature funding and valid outstanding signatures.
+Restart/chain restoration alone does not resume payments. A write-ahead generation
+guard refuses silent rollback to older payout state after interrupted storage.
+No miner credit is deleted and no future-earnings levy is imposed.
+
+Windows/Linux isolated reference-chain tests exercise actual credited/paid reward
+reorgs, restoration, explicit resume, a second reorg and restart; corruption,
+reservation and dashboard tests cover the surrounding boundaries. See
+[the implementation and operator procedure](pool-deep-reorg-policy.md). These are
+internal accounting tests, not live RC-pool or final ProductionV4 package
+qualification. Package/rehearse the upgrade and obtain authorization before
+changing the running service. Irrecoverable/legacy signed-payment cases remain
+held for a separately reviewed recovery plan; there is no unsafe force-resume.
 
 ## Model distribution and authenticated fallback
 

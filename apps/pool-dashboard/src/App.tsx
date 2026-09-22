@@ -211,6 +211,13 @@ export function App() {
 
   const pool = document.pool;
   const ledger = pool.ledger;
+  const protection = ledger.payout_protection;
+  const payoutsHeld = protection?.requires_reconciliation === true;
+  const heldRecipients = new Set(protection?.affected_payouts ?? []);
+  const heldAccounts = ledger.payouts.filter((payout) => payout.payout_on_hold);
+  const settlementStatus = payoutsHeld
+    ? protection?.all_payouts_paused ? "all automatic payouts held" : "affected automatic payouts held"
+    : pool.automatic_testnet_payouts ? "automatic settlement on" : "settlement paused";
   const confirmedPayouts = ledger.payout_transactions.reduce(
     (sum, payout) => sum + (payout.confirmations > 0 ? payout.amount_atoms : 0),
     0,
@@ -233,6 +240,17 @@ export function App() {
             pool snapshot.
           </div>
         )}
+
+        {payoutsHeld ? (
+          <section className="payout-hold-banner" role="alert" aria-label="Payout protection">
+            <CircleAlert size={22} aria-hidden="true" />
+            <div>
+              <h2>{protection?.all_payouts_paused ? "Automatic payouts paused" : "Affected payouts on hold"}</h2>
+              <p>Reward backing needs operator reconciliation. Earned credits are preserved; held payments will not be created or retried automatically. Transactions already broadcast may still confirm.</p>
+              <a href="#payouts">View payout status</a>
+            </div>
+          </section>
+        ) : null}
 
         <section className="hero" aria-labelledby="pool-title">
           <div>
@@ -279,7 +297,7 @@ export function App() {
             value={pool.operator_fee_bps === null ? "N/A" : `${(pool.operator_fee_bps / 100).toFixed(2)}%`}
             detail={`${formatAtoms(ledger.operator_fee_atoms)} from matured blocks`}
           />
-          <Stat icon={<WalletCards />} label="Confirmed payouts" value={formatAtoms(confirmedPayouts)} detail={pool.automatic_testnet_payouts ? "automatic settlement on" : "settlement paused"} />
+          <Stat icon={<WalletCards />} label="Confirmed payouts" value={formatAtoms(confirmedPayouts)} detail={settlementStatus} tone={payoutsHeld ? "warn" : undefined} />
         </section>
 
         <div className="content-grid">
@@ -423,8 +441,22 @@ export function App() {
           <SectionHeading
             eyebrow="On-chain settlement"
             title="Payouts"
-            detail={pool.automatic_testnet_payouts ? `Minimum ${formatAtoms(pool.minimum_payout_atoms ?? 0)}` : "Currently paused"}
+            detail={payoutsHeld ? "Operator reconciliation required" : pool.automatic_testnet_payouts ? `Minimum ${formatAtoms(pool.minimum_payout_atoms ?? 0)}` : "Currently paused"}
           />
+          {heldAccounts.length > 0 ? (
+            <div className="table-scroll">
+              <table aria-label="Held payout accounts">
+                <thead><tr><th>Recipient on hold</th><th className="numeric">Held unreserved credit</th><th className="numeric">Reserved payments</th></tr></thead>
+                <tbody>{heldAccounts.map((payout) => (
+                  <tr key={payout.payout}>
+                    <td><code title={payout.payout}>{shortHex(payout.payout)}</code></td>
+                    <td className="numeric">{formatAtoms(payout.held_payout_atoms ?? 0)}</td>
+                    <td className="numeric">{formatAtoms(payout.reserved_payout_atoms - payout.confirmed_payout_atoms)}</td>
+                  </tr>
+                ))}</tbody>
+              </table>
+            </div>
+          ) : null}
           {ledger.payout_transactions.length === 0 ? (
             <EmptyTable>No payout transactions have been broadcast yet.</EmptyTable>
           ) : (
@@ -437,7 +469,7 @@ export function App() {
                       <td><code title={payout.txid}>{shortHex(payout.txid)}</code></td>
                       <td><code title={payout.payout}>{shortHex(payout.payout)}</code></td>
                       <td className="numeric strong-cell">{formatAtoms(payout.amount_atoms)}</td>
-                      <td><span className={`state-badge state-${payout.state}`}>{humanState(payout.state)}</span></td>
+                      <td><span className={`state-badge state-${payout.state}`}>{humanState(payout.state)}</span>{payout.state === "prepared" && (protection?.all_payouts_paused || heldRecipients.has(payout.payout)) ? <span className="state-badge state-held">On hold</span> : null}</td>
                       <td className="numeric">{formatCount(payout.confirmations)}</td>
                     </tr>
                   ))}

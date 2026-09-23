@@ -120,7 +120,7 @@ and api3.drand.sh on 2026-09-19. Historical round 123 is the offline positive ve
 | Exact UTC release/mining schedule | Pinned in cmfd-launch | Schedule CLI and timestamp tests |
 | Signed launch-time entropy | Verifier, node/miner startup wiring and retrieval/waiting launchers implemented; packaged rehearsal pending | Signature mutation vectors plus actual packaged replay and anti-precomputation rehearsal |
 | Mainnet network/consensus identity | Shared identity registry and mainnet build feature implemented; final pin values pending | Final pinned plan and mainnet profile, distinct from RC |
-| Starting difficulty | Separate 5x start / RC minimum passed isolated full-proof and recovery tests; V2 plan/pin/package binding implemented locally. Owner waived the extended live 20→5→1 dropout run on September 23. | Final target decision with the existing evidence and an explicit record that live dropout response is unmeasured; no simulated report may be presented as a live result |
+| Starting difficulty | Owner approved the 5× RC initial target and RC minimum on September 23 after waiving the extended live 20→5→1 run. Isolated full-proof and recovery tests passed; live dropout response remains unmeasured. | Bind the exact approved targets in the final plan, pins and packages; preserve the waiver and never present simulated data as a live result |
 | Reward receiving addresses and custody | Owner controls both; offline two-wallet/plan preparation, encrypted backups and guided local password setup implemented; actual owner run still needed | Public destinations plus retained/restored backup evidence; see [custody setup](mainnet-reward-custody.md) |
 | Build reproduction and validation reporting | Owner declined seeking an external cryptographer; validation must be described as internal | Reproducible build records and accurate test/approval evidence, without claiming an external cryptographic audit |
 | Plan approval binding | Dedicated requests, signature verification, package binding and candidate pin generation implemented | Actual role approvals, reviewed source history and final pin application |
@@ -614,6 +614,13 @@ publish a rehearsal report, or claim measured dropout recovery. This waives
 that proposed experiment, not the remaining custody, package-integrity,
 storage, CI and release-approval work. The owner confirmed that the brief
 final-package smoke check remains in scope.
+
+The owner then approved the previously tested **5× RC starting difficulty with
+the RC minimum** as the final parameter choice. The exact initial target is
+`000ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccb` and the
+pow limit is `003fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff`.
+This approval does not supply reward destinations, sign release approvals,
+activate mainnet, or turn the skipped dropout experiment into evidence.
 
 The standalone pool-miner source now resolves an optional physical GPU index or
 full UUID to a single CUDA-visible UUID, gives selected GPUs separate worker

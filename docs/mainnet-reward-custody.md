@@ -34,8 +34,10 @@ For a manual invocation, substitute the verified node path and SHA-256 below:
   -InitialTarget '000ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccb'
 ```
 
-These targets are the owner-selected **5x RC starting / RC minimum candidate**,
-not a statement that final difficulty qualification or release approval is done.
+These targets are the owner-approved **5× RC starting / RC minimum parameter
+choice** as of September 23, 2026. The extended live dropout test was waived,
+so its behavior under a real hashrate drop remains unmeasured; release approval
+and final plan/package binding are still separate steps.
 The script requires them explicitly; it cannot silently choose a new policy.
 
 Default output locations use a fresh timestamp/random attempt directory:

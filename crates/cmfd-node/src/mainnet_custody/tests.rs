@@ -67,6 +67,103 @@ fn digest(report: &RewardCustodyReport) -> [u8; 32] {
 }
 
 #[test]
+fn distinct_in_memory_passwords_protect_the_two_wallets_separately() {
+    let mut fixture = Fixture::new();
+    fixture.paths.steward_passphrase_file = fixture.root.join("unused-steward-password");
+    fixture.paths.community_passphrase_file = fixture.root.join("unused-community-password");
+    let initial_target =
+        hex::decode("000ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccb")
+            .unwrap()
+            .try_into()
+            .unwrap();
+    assert!(
+        prepare_reward_custody_with_distinct_passwords(
+            &fixture.paths,
+            crate::RCNET1_PROFILE.pow_limit,
+            initial_target,
+            STEWARD_PASSWORD,
+            STEWARD_PASSWORD,
+        )
+        .is_err()
+    );
+    fixture.no_outputs();
+
+    let prepared = prepare_reward_custody_with_distinct_passwords(
+        &fixture.paths,
+        crate::RCNET1_PROFILE.pow_limit,
+        initial_target,
+        STEWARD_PASSWORD,
+        COMMUNITY_PASSWORD,
+    )
+    .unwrap();
+    let verified = verify_reward_custody_with_distinct_passwords(
+        &fixture.paths,
+        digest(&prepared),
+        STEWARD_PASSWORD,
+        COMMUNITY_PASSWORD,
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_vec(&prepared).unwrap(),
+        serde_json::to_vec(&verified).unwrap()
+    );
+    assert!(
+        verify_reward_custody_with_distinct_passwords(
+            &fixture.paths,
+            digest(&prepared),
+            STEWARD_PASSWORD,
+            b"wrong community fixture password",
+        )
+        .is_err()
+    );
+    assert!(!fixture.paths.steward_passphrase_file.exists());
+    assert!(!fixture.paths.community_passphrase_file.exists());
+    let network: [u8; 32] = hex::decode(&prepared.network_id)
+        .unwrap()
+        .try_into()
+        .unwrap();
+    for (index, (role, password)) in ROLES
+        .iter()
+        .zip([STEWARD_PASSWORD, COMMUNITY_PASSWORD])
+        .enumerate()
+    {
+        let restored = fixture.root.join(format!("distinct-restored-{role}"));
+        create_directory(&restored).unwrap();
+        let info = wallet_backup::restore_encrypted_wallet_backup(
+            &fixture
+                .paths
+                .backups_directory
+                .join(format!("{role}.cmfdwallet")),
+            &restored,
+            network,
+            password,
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode(info.destination),
+            prepared.wallets[index].destination
+        );
+    }
+}
+
+#[test]
+fn protected_password_files_must_not_contain_the_same_password() {
+    let fixture = Fixture::new();
+    fs::write(&fixture.paths.community_passphrase_file, STEWARD_PASSWORD).unwrap();
+    let error = prepare_reward_custody(
+        &fixture.paths,
+        crate::RCNET1_PROFILE.pow_limit,
+        hex::decode("000ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccb")
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("passwords must differ"));
+    fixture.no_outputs();
+}
+
+#[test]
 fn fresh_keys_plan_backups_and_standard_restore_agree_without_activation() {
     let fixture = Fixture::new();
     let report = fixture.prepare();

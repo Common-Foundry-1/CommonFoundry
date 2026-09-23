@@ -14,15 +14,19 @@ It uses the existing wallet encryption/backup format, not new cryptography.
 
 Use `scripts/prepare-mainnet-reward-wallets.ps1` with a trusted, hash-verified
 ProductionV4 node build. A locally staged double-click launcher can supply the
-executable path/hash and owner-selected targets. The setup asks for one strong
-password and confirmation; this password protects **both** otherwise-independent
-wallet keys. Keep it in a password manager. Losing it prevents backup recovery.
+executable path/hash and owner-selected targets. The setup asks for **two
+different strong passwords**, each confirmed separately: one protects the
+steward wallet and backup, and the other protects the community wallet and
+backup. Keep both securely and separately. Losing either password prevents
+recovery of that wallet from its encrypted files; there is no reset service or
+recovery phrase in this setup.
 
-The wrapper passes the password through an anonymous stdin pipe. It never puts
-the password in command arguments, logs, environment variables or temporary
-files. Buffers are cleared on exit. A second native process reopens and verifies
-the saved files before success is reported. A crash may leave partial encrypted
-files, but no plaintext password file needs to be cleaned up.
+The wrapper passes two length-framed passwords through an anonymous stdin pipe.
+It never puts them in command arguments, logs, environment variables or
+temporary files. Buffers are cleared on exit. A second native process reopens
+and verifies both saved wallets with their respective passwords before success
+is reported. A crash may leave partial encrypted files, but no plaintext
+password file needs to be cleaned up.
 
 For a manual invocation, substitute the verified node path and SHA-256 below:
 
@@ -51,8 +55,9 @@ Default output locations use a fresh timestamp/random attempt directory:
 
 Defaults put backups in a separate local directory, **not off this computer**.
 After success, copy the encrypted backup folder to offline/off-host storage and
-retain the password separately. Do not share wallet files, backup files or the
-password. Only the public directory is intended for launch preparation.
+retain **both** passwords separately from it. Do not share wallet files, backup
+files or either password. Only the public directory is intended for launch
+preparation.
 
 Windows private directories are created with protected access for the creating
 account, SYSTEM and Administrators. Private files receive protected ACLs before
@@ -61,8 +66,8 @@ Existing folders/files are not repurposed or overwritten by the native command.
 
 ## Native file-based operator workflow
 
-The native commands also accept two separately protected password files for
-operators who want different passwords. Supply absolute, separate, create-new
+The native commands also accept two separately protected password files as an
+alternative to the guided stdin pipe. Supply absolute, separate, create-new
 wallet/backup/public directories whose parents already exist. Keep password
 files outside those directories and outside Git worktrees. On Windows their
 file and containing-directory ACLs must satisfy the private-custody checks; on
@@ -74,10 +79,14 @@ cmfd-node mainnet-custody-prepare --pow-limit <target> --initial-target <target>
 cmfd-node mainnet-custody-verify --expected-plan-digest <digest-from-reviewed-preparation> --wallets-directory <wallets> --backups-directory <backups> --public-directory <public> --steward-passphrase-file <private-file> --community-passphrase-file <private-file>
 ```
 
-`--shared-passphrase-stdin` replaces both file flags when called by a trusted
-local launcher. It reads 12–1024 raw UTF-8 bytes without trimming or adding a
-newline. Never use a shell command that embeds a real password in its arguments.
-Mixed stdin/file modes and missing credentials are rejected.
+`--distinct-passphrases-stdin` replaces both file flags for the guided launcher.
+The anonymous pipe carries the exact ASCII magic
+`CMFD/REWARD-CUSTODY/TWO-PASSWORDS/V1\0`, then a little-endian 16-bit steward
+password length and bytes, followed by the corresponding community length and
+bytes. Each password must be 12–1024 raw UTF-8 bytes and the two must differ;
+truncation, extra bytes and mixed stdin/file modes are rejected. The old
+`--shared-passphrase-stdin` option is rejected; protected password files must
+also contain different passwords. Never put a real password in command arguments.
 
 ## Verification and interruption handling
 

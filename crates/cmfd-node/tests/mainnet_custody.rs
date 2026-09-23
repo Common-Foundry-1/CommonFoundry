@@ -6,6 +6,9 @@ use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
 const PASSWORD: &[u8] = b"disposable shared custody fixture password";
+const STEWARD_PASSWORD: &[u8] = b"disposable steward custody fixture password";
+const COMMUNITY_PASSWORD: &[u8] = b"disposable community custody fixture password";
+const DISTINCT_MAGIC: &[u8] = b"CMFD/REWARD-CUSTODY/TWO-PASSWORDS/V1\0";
 
 struct Fixture {
     root: PathBuf,
@@ -19,7 +22,7 @@ impl Fixture {
         Self { root }
     }
 
-    fn command(&self, subcommand: &str) -> Command {
+    fn command_with_mode(&self, subcommand: &str, mode: &str) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_cmfd-node"));
         command
             .arg("--data-dir")
@@ -31,18 +34,22 @@ impl Fixture {
             .arg(self.root.join("backups"))
             .arg("--public-directory")
             .arg(self.root.join("public"))
-            .arg("--shared-passphrase-stdin");
+            .arg(mode);
         command
     }
 
-    fn prepare(&self) -> Command {
-        let mut command = self.command("mainnet-custody-prepare");
+    fn prepare_with_mode(&self, mode: &str) -> Command {
+        let mut command = self.command_with_mode("mainnet-custody-prepare", mode);
         command
             .arg("--pow-limit")
             .arg(hex::encode(cmfd_node::RCNET1_PROFILE.pow_limit))
             .arg("--initial-target")
             .arg("000ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccb");
         command
+    }
+
+    fn prepare(&self) -> Command {
+        self.prepare_with_mode("--distinct-passphrases-stdin")
     }
 }
 impl Drop for Fixture {
@@ -64,48 +71,94 @@ fn run(mut command: Command, password: &[u8]) -> Output {
     child.wait_with_output().unwrap()
 }
 
+fn distinct_frame(steward: &[u8], community: &[u8]) -> Vec<u8> {
+    let mut frame = DISTINCT_MAGIC.to_vec();
+    for password in [steward, community] {
+        frame.extend_from_slice(&(password.len() as u16).to_le_bytes());
+        frame.extend_from_slice(password);
+    }
+    frame
+}
+
 #[test]
-fn cli_shared_stdin_password_creates_and_verifies_without_plaintext_files() {
+fn cli_distinct_stdin_passwords_create_and_verify_independent_wallets() {
     let fixture = Fixture::new();
-    let output = run(fixture.prepare(), PASSWORD);
+    let invalid = run(
+        fixture.prepare_with_mode("--distinct-passphrases-stdin"),
+        &distinct_frame(STEWARD_PASSWORD, STEWARD_PASSWORD),
+    );
+    assert!(!invalid.status.success());
+    assert_eq!(fs::read_dir(&fixture.root).unwrap().count(), 0);
+
+    let frame = distinct_frame(STEWARD_PASSWORD, COMMUNITY_PASSWORD);
+    let output = run(
+        fixture.prepare_with_mode("--distinct-passphrases-stdin"),
+        &frame,
+    );
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(
-        !output
-            .stdout
-            .windows(PASSWORD.len())
-            .any(|bytes| bytes == PASSWORD)
-    );
-    assert!(
-        !output
-            .stderr
-            .windows(PASSWORD.len())
-            .any(|bytes| bytes == PASSWORD)
-    );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["mainnet_activation_authorized"], false);
-    assert_eq!(report["backups_authenticated"], true);
-    let mut verify = fixture.command("mainnet-custody-verify");
+    assert_eq!(report["wallets"].as_array().unwrap().len(), 2);
+    assert_ne!(
+        report["wallets"][0]["destination"],
+        report["wallets"][1]["destination"]
+    );
+    let mut verify =
+        fixture.command_with_mode("mainnet-custody-verify", "--distinct-passphrases-stdin");
     verify
         .arg("--expected-plan-digest")
         .arg(report["launch_plan_digest"].as_str().unwrap());
-    let checked = run(verify, PASSWORD);
+    let checked = run(verify, &frame);
     assert!(
         checked.status.success(),
         "{}",
         String::from_utf8_lossy(&checked.stderr)
     );
     assert_eq!(checked.stdout, output.stdout);
-    assert!(!fixture.root.join("must-not-initialize").exists());
-    assert_eq!(fs::read_dir(&fixture.root).unwrap().count(), 3);
-    assert_eq!(
-        fs::read_dir(fixture.root.join("public")).unwrap().count(),
-        2
+
+    let mut wrong =
+        fixture.command_with_mode("mainnet-custody-verify", "--distinct-passphrases-stdin");
+    wrong
+        .arg("--expected-plan-digest")
+        .arg(report["launch_plan_digest"].as_str().unwrap());
+    assert!(
+        !run(
+            wrong,
+            &distinct_frame(STEWARD_PASSWORD, b"wrong community password")
+        )
+        .status
+        .success()
     );
-    assert!(!run(fixture.prepare(), PASSWORD).status.success());
+    for password in [STEWARD_PASSWORD, COMMUNITY_PASSWORD] {
+        assert!(
+            !output
+                .stdout
+                .windows(password.len())
+                .any(|part| part == password)
+        );
+        assert!(
+            !output
+                .stderr
+                .windows(password.len())
+                .any(|part| part == password)
+        );
+    }
+    assert!(!fixture.root.join("must-not-initialize").exists());
+}
+
+#[test]
+fn cli_rejects_the_old_shared_password_mode_before_creating_wallets() {
+    let fixture = Fixture::new();
+    let output = run(
+        fixture.prepare_with_mode("--shared-passphrase-stdin"),
+        PASSWORD,
+    );
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(fs::read_dir(&fixture.root).unwrap().count(), 0);
 }
 
 #[test]

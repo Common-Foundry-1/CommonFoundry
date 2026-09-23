@@ -78,6 +78,10 @@ use zeroize::Zeroizing;
 
 const SERVICE_SUPERVISION_POLL: Duration = Duration::from_millis(50);
 const POOL_SHUTDOWN_REQUEST_BYTES: &[u8] = b"CMFD_POOL_SHUTDOWN_V1\n";
+#[cfg(feature = "production-v4")]
+const DISTINCT_PASSWORD_STDIN_MAGIC: &[u8] = b"CMFD/REWARD-CUSTODY/TWO-PASSWORDS/V1\0";
+#[cfg(feature = "production-v4")]
+type CustodyStdinPasswords = [Zeroizing<Vec<u8>>; 2];
 
 fn parse_hex32(value: &str) -> Result<[u8; 32], String> {
     if value.len() != 64
@@ -227,20 +231,19 @@ struct MainnetCustodyPaths {
     /// Protected passphrase file outside all output directories. Contents are never printed.
     #[arg(
         long,
-        required_unless_present = "shared_passphrase_stdin",
-        conflicts_with = "shared_passphrase_stdin"
+        required_unless_present = "distinct_passphrases_stdin",
+        conflicts_with = "distinct_passphrases_stdin"
     )]
     steward_passphrase_file: Option<PathBuf>,
     #[arg(
         long,
-        required_unless_present = "shared_passphrase_stdin",
-        conflicts_with = "shared_passphrase_stdin"
+        required_unless_present = "distinct_passphrases_stdin",
+        conflicts_with = "distinct_passphrases_stdin"
     )]
     community_passphrase_file: Option<PathBuf>,
-    /// Read one shared password as raw UTF-8 bytes from stdin (no added newline).
-    /// Intended for a local hidden-password launcher; never put secrets in arguments.
+    /// Read two distinct length-framed passwords from one anonymous stdin pipe.
     #[arg(long)]
-    shared_passphrase_stdin: bool,
+    distinct_passphrases_stdin: bool,
 }
 
 #[cfg(feature = "production-v4")]
@@ -255,25 +258,66 @@ impl MainnetCustodyPaths {
         }
     }
 
-    fn read_stdin_password(
+    fn read_distinct_stdin_passwords(
         &self,
-    ) -> Result<Option<Zeroizing<Vec<u8>>>, Box<dyn std::error::Error>> {
-        if !self.shared_passphrase_stdin {
+    ) -> Result<Option<CustodyStdinPasswords>, Box<dyn std::error::Error>> {
+        if !self.distinct_passphrases_stdin {
             return Ok(None);
         }
-        let mut bytes = Zeroizing::new(Vec::new());
+        let mut frame = Zeroizing::new(Vec::new());
+        let maximum = DISTINCT_PASSWORD_STDIN_MAGIC.len()
+            + 4
+            + 2 * cmfd_node::wallet_backup::MAXIMUM_PASSPHRASE_BYTES
+            + 1;
         io::stdin()
             .lock()
-            .take((cmfd_node::wallet_backup::MAXIMUM_PASSPHRASE_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)?;
+            .take(maximum as u64)
+            .read_to_end(&mut frame)?;
+        Ok(Some(parse_distinct_password_frame(&frame)?))
+    }
+}
+
+#[cfg(feature = "production-v4")]
+fn parse_distinct_password_frame(
+    frame: &[u8],
+) -> Result<CustodyStdinPasswords, Box<dyn std::error::Error>> {
+    if !frame.starts_with(DISTINCT_PASSWORD_STDIN_MAGIC) {
+        return Err("invalid two-password stdin frame".into());
+    }
+    fn read_password<'a>(
+        frame: &'a [u8],
+        offset: &mut usize,
+    ) -> Result<&'a [u8], Box<dyn std::error::Error>> {
+        let length_bytes = frame
+            .get(*offset..*offset + 2)
+            .ok_or("truncated two-password stdin frame")?;
+        let length = u16::from_le_bytes([length_bytes[0], length_bytes[1]]) as usize;
+        *offset += 2;
         if !(cmfd_node::wallet_backup::MINIMUM_PASSPHRASE_BYTES
             ..=cmfd_node::wallet_backup::MAXIMUM_PASSPHRASE_BYTES)
-            .contains(&bytes.len())
+            .contains(&length)
         {
-            return Err("stdin password must contain 12 to 1024 bytes".into());
+            return Err("each wallet password must contain 12 to 1024 bytes".into());
         }
-        Ok(Some(bytes))
+        let password = frame
+            .get(*offset..*offset + length)
+            .ok_or("truncated two-password stdin frame")?;
+        *offset += length;
+        Ok(password)
     }
+    let mut offset = DISTINCT_PASSWORD_STDIN_MAGIC.len();
+    let steward = read_password(frame, &mut offset)?;
+    let community = read_password(frame, &mut offset)?;
+    if offset != frame.len() {
+        return Err("two-password stdin frame has trailing bytes".into());
+    }
+    if steward == community {
+        return Err("steward and community passwords must differ".into());
+    }
+    Ok([
+        Zeroizing::new(steward.to_vec()),
+        Zeroizing::new(community.to_vec()),
+    ])
 }
 
 #[derive(Debug, Subcommand)]
@@ -991,14 +1035,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         paths,
     } = &cli.command
     {
-        let password = paths.read_stdin_password()?;
-        let report = match password.as_ref() {
-            Some(password) => cmfd_node::mainnet_custody::prepare_reward_custody_with_password(
-                &paths.runtime_paths(),
-                *pow_limit,
-                *initial_target,
-                password,
-            )?,
+        let distinct_passwords = paths.read_distinct_stdin_passwords()?;
+        let report = match distinct_passwords.as_ref() {
+            Some([steward, community]) => {
+                cmfd_node::mainnet_custody::prepare_reward_custody_with_distinct_passwords(
+                    &paths.runtime_paths(),
+                    *pow_limit,
+                    *initial_target,
+                    steward,
+                    community,
+                )?
+            }
             None => cmfd_node::mainnet_custody::prepare_reward_custody(
                 &paths.runtime_paths(),
                 *pow_limit,
@@ -1014,13 +1061,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         paths,
     } = &cli.command
     {
-        let password = paths.read_stdin_password()?;
-        let report = match password.as_ref() {
-            Some(password) => cmfd_node::mainnet_custody::verify_reward_custody_with_password(
-                &paths.runtime_paths(),
-                *expected_plan_digest,
-                password,
-            )?,
+        let distinct_passwords = paths.read_distinct_stdin_passwords()?;
+        let report = match distinct_passwords.as_ref() {
+            Some([steward, community]) => {
+                cmfd_node::mainnet_custody::verify_reward_custody_with_distinct_passwords(
+                    &paths.runtime_paths(),
+                    *expected_plan_digest,
+                    steward,
+                    community,
+                )?
+            }
             None => cmfd_node::mainnet_custody::verify_reward_custody(
                 &paths.runtime_paths(),
                 *expected_plan_digest,
@@ -2819,6 +2869,71 @@ fn peer_warning(allow_public_peers: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "production-v4")]
+    fn distinct_frame(steward: &[u8], community: &[u8]) -> Vec<u8> {
+        let mut frame = DISTINCT_PASSWORD_STDIN_MAGIC.to_vec();
+        for password in [steward, community] {
+            frame.extend_from_slice(&(password.len() as u16).to_le_bytes());
+            frame.extend_from_slice(password);
+        }
+        frame
+    }
+
+    #[cfg(feature = "production-v4")]
+    #[test]
+    fn separate_password_frame_is_exact_bounded_and_distinct() {
+        let steward = b"disposable steward test password";
+        let community = b"disposable community test password";
+        let frame = distinct_frame(steward, community);
+        let parsed = parse_distinct_password_frame(&frame).unwrap();
+        assert_eq!(parsed[0].as_slice(), steward);
+        assert_eq!(parsed[1].as_slice(), community);
+        assert!(parse_distinct_password_frame(&frame[..frame.len() - 1]).is_err());
+        let mut trailing = frame.clone();
+        trailing.push(0);
+        assert!(parse_distinct_password_frame(&trailing).is_err());
+        let mut wrong_magic = frame.clone();
+        wrong_magic[0] ^= 1;
+        assert!(parse_distinct_password_frame(&wrong_magic).is_err());
+        assert!(parse_distinct_password_frame(&distinct_frame(steward, steward)).is_err());
+        assert!(parse_distinct_password_frame(&distinct_frame(b"short", community)).is_err());
+        assert!(
+            parse_distinct_password_frame(&distinct_frame(
+                &vec![b'x'; MAXIMUM_PASSPHRASE_BYTES + 1],
+                community,
+            ))
+            .is_err()
+        );
+    }
+
+    #[cfg(feature = "production-v4")]
+    #[test]
+    fn separate_password_stdin_conflicts_with_file_and_shared_modes() {
+        let base = [
+            "cmfd-node",
+            "mainnet-custody-prepare",
+            "--pow-limit",
+            "003fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "--initial-target",
+            "000ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccb",
+            "--wallets-directory",
+            "wallets",
+            "--backups-directory",
+            "backups",
+            "--public-directory",
+            "public",
+        ];
+        let mut separate = base.to_vec();
+        separate.push("--distinct-passphrases-stdin");
+        assert!(Cli::try_parse_from(&separate).is_ok());
+        let mut with_file = separate.clone();
+        with_file.extend(["--steward-passphrase-file", "steward.txt"]);
+        assert!(Cli::try_parse_from(&with_file).is_err());
+        let mut with_shared = separate;
+        with_shared.push("--shared-passphrase-stdin");
+        assert!(Cli::try_parse_from(&with_shared).is_err());
+    }
 
     #[test]
     fn pool_payout_activation_is_explicit_and_network_specific() {

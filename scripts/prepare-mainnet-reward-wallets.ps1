@@ -1,5 +1,5 @@
-# Offline operator convenience wrapper. Passwords travel only through an
-# anonymous stdin pipe, never command-line arguments, logs or temporary files.
+# Offline operator convenience wrapper. Two distinct passwords travel only
+# through a length-framed anonymous stdin pipe, never arguments, logs or files.
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$NodePath,
@@ -8,8 +8,10 @@ param(
     [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{64}$')][string]$InitialTarget,
     [string]$WalletParent = (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'CommonFoundry\RewardWallets'),
     [string]$BackupParent = (Join-Path ([Environment]::GetFolderPath('UserProfile')) 'CommonFoundry-Reward-Backups'),
-    [Security.SecureString]$Password,
-    [Security.SecureString]$PasswordConfirmation
+    [Security.SecureString]$StewardPassword,
+    [Security.SecureString]$StewardPasswordConfirmation,
+    [Security.SecureString]$CommunityPassword,
+    [Security.SecureString]$CommunityPasswordConfirmation
 )
 
 $ErrorActionPreference = 'Stop'
@@ -34,7 +36,38 @@ function Quote-NativeArgument([string]$Value) {
     return '"' + [regex]::Replace([regex]::Replace($Value, '(\\*)"', '$1$1\"'), '(\\+)$', '$1$1') + '"'
 }
 
-function Invoke-CustodyCommand([string[]]$Arguments, [byte[]]$PasswordBytes) {
+function Assert-PasswordConfirmation([byte[]]$PasswordBytes, [byte[]]$ConfirmationBytes, [string]$Role) {
+    if ($PasswordBytes.Length -lt 12 -or $PasswordBytes.Length -gt 1024) {
+        throw "$Role password must contain 12 to 1024 UTF-8 bytes. No wallets were created."
+    }
+    $difference = $PasswordBytes.Length -bxor $ConfirmationBytes.Length
+    for ($index = 0; $index -lt [Math]::Min($PasswordBytes.Length, $ConfirmationBytes.Length); $index++) {
+        $difference = $difference -bor ($PasswordBytes[$index] -bxor $ConfirmationBytes[$index])
+    }
+    if ($difference -ne 0) { throw "$Role password confirmation did not match. No wallets were created." }
+}
+
+function New-DistinctPasswordFrame([byte[]]$StewardBytes, [byte[]]$CommunityBytes) {
+    $difference = $StewardBytes.Length -bxor $CommunityBytes.Length
+    for ($index = 0; $index -lt [Math]::Min($StewardBytes.Length, $CommunityBytes.Length); $index++) {
+        $difference = $difference -bor ($StewardBytes[$index] -bxor $CommunityBytes[$index])
+    }
+    if ($difference -eq 0) { throw 'Steward and community passwords must differ. No wallets were created.' }
+    $magic = [Text.Encoding]::ASCII.GetBytes("CMFD/REWARD-CUSTODY/TWO-PASSWORDS/V1`0")
+    $frame = New-Object byte[] ($magic.Length + 4 + $StewardBytes.Length + $CommunityBytes.Length)
+    [Array]::Copy($magic, 0, $frame, 0, $magic.Length)
+    $offset = $magic.Length
+    foreach ($password in @($StewardBytes, $CommunityBytes)) {
+        $length = $password.Length
+        $frame[$offset] = [byte]($length -band 255)
+        $frame[$offset + 1] = [byte](($length -shr 8) -band 255)
+        [Array]::Copy($password, 0, $frame, $offset + 2, $length)
+        $offset += 2 + $length
+    }
+    return ,$frame
+}
+
+function Invoke-CustodyCommand([string[]]$Arguments, [byte[]]$PasswordFrame) {
     if ((Get-FileHash -LiteralPath $resolvedNode -Algorithm SHA256).Hash -ne $ExpectedNodeSha256) {
         throw 'The selected node executable no longer matches its expected SHA-256.'
     }
@@ -61,7 +94,7 @@ function Invoke-CustodyCommand([string[]]$Arguments, [byte[]]$PasswordBytes) {
         }
         $stdout = $process.StandardOutput.ReadToEndAsync()
         $stderr = $process.StandardError.ReadToEndAsync()
-        $process.StandardInput.BaseStream.Write($PasswordBytes, 0, $PasswordBytes.Length)
+        $process.StandardInput.BaseStream.Write($PasswordFrame, 0, $PasswordFrame.Length)
         $process.StandardInput.BaseStream.Flush()
         $process.StandardInput.Close()
         $process.WaitForExit()
@@ -85,23 +118,27 @@ if (-not [IO.Path]::IsPathRooted($WalletParent) -or -not [IO.Path]::IsPathRooted
     throw 'Wallet and backup parent directories must be absolute paths.'
 }
 
-$passwordBytes = $null
-$confirmationBytes = $null
+$stewardBytes = $null
+$stewardConfirmationBytes = $null
+$communityBytes = $null
+$communityConfirmationBytes = $null
+$passwordFrame = $null
 try {
-    if ($null -eq $Password) {
-        Write-Host 'Choose a strong password for BOTH reward wallets. Keep it in your password manager.'
+    if ($null -eq $StewardPassword) {
+        Write-Host 'Choose TWO DIFFERENT strong passwords, one for each reward wallet. Save both separately.'
         Write-Host 'This is offline candidate preparation, not mainnet activation.'
-        $Password = Read-Host 'Wallet password' -AsSecureString
+        $StewardPassword = Read-Host 'Steward wallet password' -AsSecureString
     }
-    if ($null -eq $PasswordConfirmation) { $PasswordConfirmation = Read-Host 'Confirm wallet password' -AsSecureString }
-    $passwordBytes = Convert-SecurePasswordToUtf8 $Password
-    $confirmationBytes = Convert-SecurePasswordToUtf8 $PasswordConfirmation
-    if ($passwordBytes.Length -lt 12 -or $passwordBytes.Length -gt 1024) { throw 'Use a password containing 12 to 1024 UTF-8 bytes.' }
-    $difference = $passwordBytes.Length -bxor $confirmationBytes.Length
-    for ($index = 0; $index -lt [Math]::Min($passwordBytes.Length, $confirmationBytes.Length); $index++) {
-        $difference = $difference -bor ($passwordBytes[$index] -bxor $confirmationBytes[$index])
-    }
-    if ($difference -ne 0) { throw 'Passwords did not match. No wallets were created.' }
+    if ($null -eq $StewardPasswordConfirmation) { $StewardPasswordConfirmation = Read-Host 'Confirm steward password' -AsSecureString }
+    $stewardBytes = Convert-SecurePasswordToUtf8 $StewardPassword
+    $stewardConfirmationBytes = Convert-SecurePasswordToUtf8 $StewardPasswordConfirmation
+    Assert-PasswordConfirmation $stewardBytes $stewardConfirmationBytes 'Steward'
+    if ($null -eq $CommunityPassword) { $CommunityPassword = Read-Host 'Community wallet password' -AsSecureString }
+    if ($null -eq $CommunityPasswordConfirmation) { $CommunityPasswordConfirmation = Read-Host 'Confirm community password' -AsSecureString }
+    $communityBytes = Convert-SecurePasswordToUtf8 $CommunityPassword
+    $communityConfirmationBytes = Convert-SecurePasswordToUtf8 $CommunityPasswordConfirmation
+    Assert-PasswordConfirmation $communityBytes $communityConfirmationBytes 'Community'
+    $passwordFrame = New-DistinctPasswordFrame $stewardBytes $communityBytes
 
     $attempt = [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss') + '-' + [Guid]::NewGuid().ToString('N').Substring(0, 8)
     $workParent = Join-Path $WalletParent $attempt
@@ -111,20 +148,25 @@ try {
     $wallets = Join-Path $workParent 'wallets'
     $backups = Join-Path $backupParentForAttempt 'backups'
     $public = Join-Path $workParent 'public'
-    $common = @('--wallets-directory', $wallets, '--backups-directory', $backups, '--public-directory', $public, '--shared-passphrase-stdin')
+    $common = @('--wallets-directory', $wallets, '--backups-directory', $backups, '--public-directory', $public, '--distinct-passphrases-stdin')
     Write-Host 'Creating and authenticating the encrypted wallets and backups...'
-    $prepared = Invoke-CustodyCommand (@('mainnet-custody-prepare', '--pow-limit', $PowLimit, '--initial-target', $InitialTarget) + $common) $passwordBytes
+    $prepared = Invoke-CustodyCommand (@('mainnet-custody-prepare', '--pow-limit', $PowLimit, '--initial-target', $InitialTarget) + $common) $passwordFrame
     Write-Host 'Checking the saved files in a separate node process...'
-    $verified = Invoke-CustodyCommand (@('mainnet-custody-verify', '--expected-plan-digest', $prepared.launch_plan_digest) + $common) $passwordBytes
+    $verified = Invoke-CustodyCommand (@('mainnet-custody-verify', '--expected-plan-digest', $prepared.launch_plan_digest) + $common) $passwordFrame
     if ($prepared.network_id -ne $verified.network_id -or $prepared.launch_plan_digest -ne $verified.launch_plan_digest) {
         throw 'The independent readback did not match the prepared network identity.'
     }
-    Write-Host 'Complete. Copy the encrypted backups off this computer and retain your password separately.'
+    Write-Host 'Complete. Copy the encrypted backups off this computer and retain BOTH passwords separately.'
     Write-Host 'Only the files in the public directory may be shared for launch preparation.'
     [ordered]@{ status = 'prepared_and_verified_not_activated'; wallets_directory = $wallets; backups_directory = $backups; public_directory = $public; custody = $verified } | ConvertTo-Json -Depth 6
 } finally {
-    if ($null -ne $passwordBytes) { [Array]::Clear($passwordBytes, 0, $passwordBytes.Length) }
-    if ($null -ne $confirmationBytes) { [Array]::Clear($confirmationBytes, 0, $confirmationBytes.Length) }
-    if ($null -ne $Password) { $Password.Dispose() }
-    if ($null -ne $PasswordConfirmation) { $PasswordConfirmation.Dispose() }
+    if ($null -ne $passwordFrame) { [Array]::Clear($passwordFrame, 0, $passwordFrame.Length) }
+    if ($null -ne $stewardBytes) { [Array]::Clear($stewardBytes, 0, $stewardBytes.Length) }
+    if ($null -ne $stewardConfirmationBytes) { [Array]::Clear($stewardConfirmationBytes, 0, $stewardConfirmationBytes.Length) }
+    if ($null -ne $communityBytes) { [Array]::Clear($communityBytes, 0, $communityBytes.Length) }
+    if ($null -ne $communityConfirmationBytes) { [Array]::Clear($communityConfirmationBytes, 0, $communityConfirmationBytes.Length) }
+    if ($null -ne $StewardPassword) { $StewardPassword.Dispose() }
+    if ($null -ne $StewardPasswordConfirmation) { $StewardPasswordConfirmation.Dispose() }
+    if ($null -ne $CommunityPassword) { $CommunityPassword.Dispose() }
+    if ($null -ne $CommunityPasswordConfirmation) { $CommunityPasswordConfirmation.Dispose() }
 }

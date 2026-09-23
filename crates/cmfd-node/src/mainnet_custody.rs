@@ -339,42 +339,66 @@ pub fn prepare_reward_custody(
     prepare_inner(paths, pow_limit, initial_target, None)
 }
 
-/// Shared-password setup for a local guided launcher. Passphrase-file paths are
-/// ignored in this explicit mode; no plaintext password is written to disk.
-pub fn prepare_reward_custody_with_password(
+/// Guided setup with independent passwords for the steward and community keys.
+/// No plaintext password file is needed; the caller must use a protected pipe.
+pub fn prepare_reward_custody_with_distinct_passwords(
     paths: &RewardCustodyPaths,
     pow_limit: [u8; 32],
     initial_target: [u8; 32],
-    password: &[u8],
+    steward_password: &[u8],
+    community_password: &[u8],
 ) -> Result<RewardCustodyReport, RewardCustodyError> {
-    prepare_inner(paths, pow_limit, initial_target, Some(password))
+    require_distinct_passwords(steward_password, community_password)?;
+    prepare_inner(
+        paths,
+        pow_limit,
+        initial_target,
+        Some([steward_password, community_password]),
+    )
+}
+
+fn require_distinct_passwords(
+    steward_password: &[u8],
+    community_password: &[u8],
+) -> Result<(), RewardCustodyError> {
+    if steward_password == community_password {
+        return Err(RewardCustodyError::Artifact(
+            "steward and community passwords must differ",
+        ));
+    }
+    Ok(())
 }
 
 fn passwords(
     paths: &RewardCustodyPaths,
     dirs: &[PathBuf; 3],
-    shared: Option<&[u8]>,
+    provided: Option<[&[u8]; 2]>,
 ) -> Result<[Zeroizing<Vec<u8>>; 2], RewardCustodyError> {
-    if let Some(shared) = shared {
-        if !(MINIMUM_PASSPHRASE_BYTES..=MAXIMUM_PASSPHRASE_BYTES).contains(&shared.len()) {
+    let result = if let Some([steward, community]) = provided {
+        if !(MINIMUM_PASSPHRASE_BYTES..=MAXIMUM_PASSPHRASE_BYTES).contains(&steward.len())
+            || !(MINIMUM_PASSPHRASE_BYTES..=MAXIMUM_PASSPHRASE_BYTES).contains(&community.len())
+        {
             return Err(WalletBackupError::InvalidPassphrase.into());
         }
-        return Ok([
-            Zeroizing::new(shared.to_vec()),
-            Zeroizing::new(shared.to_vec()),
-        ]);
-    }
-    Ok([
-        passphrase(&paths.steward_passphrase_file, dirs)?,
-        passphrase(&paths.community_passphrase_file, dirs)?,
-    ])
+        [
+            Zeroizing::new(steward.to_vec()),
+            Zeroizing::new(community.to_vec()),
+        ]
+    } else {
+        [
+            passphrase(&paths.steward_passphrase_file, dirs)?,
+            passphrase(&paths.community_passphrase_file, dirs)?,
+        ]
+    };
+    require_distinct_passwords(&result[0], &result[1])?;
+    Ok(result)
 }
 
 fn prepare_inner(
     paths: &RewardCustodyPaths,
     pow_limit: [u8; 32],
     initial_target: [u8; 32],
-    shared_password: Option<&[u8]>,
+    provided_passwords: Option<[&[u8]; 2]>,
 ) -> Result<RewardCustodyReport, RewardCustodyError> {
     if pow_limit == [0; 32] || initial_target == [0; 32] || initial_target > pow_limit {
         return Err(RewardCustodyError::Artifact(
@@ -382,7 +406,7 @@ fn prepare_inner(
         ));
     }
     let dirs = directories(paths, true)?;
-    let passwords = passwords(paths, &dirs, shared_password)?;
+    let passwords = passwords(paths, &dirs, provided_passwords)?;
     let secrets = [fresh_secret()?, fresh_secret()?];
     let rewards = FixedRewardDestinations {
         steward: destination(&secrets[0])?,
@@ -512,19 +536,25 @@ pub fn verify_reward_custody(
     verify_inner(paths, expected_plan_digest, None)
 }
 
-/// Shared-password counterpart to the read-only verification operation.
-pub fn verify_reward_custody_with_password(
+/// Verify both independently protected wallets from separate in-memory passwords.
+pub fn verify_reward_custody_with_distinct_passwords(
     paths: &RewardCustodyPaths,
     expected_plan_digest: [u8; 32],
-    password: &[u8],
+    steward_password: &[u8],
+    community_password: &[u8],
 ) -> Result<RewardCustodyReport, RewardCustodyError> {
-    verify_inner(paths, expected_plan_digest, Some(password))
+    require_distinct_passwords(steward_password, community_password)?;
+    verify_inner(
+        paths,
+        expected_plan_digest,
+        Some([steward_password, community_password]),
+    )
 }
 
 fn verify_inner(
     paths: &RewardCustodyPaths,
     expected_plan_digest: [u8; 32],
-    shared_password: Option<&[u8]>,
+    provided_passwords: Option<[&[u8]; 2]>,
 ) -> Result<RewardCustodyReport, RewardCustodyError> {
     let dirs = directories(paths, false)?;
     if dirs[0].join(INCOMPLETE_FILE).try_exists()? {
@@ -532,7 +562,7 @@ fn verify_inner(
             "setup is incomplete; preserve and review the partial output",
         ));
     }
-    let passwords = passwords(paths, &dirs, shared_password)?;
+    let passwords = passwords(paths, &dirs, provided_passwords)?;
     let plan = MainnetLaunchPlan::parse_pinned(
         &read_bounded(&dirs[2].join(PLAN_FILE), 32 * 1024, false)?,
         expected_plan_digest,

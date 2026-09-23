@@ -97,8 +97,9 @@ consistency has a regression test. Node seed defaults now select the compiled
 network's port rather than hard-coding the RC port.
 
 **Mainnet integration remains incomplete.** Final pin values, actual release-approval
-evidence, actual mainnet package builds and release finalization, and the real launch
-rehearsal are still pending. The runtime
+evidence, actual mainnet package builds and release finalization, and a brief
+final-package smoke check are still pending. The extended GPU dropout rehearsal
+was waived by the owner. The runtime
 explicitly refuses legacy wire/fee defaults for a new mainnet ID.
 The proposed service ports are 29443/29444/29445, separate from RC; the current
 RC seed host is only a prospective endpoint until mainnet service provisioning
@@ -119,7 +120,7 @@ and api3.drand.sh on 2026-09-19. Historical round 123 is the offline positive ve
 | Exact UTC release/mining schedule | Pinned in cmfd-launch | Schedule CLI and timestamp tests |
 | Signed launch-time entropy | Verifier, node/miner startup wiring and retrieval/waiting launchers implemented; packaged rehearsal pending | Signature mutation vectors plus actual packaged replay and anti-precomputation rehearsal |
 | Mainnet network/consensus identity | Shared identity registry and mainnet build feature implemented; final pin values pending | Final pinned plan and mainnet profile, distinct from RC |
-| Starting difficulty | Separate 5x start / RC minimum passed isolated full-proof and recovery tests; V2 plan/pin/package binding implemented locally | Final recovery policy plus controlled hashrate-drop and exact-package rehearsal |
+| Starting difficulty | Separate 5x start / RC minimum passed isolated full-proof and recovery tests; V2 plan/pin/package binding implemented locally. Owner waived the extended live 20→5→1 dropout run on September 23. | Final target decision with the existing evidence and an explicit record that live dropout response is unmeasured; no simulated report may be presented as a live result |
 | Reward receiving addresses and custody | Owner controls both; offline two-wallet/plan preparation, encrypted backups and guided local password setup implemented; actual owner run still needed | Public destinations plus retained/restored backup evidence; see [custody setup](mainnet-reward-custody.md) |
 | Build reproduction and validation reporting | Owner declined seeking an external cryptographer; validation must be described as internal | Reproducible build records and accurate test/approval evidence, without claiming an external cryptographic audit |
 | Plan approval binding | Dedicated requests, signature verification, package binding and candidate pin generation implemented | Actual role approvals, reviewed source history and final pin application |
@@ -134,12 +135,12 @@ and api3.drand.sh on 2026-09-19. Historical round 123 is the offline positive ve
 | Storage capacity | Live seed has about 274 GiB free; larger archival capacity versus pruning awaits owner decision | Measured growth and provisioned capacity/retention decision |
 | Model download availability | Full 61.2 GB solo-input set verified from primary; public Devnet-16 release now exposes all 40 manifest-named parts with matching published sizes, and mainnet fallback launchers select it | Authenticate a complete miner-role download from the fallback and rehearse the exact package |
 | Recovery and update | Offline CLI backup/restore/tail-repair rehearsal passes on Windows/Linux; mainnet storage tools now authenticate launch identity | Final signed-package and service-identity rehearsal, upgrade/rollback results |
-| Final launch rehearsal | Pending | Exact intended packages, future-round start, delayed-beacon handling, fresh-wallet transfers |
+| Final-package smoke check | Pending; owner waived only the extended six-hour GPU dropout run | Start the exact candidate package, verify node identity/connectivity and a test transaction; keep historical/mocked beacon checks separate from the actual future round |
 | Source release 24 hours early | Not yet executed | Public source and matching package timestamps at agreed release time |
 
 OTC completion is deferred until mainnet and is not part of launch activation.
 Carry forward successful unchanged RC evidence; repeat affected checks and the
-final end-to-end launch rehearsal. Do not mark this checklist complete merely
+brief final-package smoke check. Do not mark this checklist complete merely
 because the component tests pass.
 
 ## Reproducible local checks
@@ -606,6 +607,13 @@ Its report fails closed on missing identity, proof, worker or peer evidence and
 never selects a final difficulty policy. The physical multi-GPU run and its
 independently verified GPU/host identities have **not** happened. The public RC
 pool was not used for this harness.
+
+On September 23 the owner directed us to skip the extended live 20 → 5 → 1
+rehearsal. Do not pause owner miners or the old Devnet-16 pool for that run,
+publish a rehearsal report, or claim measured dropout recovery. This waives
+that proposed experiment, not the remaining custody, package-integrity,
+storage, CI and release-approval work. The owner confirmed that the brief
+final-package smoke check remains in scope.
 
 The standalone pool-miner source now resolves an optional physical GPU index or
 full UUID to a single CUDA-visible UUID, gives selected GPUs separate worker

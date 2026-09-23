@@ -68,6 +68,11 @@ class MainnetReleaseTests(unittest.TestCase):
         fixture = self.package_fixture
         fixture.repo = self.repo
         fixture.commit = self.commit
+        dashboard_manifest = json.loads(fixture.dashboard_manifest_path.read_bytes())
+        dashboard_manifest["source_commit"] = self.commit
+        fixture.dashboard_manifest_path.write_bytes(package.canonical(dashboard_manifest))
+        cuda_pin_path = self.root / release.CUDA_RUNTIME_PIN
+        cuda_pin_path.write_bytes((fixture.cuda_sha256 + "\n").encode())
         fixture.plan = self.fixture.plan
         fixture.plan_path = self.fixture.plan_path
         fixture.approval_path = self.fixture.manifest_path
@@ -82,7 +87,9 @@ class MainnetReleaseTests(unittest.TestCase):
                 shutil.copyfile(archive, self.first / archive.name)
         evidence = {release.PLAN: self.fixture.plan_path, release.MANIFEST: self.fixture.manifest_path,
                     release.QUALIFICATION: self.fixture.qualification_path, release.TRUST: self.fixture.trust_path,
-                    release.PROOF_PIN: self.fixture.proof_path}
+                    release.PROOF_PIN: self.fixture.proof_path,
+                    release.DASHBOARD_ASSETS: fixture.dashboard_manifest_path,
+                    release.CUDA_RUNTIME_PIN: cuda_pin_path}
         for role, prefix in ((signatures.PRODUCER_ROLE, "producer"), (signatures.REPRODUCER_ROLE, "reproducer")):
             names = release.ROLE_FILES[role]
             for name, key in zip(names, (prefix + "_approval", prefix + "_signature", prefix + "_allowed_signers")):
@@ -127,6 +134,20 @@ class MainnetReleaseTests(unittest.TestCase):
         self.prepare()
         with self.assertRaisesRegex(package.Error, "inventory"):
             release.validate_release(**self.common(), files=package.integrity._stage_files(self.first))
+
+    def test_reviewed_pool_asset_evidence_is_required_and_bound_to_archives(self):
+        pin = self.first / release.CUDA_RUNTIME_PIN
+        original = pin.read_bytes()
+        pin.write_bytes(("b" * 64 + "\n").encode())
+        with self.assertRaisesRegex(package.Error, "CUDA runtime"):
+            self.prepare()
+        pin.write_bytes(original)
+        manifest = self.first / release.DASHBOARD_ASSETS
+        value = json.loads(manifest.read_bytes())
+        value["source_commit"] = "b" * 40
+        manifest.write_bytes(package.canonical(value))
+        with self.assertRaisesRegex(package.Error, "frozen source commit"):
+            self.prepare()
 
     def test_standard_finalizer_cli_runs_the_mainnet_gate_and_generates_checksums(self):
         self.prepare()

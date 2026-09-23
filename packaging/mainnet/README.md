@@ -45,7 +45,12 @@ process-interruption protection, not a claim of power-loss qualification.
 `scripts/package_mainnet.py` assembles the runtime (wallet + node) and standalone
 miner archives on each native platform. It requires an exact clean frozen source
 commit, matching package versions, a canonical plan, mainnet-feature binaries,
-the launch helper, and both Linux GPU workers. It does not build the executables.
+the launch helper, both Linux GPU workers, a reviewed built pool-dashboard tree,
+and an exact-hash-pinned Linux x86-64 CUDA 12 runtime library. It does not build
+the executables or dashboard. All four archives carry the same dashboard assets
+and `lib/libcudart.so.12` so the Linux pool and WSL mining workers use one
+reconciled runtime set. The Linux runtime also carries the separate mainnet
+pool service templates; none is installed automatically.
 Use Python 3.11 or newer and install the pinned dependencies from
 scripts/requirements-release-integrity.txt. This is a packaging-host requirement,
 not an additional Windows wallet-user requirement.
@@ -58,7 +63,9 @@ py -3 scripts/package_mainnet.py --platform windows-x86_64 --kind runtime `
   --commit $FrozenCommit --version $MainnetVersion --plan $ApprovedPlan `
   --approval-manifest $VerifiedPlanApprovals `
   --output $OutputDirectory --node $NodeBinary --wallet $WalletBinary `
-  --launch $LaunchBinary --replay-worker $ReplayWorker --relation-worker $RelationWorker
+  --launch $LaunchBinary --replay-worker $ReplayWorker --relation-worker $RelationWorker `
+  --dashboard-dist $ReviewedPoolDashboardDist --dashboard-manifest $ReviewedDashboardManifest `
+  --cuda-runtime $VerifiedLinuxCudaRuntime --cuda-sha256 $ReviewedCudaRuntimeSha256
 ```
 
 For a miner archive, use `--kind miner --miner $MinerBinary` instead of the node
@@ -71,6 +78,24 @@ the wallet's distinct `CMFD_WALLET_PRELAUNCH_IDENTITY_V1` wrapper. None of these
 checks needs the future beacon or the downloaded model bank. The exact source
 catalog bytes are retained as artifact provenance and checked against the plan.
 Linux workers are bundled even in the Windows package, where mining uses WSL2.
+The dashboard manifest is canonical JSON of the form
+`{"schema":"CMFD_MAINNET_POOL_DASHBOARD_ASSETS_V1","source_commit":"<40-hex-commit>","files":{"index.html":{"bytes":123,"sha256":"<64-hex>"},"assets/index-<build-hash>.js":{"bytes":456,"sha256":"<64-hex>"}}}`
+with a record for **every** dist asset. The manifest must be reviewed against a
+reproducible build of the frozen source; source-commit binding alone does not
+prove that the JavaScript was built from that source. The assembler rejects
+missing/extra files, symlinks, hashes or sizes that differ from the manifest,
+and unexpected asset paths. No archive can be assembled without the explicit
+dashboard tree, manifest, library path and library SHA-256. The CUDA library
+must be a non-symlink Linux x86-64 ELF shared object, copied byte-for-byte.
+Its hash and the entire asset tree are bound by each package receipt.
+
+NVIDIA's [CUDA Toolkit EULA](https://docs.nvidia.com/cuda/eula/) lists Linux
+`libcudart.so` as redistributable in Attachment A, subject to the agreement's
+distribution conditions. Supply an authorized, unmodified CUDA runtime object
+and review the applicable terms before publication; the packager's ELF/hash
+checks do not establish provenance or license compliance. Do not package the
+CUDA Toolkit as a stand-alone product or infer GPU/driver compatibility from
+an ELF header. Exact-package testing on the target GPU remains required.
 
 Every archive includes production-mainnet/MAINNET-APPROVALS.json. Its digest,
 qualification binding and signer authority descriptors must match the compiled
@@ -90,15 +115,17 @@ are not qualification of actual mainnet binaries.
 After both native platforms assemble their runtime and miner archives, use
 `scripts/verify_mainnet_packages.py` with the same `--repo`, `--commit`,
 `--version`, and `--plan`, plus absolute paths for `--windows-runtime`,
-`--windows-miner`, `--linux-runtime`, `--linux-miner`, and a new `--output` report.
+`--windows-miner`, `--linux-runtime`, `--linux-miner`, the reviewed
+`--dashboard-manifest`, the reviewed `--cuda-sha256`, and a new `--output` report.
 This requires Python 3.11+ and the same pinned dependencies as assembly.
 
 The verifier does not execute or extract packaged files. It checks canonical
 ZIP/USTAR/gzip structure, bounded member sizes, exact source-script bytes,
-executable architectures and permissions, plan bytes and producer receipt hashes.
+executable and CUDA-library architectures and permissions, plan bytes,
+dashboard asset manifest/hash/size matches, and producer receipt hashes.
 The four native identity records must agree, both packages on a platform must
 have the same launch-helper binary, and all four must contain identical Linux/WSL
-workers. Extra files (including wallet keys or a preloaded beacon), missing roles,
+workers, dashboard assets and CUDA runtime. Extra files (including wallet keys or a preloaded beacon), missing roles,
 symlinks, duplicate members, noncanonical trailers and changed archives fail.
 
 The output binds the four archive hashes and explicitly remains unapproved and

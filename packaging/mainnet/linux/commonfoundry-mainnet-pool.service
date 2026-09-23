@@ -1,0 +1,51 @@
+[Unit]
+Description=Common Foundry mainnet pool (staged; separate from RC)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=commonfoundry-mainnet-pool
+Group=commonfoundry-mainnet-pool
+SupplementaryGroups=video render
+WorkingDirectory=/opt/commonfoundry-mainnet-pool/current
+StateDirectory=commonfoundry-mainnet-pool
+StateDirectoryMode=0700
+RuntimeDirectory=commonfoundry-mainnet-pool
+RuntimeDirectoryMode=0700
+LoadCredential=wallet-passphrase:/etc/commonfoundry-mainnet-pool/wallet-passphrase
+LoadCredential=pool-private-key:/etc/commonfoundry-mainnet-pool/pool-key.der
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStartPre=/opt/commonfoundry-mainnet-pool/current/cmfd-node mainnet-launch-info
+ExecStart=/usr/bin/python3 /opt/commonfoundry-mainnet-pool/current/mainnet-pool-service.py --run /etc/commonfoundry-mainnet-pool/pool.json
+KillSignal=SIGINT
+TimeoutStartSec=infinity
+TimeoutStopSec=240
+Restart=on-failure
+RestartSec=30
+UMask=0077
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/commonfoundry-mainnet-pool /opt/commonfoundry-mainnet-pool/current/production-mainnet
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=commonfoundry-mainnet-pool
+
+[Install]
+WantedBy=multi-user.target

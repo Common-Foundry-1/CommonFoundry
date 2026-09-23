@@ -35,7 +35,9 @@ class MainnetPreflightTests(unittest.TestCase):
         with mock.patch.object(package, "source_snapshot", side_effect=self.fixture.sources), \
              mock.patch.object(package, "validate_review_ancestry"), \
              mock.patch.object(package, "native_output", side_effect=AssertionError("preflight executed an archive member")):
-            return preflight.verify_set(self.fixture.repo, self.fixture.commit, "1.0.0", self.fixture.plan_path, self.archives if archives is None else archives)
+            return preflight.verify_set(self.fixture.repo, self.fixture.commit, "1.0.0", self.fixture.plan_path,
+                                        self.archives if archives is None else archives,
+                                        self.fixture.dashboard_manifest_path, self.fixture.cuda_sha256)
 
     def rewrite(self, key, transform, *, refresh_receipt=False, epoch=1789840000):
         archive = self.archives[key]
@@ -69,6 +71,8 @@ class MainnetPreflightTests(unittest.TestCase):
         self.assertFalse(report["release_approved"])
         self.assertFalse(report["independent_reproduction_verified"])
         self.assertEqual(len(report["packages"]), 4)
+        self.assertIn(package.CUDA_RUNTIME, report["pool_runtime_assets"])
+        self.assertIn("dashboard/index.html", report["pool_runtime_assets"])
         for row in report["packages"]:
             archive = next(path for path in self.archives.values() if path.name == row["name"])
             self.assertEqual(row["sha256"], hashlib.sha256(archive.read_bytes()).hexdigest())
@@ -98,6 +102,9 @@ class MainnetPreflightTests(unittest.TestCase):
         git("-c", "user.name=Package Test", "-c", "user.email=fixture@example.invalid", "commit", "--no-gpg-sign", "--quiet", "-m", "Synthetic package test source")
         self.fixture.repo = frozen
         self.fixture.commit = git("rev-parse", "HEAD")
+        dashboard_manifest = json.loads(self.fixture.dashboard_manifest_path.read_bytes())
+        dashboard_manifest["source_commit"] = self.fixture.commit
+        self.fixture.dashboard_manifest_path.write_bytes(package.canonical(dashboard_manifest))
         self.fixture.info["source_commit"] = self.fixture.commit
         self.fixture.approval_subject["review_source_commit"] = self.fixture.commit
         self.fixture.approval_manifest["subject_sha256"] = hashlib.sha256(package.canonical(self.fixture.approval_subject)).hexdigest()
@@ -110,7 +117,9 @@ class MainnetPreflightTests(unittest.TestCase):
         output = self.fixture.root / "preflight.json"
         command = [sys.executable, str(real_repo / "scripts/verify_mainnet_packages.py"),
                    "--repo", str(frozen), "--commit", self.fixture.commit, "--version", "1.0.0",
-                   "--plan", str(self.fixture.plan_path), "--output", str(output)]
+                   "--plan", str(self.fixture.plan_path), "--output", str(output),
+                   "--dashboard-manifest", str(self.fixture.dashboard_manifest_path),
+                   "--cuda-sha256", self.fixture.cuda_sha256]
         for (platform, kind), archive in archives.items():
             command.extend(["--" + platform.split("-")[0] + "-" + kind, str(archive)])
         run = subprocess.run(command, capture_output=True, timeout=20)
@@ -151,6 +160,22 @@ class MainnetPreflightTests(unittest.TestCase):
             files["cmfd-v4-replay"] = bytes(data)
         self.rewrite(("linux-x86_64", "miner"), change, refresh_receipt=True)
         with self.assertRaisesRegex(package.Error, "different Linux/WSL"):
+            self.verify()
+
+    def test_dashboard_asset_drift_is_rejected_even_with_updated_receipt(self):
+        self.rewrite(("linux-x86_64", "runtime"),
+                     lambda files: files.__setitem__("dashboard/assets/app-a1.js", b"unexpected JavaScript\n"),
+                     refresh_receipt=True)
+        with self.assertRaisesRegex(package.Error, "dashboard asset"):
+            self.verify()
+
+    def test_cuda_runtime_drift_is_rejected_even_with_updated_receipt(self):
+        def change(files):
+            library = bytearray(files[package.CUDA_RUNTIME])
+            library[-1] ^= 1
+            files[package.CUDA_RUNTIME] = bytes(library)
+        self.rewrite(("windows-x86_64", "miner"), change, refresh_receipt=True)
+        with self.assertRaisesRegex(package.Error, "CUDA runtime"):
             self.verify()
 
     def test_same_platform_launch_helper_drift_is_rejected(self):
@@ -263,7 +288,8 @@ class MainnetPreflightTests(unittest.TestCase):
             return self.fixture.sources(*args)
         with mock.patch.object(package, "source_snapshot", side_effect=snapshot), mock.patch.object(package, "validate_review_ancestry"):
             with self.assertRaisesRegex(package.Error, "set changed"):
-                preflight.verify_set(self.fixture.repo, self.fixture.commit, "1.0.0", self.fixture.plan_path, self.archives)
+                preflight.verify_set(self.fixture.repo, self.fixture.commit, "1.0.0", self.fixture.plan_path,
+                                     self.archives, self.fixture.dashboard_manifest_path, self.fixture.cuda_sha256)
 
     def test_wrong_archive_epoch_is_rejected(self):
         self.rewrite(("linux-x86_64", "runtime"), lambda _: None, epoch=1789840010)

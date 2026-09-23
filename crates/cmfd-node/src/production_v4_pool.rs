@@ -11,6 +11,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Mutex;
+use std::time::Instant;
 
 use cmfd_consensus::forgematrix_v4_proof::{
     forgematrix_v4_final_activation_digest, forgematrix_v4_mask_coefficients,
@@ -317,6 +318,7 @@ impl ProductionV4PersistentPoolVerifier {
         nonce: u64,
         share_target: [u8; 32],
     ) -> Result<ProductionV4PoolShareEvaluation, PoolError> {
+        let evaluation_started = Instant::now();
         let mut search_state = self
             .searcher
             .state
@@ -369,6 +371,7 @@ impl ProductionV4PersistentPoolVerifier {
             &serde_json::to_vec(&frozen).map_err(replay_error)?,
         )?;
 
+        let search_replay_started = Instant::now();
         search_state.replay.invoke(
             &[
                 "RUN".to_owned(),
@@ -378,6 +381,7 @@ impl ProductionV4PersistentPoolVerifier {
             ],
             "CMFD_V4_REPLAY_DONE",
         )?;
+        let search_replay_seconds = search_replay_started.elapsed().as_secs_f64();
         let search_final = read_exact_file(
             &search_final_path,
             FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES,
@@ -399,6 +403,7 @@ impl ProductionV4PersistentPoolVerifier {
         let full_prefix = files.path("full");
         let full_final_path = files.path("full-final-activation.bin");
         let proof_path = files.path("transparent-proof.bin");
+        let full_replay_started = Instant::now();
         search_state.replay.invoke(
             &[
                 "RUN".to_owned(),
@@ -408,6 +413,7 @@ impl ProductionV4PersistentPoolVerifier {
             ],
             "CMFD_V4_REPLAY_DONE",
         )?;
+        let full_replay_seconds = full_replay_started.elapsed().as_secs_f64();
         let full_final = read_exact_file(
             &full_final_path,
             FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES,
@@ -417,6 +423,7 @@ impl ProductionV4PersistentPoolVerifier {
                 "search replay and full replay final activations differ",
             ));
         }
+        let proof_started = Instant::now();
         state.proof.invoke(
             &[
                 "RUN".to_owned(),
@@ -427,6 +434,7 @@ impl ProductionV4PersistentPoolVerifier {
             ],
             "CMFD_V4_PROOF_DONE",
         )?;
+        let proof_seconds = proof_started.elapsed().as_secs_f64();
         let transparent_proof = read_bounded_file(&proof_path, PRODUCTION_V4_MAX_PROOF_BYTES)?;
         let decoded =
             decode_forgematrix_v4_transparent_proof(&transparent_proof).map_err(replay_error)?;
@@ -448,6 +456,26 @@ impl ProductionV4PersistentPoolVerifier {
             work_digest,
             transparent_proof,
         }));
+        if std::env::var("CMFD_DROPOUT_REHEARSAL_TELEMETRY").as_deref() == Ok("1") {
+            let proof_bytes = match &proof {
+                BlockProof::V4Candidate(candidate) => candidate.transparent_proof.len(),
+                _ => unreachable!("constructed a V4 proof above"),
+            };
+            eprintln!(
+                "CMFD_DROPOUT_POOL_PROOF {}",
+                serde_json::json!({
+                    "network_id": hex::encode(self.expected_network_id),
+                    "height": template.challenge.height,
+                    "parent": hex::encode(template.challenge.previous_block),
+                    "nonce": nonce,
+                    "search_replay_seconds": search_replay_seconds,
+                    "full_replay_seconds": full_replay_seconds,
+                    "proof_seconds": proof_seconds,
+                    "pool_evaluation_wall_seconds": evaluation_started.elapsed().as_secs_f64(),
+                    "proof_bytes": proof_bytes,
+                })
+            );
+        }
         Ok(ProductionV4PoolShareEvaluation {
             work_digest,
             chain_proof: Some(proof),

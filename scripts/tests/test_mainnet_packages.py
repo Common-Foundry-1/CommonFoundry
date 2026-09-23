@@ -8,6 +8,7 @@ import copy
 import hashlib
 import json
 from pathlib import Path
+import struct
 import sys
 import tarfile
 import tempfile
@@ -20,6 +21,19 @@ import package_mainnet as packages
 import mainnet_plan_approval as mainnet_approval
 import production_v4_activation_approval as signature_contract
 from test_release_integrity import pe_x86_64_fixture, elf_x86_64_fixture
+
+
+def cuda_shared_x86_64_fixture(label: bytes = b"CUDA 12 test fixture") -> bytes:
+    encoded = bytearray(192 + len(label))
+    encoded[:4] = b"\x7fELF"
+    encoded[4:7] = b"\x02\x01\x01"
+    struct.pack_into("<HHI", encoded, 16, 3, 0x3e, 1)
+    struct.pack_into("<Q", encoded, 32, 64)
+    struct.pack_into("<HHH", encoded, 52, 64, 56, 2)
+    struct.pack_into("<IIQQQQQQ", encoded, 64, 1, 5, 0, 0x400000, 0, len(encoded), len(encoded), 0x1000)
+    struct.pack_into("<IIQQQQQQ", encoded, 120, 2, 4, 176, 0x4000b0, 0, 16, 16, 8)
+    encoded[192:] = label
+    return bytes(encoded)
 
 
 class MainnetPackageTests(unittest.TestCase):
@@ -81,6 +95,22 @@ class MainnetPackageTests(unittest.TestCase):
                      "proof_approval_trust": {"contract_schema": signature_contract.SUBJECT_SCHEMA,
                                                "qualification_binding_sha256": "b" * 64, "ssh_keygen_sha256": "c" * 64,
                                                **authorities}}
+        self.dashboard_dist = self.root / "dashboard-dist"
+        dashboard = {"index.html": b'<script type="module" src="/assets/app-a1.js"></script>\n',
+                     "assets/app-a1.js": b"console.log('mainnet pool');\n"}
+        for name, data in dashboard.items():
+            target = self.dashboard_dist / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+        self.dashboard_manifest_path = self.root / "DASHBOARD-ASSETS.json"
+        self.dashboard_manifest_path.write_bytes(packages.canonical({
+            "schema": "CMFD_MAINNET_POOL_DASHBOARD_ASSETS_V1", "source_commit": self.commit,
+            "files": {name: {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+                      for name, data in dashboard.items()},
+        }))
+        self.cuda_runtime_path = self.root / "libcudart.so.12"
+        self.cuda_runtime_path.write_bytes(cuda_shared_x86_64_fixture())
+        self.cuda_sha256 = hashlib.sha256(self.cuda_runtime_path.read_bytes()).hexdigest()
         self.calls = []
 
     def args(self, platform="windows-x86_64", kind="runtime", output="output"):
@@ -98,7 +128,9 @@ class MainnetPackageTests(unittest.TestCase):
                                   wallet=binaries / "common-foundry-wallet" if kind == "runtime" else None,
                                   miner=binaries / "cmfd-miner" if kind == "miner" else None,
                                   launch=binaries / "cmfd-launch", replay_worker=binaries / "cmfd-v4-replay",
-                                  relation_worker=binaries / "real_bank0_relations")
+                                  relation_worker=binaries / "real_bank0_relations",
+                                  dashboard_dist=self.dashboard_dist, dashboard_manifest=self.dashboard_manifest_path,
+                                  cuda_runtime=self.cuda_runtime_path, cuda_sha256=self.cuda_sha256)
 
     def test_starting_target_is_explicit_bounded_and_not_an_old_plan_default(self):
         def encode(plan):
@@ -167,6 +199,9 @@ class MainnetPackageTests(unittest.TestCase):
                     self.assertEqual(receipt["files"], {name: {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()} for name, data in content.items()})
                     self.assertEqual(content["production-mainnet/MAINNET-PLAN.json"], self.plan_path.read_bytes())
                     self.assertNotIn("production-mainnet/LAUNCH-BEACON.json", content)
+                    self.assertEqual(content[packages.DASHBOARD_MANIFEST], self.dashboard_manifest_path.read_bytes())
+                    self.assertEqual(content[packages.CUDA_RUNTIME], self.cuda_runtime_path.read_bytes())
+                    self.assertEqual(content["dashboard/index.html"], (self.dashboard_dist / "index.html").read_bytes())
                     if kind == "runtime":
                         # The fixture models frozen Git blobs, not checkout CRLF.
                         self.assertEqual(content["RECOVERY.md"], (self.repo / "packaging/mainnet/RECOVERY.md").read_bytes().replace(b"\r\n", b"\n"))
@@ -178,6 +213,58 @@ class MainnetPackageTests(unittest.TestCase):
                     repeat = self.assemble(args)
                     self.assertEqual(archive.read_bytes(), repeat.read_bytes())
         self.assertFalse(any(arguments == ["network-info"] for _, arguments in self.calls))
+
+    def test_dashboard_tree_rejects_extra_missing_tampered_and_symlink_assets(self):
+        args = self.args()
+        extra = self.dashboard_dist / "unexpected.txt"
+        extra.write_bytes(b"not reviewed")
+        with self.assertRaisesRegex(packages.Error, "unexpected entry"):
+            self.assemble(args)
+        extra.unlink()
+        script = self.dashboard_dist / "assets/app-a1.js"
+        original = script.read_bytes()
+        script.write_bytes(b"different script")
+        with self.assertRaisesRegex(packages.Error, "differs from its reviewed manifest"):
+            self.assemble(args)
+        script.write_bytes(original)
+        script.unlink()
+        with self.assertRaisesRegex(packages.Error, "missing or extra"):
+            self.assemble(args)
+        try:
+            script.symlink_to(self.dashboard_dist / "index.html")
+        except OSError:
+            return  # Windows may not permit fixture symlink creation.
+        with self.assertRaisesRegex(packages.Error, "symlink"):
+            self.assemble(args)
+
+    def test_dashboard_manifest_must_bind_exact_frozen_commit_and_inventory(self):
+        args = self.args()
+        changed = json.loads(self.dashboard_manifest_path.read_bytes())
+        changed["source_commit"] = "b" * 40
+        self.dashboard_manifest_path.write_bytes(packages.canonical(changed))
+        with self.assertRaisesRegex(packages.Error, "frozen source commit"):
+            self.assemble(args)
+        changed["source_commit"] = self.commit
+        changed["files"]["assets/../../wallet.key"] = changed["files"]["index.html"]
+        self.dashboard_manifest_path.write_bytes(packages.canonical(changed))
+        with self.assertRaisesRegex(packages.Error, "unsafe or malformed"):
+            self.assemble(args)
+
+    def test_cuda_runtime_must_be_pinned_x86_64_elf_shared_library(self):
+        args = self.args()
+        args.cuda_sha256 = "1" * 64
+        with self.assertRaisesRegex(packages.Error, "reviewed pin"):
+            self.assemble(args)
+        original = self.cuda_runtime_path.read_bytes()
+        for offset, value in ((18, b"\xb7\x00"), (16, b"\x02\x00")):
+            changed = bytearray(original)
+            changed[offset:offset + len(value)] = value
+            self.cuda_runtime_path.write_bytes(changed)
+            args.cuda_sha256 = hashlib.sha256(changed).hexdigest()
+            with self.subTest(offset=offset), self.assertRaisesRegex(packages.Error, "Linux x86-64 ELF shared library"):
+                self.assemble(args)
+        self.cuda_runtime_path.write_bytes(original)
+        self.assertEqual(self.calls, [])
 
     def test_source_commit_or_approval_identity_mismatch_is_rejected(self):
         def output(executable, arguments):

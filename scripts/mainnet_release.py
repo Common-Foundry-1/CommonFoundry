@@ -24,6 +24,8 @@ MANIFEST = "MAINNET-APPROVALS.json"
 QUALIFICATION = "MAINNET-QUALIFICATION-SUBJECT.json"
 TRUST = "MAINNET-APPROVAL-TRUST.json"
 PROOF_PIN = "PRODUCTION-V4-REVIEWED-PIN.review"
+DASHBOARD_ASSETS = "DASHBOARD-ASSETS.json"
+CUDA_RUNTIME_PIN = "CUDA-RUNTIME-SHA256.txt"
 REPRODUCTION = "MAINNET-REPRODUCTION.json"
 REPRODUCTION_SIGNATURE = REPRODUCTION + ".sig"
 REPRODUCTION_SCHEMA = "CMFD_MAINNET_BINARY_REPRODUCTION_V1"
@@ -32,7 +34,8 @@ ROLE_FILES = {
     "producer": ("MAINNET-PLAN-PRODUCER-APPROVAL.json", "MAINNET-PLAN-PRODUCER-APPROVAL.json.sig", "MAINNET-PRODUCER.allowed_signers"),
     "independent_reproducer": ("MAINNET-PLAN-REPRODUCER-APPROVAL.json", "MAINNET-PLAN-REPRODUCER-APPROVAL.json.sig", "MAINNET-REPRODUCER.allowed_signers"),
 }
-BASE_EVIDENCE = {PLAN, MANIFEST, QUALIFICATION, TRUST, PROOF_PIN} | {name for names in ROLE_FILES.values() for name in names}
+BASE_EVIDENCE = {PLAN, MANIFEST, QUALIFICATION, TRUST, PROOF_PIN, DASHBOARD_ASSETS,
+                 CUDA_RUNTIME_PIN} | {name for names in ROLE_FILES.values() for name in names}
 GENERATED = {integrity.BUILDINFO_NAME, integrity.SOURCE_SBOM_NAME, integrity.PROVENANCE_NAME,
              integrity.CHECKSUM_NAME, integrity.CHECKSUM_SIGNATURE_NAME}
 
@@ -85,7 +88,18 @@ def validate_base(*, repo: Path, commit: str, version: str, files: dict,
                            ("crates/cmfd-consensus/mainnet_network_id.inc.rs", "mainnet_network_id.inc.rs")):
         if integrity._tracked_blob_at(repo, commit, relative) != candidates[name]:
             raise Error("committed mainnet pins are not the exact reviewed candidates")
-    inspected = preflight.verify_set(repo, commit, version, files[PLAN], {key: files[name] for key, name in names.items()})
+    package.validate_dashboard_manifest(snapshots[DASHBOARD_ASSETS].data, commit)
+    cuda_pin_bytes = snapshots[CUDA_RUNTIME_PIN].data
+    try:
+        cuda_pin = cuda_pin_bytes.decode("ascii").removesuffix("\n")
+    except UnicodeError as error:
+        raise Error("CUDA runtime pin must be ASCII hexadecimal") from error
+    package.nonzero_hex(cuda_pin, 64, "reviewed CUDA runtime SHA-256")
+    if cuda_pin_bytes != (cuda_pin + "\n").encode():
+        raise Error("CUDA runtime pin is not canonical")
+    inspected = preflight.verify_set(repo, commit, version, files[PLAN],
+                                     {key: files[name] for key, name in names.items()},
+                                     files[DASHBOARD_ASSETS], cuda_pin)
     if inspected["mainnet_approval_manifest_sha256"] != approval.digest(snapshots[MANIFEST].data):
         raise Error("package and staged mainnet approval manifests disagree")
     for name, snapshot in {**snapshots, **review_snapshots}.items():

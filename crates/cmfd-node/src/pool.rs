@@ -564,9 +564,13 @@ pub struct PoolDashboardSnapshot {
     pub network_name: String,
     pub network_short_name: String,
     pub network_notice: String,
+    pub network_id: String,
+    pub consensus_fingerprint: String,
     pub proof_profile: String,
     pub accepted_height: u64,
     pub tip: String,
+    pub expected_target: String,
+    pub storage_healthy: bool,
     pub current_job_id: String,
     pub share_target: String,
     pub active_connections: usize,
@@ -2416,9 +2420,13 @@ impl PoolDashboardSource {
             network_name: node_status.network.to_owned(),
             network_short_name: node_status.network_short_name.to_owned(),
             network_notice: node_status.network_notice.to_owned(),
+            network_id: node_status.network_id,
+            consensus_fingerprint: node_status.consensus_fingerprint,
             proof_profile: node_status.proof_profile.to_owned(),
             accepted_height: node_status.accepted_height,
             tip: node_status.tip,
+            expected_target: node_status.expected_target,
+            storage_healthy: node_status.storage_healthy,
             current_job_id: hex::encode(current.job_id),
             share_target: hex::encode(current.share_target),
             active_connections: self.shared.active_connections.load(Ordering::Acquire),
@@ -3181,6 +3189,7 @@ fn process_share(
     // Release the shared node before the bounded verifier worker runs; the
     // revision-bound helper rechecks the authoritative chain on commit.
     drop(node);
+    let node_submission_started = Instant::now();
     loop {
         match submit_shared_tip_block(&shared.node, (*block).clone(), unix_time_seconds()?) {
             Ok(_) => break,
@@ -3246,7 +3255,21 @@ fn process_share(
         PoolBlockState::Canonical,
         1,
     )?;
+    let node_submission_seconds = node_submission_started.elapsed().as_secs_f64();
     rotate_if_tip_changed(shared)?;
+    if std::env::var("CMFD_DROPOUT_REHEARSAL_TELEMETRY").as_deref() == Ok("1") {
+        eprintln!(
+            "CMFD_DROPOUT_POOL_ADMISSION {}",
+            serde_json::json!({
+                "network_id": hex::encode(shared.network_id),
+                "height": block_credit.height,
+                "block_id": hex::encode(block_credit.block_id),
+                "parent": hex::encode(block_credit.parent),
+                "nonce": nonce,
+                "node_submission_seconds": node_submission_seconds,
+            })
+        );
+    }
     Ok(PoolShareResult {
         job_id,
         nonce,
@@ -6025,6 +6048,19 @@ mod tests {
         assert_eq!(ledger.pool_blocks, 0);
         assert_eq!(ledger.credited_devnet_atoms, 1);
         let dashboard = server.dashboard_source().snapshot().unwrap();
+        assert_eq!(
+            dashboard.network_id,
+            hex::encode(work.job().challenge.network_id)
+        );
+        assert_eq!(
+            dashboard.consensus_fingerprint,
+            hex::encode(server.shared.consensus_fingerprint)
+        );
+        assert_eq!(
+            dashboard.expected_target,
+            hex::encode(work.job().challenge.target)
+        );
+        assert!(dashboard.storage_healthy);
         assert_eq!(dashboard.ledger.accepted_shares, 1);
         assert_eq!(dashboard.ledger.rejected_shares, 1);
         assert_eq!(dashboard.ledger.credited_devnet_atoms, 1);

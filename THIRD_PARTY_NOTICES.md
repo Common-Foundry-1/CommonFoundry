@@ -1,5 +1,16 @@
 # Third-party notices
 
+## NVIDIA CUDA runtime library
+
+Final mainnet packages require an unmodified, pinned Linux x86-64
+`libcudart.so.12` for the ProductionV4 GPU workers. NVIDIA identifies Linux
+`libcudart.so` as a distributable CUDA Toolkit component in Attachment A of
+the [CUDA Toolkit EULA](https://docs.nvidia.com/cuda/eula/), subject to that
+agreement's distribution requirements and limitations. The package's
+`CUDA-RUNTIME-SHA256.txt` release evidence identifies the exact redistributed
+object. Common Foundry does not grant an NVIDIA license or claim NVIDIA
+endorsement; recipients must use the component consistently with the EULA.
+
 ## Offline ASERT arithmetic reference
 
 The non-active difficulty comparison examples use the documented ASERT formula

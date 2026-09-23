@@ -16,6 +16,8 @@ from pathlib import Path
 import queue
 import re
 import shutil
+import stat
+import struct
 import subprocess
 import tempfile
 import threading
@@ -45,6 +47,13 @@ PLATFORMS = ("windows-x86_64", "linux-x86_64")
 PLAN_SCHEMA = "CMFD_MAINNET_LAUNCH_PLAN_V2"
 PLAN_DOMAIN = b"CMFD/MAINNET/LAUNCH-PLAN/V2\0"
 NETWORK_DOMAIN = "CMFD/MAINNET/NETWORK-ID/V2"
+DASHBOARD_MANIFEST = "production-mainnet/DASHBOARD-ASSETS.json"
+CUDA_RUNTIME = "lib/libcudart.so.12"
+MAX_DASHBOARD_FILES = 128
+MAX_DASHBOARD_FILE_BYTES = 16 * 1024 * 1024
+MAX_DASHBOARD_BYTES = 64 * 1024 * 1024
+MAX_CUDA_BYTES = 64 * 1024 * 1024
+DASHBOARD_EXTENSIONS = {"js", "css", "png", "jpg", "jpeg", "webp", "svg", "ico", "woff", "woff2", "ttf", "otf", "wasm"}
 
 
 def canonical(value: object) -> bytes:
@@ -89,6 +98,112 @@ def read_regular(path: Path, maximum: int, label: str) -> bytes:
 def file_identity(path: Path) -> dict:
     size, digest = integrity._sha256_file_with_size(path, "package file")
     return {"bytes": size, "sha256": digest}
+
+
+def dashboard_asset_name(name: object) -> bool:
+    if name == "index.html":
+        return True
+    if not isinstance(name, str) or not name.startswith("assets/"):
+        return False
+    basename = name[len("assets/"):]
+    match = re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.([A-Za-z0-9]+)", basename)
+    return match is not None and match.group(1).lower() in DASHBOARD_EXTENSIONS
+
+
+def validate_dashboard_manifest(data: bytes, commit: str) -> dict:
+    manifest = strict_json(data, "dashboard asset manifest")
+    if canonical(manifest) != data or set(manifest) != {"schema", "source_commit", "files"}:
+        raise Error("dashboard asset manifest is not canonical or has unexpected fields")
+    if manifest["schema"] != "CMFD_MAINNET_POOL_DASHBOARD_ASSETS_V1" or manifest["source_commit"] != commit:
+        raise Error("dashboard asset manifest does not bind the frozen source commit")
+    files = manifest["files"]
+    if not isinstance(files, dict) or not 2 <= len(files) <= MAX_DASHBOARD_FILES:
+        raise Error("dashboard asset inventory is missing or oversized")
+    if "index.html" not in files or not any(name.endswith(".js") for name in files):
+        raise Error("dashboard asset inventory lacks index.html or JavaScript")
+    if len({name.casefold() for name in files}) != len(files):
+        raise Error("dashboard asset inventory has case-insensitive collisions")
+    total = 0
+    for name, identity in files.items():
+        if not dashboard_asset_name(name) or not isinstance(identity, dict) or set(identity) != {"bytes", "sha256"}:
+            raise Error(f"unsafe or malformed dashboard asset: {name}")
+        if type(identity["bytes"]) is not int or not 0 < identity["bytes"] <= MAX_DASHBOARD_FILE_BYTES:
+            raise Error(f"invalid dashboard asset size: {name}")
+        nonzero_hex(identity["sha256"], 64, f"dashboard asset hash: {name}")
+        total += identity["bytes"]
+    if total > MAX_DASHBOARD_BYTES:
+        raise Error("dashboard asset tree exceeds its release limit")
+    return manifest
+
+
+def dashboard_assets(dist: Path, manifest: dict) -> dict[str, bytes]:
+    integrity._regular_directory(dist, "dashboard dist")
+    found: set[str] = set()
+    for path in dist.rglob("*"):
+        relative = path.relative_to(dist).as_posix()
+        mode = path.lstat().st_mode
+        if stat.S_ISDIR(mode) and relative == "assets":
+            continue
+        if not stat.S_ISREG(mode) or not dashboard_asset_name(relative):
+            raise Error(f"dashboard dist contains a symlink or unexpected entry: {relative}")
+        found.add(relative)
+    if found != set(manifest["files"]):
+        raise Error("dashboard dist has missing or extra assets relative to its reviewed manifest")
+    result = {}
+    for name, identity in manifest["files"].items():
+        source = dist / name
+        with integrity._stable_regular_handle(source, f"dashboard asset {name}") as (_, handle, opened):
+            if opened.st_size > MAX_DASHBOARD_FILE_BYTES:
+                raise Error(f"dashboard asset exceeds its release limit: {name}")
+            data = handle.read(MAX_DASHBOARD_FILE_BYTES + 1)
+        if {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()} != identity:
+            raise Error(f"dashboard asset differs from its reviewed manifest: {name}")
+        result[name] = data
+    return result
+
+
+def validate_cuda_runtime_header(header: bytes, size: int) -> None:
+    """Check that the pinned runtime is a Linux x86-64 ELF shared object."""
+    if len(header) < 64 or header[:4] != b"\x7fELF" or header[4:7] != b"\x02\x01\x01":
+        raise Error("CUDA runtime is not a 64-bit little-endian ELF library")
+    elf_type, machine, version = struct.unpack_from("<HHI", header, 16)
+    ph_offset = struct.unpack_from("<Q", header, 32)[0]
+    header_size, ph_size, ph_count = struct.unpack_from("<HHH", header, 52)
+    if (elf_type != 3 or machine != 0x3e or version != 1 or header_size != 64
+            or ph_offset < 64 or ph_size < 56 or not ph_count
+            or ph_offset + ph_size * ph_count > min(size, len(header))):
+        raise Error("CUDA runtime is not a valid Linux x86-64 ELF shared library")
+    dynamic = executable_load = False
+    for index in range(ph_count):
+        offset = ph_offset + ph_size * index
+        segment_type, flags = struct.unpack_from("<II", header, offset)
+        file_offset, _, _, file_size, memory_size, alignment = struct.unpack_from("<QQQQQQ", header, offset + 8)
+        if file_offset + file_size > size or memory_size < file_size:
+            raise Error("CUDA runtime has an invalid ELF segment")
+        if segment_type == 1:
+            if not alignment or alignment & (alignment - 1):
+                raise Error("CUDA runtime has an invalid ELF load alignment")
+            executable_load |= bool(flags & 1 and file_size)
+        elif segment_type == 2:
+            dynamic |= bool(file_size)
+    if not dynamic or not executable_load:
+        raise Error("CUDA runtime lacks dynamic or executable ELF segments")
+
+
+def copy_cuda_runtime(source: Path, target: Path, expected_sha256: str) -> None:
+    nonzero_hex(expected_sha256, 64, "reviewed CUDA runtime SHA-256")
+    with integrity._stable_regular_handle(source, "CUDA runtime") as (_, handle, opened):
+        if not 0 < opened.st_size <= MAX_CUDA_BYTES:
+            raise Error("CUDA runtime exceeds its release limit")
+        validate_cuda_runtime_header(handle.read(integrity.MAX_EXECUTABLE_HEADER_BYTES), opened.st_size)
+        handle.seek(0)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("wb") as output:
+            shutil.copyfileobj(handle, output)
+        identity = file_identity(target)
+        if identity != {"bytes": opened.st_size, "sha256": expected_sha256}:
+            raise Error("CUDA runtime size or SHA-256 differs from the reviewed pin")
+    target.chmod(0o644)
 
 
 def native_output(executable: Path, arguments: list[str], timeout_seconds: float = 15) -> bytes:
@@ -254,6 +369,9 @@ def package_sources(platform: str, kind: str) -> dict[str, str]:
             sources["SERVICE-SETUP.md"] = "packaging/mainnet/linux/SERVICE-SETUP.md"
             for name in ("commonfoundry-mainnet-node.service", "commonfoundry-mainnet-storage.service", "commonfoundry-mainnet-storage.timer"):
                 sources[name] = f"packaging/mainnet/linux/{name}"
+            for name in ("POOL-SERVICE-SETUP.md", "commonfoundry-mainnet-pool.service",
+                         "mainnet-pool-service.py", "mainnet-pool.json.example"):
+                sources[name] = f"packaging/mainnet/linux/{name}"
     else:
         launchers = ("START-MINER.bat", "START-MINER.ps1") if windows else ("start-miner.sh",)
     sources.update({name: f"packaging/mainnet/{directory}/{name}" for name in launchers})
@@ -358,6 +476,10 @@ def assemble(args: argparse.Namespace) -> Path:
     source_paths = package_sources(args.platform, args.kind)
     sources, epoch = source_snapshot(args.repo, commit, source_paths, args.version)
     validate_catalog(sources, plan)
+    dashboard_manifest_bytes = read_regular(args.dashboard_manifest, MAX_INFO, "reviewed dashboard asset manifest")
+    dashboard_manifest = validate_dashboard_manifest(dashboard_manifest_bytes, commit)
+    assets = dashboard_assets(args.dashboard_dist, dashboard_manifest)
+    cuda_pin = nonzero_hex(args.cuda_sha256, 64, "reviewed CUDA runtime SHA-256")
     name = f"commonfoundry-mainnet-{args.kind}-{args.platform}-v{args.version}"
     suffix = ".zip" if args.platform == "windows-x86_64" else ".tar.gz"
     output = args.output / (name + suffix)
@@ -377,6 +499,13 @@ def assemble(args: argparse.Namespace) -> Path:
         sidecar.mkdir()
         (sidecar / "MAINNET-PLAN.json").write_bytes(plan_bytes)
         (sidecar / "MAINNET-APPROVALS.json").write_bytes(manifest_bytes)
+        (sidecar / "DASHBOARD-ASSETS.json").write_bytes(dashboard_manifest_bytes)
+        for relative, data in assets.items():
+            target = stage / "dashboard" / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+            target.chmod(0o644)
+        copy_cuda_runtime(args.cuda_runtime, stage / CUDA_RUNTIME, cuda_pin)
         extension = ".exe" if args.platform == "windows-x86_64" else ""
         binaries = {"cmfd-launch": args.launch}
         if args.kind == "runtime":
@@ -446,8 +575,10 @@ def main() -> None:
     parser.add_argument("--kind", choices=("runtime", "miner"), required=True)
     parser.add_argument("--commit", required=True)
     parser.add_argument("--version", required=True)
-    for name in ("plan", "approval-manifest", "output", "launch", "replay-worker", "relation-worker"):
+    for name in ("plan", "approval-manifest", "output", "launch", "replay-worker", "relation-worker",
+                 "dashboard-dist", "dashboard-manifest", "cuda-runtime"):
         parser.add_argument("--" + name, type=Path, required=True)
+    parser.add_argument("--cuda-sha256", required=True)
     for name in ("node", "wallet", "miner"):
         parser.add_argument("--" + name, type=Path)
     args = parser.parse_args()

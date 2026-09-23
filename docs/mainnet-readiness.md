@@ -597,3 +597,38 @@ key material to the operator's PC remains awaiting explicit approval. Mainnet
 package qualification, public routing, off-host alert/custody arrangements,
 sustained load, mature payout and deep-reorganization tests remain separate
 requirements. No mainnet keys, parameters, pins or launch time were changed.
+
+## September 23 preparation checkpoint (not launch approval)
+
+An isolated rehearsal collector now records a 20 → 5 → 1 GPU worker drop,
+full-proof phase timings, stale/job-switch activity and two-node P2P observations.
+Its report fails closed on missing identity, proof, worker or peer evidence and
+never selects a final difficulty policy. The physical multi-GPU run and its
+independently verified GPU/host identities have **not** happened. The public RC
+pool was not used for this harness.
+
+A separate, staged Linux mainnet pool service now checks the compiled plan,
+signed-package files, GPU identity, fresh TLS material, payout settings and
+RC-service overlap before it can open a pool socket. Mainnet pool startup
+requires the explicit `--enable-mainnet-payouts` flag; the old testnet flag
+cannot activate mainnet settlement. The service has not been installed or
+started. The four-package assembler/preflight now binds a reviewed dashboard
+asset manifest and an exact Linux CUDA-runtime hash; real reviewed assets,
+source-derived reproducibility, signed packages and live payout/reorg tests
+remain outstanding.
+
+An opt-in dual-SM89/SM120 proof-worker build path produced candidate replay and
+proof binaries from the pinned SP1 source/patch and a clean pinned CUTLASS
+worktree. `cuobjdump` found both architecture images in each candidate. Neither
+GPU generation has run a complete proof from the final signed package; the
+candidate hashes are not release identities. The older private SM89 AI01
+worker and published SM120-only RC worker are not substitutes for that gate.
+
+Current local checks include the mainnet Python suite on Windows and Linux
+(98 tests on each, with platform-specific skips), three native Windows guided
+reward-custody tests using disposable keys, 59 focused ProductionV4 pool tests,
+strict node/miner Clippy and the dashboard build. They are internal component
+evidence, not a green final-source CI run or an actual mainnet rehearsal. The
+two real reward wallets and final pins are still absent. The separate VPS seed
+had 294,014,058,496 bytes free on September 22, below the documented 30-day
+unpruned sizing scenario; capacity and retention still need an operator choice.

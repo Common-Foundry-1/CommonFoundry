@@ -102,6 +102,8 @@ stage with the four archives and these exact public evidence filenames:
 - MAINNET-PLAN.json, MAINNET-APPROVALS.json
 - MAINNET-QUALIFICATION-SUBJECT.json, MAINNET-APPROVAL-TRUST.json
 - PRODUCTION-V4-REVIEWED-PIN.review
+- DASHBOARD-ASSETS.json (the exact reviewed dashboard manifest used for all four packages)
+- CUDA-RUNTIME-SHA256.txt (the exact reviewed Linux x86-64 `libcudart.so.12` SHA-256, lowercase hex plus newline)
 - MAINNET-PLAN-PRODUCER-APPROVAL.json and its .sig
 - MAINNET-PLAN-REPRODUCER-APPROVAL.json and its .sig
 - MAINNET-PRODUCER.allowed_signers, MAINNET-REPRODUCER.allowed_signers

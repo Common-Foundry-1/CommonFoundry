@@ -9,11 +9,31 @@ Pinned dependencies:
 - SP1 `92b8eabaea9ab7306da5826caa700adabf7445ba`, plus
   `patches/sp1-gpu-production-v4.patch`;
 - CUTLASS 3.9.2 commit `ad7b2f5e84fcfa124cb02b91d5bd26d238c0459e`;
-- CUDA 12.8 and `sm_120`.
+- CUDA 12.8; the existing RC build targets `sm_120`.
 
 Run `prepare-dependencies.sh` once in a clean Ubuntu-22.04 WSL environment, then run `build.sh`.
 Both scripts fail closed if their pinned checkout identities do not match. The build emits the
 three Rust tools plus `cmfd-v4-replay` and `cmfd-v4-fixed-row-cache` under `target/release`.
+
+For a prospective **single worker set with native SM89 and SM120 code images**, run
+`build.sh --dual-arch` from the same pinned dependency checkouts. This opt-in mode passes
+`CUDA_ARCHS=89;120` to the Rust/SP1 build, gives both standalone CUDA tools explicit
+`compute_89 -> sm_89` and `compute_120 -> sm_120` `nvcc -gencode` targets, and writes to
+`target/dual-sm89-sm120/release`. Its separate Cargo target directory prevents a cached
+SM120-only dependency from being packaged as a dual-architecture worker. The ordinary
+`build.sh` command and its `target/release` output remain SM120-only. Both modes print
+SHA-256 digests of their actual worker bytes after successful compilation; this output is
+an unsigned build record, not an approved release identity.
+
+`build.sh --dual-arch --print-build-plan` emits the exact Cargo and `nvcc` arguments
+without checking out dependencies, compiling, or opening a GPU. Run
+`bash test-build-arguments.sh` for isolated default/dual argument assertions and
+`bash -n build.sh test-build-arguments.sh` for shell syntax. Before any mainnet
+signature or package pin, inspect the resulting binaries for **both** native CUDA code
+images and perform independent replay, proof generation, CPU proof verification, and
+block-admission qualification on an SM89 RTX 4090 and an SM120 RTX 50-series host.
+The argument test alone cannot establish CUDA/SP1 compatibility, byte-for-byte
+reproducibility, GPU performance, or safe runtime deployment.
 
 The online proving path is:
 

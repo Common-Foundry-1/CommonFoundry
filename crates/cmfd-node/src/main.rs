@@ -715,9 +715,12 @@ enum Command {
         /// Run the V4 pool workers through this WSL distribution.
         #[arg(long)]
         production_v4_pool_wsl_distribution: Option<String>,
-        /// Enable automatic on-chain settlement of authenticated Devnet share credits.
-        #[arg(long)]
+        /// Enable automatic on-chain settlement of authenticated test-network share credits.
+        #[arg(long, conflicts_with = "enable_mainnet_payouts")]
         enable_testnet_payouts: bool,
+        /// Explicitly enable automatic settlement for a mainnet pool; required on mainnet.
+        #[arg(long, conflicts_with = "enable_testnet_payouts")]
+        enable_mainnet_payouts: bool,
         /// Minimum earned atoms settled to one authenticated payout key.
         #[arg(long, default_value_t = DEFAULT_POOL_MINIMUM_PAYOUT_ATOMS)]
         pool_minimum_payout_atoms: u64,
@@ -1782,6 +1785,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             production_v4_pool_scratch,
             production_v4_pool_wsl_distribution,
             enable_testnet_payouts,
+            enable_mainnet_payouts,
             pool_minimum_payout_atoms,
             pool_payout_fee_atoms,
             pool_operator_fee_bps,
@@ -1795,6 +1799,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             shutdown_request_file,
         } => {
             require_pool_mining_profile()?;
+            let automatic_payouts = pool_payouts_enabled(
+                enable_testnet_payouts,
+                enable_mainnet_payouts,
+                cfg!(feature = "production-mainnet"),
+            )?;
             let (peers, allow_public_peers) =
                 effective_operational_peers(peers, allow_public_peers, no_default_seeds)?;
             let shutdown =
@@ -1879,7 +1888,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 operator_fee_bps: pool_operator_fee_bps,
                 window_shares: pool_pplns_window_shares,
             });
-            if enable_testnet_payouts {
+            if automatic_payouts {
                 config.payout_policy = Some(PoolPayoutPolicy {
                     minimum_payout_atoms: pool_minimum_payout_atoms,
                     fee_atoms: pool_payout_fee_atoms,
@@ -1920,6 +1929,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "certificate_sha256": hex::encode(pin),
                     "share_leading_zero_bits": share_leading_zero_bits,
                     "block_reward_destination": hex::encode(miner_destination),
+                    "automatic_payouts": automatic_payouts,
                     "automatic_testnet_payouts": enable_testnet_payouts,
                     "address_only_payouts": allow_address_only_payouts,
                     "minimum_payout_atoms": pool_minimum_payout_atoms,
@@ -2768,6 +2778,24 @@ fn require_pool_mining_profile() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+fn pool_payouts_enabled(
+    enable_testnet_payouts: bool,
+    enable_mainnet_payouts: bool,
+    mainnet_build: bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    if mainnet_build {
+        if enable_testnet_payouts {
+            return Err("--enable-testnet-payouts cannot enable mainnet settlement".into());
+        }
+        if !enable_mainnet_payouts {
+            return Err("mainnet pool-serve requires --enable-mainnet-payouts".into());
+        }
+    } else if enable_mainnet_payouts {
+        return Err("--enable-mainnet-payouts requires a production-mainnet build".into());
+    }
+    Ok(enable_testnet_payouts || enable_mainnet_payouts)
+}
+
 fn peer_warning(allow_public_peers: bool) -> String {
     if allow_public_peers {
         format!(
@@ -2786,6 +2814,29 @@ fn peer_warning(allow_public_peers: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pool_payout_activation_is_explicit_and_network_specific() {
+        assert!(!pool_payouts_enabled(false, false, false).unwrap());
+        assert!(pool_payouts_enabled(true, false, false).unwrap());
+        assert!(pool_payouts_enabled(false, true, true).unwrap());
+        assert!(pool_payouts_enabled(false, false, true).is_err());
+        assert!(pool_payouts_enabled(true, false, true).is_err());
+        assert!(pool_payouts_enabled(false, true, false).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "cmfd-node",
+                "pool-serve",
+                "--certificate",
+                "certificate.der",
+                "--private-key",
+                "private-key.der",
+                "--enable-testnet-payouts",
+                "--enable-mainnet-payouts",
+            ])
+            .is_err()
+        );
+    }
 
     #[cfg(feature = "production-v4")]
     #[test]

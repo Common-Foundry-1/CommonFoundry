@@ -1119,6 +1119,7 @@ fn run_production_v4_pool_miner(options: ProductionV4PoolMinerOptions) -> Result
             &stop,
             &mut statistics,
             report_interval,
+            &options.worker,
         ) {
             Ok(()) => break,
             Err(error) if pool_error_is_reconnectable(&error) => {
@@ -1146,15 +1147,39 @@ fn mine_production_v4_pool_session(
     stop: &AtomicBool,
     statistics: &mut PoolMinerStatistics,
     report_interval: Duration,
+    worker: &str,
 ) -> Result<(), PoolError> {
     let mut job_id = None;
     let mut next_nonce = 0_u64;
     let mut remote_credited_atoms = 0_u64;
+    let mut job_started = Instant::now();
+    let mut job_completed_work_base = statistics.completed_work;
+    let mut job_search_time_base = statistics.search_time;
     while !stop.load(Ordering::Acquire) {
         let job = client.current_job().clone();
         if job_id != Some(job.job_id) {
+            if let Some(previous_job_id) = job_id
+                && std::env::var("CMFD_DROPOUT_REHEARSAL_TELEMETRY").as_deref() == Ok("1")
+            {
+                eprintln!(
+                    "CMFD_DROPOUT_MINER_JOB_SWITCH {}",
+                    serde_json::json!({
+                        "network_id": hex::encode(COMPILED_NETWORK_PROFILE.network_id),
+                        "worker": worker,
+                        "previous_job_id": hex::encode(previous_job_id),
+                        "new_job_id": hex::encode(job.job_id),
+                        "new_height": job.challenge.height,
+                        "previous_job_reported_work_units": statistics.completed_work.saturating_sub(job_completed_work_base),
+                        "previous_job_search_seconds": statistics.search_time.saturating_sub(job_search_time_base).as_secs_f64(),
+                        "previous_job_elapsed_seconds": job_started.elapsed().as_secs_f64(),
+                    })
+                );
+            }
             job_id = Some(job.job_id);
             next_nonce = client.initial_nonce_for_job(&job);
+            job_started = Instant::now();
+            job_completed_work_base = statistics.completed_work;
+            job_search_time_base = statistics.search_time;
         }
         let search_started = Instant::now();
         let scheduled_work = scheduled_pool_search_work(next_nonce);
@@ -1174,7 +1199,32 @@ fn mine_production_v4_pool_session(
         );
 
         let nonce = match result {
-            PoolWorkSearchResult::Found { nonce, .. } => nonce,
+            PoolWorkSearchResult::Found {
+                nonce,
+                meets_chain_target,
+                ..
+            } => {
+                // Diagnostic output only: no search, share, or consensus path
+                // depends on this opt-in, untrusted operator evidence.
+                if meets_chain_target
+                    && std::env::var("CMFD_DROPOUT_REHEARSAL_TELEMETRY").as_deref() == Ok("1")
+                {
+                    eprintln!(
+                        "CMFD_DROPOUT_MINER_WINNER {}",
+                        serde_json::json!({
+                            "network_id": hex::encode(COMPILED_NETWORK_PROFILE.network_id),
+                            "worker": worker,
+                            "height": job.challenge.height,
+                            "job_id": hex::encode(job.job_id),
+                            "nonce": nonce,
+                            "worker_job_reported_work_units": statistics.completed_work.saturating_sub(job_completed_work_base),
+                            "worker_job_search_seconds": statistics.search_time.saturating_sub(job_search_time_base).as_secs_f64(),
+                            "worker_job_elapsed_seconds": job_started.elapsed().as_secs_f64(),
+                        })
+                    );
+                }
+                nonce
+            }
             PoolWorkSearchResult::Cancelled { .. } => return Ok(()),
             PoolWorkSearchResult::Exhausted { .. } => {
                 match client.receive() {

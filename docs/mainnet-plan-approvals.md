@@ -103,6 +103,7 @@ stage with the four archives and these exact public evidence filenames:
 - MAINNET-QUALIFICATION-SUBJECT.json, MAINNET-APPROVAL-TRUST.json
 - PRODUCTION-V4-REVIEWED-PIN.review
 - DASHBOARD-ASSETS.json (the exact reviewed dashboard manifest used for all four packages)
+- DASHBOARD-BUILD-EVIDENCE.json (the canonical isolated-build record bound to the frozen dashboard source, lockfile and manifest)
 - CUDA-RUNTIME-SHA256.txt (the exact reviewed Linux x86-64 `libcudart.so.12` SHA-256, lowercase hex plus newline)
 - MAINNET-PLAN-PRODUCER-APPROVAL.json and its .sig
 - MAINNET-PLAN-REPRODUCER-APPROVAL.json and its .sig
@@ -113,6 +114,11 @@ Prepare the dashboard manifest from the exact clean frozen commit with
 [`mainnet-dashboard-assets.md`](mainnet-dashboard-assets.md). Its build record
 is first-person toolchain evidence, not a substitute for independent package
 reproduction or a release approval.
+The release gate requires and validates the exact build record in both stages.
+Its digest enters the independent reproduction statement, release inventory and
+final signed checksum chain. The record contains absolute Node/npm executable
+paths, which may reveal builder usernames or filesystem layout when published;
+review it for disclosure before staging and signing.
 
 Use `scripts/mainnet_release.py` with `--repo`, `--commit`, `--version`,
 `--producer-stage`, `--reproducer-stage`, `--ssh-keygen`,

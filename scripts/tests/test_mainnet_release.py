@@ -15,6 +15,7 @@ import generate_mainnet_pins as pins
 import mainnet_plan_approval as approval
 import mainnet_release as release
 import package_mainnet as package
+import prepare_mainnet_dashboard as dashboard
 import production_v4_activation_approval as signatures
 import test_generate_mainnet_pins as pin_fixtures
 
@@ -37,9 +38,23 @@ class MainnetReleaseTests(unittest.TestCase):
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes((real_repo / relative).read_bytes().replace(b"\r\n", b"\n"))
         for relative in (*package.integrity.SOURCE_LOCK_FILES, "scripts/release_integrity.py"):
+            if relative == "apps/pool-dashboard/package-lock.json":
+                continue
             target = self.repo / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes((real_repo / relative).read_bytes().replace(b"\r\n", b"\n"))
+        dashboard_package = {"name": "fixture-pool-dashboard", "version": "1.0.0"}
+        dashboard_lock = {**dashboard_package, "lockfileVersion": 3,
+                          "packages": {"": dashboard_package}}
+        for name, blob in {
+            "package.json": package.canonical(dashboard_package),
+            "package-lock.json": package.canonical(dashboard_lock),
+            "index.html": b"<div id='root'></div>\n",
+            "vite.config.ts": b"export default {};\n",
+        }.items():
+            target = self.repo / "apps/pool-dashboard" / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(blob)
         self.inventory = self.repo / "packaging/releases/mainnet.inventory"
         self.inventory.parent.mkdir(parents=True, exist_ok=True)
         inventory_names = release.BASE_EVIDENCE | set(release.archive_names("1.0.0").values()) | {release.REPRODUCTION, release.REPRODUCTION_SIGNATURE}
@@ -71,6 +86,23 @@ class MainnetReleaseTests(unittest.TestCase):
         dashboard_manifest = json.loads(fixture.dashboard_manifest_path.read_bytes())
         dashboard_manifest["source_commit"] = self.commit
         fixture.dashboard_manifest_path.write_bytes(package.canonical(dashboard_manifest))
+        frozen_dashboard = dashboard.frozen_sources(self.repo, self.commit)
+        dashboard_evidence_path = self.root / release.DASHBOARD_BUILD_EVIDENCE
+        dashboard_evidence_path.write_bytes(package.canonical({
+            "schema": dashboard.EVIDENCE_SCHEMA, "source_commit": self.commit,
+            "source_tree_sha256": hashlib.sha256(package.canonical({
+                name: dashboard.identity(blob) for name, blob in frozen_dashboard.items()})).hexdigest(),
+            "package_lock": dashboard.identity(frozen_dashboard["package-lock.json"]),
+            "toolchain": {"node": {"executable": "/usr/bin/node", "version": "v22.0.0"},
+                          "npm": {"executable": "/usr/bin/npm", "version": "11.0.0"}},
+            "commands": [{"argv": ["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"],
+                          "combined_output_bytes": 2, "combined_output_sha256": hashlib.sha256(b"ci").hexdigest()},
+                         {"argv": ["npm", "run", "build"],
+                          "combined_output_bytes": 5, "combined_output_sha256": hashlib.sha256(b"built").hexdigest()}],
+            "dashboard_manifest": dashboard.identity(fixture.dashboard_manifest_path.read_bytes()),
+            "dist_mode": "created_from_isolated_build", "independent_reproduction_claim": False,
+            "release_approved": False,
+        }))
         cuda_pin_path = self.root / release.CUDA_RUNTIME_PIN
         cuda_pin_path.write_bytes((fixture.cuda_sha256 + "\n").encode())
         fixture.plan = self.fixture.plan
@@ -89,6 +121,7 @@ class MainnetReleaseTests(unittest.TestCase):
                     release.QUALIFICATION: self.fixture.qualification_path, release.TRUST: self.fixture.trust_path,
                     release.PROOF_PIN: self.fixture.proof_path,
                     release.DASHBOARD_ASSETS: fixture.dashboard_manifest_path,
+                    release.DASHBOARD_BUILD_EVIDENCE: dashboard_evidence_path,
                     release.CUDA_RUNTIME_PIN: cuda_pin_path}
         for role, prefix in ((signatures.PRODUCER_ROLE, "producer"), (signatures.REPRODUCER_ROLE, "reproducer")):
             names = release.ROLE_FILES[role]
@@ -125,6 +158,8 @@ class MainnetReleaseTests(unittest.TestCase):
         files = package.integrity._stage_files(self.first)
         checked = release.validate_release(**self.common(), files=files)
         self.assertEqual(checked["statement"]["source_commit"], self.commit)
+        self.assertEqual(checked["statement"]["review_evidence"][release.DASHBOARD_BUILD_EVIDENCE],
+                         package.file_identity(self.first / release.DASHBOARD_BUILD_EVIDENCE))
         # The ordinary finalizer/verification entry point must not skip mainnet.
         package.integrity.validate_production_rc_artifacts(version="1.0.0", commit=self.commit,
             stage_files=files, repo=self.repo, activation_ssh_keygen=self.plan_fixture.verifier,
@@ -148,6 +183,44 @@ class MainnetReleaseTests(unittest.TestCase):
         manifest.write_bytes(package.canonical(value))
         with self.assertRaisesRegex(package.Error, "frozen source commit"):
             self.prepare()
+
+    def test_dashboard_build_evidence_is_required_and_bound_to_frozen_inputs(self):
+        path = self.first / release.DASHBOARD_BUILD_EVIDENCE
+        original = path.read_bytes()
+        path.unlink()
+        with self.assertRaisesRegex(package.Error, "inventory"):
+            self.prepare()
+        path.write_bytes(original)
+        for field, value, message in (
+            ("source_commit", "b" * 40, "frozen source commit"),
+            ("source_tree_sha256", "b" * 64, "frozen source tree"),
+            ("package_lock", {"bytes": 1, "sha256": "b" * 64}, "package-lock.json"),
+            ("dashboard_manifest", {"bytes": 1, "sha256": "b" * 64}, "DASHBOARD-ASSETS.json"),
+            ("release_approved", True, "cannot claim"),
+            ("commands", [], "command sequence"),
+            ("unexpected", "field", "unexpected fields"),
+        ):
+            with self.subTest(field=field):
+                record = json.loads(original)
+                record[field] = value
+                path.write_bytes(package.canonical(record))
+                with self.assertRaisesRegex(package.Error, message):
+                    self.prepare()
+        path.write_bytes(original)
+        with self.assertRaisesRegex(package.Error, "not canonical"):
+            path.write_bytes(json.dumps(json.loads(original), indent=2).encode())
+            self.prepare()
+        path.write_bytes(original)
+
+    def test_dashboard_build_record_is_bound_by_reproduction_signature(self):
+        self.prepare()
+        self.sign_reproduction()
+        path = self.first / release.DASHBOARD_BUILD_EVIDENCE
+        record = json.loads(path.read_bytes())
+        record["toolchain"]["node"]["version"] = "v22.1.0"
+        path.write_bytes(package.canonical(record))
+        with self.assertRaisesRegex(package.Error, "exact staged release"):
+            release.validate_release(**self.common(), files=package.integrity._stage_files(self.first))
 
     def test_standard_finalizer_cli_runs_the_mainnet_gate_and_generates_checksums(self):
         self.prepare()

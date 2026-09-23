@@ -101,6 +101,11 @@ device access, so this unit does not use `PrivateDevices=true`; it instead runs
 as the dedicated unprivileged account with only `video`/`render` groups and a
 read-only filesystem outside those two paths. Review actual device access and
 systemd sandbox behavior on AI01 before launch.
+The dual-arch candidate proof worker dynamically requires the packaged
+`libcudart.so.12` plus host `libstdc++`, `libgcc_s`, glibc and the NVIDIA driver;
+the replay worker requires the standard host libraries. The mainnet package
+does not bundle a GPU driver. Inspect dynamic dependencies and run a complete
+proof under the actual service identity on the target driver before release.
 
 ## How startup is gated
 

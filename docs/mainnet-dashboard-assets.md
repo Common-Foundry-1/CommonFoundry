@@ -44,7 +44,12 @@ commands have timeouts.
 source-tree digest, Node/npm executable paths and versions, combined command-output
 digests, and manifest digest. It is a **first-person build record**, not a
 signature, independent reproduction, mainnet approval, or proof that npm
-dependencies are trustworthy. Review it with the assets and the lockfile. A
+dependencies are trustworthy. The release gate rejects a missing, malformed or
+noncanonical record and checks its frozen commit, source tree, lockfile and
+asset-manifest bindings. The exact record is included in the independent
+reproduction statement and signed release inventory. Its absolute executable
+paths may disclose builder usernames or filesystem layout, so review it before
+publication alongside the assets and lockfile. A
 separate operator must independently rebuild and review the final packages
 for the mainnet reproduction gate described in
 [`mainnet-plan-approvals.md`](mainnet-plan-approvals.md). This helper does not

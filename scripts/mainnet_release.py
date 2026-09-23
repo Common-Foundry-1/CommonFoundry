@@ -7,12 +7,15 @@ The actual independent reproducer must review and sign the resulting statement.
 from __future__ import annotations
 
 import argparse
+import hashlib
 from pathlib import Path
+import re
 import tempfile
 
 import generate_mainnet_pins as pins
 import mainnet_plan_approval as approval
 import package_mainnet as package
+import prepare_mainnet_dashboard as dashboard
 import production_v4_activation_approval as signatures
 import verify_mainnet_packages as preflight
 
@@ -25,6 +28,7 @@ QUALIFICATION = "MAINNET-QUALIFICATION-SUBJECT.json"
 TRUST = "MAINNET-APPROVAL-TRUST.json"
 PROOF_PIN = "PRODUCTION-V4-REVIEWED-PIN.review"
 DASHBOARD_ASSETS = "DASHBOARD-ASSETS.json"
+DASHBOARD_BUILD_EVIDENCE = "DASHBOARD-BUILD-EVIDENCE.json"
 CUDA_RUNTIME_PIN = "CUDA-RUNTIME-SHA256.txt"
 REPRODUCTION = "MAINNET-REPRODUCTION.json"
 REPRODUCTION_SIGNATURE = REPRODUCTION + ".sig"
@@ -35,6 +39,7 @@ ROLE_FILES = {
     "independent_reproducer": ("MAINNET-PLAN-REPRODUCER-APPROVAL.json", "MAINNET-PLAN-REPRODUCER-APPROVAL.json.sig", "MAINNET-REPRODUCER.allowed_signers"),
 }
 BASE_EVIDENCE = {PLAN, MANIFEST, QUALIFICATION, TRUST, PROOF_PIN, DASHBOARD_ASSETS,
+                 DASHBOARD_BUILD_EVIDENCE,
                  CUDA_RUNTIME_PIN} | {name for names in ROLE_FILES.values() for name in names}
 GENERATED = {integrity.BUILDINFO_NAME, integrity.SOURCE_SBOM_NAME, integrity.PROVENANCE_NAME,
              integrity.CHECKSUM_NAME, integrity.CHECKSUM_SIGNATURE_NAME}
@@ -53,6 +58,58 @@ def plan_material(files: dict, trust: dict, verifier: Path) -> dict:
         result.update({prefix + "_approval": files[request], prefix + "_signature": files[signature],
                        prefix + "_allowed_signers": files[policy], prefix + "_signer_identity": trust[role]["signer_identity"]})
     return result
+
+
+def validate_dashboard_build_evidence(*, repo: Path, commit: str, data: bytes,
+                                      manifest: bytes) -> dict:
+    """Bind the first-person build record to the exact frozen dashboard source and assets."""
+    evidence = package.strict_json(data, "dashboard build evidence", signatures.MAX_JSON_BYTES)
+    fields = {"schema", "source_commit", "source_tree_sha256", "package_lock",
+              "toolchain", "commands", "dashboard_manifest", "dist_mode",
+              "independent_reproduction_claim", "release_approved"}
+    if package.canonical(evidence) != data or set(evidence) != fields:
+        raise Error("dashboard build evidence is not canonical or has unexpected fields")
+    if evidence["schema"] != dashboard.EVIDENCE_SCHEMA or evidence["source_commit"] != commit:
+        raise Error("dashboard build evidence does not bind the frozen source commit")
+    sources = dashboard.frozen_sources(repo, commit)
+    source_tree = hashlib.sha256(package.canonical(
+        {name: dashboard.identity(blob) for name, blob in sources.items()})).hexdigest()
+    if evidence["source_tree_sha256"] != source_tree:
+        raise Error("dashboard build evidence does not bind the frozen source tree")
+    if evidence["package_lock"] != dashboard.identity(sources["package-lock.json"]):
+        raise Error("dashboard build evidence does not bind the frozen package-lock.json")
+    if evidence["dashboard_manifest"] != dashboard.identity(manifest):
+        raise Error("dashboard build evidence does not bind DASHBOARD-ASSETS.json")
+    toolchain = evidence["toolchain"]
+    if not isinstance(toolchain, dict) or set(toolchain) != {"node", "npm"}:
+        raise Error("dashboard build evidence has an invalid toolchain")
+    for name, record in toolchain.items():
+        if not isinstance(record, dict) or set(record) != {"executable", "version"}:
+            raise Error(f"dashboard build evidence has an invalid {name} toolchain record")
+        executable, version = record["executable"], record["version"]
+        if (not isinstance(executable, str) or not 0 < len(executable) <= 4096
+                or any(ord(char) < 32 for char in executable)
+                or not isinstance(version, str)
+                or not re.fullmatch(r"v?\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?", version)):
+            raise Error(f"dashboard build evidence has invalid {name} toolchain metadata")
+    commands = evidence["commands"]
+    expected = (["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"],
+                ["npm", "run", "build"])
+    if not isinstance(commands, list) or len(commands) != len(expected):
+        raise Error("dashboard build evidence has an invalid command sequence")
+    for record, argv in zip(commands, expected):
+        if (not isinstance(record, dict)
+                or set(record) != {"argv", "combined_output_bytes", "combined_output_sha256"}
+                or record["argv"] != argv
+                or type(record["combined_output_bytes"]) is not int
+                or not 0 <= record["combined_output_bytes"] <= dashboard.MAX_TOOL_OUTPUT):
+            raise Error("dashboard build evidence has an invalid command record")
+        package.nonzero_hex(record["combined_output_sha256"], 64, "dashboard command output SHA-256")
+    if evidence["dist_mode"] not in ("created_from_isolated_build", "compared_existing"):
+        raise Error("dashboard build evidence has an invalid dist mode")
+    if evidence["independent_reproduction_claim"] is not False or evidence["release_approved"] is not False:
+        raise Error("dashboard build evidence cannot claim independent reproduction or release approval")
+    return evidence
 
 
 def validate_base(*, repo: Path, commit: str, version: str, files: dict,
@@ -89,6 +146,9 @@ def validate_base(*, repo: Path, commit: str, version: str, files: dict,
         if integrity._tracked_blob_at(repo, commit, relative) != candidates[name]:
             raise Error("committed mainnet pins are not the exact reviewed candidates")
     package.validate_dashboard_manifest(snapshots[DASHBOARD_ASSETS].data, commit)
+    validate_dashboard_build_evidence(repo=repo, commit=commit,
+                                      data=snapshots[DASHBOARD_BUILD_EVIDENCE].data,
+                                      manifest=snapshots[DASHBOARD_ASSETS].data)
     cuda_pin_bytes = snapshots[CUDA_RUNTIME_PIN].data
     try:
         cuda_pin = cuda_pin_bytes.decode("ascii").removesuffix("\n")

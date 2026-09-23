@@ -718,9 +718,9 @@ See [the current one-signer workflow](mainnet-plan-approvals.md). Actual proof
 qualification, signing, final pins/packages and deployment remain separate from
 the fixture tests of this policy change.
 
-`packaging/mainnet/APPROVAL-TRUST.json` records the existing owner's dedicated
-producer public key, with the exact public policy beside it. No private key was
-copied or generated. The current Windows OpenSSH verifier has SHA-256
+The initial `packaging/mainnet/APPROVAL-TRUST.json` reused the owner's dedicated
+RC producer key. That pending mainnet selection was subsequently replaced with
+the owner's explicit permission, as recorded below. The Windows OpenSSH verifier has SHA-256
 `47f009c35523b6997aff0f0528dae84f1545465479d722292499941cd5cb83b5`
 and a valid Microsoft Windows Authenticode signature at inspection. That is a
 new, explicit mainnet verifier pin; it does not replace the earlier RC verifier
@@ -750,3 +750,21 @@ are preparation metadata, not a published tag, release or deployed upgrade.
 Final owner signing, pin application, native builds, internal rebuild comparison,
 CI, package smoke and deployment remain outstanding. Existing live RC services
 and public release assets remain unchanged.
+
+## Owner-selected initial mainnet signing key
+
+Before any mainnet release or plan signature was published, the owner explicitly
+authorized replacing the pending release-signing key and signing the unchanged
+launch plan with the replacement. The new Ed25519 key fingerprint is
+`SHA256:hhfV/4M5XDL2hLzeX0q/IMCR4fjSq5Kb8BjMC/Zj96Q`, with principal
+`commonfoundry-mainnet-owner`. The public policy and trust descriptor agree.
+`packaging/mainnet/SIGNER-SELECTION.json` records this initial mainnet authority
+selection; no cross-signature from the former pending key is claimed.
+
+The owner chose a new password in a local window. The operator helper saved and
+authenticated the encrypted OpenSSH key and a separately encrypted backup.
+Neither a password nor private key file was added to source. The old signing
+key and existing RC release authorities remain untouched. The steward/community
+wallets, their passwords, the exact launch-plan bytes and the October 2/3 noon
+CDT schedule are unchanged. This records key selection, not publication or
+network activation; final release qualification is still required.

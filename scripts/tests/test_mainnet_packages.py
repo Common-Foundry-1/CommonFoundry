@@ -455,7 +455,7 @@ class CommittedOwnerPlanTests(unittest.TestCase):
                                for name, path in packages.package_sources(platform, kind).items()}
                     packages.validate_catalog(sources, self.plan)
 
-    def test_committed_release_policy_has_only_the_existing_owner_key(self):
+    def test_committed_release_policy_has_only_the_selected_mainnet_owner_key(self):
         encoded = (self.root / "APPROVAL-TRUST.json").read_bytes()
         trust = packages.strict_json(encoded, "mainnet owner trust")
         self.assertEqual(packages.canonical(trust), encoded)
@@ -466,7 +466,7 @@ class CommittedOwnerPlanTests(unittest.TestCase):
                          signer_identity=trust["producer"]["signer_identity"], role="producer")}
         self.assertEqual(authority, trust["producer"])
         self.assertEqual(authority["key_blob_sha256"],
-                         "14b57b0e4b74ec4d6227105d4d963844bb857d8e1115717aadc9226efce14348")
+                         "8617d5ff83395c32f684bcde5f4abf20c091e1f8d2ab929bf018cc0bf663f7a4")
         packages.nonzero_hex(trust["ssh_keygen_sha256"], 64, "mainnet SSH verifier digest")
 
     def test_custody_record_is_public_only_and_matches_each_plan_role(self):

@@ -45,6 +45,24 @@ model inputs, waits for the authenticated launch certificate, then connects.
 Windows GPU mining uses WSL2 Ubuntu-22.04 with NVIDIA support. Linux GPU mining
 needs a compatible NVIDIA driver. Normal wallet operations do not require them.
 
+For a multi-GPU rig, run one miner process per GPU. List the physical indices
+and full UUIDs with `nvidia-smi --query-gpu=index,uuid --format=csv,noheader`.
+Set a different `GPU` in each Windows BAT copy, or start separate Linux
+terminals with `CMFD_GPU=0 ./start-miner.sh` and
+`CMFD_GPU=1 ./start-miner.sh`. Full `GPU-...` UUIDs also work and are preferable
+when GPU enumeration may change. The miner verifies the selector against
+`nvidia-smi`, passes that exact GPU UUID to the CUDA replay process, and reports
+power and temperature for that physical GPU. Selected processes get distinct
+`.gpuN` pool-worker names, scratch directories, and logs under `work/logs`.
+Leaving GPU blank preserves the original single-GPU default (GPU 0 and the
+unsuffixed worker name). A user-scoped lock keyed by physical GPU UUID stops
+the same card from starting twice under index/UUID aliases or separate package
+copies; a second lock prevents sharing one scratch directory.
+If two copies attempt to prepare the shared model bank simultaneously, later
+copies wait with periodic progress reports, then revalidate the completed bank.
+The wait is capped at one hour; a timeout never uses partial inputs. A crash
+releases the OS lock, so rerun the launcher to resume authenticated setup.
+
 Wallet solo mining additionally needs approximately 61 GB of model inputs.
 Close the wallet, run PREPARE-MINING.bat (Windows) or ./prepare-mining.sh (Linux),
 then reopen it. The GPU workers are included in the package; the preparation

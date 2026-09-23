@@ -4,8 +4,12 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
+import shutil
+import subprocess
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -22,6 +26,71 @@ def sha256(value: bytes) -> str:
 
 
 class ProductionV4InputTests(unittest.TestCase):
+    def test_model_preparation_lock_fails_closed_and_releases(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "inputs"
+            with INPUTS.preparation_lock(destination):
+                with self.assertRaisesRegex(OSError, "timed out waiting"):
+                    with INPUTS.preparation_lock(destination, wait_seconds=0):
+                        pass
+            with INPUTS.preparation_lock(destination):
+                self.assertTrue((destination / ".prepare-v4-inputs.lock").is_file())
+
+    def test_model_preparation_waits_for_first_writer_then_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "inputs"
+            held = threading.Event()
+            release = threading.Event()
+
+            def first_writer() -> None:
+                with INPUTS.preparation_lock(destination):
+                    held.set()
+                    release.wait(3)
+
+            writer = threading.Thread(target=first_writer)
+            writer.start()
+            self.assertTrue(held.wait(2))
+            timer = threading.Timer(0.2, release.set)
+            timer.start()
+            try:
+                with INPUTS.preparation_lock(destination, wait_seconds=3):
+                    self.assertTrue((destination / ".prepare-v4-inputs.lock").is_file())
+            finally:
+                release.set()
+                writer.join(3)
+                timer.join(3)
+            self.assertFalse(writer.is_alive())
+
+    @unittest.skipUnless(os.name == "nt", "PowerShell model preparation test is Windows-only")
+    def test_windows_model_preparation_lock_times_out_before_shared_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            stage = Path(temporary) / "stage"
+            stage.mkdir()
+            source = SCRIPT.parents[1]
+            shutil.copyfile(source / "packaging/production-v4-testnet/windows/PREPARE-V4-INPUTS.ps1", stage / "PREPARE-V4-INPUTS.ps1")
+            for name in ("V4-INPUT-CHUNKS.json", "production-v4-rcnet-1-inputs.json", INPUTS.FIXED_RECORD_NAME):
+                shutil.copyfile(source / "packaging/production-v4-pool/shared" / name, stage / name)
+            destination = Path(temporary) / "inputs"
+            powershell = str(Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe")
+            command = r'''
+$ErrorActionPreference = 'Stop'
+Import-Module Microsoft.PowerShell.Utility -ErrorAction Stop
+New-Item -ItemType Directory -Force -Path $env:CMFD_TEST_DEST | Out-Null
+$lock = [IO.File]::Open((Join-Path $env:CMFD_TEST_DEST '.prepare-v4-inputs.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+try {
+  try {
+    & (Join-Path $env:CMFD_TEST_STAGE 'PREPARE-V4-INPUTS.ps1') -Role PoolMiner -Destination $env:CMFD_TEST_DEST -PreparationWaitSeconds 0 -ReleaseBase 'https://invalid.example'
+    throw 'The second preparer unexpectedly acquired the lock.'
+  } catch {
+    if ($_.Exception.Message -notlike '*Timed out waiting for model preparation*') { throw }
+  }
+} finally { $lock.Dispose() }
+'''
+            env = dict(os.environ, CMFD_TEST_STAGE=str(stage), CMFD_TEST_DEST=str(destination))
+            result = subprocess.run([powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command], env=env, capture_output=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse((destination / "MODEL-V2.bank.partial").exists())
+
     def test_default_mirror_uses_the_public_binary_repository(self) -> None:
         root = SCRIPT.parents[1]
         expected = "https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/download/v0.1.0-rc.1"

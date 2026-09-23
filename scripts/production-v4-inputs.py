@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -12,12 +13,61 @@ from pathlib import Path, PurePosixPath
 import shutil
 import subprocess
 import sys
+import time
 
 
 BUFFER_BYTES = 8 * 1024 * 1024
 EXPECTED_RELEASE = "v0.1.0-rc.1"
 EXPECTED_NETWORK = "CommonFoundry RCNet-1"
 FIXED_RECORD_NAME = "FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json"
+
+
+@contextmanager
+def preparation_lock(destination: Path, wait_seconds: float = 3600):
+    """Serialize writers; a crashed owner releases its OS lock automatically."""
+    if wait_seconds < 0 or wait_seconds > 7200:
+        raise ValueError("model preparation wait must be between 0 and 7200 seconds")
+    destination.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock_path = destination / ".prepare-v4-inputs.lock"
+    deadline = time.monotonic() + wait_seconds
+    next_notice = 0.0
+    while True:
+        lock = None
+        try:
+            descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            lock = os.fdopen(descriptor, "r+b")
+            if os.name == "nt":
+                import msvcrt
+
+                if os.fstat(lock.fileno()).st_size == 0:
+                    lock.write(b"\0")
+                    lock.flush()
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError as error:
+            if lock is not None:
+                lock.close()
+            now = time.monotonic()
+            if now >= deadline:
+                raise OSError(f"timed out waiting for model preparation in {destination}") from error
+            if now >= next_notice:
+                print(f"Another miner is preparing the shared model in {destination}; waiting...", flush=True)
+                next_notice = now + 15
+            time.sleep(min(1.0, deadline - now))
+    try:
+        yield
+    finally:
+        if os.name == "nt":
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        lock.close()
 
 
 def load_json(path: Path) -> dict:
@@ -306,16 +356,18 @@ def main() -> int:
     if args.prepared_inputs and not args.validate_only:
         raise ValueError("--prepared-inputs requires --validate-only")
     required_names = required_input_names(args.chunk_manifest, args.role)
-    authenticated = None
-    if not args.validate_only:
-        authenticated = prepare_inputs(args, required_names)
-    validate_inputs(
-        args.destination.resolve(),
-        args.input_manifest,
-        authenticated,
-        prepared=args.prepared_inputs,
-        required_names=required_names,
-    )
+    if args.validate_only:
+        validate_inputs(
+            args.destination.resolve(), args.input_manifest,
+            prepared=args.prepared_inputs, required_names=required_names,
+        )
+    else:
+        with preparation_lock(args.destination.resolve()):
+            authenticated = prepare_inputs(args, required_names)
+            validate_inputs(
+                args.destination.resolve(), args.input_manifest,
+                authenticated, required_names=required_names,
+            )
     return 0
 
 

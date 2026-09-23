@@ -46,6 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Path::new(&args[6]),
             32,
             None,
+            None,
         )?,
     )?);
     let stop = AtomicBool::new(false);

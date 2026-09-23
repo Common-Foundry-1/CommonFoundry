@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
 use std::process::Command;
 
-const NVIDIA_SMI_QUERY: &str = "index,power.draw,power.limit,temperature.gpu,fan.speed,utilization.gpu,clocks.current.graphics,clocks.current.memory,memory.used,memory.total";
+const NVIDIA_SMI_QUERY: &str = "index,uuid,power.draw,power.limit,temperature.gpu,fan.speed,utilization.gpu,clocks.current.graphics,clocks.current.memory,memory.used,memory.total";
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct GpuTelemetry {
+    pub(crate) uuid: String,
     pub(crate) power_watts: Option<f64>,
     pub(crate) power_limit_watts: Option<f64>,
     pub(crate) temperature_celsius: Option<f64>,
@@ -55,9 +56,9 @@ fn parse_nvidia_smi_csv(output: &str) -> Result<BTreeMap<i32, GpuTelemetry>, Str
             continue;
         }
         let columns: Vec<_> = line.split(',').map(str::trim).collect();
-        if columns.len() != 10 {
+        if columns.len() != 11 {
             return Err(format!(
-                "nvidia-smi row {} has {} columns instead of 10",
+                "nvidia-smi row {} has {} columns instead of 11",
                 line_index + 1,
                 columns.len()
             ));
@@ -65,16 +66,23 @@ fn parse_nvidia_smi_csv(output: &str) -> Result<BTreeMap<i32, GpuTelemetry>, Str
         let index = columns[0]
             .parse::<i32>()
             .map_err(|_| format!("nvidia-smi row {} has an invalid GPU index", line_index + 1))?;
+        if index < 0 || !valid_gpu_uuid(columns[1]) {
+            return Err(format!(
+                "nvidia-smi row {} has an invalid GPU identity",
+                line_index + 1
+            ));
+        }
         let telemetry = GpuTelemetry {
-            power_watts: parse_optional_number(columns[1], line_index)?,
-            power_limit_watts: parse_optional_number(columns[2], line_index)?,
-            temperature_celsius: parse_optional_number(columns[3], line_index)?,
-            fan_percent: parse_optional_number(columns[4], line_index)?,
-            utilization_percent: parse_optional_number(columns[5], line_index)?,
-            graphics_clock_mhz: parse_optional_number(columns[6], line_index)?,
-            memory_clock_mhz: parse_optional_number(columns[7], line_index)?,
-            memory_used_mib: parse_optional_number(columns[8], line_index)?,
-            memory_total_mib: parse_optional_number(columns[9], line_index)?,
+            uuid: columns[1].to_owned(),
+            power_watts: parse_optional_number(columns[2], line_index)?,
+            power_limit_watts: parse_optional_number(columns[3], line_index)?,
+            temperature_celsius: parse_optional_number(columns[4], line_index)?,
+            fan_percent: parse_optional_number(columns[5], line_index)?,
+            utilization_percent: parse_optional_number(columns[6], line_index)?,
+            graphics_clock_mhz: parse_optional_number(columns[7], line_index)?,
+            memory_clock_mhz: parse_optional_number(columns[8], line_index)?,
+            memory_used_mib: parse_optional_number(columns[9], line_index)?,
+            memory_total_mib: parse_optional_number(columns[10], line_index)?,
         };
         if result.insert(index, telemetry).is_some() {
             return Err(format!("nvidia-smi returned duplicate GPU index {index}"));
@@ -83,7 +91,26 @@ fn parse_nvidia_smi_csv(output: &str) -> Result<BTreeMap<i32, GpuTelemetry>, Str
     if result.is_empty() {
         return Err("nvidia-smi returned no GPU telemetry rows".to_owned());
     }
+    let mut uuids = std::collections::BTreeSet::new();
+    if result
+        .values()
+        .any(|gpu| !uuids.insert(gpu.uuid.to_ascii_lowercase()))
+    {
+        return Err("nvidia-smi returned duplicate GPU UUIDs".to_owned());
+    }
     Ok(result)
+}
+
+pub(crate) fn valid_gpu_uuid(value: &str) -> bool {
+    value.len() == 40
+        && value.starts_with("GPU-")
+        && value[4..].bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
 }
 
 fn parse_optional_number(value: &str, line_index: usize) -> Result<Option<f64>, String> {
@@ -117,8 +144,8 @@ mod tests {
     #[test]
     fn parses_multi_gpu_telemetry_and_unsupported_sensors() {
         let parsed = parse_nvidia_smi_csv(
-            "0, 245.50, 300.00, 64, 52, 99, 2745, 10501, 2048, 24564\n\
-             2, 181.25, 250.00, 71, [N/A], 97, 1530, 877, 8192, 16384\n",
+            "0, GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa, 245.50, 300.00, 64, 52, 99, 2745, 10501, 2048, 24564\n\
+             2, GPU-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb, 181.25, 250.00, 71, [N/A], 97, 1530, 877, 8192, 16384\n",
         )
         .unwrap();
 
@@ -135,10 +162,21 @@ mod tests {
     fn rejects_malformed_duplicate_and_nonfinite_rows() {
         assert!(parse_nvidia_smi_csv("0, 1, 2\n").is_err());
         assert!(
-            parse_nvidia_smi_csv("0, 1, 2, 3, 4, 5, 6, 7, 8, 9\n0, 1, 2, 3, 4, 5, 6, 7, 8, 9\n")
+            parse_nvidia_smi_csv("0, GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa, 1, 2, 3, 4, 5, 6, 7, 8, 9\n0, GPU-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb, 1, 2, 3, 4, 5, 6, 7, 8, 9\n")
                 .is_err()
         );
-        assert!(parse_nvidia_smi_csv("0, NaN, 2, 3, 4, 5, 6, 7, 8, 9\n").is_err());
+        assert!(
+            parse_nvidia_smi_csv(
+                "0, GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa, NaN, 2, 3, 4, 5, 6, 7, 8, 9\n"
+            )
+            .is_err()
+        );
         assert!(parse_nvidia_smi_csv("\n\r\n").is_err());
+        assert!(
+            parse_nvidia_smi_csv(
+                "0, MIG-GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa, 1, 2, 3, 4, 5, 6, 7, 8, 9\n"
+            )
+            .is_err()
+        );
     }
 }

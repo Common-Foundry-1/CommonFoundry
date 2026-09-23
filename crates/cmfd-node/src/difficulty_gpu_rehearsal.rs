@@ -95,6 +95,7 @@ fn real_5x_proofs_two_nodes_and_restart() {
             replay: ProductionV4PoolWorkerCommand {
                 program: replay,
                 arguments: vec!["--server".into(), model.as_os_str().to_owned()],
+                environment: vec![],
             },
             proof: ProductionV4PoolWorkerCommand {
                 program: proof_worker,
@@ -104,6 +105,7 @@ fn real_5x_proofs_two_nodes_and_restart() {
                     model.as_os_str().to_owned(),
                     fixed.as_os_str().to_owned(),
                 ],
+                environment: vec![],
             },
             scratch_directory: scratch.clone(),
             worker_scratch_directory: scratch.to_str().unwrap().into(),

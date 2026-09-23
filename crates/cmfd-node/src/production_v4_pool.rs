@@ -44,6 +44,9 @@ pub const PRODUCTION_V4_POOL_SEARCH_MAX_BATCH_SIZE: u32 = 64;
 pub struct ProductionV4PoolWorkerCommand {
     pub program: PathBuf,
     pub arguments: Vec<OsString>,
+    /// Process-local environment overrides. Never mutate the node's environment
+    /// to select a miner GPU: several workers may coexist in one process.
+    pub environment: Vec<(OsString, OsString)>,
 }
 
 /// Paths and commands for one pool-owned ProductionV4 verifier.
@@ -73,7 +76,9 @@ pub fn production_v4_pool_searcher_config(
     scratch_directory: &Path,
     batch_size: u32,
     wsl_distribution: Option<&str>,
+    cuda_visible_device: Option<&str>,
 ) -> Result<ProductionV4PoolSearcherConfig, PoolError> {
+    let selected_device = production_v4_worker_cuda_visible_device(cuda_visible_device)?;
     let replay_worker = canonical_worker_file(replay_worker, "ProductionV4 pool search worker")?;
     let model_bank = canonical_worker_file(model_bank, "ProductionV4 model bank")?;
     if !scratch_directory.is_absolute() {
@@ -106,27 +111,25 @@ pub fn production_v4_pool_searcher_config(
                 let replay_worker = wsl_path(&wsl, distribution, &replay_worker)?;
                 let model_bank = wsl_path(&wsl, distribution, &model_bank)?;
                 let worker_scratch_directory = wsl_path(&wsl, distribution, &scratch_directory)?;
-                let arguments = [
-                    "-d",
-                    distribution,
-                    "--exec",
-                    "env",
-                    "CUDA_VISIBLE_DEVICES=0",
-                    "CUDA_HOME=/usr/local/cuda-12.8",
-                    "CUDA_PATH=/usr/local/cuda-12.8",
-                    "CUDAToolkit_ROOT=/usr/local/cuda-12.8",
-                    "LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64",
-                    &replay_worker,
-                    "--server",
-                    &model_bank,
-                ]
-                .into_iter()
-                .map(Into::into)
-                .collect();
+                let arguments = vec![
+                    "-d".into(),
+                    distribution.into(),
+                    "--exec".into(),
+                    "env".into(),
+                    format!("CUDA_VISIBLE_DEVICES={selected_device}").into(),
+                    "CUDA_HOME=/usr/local/cuda-12.8".into(),
+                    "CUDA_PATH=/usr/local/cuda-12.8".into(),
+                    "CUDAToolkit_ROOT=/usr/local/cuda-12.8".into(),
+                    "LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64".into(),
+                    replay_worker.into(),
+                    "--server".into(),
+                    model_bank.into(),
+                ];
                 Ok(ProductionV4PoolSearcherConfig {
                     replay: ProductionV4PoolWorkerCommand {
                         program: wsl,
                         arguments,
+                        environment: vec![],
                     },
                     scratch_directory,
                     worker_scratch_directory,
@@ -138,6 +141,10 @@ pub fn production_v4_pool_searcher_config(
             replay: ProductionV4PoolWorkerCommand {
                 program: replay_worker,
                 arguments: vec!["--server".into(), model_bank.into_os_string()],
+                environment: cuda_visible_device
+                    .map(|_| ("CUDA_VISIBLE_DEVICES".into(), selected_device.into()))
+                    .into_iter()
+                    .collect(),
             },
             worker_scratch_directory: scratch_directory
                 .to_str()
@@ -178,6 +185,7 @@ pub fn production_v4_solo_config(
         scratch_directory,
         32,
         wsl_distribution,
+        None,
     )?;
     let bank = canonical_worker_file(model_bank, "ProductionV4 model bank")?;
     let proof = match wsl_distribution {
@@ -189,6 +197,7 @@ pub fn production_v4_solo_config(
                 bank.into_os_string(),
                 fixed_directory.into_os_string(),
             ],
+            environment: vec![],
         },
         Some(distribution) => {
             #[cfg(not(windows))]
@@ -206,7 +215,11 @@ pub fn production_v4_solo_config(
                         distribution.into(),
                         "--exec".into(),
                         "env".into(),
-                        "CUDA_VISIBLE_DEVICES=0".into(),
+                        format!(
+                            "CUDA_VISIBLE_DEVICES={}",
+                            production_v4_worker_cuda_visible_device(None)?
+                        )
+                        .into(),
                         "LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64".into(),
                         wsl_path(wsl, distribution, &proof_worker)?.into(),
                         "--server".into(),
@@ -214,6 +227,7 @@ pub fn production_v4_solo_config(
                         wsl_path(wsl, distribution, &bank)?.into(),
                         wsl_path(wsl, distribution, &fixed_directory)?.into(),
                     ],
+                    environment: vec![],
                 }
             }
         }
@@ -653,6 +667,7 @@ impl PersistentWorker {
         }
         let mut child = Command::new(&command.program)
             .args(&command.arguments)
+            .envs(command.environment.iter().cloned())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -788,6 +803,33 @@ fn validate_wsl_distribution(distribution: &str) -> Result<(), PoolError> {
         ));
     }
     Ok(())
+}
+
+/// CUDA enumerates a one-device visibility mask as ordinal zero. Pool miners
+/// pass an explicit UUID. With no override, preserve the historical WSL
+/// default of GPU zero and let native solo workers inherit their own mask.
+pub fn production_v4_worker_cuda_visible_device(
+    explicit: Option<&str>,
+) -> Result<String, PoolError> {
+    let selected = explicit.unwrap_or("0");
+    let numeric = !selected.is_empty()
+        && selected.bytes().all(|byte| byte.is_ascii_digit())
+        && selected.parse::<i32>().is_ok();
+    let uuid = selected.len() == 40
+        && selected.starts_with("GPU-")
+        && selected[4..].bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        });
+    if !numeric && !uuid {
+        return Err(pool_replay_failure(
+            "CUDA_VISIBLE_DEVICES must select exactly one numeric CUDA device or GPU UUID",
+        ));
+    }
+    Ok(selected.to_owned())
 }
 
 #[cfg(windows)]
@@ -1028,6 +1070,23 @@ mod tests {
         assert!(validate_scratch_paths(local, "/mnt/c/cmfd-pool-scratch").is_ok());
         assert!(validate_scratch_paths(local, "/tmp/bad\nRUN\tfull").is_err());
         assert!(validate_scratch_paths(Path::new("relative"), "/tmp/pool").is_err());
+    }
+
+    #[test]
+    fn cuda_worker_selector_rejects_multi_gpu_and_shell_values() {
+        let uuid = "GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        assert_eq!(production_v4_worker_cuda_visible_device(None).unwrap(), "0");
+        assert_eq!(
+            production_v4_worker_cuda_visible_device(Some(uuid)).unwrap(),
+            uuid
+        );
+        assert_eq!(
+            production_v4_worker_cuda_visible_device(Some("2")).unwrap(),
+            "2"
+        );
+        for invalid in ["", "0,1", "GPU-short", "0;touch /tmp/pwn", "-1", " 1"] {
+            assert!(production_v4_worker_cuda_visible_device(Some(invalid)).is_err());
+        }
     }
 
     #[test]

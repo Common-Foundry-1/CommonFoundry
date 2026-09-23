@@ -2279,6 +2279,7 @@ fn configure_production_v4_pool_verifier(
                 ProductionV4PoolWorkerCommand {
                     program: replay_worker,
                     arguments: vec!["--server".into(), artifacts.bank.as_os_str().to_owned()],
+                    environment: vec![],
                 },
                 ProductionV4PoolWorkerCommand {
                     program: proof_worker,
@@ -2286,6 +2287,7 @@ fn configure_production_v4_pool_verifier(
                         artifacts.bank.as_os_str(),
                         fixed_artifact_directory.as_os_str(),
                     ),
+                    environment: vec![],
                 },
                 scratch_directory
                     .to_str()
@@ -2375,12 +2377,14 @@ fn production_v4_wsl_pool_workers(
             production_v4_wsl_path(&wsl, distribution, fixed_artifact_directory)?;
         let worker_scratch_directory =
             production_v4_wsl_path(&wsl, distribution, scratch_directory)?;
+        let selected_device =
+            cmfd_node::production_v4_pool::production_v4_worker_cuda_visible_device(None)?;
         let environment = [
-            "CUDA_VISIBLE_DEVICES=0",
-            "CUDA_HOME=/usr/local/cuda-12.8",
-            "CUDA_PATH=/usr/local/cuda-12.8",
-            "CUDAToolkit_ROOT=/usr/local/cuda-12.8",
-            "LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64",
+            format!("CUDA_VISIBLE_DEVICES={selected_device}"),
+            "CUDA_HOME=/usr/local/cuda-12.8".to_owned(),
+            "CUDA_PATH=/usr/local/cuda-12.8".to_owned(),
+            "CUDAToolkit_ROOT=/usr/local/cuda-12.8".to_owned(),
+            "LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64".to_owned(),
         ];
         let worker_command = |program: String, mut arguments: Vec<std::ffi::OsString>| {
             let mut prefix = vec![
@@ -2389,12 +2393,13 @@ fn production_v4_wsl_pool_workers(
                 "--exec".into(),
                 "env".into(),
             ];
-            prefix.extend(environment.into_iter().map(Into::into));
+            prefix.extend(environment.iter().cloned().map(Into::into));
             prefix.push(program.into());
             prefix.append(&mut arguments);
             ProductionV4PoolWorkerCommand {
                 program: wsl.clone(),
                 arguments: prefix,
+                environment: vec![],
             }
         };
         Ok((

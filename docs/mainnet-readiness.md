@@ -607,6 +607,17 @@ never selects a final difficulty policy. The physical multi-GPU run and its
 independently verified GPU/host identities have **not** happened. The public RC
 pool was not used for this harness.
 
+The standalone pool-miner source now resolves an optional physical GPU index or
+full UUID to a single CUDA-visible UUID, gives selected GPUs separate worker
+names, scratch paths and logs, and holds a per-UUID process lock. Shared model
+preparation waits under an OS lock instead of racing concurrent rig launchers.
+The unselected single-GPU path and wallet solo worker retain their previous
+behavior. Windows miner, node, launcher and input-preparation tests pass; Linux
+miner/node compilation passes; a one-card WSL CUDA query accepted the full UUID.
+This is a source candidate only. A six-card rig must still prove distinct
+device assignment, accepted shares, reconnects and sustained operation before
+any new miner package is approved.
+
 A separate, staged Linux mainnet pool service now checks the compiled plan,
 signed-package files, GPU identity, fresh TLS material, payout settings and
 RC-service overlap before it can open a pool socket. Mainnet pool startup

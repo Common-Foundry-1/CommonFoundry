@@ -62,6 +62,82 @@ exit 0
         self.assertIn("pool --pool " + pool, calls[3])
         self.assertIn("--miner " + wallet, calls[3])
 
+    def test_linux_miner_gpu_selection_is_isolated_and_default_is_unchanged(self):
+        wallet = "ab" * 32
+        pool = "cmfd+tls://8.8.8.8:29445?pin=" + "cd" * 32
+        result, calls = self.invoke("start-miner.sh", wallet, pool, "2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--gpu 2", calls[-1])
+        self.assertIn("pool-search-gpu-2", calls[-1])
+        self.assertTrue((self.root / "work/logs/miner-gpu-2.log").is_file())
+        self.log.unlink()
+        result, calls = self.invoke("start-miner.sh", wallet, pool)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("--gpu", calls[-1])
+        self.assertIn("work/pool-search --stats-seconds", calls[-1])
+
+    def test_linux_rc_miner_uses_the_same_optional_gpu_isolation(self):
+        shutil.copyfile(
+            self.repo / "packaging/production-rc/miner/linux/start-miner.sh",
+            self.root / "rc-start-miner.sh",
+        )
+        wallet = "ab" * 32
+        pool = "cmfd+tls://8.8.8.8:29445?pin=" + "cd" * 32
+        uuid = "GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        result, calls = self.invoke("rc-start-miner.sh", wallet, pool, uuid)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--gpu " + uuid, calls[-1])
+        self.assertIn("pool-search-gpu-" + uuid, calls[-1])
+
+    @unittest.skipUnless(os.name == "nt", "native PowerShell launcher execution is Windows-only")
+    def test_windows_mainnet_and_rc_miners_pass_selected_gpu_and_isolate_paths(self):
+        powershell = str(Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe")
+        build = self.root / "build-miner-probe.ps1"
+        build.write_text('''$ErrorActionPreference = 'Stop'
+$source = @'
+using System;
+using System.IO;
+using System.Reflection;
+public class MinerProbe {
+  public static void Main(string[] args) {
+    string name = Path.GetFileNameWithoutExtension(Assembly.GetExecutingAssembly().Location);
+    File.AppendAllText(Environment.GetEnvironmentVariable("CMFD_TEST_LOG"), name + "|" + String.Join(" ", args) + "\\n");
+  }
+}
+'@
+Add-Type -TypeDefinition $source -OutputAssembly (Join-Path $PSScriptRoot 'miner-probe.exe') -OutputType ConsoleApplication
+''', encoding="utf-8")
+        built = subprocess.run([powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(build)], capture_output=True, timeout=30)
+        self.assertEqual(built.returncode, 0, built.stderr)
+        for name in ("cmfd-miner.exe", "cmfd-launch.exe"):
+            shutil.copyfile(self.root / "miner-probe.exe", self.root / name)
+        (self.root / "PREPARE-V4-INPUTS.ps1").write_text('param($Role,$FallbackReleaseBase)\n[IO.File]::AppendAllText($env:CMFD_TEST_LOG,"prepare|$Role`n")\n', encoding="utf-8")
+        shutil.copyfile(self.repo / "packaging/mainnet/windows/START-MINER.ps1", self.root / "START-MAINNET-MINER.ps1")
+        shutil.copyfile(self.repo / "packaging/production-rc/miner/windows/START-MINER.ps1", self.root / "START-RC-MINER.ps1")
+        wallet = "ab" * 32
+        pool = "cmfd+tls://8.8.8.8:29445?pin=" + "cd" * 32
+        env = dict(os.environ, CMFD_TEST_LOG=str(self.log))
+        env.pop("CUDA_VISIBLE_DEVICES", None)
+        env.pop("CMFD_GPU", None)
+        for script, expected_prefix in (("START-MAINNET-MINER.ps1", ["cmfd-miner", "prepare", "cmfd-launch", "cmfd-miner"]),
+                                        ("START-RC-MINER.ps1", ["prepare", "cmfd-miner"])):
+            with self.subTest(script=script):
+                self.log.unlink(missing_ok=True)
+                arguments = [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(self.root / script),
+                             "-WalletAddress", wallet, "-PoolUrl", pool, "-WorkerName", "rig", "-GpuSelector", "2"]
+                result = subprocess.run(arguments, env=env, capture_output=True, timeout=20)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                calls = self.log.read_text().splitlines()
+                self.assertEqual([line.split("|")[0] for line in calls], expected_prefix)
+                self.assertIn("--gpu 2", calls[-1])
+                self.assertIn("pool-search-gpu-2", calls[-1])
+                self.assertTrue((self.root / "work/logs/miner-gpu-2.log").is_file())
+        self.log.unlink()
+        result = subprocess.run(arguments[:-2] + ["-GpuSelector", ""], env=env, capture_output=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("--gpu", self.log.read_text().splitlines()[-1])
+        self.assertIn("pool-search", self.log.read_text().splitlines()[-1])
+
     def test_miner_does_not_start_after_failed_beacon_or_invalid_address(self):
         pool = "cmfd+tls://8.8.8.8:29445?pin=" + "cd" * 32
         result, calls = self.invoke("start-miner.sh", "bad-address", pool)

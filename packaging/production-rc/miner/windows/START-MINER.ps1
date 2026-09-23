@@ -4,6 +4,7 @@ param(
     [string]$WalletAddress,
     [string]$PoolUrl,
     [string]$WorkerName = $env:COMPUTERNAME,
+    [string]$GpuSelector = $env:CMFD_GPU,
     [string]$WslDistribution = 'Ubuntu-22.04'
 )
 
@@ -29,19 +30,38 @@ $WorkerName = $WorkerName.Trim()
 if ($WorkerName -cnotmatch '^[A-Za-z0-9._-]{1,32}$') {
     throw 'WorkerName must contain 1-32 letters, numbers, dots, underscores, or hyphens.'
 }
+if ([string]::IsNullOrWhiteSpace($GpuSelector) -and -not [string]::IsNullOrWhiteSpace($env:CUDA_VISIBLE_DEVICES)) { $GpuSelector = $env:CUDA_VISIBLE_DEVICES }
+if (-not [string]::IsNullOrEmpty($GpuSelector) -and $GpuSelector -cnotmatch '^(?:[0-9]+|GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})$') { throw 'GpuSelector must be one NVIDIA GPU index or full GPU UUID.' }
+$gpuArguments = @()
+$scratchName = 'pool-search'
+$logKey = 'default'
+if (-not [string]::IsNullOrEmpty($GpuSelector)) {
+    $gpuArguments = @('--gpu', $GpuSelector)
+    $scratchName = "pool-search-gpu-$GpuSelector"
+    $logKey = "gpu-$GpuSelector"
+}
+$logs = Join-Path $PSScriptRoot 'work\logs'
+New-Item -ItemType Directory -Force -Path $logs | Out-Null
+Start-Transcript -LiteralPath (Join-Path $logs "miner-$logKey.log") -Append | Out-Null
+try {
 
 & (Join-Path $PSScriptRoot 'PREPARE-V4-INPUTS.ps1') -Role PoolMiner
 $inputs = Join-Path $PSScriptRoot 'inputs'
-$scratch = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'work\pool-search'))
+$scratch = [IO.Path]::GetFullPath((Join-Path (Join-Path $PSScriptRoot 'work') $scratchName))
 New-Item -ItemType Directory -Force -Path $scratch | Out-Null
 
 & (Join-Path $PSScriptRoot 'cmfd-miner.exe') pool `
     --pool $PoolUrl `
     --miner $WalletAddress `
     --worker $WorkerName `
+    @gpuArguments `
     --production-v4-bank (Join-Path $inputs 'MODEL-V2.bank') `
     --production-v4-replay-worker (Join-Path $PSScriptRoot 'cmfd-v4-replay') `
     --production-v4-scratch $scratch `
     --production-v4-wsl-distribution $WslDistribution `
     --stats-seconds 5
-exit $LASTEXITCODE
+$minerExitCode = $LASTEXITCODE
+} finally {
+    Stop-Transcript | Out-Null
+}
+exit $minerExitCode

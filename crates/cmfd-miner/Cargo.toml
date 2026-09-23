@@ -33,6 +33,7 @@ cmfd-cuda = { path = "../cmfd-cuda" }
 cmfd-consensus = { path = "../cmfd-consensus" }
 cmfd-node = { path = "../cmfd-node" }
 ctrlc.workspace = true
+fs2.workspace = true
 hex.workspace = true
 serde.workspace = true
 serde_json.workspace = true

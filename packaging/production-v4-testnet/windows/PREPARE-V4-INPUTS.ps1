@@ -7,7 +7,9 @@ param(
     [string]$ReleaseBase = 'https://downloads.commonfoundry.ai/v0.1.0-rc.1',
     [string]$FallbackReleaseBase = 'https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/download/v0.1.0-rc.1',
     [ValidateRange(1, 16)]
-    [int]$DownloadConcurrency = 16
+    [int]$DownloadConcurrency = 16,
+    [ValidateRange(0, 7200)]
+    [int]$PreparationWaitSeconds = 3600
 )
 
 $ErrorActionPreference = 'Stop'
@@ -181,7 +183,28 @@ if (-not $inputEntries.ContainsKey($fixedName) -or
 }
 $destinationPath = [IO.Path]::GetFullPath($Destination)
 $partDirectory = Join-Path $destinationPath '.parts'
-New-Item -ItemType Directory -Force -Path $destinationPath, $partDirectory | Out-Null
+New-Item -ItemType Directory -Force -Path $destinationPath | Out-Null
+$lockPath = Join-Path $destinationPath '.prepare-v4-inputs.lock'
+$deadline = [DateTime]::UtcNow.AddSeconds($PreparationWaitSeconds)
+$nextNotice = [DateTime]::MinValue
+while ($true) {
+    try {
+        $preparationLock = [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        break
+    } catch [IO.IOException] {
+        $now = [DateTime]::UtcNow
+        if ($now -ge $deadline) {
+            throw "Timed out waiting for model preparation in $destinationPath. Retry after the other miner finishes."
+        }
+        if ($now -ge $nextNotice) {
+            Write-Host "Another miner is preparing the shared model in $destinationPath; waiting..."
+            $nextNotice = $now.AddSeconds(15)
+        }
+        Start-Sleep -Seconds 1
+    }
+}
+try {
+New-Item -ItemType Directory -Force -Path $partDirectory | Out-Null
 
 $manifestRole = if ($Role -ceq 'PoolMiner') { 'pool-miner' } else { $Role.ToLowerInvariant() }
 foreach ($file in $manifest.files) {
@@ -244,3 +267,6 @@ if (-not (Test-Identity $fixedTarget ([uint64]$inputEntries[$fixedName].bytes) (
     throw 'Prepared fixed artifact record failed authentication.'
 }
 Write-Host "ProductionV4 $Role inputs are ready under $destinationPath"
+} finally {
+    $preparationLock.Dispose()
+}

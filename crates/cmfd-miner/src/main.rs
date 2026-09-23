@@ -88,11 +88,15 @@ use cmfd_node::{
     ProductionV4VerifierArtifacts, RCNET1_PROFILE,
     build_offline_rcnet1_block1_qualification_template, rcnet_candidate::RcnetLaunchCandidate,
 };
+#[cfg(feature = "production-v4")]
+use fs2::FileExt;
 #[cfg(any(feature = "production-v3-testnet", feature = "production-v4"))]
 use same_file::Handle as SameFileHandle;
 
 mod telemetry;
 
+#[cfg(feature = "production-v4")]
+use telemetry::valid_gpu_uuid;
 use telemetry::{GpuTelemetry, query_nvidia_smi};
 
 #[cfg(any(feature = "production-v3-testnet", feature = "production-v4"))]
@@ -227,6 +231,10 @@ enum Command {
         /// Pool worker name: 1-32 letters, numbers, dots, underscores, or hyphens.
         #[arg(long)]
         worker: String,
+        /// One physical NVIDIA GPU index or full GPU UUID. Omit for GPU 0.
+        /// An inherited single CUDA_VISIBLE_DEVICES selector is also honored.
+        #[arg(long)]
+        gpu: Option<String>,
         /// Absolute path to the pinned ProductionV4 model bank.
         #[arg(long)]
         production_v4_bank: PathBuf,
@@ -648,6 +656,7 @@ fn main() -> Result<()> {
             pool,
             miner,
             worker,
+            gpu,
             production_v4_bank,
             production_v4_replay_worker,
             production_v4_scratch,
@@ -657,6 +666,7 @@ fn main() -> Result<()> {
             pool,
             miner,
             worker,
+            gpu,
             model_bank: production_v4_bank,
             replay_worker: production_v4_replay_worker,
             scratch_directory: production_v4_scratch,
@@ -920,11 +930,161 @@ struct ProductionV4PoolMinerOptions {
     pool: String,
     miner: String,
     worker: String,
+    gpu: Option<String>,
     model_bank: PathBuf,
     replay_worker: PathBuf,
     scratch_directory: PathBuf,
     wsl_distribution: Option<String>,
     stats_seconds: u64,
+}
+
+#[cfg(feature = "production-v4")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedPoolGpu {
+    physical_index: i32,
+    uuid: String,
+    /// Preserve the existing worker name when the operator did not request
+    /// multi-GPU selection. Explicit/inherited selection gets a stable suffix.
+    named_selection: bool,
+}
+
+#[cfg(feature = "production-v4")]
+fn resolve_pool_gpu(
+    requested: Option<&str>,
+    inherited: Option<&str>,
+    devices: &BTreeMap<i32, GpuTelemetry>,
+) -> Result<ResolvedPoolGpu> {
+    let selector = requested.or(inherited).unwrap_or("0");
+    if selector.is_empty() || selector.contains(',') || selector.trim() != selector {
+        bail!("--gpu and CUDA_VISIBLE_DEVICES must name exactly one GPU");
+    }
+    let gpu = if selector.bytes().all(|byte| byte.is_ascii_digit()) {
+        let index = selector
+            .parse::<i32>()
+            .context("GPU index is out of range")?;
+        devices.get(&index)
+    } else if valid_gpu_uuid(selector) {
+        devices
+            .values()
+            .find(|gpu| gpu.uuid.eq_ignore_ascii_case(selector))
+    } else {
+        bail!("GPU selector must be a physical NVIDIA index or full GPU UUID");
+    }
+    .ok_or_else(|| anyhow!("selected GPU {selector} is not present in nvidia-smi"))?;
+    let physical_index = devices
+        .iter()
+        .find_map(|(index, candidate)| (candidate.uuid == gpu.uuid).then_some(*index))
+        .ok_or_else(|| anyhow!("selected GPU disappeared during enumeration"))?;
+    Ok(ResolvedPoolGpu {
+        physical_index,
+        uuid: gpu.uuid.clone(),
+        named_selection: requested.is_some() || inherited.is_some(),
+    })
+}
+
+#[cfg(feature = "production-v4")]
+fn pool_worker_name(base: &str, gpu: &ResolvedPoolGpu) -> Result<String> {
+    let worker = if gpu.named_selection {
+        format!("{base}.gpu{}", gpu.physical_index)
+    } else {
+        base.to_owned()
+    };
+    if worker.len() > 32
+        || worker.is_empty()
+        || !worker
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        bail!("worker name, including its GPU suffix, must be 1-32 safe ASCII characters");
+    }
+    Ok(worker)
+}
+
+#[cfg(feature = "production-v4")]
+fn pool_gpu_telemetry<'a>(
+    devices: &'a BTreeMap<i32, GpuTelemetry>,
+    gpu: &ResolvedPoolGpu,
+) -> Option<&'a GpuTelemetry> {
+    devices
+        .values()
+        .find(|value| value.uuid.eq_ignore_ascii_case(&gpu.uuid))
+}
+
+#[cfg(feature = "production-v4")]
+fn lock_pool_scratch(path: &Path) -> Result<File> {
+    if !path.is_absolute() {
+        bail!("ProductionV4 pool scratch directory must be absolute");
+    }
+    fs::create_dir_all(path).with_context(|| format!("create {}", path.display()))?;
+    let canonical = fs::canonicalize(path)?;
+    let lock_path = canonical.join(".cmfd-pool-miner.lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("open {}", lock_path.display()))?;
+    lock.try_lock_exclusive().with_context(|| {
+        format!(
+            "scratch directory {} is already in use by another miner",
+            canonical.display()
+        )
+    })?;
+    Ok(lock)
+}
+
+#[cfg(feature = "production-v4")]
+fn pool_gpu_lock_directory() -> Result<PathBuf> {
+    let root = if cfg!(windows) {
+        std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow!("LOCALAPPDATA is required for the GPU process lock"))?
+    } else {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow!("HOME is required for the GPU process lock"))?
+            .join(".local")
+            .join("state")
+    };
+    if !root.is_absolute() {
+        bail!("GPU process lock directory must be under an absolute user-state path");
+    }
+    let directory = root.join("CommonFoundry").join("gpu-locks");
+    fs::create_dir_all(&directory)
+        .with_context(|| format!("create GPU process lock directory {}", directory.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+    }
+    fs::canonicalize(&directory).map_err(Into::into)
+}
+
+#[cfg(feature = "production-v4")]
+fn lock_pool_gpu_at(gpu: &ResolvedPoolGpu, directory: &Path) -> Result<File> {
+    if !valid_gpu_uuid(&gpu.uuid) || !directory.is_absolute() {
+        bail!("GPU lock requires a complete UUID and absolute user-state directory");
+    }
+    fs::create_dir_all(directory)?;
+    let lock_path = fs::canonicalize(directory)?.join(format!(
+        ".pool-miner-{}.lock",
+        gpu.uuid.to_ascii_lowercase()
+    ));
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("open GPU lock {}", lock_path.display()))?;
+    lock.try_lock_exclusive().with_context(|| {
+        format!(
+            "GPU {} is already assigned to another pool miner process",
+            gpu.uuid
+        )
+    })?;
+    Ok(lock)
 }
 
 #[cfg(feature = "production-v4")]
@@ -992,14 +1152,26 @@ impl PoolMinerStatistics {
         )
     }
 
-    fn report_if_due(&mut self, height: u64, interval: Duration) {
+    fn report_if_due(&mut self, height: u64, interval: Duration, gpu: &ResolvedPoolGpu) {
         if self.last_report.elapsed() < interval {
             return;
         }
         let report_at = Instant::now();
         let rate = self.work_rate_since_last_report();
         let telemetry = match query_nvidia_smi() {
-            Ok(telemetry) => telemetry.get(&0).cloned(),
+            Ok(telemetry) => match pool_gpu_telemetry(&telemetry, gpu) {
+                Some(value) => Some(value.clone()),
+                None => {
+                    if !self.telemetry_warning_printed {
+                        println!(
+                            "Selected GPU {} is absent from NVIDIA telemetry; mining will continue.",
+                            gpu.uuid
+                        );
+                        self.telemetry_warning_printed = true;
+                    }
+                    None
+                }
+            },
             Err(error) => {
                 if !self.telemetry_warning_printed {
                     println!("NVIDIA telemetry unavailable ({error}); mining will continue.");
@@ -1016,7 +1188,9 @@ impl PoolMinerStatistics {
             .as_ref()
             .and_then(|value| value.temperature_celsius);
         println!(
-            "MINER STATS | height {height} | hashrate {rate:.2} FW/s | accepted {} | rejected {} | stale {} | blocks {} | credit {} atoms | power {} | efficiency {} | temp {} | uptime {}",
+            "MINER STATS | GPU {} ({}) | height {height} | hashrate {rate:.2} FW/s | accepted {} | rejected {} | stale {} | blocks {} | credit {} atoms | power {} | efficiency {} | temp {} | uptime {}",
+            gpu.physical_index,
+            gpu.uuid,
             self.accepted,
             self.rejected,
             self.stale,
@@ -1066,10 +1240,22 @@ fn run_production_v4_pool_miner(options: ProductionV4PoolMinerOptions) -> Result
     }
     let (address, certificate_pin) = parse_pinned_pool_url(&options.pool)?;
     let payout = parse_miner_destination(&options.miner).map_err(anyhow::Error::from)?;
+    let inherited_gpu = match std::env::var("CUDA_VISIBLE_DEVICES") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            bail!("CUDA_VISIBLE_DEVICES is not valid Unicode");
+        }
+    };
+    let devices = query_nvidia_smi().map_err(anyhow::Error::msg)?;
+    let gpu = resolve_pool_gpu(options.gpu.as_deref(), inherited_gpu.as_deref(), &devices)?;
+    let worker = pool_worker_name(&options.worker, &gpu)?;
+    let _gpu_lock = lock_pool_gpu_at(&gpu, &pool_gpu_lock_directory()?)?;
+    let _scratch_lock = lock_pool_scratch(&options.scratch_directory)?;
     let client_config = PoolClientConfig::compiled_network_address_only(
         address,
         certificate_pin,
-        options.worker.clone(),
+        worker.clone(),
         payout,
     )?;
     let searcher = ProductionV4PersistentPoolSearcher::start(production_v4_pool_searcher_config(
@@ -1078,6 +1264,7 @@ fn run_production_v4_pool_miner(options: ProductionV4PoolMinerOptions) -> Result
         &options.scratch_directory,
         PRODUCTION_V4_POOL_SEARCH_BATCH_SIZE,
         options.wsl_distribution.as_deref(),
+        Some(&gpu.uuid),
     )?)?;
     let stop = Arc::new(AtomicBool::new(false));
     let handler_stop = Arc::clone(&stop);
@@ -1088,7 +1275,8 @@ fn run_production_v4_pool_miner(options: ProductionV4PoolMinerOptions) -> Result
 
     println!("Pool: {}", options.pool);
     println!("Payout: {}", options.miner);
-    println!("Worker: {}", options.worker);
+    println!("Worker: {worker}");
+    println!("GPU {}: {}", gpu.physical_index, gpu.uuid);
     while !stop.load(Ordering::Acquire) {
         let mut client = match PoolClient::connect(client_config.clone()) {
             Ok(client) => client,
@@ -1119,7 +1307,8 @@ fn run_production_v4_pool_miner(options: ProductionV4PoolMinerOptions) -> Result
             &stop,
             &mut statistics,
             report_interval,
-            &options.worker,
+            &worker,
+            &gpu,
         ) {
             Ok(()) => break,
             Err(error) if pool_error_is_reconnectable(&error) => {
@@ -1148,6 +1337,7 @@ fn mine_production_v4_pool_session(
     statistics: &mut PoolMinerStatistics,
     report_interval: Duration,
     worker: &str,
+    gpu: &ResolvedPoolGpu,
 ) -> Result<(), PoolError> {
     let mut job_id = None;
     let mut next_nonce = 0_u64;
@@ -1196,6 +1386,7 @@ fn mine_production_v4_pool_session(
         statistics.report_if_due(
             client.current_job().challenge.height.saturating_sub(1),
             report_interval,
+            gpu,
         );
 
         let nonce = match result {
@@ -5826,6 +6017,188 @@ mod tests {
 
     #[cfg(feature = "production-v4")]
     #[test]
+    fn pool_gpu_selection_is_physical_and_default_worker_is_unchanged() {
+        let first = "GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let second = "GPU-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let devices = BTreeMap::from([
+            (
+                0,
+                GpuTelemetry {
+                    uuid: first.into(),
+                    power_watts: Some(100.0),
+                    ..Default::default()
+                },
+            ),
+            (
+                2,
+                GpuTelemetry {
+                    uuid: second.into(),
+                    power_watts: Some(200.0),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let default = resolve_pool_gpu(None, None, &devices).unwrap();
+        assert_eq!(default.physical_index, 0);
+        assert_eq!(default.uuid, first);
+        assert_eq!(pool_worker_name("rig", &default).unwrap(), "rig");
+
+        for selector in ["2", second] {
+            let chosen = resolve_pool_gpu(Some(selector), None, &devices).unwrap();
+            assert_eq!(chosen.physical_index, 2);
+            assert_eq!(chosen.uuid, second);
+            assert_eq!(pool_worker_name("rig", &chosen).unwrap(), "rig.gpu2");
+            assert_eq!(
+                pool_gpu_telemetry(&devices, &chosen).unwrap().power_watts,
+                Some(200.0)
+            );
+        }
+        let inherited = resolve_pool_gpu(None, Some(second), &devices).unwrap();
+        assert_eq!(pool_worker_name("rig", &inherited).unwrap(), "rig.gpu2");
+        for selector in [
+            "1",
+            "3",
+            "GPU-cccccccc-cccc-cccc-cccc-cccccccccccc",
+            "0,2",
+            "",
+            "-1",
+            "GPU-short",
+        ] {
+            assert!(
+                resolve_pool_gpu(Some(selector), None, &devices).is_err(),
+                "accepted {selector}"
+            );
+        }
+        assert!(pool_worker_name(&"x".repeat(32), &inherited).is_err());
+    }
+
+    #[cfg(feature = "production-v4")]
+    #[test]
+    fn pool_gpu_cli_accepts_exact_selector() {
+        let cli = Cli::try_parse_from([
+            "cmfd-miner", "pool", "--pool", "cmfd+tls://127.0.0.1:22445?pin=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--miner", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "--worker", "rig", "--gpu", "GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "--production-v4-bank", "/tmp/bank", "--production-v4-replay-worker", "/tmp/replay",
+            "--production-v4-scratch", "/tmp/scratch",
+        ]).unwrap();
+        assert!(
+            matches!(cli.command, Command::Pool { gpu: Some(value), .. } if value == "GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        );
+    }
+
+    #[cfg(feature = "production-v4")]
+    #[test]
+    fn pool_scratch_rejects_a_concurrent_miner() {
+        let path =
+            std::env::temp_dir().join(format!("cmfd-pool-scratch-lock-{}", std::process::id()));
+        let first = lock_pool_scratch(&path).unwrap();
+        assert!(lock_pool_scratch(&path).is_err());
+        drop(first);
+        let second = lock_pool_scratch(&path).unwrap();
+        drop(second);
+        fs::remove_file(path.join(".cmfd-pool-miner.lock")).unwrap();
+        fs::remove_dir(path).unwrap();
+    }
+
+    #[cfg(feature = "production-v4")]
+    #[test]
+    fn gpu_process_lock_catches_default_index_and_uuid_aliases() {
+        let directory =
+            std::env::temp_dir().join(format!("cmfd-gpu-lock-alias-{}", std::process::id()));
+        let uuid = "GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let default = ResolvedPoolGpu {
+            physical_index: 0,
+            uuid: uuid.into(),
+            named_selection: false,
+        };
+        let explicit = ResolvedPoolGpu {
+            named_selection: true,
+            ..default.clone()
+        };
+        let first = lock_pool_gpu_at(&default, &directory).unwrap();
+        assert!(lock_pool_gpu_at(&explicit, &directory).is_err());
+        let other = ResolvedPoolGpu {
+            physical_index: 1,
+            uuid: "GPU-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".into(),
+            named_selection: true,
+        };
+        let independent = lock_pool_gpu_at(&other, &directory).unwrap();
+        drop(independent);
+        drop(first);
+        let released = lock_pool_gpu_at(&explicit, &directory).unwrap();
+        drop(released);
+        for file in fs::read_dir(&directory).unwrap() {
+            fs::remove_file(file.unwrap().path()).unwrap();
+        }
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[cfg(feature = "production-v4")]
+    #[test]
+    fn gpu_process_lock_child_process() {
+        let Some(directory) = std::env::var_os("CMFD_TEST_POOL_GPU_LOCK_CHILD") else {
+            return;
+        };
+        let directory = PathBuf::from(directory);
+        let gpu = ResolvedPoolGpu {
+            physical_index: 0,
+            uuid: "GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".into(),
+            named_selection: true,
+        };
+        let _lock = lock_pool_gpu_at(&gpu, &directory).unwrap();
+        fs::write(directory.join("ready"), b"locked").unwrap();
+        thread::sleep(Duration::from_secs(30));
+    }
+
+    #[cfg(feature = "production-v4")]
+    #[test]
+    fn gpu_process_lock_releases_after_child_termination() {
+        let directory =
+            std::env::temp_dir().join(format!("cmfd-gpu-lock-crash-{}", std::process::id()));
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::gpu_process_lock_child_process",
+                "--nocapture",
+            ])
+            .env("CMFD_TEST_POOL_GPU_LOCK_CHILD", &directory)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let ready = directory.join("ready");
+        for _ in 0..100 {
+            if ready.is_file() {
+                break;
+            }
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        let observed = ready.is_file();
+        let gpu = ResolvedPoolGpu {
+            physical_index: 0,
+            uuid: "GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".into(),
+            named_selection: true,
+        };
+        if observed {
+            assert!(lock_pool_gpu_at(&gpu, &directory).is_err());
+        }
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(observed, "child did not acquire the GPU lock in time");
+        let recovered = lock_pool_gpu_at(&gpu, &directory).unwrap();
+        drop(recovered);
+        for file in fs::read_dir(&directory).unwrap() {
+            fs::remove_file(file.unwrap().path()).unwrap();
+        }
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[cfg(feature = "production-v4")]
+    #[test]
     fn pool_hashrate_counts_the_gpu_batch_and_excludes_pool_wait_time() {
         let result = PoolWorkSearchResult::Found {
             nonce: 7,
@@ -6537,6 +6910,7 @@ mod tests {
     #[test]
     fn telemetry_format_reports_power_efficiency_and_sensors() {
         let telemetry = GpuTelemetry {
+            uuid: "GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".into(),
             power_watts: Some(250.0),
             power_limit_watts: Some(300.0),
             temperature_celsius: Some(64.0),

@@ -22,6 +22,33 @@ worker. Interrupted downloads resume automatically.
 The TLS pin authenticates the pool endpoint. Keep the full URL intact and do
 not substitute an unpinned address.
 
+## One process per GPU (source template for a future package)
+
+These launcher changes are not retroactive to already signed RC archives.
+For a future package built from this source, run one launcher per physical GPU.
+On Linux, set `CMFD_GPU=0` and `CMFD_GPU=1` in separate terminals. On Windows,
+set `GPU=0` and `GPU=1` in separate copies of `START-MINER.bat`. A full GPU UUID
+from `nvidia-smi --query-gpu=index,uuid --format=csv,noheader` can be used
+instead of an index. The pool miner rejects malformed, unavailable, or multi-GPU
+selectors; a missing selector defaults to GPU zero. It pins each replay worker
+by the selected full UUID, which CUDA sees as ordinal zero. It logs the
+selected physical card's telemetry,
+appends `.gpuN` to the pool worker name, and gives each GPU its own scratch
+directory and launcher log. With no selector, the existing single-GPU GPU-0
+behavior and worker name remain unchanged.
+An OS lock keyed by full UUID blocks a second miner on the same physical card,
+even if one used its index and the other its UUID or a different package copy.
+
+The shared model-bank setup is serialized by an OS file lock. Later launchers
+wait with progress messages and then revalidate the first copy's authenticated
+bank. The one-hour timeout fails closed; a crash releases the lock so setup can
+be resumed. Do not copy partially assembled input files. This topology has
+launcher and stub tests; physical multi-GPU mining and accepted pool shares
+still require a separate rig qualification before release. A single-card WSL
+CUDA smoke check observed the same full GPU UUID on Windows and WSL and one
+visible CUDA device when selected by UUID; that does not prove two-card
+assignment or end-to-end share acceptance.
+
 ## Miner 2 GPU update
 
 The miner-only `v0.1.0-rc.5-miner.2` release improves GPU batching on RTX 40/50

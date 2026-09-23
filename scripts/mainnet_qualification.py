@@ -10,6 +10,7 @@ import argparse
 import hashlib
 from pathlib import Path
 import sys
+import tempfile
 
 import package_mainnet as package
 import production_v4_activation_approval as signatures
@@ -42,6 +43,8 @@ def verifier_sources(repo: Path, commit: str) -> dict:
         name = encoded_name.decode("utf-8", "strict")
         if not name.endswith(".py") or "/tests/" in name:
             continue
+        if not name.startswith("scripts/") or "\\" in name or any(part in ("", ".", "..") for part in name.split("/")):
+            raise Error("proof qualification source contains an unsafe Python path")
         if metadata.split()[:2] not in ([b"100644", b"blob"], [b"100755", b"blob"]):
             raise Error("proof qualification source contains a special Python entry")
         data = package.integrity._tracked_blob_at(repo, commit, name)
@@ -133,9 +136,25 @@ def prepare(*, repo: Path, commit: str, plan: Path, proof: Path, statement: Path
     if output.exists() or output.is_symlink():
         raise Error("proof qualification output already exists")
     sources = verifier_sources(repo, commit)
+    # Git may check Python out as CRLF on Windows. Execute exact committed
+    # blobs, not host-normalized bytes or ignored files from the working tree.
+    with tempfile.TemporaryDirectory(prefix="cmfd-mainnet-proof-verifier-") as temporary:
+        exported = Path(temporary)
+        for relative in sources:
+            target = exported / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(package.integrity._tracked_blob_at(repo, commit, relative))
+        return _prepare_with_verifier(repo=repo, commit=commit, plan=plan, proof=proof, statement=statement,
+            model_bank=model_bank, fixed_record=fixed_record, output=output,
+            sources=sources, verifier=exported / VERIFIER)
+
+
+def _prepare_with_verifier(*, repo: Path, commit: str, plan: Path, proof: Path, statement: Path,
+                           model_bank: Path, fixed_record: Path, output: Path,
+                           sources: dict, verifier: Path) -> dict:
     paths = {"model_bank": model_bank, "fixed_artifact_record": fixed_record,
              "qualification_proof": proof, "strict_statement": statement,
-             "fresh_process_verifier_script": repo / VERIFIER}
+             "fresh_process_verifier_script": verifier}
     def identities():
         return {role: {key: value for key, value in package.integrity._production_v4_file_identity(path, role).items()
                        if key != "name"} for role, path in paths.items()}
@@ -145,7 +164,7 @@ def prepare(*, repo: Path, commit: str, plan: Path, proof: Path, statement: Path
     for role, artifact in (("model_bank", "bank"), ("fixed_artifact_record", "fixed_record")):
         if files[role] != launch["payload"]["rules"]["artifacts"][artifact]:
             raise Error("qualification input does not match the mainnet plan: " + role)
-    raw_result = package.native_output(Path(sys.executable), [str(repo / VERIFIER),
+    raw_result = package.native_output(Path(sys.executable), [str(verifier),
         "--statement", str(statement), "--proof", str(proof), "--fixed-artifact-record", str(fixed_record),
         "--model-bank", str(model_bank), "--json"], timeout_seconds=1800)
     result = package.strict_json(raw_result, "fresh-process full-proof result", signatures.MAX_JSON_BYTES)

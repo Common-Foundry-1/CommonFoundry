@@ -139,6 +139,23 @@ class MainnetQualificationPreparationTests(unittest.TestCase):
         with self.assertRaisesRegex(qualification.Error, "fresh qualification"):
             qualification.validate_source(self.repo, self.git("rev-parse", "HEAD"), json.loads(self.output.read_bytes()))
 
+    def test_windows_line_endings_execute_exact_committed_verifier_blobs(self):
+        self.git("config", "core.autocrlf", "true")
+        source = self.repo / qualification.VERIFIER
+        committed = package.integrity._tracked_blob_at(self.repo, self.commit, qualification.VERIFIER)
+        source.write_bytes(committed.replace(b"\n", b"\r\n"))
+        self.git("add", "--renormalize", "scripts")
+        self.git("diff", "--cached", "--quiet")
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        def check_export(_executable, args, **_kwargs):
+            selected = Path(args[0])
+            self.assertNotEqual(selected, source)
+            self.assertEqual(selected.read_bytes(), committed)
+            return package.canonical(self.result)
+        with mock.patch.object(package, "native_output", side_effect=check_export):
+            self.prepare()
+        qualification.validate_source(self.repo, self.commit, json.loads(self.output.read_bytes()))
+
     def test_partial_result_and_input_replacement_cannot_publish_qualification(self):
         result = copy.deepcopy(self.result)
         result["full_cryptographic_proof_verified"] = False

@@ -128,6 +128,7 @@ fn start_production_v4_pool_searcher(
         &assets.scratch_directory,
         PRODUCTION_V4_POOL_SEARCH_BATCH_SIZE,
         assets.wsl_distribution.as_deref(),
+        None,
     )?;
     ProductionV4PersistentPoolSearcher::start(config)
 }

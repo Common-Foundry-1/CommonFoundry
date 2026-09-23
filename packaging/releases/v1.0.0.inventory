@@ -1,0 +1,17 @@
+CUDA-RUNTIME-SHA256.txt
+DASHBOARD-ASSETS.json
+DASHBOARD-BUILD-EVIDENCE.json
+MAINNET-APPROVAL-TRUST.json
+MAINNET-APPROVALS.json
+MAINNET-INTERNAL-REBUILD.json
+MAINNET-INTERNAL-REBUILD.json.sig
+MAINNET-PLAN-PRODUCER-APPROVAL.json
+MAINNET-PLAN-PRODUCER-APPROVAL.json.sig
+MAINNET-PLAN.json
+MAINNET-PRODUCER.allowed_signers
+MAINNET-QUALIFICATION-SUBJECT.json
+PRODUCTION-V4-REVIEWED-PIN.review
+commonfoundry-mainnet-miner-linux-x86_64-v1.0.0.tar.gz
+commonfoundry-mainnet-miner-windows-x86_64-v1.0.0.zip
+commonfoundry-mainnet-runtime-linux-x86_64-v1.0.0.tar.gz
+commonfoundry-mainnet-runtime-windows-x86_64-v1.0.0.zip

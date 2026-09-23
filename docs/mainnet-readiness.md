@@ -725,3 +725,28 @@ copied or generated. The current Windows OpenSSH verifier has SHA-256
 and a valid Microsoft Windows Authenticode signature at inspection. That is a
 new, explicit mainnet verifier pin; it does not replace the earlier RC verifier
 digest or retroactively alter RC release evidence.
+
+## Mainnet 1.0.0 preparation and real proof verification (September 23)
+
+The owner-signed workflow's real qualification run completed successfully on
+`701c5513e2371e6b3647f4e9a8f2a56b56f0904c`. It used the exact Git-exported verifier
+sources, the preserved 12,025,320-byte proof, its strict statement, the actual
+6,442,975,416-byte model bank and pinned fixed record. The complete cryptographic
+check passed with no remaining stages: all six relations, three opening
+reductions, three BaseFold transcripts, Merkle/query folds, initial boundaries,
+hash bindings and the statement's target comparison.
+
+The canonical report is preserved as
+`packaging/mainnet/MAINNET-QUALIFICATION-SUBJECT.json`, SHA-256
+`d152210c6de7bf94e8747d427fafa16ff0aa8bfe9e62b701898c34e361ab2359`.
+It explicitly records internal verification, not independent reproduction or
+mainnet authorization. This preserved RC proof verifies the unchanged proof
+system; it is not a mainnet block or verification of the future launch beacon.
+
+Node, miner, wallet, launch helper and dashboard metadata are aligned to the
+planned **1.0.0** mainnet package set. The release inventory lists the four
+native runtime/miner archives and required single-owner signing evidence. These
+are preparation metadata, not a published tag, release or deployed upgrade.
+Final owner signing, pin application, native builds, internal rebuild comparison,
+CI, package smoke and deployment remain outstanding. Existing live RC services
+and public release assets remain unchanged.

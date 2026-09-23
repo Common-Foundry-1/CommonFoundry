@@ -1034,7 +1034,7 @@ dependencies = [
 
 [[package]]
 name = "cmfd-launch"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "clap",
  "ctrlc",
@@ -1059,7 +1059,7 @@ dependencies = [
 
 [[package]]
 name = "cmfd-miner"
-version = "0.1.0-rc.5-miner.2"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1077,7 +1077,7 @@ dependencies = [
 
 [[package]]
 name = "cmfd-node"
-version = "0.1.0-rc.5"
+version = "1.0.0"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -1167,7 +1167,7 @@ dependencies = [
 
 [[package]]
 name = "common-foundry-wallet"
-version = "0.1.0-rc.5"
+version = "1.0.0"
 dependencies = [
  "base64 0.22.1",
  "cmfd-consensus",

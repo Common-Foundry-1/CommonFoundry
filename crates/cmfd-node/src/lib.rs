@@ -5904,7 +5904,7 @@ impl Node {
         // signature width, so this existing helper computes the exact signed
         // size even when inputs belong to different custody keys.
         let encoded_bytes = signed_wallet_payment_size(&plan.transaction, change_destination)?;
-        let minimum_fee = required_relay_fee(encoded_bytes);
+        let minimum_fee = required_relay_fee(encoded_bytes, self.profile.network_id);
         if fee_burned < minimum_fee {
             return Err(NodeError::MempoolFeeTooLow {
                 required: minimum_fee,
@@ -5953,7 +5953,7 @@ impl Node {
             ));
         }
         let encoded_bytes = encode_transaction(&transaction)?.len();
-        let minimum_fee = required_relay_fee(encoded_bytes);
+        let minimum_fee = required_relay_fee(encoded_bytes, self.profile.network_id);
         if plan.fee_burned_atoms < minimum_fee {
             return Err(NodeError::MempoolFeeTooLow {
                 required: minimum_fee,
@@ -6223,7 +6223,7 @@ impl Node {
         let signing_keys = vec![&self.wallet_signing_key; transaction.inputs.len()];
         transaction.sign_all(&signing_keys)?;
         let encoded_bytes = encode_transaction(&transaction)?.len();
-        let minimum_fee = required_relay_fee(encoded_bytes);
+        let minimum_fee = required_relay_fee(encoded_bytes, self.profile.network_id);
         if fee_burned < minimum_fee {
             return Err(NodeError::MempoolFeeTooLow {
                 required: minimum_fee,
@@ -7369,7 +7369,7 @@ fn validate_mempool_transaction(
     }
     let validation =
         state.validate_transactions_for_next_block(std::slice::from_ref(transaction))?;
-    let required = required_relay_fee(encoded_bytes);
+    let required = required_relay_fee(encoded_bytes, state.params().network_id);
     if validation.total_burned_fees < required {
         return Err(NodeError::MempoolFeeTooLow {
             required,
@@ -7387,7 +7387,7 @@ fn validate_wallet_minimum_fee(network_id: [u8; 32], actual: u64) -> Result<(), 
     Ok(())
 }
 
-fn required_relay_fee(encoded_bytes: usize) -> u64 {
+fn required_relay_fee(encoded_bytes: usize, network_id: [u8; 32]) -> u64 {
     let kib = encoded_bytes.saturating_add(1023) / 1024;
     u64::try_from(kib)
         .ok()
@@ -7395,8 +7395,26 @@ fn required_relay_fee(encoded_bytes: usize) -> u64 {
         .unwrap_or(u64::MAX)
         .max(MIN_RELAY_FEE_PER_KIB)
         .max(cmfd_consensus::economics::minimum_transaction_fee(
-            COMPILED_NETWORK_PROFILE.network_id,
+            network_id,
         ))
+}
+
+#[cfg(test)]
+mod relay_fee_tests {
+    use super::*;
+
+    #[test]
+    fn relay_fee_uses_the_open_node_network_not_the_compiled_profile() {
+        let encoded_bytes = 500;
+        assert_eq!(
+            required_relay_fee(encoded_bytes, DEVNET_PROFILE.network_id),
+            MIN_RELAY_FEE_PER_KIB
+        );
+        assert_eq!(
+            required_relay_fee(encoded_bytes, RCNET1_PROFILE.network_id),
+            cmfd_consensus::economics::MIN_TRANSACTION_FEE_ATOMS
+        );
+    }
 }
 
 pub(crate) fn signed_wallet_payment_size(

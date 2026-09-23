@@ -113,7 +113,7 @@ mainnet_network_id.inc.rs; other changes require fresh review.
 All package files are hashed into MAINNET-PACKAGE.json. Archive metadata is
 normalized to the frozen commit's timestamp, and existing outputs are never
 overwritten. The receipt explicitly does not grant release approval. Final
-cross-platform reconciliation, independent approval, signing/checksum inventory,
+cross-platform reconciliation, owner approval, signing/checksum inventory,
 and full signed-package launch rehearsal remain required. Fixture archive tests
 are not qualification of actual mainnet binaries.
 
@@ -136,7 +136,7 @@ workers, dashboard assets and CUDA runtime. Extra files (including wallet keys o
 symlinks, duplicate members, noncanonical trailers and changed archives fail.
 
 The output binds the four archive hashes and explicitly remains unapproved and
-not independently reproduced. It is input to independent reproduction, review
+not independently reproduced. It is input to internal rebuild comparison, review
 and final signing, not a substitute for those steps. It never uploads anything.
 
 Linux runtime packages also include isolated mainnet systemd templates and
@@ -145,7 +145,7 @@ mainnet-storage-readiness.py is a read-only capacity planner/reserve check;
 it never prunes data. The existing RC seed and its credentials must remain
 untouched while preparing the separate mainnet directories and service account.
 
-Final publication additionally requires the signed binary-reproduction statement
+Final publication additionally requires the owner-signed internal-build statement
 and the mainnet-specific checks in the standard release finalizer. See
 docs/mainnet-plan-approvals.md in the source checkout for exact evidence filenames
 and the preparation/signing sequence. Neither archive assembly nor an unsigned

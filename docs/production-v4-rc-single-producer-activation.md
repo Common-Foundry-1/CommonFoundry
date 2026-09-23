@@ -4,8 +4,9 @@ RCNet-1 may be activated by one project producer after the source commit is
 frozen and the preserved block-1 proof passes the full independent verifier.
 This policy is deliberately limited to an experimental release candidate. It
 does not claim independent reproduction, an external audit, or mainnet
-authorization. The existing distinct producer/reproducer policy remains the
-mainnet path.
+authorization. Mainnet now has its own explicitly owner-signed policy;
+see [mainnet plan approvals](mainnet-plan-approvals.md). This RC signature alone
+still cannot authorize mainnet.
 
 The preparation command refuses a dirty source tree, an existing activation
 pin, a mismatched RCNet candidate, mismatched model or fixed-record artifacts,

@@ -64,7 +64,7 @@ class MainnetPackageTests(unittest.TestCase):
         # Synthetic producer records for archive tests, not real approvals.
         authorities = {}
         approvals = {}
-        for index, role in enumerate(signature_contract.ROLES, 1):
+        for index, role in enumerate(mainnet_approval.ROLES, 1):
             key_hash = str(index) * 64
             authority = {"signer_identity": role + "@example.invalid", "key_blob_sha256": key_hash,
                          "allowed_signers_sha256": str(index + 2) * 64, "key_type": "ssh-ed25519",
@@ -92,8 +92,9 @@ class MainnetPackageTests(unittest.TestCase):
                      "genesis_policy": "requires_verified_launch_beacon", "beacon_round": packages.BEACON_ROUND,
                      "activation_evidence_sha256": "3" * 64,
                      "mainnet_approval_manifest_sha256": hashlib.sha256(self.approval_path.read_bytes()).hexdigest(),
-                     "proof_approval_trust": {"contract_schema": signature_contract.SUBJECT_SCHEMA,
+                     "proof_approval_trust": {"contract_schema": "CMFD_MAINNET_SINGLE_SIGNER_APPROVAL_SUBJECT_V1",
                                                "qualification_binding_sha256": "b" * 64, "ssh_keygen_sha256": "c" * 64,
+                                               "independent_reproducer": None,
                                                **authorities}}
         self.dashboard_dist = self.root / "dashboard-dist"
         dashboard = {"index.html": b'<script type="module" src="/assets/app-a1.js"></script>\n',
@@ -453,6 +454,20 @@ class CommittedOwnerPlanTests(unittest.TestCase):
                     sources = {name: (self.repo / path).read_bytes()
                                for name, path in packages.package_sources(platform, kind).items()}
                     packages.validate_catalog(sources, self.plan)
+
+    def test_committed_release_policy_has_only_the_existing_owner_key(self):
+        encoded = (self.root / "APPROVAL-TRUST.json").read_bytes()
+        trust = packages.strict_json(encoded, "mainnet owner trust")
+        self.assertEqual(packages.canonical(trust), encoded)
+        self.assertEqual(set(trust), {"producer", "ssh_keygen_sha256"})
+        policy = (self.root / "MAINNET-PRODUCER.allowed_signers").read_bytes()
+        authority = {"signer_identity": trust["producer"]["signer_identity"],
+                     **signature_contract.parse_allowed_signers_authority(policy,
+                         signer_identity=trust["producer"]["signer_identity"], role="producer")}
+        self.assertEqual(authority, trust["producer"])
+        self.assertEqual(authority["key_blob_sha256"],
+                         "14b57b0e4b74ec4d6227105d4d963844bb857d8e1115717aadc9226efce14348")
+        packages.nonzero_hex(trust["ssh_keygen_sha256"], 64, "mainnet SSH verifier digest")
 
     def test_custody_record_is_public_only_and_matches_each_plan_role(self):
         data = (self.root / "REWARD-CUSTODY.json").read_bytes()

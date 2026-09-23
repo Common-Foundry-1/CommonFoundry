@@ -20,6 +20,7 @@ packaging/mainnet/linux/*.sh text eol=lf
 packaging/mainnet/linux/*.service text eol=lf
 packaging/mainnet/linux/*.timer text eol=lf
 packaging/mainnet/*.json text eol=lf
+packaging/mainnet/*.allowed_signers text eol=lf
 tools/production-v4-prover/*.sh text eol=lf
 tools/production-v4-prover/patches/*.patch text eol=lf
 packaging/mainnet/windows/*.ps1 text eol=lf

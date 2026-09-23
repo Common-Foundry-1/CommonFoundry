@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Mainnet release gate and unsigned independent-build attestation preparation.
+"""Mainnet release gate and unsigned owner/internal-build attestation preparation.
 
 No signing, pin application, public publication, or network activation occurs.
-The actual independent reproducer must review and sign the resulting statement.
+The single owner signer reviews and signs the resulting internal-build statement.
 """
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ import argparse
 import hashlib
 from pathlib import Path
 import re
-import tempfile
 
 import generate_mainnet_pins as pins
 import mainnet_plan_approval as approval
@@ -30,13 +29,12 @@ PROOF_PIN = "PRODUCTION-V4-REVIEWED-PIN.review"
 DASHBOARD_ASSETS = "DASHBOARD-ASSETS.json"
 DASHBOARD_BUILD_EVIDENCE = "DASHBOARD-BUILD-EVIDENCE.json"
 CUDA_RUNTIME_PIN = "CUDA-RUNTIME-SHA256.txt"
-REPRODUCTION = "MAINNET-REPRODUCTION.json"
+REPRODUCTION = "MAINNET-INTERNAL-REBUILD.json"
 REPRODUCTION_SIGNATURE = REPRODUCTION + ".sig"
-REPRODUCTION_SCHEMA = "CMFD_MAINNET_BINARY_REPRODUCTION_V1"
-REPRODUCTION_STATEMENT = "I independently rebuilt the reviewed source and reproduced the exact four package archives identified in this statement."
+REPRODUCTION_SCHEMA = "CMFD_MAINNET_OWNER_INTERNAL_REBUILD_V1"
+REPRODUCTION_STATEMENT = "I performed an internal rebuild of the reviewed source and reproduced the exact four package archives identified here. This does not claim independent review."
 ROLE_FILES = {
     "producer": ("MAINNET-PLAN-PRODUCER-APPROVAL.json", "MAINNET-PLAN-PRODUCER-APPROVAL.json.sig", "MAINNET-PRODUCER.allowed_signers"),
-    "independent_reproducer": ("MAINNET-PLAN-REPRODUCER-APPROVAL.json", "MAINNET-PLAN-REPRODUCER-APPROVAL.json.sig", "MAINNET-REPRODUCER.allowed_signers"),
 }
 BASE_EVIDENCE = {PLAN, MANIFEST, QUALIFICATION, TRUST, PROOF_PIN, DASHBOARD_ASSETS,
                  DASHBOARD_BUILD_EVIDENCE,
@@ -53,7 +51,7 @@ def archive_names(version: str) -> dict:
 
 def plan_material(files: dict, trust: dict, verifier: Path) -> dict:
     result = {"ssh_keygen": verifier, "expected_verifier_sha256": trust["ssh_keygen_sha256"]}
-    for role, prefix in ((signatures.PRODUCER_ROLE, "producer"), (signatures.REPRODUCER_ROLE, "reproducer")):
+    for role, prefix in ((signatures.PRODUCER_ROLE, "producer"),):
         request, signature, policy = ROLE_FILES[role]
         result.update({prefix + "_approval": files[request], prefix + "_signature": files[signature],
                        prefix + "_allowed_signers": files[policy], prefix + "_signer_identity": trust[role]["signer_identity"]})
@@ -133,7 +131,7 @@ def validate_base(*, repo: Path, commit: str, version: str, files: dict,
         raise Error("staged mainnet trust policy differs from the committed review policy")
     if expected_verifier_sha256 != trust["ssh_keygen_sha256"]:
         raise Error("mainnet release verifier differs from the precommitted policy")
-    verified = approval.verify_pair(subject=subject, expected_trust=trust, **plan_material(files, trust, verifier))
+    verified = approval.verify_approval(subject=subject, expected_trust=trust, **plan_material(files, trust, verifier))
     if signatures.canonical_json(verified) != snapshots[MANIFEST].data:
         raise Error("mainnet plan approval manifest does not match fresh signature verification")
     qualification = signatures._json_object(snapshots[QUALIFICATION].data, "qualification subject")
@@ -164,12 +162,13 @@ def validate_base(*, repo: Path, commit: str, version: str, files: dict,
         raise Error("package and staged mainnet approval manifests disagree")
     for name, snapshot in {**snapshots, **review_snapshots}.items():
         signatures._assert_snapshot_current(snapshot, name)
-    # The source-free evidence files are part of the independent statement too.
+    # The source-free evidence files are part of the owner's internal-build statement too.
     evidence = {name: {"bytes": len(row.data), "sha256": approval.digest(row.data)} for name, row in sorted(snapshots.items())}
     statement = {"schema": REPRODUCTION_SCHEMA, "statement": REPRODUCTION_STATEMENT,
-                 "role": signatures.REPRODUCER_ROLE,
-                 "namespace": signatures.NAMESPACES[signatures.REPRODUCER_ROLE],
-                 "signer_identity": trust[signatures.REPRODUCER_ROLE]["signer_identity"],
+                 "role": signatures.PRODUCER_ROLE,
+                 "namespace": signatures.NAMESPACES[signatures.PRODUCER_ROLE],
+                 "signer_identity": trust[signatures.PRODUCER_ROLE]["signer_identity"],
+                 "independent_reproduction_claim": False,
                  "source_commit": commit, "review_source_commit": review_commit, "package_version": version,
                  "launch_plan_digest": plan["launch_plan_digest"], "network_id": plan["network_id"],
                  "mainnet_approval_manifest_sha256": approval.digest(snapshots[MANIFEST].data),
@@ -178,35 +177,11 @@ def validate_base(*, repo: Path, commit: str, version: str, files: dict,
 
 
 def verify_reproduction_signature(*, payload: bytes, files: dict, trust: dict, verifier: Path) -> None:
-    role = signatures.REPRODUCER_ROLE
-    snapshots = {
-        "request": signatures._snapshot(files[REPRODUCTION], "mainnet reproduction statement", signatures.MAX_JSON_BYTES),
-        "signature": signatures._snapshot(files[REPRODUCTION_SIGNATURE], "mainnet reproduction signature", signatures.MAX_SIGNATURE_BYTES),
-        "policy": signatures._snapshot(files[ROLE_FILES[role][2]], "reproducer public policy", signatures.MAX_ALLOWED_SIGNERS_BYTES),
-        "verifier": signatures._snapshot(verifier, "trusted SSH verifier", signatures.MAX_VERIFIER_BYTES),
-    }
-    if snapshots["request"].data != payload:
+    if signatures._snapshot(files[REPRODUCTION], "internal rebuild statement", signatures.MAX_JSON_BYTES).data != payload:
         raise Error("mainnet reproduction statement does not bind the exact staged release")
-    if approval.digest(snapshots["verifier"].data) != trust["ssh_keygen_sha256"]:
-        raise Error("mainnet reproduction verifier differs from its trusted digest")
-    authority = signatures.parse_allowed_signers_authority(snapshots["policy"].data,
-                 signer_identity=trust[role]["signer_identity"], role=role)
-    if {"signer_identity": trust[role]["signer_identity"], **authority} != trust[role]:
-        raise Error("reproduction signer differs from the committed authority")
-    with tempfile.TemporaryDirectory(prefix="cmfd-mainnet-reproduction-") as temporary:
-        root = Path(temporary)
-        executable = root / ("ssh-keygen" + verifier.suffix)
-        policy = root / "reproducer.allowed_signers"
-        signature = root / "reproduction.sig"
-        signatures._write_exclusive(executable, snapshots["verifier"].data, executable=True)
-        signatures._write_exclusive(policy, snapshots["policy"].data)
-        signatures._write_exclusive(signature, snapshots["signature"].data)
-        signatures._verify_signature(verifier=executable, allowed_signers=policy,
-                                     signer_identity=trust[role]["signer_identity"], namespace=signatures.NAMESPACES[role],
-                                     signature=signature, payload=payload,
-                                     environment=signatures._verification_environment(root, verifier))
-    for name, snapshot in snapshots.items():
-        signatures._assert_snapshot_current(snapshot, name)
+    approval.verify_owner_signature(payload=payload, request=files[REPRODUCTION],
+        signature=files[REPRODUCTION_SIGNATURE], policy=files[ROLE_FILES["producer"][2]],
+        authority=trust["producer"], verifier=verifier, verifier_sha256=trust["ssh_keygen_sha256"])
 
 
 def validate_release(*, repo: Path, commit: str, version: str, files: dict,
@@ -253,7 +228,7 @@ def prepare_reproduction(*, repo: Path, commit: str, version: str,
     encoded = signatures.canonical_json(first["statement"])
     integrity._write_new(output, encoded)
     return {"statement_sha256": approval.digest(encoded), "byte_identical": True,
-            "independent_attestation_required": True, "release_approved": False}
+            "owner_attestation_required": True, "independent_reproduction_claim": False, "release_approved": False}
 
 
 def main() -> None:
@@ -261,7 +236,7 @@ def main() -> None:
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--commit", required=True)
     parser.add_argument("--version", required=True)
-    for name in ("producer-stage", "reproducer-stage", "ssh-keygen", "output"):
+    for name in ("producer-stage", "rebuild-stage", "ssh-keygen", "output"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--ssh-keygen-sha256", required=True)
     args = parser.parse_args()
@@ -270,7 +245,7 @@ def main() -> None:
             parser.error(f"--{name} must be an absolute path")
     try:
         result = prepare_reproduction(repo=args.repo, commit=args.commit, version=args.version,
-                                      producer_stage=args.producer_stage, reproducer_stage=args.reproducer_stage,
+                                      producer_stage=args.producer_stage, reproducer_stage=args.rebuild_stage,
                                       verifier=args.ssh_keygen, expected_verifier_sha256=args.ssh_keygen_sha256, output=args.output)
         print(signatures.canonical_json(result).decode(), end="")
     except (OSError, ValueError, KeyError, TypeError, Error, signatures.ApprovalError) as error:

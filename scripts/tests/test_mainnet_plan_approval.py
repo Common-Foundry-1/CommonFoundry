@@ -14,7 +14,8 @@ import mainnet_plan_approval as mainnet
 import package_mainnet as package
 import production_v4_activation_approval as signatures
 import test_mainnet_packages as package_fixtures
-import test_production_v4_activation_approval as proof_fixtures
+import mainnet_qualification as qualification_policy
+import test_mainnet_qualification as proof_fixtures
 
 
 class MainnetPlanApprovalTests(unittest.TestCase):
@@ -29,7 +30,7 @@ class MainnetPlanApprovalTests(unittest.TestCase):
         self.verifier = Path(executable)
         self.keys = {}
         self.policies = {}
-        for role in signatures.ROLES:
+        for role in mainnet.ROLES:
             key = self.root / (role + "-temporary-test-key")
             subprocess.run([executable, "-q", "-t", "ed25519", "-N", "", "-f", str(key)], capture_output=True, check=True)
             public = key.with_suffix(".pub").read_text().split()
@@ -37,16 +38,15 @@ class MainnetPlanApprovalTests(unittest.TestCase):
             policy.write_bytes(f'{role}@example.invalid namespaces="{signatures.NAMESPACES[role]}" {public[0]} {public[1]}\n'.encode())
             self.keys[role], self.policies[role] = key, policy
         self.policy_args = dict(producer_allowed_signers=self.policies[signatures.PRODUCER_ROLE],
-                                producer_signer_identity="producer@example.invalid",
-                                reproducer_allowed_signers=self.policies[signatures.REPRODUCER_ROLE],
-                                reproducer_signer_identity="independent_reproducer@example.invalid")
-        self.trust = {**signatures.load_trusted_authorities(**self.policy_args),
+                                producer_signer_identity="producer@example.invalid")
+        authority = signatures.parse_allowed_signers_authority(self.policies["producer"].read_bytes(),
+            signer_identity="producer@example.invalid", role="producer")
+        self.trust = {"producer": {"signer_identity": "producer@example.invalid", **authority},
                       "ssh_keygen_sha256": hashlib.sha256(self.verifier.read_bytes()).hexdigest()}
         self.plan = copy.deepcopy(self.fixture.plan)
-        self.qualification = proof_fixtures.ProductionV4ActivationApprovalTests().subject()
         for role, artifact, letter in (("model_bank", "bank", "a"), ("fixed_artifact_record", "fixed_record", "b")):
             self.plan["payload"]["rules"]["artifacts"][artifact]["blake3"] = letter * 64
-            self.qualification["files"][role].update(self.plan["payload"]["rules"]["artifacts"][artifact])
+        self.qualification = proof_fixtures.fixture(self.plan)
         self.plan_bytes = self.encode_plan(self.plan)
         self.qualification_bytes = signatures.canonical_json(self.qualification)
         self.trust_bytes = signatures.canonical_json(self.trust)
@@ -63,7 +63,7 @@ class MainnetPlanApprovalTests(unittest.TestCase):
         subject = self.subject if subject is None else subject
         prepared = mainnet.prepare_payloads(subject=subject, expected_trust=self.trust, **self.policy_args)
         material = {**self.policy_args, "ssh_keygen": self.verifier, "expected_verifier_sha256": self.trust["ssh_keygen_sha256"]}
-        for role, prefix in ((signatures.PRODUCER_ROLE, "producer"), (signatures.REPRODUCER_ROLE, "reproducer")):
+        for role, prefix in ((signatures.PRODUCER_ROLE, "producer"),):
             path = self.root / (prefix + ".approval.json")
             path.write_bytes(prepared["payloads"][role])
             subprocess.run([str(self.verifier), "-Y", "sign", "-f", str(self.keys[role]), "-n", signatures.NAMESPACES[role], str(path)], capture_output=True, check=True)
@@ -71,12 +71,13 @@ class MainnetPlanApprovalTests(unittest.TestCase):
             material[prefix + "_signature"] = Path(str(path) + ".sig")
         return material
 
-    def test_two_real_signatures_produce_plan_bound_manifest(self):
-        manifest = mainnet.verify_pair(subject=self.subject, expected_trust=self.trust, **self.signed_material())
+    def test_one_real_signature_produces_plan_bound_manifest(self):
+        manifest = mainnet.verify_approval(subject=self.subject, expected_trust=self.trust, **self.signed_material())
         encoded = signatures.canonical_json(manifest)
         self.assertEqual(mainnet.validate_manifest(encoded, self.plan_bytes), manifest)
         runtime = {"mainnet_approval_manifest_sha256": mainnet.digest(encoded),
-                   "proof_approval_trust": {**self.trust, "qualification_binding_sha256": self.subject["qualification_binding_sha256"]}}
+                   "proof_approval_trust": {**self.trust, "contract_schema": qualification_policy.TRUST_SCHEMA,
+                       "independent_reproducer": None, "qualification_binding_sha256": self.subject["qualification_binding_sha256"]}}
         mainnet.bind_manifest_to_runtime(manifest, encoded, runtime)
         runtime["mainnet_approval_manifest_sha256"] = "9" * 64
         with self.assertRaisesRegex(signatures.ApprovalError, "compiled pin"):
@@ -90,32 +91,57 @@ class MainnetPlanApprovalTests(unittest.TestCase):
                                         review_commit="a" * 40, trust_bytes=self.trust_bytes)
         rewritten = mainnet.prepare_payloads(subject=subject, expected_trust=self.trust, **self.policy_args)
         material["producer_approval"].write_bytes(rewritten["payloads"][signatures.PRODUCER_ROLE])
-        material["reproducer_approval"].write_bytes(rewritten["payloads"][signatures.REPRODUCER_ROLE])
         with self.assertRaisesRegex(signatures.ApprovalError, "signature is invalid"):
-            mainnet.verify_pair(subject=subject, expected_trust=self.trust, **material)
+            mainnet.verify_approval(subject=subject, expected_trust=self.trust, **material)
 
-    def test_role_signature_swap_is_rejected(self):
+    def test_wrong_namespace_signature_is_rejected(self):
         material = self.signed_material()
-        material["producer_signature"], material["reproducer_signature"] = material["reproducer_signature"], material["producer_signature"]
+        material["producer_signature"].unlink()
+        subprocess.run([str(self.verifier), "-Y", "sign", "-f", str(self.keys["producer"]),
+            "-n", signatures.NAMESPACES["independent_reproducer"], str(material["producer_approval"])], capture_output=True, check=True)
         with self.assertRaisesRegex(signatures.ApprovalError, "signature is invalid"):
-            mainnet.verify_pair(subject=self.subject, expected_trust=self.trust, **material)
+            mainnet.verify_approval(subject=self.subject, expected_trust=self.trust, **material)
+
+    def test_another_key_and_an_rc_payload_cannot_replace_owner_approval(self):
+        material = self.signed_material()
+        wrong_key = self.root / "unauthorized-test-key"
+        subprocess.run([str(self.verifier), "-q", "-t", "ed25519", "-N", "", "-f", str(wrong_key)], capture_output=True, check=True)
+        material["producer_signature"].unlink()
+        subprocess.run([str(self.verifier), "-Y", "sign", "-f", str(wrong_key),
+            "-n", signatures.NAMESPACES["producer"], str(material["producer_approval"])], capture_output=True, check=True)
+        with self.assertRaisesRegex(signatures.ApprovalError, "signature is invalid"):
+            mainnet.verify_approval(subject=self.subject, expected_trust=self.trust, **material)
+        material["producer_signature"].unlink()
+        original = material["producer_approval"].read_bytes()
+        material["producer_approval"].write_bytes(original.replace(mainnet.ROLE_SCHEMA.encode(), b"CMFD_PRODUCTION_V4_RC_SINGLE_PRODUCER_ROLE_APPROVAL_V1"))
+        subprocess.run([str(self.verifier), "-Y", "sign", "-f", str(self.keys["producer"]),
+            "-n", signatures.NAMESPACES["producer"], str(material["producer_approval"])], capture_output=True, check=True)
+        material["producer_approval"].write_bytes(original)
+        with self.assertRaisesRegex(signatures.ApprovalError, "signature is invalid"):
+            mainnet.verify_approval(subject=self.subject, expected_trust=self.trust, **material)
+
+    def test_second_approval_is_rejected_not_silently_ignored(self):
+        manifest = mainnet.verify_approval(subject=self.subject, expected_trust=self.trust, **self.signed_material())
+        manifest["approvals"]["independent_reproducer"] = copy.deepcopy(manifest["approvals"]["producer"])
+        with self.assertRaises(signatures.ApprovalError):
+            mainnet.validate_manifest(signatures.canonical_json(manifest), self.plan_bytes)
 
     def test_rc_entry_point_stays_rc_only(self):
         with self.assertRaises(signatures.ApprovalError):
-            signatures.prepare_approval_payloads(subject=self.subject, **self.policy_args)
+            signatures.validate_subject(self.subject)
 
     def test_unknown_or_same_signer_and_verifier_substitution_are_rejected(self):
         wrong = copy.deepcopy(self.trust)
         wrong["producer"]["signer_identity"] = "someone-else@example.invalid"
         with self.assertRaises(signatures.ApprovalError):
             mainnet.prepare_payloads(subject=self.subject, expected_trust=wrong, **self.policy_args)
-        same = dict(self.policy_args, reproducer_signer_identity="producer@example.invalid")
+        same = {**self.trust, "independent_reproducer": self.trust["producer"]}
         with self.assertRaises(signatures.ApprovalError):
-            mainnet.prepare_payloads(subject=self.subject, expected_trust=self.trust, **same)
+            mainnet.prepare_payloads(subject=self.subject, expected_trust=same, **self.policy_args)
         material = self.signed_material()
         material["expected_verifier_sha256"] = "f" * 64
         with self.assertRaisesRegex(signatures.ApprovalError, "precommitted trust"):
-            mainnet.verify_pair(subject=self.subject, expected_trust=self.trust, **material)
+            mainnet.verify_approval(subject=self.subject, expected_trust=self.trust, **material)
 
     def test_qualification_artifact_or_subject_mutation_is_rejected(self):
         changed = copy.deepcopy(self.qualification)
@@ -140,6 +166,9 @@ class MainnetPlanApprovalTests(unittest.TestCase):
         repo.mkdir()
         trust_path = repo / "approval-trust.json"
         trust_path.write_bytes(self.trust_bytes)
+        verifier_source = repo / qualification_policy.VERIFIER
+        verifier_source.parent.mkdir()
+        verifier_source.write_bytes(b"# synthetic qualification source; not a real verifier\n")
         def git(*args):
             return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, check=True).stdout.decode().strip()
         git("init", "--quiet")
@@ -147,8 +176,7 @@ class MainnetPlanApprovalTests(unittest.TestCase):
         git("add", ".")
         git("-c", "user.name=Approval Test", "-c", "user.email=fixture@example.invalid", "commit", "--no-gpg-sign", "-qm", "Temporary public trust fixture")
         commit = git("rev-parse", "HEAD")
-        for field in ("activation_source_commit", "artifact_generation_source_commit", "qualification_source_commit"):
-            self.qualification[field] = commit
+        proof_fixtures.bind_fixture_source(repo, commit, self.qualification)
         qualification_path = self.root / "qualification.json"
         qualification_path.write_bytes(signatures.canonical_json(self.qualification))
         plan_path = self.root / "plan.json"
@@ -158,14 +186,12 @@ class MainnetPlanApprovalTests(unittest.TestCase):
         common = ["--repo", str(repo), "--review-commit", commit, "--plan", str(plan_path),
                   "--qualification-subject", str(qualification_path), "--trust", str(trust_path),
                   "--producer-policy", str(self.policy_args["producer_allowed_signers"]),
-                  "--producer-identity", self.policy_args["producer_signer_identity"],
-                  "--reproducer-policy", str(self.policy_args["reproducer_allowed_signers"]),
-                  "--reproducer-identity", self.policy_args["reproducer_signer_identity"]]
+                  "--producer-identity", self.policy_args["producer_signer_identity"]]
         result = subprocess.run([sys.executable, str(script), "prepare", *common, "--output", str(pending)], capture_output=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
         verify = [sys.executable, str(script), "verify", *common, "--output", str(self.root / "manifest.json"),
                   "--ssh-keygen", str(self.verifier), "--ssh-keygen-sha256", self.trust["ssh_keygen_sha256"]]
-        for role, prefix in ((signatures.PRODUCER_ROLE, "producer"), (signatures.REPRODUCER_ROLE, "reproducer")):
+        for role, prefix in ((signatures.PRODUCER_ROLE, "producer"),):
             payload = pending / f"{role}.approval.json"
             subprocess.run([str(self.verifier), "-Y", "sign", "-f", str(self.keys[role]), "-n", signatures.NAMESPACES[role], str(payload)], capture_output=True, check=True)
             verify.extend([f"--{prefix}-approval", str(payload), f"--{prefix}-signature", str(payload) + ".sig"])

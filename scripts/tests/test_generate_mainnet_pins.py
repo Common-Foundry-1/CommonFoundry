@@ -14,11 +14,13 @@ import generate_mainnet_pins as pins
 import mainnet_plan_approval as approval
 import production_v4_activation_approval as signatures
 import test_mainnet_plan_approval as approval_fixtures
+import test_mainnet_qualification as qualification_fixtures
+import mainnet_qualification as qualification_policy
 
 
 class MainnetPinGenerationTests(unittest.TestCase):
     def setUp(self):
-        self.fixture = approval_fixtures.MainnetPlanApprovalTests("test_two_real_signatures_produce_plan_bound_manifest")
+        self.fixture = approval_fixtures.MainnetPlanApprovalTests("test_one_real_signature_produces_plan_bound_manifest")
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
         self.root = self.fixture.root
@@ -27,6 +29,9 @@ class MainnetPinGenerationTests(unittest.TestCase):
         self.trust_path = self.repo / "packaging/mainnet/APPROVAL-TRUST.json"
         self.trust_path.parent.mkdir(parents=True, exist_ok=True)
         self.trust_path.write_bytes(self.fixture.trust_bytes)
+        verifier_source = self.repo / qualification_policy.VERIFIER
+        verifier_source.parent.mkdir()
+        verifier_source.write_bytes(b"# synthetic qualification source; not a real verifier\n")
         self.source_pins = []
         for relative in ("crates/cmfd-node/mainnet_release_pin.inc.rs", "crates/cmfd-consensus/mainnet_network_id.inc.rs"):
             path = self.repo / relative
@@ -42,22 +47,9 @@ class MainnetPinGenerationTests(unittest.TestCase):
         git("-c", "user.name=Pin Test", "-c", "user.email=fixture@example.invalid", "commit", "--no-gpg-sign", "-qm", "Synthetic pin-review source")
         self.commit = git("rev-parse", "HEAD")
         self.qualification = copy.deepcopy(self.fixture.qualification)
-        for field in ("activation_source_commit", "artifact_generation_source_commit", "qualification_source_commit"):
-            self.qualification[field] = self.commit
-        files = self.qualification["files"]
-        self.fields = {
-            "schema": "CMFD_PRODUCTION_V4_ACTIVATION_V1", "qualification_source_commit": self.commit,
-            "qualification_manifest_sha256": files["independent_reproduction_report"]["sha256"],
-            "fresh_process_verifier_binary_sha256": files["fresh_process_verifier_script"]["sha256"],
-            "fresh_process_verifier_report_sha256": files["fresh_process_verifier_report"]["sha256"],
-            "core_spec_sha256": pins.integrity.PRODUCTION_V4_CORE_SPEC_SHA256,
-            "core_vector_sha256": pins.integrity.PRODUCTION_V4_CORE_VECTOR_SHA256,
-            "proof_algebra_sha256": pins.integrity.PRODUCTION_V4_PROOF_ALGEBRA_SHA256,
-            "approval_trust": {**self.fixture.trust, "contract_schema": signatures.SUBJECT_SCHEMA,
-                               "qualification_binding_sha256": signatures.qualification_binding_sha256(files)},
-        }
+        qualification_fixtures.bind_fixture_source(self.repo, self.commit, self.qualification)
+        self.fields = qualification_policy.proof_pin_fields(self.qualification, self.fixture.trust)
         self.proof_bytes = pins.integrity._render_production_v4_activation_pin(self.fields)
-        self.qualification["source_pin_sha256"] = approval.digest(self.proof_bytes)
         self.qualification_path = self.root / "qualification-subject.json"
         self.qualification_path.write_bytes(signatures.canonical_json(self.qualification))
         self.plan = copy.deepcopy(self.fixture.plan)
@@ -74,7 +66,7 @@ class MainnetPinGenerationTests(unittest.TestCase):
         self.subject = approval.build_subject(plan_bytes=self.plan_bytes, qualification_bytes=self.qualification_path.read_bytes(),
                                               review_commit=self.commit, trust_bytes=self.fixture.trust_bytes)
         self.material = self.fixture.signed_material(self.subject)
-        self.manifest = approval.verify_pair(subject=self.subject, expected_trust=self.fixture.trust, **self.material)
+        self.manifest = approval.verify_approval(subject=self.subject, expected_trust=self.fixture.trust, **self.material)
         self.manifest_path = self.root / "manifest.json"
         self.manifest_path.write_bytes(signatures.canonical_json(self.manifest))
         self.proof_path = self.root / "proof-pin.review"
@@ -103,7 +95,7 @@ class MainnetPinGenerationTests(unittest.TestCase):
     def test_parser_rejects_arbitrary_rust_and_noncanonical_targets(self):
         self.assertEqual(pins.parse_reviewed_proof_pin(self.proof_bytes), self.fields)
         for data in (b"None\n", self.proof_bytes.replace(b"\n", b"\r\n"), self.proof_bytes + b"const EVIL: u8 = 1;\n",
-                     self.proof_bytes.replace(b'"CMFD_PRODUCTION_V4_ACTIVATION_V1"', b'include!("elsewhere.rs")')):
+                     self.proof_bytes.replace(qualification_policy.ACTIVATION_SCHEMA.encode(), b'include!("elsewhere.rs")')):
             with self.subTest(data=data[:40]), self.assertRaises((pins.Error, signatures.ApprovalError)):
                 pins.parse_reviewed_proof_pin(data)
 

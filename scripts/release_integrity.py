@@ -4172,6 +4172,8 @@ def _validate_production_v4_rc_artifacts(
     approval_trust = _validate_production_v4_approval_trust_fields(
         evidence["activation_approval_trust"]
     )
+    if approval_trust["contract_schema"] != activation_approval.SUBJECT_SCHEMA:
+        raise IntegrityError("dual-party RC release requires its original approval policy")
     if (
         repo is None
         or activation_ssh_keygen is None
@@ -4551,6 +4553,8 @@ def _validate_production_v4_single_producer_rc_artifacts(
     trust = _validate_production_v4_approval_trust_fields(
         evidence.get("activation_approval_trust")
     )
+    if trust["contract_schema"] != "CMFD_PRODUCTION_V4_RC_SINGLE_PRODUCER_APPROVAL_SUBJECT_V1":
+        raise IntegrityError("single-producer RC release cannot inherit mainnet approval")
     expected_evidence, expected_evidence_bytes = _production_v4_activation_evidence(
         validated={"artifacts": proof["artifacts"]},
         pin_fields={
@@ -7193,9 +7197,9 @@ def _validate_production_v4_approval_trust_fields(
         },
         "ProductionV4 activation approval trust",
     )
-    single_producer_rc = (
-        trust["contract_schema"]
-        == "CMFD_PRODUCTION_V4_RC_SINGLE_PRODUCER_APPROVAL_SUBJECT_V1"
+    single_producer_rc = trust["contract_schema"] in (
+        "CMFD_PRODUCTION_V4_RC_SINGLE_PRODUCER_APPROVAL_SUBJECT_V1",
+        "CMFD_MAINNET_SINGLE_SIGNER_APPROVAL_SUBJECT_V1",
     )
     if (
         not single_producer_rc
@@ -7215,7 +7219,7 @@ def _validate_production_v4_approval_trust_fields(
     if single_producer_rc:
         if trust["independent_reproducer"] is not None:
             raise IntegrityError(
-                "ProductionV4 single-producer RC trust must not claim an independent reproducer"
+                "ProductionV4 single-signer trust must not claim an independent reproducer"
             )
         roles = ("producer",)
     else:

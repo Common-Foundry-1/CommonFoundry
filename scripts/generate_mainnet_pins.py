@@ -14,6 +14,7 @@ from pathlib import Path
 import mainnet_plan_approval as approval
 import package_mainnet as package
 import production_v4_activation_approval as signatures
+import mainnet_qualification as qualification_policy
 
 integrity = package.integrity
 Error = integrity.IntegrityError
@@ -45,19 +46,21 @@ def parse_reviewed_proof_pin(data: bytes) -> dict:
             return value
         line("Some(ProductionV4ActivationEvidence {")
         fields = {name: field(name, 4) for name in PIN_FIELDS}
-        if fields["schema"] != "CMFD_PRODUCTION_V4_ACTIVATION_V1":
-            raise Error("mainnet cannot reuse single-producer RC activation")
+        if fields["schema"] != qualification_policy.ACTIVATION_SCHEMA:
+            raise Error("mainnet requires its own single-owner activation, not RC approval")
         signatures._commit(fields["qualification_source_commit"], "proof qualification commit")
         for name in PIN_FIELDS[2:]:
             signatures._hex256(fields[name], name)
         line("    approval_trust: ProductionV4ActivationApprovalTrust {")
         trust = {name: field(name, 8) for name in ("contract_schema", "qualification_binding_sha256", "ssh_keygen_sha256")}
-        for role in signatures.ROLES:
+        for role in approval.ROLES:
             prefix = "Some(" if role == signatures.REPRODUCER_ROLE else ""
             suffix = ")" if prefix else ""
             line(f"        {role}: {prefix}ProductionV4ActivationSignerTrust {{")
             trust[role] = {name: field(name, 12) for name in SIGNER_FIELDS}
             line(f"        }}{suffix},")
+        line("        independent_reproducer: None,")
+        trust["independent_reproducer"] = None
         line("    },")
         line("})")
         if next(lines, None) is not None:
@@ -65,32 +68,17 @@ def parse_reviewed_proof_pin(data: bytes) -> dict:
     except (StopIteration, UnicodeError, json.JSONDecodeError) as error:
         raise Error("proof pin is not a supported canonical literal") from error
     fields["approval_trust"] = integrity._validate_production_v4_approval_trust_fields(trust)
-    if trust["contract_schema"] != signatures.SUBJECT_SCHEMA:
-        raise Error("mainnet proof target must use dual-party trust")
+    if trust["contract_schema"] != qualification_policy.TRUST_SCHEMA:
+        raise Error("mainnet proof target must use its explicit one-signer trust")
     if integrity._render_production_v4_activation_pin(fields) != data:
         raise Error("proof pin does not round-trip to its canonical literal")
     return fields
 
 
 def validate_proof_binding(fields: dict, pin_bytes: bytes, qualification: dict, trust_policy: dict) -> None:
-    if approval.digest(pin_bytes) != qualification["source_pin_sha256"]:
-        raise Error("proof target differs from the signed qualification target")
-    if fields["qualification_source_commit"] != qualification["qualification_source_commit"]:
-        raise Error("proof target qualification commit mismatch")
-    expected = {
-        "qualification_manifest_sha256": qualification["files"]["independent_reproduction_report"]["sha256"],
-        "fresh_process_verifier_binary_sha256": qualification["files"]["fresh_process_verifier_script"]["sha256"],
-        "fresh_process_verifier_report_sha256": qualification["files"]["fresh_process_verifier_report"]["sha256"],
-        "core_spec_sha256": integrity.PRODUCTION_V4_CORE_SPEC_SHA256,
-        "core_vector_sha256": integrity.PRODUCTION_V4_CORE_VECTOR_SHA256,
-        "proof_algebra_sha256": integrity.PRODUCTION_V4_PROOF_ALGEBRA_SHA256,
-    }
-    if any(fields[name] != value for name, value in expected.items()):
-        raise Error("proof target disagrees with the qualified reports or frozen specifications")
-    expected_trust = {**trust_policy, "contract_schema": signatures.SUBJECT_SCHEMA,
-                      "qualification_binding_sha256": signatures.qualification_binding_sha256(qualification["files"])}
-    if fields["approval_trust"] != expected_trust:
-        raise Error("proof target authority/binding differs from the committed review policy")
+    expected = qualification_policy.proof_pin_fields(qualification, trust_policy)
+    if fields != expected or pin_bytes != integrity._render_production_v4_activation_pin(expected):
+        raise Error("proof target differs from the signed qualification target and qualified reports")
 
 
 def byte_array(value: str) -> str:
@@ -128,7 +116,7 @@ def generate(*, repo: Path, review_commit: str, plan: Path, qualification: Path,
     subject, trust_policy, snapshots = approval.load_inputs(repo, review_commit, plan, qualification, trust)
     proof_snapshot = signatures._snapshot(proof_pin, "reviewed proof pin", 64 * 1024)
     manifest_snapshot = signatures._snapshot(approval_manifest, "mainnet approval manifest", package.MAX_INFO)
-    verified = approval.verify_pair(subject=subject, expected_trust=trust_policy, **material)
+    verified = approval.verify_approval(subject=subject, expected_trust=trust_policy, **material)
     if signatures.canonical_json(verified) != manifest_snapshot.data:
         raise Error("supplied mainnet manifest is not the freshly verified signature result")
     fields = parse_reviewed_proof_pin(proof_snapshot.data)
@@ -182,9 +170,9 @@ def main() -> None:
     parser.add_argument("--review-commit", required=True)
     for name in ("plan", "qualification-subject", "trust", "proof-pin", "approval-manifest", "output",
                  "producer-policy", "producer-approval", "producer-signature",
-                 "reproducer-policy", "reproducer-approval", "reproducer-signature", "ssh-keygen"):
+                 "ssh-keygen"):
         parser.add_argument("--" + name, type=Path, required=True)
-    for name in ("producer-identity", "reproducer-identity", "ssh-keygen-sha256"):
+    for name in ("producer-identity", "ssh-keygen-sha256"):
         parser.add_argument("--" + name, required=True)
     args = parser.parse_args()
     for name, value in vars(args).items():
@@ -196,8 +184,6 @@ def main() -> None:
                           approval_manifest=args.approval_manifest, output=args.output, material={
                               "producer_allowed_signers": args.producer_policy, "producer_signer_identity": args.producer_identity,
                               "producer_approval": args.producer_approval, "producer_signature": args.producer_signature,
-                              "reproducer_allowed_signers": args.reproducer_policy, "reproducer_signer_identity": args.reproducer_identity,
-                              "reproducer_approval": args.reproducer_approval, "reproducer_signature": args.reproducer_signature,
                               "ssh_keygen": args.ssh_keygen, "expected_verifier_sha256": args.ssh_keygen_sha256,
                           })
         print(signatures.canonical_json(report).decode(), end="")

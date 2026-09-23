@@ -328,7 +328,7 @@ pub const PRODUCTION_RC_NETWORK_IDENTITY: ProductionRcNetworkIdentityPin =
 
 /// Fail-closed insertion point for authenticated ProductionV4 activation
 /// evidence. RCNet may use the explicit single-producer RC policy; mainnet
-/// remains on the distinct producer and independent-reproducer policy.
+/// uses a distinct owner-signed policy and exact launch-plan approval.
 #[cfg(feature = "production-rc")]
 pub const PRODUCTION_V4_ACTIVATION: Option<ProductionV4ActivationEvidence> =
     include!("production_v4_activation_pin.inc.rs");
@@ -503,16 +503,17 @@ fn validate_production_v4_approval_trust(
     const DUAL_APPROVAL_SCHEMA: &str = "CMFD_PRODUCTION_V4_ACTIVATION_APPROVAL_SUBJECT_V1";
     const SINGLE_PRODUCER_RC_SCHEMA: &str =
         "CMFD_PRODUCTION_V4_RC_SINGLE_PRODUCER_APPROVAL_SUBJECT_V1";
+    const MAINNET_OWNER_SCHEMA: &str = "CMFD_MAINNET_SINGLE_SIGNER_APPROVAL_SUBJECT_V1";
     let independent_reproducer = match trust.contract_schema {
         DUAL_APPROVAL_SCHEMA => Some(
             trust
                 .independent_reproducer
                 .ok_or("ProductionV4 independent reproducer approval trust is absent")?,
         ),
-        SINGLE_PRODUCER_RC_SCHEMA => {
+        SINGLE_PRODUCER_RC_SCHEMA | MAINNET_OWNER_SCHEMA => {
             if trust.independent_reproducer.is_some() {
                 return Err(
-                    "ProductionV4 single-producer RC trust must not claim an independent reproducer",
+                    "ProductionV4 single-signer trust must not claim an independent reproducer",
                 );
             }
             None
@@ -678,6 +679,12 @@ pub fn validate_production_rc(
     if profile.proof != ConsensusProofSelection::ProductionV4 {
         return Err("compiled consensus proof selection is not ProductionV4");
     }
+    if profile
+        .production_v4_activation
+        .is_some_and(|evidence| evidence.schema == "CMFD_MAINNET_SINGLE_SIGNER_PROOF_ACTIVATION_V1")
+    {
+        return Err("mainnet approval cannot authorize an RC release");
+    }
     validate_production_network_identity(
         profile
             .production_network_identity
@@ -695,7 +702,9 @@ fn validate_v4_evidence_and_artifacts(
         .ok_or("ProductionV4 activation evidence is absent")?;
     if !matches!(
         evidence.schema,
-        "CMFD_PRODUCTION_V4_ACTIVATION_V1" | "CMFD_PRODUCTION_V4_RC_SINGLE_PRODUCER_ACTIVATION_V1"
+        "CMFD_PRODUCTION_V4_ACTIVATION_V1"
+            | "CMFD_PRODUCTION_V4_RC_SINGLE_PRODUCER_ACTIVATION_V1"
+            | "CMFD_MAINNET_SINGLE_SIGNER_PROOF_ACTIVATION_V1"
     ) {
         return Err("ProductionV4 activation evidence schema is unsupported");
     }
@@ -753,6 +762,10 @@ fn validate_v4_evidence_and_artifacts(
         ) | (
             "CMFD_PRODUCTION_V4_RC_SINGLE_PRODUCER_ACTIVATION_V1",
             "CMFD_PRODUCTION_V4_RC_SINGLE_PRODUCER_APPROVAL_SUBJECT_V1",
+            None,
+        ) | (
+            "CMFD_MAINNET_SINGLE_SIGNER_PROOF_ACTIVATION_V1",
+            "CMFD_MAINNET_SINGLE_SIGNER_APPROVAL_SUBJECT_V1",
             None,
         )
     );
@@ -821,16 +834,16 @@ pub fn validate_mainnet_release(
     if !is_nonzero_lower_hex(pin.approval_manifest_sha256, 32) {
         return Err("mainnet approval manifest pin is absent or invalid");
     }
-    if pin.activation.schema != "CMFD_PRODUCTION_V4_ACTIVATION_V1"
+    if pin.activation.schema != "CMFD_MAINNET_SINGLE_SIGNER_PROOF_ACTIVATION_V1"
         || pin.activation.approval_trust.contract_schema
-            != "CMFD_PRODUCTION_V4_ACTIVATION_APPROVAL_SUBJECT_V1"
+            != "CMFD_MAINNET_SINGLE_SIGNER_APPROVAL_SUBJECT_V1"
         || pin
             .activation
             .approval_trust
             .independent_reproducer
-            .is_none()
+            .is_some()
     {
-        return Err("mainnet requires distinct producer and independent-reproducer approvals");
+        return Err("mainnet requires its explicit single-owner release approval");
     }
     if profile.production_v4_activation != Some(pin.activation) {
         return Err("mainnet activation profile does not match its release pin");
@@ -1112,6 +1125,15 @@ mod tests {
             approval_trust: SINGLE_PRODUCER_V4_APPROVAL_TRUST,
             ..V4_EVIDENCE
         };
+    const MAINNET_OWNER_EVIDENCE: ProductionV4ActivationEvidence = ProductionV4ActivationEvidence {
+        schema: "CMFD_MAINNET_SINGLE_SIGNER_PROOF_ACTIVATION_V1",
+        approval_trust: ProductionV4ActivationApprovalTrust {
+            contract_schema: "CMFD_MAINNET_SINGLE_SIGNER_APPROVAL_SUBJECT_V1",
+            independent_reproducer: None,
+            ..V4_APPROVAL_TRUST
+        },
+        ..V4_EVIDENCE
+    };
     const V4_ARTIFACTS: ProductionV4ArtifactIdentityPins = ProductionV4ArtifactIdentityPins {
         bank: ProductionV3FileIdentityPin {
             bytes: 1,
@@ -1179,12 +1201,13 @@ mod tests {
             steward_reward_destination: NETWORK_IDENTITY.steward_reward_destination,
             community_reward_destination: NETWORK_IDENTITY.community_reward_destination,
             approval_manifest_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            activation: V4_EVIDENCE,
+            activation: MAINNET_OWNER_EVIDENCE,
         };
         (
             CompiledReleaseProfile {
                 network: CompiledNetworkProfile::Mainnet,
                 production_network_identity: None,
+                production_v4_activation: Some(MAINNET_OWNER_EVIDENCE),
                 ..v4_profile()
             },
             configuration,
@@ -1293,9 +1316,9 @@ mod tests {
                 Some(configuration.network_id),
                 BUILD_SOURCE_COMMIT
             ),
-            Err("mainnet requires distinct producer and independent-reproducer approvals")
+            Err("mainnet requires its explicit single-owner release approval")
         );
-        configuration.activation = V4_EVIDENCE;
+        configuration.activation = MAINNET_OWNER_EVIDENCE;
         configuration
             .activation
             .approval_trust
@@ -1335,6 +1358,18 @@ mod tests {
     }
 
     #[test]
+    fn owner_mainnet_approval_cannot_authorize_rc() {
+        let profile = CompiledReleaseProfile {
+            production_v4_activation: Some(MAINNET_OWNER_EVIDENCE),
+            ..v4_profile()
+        };
+        assert_eq!(
+            validate_production_rc(profile, BUILD_SOURCE_COMMIT),
+            Err("mainnet approval cannot authorize an RC release")
+        );
+    }
+
+    #[test]
     fn mainnet_evidence_binds_the_new_plan_and_cannot_be_an_rc_record() {
         let (profile, configuration) = mainnet_fixture();
         let bytes = canonical_mainnet_activation_evidence_json(
@@ -1353,7 +1388,7 @@ mod tests {
         assert_eq!(value["network_id"], lower_hex(configuration.network_id));
         assert_eq!(value["proof_activation"]["network_profile"], "Mainnet");
         assert!(
-            !value["proof_activation"]["activation_approval_trust"]["independent_reproducer"]
+            value["proof_activation"]["activation_approval_trust"]["independent_reproducer"]
                 .is_null()
         );
         assert!(
@@ -1683,7 +1718,7 @@ mod tests {
         };
         assert_eq!(
             validate_production_rc(single_with_reproducer, BUILD_SOURCE_COMMIT),
-            Err("ProductionV4 single-producer RC trust must not claim an independent reproducer")
+            Err("ProductionV4 single-signer trust must not claim an independent reproducer")
         );
 
         let dual_without_reproducer = CompiledReleaseProfile {

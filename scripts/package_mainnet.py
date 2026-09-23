@@ -301,12 +301,13 @@ def validate_info(data: bytes, plan: dict, commit: str) -> dict:
     nonzero_hex(info["activation_evidence_sha256"], 64, "activation evidence digest")
     nonzero_hex(info["mainnet_approval_manifest_sha256"], 64, "mainnet approval manifest digest")
     trust = info["proof_approval_trust"]
-    if not isinstance(trust, dict) or trust.get("contract_schema") != "CMFD_PRODUCTION_V4_ACTIVATION_APPROVAL_SUBJECT_V1":
-        raise Error("runtime proof approval trust is absent or not dual-role")
+    if not isinstance(trust, dict) or trust.get("contract_schema") != "CMFD_MAINNET_SINGLE_SIGNER_APPROVAL_SUBJECT_V1":
+        raise Error("runtime proof approval trust is absent or not mainnet single-signer")
     nonzero_hex(trust.get("qualification_binding_sha256"), 64, "proof qualification binding")
     nonzero_hex(trust.get("ssh_keygen_sha256"), 64, "proof approval verifier pin")
-    if not isinstance(trust.get("producer"), dict) or not isinstance(trust.get("independent_reproducer"), dict):
-        raise Error("runtime lacks distinct producer/reproducer trust")
+    if not isinstance(trust.get("producer"), dict) or trust.get("independent_reproducer") is not None:
+        raise Error("runtime must have exactly one mainnet release signer")
+    integrity._validate_production_v4_approval_trust_fields(trust)
     return info
 
 

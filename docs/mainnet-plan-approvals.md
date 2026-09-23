@@ -1,145 +1,111 @@
-# Mainnet plan approvals
+# Mainnet: one release signer
 
-The existing ProductionV4 qualification gate remains required. RC approval does
-not authorize mainnet. The mainnet plan needs an additional exact-byte approval
-that binds the reviewed source, the canonical plan, the qualified model/proof
-material and the committed signer/verifier policy.
+On September 23, 2026 the owner selected **one release signer**. Mainnet uses an
+explicit owner-signed policy, not the older two-party RC qualification policy.
+There is no second signer, independent-reproducer signature or external-audit
+claim. Full proof verification, exact source/plan binding, internal rebuilds,
+package reconciliation and release signatures remain required.
 
-`scripts/mainnet_plan_approval.py` does not select reviewers, generate signing
-keys, sign requests, change release pins or activate a network. `prepare` creates
-unsigned requests; `verify` checks both externally supplied signatures and writes
-a canonical manifest. Distinct keys are necessary but do not, by themselves,
-prove organizational independence or the quality of a review.
+## 1. Freeze the public plan and internal proof evidence
 
-## Prerequisites
+The owner's public reward destinations and approved 5x RC starting target are in
+`packaging/mainnet/MAINNET-PLAN.json`. Private wallets, encrypted backups and
+passwords must remain outside the source repository. The source remains private
+until October 2 at 17:00 UTC; mining starts October 3 at 17:00 UTC.
 
-- Final reward receiving addresses and starting target, with custody/recovery
-  evidence. Generate the canonical plan with the Rust mainnet-plan command.
-- Validated ProductionV4 qualification evidence and its canonical pin-phase
-  approval subject. This tool checks its binding and artifact agreement; it does
-  not replace the full proof-qualification verifier.
-- A named producer and independent reproducer, each with a separate dedicated
-  allowed-signers policy and control of their own private signing key.
-- A canonical, committed trust JSON object containing `producer`,
-  `independent_reproducer` and `ssh_keygen_sha256`. Each role contains
-  `signer_identity`, `allowed_signers_sha256`, `key_blob_sha256`, `key_fingerprint`
-  and `key_type`. Derive these from the actual public allowed-signers files and
-  the trusted OpenSSH executable; never fill in guessed hashes or fixture values.
-  For final release tooling, commit it at `packaging/mainnet/APPROVAL-TRUST.json`
-  before freezing the review commit.
-- A clean, exact review checkout with final versions and code. Both qualifying
-  source history and trust policy must belong to that checkout.
+From the clean reviewed commit, run `scripts/mainnet_qualification.py` with
+absolute paths for `--repo`, `--plan`, `--proof`, `--statement`, `--model-bank`,
+`--fixed-record`, `--output`, and the full `--commit`. Use a new output outside
+source. This runs the existing independent verifier implementation in a fresh
+process with all full-proof inputs, checks actual artifact hashes against the
+plan, rehashes them after verification and binds the tracked Python source tree.
+The output is a canonical internal qualification record, not a signed approval.
 
-The dedicated ProductionV4 activation SSH namespaces are retained for these
-same authorities. Mainnet uses distinct subject and role-payload schemas, so an
-RC signature or a signature for the other role cannot approve a mainnet request.
-Do not broaden the allowed-signers namespace restriction.
+All candidate claims, target comparison, matrix relations, initial-boundary
+checks, opening reductions, Merkle paths and BaseFold verification must succeed.
+A framing-only check or partial result is rejected. A preserved RC proof may
+demonstrate the unchanged proof system; it is not represented as a mainnet block
+or a test of the future launch beacon. Changed verifier sources require new
+qualification. Retain the proof, strict statement and source with the record.
 
-## Workflow
+## 2. Commit the owner's public signing policy
 
-1. Run `prepare` with absolute paths for `--repo`, `--plan`,
-   `--qualification-subject`, `--trust`, `--producer-policy`,
-   `--reproducer-policy`, and a new `--output` directory outside tracked source.
-   Supply `--review-commit`, `--producer-identity` and `--reproducer-identity`.
-2. Each actual reviewer inspects SUBJECT.json and their role request, verifies
-   the referenced evidence, and signs their own exact request using the
-   namespace in that request. Keep private keys with their owners. The tool
-   cannot provide or infer an independent reviewer.
-3. Run `verify` with the same inputs plus `--producer-approval`,
-   `--producer-signature`, `--reproducer-approval`, `--reproducer-signature`,
-   `--ssh-keygen` and `--ssh-keygen-sha256`. The executable digest must match the
-   precommitted trust policy. Use a new output file for MAINNET-APPROVALS.json.
-4. Preserve both signed requests, signatures, public policies, qualification
-   subject and trust document with the review evidence. The manifest hashes
-   those records; it is not a substitute for retaining or publishing them.
-5. After all qualification/review requirements are satisfied, the mainnet pin
-   configuration must include the verified manifest digest and matching proof
-   trust. Generate candidates with `scripts/generate_mainnet_pins.py` as described
-   below. Application and final release signing remain separate operations.
-6. Assemble with `--approval-manifest` and run the four-package preflight. The
-   packaged manifest must match the compiled digest, plan and proof authority
-   descriptors. Only the two explicit mainnet pin files may change after the
-   reviewed commit. Any code, dependency, version or other source change needs
-   a new reviewed commit and new signed requests.
+Commit canonical `packaging/mainnet/APPROVAL-TRUST.json` containing exactly
+`producer` and `ssh_keygen_sha256`. The producer descriptor contains
+`signer_identity`, `allowed_signers_sha256`, `key_blob_sha256`, `key_fingerprint`
+and `key_type`, derived from the actual public policy. Use the existing dedicated
+producer namespace `commonfoundry-production-v4-activation-producer-v1`.
+The allowed-signers file must have one exact principal/key and that namespace.
+Keep the private signing key with the owner; no signing key is generated by
+these tools. Do not substitute the steward or community wallet key.
 
-No future beacon signature is included in an approval request. The pinned
-October schedule and genesis policy are approved, while the live beacon is
-verified separately at activation. Passing signature checks is not proof that
-deployment, recovery, mining/payouts or the final launch rehearsal are complete.
+Mainnet has its own subject, approval, manifest and proof-activation schemas.
+An RC approval, a payload for another purpose, another key or a second approval
+cannot stand in for this mainnet authorization. The trusted SSH verifier hash
+is checked before execution, and verifier/policy/request/signature files are
+snapshotted and rechecked against replacement during verification.
 
-## Generate the two pin candidates
+## 3. Prepare and verify the single plan signature
 
-Supply the same clean review checkout, canonical plan, qualification subject,
-trust document, both role policies/requests/signatures and pinned SSH verifier.
-Also provide `--proof-pin` (the canonical dual-party ProductionV4 review target)
-and `--approval-manifest` (the verified MAINNET-APPROVALS.json). Use a new absolute
-`--output` directory outside the source repository.
+Run `scripts/mainnet_plan_approval.py prepare` with `--repo`, `--review-commit`,
+`--plan`, `--qualification-subject` (the internal record from step 1), `--trust`,
+`--producer-policy`, `--producer-identity` and a new `--output` directory.
+It creates `SUBJECT.json`, `producer.approval.json` and
+`PRODUCTION-V4-REVIEWED-PIN.review`. It does not sign or install them.
 
-The proof target must come from the existing qualified proof workflow and must
-match the source-pin digest in the signed qualification subject. Do not reset
-or overwrite the active RC proof pin to prepare mainnet. RC single-producer
-targets cannot be used here. All actual qualification and reviewer evidence
-remains required; syntactically valid hashes are not such evidence.
+The owner reviews and signs `producer.approval.json` with the dedicated producer
+key and namespace. Run `verify` with the same inputs plus `--producer-approval`,
+`--producer-signature`, `--ssh-keygen`, `--ssh-keygen-sha256` and a new output
+file for `MAINNET-APPROVALS.json`. No reproducer arguments are accepted.
 
-The generator re-verifies both mainnet signatures. It accepts only the existing
-canonical literal format, never evaluates arbitrary Rust, and checks the report,
-specification and authority bindings. It emits mainnet_release_pin.inc.rs,
-mainnet_network_id.inc.rs and PIN-REVIEW.json. It neither applies them nor starts
-a node. Existing output directories are not overwritten; failure cleanup removes
-only files created by this invocation and preserves any concurrent operator file.
+The signed subject binds the exact canonical plan bytes, network identity,
+launch/source times, reviewed commit, complete qualification record and committed
+owner/verifier policy. The manifest records the verified signature identities.
+No future beacon signature is included; nodes verify the exact pinned round at
+launch, independently of this release-signing process.
 
-After independently reviewing the candidate hashes and contents, apply only the
-two generated includes in the intended source locations, commit them, build the
-mainnet-feature binaries, and run the native identity/packaging checks. Full
-mainnet plan parsing and the signed-package rehearsal are still required. A Rust
-syntax/type smoke test of a generated include is not a release authorization.
+## 4. Generate and apply the two mainnet pins
 
-## Final binary reproduction and release gate
+Run `scripts/generate_mainnet_pins.py` with the same inputs, the freshly verified
+`--approval-manifest`, `--proof-pin` from step 3 and a new external `--output`
+directory. The tool rechecks the owner signature, complete qualification binding
+and canonical proof target. It emits `mainnet_release_pin.inc.rs`,
+`mainnet_network_id.inc.rs` and `PIN-REVIEW.json` without changing source.
 
-After both native package sets have been independently built, prepare a release
-stage with the four archives and these exact public evidence filenames:
+After checking the candidates, apply and commit only those two includes. Other
+code, dependency, version or trust changes after the reviewed commit require a
+fresh review/signature. Mainnet builds still reject absent pins and RC identities.
+The RC activation pin is not overwritten or reinterpreted as mainnet approval.
 
-- MAINNET-PLAN.json, MAINNET-APPROVALS.json
-- MAINNET-QUALIFICATION-SUBJECT.json, MAINNET-APPROVAL-TRUST.json
-- PRODUCTION-V4-REVIEWED-PIN.review
-- DASHBOARD-ASSETS.json (the exact reviewed dashboard manifest used for all four packages)
-- DASHBOARD-BUILD-EVIDENCE.json (the canonical isolated-build record bound to the frozen dashboard source, lockfile and manifest)
-- CUDA-RUNTIME-SHA256.txt (the exact reviewed Linux x86-64 `libcudart.so.12` SHA-256, lowercase hex plus newline)
-- MAINNET-PLAN-PRODUCER-APPROVAL.json and its .sig
-- MAINNET-PLAN-REPRODUCER-APPROVAL.json and its .sig
-- MAINNET-PRODUCER.allowed_signers, MAINNET-REPRODUCER.allowed_signers
+## 5. Build, internally reproduce and sign the four packages
 
-Prepare the dashboard manifest from the exact clean frozen commit with
-`scripts/prepare_mainnet_dashboard.py`; see
-[`mainnet-dashboard-assets.md`](mainnet-dashboard-assets.md). Its build record
-is first-person toolchain evidence, not a substitute for independent package
-reproduction or a release approval.
-The release gate requires and validates the exact build record in both stages.
-Its digest enters the independent reproduction statement, release inventory and
-final signed checksum chain. The record contains absolute Node/npm executable
-paths, which may reveal builder usernames or filesystem layout when published;
-review it for disclosure before staging and signing.
+Build Windows/Linux runtime and miner archives from the clean pinned commit.
+Prepare reviewed dashboard assets using `scripts/prepare_mainnet_dashboard.py`
+and preserve the build evidence. Pin the exact authorized Linux CUDA runtime.
+Run `scripts/verify_mainnet_packages.py` to reconcile all four archives.
 
-Use `scripts/mainnet_release.py` with `--repo`, `--commit`, `--version`,
-`--producer-stage`, `--reproducer-stage`, `--ssh-keygen`,
-`--ssh-keygen-sha256` and a new `--output` file. Both stages are fully inspected;
-the same directory or hardlinked archives cannot stand in for two builds.
-The output is an unsigned first-person reproduction statement. Matching bytes
-alone do not establish independence. Only the actual independent reproducer
-should sign it after genuinely rebuilding and checking those packages.
+The producer and separate internal rebuild stages contain the four archives and:
 
-Stage the exact statement as MAINNET-REPRODUCTION.json and its detached signature
-as MAINNET-REPRODUCTION.json.sig. Its signature uses the already committed
-independent-reproducer authority and namespace. A producer signature cannot
-replace it. Include every staged artifact/evidence filename in the release
-inventory, committed before the review freeze.
+- `MAINNET-PLAN.json`, `MAINNET-APPROVALS.json`
+- `MAINNET-QUALIFICATION-SUBJECT.json`, `MAINNET-APPROVAL-TRUST.json`
+- `PRODUCTION-V4-REVIEWED-PIN.review`
+- `MAINNET-PLAN-PRODUCER-APPROVAL.json` and its `.sig`
+- `MAINNET-PRODUCER.allowed_signers`
+- `DASHBOARD-ASSETS.json`, `DASHBOARD-BUILD-EVIDENCE.json`
+- `CUDA-RUNTIME-SHA256.txt`
 
-The normal `release_integrity.py finalize` and `verify` commands now dispatch
-mainnet artifacts through this gate, including plain version labels such as
-1.0.0. Supply the pinned `--activation-ssh-keygen` and
-`--activation-ssh-keygen-sha256`. The gate rechecks plan signatures, exact applied
-pins, four-package consistency, public evidence and the reproduction statement.
-The ordinary finalizer then produces BUILDINFO, source SBOM, provenance and
-checksums. It does not sign those checksums or publish anything. The normal
-offline release-signing/download-verification step remains required, together
-with the deployment and launch rehearsal.
+Run `scripts/mainnet_release.py` with `--repo`, `--commit`, `--version`,
+`--producer-stage`, `--rebuild-stage`, `--ssh-keygen`, `--ssh-keygen-sha256` and
+a new `--output`. It requires two byte-identical archive sets in separate
+directories and rejects hardlinked copies. The tool cannot prove that a copied
+archive was genuinely rebuilt: the owner must perform the rebuild before signing.
+Its statement explicitly identifies this as **internal**, not independent review.
+
+The **same owner signer** signs the result under the producer namespace. Stage it
+as `MAINNET-INTERNAL-REBUILD.json` and `MAINNET-INTERNAL-REBUILD.json.sig`.
+Commit the release inventory before review freeze. The ordinary
+`release_integrity.py finalize` / `verify` gates recheck the plan signature,
+qualification, applied pins, all four packages, asset evidence and signed
+internal-build statement. Checksums, provenance, SBOM and final release signing
+remain required. The brief final-package smoke and deployment checks also remain;
+the previously waived six-hour GPU-dropout test is not reinstated.

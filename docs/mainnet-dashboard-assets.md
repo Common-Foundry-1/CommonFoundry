@@ -50,7 +50,7 @@ asset-manifest bindings. The exact record is included in the independent
 reproduction statement and signed release inventory. Its absolute executable
 paths may disclose builder usernames or filesystem layout, so review it before
 publication alongside the assets and lockfile. A
-separate operator must independently rebuild and review the final packages
-for the mainnet reproduction gate described in
+separate internal build must reproduce the final packages, with the same owner
+signing the accurate internal-build statement for the mainnet gate described in
 [`mainnet-plan-approvals.md`](mainnet-plan-approvals.md). This helper does not
 apply launch pins, publish source or binaries, or start mining.

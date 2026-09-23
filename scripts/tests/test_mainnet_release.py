@@ -18,6 +18,8 @@ import package_mainnet as package
 import prepare_mainnet_dashboard as dashboard
 import production_v4_activation_approval as signatures
 import test_generate_mainnet_pins as pin_fixtures
+import test_mainnet_qualification as qualification_fixtures
+import mainnet_qualification as qualification_policy
 
 
 class MainnetReleaseTests(unittest.TestCase):
@@ -66,13 +68,18 @@ class MainnetReleaseTests(unittest.TestCase):
         self.git("add", ".")
         self.git("-c", "user.name=Release Test", "-c", "user.email=fixture@example.invalid", "commit", "--no-gpg-sign", "-qm", "Synthetic reviewed release tree")
         self.review_commit = self.git("rev-parse", "HEAD")
+        qualification_fixtures.bind_fixture_source(self.repo, self.review_commit, self.fixture.qualification)
+        self.fixture.qualification_path.write_bytes(package.canonical(self.fixture.qualification))
+        self.fixture.fields = qualification_policy.proof_pin_fields(self.fixture.qualification, self.plan_fixture.trust)
+        self.fixture.proof_bytes = package.integrity._render_production_v4_activation_pin(self.fixture.fields)
+        self.fixture.proof_path.write_bytes(self.fixture.proof_bytes)
         self.subject = approval.build_subject(plan_bytes=self.fixture.plan_bytes,
                        qualification_bytes=self.fixture.qualification_path.read_bytes(),
                        review_commit=self.review_commit, trust_bytes=self.plan_fixture.trust_bytes)
-        for name in ("producer_signature", "reproducer_signature"):
+        for name in ("producer_signature",):
             self.fixture.material[name].unlink()
         self.material = self.plan_fixture.signed_material(self.subject)
-        self.manifest = approval.verify_pair(subject=self.subject, expected_trust=self.plan_fixture.trust, **self.material)
+        self.manifest = approval.verify_approval(subject=self.subject, expected_trust=self.plan_fixture.trust, **self.material)
         self.fixture.manifest_path.write_bytes(signatures.canonical_json(self.manifest))
         candidates = pins.render_mainnet_pins(self.fixture.plan, self.fixture.manifest_path.read_bytes(), self.fixture.proof_bytes)
         for path in self.fixture.source_pins:
@@ -123,7 +130,7 @@ class MainnetReleaseTests(unittest.TestCase):
                     release.DASHBOARD_ASSETS: fixture.dashboard_manifest_path,
                     release.DASHBOARD_BUILD_EVIDENCE: dashboard_evidence_path,
                     release.CUDA_RUNTIME_PIN: cuda_pin_path}
-        for role, prefix in ((signatures.PRODUCER_ROLE, "producer"), (signatures.REPRODUCER_ROLE, "reproducer")):
+        for role, prefix in ((signatures.PRODUCER_ROLE, "producer"),):
             names = release.ROLE_FILES[role]
             for name, key in zip(names, (prefix + "_approval", prefix + "_signature", prefix + "_allowed_signers")):
                 evidence[name] = self.material[key]
@@ -145,14 +152,15 @@ class MainnetReleaseTests(unittest.TestCase):
 
     def sign_reproduction(self):
         subprocess.run([str(self.plan_fixture.verifier), "-Y", "sign", "-f",
-                        str(self.plan_fixture.keys[signatures.REPRODUCER_ROLE]), "-n",
-                        signatures.NAMESPACES[signatures.REPRODUCER_ROLE], str(self.first / release.REPRODUCTION)],
+                        str(self.plan_fixture.keys[signatures.PRODUCER_ROLE]), "-n",
+                        signatures.NAMESPACES[signatures.PRODUCER_ROLE], str(self.first / release.REPRODUCTION)],
                        check=True, capture_output=True)
 
     def test_real_signatures_and_reproduced_archives_pass_the_mainnet_gate(self):
         result = self.prepare()
         self.assertTrue(result["byte_identical"])
-        self.assertTrue(result["independent_attestation_required"])
+        self.assertTrue(result["owner_attestation_required"])
+        self.assertFalse(result["independent_reproduction_claim"])
         self.assertFalse(result["release_approved"])
         self.sign_reproduction()
         files = package.integrity._stage_files(self.first)
@@ -286,7 +294,7 @@ class MainnetReleaseTests(unittest.TestCase):
             with self.assertRaisesRegex(package.Error, "changed during signature"):
                 release.validate_release(**self.common(), files=package.integrity._stage_files(self.first))
 
-    def test_tampered_statement_and_producer_signature_cannot_replace_reproducer(self):
+    def test_tampered_statement_and_wrong_namespace_cannot_authorize_release(self):
         self.prepare()
         self.sign_reproduction()
         path = self.first / release.REPRODUCTION

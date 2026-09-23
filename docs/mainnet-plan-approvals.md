@@ -108,6 +108,12 @@ stage with the four archives and these exact public evidence filenames:
 - MAINNET-PLAN-REPRODUCER-APPROVAL.json and its .sig
 - MAINNET-PRODUCER.allowed_signers, MAINNET-REPRODUCER.allowed_signers
 
+Prepare the dashboard manifest from the exact clean frozen commit with
+`scripts/prepare_mainnet_dashboard.py`; see
+[`mainnet-dashboard-assets.md`](mainnet-dashboard-assets.md). Its build record
+is first-person toolchain evidence, not a substitute for independent package
+reproduction or a release approval.
+
 Use `scripts/mainnet_release.py` with `--repo`, `--commit`, `--version`,
 `--producer-stage`, `--reproducer-stage`, `--ssh-keygen`,
 `--ssh-keygen-sha256` and a new `--output` file. Both stages are fully inspected;

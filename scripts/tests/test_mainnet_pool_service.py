@@ -62,7 +62,7 @@ class MainnetPoolServiceTests(unittest.TestCase):
         (self.root / "production-v4-rcnet-1-inputs.json").write_text(
             json.dumps({"schema_version": 1, "files": rows}), encoding="utf-8")
         self.plan = {"launch_plan_digest": "1" * 64, "network_id": "2" * 64,
-                     "payload": {"rules": {"artifacts": {
+                     "payload": {"minimum_transaction_fee_atoms": 1, "rules": {"artifacts": {
                          "bank": {"sha256": rows_by_name(rows, "MODEL-V2.bank")["sha256"],
                                   "bytes": rows_by_name(rows, "MODEL-V2.bank")["bytes"]},
                          "fixed_record": {"sha256": rows_by_name(rows, "FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json")["sha256"],
@@ -147,6 +147,17 @@ class MainnetPoolServiceTests(unittest.TestCase):
         self.config["expected_proof_worker_sha256"] = "0" * 64
         self.save_config()
         with self.assertRaisesRegex(pool.PreflightError, "expected_proof_worker_sha256"):
+            self.preflight()
+
+    def test_payout_threshold_and_fee_must_match_mainnet_plan(self):
+        self.config["minimum_payout_atoms"] = 1
+        self.save_config()
+        with self.assertRaisesRegex(pool.PreflightError, "minimum payout"):
+            self.preflight()
+        self.config["minimum_payout_atoms"] = 100
+        self.plan["payload"]["minimum_transaction_fee_atoms"] = 2
+        self.save_config()
+        with self.assertRaisesRegex(pool.PreflightError, "payout fee"):
             self.preflight()
 
     def test_reused_rc_certificate_or_private_key_rejected(self):

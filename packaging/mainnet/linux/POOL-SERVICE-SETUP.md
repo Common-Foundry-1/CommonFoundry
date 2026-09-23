@@ -87,6 +87,9 @@ approved pool GPU still has a compute process. It never stops that process.
    becomes the miner URL pin. `automatic_payouts` must be explicitly true; the
    launcher uses the **mainnet-specific** `--enable-mainnet-payouts` flag, never
    `--enable-testnet-payouts`. A runtime without that flag fails closed.
+   The burned payout fee must meet the exact minimum in the pinned launch
+   plan, and the payout threshold must exceed that fee; a lower value is
+   rejected before the beacon wait or pool startup.
 
 The service's release copy includes its own `production-mainnet/MAINNET-PLAN.json`.
 To let the launch helper publish the verified future beacon without granting

@@ -152,6 +152,8 @@ def validate_config(config: dict) -> dict:
     for field, (minimum, maximum) in NUMBER_FIELDS.items():
         if type(config[field]) is not int or not minimum <= config[field] <= maximum:
             raise PreflightError(f"{field} must be an approved integer from {minimum} to {maximum}")
+    if config["minimum_payout_atoms"] <= config["payout_fee_atoms"]:
+        raise PreflightError("minimum payout must exceed the burned payout fee")
     if config["automatic_payouts"] is not True:
         raise PreflightError("automatic mainnet payouts require explicit approval and activation")
     if not isinstance(config["gpu_uuid"], str) or not GPU_UUID.fullmatch(config["gpu_uuid"]):
@@ -211,13 +213,16 @@ def validate_info(info: dict, config: dict) -> tuple[dict, dict]:
     if not isinstance(plan, dict) or plan.get("launch_plan_digest") != config["expected_plan_digest"] or plan.get("network_id") != config["expected_network_id"]:
         raise PreflightError("mainnet launch plan/network ID differs from approved pool configuration")
     try:
+        minimum_fee = plan["payload"]["minimum_transaction_fee_atoms"]
+        if type(minimum_fee) is not int or minimum_fee <= 0 or config["payout_fee_atoms"] < minimum_fee:
+            raise ValueError("payout fee is below the pinned mainnet burn minimum")
         artifacts = plan["payload"]["rules"]["artifacts"]
         bank, record = artifacts["bank"], artifacts["fixed_record"]
         for row in (bank, record):
             if not HEX64.fullmatch(row["sha256"]) or type(row["bytes"]) is not int or row["bytes"] <= 0:
                 raise ValueError("invalid artifact identity")
     except (KeyError, TypeError, ValueError) as exc:
-        raise PreflightError("mainnet plan lacks authenticated ProductionV4 artifact identities") from exc
+        raise PreflightError("mainnet plan or payout fee lacks approved rule identities") from exc
     return bank, record
 
 

@@ -105,11 +105,34 @@ a separate unused attempt; do not replace a wallet that has received funds.
 
 This is **candidate custody preparation, not mainnet authorization**. It does not
 apply release pins, sign approvals, start a node, create a chain, publish addresses,
-or transfer funds. The actual custody step remains incomplete until the owner runs
-the local prompt and retains/restores the resulting backups. Tests use disposable
-keys and are not the owner's wallets.
+or transfer funds. Component tests use disposable keys and are not evidence of
+the owner's custody; the completed owner setup is recorded separately below.
 
 Changing launch-plan parameters changes the network ID. Do not silently reuse
 wallet files encrypted for an older plan; prepare a fresh unused pair before
 the final freeze or perform a separately reviewed explicit migration. Once the
 final addresses/plan are published, do not rerun setup to replace them.
+
+## Owner setup completed September 23, 2026
+
+The owner completed the guided setup using the distinct-password release utility
+built from `76acf5f5f03e1fc62d5c16e08037eda4d591c8e1`. The public output is
+preserved byte-for-byte in `packaging/mainnet/MAINNET-PLAN.json` and
+`packaging/mainnet/REWARD-CUSTODY.json`:
+
+- Steward: `5321229f3d3e3fccb900f95c7baee2b27a929afe70f95a0bde0394dba79c9684`
+- Community: `bcd252021db8c7732cec4c2cba4b41a9d373dcbde61402e22c933751e74cc341`
+- Launch plan digest: `6c839b274f6385e7f4040a715436b739612527f29bfa9bdf5d2f89de1f440b52`
+
+The native setup report records successful authentication of both encrypted
+backups. A subsequent check found no incomplete marker and matched all four
+encrypted-file hashes against that report. No password or private key was read
+by that subsequent check. Regeneration using the public addresses and approved
+targets reproduced the exact plan bytes. CI regression checks protect this
+record's identity, public-only schema and agreement with the artifact catalog.
+
+The encrypted backups currently exist in a separate local folder. An off-host
+copy and secure retention of both passwords remain operator responsibilities;
+neither has been independently confirmed. Do not rerun the setup just to reopen
+these wallets or create another backup. These records do not activate mainnet
+or replace the outstanding signed plan and release approvals.

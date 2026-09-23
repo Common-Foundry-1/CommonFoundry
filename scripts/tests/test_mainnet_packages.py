@@ -416,5 +416,70 @@ class MainnetPackageTests(unittest.TestCase):
             packages.native_output(Path(sys.executable), ["-c", "import time; time.sleep(5)"], timeout_seconds=0.1)
 
 
+class CommittedOwnerPlanTests(unittest.TestCase):
+    """Validate public owner records only; never open real custody files.
+
+    The exact-byte guard requires explicit review if the launch plan changes.
+    These checks are not signatures, private-key checks or launch approval.
+    """
+
+    def setUp(self):
+        self.repo = Path(__file__).resolve().parents[2]
+        self.root = self.repo / "packaging/mainnet"
+        self.plan_bytes = (self.root / "MAINNET-PLAN.json").read_bytes()
+        self.plan = packages.validate_plan(self.plan_bytes)
+
+    def test_owner_plan_identity_and_approved_parameters(self):
+        self.assertEqual(hashlib.sha256(self.plan_bytes).hexdigest(),
+                         "1dfcdfbb6739f10051f6325a3d884997cd65b468cc3594f7b03a9c83d42f3db7")
+        self.assertEqual(self.plan["launch_plan_digest"],
+                         "6c839b274f6385e7f4040a715436b739612527f29bfa9bdf5d2f89de1f440b52")
+        self.assertEqual(self.plan["network_id"],
+                         "4c128b19b8f663067cca1905f40993cfdbe7a4462f00b0a062d3f68d578175ec")
+        payload = self.plan["payload"]
+        self.assertEqual(payload["initial_target"],
+                         "000ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccb")
+        self.assertEqual(payload["rules"]["proof_of_work"]["pow_limit"],
+                         "003fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+        self.assertEqual(payload["source_release_unix_seconds"], 1790960400)
+        self.assertEqual(payload["rules"]["virtual_genesis_timestamp_unix_seconds"], 1791046800)
+        self.assertEqual(payload["beacon"]["round"], 32747812)
+        self.assertEqual(payload["minimum_transaction_fee_atoms"], 10000000)
+
+    def test_owner_plan_matches_packaged_artifact_catalog(self):
+        for platform in ("windows-x86_64", "linux-x86_64"):
+            for kind in ("runtime", "miner"):
+                with self.subTest(platform=platform, kind=kind):
+                    sources = {name: (self.repo / path).read_bytes()
+                               for name, path in packages.package_sources(platform, kind).items()}
+                    packages.validate_catalog(sources, self.plan)
+
+    def test_custody_record_is_public_only_and_matches_each_plan_role(self):
+        data = (self.root / "REWARD-CUSTODY.json").read_bytes()
+        report = packages.strict_json(data, "public owner custody", 8192)
+        self.assertEqual(data, (json.dumps(report, indent=2) + "\n").encode())
+        self.assertEqual(set(report), {"schema", "launch_plan_digest", "network_id", "wallets",
+                                       "backups_authenticated", "mainnet_activation_authorized"})
+        self.assertEqual(report["schema"], "CMFD_MAINNET_REWARD_CUSTODY_V1")
+        for field in ("launch_plan_digest", "network_id"):
+            self.assertEqual(report[field], self.plan[field])
+        self.assertIs(report["backups_authenticated"], True)
+        self.assertIs(report["mainnet_activation_authorized"], False)
+        self.assertEqual([row["role"] for row in report["wallets"]], ["steward", "community"])
+        destinations = self.plan["payload"]["rules"]["reward_destinations"]
+        hashes = set()
+        for wallet in report["wallets"]:
+            role = wallet["role"]
+            self.assertEqual(set(wallet), {"role", "destination", "encrypted_wallet_sha256",
+                                           "encrypted_backup_sha256"})
+            self.assertEqual(wallet["destination"], destinations[role + "_xonly_public_key"])
+            packages.integrity._require_xonly_public_key(wallet["destination"], role)
+            for field in ("encrypted_wallet_sha256", "encrypted_backup_sha256"):
+                packages.nonzero_hex(wallet[field], 64, field)
+                hashes.add(wallet[field])
+        self.assertEqual(len(hashes), 4)
+        self.assertEqual(len(set(destinations.values())), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

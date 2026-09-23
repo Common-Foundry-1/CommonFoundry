@@ -1,0 +1,21 @@
+{
+  "schema": "CMFD_MAINNET_REWARD_CUSTODY_V1",
+  "launch_plan_digest": "6c839b274f6385e7f4040a715436b739612527f29bfa9bdf5d2f89de1f440b52",
+  "network_id": "4c128b19b8f663067cca1905f40993cfdbe7a4462f00b0a062d3f68d578175ec",
+  "wallets": [
+    {
+      "role": "steward",
+      "destination": "5321229f3d3e3fccb900f95c7baee2b27a929afe70f95a0bde0394dba79c9684",
+      "encrypted_wallet_sha256": "518f77598a0ef92faf96415b2672661b03c797a98d18f09640622b164b53cb9d",
+      "encrypted_backup_sha256": "88f64bc1ee133f22ce2cab17beffdab0c8b6beeef12a22eee3ec0e8bbd4f6ac2"
+    },
+    {
+      "role": "community",
+      "destination": "bcd252021db8c7732cec4c2cba4b41a9d373dcbde61402e22c933751e74cc341",
+      "encrypted_wallet_sha256": "b8f46dce3f0ee6845029a403b35b53d6668ab007c597d490541e4a494135e6d0",
+      "encrypted_backup_sha256": "4179ec162aba4ffc99331482811a574a2cc055760607f09702a21a2456cb70e4"
+    }
+  ],
+  "backups_authenticated": true,
+  "mainnet_activation_authorized": false
+}

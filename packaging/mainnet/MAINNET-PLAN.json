@@ -1,0 +1,84 @@
+{
+  "schema": "CMFD_MAINNET_LAUNCH_PLAN_V2",
+  "payload": {
+    "rules": {
+      "profile": "CommonFoundry Mainnet",
+      "artifacts": {
+        "bank": {
+          "bytes": 6442975416,
+          "blake3": "b8be8450b933dc759aa34f2d60e73cf4eac3064407c6a9f48372175abe87b6ac",
+          "sha256": "5f9b213c3bda51b74e4ebabb26607b67385d613aa8d99af915a48ab063e17d4e"
+        },
+        "fixed_record": {
+          "bytes": 6973,
+          "blake3": "3c9587fb833234cdfa88b97502a89abba613b9002c16bb6483b34d5399deebd0",
+          "sha256": "ea218831aa567e486426ded77c84a5752a817329c496e3557c6d43577f0afe79"
+        },
+        "fixed_record_version": 1,
+        "proof_system_digest": "e849e3bfc83f8f8dd0f1fc1100879417718ba2bffb92af5cd649b61c720675a3",
+        "model_manifest_digest": "68f6fe674f75a363c62c275ebb11fa74aa089e9bbde5bcb952ec35b8890b575c",
+        "fixed_artifact_format_digest": "1c26e090041e96e5ef805747b87cf5bd591d5d127a3b86dee5cca5945e57df44",
+        "fixed_artifact_record_digest": "2efd2c4244bbd7808547b85266987544233fbe339f445135b07843aa8893d45e"
+      },
+      "virtual_genesis_timestamp_unix_seconds": 1791046800,
+      "consensus": {
+        "network_protocol_version": 2,
+        "block_version": 1,
+        "transaction_version": 1,
+        "wire_version": 1,
+        "maximum_future_offset_seconds": 86400,
+        "target_spacing_seconds": 60,
+        "coinbase_maturity_blocks": 100,
+        "median_time_window": 11,
+        "max_block_transactions": 1024,
+        "max_transaction_inputs": 128,
+        "max_transaction_outputs": 128,
+        "max_block_aggregate_inputs": 4096,
+        "max_block_aggregate_outputs": 4096,
+        "max_block_signature_checks": 2048,
+        "max_coinbase_outputs": 3,
+        "consensus_signature_bytes": 64,
+        "dgw_window": 180,
+        "wire_header_bytes": 16,
+        "max_transaction_bytes": 65536,
+        "max_proof_bytes": 13631488,
+        "max_block_bytes": 16777216
+      },
+      "proof_of_work": {
+        "selection": "ProductionV4",
+        "wire_type": 4,
+        "algorithm_version": 4,
+        "proof_version": 1,
+        "banks": 3,
+        "layers_per_bank": 128,
+        "exact_transparent_proof_bytes": 12025320,
+        "pow_limit": "003fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      "monetary_policy": {
+        "atoms_per_coin": 100000000,
+        "initial_subsidy_atoms": 50000000000,
+        "tail_height": 2628001,
+        "tail_subsidy_atoms": 500000000,
+        "steward_percent": 25,
+        "community_percent": 5
+      },
+      "reward_destinations": {
+        "steward_xonly_public_key": "5321229f3d3e3fccb900f95c7baee2b27a929afe70f95a0bde0394dba79c9684",
+        "community_xonly_public_key": "bcd252021db8c7732cec4c2cba4b41a9d373dcbde61402e22c933751e74cc341"
+      }
+    },
+    "initial_target": "000ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccb",
+    "minimum_transaction_fee_atoms": 10000000,
+    "source_release_unix_seconds": 1790960400,
+    "beacon": {
+      "chain_hash": "52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971",
+      "public_key": "83cf0f2896adee7eb8b5f01fcad3912212c437e0073e911fb90022d3e760183c8c4b450b6a0a6c3ac6a5776a2d1064510d1fec758c921cc22b0e17e63aaf4bcb5ed66304de9cf809bd274ca73bab4af5a6e9c76a4bc09e76eae8991ef5ece45a",
+      "scheme": "bls-unchained-g1-rfc9380",
+      "genesis_time": 1692803367,
+      "period_seconds": 3,
+      "round": 32747812
+    }
+  },
+  "launch_plan_digest": "6c839b274f6385e7f4040a715436b739612527f29bfa9bdf5d2f89de1f440b52",
+  "network_id": "4c128b19b8f663067cca1905f40993cfdbe7a4462f00b0a062d3f68d578175ec"
+}

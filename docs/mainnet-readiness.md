@@ -121,11 +121,11 @@ and api3.drand.sh on 2026-09-19. Historical round 123 is the offline positive ve
 | Signed launch-time entropy | Verifier, node/miner startup wiring and retrieval/waiting launchers implemented; packaged rehearsal pending | Signature mutation vectors plus actual packaged replay and anti-precomputation rehearsal |
 | Mainnet network/consensus identity | Shared identity registry and mainnet build feature implemented; final pin values pending | Final pinned plan and mainnet profile, distinct from RC |
 | Starting difficulty | Owner approved the 5× RC initial target and RC minimum on September 23 after waiving the extended live 20→5→1 run. Isolated full-proof and recovery tests passed; live dropout response remains unmeasured. | Bind the exact approved targets in the final plan, pins and packages; preserve the waiver and never present simulated data as a live result |
-| Reward receiving addresses and custody | Owner controls both; offline two-wallet/plan preparation, encrypted backups and guided setup with distinct role passwords implemented; actual owner run still needed | Public destinations plus separately retained passwords and restored backup evidence; see [custody setup](mainnet-reward-custody.md) |
+| Reward receiving addresses and custody | Owner completed the distinct-password setup September 23. Both public destinations and the exact plan are committed; all four encrypted-file hashes match the authenticated setup report. | Off-host backup retention remains unconfirmed; see [custody setup](mainnet-reward-custody.md#owner-setup-completed-september-23-2026) |
 | Build reproduction and validation reporting | Owner declined seeking an external cryptographer; validation must be described as internal | Reproducible build records and accurate test/approval evidence, without claiming an external cryptographic audit |
 | Plan approval binding | Dedicated requests, signature verification, package binding and candidate pin generation implemented | Actual role approvals, reviewed source history and final pin application |
 | Dependency audit | rustls updated to 0.23.45 for RUSTSEC-2026-0285; 44 pool/TLS tests pass and cargo-audit reports zero vulnerabilities | Final build audit plus review of remaining informational dependency warnings |
-| Full cross-platform CI | Baseline a0e3595 run 35658638655 passed all jobs; newer local target integration has focused Windows/Linux checks | Completed successful full run on the final source, not only selected jobs |
+| Full cross-platform CI | All 14 jobs passed on be9ce8836581f01ec80031e4800380a361f368a3 in run 35907290535. The later distinct-password custody and committed-plan checkpoint still requires CI. | Completed successful full run on the final source, not only selected jobs |
 | Windows/Linux release packages | Native assembler and four package layouts implemented; actual builds await final configuration | Clean installs, signature/checksum verification, matching runtime identity |
 | Four-package release consistency | Offline archive/source/receipt reconciliation implemented | Actual four-archive preflight report followed by independent reproduction and signing |
 | Mainnet release finalization | Generic finalizer dispatches mainnet assets through exact-pin, plan-signature and signed-reproduction checks | Real independently built archives and signed evidence, then final checksums/signature |
@@ -650,11 +650,46 @@ GPU generation has run a complete proof from the final signed package; the
 candidate hashes are not release identities. The older private SM89 AI01
 worker and published SM120-only RC worker are not substitutes for that gate.
 
-Current local checks include the mainnet Python suite on Windows and Linux
+The earlier September 23 local checks included the mainnet Python suite on Windows and Linux
 (98 tests on each, with platform-specific skips), three native Windows guided
 reward-custody tests using disposable keys, 59 focused ProductionV4 pool tests,
 strict node/miner Clippy and the dashboard build. They are internal component
-evidence, not a green final-source CI run or an actual mainnet rehearsal. The
-two real reward wallets and final pins are still absent. The separate VPS seed
+evidence, not a green final-source CI run or an actual mainnet rehearsal. At that
+checkpoint the two real reward wallets and final pins were absent; the owner
+subsequently completed custody as recorded below. The separate VPS seed
 had 294,014,058,496 bytes free on September 22, below the documented 30-day
 unpruned sizing scenario; capacity and retention still need an operator choice.
+
+## Owner custody and public plan checkpoint (September 23)
+
+The owner completed the setup built from `76acf5f5f03e1fc62d5c16e08037eda4d591c8e1`.
+It requires two different passwords and authenticates both wallets and their
+independently encrypted backups before publishing the public report. The setup's
+incomplete marker is absent, and all four 176-byte encrypted files match the
+SHA-256 values in `packaging/mainnet/REWARD-CUSTODY.json`. Only that public report
+and `packaging/mainnet/MAINNET-PLAN.json` were copied into source. No private key,
+encrypted wallet/backup file or password is included.
+
+The plan was regenerated from the compiled node using the public destinations
+and approved targets, and matched byte-for-byte. Independent Python validation
+also checked canonical encoding, derived plan/network identities, the artifact
+catalog, schedule and both secp256k1 public keys. The exact plan SHA-256 is
+`1dfcdfbb6739f10051f6325a3d884997cd65b468cc3594f7b03a9c83d42f3db7`;
+the plan digest is
+`6c839b274f6385e7f4040a715436b739612527f29bfa9bdf5d2f89de1f440b52`.
+The network ID is
+`4c128b19b8f663067cca1905f40993cfdbe7a4462f00b0a062d3f68d578175ec`.
+
+These are the owner's actual candidate destinations, not fixture wallets.
+The public report records native backup authentication; the later automated
+check only compared ciphertext hashes and did not decrypt the wallets or obtain
+their passwords. Off-host backup retention has not been confirmed. This records
+completed local custody and the final parameter choice, not signed launch
+authorization; both mainnet release pins remain absent.
+
+Full cross-platform CI run
+[35907290535](https://github.com/Common-Foundry-1/CommonFoundry/actions/runs/35907290535)
+completed successfully on `be9ce8836581f01ec80031e4800380a361f368a3`,
+including both desktop builds and the aggregate Rust check. That run predates
+the distinct-password implementation and this public-plan checkpoint. Final
+source CI, approvals, packages and brief package smoke remain outstanding.

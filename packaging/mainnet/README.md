@@ -1,5 +1,12 @@
 # Mainnet launchers
 
+The committed `MAINNET-PLAN.json` and `REWARD-CUSTODY.json` are the public output
+of the owner's completed September 23 custody setup with two different passwords.
+They bind the two reward destinations, 5x RC starting difficulty and October 3
+17:00 UTC launch. They contain no wallet keys or passwords and are not launch
+approvals. Do not regenerate or replace them with fixture destinations. See
+`docs/mainnet-reward-custody.md` for verification and remaining backup retention.
+
 These source launchers are for the final signed mainnet packages; they do not
 convert an RC package into a mainnet package. Final packaging must stage the
 mainnet binaries, the authenticated MAINNET-PLAN.json, cmfd-launch, and the

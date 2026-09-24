@@ -5,11 +5,11 @@ Some(MainnetReleaseConfiguration {
     initial_target: [0x00, 0x0c, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcb],
     steward_reward_destination: [0x53, 0x21, 0x22, 0x9f, 0x3d, 0x3e, 0x3f, 0xcc, 0xb9, 0x00, 0xf9, 0x5c, 0x7b, 0xae, 0xe2, 0xb2, 0x7a, 0x92, 0x9a, 0xfe, 0x70, 0xf9, 0x5a, 0x0b, 0xde, 0x03, 0x94, 0xdb, 0xa7, 0x9c, 0x96, 0x84],
     community_reward_destination: [0xbc, 0xd2, 0x52, 0x02, 0x1d, 0xb8, 0xc7, 0x73, 0x2c, 0xec, 0x4c, 0x2c, 0xba, 0x4b, 0x41, 0xa9, 0xd3, 0x73, 0xdc, 0xbd, 0xe6, 0x14, 0x02, 0xe2, 0x2c, 0x93, 0x37, 0x51, 0xe7, 0x4c, 0xc3, 0x41],
-    approval_manifest_sha256: "f781c84cbb36856af588d8d5ca921a42dfc309fe7c7ccf3e0da7312b7cd4a6c9",
+    approval_manifest_sha256: "3d50cba9cd081f0ed8e83dce9df0729e86377c5633e4211cf9616ede8a1a83c4",
     activation: ProductionV4ActivationEvidence {
         schema: "CMFD_MAINNET_SINGLE_SIGNER_PROOF_ACTIVATION_V1",
-        qualification_source_commit: "701c5513e2371e6b3647f4e9a8f2a56b56f0904c",
-        qualification_manifest_sha256: "d152210c6de7bf94e8747d427fafa16ff0aa8bfe9e62b701898c34e361ab2359",
+        qualification_source_commit: "45601234aece4a7c4ee17d6f91c64e5d669628f4",
+        qualification_manifest_sha256: "7c5d56410e550324e58b1274e40d61be35684544a100dbf46ec34f34c4355e31",
         fresh_process_verifier_binary_sha256: "73a82ea556e367e39f822b19333cfefb827d7979486eeebf44e11d4854c2c3ac",
         fresh_process_verifier_report_sha256: "1135d54ba849eba328aa27e0c5186779a77324a6a965bed95ac359d7ef4cb053",
         core_spec_sha256: "507075fb6d22b7ac0968508b18c48a09a017806e7d4e0454b71f8ae88440df84",
@@ -17,7 +17,7 @@ Some(MainnetReleaseConfiguration {
         proof_algebra_sha256: "5a686ad518a7d957b8af908fb52cd58056e63da4dab578a40d4ef097654aaf33",
         approval_trust: ProductionV4ActivationApprovalTrust {
             contract_schema: "CMFD_MAINNET_SINGLE_SIGNER_APPROVAL_SUBJECT_V1",
-            qualification_binding_sha256: "d152210c6de7bf94e8747d427fafa16ff0aa8bfe9e62b701898c34e361ab2359",
+            qualification_binding_sha256: "7c5d56410e550324e58b1274e40d61be35684544a100dbf46ec34f34c4355e31",
             ssh_keygen_sha256: "47f009c35523b6997aff0f0528dae84f1545465479d722292499941cd5cb83b5",
             producer: ProductionV4ActivationSignerTrust {
                 signer_identity: "commonfoundry-mainnet-owner",

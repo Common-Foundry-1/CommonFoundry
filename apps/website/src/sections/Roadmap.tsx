@@ -27,8 +27,8 @@ export function Roadmap() {
       />
       <div className="roadmap__content section-shell">
         <div className="section-heading">
-          <h2 id="roadmap-heading">The foundation is built. The opportunity is ahead.</h2>
-          <p>RC5 today. Preparing for the October 3 mainnet launch target, with final qualification and independent review still ahead.</p>
+          <h2 id="roadmap-heading">Be part of the next chapter.</h2>
+          <p>A working test network today. Mainnet ahead. A longer-term mission to bring more people into open GPU compute.</p>
         </div>
 
         <ol className="roadmap__rail">
@@ -54,10 +54,11 @@ export function Roadmap() {
 
         <div className="conversion-band">
           <div>
-            <h3>Get ready.<br />Build with the Foundry.</h3>
+            <h3>Start in Discord.<br />We’ll help from there.</h3>
             <p>
-              Miners, developers and long-term supporters: explore the release,
-              examine the monetary design and help shape what comes next.
+              You don’t need a rig or a finished setup to join. Tell us whether
+              you want to mine, build or learn. Get guidance from the team and
+              community, and follow the official launch announcements.
             </p>
           </div>
           <div className="conversion-band__actions">
@@ -67,20 +68,20 @@ export function Roadmap() {
                 target="_blank"
                 rel="noopener noreferrer"
               >
-                Join the community
+                Join Discord
               </ButtonLink>
               <ButtonLink
-                href={RELEASE_URL}
+                href={WHITEPAPER_URL}
                 target="_blank"
                 rel="noopener noreferrer"
                 variant="secondary"
               >
-                Explore RC5
+                Read the white paper
               </ButtonLink>
             </div>
             <p className="trust-note">
               <ShieldIcon />
-              <span>RCNet is a test network, not mainnet. Mainnet launch updates are published above.</span>
+              <span>Setup help · Hardware guidance · Launch updates</span>
             </p>
           </div>
         </div>
@@ -91,6 +92,8 @@ export function Roadmap() {
             <span>Common Foundry</span>
           </div>
           <nav aria-label="Footer navigation">
+            <a href={DISCORD_URL} target="_blank" rel="noopener noreferrer"><span>Discord</span><ArrowIcon /></a>
+            <a href={RELEASE_URL} target="_blank" rel="noopener noreferrer"><span>RCNet test downloads</span><ArrowIcon /></a>
             <a href={GITHUB_URL} target="_blank" rel="noopener noreferrer"><span>GitHub</span><ArrowIcon /></a>
             <a href={WHITEPAPER_URL} target="_blank" rel="noopener noreferrer"><DocumentIcon /><span>White paper</span></a>
             <a href={SECURITY_URL} target="_blank" rel="noopener noreferrer"><ShieldIcon /><span>Security</span></a>

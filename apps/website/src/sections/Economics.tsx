@@ -33,12 +33,12 @@ export function Economics() {
   return (
     <section id="economics" className="economics section-shell" aria-labelledby="economics-heading">
       <div className="section-heading">
-        <h2 id="economics-heading">A long-term monetary thesis. Explicit rules.</h2>
+        <h2 id="economics-heading">CMFD. Earned through work.</h2>
         <p>
-          Declining issuance reduces new supply over the bootstrap. Burned fees
-          remove coins from circulation. A permanent miner-only tail supports
-          the security budget. These are the foundations of our store-of-value
-          thesis; lasting value depends on adoption and execution.
+          No premine. No token sale. CMFD is issued through mining under an
+          explicit reward schedule, with declining issuance, burned transaction
+          fees and a permanent miner-only tail. A monetary model built to
+          support the network for the long term.
         </p>
       </div>
 
@@ -48,7 +48,7 @@ export function Economics() {
           <svg viewBox="0 0 1000 310" role="img" aria-labelledby="chart-title chart-desc">
             <title id="chart-title">Common Foundry scheduled block subsidy</title>
             <desc id="chart-desc">
-              A five-year linear decline from 500 CMFD per block, followed by a permanent 5 CMFD miner tail.
+              A decline over 2,628,000 blocks, about five years at the target block spacing, from 500 CMFD per block, followed by a permanent 5 CMFD miner tail.
             </desc>
             <g className="chart-grid">
               <path d="M70 35H950M70 138H950M70 240H950" />
@@ -140,9 +140,9 @@ export function Economics() {
         </div>
 
         <aside className="economics__disclosures" aria-label="Economic disclosures">
-          <p><FlameIcon /><span>100% of transaction and channel-close fees are burned. RC5 enforces a 0.1 CMFD minimum.</span></p>
+          <p><FlameIcon /><span>Transaction fees are burned, not paid to miners. The planned mainnet minimum is 0.1 CMFD per transaction.</span></p>
           <p><ShieldIcon /><span>The 25% stewardship and 5% community allocations end with the bootstrap; the permanent 5 CMFD tail goes only to miners.</span></p>
-          <p className="economics__plain"><span>No premine. No token sale. All usage fees burned.</span></p>
+          <p className="economics__plain"><span>The schedule is defined by block height. Years are approximate at the target block spacing.</span></p>
           <p className="economics__plain"><span>The tail is perpetual, not a hard supply cap. Net supply depends on issuance and actual fee burning.</span></p>
           <a href={EMISSION_URL} target="_blank" rel="noopener noreferrer">
             <span>Inspect the emission rules</span>

@@ -290,7 +290,7 @@ h3 {
   }
 }
 
-@media (max-width: 860px) {
+@media (max-width: 1080px) {
   .site-header {
     grid-template-columns: 1fr auto;
   }

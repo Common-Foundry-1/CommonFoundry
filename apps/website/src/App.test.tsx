@@ -3,91 +3,99 @@ import { describe, expect, it } from "vitest";
 import App from "./App";
 import { DISCORD_URL, EMISSION_URL, MAINNET_LAUNCH_AT, SOURCE_RELEASE_AT, RELEASE_URL, RELEASE_VERSION, SECURITY_URL, WHITEPAPER_URL } from "./content";
 
-describe("investor website", () => {
-  it("announces the mainnet target and a 24-hour preparation window without presenting RC downloads as mainnet", () => {
+describe("Discord-first launch website", () => {
+  it("leads with inference and makes Discord the primary first-screen action", () => {
+    render(<App />);
+    const hero = screen.getByRole("region", { name: /Inference first.*Built to lead/i });
+    const primary = within(hero).getByRole("link", { name: "Join Discord" });
+    expect(primary).toHaveAttribute("href", DISCORD_URL);
+    expect(primary).toHaveClass("button-link--primary");
+    expect(within(hero).getByRole("link", { name: "Launch schedule" })).toHaveAttribute("href", "#launch");
+    expect(within(hero).queryByRole("link", { name: /RC5|download/i })).not.toBeInTheDocument();
+    expect(within(hero).getByText("Setup help. Mining guidance. Launch announcements.")).toBeVisible();
+    expect(within(screen.getByRole("banner")).getByRole("link", { name: "Join Discord" })).toHaveAttribute("href", DISCORD_URL);
+  });
+
+  it("retains the exact launch schedule without presenting test downloads as mainnet", () => {
     render(<App />);
     const launch = screen.getByRole("region", { name: "Two dates. One shared start." });
     expect(within(launch).getByText("October 2, 2026")).toHaveAttribute("datetime", SOURCE_RELEASE_AT);
     expect(within(launch).getByText("October 3, 2026")).toHaveAttribute("datetime", MAINNET_LAUNCH_AT);
     expect(Date.parse(MAINNET_LAUNCH_AT) - Date.parse(SOURCE_RELEASE_AT)).toBe(86_400_000);
     expect(within(launch).getAllByText(/12:00 PM CDT · 17:00 UTC/)).toHaveLength(2);
-    expect(within(launch).getByText(/Mainnet is not live yet; current RC5 downloads connect to RCNet/)).toBeVisible();
-    expect(screen.getByRole("link", { name: "See the launch plan" })).toHaveAttribute("href", "#launch");
+    expect(within(launch).getByText(/Mainnet is not live yet/)).toBeVisible();
+    expect(within(launch).getByText(/current downloads connect to RCNet/)).toBeVisible();
+    expect(within(launch).getByRole("link", { name: "Get launch-ready in Discord" })).toHaveAttribute("href", DISCORD_URL);
     expect(screen.queryByRole("link", { name: /download mainnet/i })).not.toBeInTheDocument();
-    expect(screen.queryByText(/not announced launches/i)).not.toBeInTheDocument();
   });
 
-  it("links RC5 downloads and the community through their correct destinations", () => {
+  it("uses the same official Discord destination across the conversion flow", () => {
     render(<App />);
-
-    const releaseLinks = screen.getAllByRole("link", { name: /RC5|release notes and setup/i });
-    expect(releaseLinks.length).toBeGreaterThan(2);
-    for (const link of releaseLinks) {
-      expect(link).toHaveAttribute("href", RELEASE_URL);
+    const discordLinks = screen.getAllByRole("link").filter((link) => link.getAttribute("href") === DISCORD_URL);
+    expect(discordLinks.length).toBeGreaterThanOrEqual(7);
+    for (const link of discordLinks) {
       expect(link).toHaveAttribute("target", "_blank");
       expect(link).toHaveAttribute("rel", expect.stringContaining("noopener"));
+      expect(link).toHaveAttribute("rel", expect.stringContaining("noreferrer"));
     }
-    expect(screen.getByRole("link", { name: /join the community/i })).toHaveAttribute("href", DISCORD_URL);
+    expect(screen.getByRole("heading", { name: /Start in Discord.*help from there/i })).toBeVisible();
+    expect(screen.getByRole("link", { name: "RCNet test downloads" })).toHaveAttribute("href", RELEASE_URL);
   });
 
-  it("opens and closes the accessible mobile navigation", () => {
+  it("keeps the inference vision separate from deployed proof-of-work functionality", () => {
     render(<App />);
+    const thesis = screen.getByRole("region", { name: "Open compute. Built by people like you." });
+    const inference = within(thesis).getByRole("button", { name: /Inference is the direction/i });
+    expect(inference).toHaveAttribute("aria-pressed", "true");
+    expect(within(thesis).getByText(/remains in development and is not part of the initial mainnet launch/i)).toBeVisible();
+    expect(within(thesis).getByText(/sending and receiving do not require a GPU/i)).toBeVisible();
+    const foundation = within(thesis).getByRole("button", { name: /A GPU-powered foundation/i });
+    fireEvent.click(foundation);
+    expect(foundation).toHaveAttribute("aria-pressed", "true");
+    expect(inference).toHaveAttribute("aria-pressed", "false");
+    expect(screen.queryByText(/independent review.*(progress|ahead)/i)).not.toBeInTheDocument();
+  });
 
+  it("opens and closes mobile navigation with a matching Discord call to action", () => {
+    render(<App />);
     const toggle = screen.getByRole("button", { name: "Open navigation" });
     fireEvent.click(toggle);
     expect(toggle).toHaveAttribute("aria-expanded", "true");
-    const mobileNavigation = screen.getByRole("navigation", { name: "Mobile navigation" });
-    expect(mobileNavigation).toBeVisible();
-
-    fireEvent.click(within(mobileNavigation).getByRole("link", { name: /economics/i }));
-    expect(screen.getByRole("button", { name: "Open navigation" })).toHaveAttribute(
-      "aria-expanded",
-      "false",
-    );
+    const menu = document.getElementById("mobile-menu")!;
+    expect(menu).toHaveAttribute("aria-hidden", "false");
+    expect(within(menu).getByRole("link", { name: "Join Discord" })).toHaveAttribute("href", DISCORD_URL);
+    fireEvent.click(within(menu).getByRole("link", { name: "Economics" }));
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(menu).toHaveAttribute("aria-hidden", "true");
+    fireEvent.click(toggle);
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(toggle).toHaveFocus();
   });
 
-  it("supports keyboard-oriented native emission controls and expandable gates", () => {
+  it("retains the emission controls and expandable roadmap details", () => {
     render(<App />);
-
     const emission = screen.getByRole("slider", { name: "Block height" });
-    emission.focus();
-    fireEvent.keyDown(emission, { key: "ArrowRight" });
     fireEvent.change(emission, { target: { value: "2628001" } });
     expect(screen.getByText(/Block 2,628,001 · 5 CMFD per block/)).toBeVisible();
-
-    const gate = screen.getByRole("button", {
-      name: /Full-shape ProductionV4 proof/i,
-    });
-    gate.focus();
+    const gate = screen.getByRole("button", { name: /October 3 · Mainnet/i });
     fireEvent.click(gate);
     expect(gate).toHaveAttribute("aria-expanded", "true");
-    expect(screen.getByText(/384-layer ForgeMatrix proof is measured/i)).toBeVisible();
+    expect(screen.getByText(/24 hours after the source-release window/i)).toBeVisible();
   });
 
-  it("presents ProductionV4 milestones and links bundled source documents", () => {
+  it("preserves economic disclosures and keeps technical resources accessible", () => {
     render(<App />);
-
-    expect(screen.getByText("Independent implementations and review")).toBeVisible();
     expect(screen.getByText(/permanent 5 CMFD tail goes only to miners/i)).toBeVisible();
+    expect(screen.getByText(/planned mainnet minimum is 0.1 CMFD/i)).toBeVisible();
+    expect(screen.getByText(/25% stewardship and 5% community allocations/i)).toBeVisible();
+    expect(screen.getByText(/tail is perpetual, not a hard supply cap/i)).toBeVisible();
     expect(screen.getByText(RELEASE_VERSION)).toBeVisible();
-    expect(screen.queryByText(/devnet[.-]16/i)).not.toBeInTheDocument();
-    expect(screen.getByText(/RC5 enforces a 0.1 CMFD minimum/i)).toBeVisible();
-    expect(screen.getByText(/lasting value depends on adoption and execution/i)).toBeVisible();
-    expect(screen.getByText(/RCNet is a test network, not mainnet/i)).toBeVisible();
-    const rejectedAuditCount = ["two", "external", "audits"].join(" ");
-    expect(screen.queryByText(new RegExp(rejectedAuditCount, "i"))).not.toBeInTheDocument();
-
-    expect(screen.getAllByRole("link", { name: /white paper/i })[0]).toHaveAttribute(
-      "href",
-      WHITEPAPER_URL,
-    );
-    expect(screen.getByRole("link", { name: /security/i })).toHaveAttribute(
-      "href",
-      SECURITY_URL,
-    );
-    expect(screen.getByRole("link", { name: /emission rules/i })).toHaveAttribute(
-      "href",
-      EMISSION_URL,
-    );
+    expect(screen.queryByText(/all usage fees burned/i)).not.toBeInTheDocument();
+    for (const link of screen.getAllByRole("link", { name: /white paper/i })) {
+      expect(link).toHaveAttribute("href", WHITEPAPER_URL);
+    }
+    expect(screen.getByRole("link", { name: "Security" })).toHaveAttribute("href", SECURITY_URL);
+    expect(screen.getByRole("link", { name: /emission rules/i })).toHaveAttribute("href", EMISSION_URL);
   });
 });

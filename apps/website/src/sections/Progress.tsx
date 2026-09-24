@@ -3,7 +3,7 @@ import { ArrowIcon, ProgressGlyph } from "../components/Icons";
 import {
   implementedItems,
   nextItems,
-  RELEASE_URL,
+  DISCORD_URL,
   RELEASE_VERSION,
   type ProgressItem,
 } from "../content";
@@ -39,15 +39,16 @@ export function Progress() {
     <section id="progress" className="progress section-shell" aria-labelledby="progress-heading">
       <div className="section-heading progress__heading">
         <div>
-          <h2 id="progress-heading">From proof design to a release you can run.</h2>
+          <h2 id="progress-heading">Built to run. Getting ready to launch.</h2>
           <p>
-            RC5 brings the node, encrypted wallet and GPU mining path together.
-            Native backup dialogs and authenticated runtime setup turn the
-            cryptographic foundation into a more usable RCNet experience.
+            Wallets, transfers, GPU mining and node synchronization are already
+            being exercised on RCNet. We’re bringing that foundation into
+            mainnet. Join Discord for the current status and the right setup
+            for your machine.
           </p>
         </div>
         <p className="release-line">
-          <strong>Current release candidate</strong>
+          <strong>RCNet test release</strong>
           <span>·</span>
           <code>{RELEASE_VERSION}</code>
         </p>
@@ -62,7 +63,7 @@ export function Progress() {
         } as CSSProperties}
       >
         <div className="progress__group progress__group--implemented">
-          <h3>Built and shipped</h3>
+          <h3>Built and tested</h3>
           <ProgressList items={implementedItems} tone="implemented" />
         </div>
 
@@ -76,7 +77,7 @@ export function Progress() {
             onChange={(event) => setEmphasis(Number(event.target.value))}
             aria-valuetext={
               emphasis < 40
-                ? "ProductionV4 achievements emphasized"
+                ? "Tested capabilities emphasized"
                 : emphasis > 60
                   ? "Next milestones emphasized"
                   : "Both groups equally emphasized"
@@ -92,9 +93,9 @@ export function Progress() {
       </div>
 
       <div className="progress__close">
-        <p>Complete runtime packages. Clear setup instructions.</p>
-        <a href={RELEASE_URL} target="_blank" rel="noopener noreferrer">
-          <span>Release notes and setup</span>
+        <p>Not sure where to start? We’ll help you find the next step.</p>
+        <a href={DISCORD_URL} target="_blank" rel="noopener noreferrer">
+          <span>Get setup help in Discord</span>
           <ArrowIcon />
         </a>
       </div>

@@ -1,20 +1,20 @@
 import { useEffect, useRef, useState } from "react";
-import { RELEASE_URL, navItems, type SectionId } from "../content";
+import { DISCORD_URL, navItems, type SectionId } from "../content";
 import { ArrowIcon, CloseIcon, MenuIcon } from "./Icons";
 
 function useActiveSection() {
-  const [activeSection, setActiveSection] = useState<SectionId>("thesis");
+  const [activeSection, setActiveSection] = useState<SectionId>("launch");
 
   useEffect(() => {
     let frame = 0;
 
     const update = () => {
       const marker = window.scrollY + window.innerHeight * 0.34;
-      let active: SectionId = "thesis";
+      let active: SectionId = "launch";
 
       for (const item of navItems) {
         const element = document.getElementById(item.id);
-        if (element && element.offsetTop <= marker) {
+        if (element && element.getBoundingClientRect().top + window.scrollY <= marker) {
           active = item.id;
         }
       }
@@ -93,11 +93,11 @@ export function Header() {
 
       <a
         className="header-cta"
-        href={RELEASE_URL}
+        href={DISCORD_URL}
         target="_blank"
         rel="noopener noreferrer"
       >
-        <span>Get RC5</span>
+        <span>Join Discord</span>
         <ArrowIcon />
       </a>
 
@@ -130,12 +130,12 @@ export function Header() {
         </nav>
         <a
           className="mobile-menu__cta"
-          href={RELEASE_URL}
+          href={DISCORD_URL}
           target="_blank"
           rel="noopener noreferrer"
           onClick={closeMenu}
         >
-          <span>Get RC5</span>
+          <span>Join Discord</span>
           <ArrowIcon />
         </a>
       </div>

@@ -1,22 +1,23 @@
 import { useState } from "react";
 import gpuOperator from "../assets/gpu-operator.png";
 import { ArrowIcon } from "../components/Icons";
+import { DISCORD_URL } from "../content";
 
 type Pathway = "ledger" | "inference";
 
 export function Thesis() {
-  const [activePath, setActivePath] = useState<Pathway>("ledger");
+  const [activePath, setActivePath] = useState<Pathway>("inference");
 
   return (
     <section id="thesis" className="thesis section-shell" aria-labelledby="thesis-heading">
       <div className="section-heading section-heading--split">
         <div>
-          <h2 id="thesis-heading">The case for Common Foundry.</h2>
+          <h2 id="thesis-heading">Open compute. Built by people like you.</h2>
           <p>
-            A distinctive proof system. Monetary rules you can inspect. A
-            community built around consumer GPUs. The long-term thesis combines
-            verifiable network security with an open-compute ecosystem, starting
-            with a working release candidate.
+            For miners who want to put their hardware to work. For developers
+            who want to build open infrastructure. For everyone who believes
+            AI compute should have more participants, not fewer gatekeepers.
+            There’s a place for you here.
           </p>
         </div>
       </div>
@@ -34,11 +35,11 @@ export function Thesis() {
             {[0, 1, 2, 3, 4].map((item) => <i key={item} />)}
           </span>
           <span className="thesis-path__copy">
-            <strong>Secure the ledger</strong>
+            <strong>A GPU-powered foundation</strong>
             <span>
-              ForgeMatrix proves a 384-layer matrix computation. Its transparent
-              BaseFold-based proof needs no trusted setup; nodes verify the
-              committed work independently instead of trusting the miner.
+              ForgeMatrix turns GPU matrix computation into verifiable proof
+              of work. Nodes check the proof on the CPU: running a node,
+              sending and receiving do not require a GPU.
             </span>
           </span>
         </button>
@@ -66,20 +67,20 @@ export function Thesis() {
             {[0, 1, 2, 3].map((item) => <i key={item} />)}
           </span>
           <span className="thesis-path__copy">
-            <strong>Build toward open inference</strong>
+            <strong>Inference is the direction</strong>
             <span>
-              The next economic layer is customer-paid GPU inference with
-              prepaid settlement channels. This is a separate development path,
-              not a claim that mining already serves customer AI jobs.
+              Customer-paid AI inference is the service layer we’re building
+              toward. It remains in development and is not part of the initial
+              mainnet launch. Help shape it with the community.
             </span>
           </span>
         </button>
       </div>
 
       <div className="thesis__close">
-        <p>One hardware base. Distinct roles for consensus and customer compute.</p>
-        <a href="#technology">
-          <span>Explore the architecture</span>
+        <p>Mining secures the chain. Customer inference is a separate service layer.</p>
+        <a href={DISCORD_URL} target="_blank" rel="noopener noreferrer">
+          <span>Meet the builders in Discord</span>
           <ArrowIcon />
         </a>
       </div>

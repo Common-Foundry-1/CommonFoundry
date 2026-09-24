@@ -10,6 +10,7 @@ export const MAINNET_LAUNCH_AT = "2026-10-03T17:00:00Z";
 export const SOURCE_RELEASE_AT = "2026-10-02T17:00:00Z";
 
 export type SectionId =
+  | "launch"
   | "thesis"
   | "technology"
   | "progress"
@@ -22,9 +23,9 @@ export interface NavItem {
 }
 
 export const navItems: readonly NavItem[] = [
-  { id: "thesis", label: "Thesis" },
-  { id: "technology", label: "Technology" },
-  { id: "progress", label: "Progress" },
+  { id: "launch", label: "Launch" },
+  { id: "thesis", label: "Why Common Foundry" },
+  { id: "progress", label: "What's ready" },
   { id: "economics", label: "Economics" },
   { id: "roadmap", label: "Roadmap" },
 ];
@@ -43,19 +44,19 @@ export interface ProgressItem {
 }
 
 export const implementedItems: readonly ProgressItem[] = [
-  { label: "384-layer proof with CPU verification", icon: "ledger" },
-  { label: "RTX 5090 and 5070 Ti 16 GB proof paths", icon: "network" },
-  { label: "Wallet-integrated GPU solo mining", icon: "wallet" },
-  { label: "Native encrypted backup and restore", icon: "lock" },
-  { label: "Signed release manifests and runtime setup", icon: "channel" },
+  { label: "Windows and Linux wallets and nodes", icon: "wallet" },
+  { label: "Solo and pool mining workflows", icon: "network" },
+  { label: "GPU proofs checked by CPU nodes", icon: "ledger" },
+  { label: "Encrypted wallet backup and restore", icon: "lock" },
+  { label: "Sending, receiving and syncing on RCNet", icon: "channel" },
 ];
 
 export const nextItems: readonly ProgressItem[] = [
-  { label: "Faster 16 GB proving", icon: "lock" },
-  { label: "Broader GPU and driver qualification", icon: "lock" },
-  { label: "Expanded public testnet participation", icon: "lock" },
-  { label: "Independent implementations and review", icon: "lock" },
-  { label: "Mainnet readiness and operator adoption", icon: "lock" },
+  { label: "Final launch-package checks", icon: "lock" },
+  { label: "Public source and packages · October 2", icon: "channel" },
+  { label: "Mainnet mining · October 3", icon: "network" },
+  { label: "Broader GPU and operator participation", icon: "ledger" },
+  { label: "Customer-paid inference development", icon: "channel" },
 ];
 
 export interface RoadmapGate {
@@ -68,37 +69,37 @@ export interface RoadmapGate {
 export const roadmapGates: readonly RoadmapGate[] = [
   {
     number: "01",
-    title: "Full-shape ProductionV4 proof",
+    title: "A working foundation",
     detail:
-      "The 384-layer ForgeMatrix proof is measured, CPU-verified, accepted through normal P2P admission, and persisted by another node.",
+      "RCNet brings together GPU proof of work, wallets, transfers and node synchronization. Its production-sized ForgeMatrix proofs are checked by CPU nodes.",
     phase: "active",
   },
   {
     number: "02",
-    title: "RC5 wallet and mining release",
+    title: "Get ready with the community",
     detail:
-      "RC5 ships Windows and Linux runtime setup, wallet-integrated solo mining, native backup dialogs and a network-enforced 0.1 CMFD minimum fee burn. Initial mining packages target NVIDIA RTX 50-series; platform prerequisites are in the release guide.",
+      "Join Discord for setup help, supported-hardware guidance and the right test downloads. You do not need a mining rig or a finished setup to join the conversation.",
     phase: "active",
   },
   {
     number: "03",
-    title: "Optimize the 16 GB proving path",
+    title: "October 2 · Prepare",
     detail:
-      "Improve complete proof latency while measuring memory, power, and efficiency across consumer GPU tiers.",
+      "Public source and matching Windows/Linux launch packages are planned for October 2, 2026 at noon CDT / 17:00 UTC, with release notes and checksums. Follow the official Discord announcements before installing.",
     phase: "future",
   },
   {
     number: "04",
-    title: "Scale the public testnet",
+    title: "October 3 · Mainnet",
     detail:
-      "Add more peers and mixed hardware while exercising propagation, forks, restarts, wallet flows, and pool operation.",
+      "Mainnet mining is planned to begin October 3, 2026 at noon CDT / 17:00 UTC, 24 hours after the source-release window. Final release and deployment checks remain in progress; any schedule changes will be announced.",
     phase: "future",
   },
   {
     number: "05",
-    title: "October 3 mainnet launch target",
+    title: "Build toward open inference",
     detail:
-      "Mainnet is planned for October 3, 2026 at noon Central (CDT / 17:00 UTC), with source and matching launch packages planned 24 hours earlier. Final release checks, independent review and the launch rehearsal remain in progress. Exchange availability is a separate milestone.",
+      "Customer-paid AI inference is a separate service layer in development, not a feature promised for the initial mainnet launch. We want GPU operators and developers involved in shaping it.",
     phase: "future",
   },
 ];

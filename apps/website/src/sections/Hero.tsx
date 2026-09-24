@@ -2,7 +2,7 @@ import { useRef, type PointerEvent } from "react";
 import heroApparatus from "../assets/hero-apparatus.png";
 import { ButtonLink } from "../components/ButtonLink";
 import { ShieldIcon } from "../components/Icons";
-import { RELEASE_URL } from "../content";
+import { DISCORD_URL } from "../content";
 
 export function Hero() {
   const visualRef = useRef<HTMLDivElement>(null);
@@ -26,28 +26,31 @@ export function Hero() {
       <div className="hero__copy">
         <a className="hero__launch-label" href="#launch">Mainnet coming October 3, 2026 <span aria-hidden="true">↗</span></a>
         <h1 id="hero-heading">
-          Verifiable work.<br />A new chapter begins.
+          Inference first.<br />Built to lead.
         </h1>
         <p>
-          Open GPU infrastructure with serious cryptography and deliberate
-          monetary design. ForgeMatrix pairs consumer-GPU proof of work with
-          independent verification, declining issuance and permanently burned
-          fees. Mainnet is coming. Get ready for the next chapter of Common Foundry.
+          AI compute should belong to more of us. We’re building Common Foundry
+          around GPU operators, verifiable work and a path to customer-paid
+          inference. Mainnet is coming October 3. Join the people building
+          what comes next.
         </p>
 
         <div className="hero__actions">
-          <ButtonLink href="#launch">
-            See the launch plan
+          <ButtonLink href={DISCORD_URL} target="_blank" rel="noopener noreferrer">
+            Join Discord
           </ButtonLink>
-          <ButtonLink href={RELEASE_URL} target="_blank" rel="noopener noreferrer" variant="secondary">
-            Test RC5
+          <ButtonLink href="#launch" variant="secondary">
+            Launch schedule
           </ButtonLink>
         </div>
+
+        <p className="hero__support">Setup help. Mining guidance. Launch announcements.</p>
 
         <div className="trust-note">
           <ShieldIcon />
           <span>No premine · No token sale · GPU proof of work</span>
         </div>
+
       </div>
 
       <div
@@ -65,16 +68,16 @@ export function Hero() {
           />
         </div>
         <div className="hero__legend" aria-hidden="true">
-          <span><i className="legend-square" />Proof of work</span>
+          <span><i className="legend-square" />GPU operators</span>
           <b />
-          <span><i className="legend-line" />Inference work</span>
+          <span><i className="legend-line" />Verifiable work</span>
           <b />
-          <span><i className="legend-hex" />Market settlement</span>
+          <span><i className="legend-hex" />Inference vision</span>
         </div>
       </div>
 
       <a className="section-preview" href="#thesis">
-        <span>Built to verify. Designed for the long term.</span>
+        <span>Your hardware. Your ideas. A place in the Foundry.</span>
         <i aria-hidden="true">+</i>
       </a>
     </section>

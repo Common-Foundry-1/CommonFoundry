@@ -1,13 +1,13 @@
 import { ButtonLink } from "../components/ButtonLink";
-import { MAINNET_LAUNCH_AT, SOURCE_RELEASE_AT, X_URL } from "../content";
+import { DISCORD_URL, MAINNET_LAUNCH_AT, SOURCE_RELEASE_AT } from "../content";
 
 export function Launch() {
   return (
     <section id="launch" className="launch section-shell" aria-labelledby="launch-heading">
       <div className="section-heading">
-        <p className="launch__eyebrow">The next chapter · Mainnet coming soon</p>
+        <p className="launch__eyebrow">Join before launch · Mainnet coming soon</p>
         <h2 id="launch-heading">Two dates. One shared start.</h2>
-        <p>Mark your calendar. The announced launch schedule gives everyone 24 hours to inspect the source and prepare before mainnet mining begins.</p>
+        <p>Get ready together. Source and launch packages are planned 24 hours before mining begins, giving everyone the same preparation window.</p>
       </div>
       <div className="launch__dates">
         <article>
@@ -19,15 +19,15 @@ export function Launch() {
         </article>
         <article>
           <span className="launch__step">02 / LAUNCH</span>
-          <h3>Mainnet launch target</h3>
+          <h3>Mainnet mining begins</h3>
           <time dateTime={MAINNET_LAUNCH_AT}>October 3, 2026</time>
           <p>Noon Central · 12:00 PM CDT · 17:00 UTC</p>
           <p>The planned start of the Common Foundry mainnet. Prepare your wallet, node and supported mining hardware ahead of the shared start.</p>
         </article>
       </div>
       <div className="launch__status">
-        <p><strong>Preparing for launch.</strong> Final release checks, independent review and the launch rehearsal remain in progress. Mainnet is not live yet; current RC5 downloads connect to RCNet. This page and our official channels will carry release instructions and any schedule changes.</p>
-        <ButtonLink href={X_URL} target="_blank" rel="noopener noreferrer" variant="secondary">Follow launch updates</ButtonLink>
+        <p><strong>Preparing for launch.</strong> Mainnet is not live yet. Final package and deployment checks are in progress; current downloads connect to RCNet. Discord is the place for release instructions, setup help and any schedule changes.</p>
+        <ButtonLink href={DISCORD_URL} target="_blank" rel="noopener noreferrer">Get launch-ready in Discord</ButtonLink>
       </div>
     </section>
   );

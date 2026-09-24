@@ -9,6 +9,37 @@
 
 ## Source baseline
 
+### September 23-24 qualification checkpoint
+
+The owner has completed both separately encrypted reward wallets and selected
+one replacement release signer. The approved public plan, first plan signature
+and generated mainnet pins were applied in `4c06f975bab1e76fdda8f80dc352d24e65f44168`.
+Windows/Linux node, miner, launch helper and wallet binaries were each built twice;
+both native build sets matched byte-for-byte. All four archives passed offline
+cross-platform preflight after Linux archive staging was moved off drvfs.
+
+**Those candidate archives are withheld, not approved for publication.** An actual
+proof-worker startup check found the bundled worker accepted only the older test
+network IDs. Signed private checkpoint `45601234aece4a7c4ee17d6f91c64e5d669628f4`
+fixes it using the exact shared mainnet pin, preserves per-template network binding,
+and adds a read-only worker identity check to Linux assembly. Unknown or malformed
+IDs remain rejected. CI now chooses the actual mainnet feature/configuration for
+1.0.0 instead of feeding that version to RC-only packaging scripts.
+
+The fixed worker's two Rust network tests and all six actual server/one-shot
+startup probes passed without model or CUDA work. Native SM89 and SM120 images
+were inspected. This is not complete-proof GPU qualification or evidence of
+support for older GPU generations. The Python mainnet suite ran 126 tests on
+each OS; each had seven platform/environment skips and no failures. Full-proof
+CPU verification was rerun against the exact Python sources at `4560123` and
+passed every algebra, opening, Merkle, boundary, digest and target check.
+
+The updated source still needs fresh owner approval/pins, rebuilt final archives,
+hardware proof and brief final-package checks, final release signatures, and
+mainnet infrastructure cutover. No mainnet service was started. Existing reward
+destinations, starting difficulty, signer and October 2/3 schedule are unchanged.
+The six-hour GPU-dropout waiver remains in force.
+
 The readiness branch starts at `08e63ad3862b82f7d2fc3853711bc4c1b314db66`,
 the signed RC5 miner.2 release source. It includes RC5
 `ae00bcacde01aaf1e54dcc0297d388165d677af2` and the qualified Ada/Blackwell
@@ -62,8 +93,9 @@ keys follow the encrypted-key requirement.
 
 `production-mainnet` is now a distinct node/wallet/miner build feature. It
 requires a finalized `mainnet_release_pin.inc.rs` and the matching shared
-consensus `mainnet_network_id.inc.rs`. Both remain `None` until the owner confirms
-the parameters and the required approvals are accepted. Builds reject absent
+consensus `mainnet_network_id.inc.rs`. Initial values were applied after owner
+approval; the corrected source now requires refreshed approval and release pins.
+Builds reject absent
 pins and reject single-producer RC approvals as mainnet authorization.
 
 The shared node-opening path and thin-miner handshake resolve the verified
@@ -96,9 +128,10 @@ The source checksum typo for fixed-bank-0.tree is corrected and cross-manifest
 consistency has a regression test. Node seed defaults now select the compiled
 network's port rather than hard-coding the RC port.
 
-**Mainnet integration remains incomplete.** Final pin values, actual release-approval
-evidence, actual mainnet package builds and release finalization, and a brief
-final-package smoke check are still pending. The extended GPU dropout rehearsal
+**Mainnet integration remains incomplete.** Initial signed pins and internally
+reproduced packages exist, but the affected worker/package fixes require refreshed
+approvals, final builds, release finalization, and the brief final-package smoke
+check. The extended GPU dropout rehearsal
 was waived by the owner. The runtime
 explicitly refuses legacy wire/fee defaults for a new mainnet ID.
 The proposed service ports are 29443/29444/29445, separate from RC; the current
@@ -119,15 +152,15 @@ and api3.drand.sh on 2026-09-19. Historical round 123 is the offline positive ve
 | One canonical source baseline | Readiness branch created from miner.2 | Final frozen source commit and source publication target |
 | Exact UTC release/mining schedule | Pinned in cmfd-launch | Schedule CLI and timestamp tests |
 | Signed launch-time entropy | Verifier, node/miner startup wiring and retrieval/waiting launchers implemented; packaged rehearsal pending | Signature mutation vectors plus actual packaged replay and anti-precomputation rehearsal |
-| Mainnet network/consensus identity | Shared identity registry and mainnet build feature implemented; final pin values pending | Final pinned plan and mainnet profile, distinct from RC |
+| Mainnet network/consensus identity | Approved identity applied in the first candidate; corrected worker accepts its exact compiled pin | Refreshed source approval/pins and final package checks |
 | Starting difficulty | Owner approved the 5× RC initial target and RC minimum on September 23 after waiving the extended live 20→5→1 run. Isolated full-proof and recovery tests passed; live dropout response remains unmeasured. | Bind the exact approved targets in the final plan, pins and packages; preserve the waiver and never present simulated data as a live result |
 | Reward receiving addresses and custody | Owner completed the distinct-password setup September 23. Both public destinations and the exact plan are committed; all four encrypted-file hashes match the authenticated setup report. | Off-host backup retention remains unconfirmed; see [custody setup](mainnet-reward-custody.md#owner-setup-completed-september-23-2026) |
 | Build reproduction and validation reporting | Owner declined seeking an external cryptographer; validation must be described as internal | Reproducible build records and accurate test/approval evidence, without claiming an external cryptographic audit |
-| Plan approval binding | Owner selected one release signer on September 23; mainnet-specific owner requests, verification, package binding and pin generation are implemented | Actual owner signature, full internal proof qualification, reviewed source history and final pin application |
+| Plan approval binding | One owner signer selected; first signature verified and pins applied; full internal proof reverified after affected source fixes | Renew approval for corrected source, then apply exact generated pins |
 | Dependency audit | rustls updated to 0.23.45 for RUSTSEC-2026-0285; 44 pool/TLS tests pass and cargo-audit reports zero vulnerabilities | Final build audit plus review of remaining informational dependency warnings |
-| Full cross-platform CI | All 14 jobs passed on be9ce8836581f01ec80031e4800380a361f368a3 in run 35907290535. The later distinct-password custody and committed-plan checkpoint still requires CI. | Completed successful full run on the final source, not only selected jobs |
-| Windows/Linux release packages | Native assembler and four package layouts implemented; actual builds await final configuration | Clean installs, signature/checksum verification, matching runtime identity |
-| Four-package release consistency | Offline archive/source/receipt reconciliation implemented | Actual four-archive preflight report followed by internal rebuild comparison and owner signing |
+| Full cross-platform CI | All 14 jobs passed on d8116f56a18f5ef18a64761afb6c15196952660f in run 35926944704. The 4c06f97 run exposed RC-only packaging of version 1.0.0; 4560123 corrects profile selection and awaits CI. | Completed successful full run on the final source, not only selected jobs |
+| Windows/Linux release packages | First eight native binaries each rebuilt identically; candidate withheld for the proof-worker correction | Rebuild corrected signed source, clean installs and final identity verification |
+| Four-package release consistency | Both initial four-archive sets passed actual preflight and byte comparison; not release-approved | Repeat for corrected worker/final source, then owner signing |
 | Mainnet release finalization | Generic finalizer checks exact pins, owner plan signature and an owner-signed internal-build statement | Two internally built archive sets and accurate signed evidence, then final checksums/signature |
 | Wallet preparation before activation | Encrypted creation with backup, restore, public address display and launch-wait UI implemented | Native custody tests plus rendered fixture checks; final signed-package rehearsal pending |
 | Seeds, discovery, explorer | Live RC seed checked healthy September 19; isolated mainnet service templates staged, not deployed | Independent node results and mainnet service configuration |

@@ -157,10 +157,15 @@ class MainnetPackageTests(unittest.TestCase):
     def sources(self, repo, commit, paths, version):
         return {name: (repo / relative).read_bytes().replace(b"\r\n", b"\n") for name, relative in paths.items()}, 1789840000
 
-    def output(self, executable, arguments):
+    def output(self, executable, arguments, **_kwargs):
         self.calls.append((executable.name, arguments))
         if arguments == ["--version"]:
             return b"1.0.0\n"
+        if arguments == ["network-info"]:
+            self.assertEqual(executable.name, "real_bank0_relations")
+            return packages.canonical({"schema": "CMFD_PRODUCTION_V4_PROOF_WORKER_NETWORK_V1",
+                                       "role": "real_bank0_relations", "mainnet_network_id": self.plan["network_id"],
+                                       "legacy_network_ids": ["1" * 64, "2" * 64]})
         if arguments == ["schedule"]:
             beacon = self.plan["payload"]["beacon"]
             return packages.canonical({"schema": "CMFD_MAINNET_LAUNCH_SCHEDULE_V1",
@@ -213,7 +218,42 @@ class MainnetPackageTests(unittest.TestCase):
                     args.output = self.root / (platform + kind + "-repeat")
                     repeat = self.assemble(args)
                     self.assertEqual(archive.read_bytes(), repeat.read_bytes())
-        self.assertFalse(any(arguments == ["network-info"] for _, arguments in self.calls))
+        self.assertTrue(any(name == "real_bank0_relations" and arguments == ["network-info"] for name, arguments in self.calls))
+
+    def test_linux_packages_reject_a_legacy_only_proof_worker(self):
+        def legacy(executable, arguments, **kwargs):
+            result = self.output(executable, arguments, **kwargs)
+            if arguments == ["network-info"]:
+                info = json.loads(result)
+                info["mainnet_network_id"] = None
+                return packages.canonical(info)
+            return result
+        for kind in ("runtime", "miner"):
+            args = self.args("linux-x86_64", kind, "legacy-" + kind)
+            with self.subTest(kind=kind), self.assertRaisesRegex(packages.Error, "proof worker.*mainnet"):
+                self.assemble(args, output=legacy)
+            self.assertEqual(list(args.output.iterdir()), [])
+
+    def test_worker_network_identity_rejects_unknown_or_malformed_data(self):
+        good = json.loads(self.output(Path("real_bank0_relations"), ["network-info"]))
+        self.assertEqual(packages.validate_proof_worker_network(packages.canonical(good), self.plan), good)
+        mutations = [("mainnet_network_id", "f" * 64), ("legacy_network_ids", [["1" * 64], "2" * 64]),
+                     ("legacy_network_ids", ["1" * 64] * 2), ("role", "cmfd-v4-replay"),
+                     ("legacy_network_ids", [self.plan["network_id"], "2" * 64])]
+        for key, value in mutations:
+            changed = {**good, key: value}
+            with self.subTest(key=key, value=value), self.assertRaises(packages.Error):
+                packages.validate_proof_worker_network(packages.canonical(changed), self.plan)
+
+    def test_linux_staging_rejects_filesystem_that_loses_permissions(self):
+        args = self.args("linux-x86_64", "runtime", "bad-modes")
+        original = packages.integrity._canonical_file_mode
+        def bad_mode(path):
+            return 0o755 if path.name == "MAINNET-PACKAGE.json" else original(path)
+        with mock.patch.object(packages.integrity, "_canonical_file_mode", side_effect=bad_mode):
+            with self.assertRaisesRegex(packages.Error, "POSIX executable permissions"):
+                self.assemble(args)
+        self.assertEqual(list(args.output.iterdir()), [])
 
     def test_dashboard_tree_rejects_extra_missing_tampered_and_symlink_assets(self):
         args = self.args()

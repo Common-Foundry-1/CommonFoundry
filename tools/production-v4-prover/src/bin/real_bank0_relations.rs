@@ -56,12 +56,12 @@ use slop_basefold::FriConfig;
 use slop_challenger::{CanObserve, FieldChallenger, IopCtx};
 use slop_multilinear::{Mle, Point};
 use slop_tensor::{Dimensions, Tensor, TensorView};
+use sp1_gpu_basefold::FriCudaProver;
+use sp1_gpu_commit::commit_multilinears;
 use sp1_gpu_cudart::{
     args, cuda_memory_info, dot_along_dim_view, run_sync_in_place, DeviceBuffer, DevicePoint,
     DeviceTensor, TaskScope,
 };
-use sp1_gpu_basefold::FriCudaProver;
-use sp1_gpu_commit::commit_multilinears;
 use sp1_gpu_jagged_sumcheck::{
     cubic_transition_sumcheck, simple_hadamard_sumcheck, triple_hadamard_sumcheck,
 };
@@ -128,6 +128,22 @@ struct PreparedProver {
 
 fn main() -> Result<()> {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if args.len() == 1 && args[0] == "network-info" {
+        // No model files, CUDA context, or proving work are opened by this query.
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "schema": "CMFD_PRODUCTION_V4_PROOF_WORKER_NETWORK_V1",
+                "role": "real_bank0_relations",
+                "mainnet_network_id": cmfd_consensus::mainnet_network::MAINNET_NETWORK_ID
+                    .filter(|id| cmfd_consensus::mainnet_network::is_mainnet_network(*id))
+                    .map(hex::encode),
+                "legacy_network_ids": [hex::encode(PRODUCTION_V4_TESTNET_NETWORK_ID),
+                                       hex::encode(PRODUCTION_V4_RCNET1_NETWORK_ID)],
+            }))?
+        );
+        return Ok(());
+    }
     if args.first().is_some_and(|value| value == "--server") {
         ensure!(
             args.len() == 4,
@@ -189,10 +205,54 @@ fn parse_expected_network_id(value: &OsString) -> Result<[u8; 32]> {
         .map_err(|_| anyhow::anyhow!("expected network ID is not a 32-byte hexadecimal value"))?;
     ensure!(
         network_id == PRODUCTION_V4_TESTNET_NETWORK_ID
-            || network_id == PRODUCTION_V4_RCNET1_NETWORK_ID,
+            || network_id == PRODUCTION_V4_RCNET1_NETWORK_ID
+            || cmfd_consensus::mainnet_network::is_mainnet_network(network_id),
         "expected network ID is not a compiled ProductionV4 network"
     );
     Ok(network_id)
+}
+
+#[cfg(test)]
+mod network_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_the_compiled_networks_only() {
+        for id in [
+            PRODUCTION_V4_TESTNET_NETWORK_ID,
+            PRODUCTION_V4_RCNET1_NETWORK_ID,
+        ]
+        .into_iter()
+        .chain(cmfd_consensus::mainnet_network::MAINNET_NETWORK_ID)
+        {
+            assert_eq!(
+                parse_expected_network_id(&OsString::from(hex::encode(id))).unwrap(),
+                id
+            );
+        }
+        for id in [[0; 32], [0xff; 32], [0x63; 32]] {
+            assert!(parse_expected_network_id(&OsString::from(hex::encode(id))).is_err());
+        }
+        if let Some(mut id) = cmfd_consensus::mainnet_network::MAINNET_NETWORK_ID {
+            id[0] ^= 1;
+            assert!(parse_expected_network_id(&OsString::from(hex::encode(id))).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_noncanonical_network_encodings() {
+        for value in [
+            "",
+            "00",
+            &"a".repeat(63),
+            &"a".repeat(65),
+            &"A".repeat(64),
+            &format!(" {}", hex::encode(PRODUCTION_V4_RCNET1_NETWORK_ID)),
+            &format!("{}\n", hex::encode(PRODUCTION_V4_RCNET1_NETWORK_ID)),
+        ] {
+            assert!(parse_expected_network_id(&OsString::from(value)).is_err());
+        }
+    }
 }
 
 fn prepare_prover(model_path: &Path, artifact_dir: &Path) -> Result<PreparedProver> {
@@ -222,10 +282,8 @@ fn prepare_prover(model_path: &Path, artifact_dir: &Path) -> Result<PreparedProv
     let fixed_maps: [real_v4_opening::FixedArtifactMaps; 3] = (0..3)
         .map(|bank| {
             let started = Instant::now();
-            let maps = real_v4_opening::FixedArtifactMaps::open(
-                artifact_dir,
-                fixed_record.banks()[bank],
-            )?;
+            let maps =
+                real_v4_opening::FixedArtifactMaps::open(artifact_dir, fixed_record.banks()[bank])?;
             eprintln!(
                 "fixed_artifact_prep bank={bank} seconds={:.6}",
                 started.elapsed().as_secs_f64()
@@ -319,11 +377,8 @@ fn prove_job(
     let final_activation = read_final_activation(final_path)?;
     let block = frozen.challenge;
     let nonce = frozen.nonce;
-    let challenge_digest = forgematrix_v4_challenge_digest(
-        &block,
-        nonce,
-        prepared.fixed_record.manifest_digest(),
-    );
+    let challenge_digest =
+        forgematrix_v4_challenge_digest(&block, nonce, prepared.fixed_record.manifest_digest());
     let final_activation_digest =
         forgematrix_v4_final_activation_digest(challenge_digest, &final_activation);
     let statement = ForgeMatrixV4TranscriptStatement {
@@ -361,8 +416,7 @@ fn prove_job(
         .iter()
         .map(montgomery_values)
         .collect::<Result<Vec<_>>>()?;
-    let (dynamic_traces, dynamic_words) =
-        prepare_dynamic_traces(&dynamic_values, scope)?;
+    let (dynamic_traces, dynamic_words) = prepare_dynamic_traces(&dynamic_values, scope)?;
     if let Some(expected) = expected_dynamic_words {
         ensure!(
             expected == dynamic_words,
@@ -408,8 +462,8 @@ fn prepare_dynamic_traces(
             DYNAMIC_COLUMNS,
             ROWS,
         )]);
-        let trace =
-            JaggedTraceMle::from_chip_layout(Buffer::from(dense), &layout, LOG_ROWS).into_device(scope);
+        let trace = JaggedTraceMle::from_chip_layout(Buffer::from(dense), &layout, LOG_ROWS)
+            .into_device(scope);
         let prover = FriCudaProver::<TestGC, _, Felt>::new(
             Poseidon2SP1Field16CudaProver::new(scope),
             FriConfig::new(LOG_BLOWUP, QUERIES, POW_BITS),
@@ -417,7 +471,10 @@ fn prepare_dynamic_traces(
         );
         let (_, data) = commit_multilinears::<TestGC, _>(&trace, LOG_ROWS, false, false, &prover)?;
         scope.synchronize_blocking()?;
-        words.push(data.original_commitment.map(|value| value.as_canonical_u32()));
+        words.push(
+            data.original_commitment
+                .map(|value| value.as_canonical_u32()),
+        );
         traces.push(trace);
         eprintln!(
             "bank={bank} fused_commit_seconds={:.6}",
@@ -479,24 +536,19 @@ fn prove_complete_proof(
     let mut openings = Vec::with_capacity(3);
 
     let [dynamic_device, next_dynamic_device, final_dynamic_device] = dynamic_traces;
-    let (
-        bank_relations,
-        bank_claims,
-        boundary_claims,
-        encoded_device,
-        dynamic_device,
-    ) = prove_bank_relations(
-        0,
-        statement,
-        base_input,
-        &encoded_banks[0],
-        dynamic_values[0],
-        dynamic_device,
-        &initial_activation,
-        &mut cpu_challenger,
-        &mut gpu_challenger,
-        scope,
-    )?;
+    let (bank_relations, bank_claims, boundary_claims, encoded_device, dynamic_device) =
+        prove_bank_relations(
+            0,
+            statement,
+            base_input,
+            &encoded_banks[0],
+            dynamic_values[0],
+            dynamic_device,
+            &initial_activation,
+            &mut cpu_challenger,
+            &mut gpu_challenger,
+            scope,
+        )?;
     ensure!(
         boundary_claims.is_empty(),
         "bank 0 produced a previous-bank boundary claim"
@@ -505,24 +557,19 @@ fn prove_complete_proof(
     claims.push(bank_claims);
 
     let boundary = last_activation_layer(dynamic_values[0]);
-    let (
-        bank_relations,
-        bank_claims,
-        boundary_claims,
-        next_encoded_device,
-        next_dynamic_device,
-    ) = prove_bank_relations(
-        1,
-        statement,
-        base_input,
-        &encoded_banks[1],
-        dynamic_values[1],
-        next_dynamic_device,
-        boundary,
-        &mut cpu_challenger,
-        &mut gpu_challenger,
-        scope,
-    )?;
+    let (bank_relations, bank_claims, boundary_claims, next_encoded_device, next_dynamic_device) =
+        prove_bank_relations(
+            1,
+            statement,
+            base_input,
+            &encoded_banks[1],
+            dynamic_values[1],
+            next_dynamic_device,
+            boundary,
+            &mut cpu_challenger,
+            &mut gpu_challenger,
+            scope,
+        )?;
     relations.push(bank_relations);
     claims.push(bank_claims);
     claims[0].extend(boundary_claims);
@@ -540,13 +587,7 @@ fn prove_complete_proof(
         scope,
     )?);
     let boundary = last_activation_layer(dynamic_values[1]);
-    let (
-        bank_relations,
-        bank_claims,
-        boundary_claims,
-        final_encoded_device,
-        final_dynamic_device,
-    ) =
+    let (bank_relations, bank_claims, boundary_claims, final_encoded_device, final_dynamic_device) =
         prove_bank_relations(
             2,
             statement,
@@ -754,8 +795,7 @@ fn prove_bank_relations(
         );
 
         let dynamic_tensor = dynamic.main_virtual_tensor(LOG_ROWS);
-        let preactivation_reduced =
-            reduce_batches(&dynamic_tensor, 0, &gpu_matrix_point.1, scope)?;
+        let preactivation_reduced = reduce_batches(&dynamic_tensor, 0, &gpu_matrix_point.1, scope)?;
         let next_reduced =
             reduce_batches(&dynamic_tensor, BANK_VALUES, &gpu_matrix_point.1, scope)?;
         let preactivation_evaluation = evaluate_matrix(

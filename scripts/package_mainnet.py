@@ -206,11 +206,13 @@ def copy_cuda_runtime(source: Path, target: Path, expected_sha256: str) -> None:
     target.chmod(0o644)
 
 
-def native_output(executable: Path, arguments: list[str], timeout_seconds: float = 15) -> bytes:
+def native_output(executable: Path, arguments: list[str], timeout_seconds: float = 15,
+                  *, environment: dict[str, str] | None = None) -> bytes:
     """Bound process duration and collected bytes; invoke without any shell."""
     child = subprocess.Popen([str(executable), *arguments], stdin=subprocess.DEVNULL,
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+                             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                             env=environment)
     result: queue.Queue = queue.Queue(maxsize=1)
     def read():
         try:
@@ -460,6 +462,24 @@ def copy_executable(source: Path, target: Path, platform: str) -> None:
     target.chmod(0o755)
 
 
+def validate_proof_worker_network(data: bytes, plan: dict) -> dict:
+    info = strict_json(data, "proof worker network identity")
+    if (set(info) != {"schema", "role", "mainnet_network_id", "legacy_network_ids"}
+            or info["schema"] != "CMFD_PRODUCTION_V4_PROOF_WORKER_NETWORK_V1"
+            or info["role"] != "real_bank0_relations"
+            or info["mainnet_network_id"] != plan["network_id"]):
+        raise Error("proof worker does not support the compiled mainnet network")
+    legacy = info["legacy_network_ids"]
+    if (not isinstance(legacy, list) or len(legacy) != 2
+            or not all(isinstance(network, str) for network in legacy) or len(set(legacy)) != 2):
+        raise Error("proof worker legacy network inventory is malformed")
+    for network in legacy:
+        nonzero_hex(network, 64, "proof worker legacy network")
+        if network == plan["network_id"]:
+            raise Error("proof worker treats mainnet as a legacy network")
+    return info
+
+
 def assemble(args: argparse.Namespace) -> Path:
     integrity._require_native_runtime_platform(args.platform)
     commit = nonzero_hex(args.commit, 40, "source commit")
@@ -487,7 +507,10 @@ def assemble(args: argparse.Namespace) -> Path:
     if output.exists() or output.is_symlink():
         raise Error(f"package already exists: {output}")
     args.output.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=".mainnet-package-", dir=args.output) as temporary:
+    # Linux packages may be written to a Windows-mounted output directory. Keep
+    # staging on the native temp filesystem: drvfs without metadata ignores chmod
+    # and otherwise turns data/configuration files into executable archive members.
+    with tempfile.TemporaryDirectory(prefix=".mainnet-package-") as temporary:
         stage = Path(temporary) / name
         stage.mkdir()
         for relative, data in sources.items():
@@ -526,6 +549,10 @@ def assemble(args: argparse.Namespace) -> Path:
         if len({before[name]["sha256"] for name in executable_names}) != len(executable_names):
             raise Error("different executable roles must not reuse the same binary")
         directories = {path.relative_to(stage).as_posix() for path in stage.rglob("*") if path.is_dir()}
+        if args.platform == "linux-x86_64":
+            worker_environment = dict(os.environ, LD_LIBRARY_PATH=str(stage / "lib"))
+            validate_proof_worker_network(native_output(worker_root / "real_bank0_relations",
+                ["network-info"], environment=worker_environment), plan)
         identities = {}
         common_info = None
         for role in binaries:
@@ -562,6 +589,13 @@ def assemble(args: argparse.Namespace) -> Path:
                    "network_id": plan["network_id"], "files": before, "native_identities": identities,
                    "artifact_source_release": "v0.1.0-rc.1", "release_approved": False}
         (stage / "MAINNET-PACKAGE.json").write_bytes(canonical(receipt))
+        if args.platform == "linux-x86_64":
+            for path in stage.rglob("*"):
+                if path.is_file():
+                    name_in_package = path.relative_to(stage).as_posix()
+                    expected_mode = 0o755 if name_in_package in executable_names or path.suffix in (".sh", ".bat") else 0o644
+                    if integrity._canonical_file_mode(path) != expected_mode:
+                        raise Error("Linux package staging must preserve POSIX executable permissions; use a native Linux TMPDIR")
         # Detect a concurrent checkout change before publishing an archive.
         source_snapshot(args.repo, commit, source_paths, args.version)
         writer = integrity.create_deterministic_zip if suffix == ".zip" else integrity.create_deterministic_tar_gz

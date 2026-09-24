@@ -78,6 +78,16 @@ py -3 scripts/package_mainnet.py --platform windows-x86_64 --kind runtime `
 For a miner archive, use `--kind miner --miner $MinerBinary` instead of the node
 and wallet arguments. On Linux use python3 and `--platform linux-x86_64`.
 The source node/wallet/miner versions must match; RC versions are not accepted.
+Linux staging uses the native temporary filesystem so Windows-mounted output
+directories cannot silently mark configuration files executable. Set `TMPDIR`
+to a native Linux filesystem if the default temporary directory is mounted from
+Windows; package assembly rejects incorrect executable modes.
+
+Linux assembly also queries the proof worker's read-only `network-info` command
+using the staged CUDA runtime. Its mainnet network ID must match the approved
+plan. A successful ELF/architecture check alone cannot qualify an older RC-only
+worker for mainnet. The reconciled Windows/WSL packages carry those same worker
+bytes; complete proof and hardware qualification remain separate checks.
 
 The assembler executes only read-only native identity/version commands, with
 bounded output and deadlines. Node/miner `mainnet-launch-info` must agree with

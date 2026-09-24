@@ -82,7 +82,12 @@ real_bank0_relations --network-id EXPECTED_NETWORK_ID MODEL ARTIFACT_DIRECTORY T
 ```
 
 `EXPECTED_NETWORK_ID` is required to be exactly 64 lowercase hexadecimal characters and must be
-one of the compiled ProductionV4 Testnet-1 or RCNet-1 identities. Packaged ProductionV4 miner
+one of the compiled ProductionV4 Testnet-1, RCNet-1, or finalized mainnet identities. Mainnet is
+accepted only when it exactly matches the shared, non-placeholder consensus pin; an arbitrary
+caller-supplied ID cannot enable another chain. `real_bank0_relations network-info` reports that
+compiled pin without loading a model or starting CUDA. Linux mainnet package assembly requires
+this query to match the approved plan, rejecting legacy-only workers before archiving. The
+per-template expected-network comparison remains required for every proof. Packaged ProductionV4 miner
 launchers read it from the already authenticated input manifest; node-owned pool workers pass the
 full network ID from the compiled network profile.
 

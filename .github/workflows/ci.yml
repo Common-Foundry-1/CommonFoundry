@@ -433,6 +433,10 @@ jobs:
           ${{ steps.desktop_metadata.outputs.bundle_args }}
           --features ${{ steps.desktop_metadata.outputs.network_feature }} -- --locked
         working-directory: apps/wallet
+      - name: Stage public mainnet plan beside CI executables
+        if: steps.desktop_metadata.outputs.network_feature == 'production-mainnet'
+        run: >-
+          python -c "from pathlib import Path; source = Path('packaging/mainnet/MAINNET-PLAN.json'); target = Path('target/release/production-mainnet/MAINNET-PLAN.json'); target.parent.mkdir(parents=True, exist_ok=True); target.open('xb').write(source.read_bytes())"
       - name: Verify mainnet node and wallet identities
         if: steps.desktop_metadata.outputs.network_feature == 'production-mainnet'
         run: |

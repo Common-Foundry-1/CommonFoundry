@@ -63,3 +63,16 @@ class MainnetCiIdentityTests(unittest.TestCase):
                 return output
             with self.subTest(mutation=mutation), self.assertRaises(check.package.Error):
                 self.run_check(output=changed)
+
+    def test_ci_stages_only_the_public_plan_before_querying_mainnet_binaries(self):
+        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml").read_text()
+        desktop = workflow.split("  desktop:\n", 1)[1]
+        stage = "- name: Stage public mainnet plan beside CI executables"
+        verify = "- name: Verify mainnet node and wallet identities"
+        self.assertLess(desktop.index(stage), desktop.index(verify))
+        step = desktop.split(stage, 1)[1].split("\n      - ", 1)[0]
+        self.assertIn("steps.desktop_metadata.outputs.network_feature == 'production-mainnet'", step)
+        self.assertIn("Path('packaging/mainnet/MAINNET-PLAN.json')", step)
+        self.assertIn("Path('target/release/production-mainnet/MAINNET-PLAN.json')", step)
+        self.assertIn("target.open('xb')", step)
+        self.assertNotIn("LAUNCH-BEACON", step)

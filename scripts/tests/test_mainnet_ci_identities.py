@@ -1,6 +1,7 @@
 """Native identity CLI regression fixtures, not running wallets or launch approval."""
 import base64
 import copy
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -91,3 +92,30 @@ class MainnetCiIdentityTests(unittest.TestCase):
             "github.ref != 'refs/heads/release/mainnet-gpu-compatibility' }}",
             concurrency,
         )
+
+
+class MainnetReleasePolicyTests(unittest.TestCase):
+    def test_release_checksum_policy_uses_the_selected_mainnet_key(self):
+        repo = Path(__file__).resolve().parents[2]
+        root = repo / "packaging/mainnet"
+        release = (root / "MAINNET-RELEASE.allowed_signers").read_text().splitlines()
+        producer = (root / "MAINNET-PRODUCER.allowed_signers").read_text().splitlines()
+        selected = json.loads((root / "SIGNER-SELECTION.json").read_bytes())
+        trust = json.loads((root / "APPROVAL-TRUST.json").read_bytes())
+        self.assertEqual(len(release), 1)
+        self.assertEqual(len(producer), 1)
+        release_parts, producer_parts = release[0].split(), producer[0].split()
+        self.assertEqual(len(release_parts), 4)
+        self.assertEqual(len(producer_parts), 4)
+        self.assertEqual(release_parts[:3], [
+            selected["signer_identity"], 'namespaces="commonfoundry-release"', "ssh-ed25519",
+        ])
+        self.assertEqual(producer_parts[0], release_parts[0])
+        self.assertEqual(producer_parts[2:], release_parts[2:])
+        self.assertNotEqual(producer_parts[1], release_parts[1])
+        key_blob = base64.b64decode(release_parts[3], validate=True)
+        key_hash = hashlib.sha256(key_blob).digest()
+        fingerprint = "SHA256:" + base64.b64encode(key_hash).decode().rstrip("=")
+        self.assertEqual(key_hash.hex(), trust["producer"]["key_blob_sha256"])
+        self.assertEqual(fingerprint, selected["selected_fingerprint"])
+        self.assertEqual(fingerprint, trust["producer"]["key_fingerprint"])

@@ -6,6 +6,11 @@ use CDT, not winter CST.
 
 Extract the complete archive to a folder you can write to. Keep its files
 together. Verify the release signatures and SHA256 checksums before running it.
+The published source includes `docs/mainnet-release-verification.md` and the
+release checksum policy `packaging/mainnet/MAINNET-RELEASE.allowed_signers`.
+Check that policy's Ed25519 fingerprint independently before using its
+`verify-download` procedure on the complete release directory. The expected
+fingerprint is `SHA256:hhfV/4M5XDL2hLzeX0q/IMCR4fjSq5Kb8BjMC/Zj96Q`.
 The embedded MAINNET-PACKAGE.json records the producer's package inventory and
 native identity checks; it is not an independent approval or a signature.
 production-mainnet/MAINNET-APPROVALS.json identifies the plan-review records

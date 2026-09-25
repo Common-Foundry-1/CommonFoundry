@@ -1,0 +1,8 @@
+# Ingress-only validation example, NOT the live tunnel configuration.
+# At approved cutover, merge only this hostname rule into the existing ingress
+# list. Preserve its tunnel credentials, RC/pool rules and final catch-all.
+ingress:
+  - hostname: mainnet-explorer-origin.commonfoundry.ai
+    path: '^/v1/explorer(?:$|/block/(?:[0-9]+|[0-9a-fA-F]{64})$|/transaction/[0-9a-fA-F]{64}$|/address/[0-9a-fA-F]{64}(?:/[0-9a-fA-F]{64}\.[1-9][0-9]{0,19}\.(?:0|[1-9][0-9]{0,3}))?$)'
+    service: http://127.0.0.1:29443
+  - service: http_status:404

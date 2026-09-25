@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AlertTriangle, LoaderCircle } from "lucide-react";
-import { loadBlock, loadExplorer, loadTransaction, MAINNET_MODE } from "./api";
+import { ExplorerRequestError, loadAddress, loadBlock, loadExplorer, loadTransaction, MAINNET_MODE } from "./api";
+import { ADDRESS_HASH } from "../shared/address";
 import { demoBlock } from "./demoData";
-import type { ExplorerBlock, ExplorerSnapshot, ExplorerTransaction, ExplorerView } from "./types";
+import type { ExplorerBlock, ExplorerSearchKind, ExplorerSnapshot, ExplorerTransaction, ExplorerView } from "./types";
+import { AddressDetail } from "./components/AddressDetail";
 import { BlockDetail, TransactionDetail } from "./components/DetailViews";
 import { Header } from "./components/Header";
 import { Overview } from "./components/Overview";
@@ -13,8 +15,11 @@ export default function App() {
   const [view, setView] = useState<ExplorerView>({ kind: "overview" });
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [navigating, setNavigating] = useState(false);
   const refreshVersion = useRef(0);
   const refreshInFlight = useRef(false);
+  const navigationVersion = useRef(0);
+  const networkId = useRef<string | null>(null);
 
   const refresh = useCallback(async (force = false) => {
     if (refreshInFlight.current && !force) return;
@@ -23,80 +28,90 @@ export default function App() {
     try {
       const loaded = await loadExplorer();
       if (version !== refreshVersion.current) return;
-      setSnapshot(loaded.data);
-      setPreview(loaded.preview);
-      setError(null);
+      if (loaded.preview || (networkId.current && networkId.current !== loaded.data.network_id)) {
+        navigationVersion.current += 1; setNavigating(false); setView({ kind: "overview" });
+      }
+      networkId.current = loaded.data.network_id;
+      setSnapshot(loaded.data); setPreview(loaded.preview); setError(null);
     } catch (reason) {
       if (version !== refreshVersion.current) return;
-      setSnapshot(null);
-      setPreview(false);
-      setView({ kind: "overview" });
+      navigationVersion.current += 1;
+      setSnapshot(null); setPreview(false); setNavigating(false); setView({ kind: "overview" });
       setError(reason instanceof Error ? reason.message : "The explorer node is unavailable.");
     } finally {
-      if (version === refreshVersion.current) {
-        refreshInFlight.current = false;
-        setLoading(false);
-      }
+      if (version === refreshVersion.current) { refreshInFlight.current = false; setLoading(false); }
     }
   }, []);
 
   useEffect(() => {
     void refresh();
     const timer = window.setInterval(() => void refresh(), 10_000);
-    return () => { window.clearInterval(timer); refreshVersion.current += 1; refreshInFlight.current = false; };
+    return () => { window.clearInterval(timer); refreshVersion.current += 1; navigationVersion.current += 1; refreshInFlight.current = false; };
   }, [refresh]);
 
-  const openBlock = async (block: ExplorerBlock | string) => {
+  const navigate = async (load: () => Promise<ExplorerView>) => {
+    const version = ++navigationVersion.current;
+    setError(null); setNavigating(true);
     try {
-      setError(null);
-      const detail = preview && typeof block !== "string" ? demoBlock(block) : await loadBlock(typeof block === "string" ? block : block.block_id, preview);
-      setView({ kind: "block", block: detail });
-      window.scrollTo({ top: 0, behavior: "smooth" });
+      const next = await load();
+      if (version !== navigationVersion.current) return;
+      setView(next); window.scrollTo({ top: 0, behavior: "smooth" });
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Block not found.");
+      if (version !== navigationVersion.current) return;
+      setView({ kind: "overview" });
+      setError(reason instanceof Error ? reason.message : "The requested chain data is unavailable.");
+    } finally {
+      if (version === navigationVersion.current) setNavigating(false);
     }
   };
 
-  const openTransaction = async (transaction: ExplorerTransaction | string) => {
-    try {
-      setError(null);
-      const detail = typeof transaction === "string" ? await loadTransaction(transaction, preview) : transaction;
-      setView({ kind: "transaction", transaction: detail });
-      window.scrollTo({ top: 0, behavior: "smooth" });
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Transaction not found.");
-    }
-  };
+  const openBlock = (block: ExplorerBlock | string) => navigate(async () => ({
+    kind: "block", block: preview && typeof block !== "string" ? demoBlock(block) : await loadBlock(typeof block === "string" ? block : block.block_id, preview),
+  }));
+  const openTransaction = (transaction: ExplorerTransaction | string) => navigate(async () => ({
+    kind: "transaction", transaction: typeof transaction === "string" ? await loadTransaction(transaction, preview) : transaction,
+  }));
 
-  const search = async (query: string) => {
-    if (/^\d+$/.test(query)) {
-      await openBlock(query);
+  const search = async (query: string, kind: ExplorerSearchKind) => {
+    if (kind === "address" && ADDRESS_HASH.test(query)) {
+      await navigate(async () => ({ kind: "address", address: await loadAddress(query, null, preview) }));
       return;
     }
-    if (/^[0-9a-fA-F]{64}$/.test(query)) {
-      const normalized = query.toLowerCase();
-      try {
-        const block = await loadBlock(normalized, preview);
-        setView({ kind: "block", block });
-        setError(null);
-        window.scrollTo({ top: 0, behavior: "smooth" });
-        return;
-      } catch {
-        await openTransaction(normalized);
-        return;
-      }
+    if (kind === "chain" && /^\d{1,20}$/.test(query) && BigInt(query) <= 18_446_744_073_709_551_615n) {
+      await openBlock(query); return;
     }
-    setError("Enter a block height or a 64-character block/transaction hash.");
+    if (kind === "chain" && ADDRESS_HASH.test(query)) {
+      const normalized = query.toLowerCase();
+      await navigate(async () => {
+        try { return { kind: "block", block: await loadBlock(normalized, preview) }; }
+        catch (reason) {
+          if (!preview && (!(reason instanceof ExplorerRequestError) || reason.status !== 404)) throw reason;
+          return { kind: "transaction", transaction: await loadTransaction(normalized, preview) };
+        }
+      });
+      return;
+    }
+    navigationVersion.current += 1; setNavigating(false); setView({ kind: "overview" });
+    setError(kind === "address" ? "Enter a 64-character wallet address." : "Enter a block height or a 64-character block/transaction hash. Choose Address to look up a wallet.");
   };
 
   const home = () => {
-    setView({ kind: "overview" });
-    setError(null);
+    navigationVersion.current += 1; setNavigating(false); setView({ kind: "overview" }); setError(null);
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
   if (loading) return <div className="load-state"><LoaderCircle className="spin" /><span>Opening the chain…</span></div>;
   if (!snapshot) return <div className="load-state error"><AlertTriangle /><strong>{MAINNET_MODE ? "Mainnet explorer awaiting connection" : "Explorer unavailable"}</strong><span>{error}</span><button type="button" onClick={() => void refresh(true)}>Retry</button></div>;
 
-  return <div className="app-shell"><Header network={snapshot.network_short_name} connected={!preview} onHome={home} onSearch={(query) => void search(query)} />{error && <div className="error-banner"><AlertTriangle size={15} />{error}<button type="button" onClick={() => setError(null)}>Dismiss</button></div>}{view.kind === "overview" && <Overview snapshot={snapshot} preview={preview} onBlock={(block) => void openBlock(block)} onTransaction={(tx) => void openTransaction(tx)} />}{view.kind === "block" && <BlockDetail block={view.block} onBack={home} onTransaction={(tx) => void openTransaction(tx)} />}{view.kind === "transaction" && <TransactionDetail transaction={view.transaction} onBack={home} />}<footer><span>Common Foundry Explorer</span><code>{snapshot.network_id.slice(0, 16)}…</code><span>Built for independently verifiable compute.</span></footer></div>;
+  return <div className="app-shell">
+    <Header network={snapshot.network_short_name} connected={!preview} onHome={home} onSearch={(query, kind) => void search(query, kind)} />
+    {error && <div className="error-banner" role="alert"><AlertTriangle size={15} />{error}<button type="button" onClick={() => setError(null)}>Dismiss</button></div>}
+    {navigating ? <main className="detail-loading" role="status"><LoaderCircle className="spin" /> Looking up chain data…</main> : <>
+      {view.kind === "overview" && <Overview snapshot={snapshot} preview={preview} onBlock={(block) => void openBlock(block)} onTransaction={(tx) => void openTransaction(tx)} />}
+      {view.kind === "block" && <BlockDetail block={view.block} onBack={home} onTransaction={(tx) => void openTransaction(tx)} />}
+      {view.kind === "transaction" && <TransactionDetail transaction={view.transaction} onBack={home} />}
+      {view.kind === "address" && <AddressDetail initial={view.address} liveTip={snapshot.tip} onBack={home} onBlock={(id) => void openBlock(id)} onTransaction={(id) => void openTransaction(id)} />}
+    </>}
+    <footer><span>Common Foundry Explorer</span><code>{snapshot.network_id.slice(0, 16)}…</code><span>Built for independently verifiable compute.</span></footer>
+  </div>;
 }

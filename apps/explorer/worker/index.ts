@@ -1,11 +1,12 @@
 import { MAINNET_NETWORK_ID, NETWORK_HEADER } from "../shared/network";
+import { isAddressApiPath } from "../shared/address";
 
 const SNAPSHOT_PATH = "/v1/explorer";
 const BLOCK_PATH = /^\/v1\/explorer\/block\/(?:[0-9]+|[0-9a-fA-F]{64})$/;
 const TRANSACTION_PATH = /^\/v1\/explorer\/transaction\/[0-9a-fA-F]{64}$/;
 
 export function isExplorerApiPath(pathname: string): boolean {
-  return pathname === SNAPSHOT_PATH || BLOCK_PATH.test(pathname) || TRANSACTION_PATH.test(pathname);
+  return pathname === SNAPSHOT_PATH || BLOCK_PATH.test(pathname) || TRANSACTION_PATH.test(pathname) || isAddressApiPath(pathname);
 }
 
 function withSecurityHeaders(response: Response): Response {

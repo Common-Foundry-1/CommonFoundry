@@ -17,11 +17,29 @@ function environment(overrides: Partial<Env> = {}): Env {
 afterEach(() => vi.unstubAllGlobals());
 
 describe("explorer edge API allowlist", () => {
+  it("keeps the prepared origin rule anchored to only public explorer paths", () => {
+    const yaml = readFileSync(new URL("../origin-ingress.example.yml", import.meta.url), "utf8");
+    const expression = /^\s+path: '(.*)'$/m.exec(yaml)?.[1];
+    if (!expression) throw new Error("Origin example must contain a quoted path expression");
+    const originPath = new RegExp(expression);
+    for (const path of ["/v1/explorer", "/v1/explorer/block/42", `/v1/explorer/transaction/${"ab".repeat(32)}`, `/v1/explorer/address/${"a1".repeat(32)}`, `/v1/explorer/address/${"a1".repeat(32)}/${"d1".repeat(32)}.81.1`]) {
+      expect(originPath.test(path)).toBe(true);
+    }
+    for (const path of ["/v1/wallet", "/v1/status", "/prefix/v1/explorer", "/v1/explorer/extra", `/v1/explorer/address/${"a1".repeat(32)}/extra/private`, `/v1/explorer/transaction/${"ab".repeat(32)}.json`]) {
+      expect(originPath.test(path)).toBe(false);
+    }
+    expect(yaml).toContain("hostname: mainnet-explorer-origin.commonfoundry.ai");
+    expect(yaml).toContain("service: http://127.0.0.1:29443");
+    expect(yaml.trimEnd().endsWith("- service: http_status:404")).toBe(true);
+  });
+
   it("allows only the bounded read-only explorer routes", () => {
     expect(isExplorerApiPath("/v1/explorer")).toBe(true);
     expect(isExplorerApiPath("/v1/explorer/block/42")).toBe(true);
     expect(isExplorerApiPath(`/v1/explorer/block/${"ab".repeat(32)}`)).toBe(true);
     expect(isExplorerApiPath(`/v1/explorer/transaction/${"01".repeat(32)}`)).toBe(true);
+    expect(isExplorerApiPath(`/v1/explorer/address/${"a1".repeat(32)}`)).toBe(true);
+    expect(isExplorerApiPath(`/v1/explorer/address/${"a1".repeat(32)}/${"d1".repeat(32)}.81.1`)).toBe(true);
   });
 
   it("does not expose general node RPC routes", () => {
@@ -43,7 +61,17 @@ describe("mainnet explorer identity gate", () => {
     expect(config.routes[0].pattern).toBe("explorer.commonfoundry.ai");
   });
 
-  it.each(["/v1/explorer", "/v1/explorer/block/42", `/v1/explorer/transaction/${"ab".repeat(32)}`])(
+  it.each(["bad", `${"ab".repeat(32)}.0.0`, `${"ab".repeat(32)}.01.0`, `${"ab".repeat(32)}.1.1025`, `${"ab".repeat(32)}.18446744073709551616.0`, `${"ab".repeat(32)}.1.0/extra`])(
+    "rejects invalid address cursor %s without forwarding", async (cursor) => {
+      const upstream = vi.fn(); vi.stubGlobal("fetch", upstream);
+      const path = `/v1/explorer/address/${"a1".repeat(32)}/${cursor}`;
+      expect(isExplorerApiPath(path)).toBe(false);
+      expect((await worker.fetch(new Request("https://explorer.test" + path), environment())).status).toBe(404);
+      expect(upstream).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["/v1/explorer", "/v1/explorer/block/42", `/v1/explorer/transaction/${"ab".repeat(32)}`, `/v1/explorer/address/${"a1".repeat(32)}`, `/v1/explorer/address/${"a1".repeat(32)}/${"d1".repeat(32)}.81.1`])(
     "streams only correctly identified responses for %s", async (path) => {
       const upstream = vi.fn().mockResolvedValue(new Response('{"ok":true}', {
         headers: { "Content-Type": "application/json", [NETWORK_HEADER]: MAINNET_NETWORK_ID },
@@ -83,6 +111,18 @@ describe("mainnet explorer identity gate", () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ error: "not found" }, { status: 404 })));
     const response = await worker.fetch(new Request("https://explorer.test/v1/explorer/block/42"), environment());
     expect(response.status).toBe(503);
+  });
+
+  it("streams authenticated stale-cursor errors but rejects unidentified ones", async () => {
+    const data = { error: "Restart pagination", code: "explorer_cursor_stale", retryable: true };
+    const upstream = vi.fn().mockResolvedValueOnce(Response.json(data, { status: 409, headers: { [NETWORK_HEADER]: MAINNET_NETWORK_ID } }))
+      .mockResolvedValueOnce(Response.json(data, { status: 409 }));
+    vi.stubGlobal("fetch", upstream);
+    const request = new Request(`https://explorer.test/v1/explorer/address/${"a1".repeat(32)}/${"d1".repeat(32)}.81.1`);
+    const response = await worker.fetch(request, environment());
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual(data);
+    expect((await worker.fetch(request, environment())).status).toBe(503);
   });
 
   it.each(["", "63".repeat(32)])("refuses a missing or incorrect configured mainnet pin", async (pin) => {

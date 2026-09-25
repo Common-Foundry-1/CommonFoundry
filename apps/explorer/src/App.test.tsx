@@ -2,15 +2,22 @@ import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import App from "./App";
-import { loadExplorer, type ExplorerLoad } from "./api";
+import { ExplorerRequestError, loadAddress, loadBlock, loadExplorer, loadTransaction, type ExplorerLoad } from "./api";
 import { demoSnapshot } from "./demoData";
+import { addressFixture, fixtureAddress } from "./test/addressFixture";
+import type { ExplorerAddress } from "./types";
 
-vi.mock("./api", async () => {
+vi.mock("./api", async (original) => {
   const { demoSnapshot } = await import("./demoData");
-  return { MAINNET_MODE: false, loadExplorer: vi.fn().mockResolvedValue({ data: demoSnapshot, preview: true }), loadBlock: vi.fn(), loadTransaction: vi.fn() };
+  return { ...await original<typeof import("./api")>(), MAINNET_MODE: false, loadExplorer: vi.fn().mockResolvedValue({ data: demoSnapshot, preview: true }), loadBlock: vi.fn(), loadTransaction: vi.fn(), loadAddress: vi.fn() };
 });
 
-beforeEach(() => vi.mocked(loadExplorer).mockReset().mockResolvedValue({ data: demoSnapshot, preview: true }));
+beforeEach(() => {
+  vi.mocked(loadExplorer).mockReset().mockResolvedValue({ data: demoSnapshot, preview: true });
+  vi.mocked(loadAddress).mockReset().mockResolvedValue(addressFixture());
+  vi.mocked(loadBlock).mockReset(); vi.mocked(loadTransaction).mockReset();
+  vi.spyOn(window, "scrollTo").mockImplementation(() => {});
+});
 afterEach(() => vi.restoreAllMocks());
 
 function capturePoll() {
@@ -92,4 +99,65 @@ test("navigation closes after choosing a section", async () => {
   expect(screen.getByRole("navigation", { name: "Explorer navigation" })).toHaveClass("is-open");
   await user.click(screen.getByRole("link", { name: "Network" }));
   expect(screen.getByRole("navigation", { name: "Explorer navigation" })).not.toHaveClass("is-open");
+});
+
+test("explicit Address search avoids block/transaction hash ambiguity", async () => {
+  vi.mocked(loadExplorer).mockResolvedValue({ data: demoSnapshot, preview: false });
+  render(<App />);
+  await screen.findByRole("heading", { name: "Latest blocks" });
+  const user = userEvent.setup();
+  await user.selectOptions(screen.getByRole("combobox", { name: "Search type" }), "address");
+  await user.type(screen.getByRole("textbox", { name: "Search wallet address" }), fixtureAddress);
+  await user.click(screen.getByRole("button", { name: "Search" }));
+  expect(await screen.findByRole("heading", { name: "Address" })).toBeInTheDocument();
+  expect(loadAddress).toHaveBeenCalledWith(fixtureAddress, null, false);
+  expect(loadBlock).not.toHaveBeenCalled(); expect(loadTransaction).not.toHaveBeenCalled();
+});
+
+test("a delayed address search cannot return after the user goes home", async () => {
+  let finish: ((value: ExplorerAddress) => void) | undefined;
+  vi.mocked(loadExplorer).mockResolvedValue({ data: demoSnapshot, preview: false });
+  vi.mocked(loadAddress).mockReturnValue(new Promise((resolve) => { finish = resolve; }));
+  render(<App />);
+  await screen.findByRole("heading", { name: "Latest blocks" });
+  const user = userEvent.setup();
+  await user.selectOptions(screen.getByRole("combobox", { name: "Search type" }), "address");
+  await user.type(screen.getByRole("textbox", { name: "Search wallet address" }), fixtureAddress + "{Enter}");
+  expect(await screen.findByText("Looking up chain data…")).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "Explorer overview" }));
+  await act(async () => finish?.(addressFixture()));
+  expect(screen.getByRole("heading", { name: "Latest blocks" })).toBeInTheDocument();
+  expect(screen.queryByRole("heading", { name: "Address" })).not.toBeInTheDocument();
+});
+
+test("a connection failure invalidates a pending address result", async () => {
+  const poll = capturePoll();
+  let finish: ((value: ExplorerAddress) => void) | undefined;
+  vi.mocked(loadExplorer).mockResolvedValueOnce({ data: demoSnapshot, preview: false }).mockRejectedValueOnce(new Error("offline"));
+  vi.mocked(loadAddress).mockReturnValue(new Promise((resolve) => { finish = resolve; }));
+  render(<App />);
+  await screen.findByRole("heading", { name: "Latest blocks" });
+  const user = userEvent.setup();
+  await user.selectOptions(screen.getByRole("combobox", { name: "Search type" }), "address");
+  await user.type(screen.getByRole("textbox", { name: "Search wallet address" }), fixtureAddress + "{Enter}");
+  await act(async () => poll());
+  await act(async () => finish?.(addressFixture()));
+  expect(screen.getByText("Explorer unavailable")).toBeInTheDocument();
+  expect(screen.queryByText("Confirmed balance")).not.toBeInTheDocument();
+});
+
+test("hash search falls back only for not-found, never for an identity failure", async () => {
+  vi.mocked(loadExplorer).mockResolvedValue({ data: demoSnapshot, preview: false });
+  vi.mocked(loadBlock).mockRejectedValueOnce(new Error("different network"))
+    .mockRejectedValueOnce(new ExplorerRequestError("not found", 404));
+  vi.mocked(loadTransaction).mockRejectedValueOnce(new ExplorerRequestError("transaction not found", 404));
+  render(<App />);
+  await screen.findByRole("heading", { name: "Latest blocks" });
+  const user = userEvent.setup();
+  await user.type(screen.getByRole("textbox", { name: /Search block height/ }), fixtureAddress + "{Enter}");
+  expect(await screen.findByRole("alert")).toHaveTextContent("different network");
+  expect(loadTransaction).not.toHaveBeenCalled();
+  await user.click(screen.getByRole("button", { name: "Search" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("transaction not found");
+  expect(loadTransaction).toHaveBeenCalledWith(fixtureAddress, false);
 });

@@ -1,4 +1,5 @@
-import type { ExplorerBlock, ExplorerBlockDetail, ExplorerSnapshot, ExplorerTransaction } from "./types";
+import type { ExplorerAddress, ExplorerAddressActivity, ExplorerBlock, ExplorerBlockDetail, ExplorerSnapshot, ExplorerTransaction } from "./types";
+import { ADDRESS_PAGE_SIZE, isAddressCursor } from "../shared/address";
 
 const HASH = /^[0-9a-f]{64}$/i;
 const ATOMS = /^(0|[1-9][0-9]{0,19})$/;
@@ -40,4 +41,36 @@ export function isExplorerSnapshot(value: unknown): value is ExplorerSnapshot {
     && ["accepted_height", "utxo_count", "mempool_transactions", "mempool_bytes", "connected_peers"].every((key) => natural(value[key]))
     && Array.isArray(value.latest_blocks) && value.latest_blocks.length <= 12 && value.latest_blocks.every(isExplorerBlock)
     && Array.isArray(value.recent_transactions) && value.recent_transactions.length <= 24 && value.recent_transactions.every(isExplorerTransaction);
+}
+
+const totalAtoms = (value: unknown): value is string => typeof value === "string"
+  && /^(0|[1-9][0-9]{0,38})$/.test(value) && BigInt(value) <= (1n << 128n) - 1n;
+
+function isAddressActivity(value: unknown): value is ExplorerAddressActivity {
+  return record(value) && hash(value.txid) && hash(value.block_id)
+    && natural(value.block_height) && value.block_height > 0 && natural(value.timestamp)
+    && natural(value.confirmations) && value.confirmations > 0
+    && typeof value.kind === "string" && ["coinbase", "received", "sent", "self"].includes(value.kind)
+    && totalAtoms(value.received_atoms) && natural(value.received_outputs) && natural(value.spent_inputs)
+    && (value.received_outputs > 0 || value.spent_inputs > 0);
+}
+
+export function isExplorerAddress(value: unknown): value is ExplorerAddress {
+  if (!record(value) || !hash(value.address) || !hash(value.tip) || !natural(value.accepted_height)
+      || value.balance_scope !== "key_outputs" || value.includes_mempool !== false
+      || !totalAtoms(value.confirmed_atoms) || !totalAtoms(value.spendable_atoms) || !totalAtoms(value.immature_atoms)
+      || !natural(value.utxo_count) || value.page_limit !== ADDRESS_PAGE_SIZE || typeof value.has_more !== "boolean"
+      || !Array.isArray(value.history) || value.history.length > ADDRESS_PAGE_SIZE || !value.history.every(isAddressActivity)) return false;
+  if (BigInt(value.confirmed_atoms) !== BigInt(value.spendable_atoms) + BigInt(value.immature_atoms)) return false;
+  const entries = value.history;
+  const height = value.accepted_height;
+  if (entries.some((entry, index) => entry.block_height > height || entry.confirmations !== height - entry.block_height + 1
+      || (index > 0 && entry.block_height > entries[index - 1].block_height))) return false;
+  if (new Set(entries.map((entry) => `${entry.block_id}:${entry.txid}`)).size !== entries.length) return false;
+  if (!value.has_more) return value.next_cursor === null;
+  if (entries.length !== ADDRESS_PAGE_SIZE || !isAddressCursor(value.next_cursor)) return false;
+  const [tip, lastHeight, position] = value.next_cursor.split(".");
+  const last = entries[entries.length - 1];
+  return tip.toLowerCase() === value.tip.toLowerCase() && BigInt(lastHeight) === BigInt(last.block_height)
+    && ((position === "0") === (last.kind === "coinbase"));
 }

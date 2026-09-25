@@ -53,4 +53,35 @@ export type ExplorerBlockDetail = ExplorerBlock & {
 export type ExplorerView =
   | { kind: "overview" }
   | { kind: "block"; block: ExplorerBlockDetail }
-  | { kind: "transaction"; transaction: ExplorerTransaction };
+  | { kind: "transaction"; transaction: ExplorerTransaction }
+  | { kind: "address"; address: ExplorerAddress };
+
+export type ExplorerSearchKind = "chain" | "address";
+
+export type ExplorerAddressActivity = {
+  txid: string;
+  block_id: string;
+  block_height: number;
+  timestamp: number;
+  confirmations: number;
+  kind: "coinbase" | "received" | "sent" | "self";
+  received_atoms: string;
+  received_outputs: number;
+  spent_inputs: number;
+};
+
+export type ExplorerAddress = {
+  address: string;
+  tip: string;
+  accepted_height: number;
+  balance_scope: "key_outputs";
+  includes_mempool: false;
+  confirmed_atoms: string;
+  spendable_atoms: string;
+  immature_atoms: string;
+  utxo_count: number;
+  history: ExplorerAddressActivity[];
+  page_limit: number;
+  has_more: boolean;
+  next_cursor: string | null;
+};

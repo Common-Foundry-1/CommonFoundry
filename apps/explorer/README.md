@@ -1,7 +1,7 @@
 # Common Foundry Explorer
 
 Read-only ProductionV4 chain explorer with a live forge visualization, canonical block history,
-transaction activity, and block/transaction search.
+transaction activity, and block/transaction/address search.
 
 ## Development
 
@@ -39,9 +39,22 @@ its full stored block and exact transaction position/ID. A missing or orphan-onl
 no block bodies; a confirmed lookup reads only the matching block. Mempool lookup remains separate.
 The index itself is in memory and grows with retained transaction occurrences across forks. This
 does not provide a disk-backed index for larger deployments. Memory/startup-cost qualification
-and public integration of the native address API below remain preparation work.
+and public cutover of the address API below remain preparation work.
 
-### Native address API (public UI/routing not yet enabled)
+### Address lookup (prepared; public cutover pending)
+
+Choose **Address** in the search-type selector and enter a wallet's hexadecimal
+key destination. Block/transaction search remains a separate mode because all
+three identifiers can have the same64-character shape. Address lookup never uses
+preview balances, including in ordinary development mode.
+
+The prepared frontend displays confirmed/spendable/immature balances and
+newer/older activity pages. It validates exact decimal totals, page bounds,
+address/chain bindings and network identity before rendering. A stale cursor
+automatically reloads page1; a newly observed tip refreshes the view. Connection
+errors remove old balances until Retry succeeds. Versioned requests prevent an
+older response from overwriting newer navigation or chain state. Reward rows link
+to their block instead of the ordinary transaction endpoint.
 
 The node now also supports read-only `GET /v1/explorer/address/{address}` and
 `GET /v1/explorer/address/{address}/{cursor}`. An address is a 64-character hexadecimal key
@@ -67,9 +80,11 @@ the client must restart pagination. Malformed or unrelated-address cursors retur
 Address errors have a string `error` message plus top-level `code` and `retryable` fields;
 existing non-address RPC error contracts are unchanged.
 Every page reauthenticates its matching stored blocks, reading a shared block only once and
-at most 20 block bodies. Empty histories read none. These native routes are not yet allowed
-through the deployed Worker/tunnel or available in the frontend; integrate and qualify those
-surfaces before describing public address search as available.
+at most20 block bodies. Empty histories read none. The prepared Worker includes
+only these address path shapes and checks numeric cursor bounds; it still rejects
+query strings, writes and general RPC. Local Workers-runtime and desktop/mobile
+browser checks use labelled fixtures, not live mainnet data. The live Worker and
+tunnel have NOT been switched to this version.
 
 ## Mainnet preparation
 
@@ -103,17 +118,15 @@ signed a8b23ec runtime does not emit it. The expected ID is pinned to
 `packaging/mainnet/MAINNET-PLAN.json` by tests. Generate binding/runtime types
 with `npm run types` after configuration changes rather than editing them by hand.
 
-Before public cutover, integrate address search into the Worker/frontend and complete index resource qualification, prepare the
-separate mainnet origin tunnel rule below, and qualify the actual native origin
+Before public cutover, complete index resource qualification, merge the separate
+mainnet origin rule in [origin-ingress.example.yml](./origin-ingress.example.yml), and qualify the actual native origin
 when its launch gate permits startup. Preserve the existing RC origin and pool
 rules. The new origin must expose only these anchored read-only route paths to
 `http://127.0.0.1:29443`; never expose the general RPC service:
 
-```yaml
-- hostname: mainnet-explorer-origin.commonfoundry.ai
-  path: ^/v1/explorer(?:$|/block/(?:[0-9]+|[0-9a-fA-F]{64})$|/transaction/[0-9a-fA-F]{64}$)
-  service: http://127.0.0.1:29443
-```
+The example allows snapshot, block, transaction and address/cursor paths only.
+It is an ingress-only validation fixture, not a replacement for the deployed
+configuration. The Worker and node additionally enforce numeric cursor limits.
 
 Validate the complete proposed tunnel configuration with the installed
 `cloudflared tunnel ingress validate` and test both allowed and denied URLs with
@@ -124,8 +137,10 @@ owner-controlled; no deployment command is run by the CI dry-run job.
 
 ## Devnet deployment
 
-The public Devnet explorer is deployed as a Cloudflare Worker with static assets. Its edge handler
-proxies only the three bounded explorer routes above to
+The existing public Devnet explorer is deployed as a Cloudflare Worker with static assets.
+This prepared source expands its read-only allowlist to the address routes as well;
+deploy only alongside the corresponding native origin and matching tunnel rule.
+The RC environment points to
 `https://devnet-explorer-origin.commonfoundry.ai`; every other `/v1` route is rejected. The origin
 hostname must be a Cloudflare Tunnel route whose only service is the node's loopback RPC endpoint.
 

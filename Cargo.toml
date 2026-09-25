@@ -16,6 +16,8 @@ exclude = [
     "third_party/p3-merkle-tree-0.6.3-gpu-first-layer",
     "third_party/p3-whir-0.6.3-generic-initial-matrix",
     "third_party/p3-util-0.6.3-msrv",
+    "third_party/glib-0.18.5-variant-str-iter",
+    "tools/linux-wallet-dependency-check",
 ]
 resolver = "2"
 
@@ -49,6 +51,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zeroize = "1.9.0"
 
 [patch.crates-io]
+# GTK3/Tauri requires GLib 0.18. Preserve its API and backport upstream's
+# two-line VariantStrIter out-pointer fix (RUSTSEC-2024-0429).
+glib = { path = "third_party/glib-0.18.5-variant-str-iter" }
 # Plonky3 0.6.3 uses slice::assume_init_ref, which stabilized after our Rust 1.88 MSRV.
 # This is the exact 0.6.3 source with only its former equivalent conversion restored.
 p3-util = { path = "third_party/p3-util-0.6.3-msrv" }

@@ -1,5 +1,14 @@
 # Third-party notices
 
+## GLib Rust bindings 0.18.5
+
+The Linux wallet's GTK3 stack uses the MIT-licensed gtk-rs GLib bindings.
+`third_party/glib-0.18.5-variant-str-iter` preserves the published crate's
+LICENSE and COPYRIGHT and backports the upstream two-line fix for
+RUSTSEC-2024-0429. Its source inventory and patch provenance are retained there.
+Copyrights are retained by the gtk-rs contributors. This does not relicense
+the separately installed GNOME libraries to which the bindings link.
+
 ## NVIDIA CUDA runtime library
 
 Final mainnet packages require an unmodified, pinned Linux x86-64

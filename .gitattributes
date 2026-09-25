@@ -11,6 +11,8 @@ docs/production-v4-pool-miner.md text eol=lf
 docs/release-notes/v0.1.0-rc.4.md text eol=lf
 LICENSE text eol=lf
 THIRD_PARTY_NOTICES.md text eol=lf
+third_party/glib-0.18.5-variant-str-iter/** -text
+third_party/glib-0.18.5-variant-str-iter/LICENSE whitespace=-blank-at-eof
 docs/consensus/production-v4-core-spec-v1.md text eol=lf
 docs/consensus/production-v4-core-vector-v1.json text eol=lf
 docs/consensus/production-v4-proof-algebra-v1.md text eol=lf

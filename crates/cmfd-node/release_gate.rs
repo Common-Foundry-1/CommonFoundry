@@ -10,7 +10,8 @@ pub enum CompiledNetworkProfile {
         any(
             feature = "production-v3-testnet",
             feature = "production-v4-testnet",
-            feature = "production-rc"
+            feature = "production-rc",
+            feature = "production-mainnet"
         ),
         allow(dead_code)
     )]
@@ -30,7 +31,8 @@ pub enum ConsensusProofSelection {
         any(
             feature = "production-v3-testnet",
             feature = "production-v4-testnet",
-            feature = "production-rc"
+            feature = "production-rc",
+            feature = "production-mainnet"
         ),
         allow(dead_code)
     )]

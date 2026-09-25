@@ -76,3 +76,18 @@ class MainnetCiIdentityTests(unittest.TestCase):
         self.assertIn("Path('target/release/production-mainnet/MAINNET-PLAN.json')", step)
         self.assertIn("target.open('xb')", step)
         self.assertNotIn("LAUNCH-BEACON", step)
+
+    def test_ci_checks_mainnet_feature_warnings_and_preserves_active_qualification(self):
+        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml").read_text()
+        mainnet_checks = workflow.split("  rust-v4:\n", 1)[1].split("\n  rust:\n", 1)[0]
+        self.assertIn("components: clippy", mainnet_checks)
+        self.assertIn(
+            "cargo clippy --locked -p cmfd-node --lib --tests --features production-mainnet -- -D warnings",
+            mainnet_checks,
+        )
+        concurrency = workflow.split("concurrency:\n", 1)[1].split("\npermissions:", 1)[0]
+        self.assertIn(
+            "cancel-in-progress: ${{ github.ref != 'refs/heads/release/mainnet-readiness' && "
+            "github.ref != 'refs/heads/release/mainnet-gpu-compatibility' }}",
+            concurrency,
+        )

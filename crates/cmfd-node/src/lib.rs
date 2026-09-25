@@ -3611,6 +3611,7 @@ pub struct Node {
     state: ChainState,
     index: BlockIndex,
     explorer_outputs: explorer_address_index::AddressOutputIndex,
+    explorer_history_cache: Option<explorer::ExplorerHistoryCache>,
     /// Monotonically changes after every successful block commit. External
     /// proof admissions bind to this value so branch snapshots cannot be
     /// committed after chain state or fork choice changes.
@@ -5116,6 +5117,7 @@ impl Node {
             state,
             index,
             explorer_outputs,
+            explorer_history_cache: None,
             chain_revision,
             mempool: BTreeMap::new(),
             mempool_bytes: 0,

@@ -1,10 +1,55 @@
 use cmfd_consensus::{Block, BlockProof, Transaction, encode_block, encode_transaction};
 use serde::Serialize;
+use std::time::{Duration, Instant};
 
-use crate::{Node, NodeError, ProofProfile, read_indexed_block};
+use crate::{
+    BLOCK_LOG_FILE, Node, NodeError, ProofProfile, io_error, read_indexed_block,
+    verify_retained_block_log_path,
+};
 
 const EXPLORER_BLOCK_LIMIT: usize = 12;
 const EXPLORER_TRANSACTION_LIMIT: usize = 24;
+const EXPLORER_CACHE_MAX_AGE: Duration = Duration::from_secs(30);
+
+/// Bounded, process-local display metadata, never proof or admission authority.
+/// Only fully authenticated reads populate this cache. It expires periodically
+/// and whenever the canonical tip changes; live mempool/peer fields stay uncached.
+pub(super) struct ExplorerHistoryCache {
+    tip: [u8; 32],
+    checked_at: Instant,
+    blocks: Vec<ExplorerBlock>,
+    transactions: Vec<ExplorerTransaction>,
+}
+
+impl ExplorerHistoryCache {
+    #[cfg(test)]
+    fn retained_payload_bytes(&self) -> usize {
+        let mut bytes = std::mem::size_of::<Self>()
+            + self.blocks.capacity() * std::mem::size_of::<ExplorerBlock>()
+            + self.transactions.capacity() * std::mem::size_of::<ExplorerTransaction>();
+        for block in &self.blocks {
+            bytes += [
+                &block.block_id,
+                &block.previous_block,
+                &block.transaction_root,
+                &block.target,
+                &block.nonce,
+                &block.work_digest,
+                &block.coinbase_atoms,
+            ]
+            .into_iter()
+            .map(String::capacity)
+            .sum::<usize>();
+        }
+        for tx in &self.transactions {
+            bytes += tx.txid.capacity()
+                + tx.output_atoms.capacity()
+                + tx.block_id.as_ref().map_or(0, String::capacity)
+                + tx.fee_burned_atoms.as_ref().map_or(0, String::capacity);
+        }
+        bytes
+    }
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ExplorerBlock {
@@ -66,8 +111,28 @@ pub struct ExplorerBlockDetail {
 
 impl Node {
     pub fn explorer_snapshot(&mut self) -> Result<ExplorerSnapshot, NodeError> {
+        if self.storage_faulted {
+            return Err(NodeError::StorageFaulted);
+        }
+        // Keep cheap retained-file identity/length checks on every poll, even
+        // a metadata-cache hit. No snapshot may hide a known storage fault.
+        let log_path = self.data_dir.join(BLOCK_LOG_FILE);
+        let storage = (|| {
+            verify_retained_block_log_path(&self.log, &log_path)?;
+            let length = self
+                .log
+                .metadata()
+                .map_err(|source| io_error("inspect explorer block log", &log_path, source))?
+                .len();
+            if length != self.block_log_length {
+                return Err(NodeError::CorruptLog(
+                    "explorer block log length changed outside durable admission".to_owned(),
+                ));
+            }
+            Ok(())
+        })();
+        self.latch_authenticated_storage_failure(storage)?;
         let status = self.status()?;
-        let mut latest_blocks = Vec::new();
         let mut recent_transactions = self
             .mempool
             .values()
@@ -85,6 +150,54 @@ impl Node {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
+        self.refresh_explorer_history_cache()?;
+        let cached = self
+            .explorer_history_cache
+            .as_ref()
+            .expect("successful cache refresh installs complete metadata");
+        let latest_blocks = cached.blocks.clone();
+        recent_transactions.extend(
+            cached
+                .transactions
+                .iter()
+                .take(EXPLORER_TRANSACTION_LIMIT - recent_transactions.len())
+                .cloned(),
+        );
+
+        let connected_peers = status
+            .peers
+            .iter()
+            .filter(|peer| peer.active_connections > 0)
+            .count();
+        Ok(ExplorerSnapshot {
+            network: status.network,
+            network_short_name: status.network_short_name,
+            network_id: status.network_id,
+            consensus_fingerprint: status.consensus_fingerprint,
+            proof_profile: status.proof_profile,
+            proof_of_work: status.proof_of_work,
+            tip: status.tip,
+            accepted_height: status.accepted_height,
+            expected_target: status.expected_target,
+            cumulative_work: status.cumulative_work,
+            utxo_count: status.utxo_count,
+            mempool_transactions: status.mempool_transactions,
+            mempool_bytes: status.mempool_bytes,
+            connected_peers,
+            latest_blocks,
+            recent_transactions,
+        })
+    }
+
+    fn refresh_explorer_history_cache(&mut self) -> Result<(), NodeError> {
+        let tip = self.state.tip();
+        if self.explorer_history_cache.as_ref().is_some_and(|cache| {
+            cache.tip == tip && cache.checked_at.elapsed() < EXPLORER_CACHE_MAX_AGE
+        }) {
+            return Ok(());
+        }
+        let mut latest_blocks = Vec::with_capacity(EXPLORER_BLOCK_LIMIT);
+        let mut recent_transactions = Vec::with_capacity(EXPLORER_TRANSACTION_LIMIT);
         let active_ids: Vec<_> = self
             .index
             .active_chain
@@ -118,35 +231,22 @@ impl Node {
             }
         }
 
-        let connected_peers = status
-            .peers
-            .iter()
-            .filter(|peer| peer.active_connections > 0)
-            .count();
-        Ok(ExplorerSnapshot {
-            network: status.network,
-            network_short_name: status.network_short_name,
-            network_id: status.network_id,
-            consensus_fingerprint: status.consensus_fingerprint,
-            proof_profile: status.proof_profile,
-            proof_of_work: status.proof_of_work,
-            tip: status.tip,
-            accepted_height: status.accepted_height,
-            expected_target: status.expected_target,
-            cumulative_work: status.cumulative_work,
-            utxo_count: status.utxo_count,
-            mempool_transactions: status.mempool_transactions,
-            mempool_bytes: status.mempool_bytes,
-            connected_peers,
-            latest_blocks,
-            recent_transactions,
-        })
+        self.explorer_history_cache = Some(ExplorerHistoryCache {
+            tip,
+            checked_at: Instant::now(),
+            blocks: latest_blocks,
+            transactions: recent_transactions,
+        });
+        Ok(())
     }
 
     pub fn explorer_block(
         &mut self,
         query: &str,
     ) -> Result<Option<ExplorerBlockDetail>, NodeError> {
+        if self.storage_faulted {
+            return Err(NodeError::StorageFaulted);
+        }
         let Some((position, block_id)) = self.resolve_active_block(query) else {
             return Ok(None);
         };
@@ -347,9 +447,12 @@ pub(super) fn parse_identifier(value: &str) -> Option<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::Write;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
+    use crate::tests::{clean_test_dir, mined_child, spend_coinbase_output, test_dir};
     use crate::{DEVNET_PROFILE, RpcRequest, route_rpc_request};
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -366,7 +469,253 @@ mod tests {
         const {
             assert!(EXPLORER_BLOCK_LIMIT <= 32);
             assert!(EXPLORER_TRANSACTION_LIMIT <= 64);
+            assert!(EXPLORER_CACHE_MAX_AGE.as_secs() <= 30);
         }
+    }
+
+    fn mine(node: &mut Node) -> Block {
+        let now = crate::DEVNET_GENESIS_TIMESTAMP + node.state.next_height() * 60;
+        node.mine_once(
+            crate::default_miner_destination(),
+            now,
+            crate::DEFAULT_MINING_ATTEMPTS,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn overview_cache_bounds_retained_metadata_and_repeated_poll_body_reads() {
+        let path = test_dir("explorer-cache-polls");
+        let mut node = Node::open(&path).unwrap();
+        let mut funding = Vec::new();
+        for _ in 0..12 {
+            funding.push(mine(&mut node));
+        }
+        for block in &funding {
+            for (index, owner) in [(1, 0x11), (2, 0x12)] {
+                let transaction = spend_coinbase_output(&node, block, index, owner, 0x31, 1);
+                node.submit_transaction(transaction).unwrap();
+            }
+        }
+        mine(&mut node);
+        for _ in 0..11 {
+            mine(&mut node);
+        }
+        let cold_start = Instant::now();
+        let expected = node.explorer_snapshot().unwrap();
+        let cold_micros = cold_start.elapsed().as_micros();
+        assert_eq!(expected.latest_blocks.len(), EXPLORER_BLOCK_LIMIT);
+        assert_eq!(
+            expected.recent_transactions.len(),
+            EXPLORER_TRANSACTION_LIMIT
+        );
+        assert_eq!(node.explorer_block_reads, EXPLORER_BLOCK_LIMIT);
+        let cache_bytes = node
+            .explorer_history_cache
+            .as_ref()
+            .unwrap()
+            .retained_payload_bytes();
+        let originally_checked_at = node.explorer_history_cache.as_ref().unwrap().checked_at;
+        assert!(
+            cache_bytes <= 64 * 1024,
+            "bounded display metadata must not retain block/proof bodies"
+        );
+        let warm_start = Instant::now();
+        for _ in 0..1000 {
+            assert_eq!(node.explorer_snapshot().unwrap(), expected);
+        }
+        let warm_elapsed = warm_start.elapsed();
+        // On a heavily paused machine, age expiry is legitimate. Do not make
+        // CI success depend on a wall-clock latency promise; record the result.
+        let cache_lifetime = originally_checked_at.elapsed();
+        let permitted_refreshes = 1 + cache_lifetime.as_secs() / EXPLORER_CACHE_MAX_AGE.as_secs();
+        assert!(node.explorer_block_reads <= EXPLORER_BLOCK_LIMIT * permitted_refreshes as usize);
+        if cache_lifetime < EXPLORER_CACHE_MAX_AGE {
+            assert_eq!(node.explorer_block_reads, EXPLORER_BLOCK_LIMIT);
+        }
+        println!(
+            "EXPLORER_CACHE_BENCH {}",
+            serde_json::json!({
+                "fixture_profile": "DevnetV2Reference", "production_proof_latency_qualified": false,
+                "os": std::env::consts::OS, "cold_snapshot_us": cold_micros,
+                "warm_polls": 1000, "warm_total_us": warm_elapsed.as_micros(),
+                "total_block_body_reads": node.explorer_block_reads,
+                "retained_metadata_payload_bytes": cache_bytes,
+                "allocator_overhead_included": false,
+                "response_json_bytes": serde_json::to_vec(&expected).unwrap().len(),
+            })
+        );
+        node.explorer_history_cache.as_mut().unwrap().checked_at = Instant::now()
+            .checked_sub(EXPLORER_CACHE_MAX_AGE + Duration::from_secs(1))
+            .unwrap();
+        let previous_reads = node.explorer_block_reads;
+        assert_eq!(node.explorer_snapshot().unwrap(), expected);
+        assert_eq!(
+            node.explorer_block_reads - previous_reads,
+            EXPLORER_BLOCK_LIMIT
+        );
+        drop(node);
+        let mut reopened = Node::open(&path).unwrap();
+        assert!(reopened.explorer_history_cache.is_none());
+        assert_eq!(reopened.explorer_snapshot().unwrap(), expected);
+        assert_eq!(reopened.explorer_block_reads, EXPLORER_BLOCK_LIMIT);
+        drop(reopened);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn overview_cache_keeps_mempool_and_peer_fields_live() {
+        let path = test_dir("explorer-cache-live");
+        let mut node = Node::open(&path).unwrap();
+        let funding = mine(&mut node);
+        assert!(
+            node.explorer_snapshot()
+                .unwrap()
+                .recent_transactions
+                .is_empty()
+        );
+        let reads = node.explorer_block_reads;
+        let transaction = spend_coinbase_output(&node, &funding, 2, 0x12, 0x31, 1);
+        let txid = hex::encode(transaction.txid());
+        node.submit_transaction(transaction).unwrap();
+        node.record_peer_started(
+            crate::PeerDirection::Inbound,
+            "127.0.0.1:20000".to_owned(),
+            crate::unix_time_seconds().unwrap(),
+        );
+        let pending = node.explorer_snapshot().unwrap();
+        assert_eq!(node.explorer_block_reads, reads);
+        assert_eq!(pending.mempool_transactions, 1);
+        assert_eq!(pending.connected_peers, 1);
+        assert_eq!(pending.recent_transactions[0].txid, txid);
+        assert_eq!(pending.recent_transactions[0].status, "mempool");
+        mine(&mut node);
+        let confirmed = node.explorer_snapshot().unwrap();
+        assert_eq!(confirmed.accepted_height, 2);
+        assert_eq!(confirmed.mempool_transactions, 0);
+        assert_eq!(confirmed.recent_transactions[0].status, "confirmed");
+        assert_eq!(confirmed.recent_transactions[0].txid, txid);
+        assert_eq!(node.explorer_block_reads - reads, 2);
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn overview_cache_follows_canonical_reorganizations_not_side_branch_arrival() {
+        let path = test_dir("explorer-cache-reorg");
+        let mut node = Node::open(&path).unwrap();
+        let active = mine(&mut node);
+        let first = node.explorer_snapshot().unwrap();
+        let sibling = mined_child(
+            &node,
+            node.params.genesis_hash,
+            crate::DEVNET_GENESIS_TIMESTAMP + 60,
+            0x41,
+        );
+        node.submit_block(sibling.clone(), sibling.challenge.timestamp)
+            .unwrap();
+        assert_eq!(node.explorer_snapshot().unwrap(), first);
+        assert_eq!(node.explorer_block_reads, 1);
+        let child = mined_child(
+            &node,
+            sibling.block_id(),
+            crate::DEVNET_GENESIS_TIMESTAMP + 120,
+            0x41,
+        );
+        node.submit_block(child.clone(), child.challenge.timestamp)
+            .unwrap();
+        let after = node.explorer_snapshot().unwrap();
+        assert_eq!(after.tip, hex::encode(child.block_id()));
+        assert_eq!(after.latest_blocks.len(), 2);
+        assert_eq!(
+            after.latest_blocks[1].block_id,
+            hex::encode(sibling.block_id())
+        );
+        assert!(
+            after
+                .latest_blocks
+                .iter()
+                .all(|block| block.block_id != hex::encode(active.block_id()))
+        );
+        assert_eq!(node.explorer_block_reads, 3);
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn overview_cache_never_hides_log_length_changes_or_known_faults() {
+        let path = test_dir("explorer-cache-length");
+        let mut node = Node::open(&path).unwrap();
+        mine(&mut node);
+        node.explorer_snapshot().unwrap();
+        // The Windows retained handle intentionally permits append only, not
+        // arbitrary SetEndOfFile. Inject a stray append through that handle.
+        node.log.write_all(&[0]).unwrap();
+        node.log.sync_all().unwrap();
+        assert!(matches!(
+            node.explorer_snapshot(),
+            Err(NodeError::CorruptLog(_))
+        ));
+        assert!(node.storage_faulted);
+        assert_eq!(node.explorer_block_reads, 1);
+        assert!(matches!(
+            node.explorer_snapshot(),
+            Err(NodeError::StorageFaulted)
+        ));
+        assert!(matches!(
+            node.explorer_block("1"),
+            Err(NodeError::StorageFaulted)
+        ));
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn overview_cache_expiry_and_cold_refresh_reauthenticate_without_partial_install() {
+        let path = test_dir("explorer-cache-auth");
+        let mut node = Node::open(&path).unwrap();
+        let first = mine(&mut node);
+        node.explorer_snapshot().unwrap();
+        let cached_tip = node.explorer_history_cache.as_ref().unwrap().tip;
+        mine(&mut node);
+        Arc::get_mut(node.index.blocks.get_mut(&first.block_id()).unwrap())
+            .unwrap()
+            .locator
+            .complete_digest[0] ^= 1;
+        assert!(matches!(
+            node.explorer_snapshot(),
+            Err(NodeError::CorruptLog(_))
+        ));
+        assert!(node.storage_faulted);
+        assert_eq!(
+            node.explorer_history_cache.as_ref().unwrap().tip,
+            cached_tip
+        );
+        assert!(matches!(
+            node.explorer_snapshot(),
+            Err(NodeError::StorageFaulted)
+        ));
+        drop(node);
+        clean_test_dir(&path);
+
+        let path = test_dir("explorer-cache-expiry-auth");
+        let mut node = Node::open(&path).unwrap();
+        let block = mine(&mut node);
+        node.explorer_snapshot().unwrap();
+        Arc::get_mut(node.index.blocks.get_mut(&block.block_id()).unwrap())
+            .unwrap()
+            .locator
+            .complete_digest[0] ^= 1;
+        node.explorer_history_cache.as_mut().unwrap().checked_at = Instant::now()
+            .checked_sub(EXPLORER_CACHE_MAX_AGE + Duration::from_secs(1))
+            .unwrap();
+        assert!(matches!(
+            node.explorer_snapshot(),
+            Err(NodeError::CorruptLog(_))
+        ));
+        assert!(node.storage_faulted);
+        drop(node);
+        clean_test_dir(&path);
     }
 
     #[test]

@@ -33,6 +33,19 @@ compact transaction locations for committed blocks and reconstructs them during 
 authenticated block-log startup scan, including when a startup snapshot is used. The snapshot and
 block-log formats are unchanged. No transaction hint from an independent cache is trusted.
 
+Overview polling keeps a bounded, process-local cache of at most12 checked block summaries and
+24 confirmed transaction summaries, not block/proof bodies. A tip change or30-second expiry
+reauthenticates the retained blocks before replacing that cache. Mempool, peer and status fields
+are always read live. Every poll still checks retained-file identity and log length; known storage
+faults refuse the response. The cache is discarded on restart and never participates in block
+admission, proof verification or fork choice. Individual block/transaction/address detail reads
+continue to authenticate their stored bodies.
+
+The `overview_cache` native tests include a bounded repeated-poll probe, print fixture/profile
+labels and retained metadata payload bytes, and check expiry, reorgs, live mempool/peer changes
+and storage faults. Those small-profile method-call measurements are not HTTP throughput,
+whole-index memory, full-proof decode latency or production startup qualification.
+
 Queries check current active-chain membership, so side branches do not appear as confirmations
 and reorganizations do not require rewriting the location index. A confirmed result reauthenticates
 its full stored block and exact transaction position/ID. A missing or orphan-only transaction reads

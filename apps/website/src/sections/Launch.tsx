@@ -1,5 +1,5 @@
 import { ButtonLink } from "../components/ButtonLink";
-import { DISCORD_URL, MAINNET_LAUNCH_AT, SOURCE_RELEASE_AT } from "../content";
+import { DISCORD_URL, MAINNET_LAUNCH_AT, MAINNET_RELEASE_KEY_FINGERPRINT, MAINNET_RELEASE_KEY_URL, SOURCE_RELEASE_AT } from "../content";
 
 export function Launch() {
   return (
@@ -28,6 +28,12 @@ export function Launch() {
       <div className="launch__status">
         <p><strong>Preparing for launch.</strong> Mainnet is not live yet. Final package and deployment checks are in progress; current downloads connect to RCNet. Discord is the place for release instructions, setup help and any schedule changes.</p>
         <ButtonLink href={DISCORD_URL} target="_blank" rel="noopener noreferrer">Get launch-ready in Discord</ButtonLink>
+      </div>
+      <div className="launch__trust">
+        <h3>Mainnet release verification key</h3>
+        <p>The public signing-key fingerprint is available before the planned package release. Compare it with the key in the published source before trusting any October 2 download. Mainnet packages are not available yet.</p>
+        <code>{MAINNET_RELEASE_KEY_FINGERPRINT}</code>
+        <a href={MAINNET_RELEASE_KEY_URL}>View the public release key</a>
       </div>
     </section>
   );

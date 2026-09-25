@@ -44,6 +44,20 @@
 .launch__status { margin-top: 1.8rem; }
 .launch__status p { max-width: 900px; margin-bottom: 1.3rem; color: var(--mineral-300); line-height: 1.7; }
 .launch__status strong { color: var(--mineral-100); }
+.launch__trust {
+  display: grid;
+  gap: 0.8rem;
+  max-width: 900px;
+  margin-top: 2rem;
+  padding: 1.5rem;
+  border: 1px solid var(--line);
+  border-radius: 0.5rem;
+  background: var(--graphite-900);
+}
+.launch__trust h3 { font-size: 1.35rem; }
+.launch__trust p { color: var(--mineral-300); line-height: 1.65; }
+.launch__trust code { overflow-wrap: anywhere; color: var(--mineral-100); }
+.launch__trust a { width: fit-content; color: var(--copper-300); text-underline-offset: 0.2em; }
 
 @media (max-width: 760px) {
   .launch__dates { grid-template-columns: minmax(0, 1fr); }

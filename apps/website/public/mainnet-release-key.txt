@@ -1,0 +1,1 @@
+commonfoundry-mainnet-owner namespaces="commonfoundry-release" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKv4KvH7J6tHyy3f5xALHEiADtWtiRX+au2yQoK4b5a9

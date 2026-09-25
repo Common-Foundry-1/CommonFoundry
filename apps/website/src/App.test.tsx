@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import App from "./App";
-import { DISCORD_URL, EMISSION_URL, MAINNET_LAUNCH_AT, SOURCE_RELEASE_AT, RELEASE_URL, RELEASE_VERSION, SECURITY_URL, WHITEPAPER_URL } from "./content";
+import { DISCORD_URL, EMISSION_URL, MAINNET_LAUNCH_AT, MAINNET_RELEASE_KEY_FINGERPRINT, MAINNET_RELEASE_KEY_URL, SOURCE_RELEASE_AT, RELEASE_URL, RELEASE_VERSION, SECURITY_URL, WHITEPAPER_URL } from "./content";
 
 describe("Discord-first launch website", () => {
   it("leads with inference and makes Discord the primary first-screen action", () => {
@@ -26,6 +26,9 @@ describe("Discord-first launch website", () => {
     expect(within(launch).getByText(/Mainnet is not live yet/)).toBeVisible();
     expect(within(launch).getByText(/current downloads connect to RCNet/)).toBeVisible();
     expect(within(launch).getByRole("link", { name: "Get launch-ready in Discord" })).toHaveAttribute("href", DISCORD_URL);
+    expect(within(launch).getByText(MAINNET_RELEASE_KEY_FINGERPRINT)).toBeVisible();
+    expect(within(launch).getByRole("link", { name: "View the public release key" })).toHaveAttribute("href", MAINNET_RELEASE_KEY_URL);
+    expect(within(launch).getByText(/Mainnet packages are not available yet/)).toBeVisible();
     expect(screen.queryByRole("link", { name: /download mainnet/i })).not.toBeInTheDocument();
   });
 

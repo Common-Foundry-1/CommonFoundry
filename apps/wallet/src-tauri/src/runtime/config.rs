@@ -27,6 +27,9 @@ pub(crate) struct NodeRuntimeConfig {
     /// the console. The file log under the node's data directory is always
     /// debug level, regardless of this count.
     pub(super) verbose: u8,
+    /// An explicitly selected network data directory; never an activation or
+    /// network-identity override. Normal double-click storage is unchanged.
+    pub(super) data_dir: Option<PathBuf>,
     pub(super) wallet_passphrase_file: Option<PathBuf>,
     pub(super) production_v3: ProductionV3RuntimeOptions,
 }
@@ -65,6 +68,12 @@ impl ProductionV3RuntimeOptions {
 pub(crate) const DEFAULT_BOOTSTRAP_PEER: SocketAddr = COMPILED_NETWORK_PROFILE.bootstrap_peer();
 
 impl NodeRuntimeConfig {
+    pub(crate) fn webview_data_directory(&self) -> Option<PathBuf> {
+        self.data_dir
+            .as_ref()
+            .map(|directory| directory.join("webview-profile"))
+    }
+
     #[cfg(test)]
     pub(super) fn default_for_test() -> Self {
         Self {
@@ -73,6 +82,7 @@ impl NodeRuntimeConfig {
             allow_public_peers: true,
             peers_explicit: false,
             verbose: 0,
+            data_dir: None,
             wallet_passphrase_file: None,
             production_v3: ProductionV3RuntimeOptions::default(),
         }
@@ -106,6 +116,7 @@ impl NodeRuntimeConfig {
         let mut allow_public_peers = false;
         let mut peers_explicit = false;
         let mut verbose: u8 = 0;
+        let mut data_dir = None;
         let mut wallet_passphrase_file = None;
         let mut production_v3 = ProductionV3RuntimeOptions::default();
         let mut arguments = arguments.into_iter().map(Into::into);
@@ -163,6 +174,16 @@ impl NodeRuntimeConfig {
                 "--verbose" => {
                     has_control_arg = true;
                     verbose = verbose.saturating_add(1);
+                }
+                "--data-dir" => {
+                    has_control_arg = true;
+                    if data_dir.is_some() {
+                        return Err(ConfigError::DuplicateOption("--data-dir"));
+                    }
+                    let value = arguments
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--data-dir"))?;
+                    data_dir = Some(parse_data_dir(&value)?);
                 }
                 "--wallet-passphrase-file" => {
                     has_control_arg = true;
@@ -264,6 +285,17 @@ impl NodeRuntimeConfig {
                     has_control_arg = true;
                     verbose = verbose.saturating_add(argument.len() as u8 - 1);
                 }
+                _ if argument.starts_with("--data-dir=") => {
+                    has_control_arg = true;
+                    if data_dir.is_some() {
+                        return Err(ConfigError::DuplicateOption("--data-dir"));
+                    }
+                    data_dir = Some(parse_data_dir(
+                        argument
+                            .strip_prefix("--data-dir=")
+                            .expect("prefix checked"),
+                    )?);
+                }
                 _ if argument.starts_with("--p2p-bind=") => {
                     has_control_arg = true;
                     if p2p_bind.is_some() {
@@ -320,6 +352,7 @@ impl NodeRuntimeConfig {
             allow_public_peers,
             peers_explicit,
             verbose,
+            data_dir,
             wallet_passphrase_file,
             production_v3,
         }
@@ -363,6 +396,54 @@ impl NodeRuntimeConfig {
             PeerAddressPolicy::PrivateOnly
         }
     }
+}
+
+fn parse_data_dir(value: &str) -> Result<PathBuf, ConfigError> {
+    use std::path::Component;
+
+    let path = PathBuf::from(value);
+    if !path.is_absolute()
+        || path.file_name().is_none()
+        || path
+            .components()
+            .any(|part| matches!(part, Component::ParentDir))
+    {
+        return Err(ConfigError::InvalidDataDirectory);
+    }
+    // Windows UNC/device/verbatim paths are not portable local wallet paths.
+    // Existing node/custody filesystem ownership checks still apply on use.
+    #[cfg(windows)]
+    if !matches!(path.components().next(), Some(Component::Prefix(prefix)) if matches!(prefix.kind(), std::path::Prefix::Disk(_)))
+    {
+        return Err(ConfigError::InvalidDataDirectory);
+    }
+    #[cfg(windows)]
+    for part in path.components() {
+        if let Component::Normal(name) = part {
+            let name = name.to_str().ok_or(ConfigError::InvalidDataDirectory)?;
+            let stem = name
+                .split('.')
+                .next()
+                .unwrap_or_default()
+                .to_ascii_uppercase();
+            let device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+                || ["COM", "LPT"].iter().any(|prefix| {
+                    stem.strip_prefix(prefix).is_some_and(|suffix| {
+                        matches!(
+                            suffix,
+                            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                        )
+                    })
+                });
+            if device
+                || name.ends_with(['.', ' '])
+                || name.chars().any(|ch| ch < ' ' || "<>:\"|?*".contains(ch))
+            {
+                return Err(ConfigError::InvalidDataDirectory);
+            }
+        }
+    }
+    Ok(path)
 }
 
 /// Matches `-v`, `-vv`, `-vvv`, etc. — clap-style bundled short verbosity
@@ -443,6 +524,7 @@ pub(crate) enum ConfigError {
     InvalidAddress { option: &'static str, value: String },
     InvalidSha256(&'static str),
     InvalidPositiveInteger(&'static str),
+    InvalidDataDirectory,
     MalformedProductionV3Argument,
     InvalidPeerConfiguration(String),
     HelpWithArguments,
@@ -484,6 +566,9 @@ impl fmt::Display for ConfigError {
             Self::InvalidPositiveInteger(option) => {
                 write!(formatter, "{option} requires a nonzero unsigned integer")
             }
+            Self::InvalidDataDirectory => formatter.write_str(
+                "--data-dir requires an absolute local directory, not a root, relative path, parent traversal or Windows network/device path",
+            ),
             Self::MalformedProductionV3Argument => formatter.write_str(
                 "ProductionV3 options require an exact supported name and a separate value",
             ),
@@ -533,6 +618,8 @@ mod tests {
         assert!(config.allow_public_peers);
         assert!(!config.peers_explicit);
         assert_eq!(config.verbose, 0);
+        assert_eq!(config.data_dir, None);
+        assert_eq!(config.webview_data_directory(), None);
         assert_eq!(config.wallet_passphrase_file, None);
         assert!(!config.production_v3.is_configured());
     }
@@ -554,6 +641,86 @@ mod tests {
             ]),
             Err(ConfigError::DuplicateOption("--wallet-passphrase-file"))
         ));
+    }
+
+    #[test]
+    fn data_directory_is_absolute_explicit_and_unique_without_changing_network_defaults() {
+        #[cfg(windows)]
+        let directory = "C:\\Common Foundry\\isolated-mainnet";
+        #[cfg(not(windows))]
+        let directory = "/tmp/common-foundry/isolated-mainnet";
+        let ProcessCommand::Run(config) =
+            NodeRuntimeConfig::parse(["--data-dir", directory]).unwrap()
+        else {
+            panic!("expected run")
+        };
+        assert_eq!(config.data_dir, Some(PathBuf::from(directory)));
+        assert_eq!(
+            config.webview_data_directory(),
+            Some(PathBuf::from(directory).join("webview-profile"))
+        );
+        assert_eq!(config.p2p_bind, COMPILED_NETWORK_PROFILE.p2p_address());
+        assert_eq!(config.peers, vec![DEFAULT_BOOTSTRAP_PEER]);
+        let equals = format!("--data-dir={directory}");
+        assert_eq!(
+            NodeRuntimeConfig::parse([equals.clone()]).unwrap(),
+            ProcessCommand::Run(config)
+        );
+        assert!(matches!(
+            NodeRuntimeConfig::parse([equals.as_str(), "--data-dir", directory]),
+            Err(ConfigError::DuplicateOption("--data-dir"))
+        ));
+        assert!(matches!(
+            NodeRuntimeConfig::parse(["--data-dir"]),
+            Err(ConfigError::MissingValue("--data-dir"))
+        ));
+        assert!(matches!(
+            NodeRuntimeConfig::parse(["--data-dir", directory, "runtime-identity"]),
+            Err(ConfigError::RuntimeIdentityWithArguments)
+        ));
+        assert!(matches!(
+            NodeRuntimeConfig::parse(["runtime-identity", "--data-dir", directory]),
+            Err(ConfigError::RuntimeIdentityWithArguments)
+        ));
+    }
+
+    #[test]
+    fn ambiguous_or_network_data_directory_paths_are_rejected() {
+        for invalid in ["", ".", "wallet", "../wallet", "/", "--help"] {
+            assert!(
+                matches!(
+                    NodeRuntimeConfig::parse(["--data-dir", invalid]),
+                    Err(ConfigError::InvalidDataDirectory)
+                ),
+                "{invalid}"
+            );
+        }
+        #[cfg(windows)]
+        let invalid_absolute = [
+            "C:\\",
+            "C:wallet",
+            "C:\\wallet\\..\\other",
+            "\\\\server\\share\\wallet",
+            "\\\\?\\C:\\wallet",
+            "\\\\.\\device\\wallet",
+            "C:\\folder.\\wallet",
+            "C:\\folder \\wallet",
+            "C:\\dir:stream\\wallet",
+            "C:\\NUL",
+            "C:\\COM1.txt\\wallet",
+            "C:\\LPT¹\\wallet",
+        ];
+        #[cfg(not(windows))]
+        let invalid_absolute = ["/tmp/wallet/../other"];
+        for invalid in invalid_absolute {
+            assert!(
+                matches!(
+                    NodeRuntimeConfig::parse(["--data-dir", invalid]),
+                    Err(ConfigError::InvalidDataDirectory)
+                ),
+                "{invalid}"
+            );
+        }
     }
 
     #[test]

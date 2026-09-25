@@ -112,6 +112,7 @@ pub fn run() -> i32 {
         runtime::ProcessCommand::Run(config) => *config,
     };
 
+    let webview_data_directory = node_config.webview_data_directory();
     let app = match tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -121,7 +122,7 @@ pub fn run() -> i32 {
                 let _ = window.set_focus();
             }
         }))
-        .setup(|app| {
+        .setup(move |app| {
             app.manage(RuntimeState::start(app, node_config));
 
             let mut window_config = app
@@ -133,7 +134,11 @@ pub fn run() -> i32 {
                 .ok_or("the main wallet window is missing from tauri.conf.json")?
                 .clone();
             window_config.title = COMPILED_NETWORK_PROFILE.wallet_window_title().to_owned();
-            WebviewWindowBuilder::from_config(app, &window_config)?
+            let mut window = WebviewWindowBuilder::from_config(app, &window_config)?;
+            if let Some(directory) = webview_data_directory {
+                window = window.data_directory(directory);
+            }
+            window
                 .on_navigation(allow_navigation)
                 .on_new_window(|_, _| NewWindowResponse::Deny)
                 .build()?;

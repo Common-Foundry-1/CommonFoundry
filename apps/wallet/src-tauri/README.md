@@ -1,5 +1,29 @@
 # Desktop node peer configuration
 
+## Choosing an explicit data directory
+
+Normal double-click startup keeps the existing per-network application-data
+location. Operators can instead pass `--data-dir <absolute-path>` to select
+the exact wallet/node data directory, for example
+`--data-dir "C:\CommonFoundry\mainnet-wallet"` on Windows or
+`--data-dir /home/operator/commonfoundry/mainnet-wallet` on Linux. This does
+not move or copy an existing wallet. Back it up before changing locations.
+With an explicit directory, the embedded browser profile also lives beneath
+that directory in `webview-profile`, keeping desktop test/portable state separate.
+
+The argument must name a non-root absolute local directory without `..`
+components. Windows network, device and verbatim paths are rejected. Normal
+filesystem ownership, network identity, wallet encryption and launch checks
+still apply; this option cannot switch networks or activate mainnet early.
+Close any running wallet before using it: a second launch still only focuses
+the existing single-instance window and does not change its data directory.
+
+## Historical Devnet-0 peer examples
+
+The examples below are for the original Devnet-0 profile. For a mainnet package,
+use its `--help` output for the compiled port/identity and the packaged mainnet
+instructions, not these older addresses or test-network launchers.
+
 Common Foundry Wallet normally starts by double-clicking its shortcut. With no
 arguments, the embedded Devnet-0 node listens on `127.0.0.1:18444` and connects
 to a bootstrap peer at `107.214.187.2:18444` for initial sync.

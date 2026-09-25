@@ -159,17 +159,20 @@ impl RuntimeState {
             config.p2p_bind,
             peers
         );
-        let data_dir = app
-            .path()
-            .app_local_data_dir()
-            .map(|root| wallet_data_dir(&root, COMPILED_NETWORK_PROFILE))
-            .map_err(|_| {
-                startup_error(
-                    "data_directory_unavailable",
-                    "The desktop wallet could not resolve its local data directory.",
-                    false,
-                )
-            });
+        let data_dir = match &config.data_dir {
+            Some(directory) => Ok(directory.clone()),
+            None => app
+                .path()
+                .app_local_data_dir()
+                .map(|root| wallet_data_dir(&root, COMPILED_NETWORK_PROFILE))
+                .map_err(|_| {
+                    startup_error(
+                        "data_directory_unavailable",
+                        "The desktop wallet could not resolve its local data directory.",
+                        false,
+                    )
+                }),
+        };
         let log_guard = data_dir
             .as_ref()
             .ok()
@@ -1151,12 +1154,13 @@ fn command_help_text_for_profile(profile: NetworkProfile) -> String {
         concat!(
             "Common Foundry Wallet\n",
             "Compiled network: {} ({})\n",
-            "Usage: common-foundry-wallet [runtime-identity|--help|--version] [--p2p-bind <addr>] [--peer <addr> ...] [--allow-public-peers] [--wallet-passphrase-file <path>] [-v...]\n",
+            "Usage: common-foundry-wallet [runtime-identity|--help|--version] [--data-dir <absolute-path>] [--p2p-bind <addr>] [--peer <addr> ...] [--allow-public-peers] [--wallet-passphrase-file <path>] [-v...]\n",
             "Arguments:\n",
             "  --help (-h)             Show this help\n",
             "  --version (-V)          Print version\n",
             "  runtime-identity        Authenticate packaged V4 artifacts and print compiled wallet identity\n",
             "  -v, --verbose           Increase console verbosity (repeatable)\n",
+            "  --data-dir <path>       Explicit absolute local network data directory\n",
             "  --p2p-bind <addr>       Local P2P bind address (default {})\n",
             "  --peer <addr>           Public or private outbound peer (repeatable)\n",
             "  --allow-public-peers     Allow public peers for explicit --peer entries\n",
@@ -1251,6 +1255,7 @@ mod tests {
             allow_public_peers: true,
             peers_explicit: false,
             verbose: 0,
+            data_dir: None,
             wallet_passphrase_file: None,
             production_v3: config::ProductionV3RuntimeOptions::default(),
         }
@@ -1301,16 +1306,46 @@ mod tests {
 
     #[test]
     fn offline_create_and_restore_expose_only_public_destination() {
+        // Mainnet's real status path authenticates the plan beside the current
+        // executable. Test a genuine isolated package, never skip that gate or
+        // write sidecars into the shared Cargo target directory.
+        #[cfg(feature = "production-mainnet")]
+        let package_case = match std::env::var("CMFD_WALLET_PACKAGE_TEST_CASE") {
+            Err(std::env::VarError::NotPresent) => {
+                run_offline_mainnet_package_cases();
+                return;
+            }
+            Ok(value) if matches!(value.as_str(), "missing-plan" | "prepared") => value,
+            _ => panic!("unexpected wallet package fixture mode"),
+        };
         let files = TestFiles::new();
         let state = RuntimeState::failed_for_test(wallet_locked_error());
         let mut handle = state.handle();
         handle.data_dir = Ok(files.root.join("wallet"));
         let passphrase = b"correct horse battery staple";
         let backup = files.root.join("wallet.cmfd-backup");
+        #[cfg(feature = "production-mainnet")]
+        if package_case == "missing-plan" {
+            assert_eq!(
+                handle.create(&backup, passphrase).unwrap_err().code,
+                "mainnet_launch_required"
+            );
+            assert!(!backup.exists());
+            assert!(!files.root.join("wallet").exists());
+            return;
+        }
         let created = handle.create(&backup, passphrase).unwrap();
         assert_eq!(created.storage, "encrypted");
         assert!(!created.unlocked);
         assert!(created.destination.is_some());
+        #[cfg(feature = "production-mainnet")]
+        assert!(
+            !created
+                .launch
+                .as_ref()
+                .expect("packaged mainnet launch state")
+                .ready
+        );
         assert!(state.node().is_err());
         assert!(state.mining().is_err());
         assert!(state.peers().is_err());
@@ -1328,6 +1363,68 @@ mod tests {
         assert!(!restored.unlocked);
         assert!(state.node().is_err());
         assert!(!files.root.join("restored/blocks.log").exists());
+    }
+
+    #[cfg(feature = "production-mainnet")]
+    fn run_offline_mainnet_package_cases() {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        let files = TestFiles::new();
+        let executable = files.root.join(format!(
+            "wallet-package-test{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        for case in ["missing-plan", "prepared"] {
+            if case == "prepared" {
+                let sidecar = files.root.join("production-mainnet");
+                fs::create_dir(&sidecar).unwrap();
+                fs::write(
+                    sidecar.join("MAINNET-PLAN.json"),
+                    include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../../packaging/mainnet/MAINNET-PLAN.json"
+                    )),
+                )
+                .unwrap();
+            }
+            let mut command = Command::new(&executable);
+            command
+                .current_dir(&files.root)
+                .args([
+                    "--exact",
+                    "runtime::tests::offline_create_and_restore_expose_only_public_destination",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("CMFD_WALLET_PACKAGE_TEST_CASE", case)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                command.creation_flags(0x0800_0000);
+            }
+            let mut child = command.spawn().unwrap();
+            let started = Instant::now();
+            while child.try_wait().unwrap().is_none() {
+                if started.elapsed() > Duration::from_secs(60) {
+                    child.kill().unwrap();
+                    let _ = child.wait();
+                    panic!("offline mainnet package fixture timed out: {case}");
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{case}: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[test]

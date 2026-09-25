@@ -25,7 +25,7 @@ physical Volta qualification.
 
 - The new build helper checks the pinned, clean CUTLASS checkout, every compiler
   target and the actual native/PTX output images. Existing workers are preserved.
-- Sixteen GPU-free replay-build regression tests passed, including rejection of
+- Seventeen GPU-free replay-build regression tests passed, including rejection of
   missing targets, wrong PTX, unsupported reproducibility options and reused
   intermediate directories. Exact default/dual build-plan tests passed.
 - The combined Linux build/service/launcher run passed 36 tests, with two
@@ -45,7 +45,16 @@ physical Volta qualification.
   Therefore the matching worktree outputs are not final release candidates.
 - A compile-only two-directory fixture confirmed that a stable named namespace
   removes that path dependence. The replay source now uses `cmfd_v4_replay`;
-  clean-source full-target rebuilds and all GPU qualification remain required.
+  its own kernel names are stable. CUDA header-generated internal names remain
+  path dependent, so arbitrary source-export locations do not yield equal bytes.
+- Two fresh full-target builds from the canonical Git export of
+  `80d742fb07fd0eca71a8e04cbfef3e1a5dac2659` matched byte-for-byte:
+  3,176,576 bytes; SHA-256
+  `f872912bdc3431642e509a634caa2844f347e220ed7b58a02cf2ec874387c5f1`.
+  Both retain all seven native targets and compute_70 PTX. Source and dependency
+  absolute paths must be pinned in the repeat-build recipe. This is internal
+  same-toolchain build evidence; GPU execution and final release-set assembly
+  are still pending.
 
 Compiler symbol seeding does not seed cryptographic randomness or mining nonces.
 Keep the toolchain, dependency checkout, source hashes, intermediates and logs

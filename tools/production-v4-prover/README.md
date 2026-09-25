@@ -63,6 +63,10 @@ names otherwise contain an absolute-source-path hash even with a fixed seed.
 Include a clean committed-source export in the comparison, not just two builds
 from the original worktree. The source-path normalization must not be performed
 by editing compiled binaries.
+CUDA header-generated internal names still depend on the source path. Use the
+same canonical absolute source and dependency roots in both clean build
+environments and retain those paths in the reproduction recipe. The named
+namespace alone does not make arbitrary checkout locations byte-identical.
 Retain both binaries, compiler logs and target-image inventories. A normal
 unseeded compilation is a development build, not reproducible-release evidence.
 Matching two builds remains separate from native/PTX correctness checks,

@@ -7235,4 +7235,187 @@ mod tests {
             PoolError::CertificatePinMismatch
         ));
     }
+
+    // Exercise the production TLS builders without creating a Node, PoolServer,
+    // wallet, job, GPU worker, or public listener. Both endpoints are loopback.
+    fn identity_tls_round_trip(server_config: ServerConfig, pin: [u8; 32]) -> Result<(), String> {
+        const MESSAGE: &[u8] = b"CMFD isolated TLS identity check";
+        const TIMEOUT: Duration = Duration::from_secs(5);
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .map_err(|error| error.to_string())?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| error.to_string())?;
+        let address = listener.local_addr().map_err(|error| error.to_string())?;
+        let (client_done, wait_for_client) = std::sync::mpsc::sync_channel(1);
+        let server = thread::spawn(move || -> Result<(), String> {
+            let deadline = Instant::now() + TIMEOUT;
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, peer)) if peer.ip().is_loopback() => break stream,
+                    Ok(_) => return Err("non-loopback peer refused".to_owned()),
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return Err("isolated TLS accept deadline expired".to_owned());
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
+            };
+            // Winsock accepts inherit the listener's nonblocking mode. Match
+            // handle_connection's explicit reset before using blocking TLS I/O.
+            stream
+                .set_nonblocking(false)
+                .map_err(|error| error.to_string())?;
+            stream
+                .set_read_timeout(Some(TIMEOUT))
+                .map_err(|error| error.to_string())?;
+            stream
+                .set_write_timeout(Some(TIMEOUT))
+                .map_err(|error| error.to_string())?;
+            let connection = ServerConnection::new(Arc::new(server_config))
+                .map_err(|error| error.to_string())?;
+            let mut tls = StreamOwned::new(connection, stream);
+            let mut received = [0_u8; MESSAGE.len()];
+            tls.read_exact(&mut received)
+                .map_err(|error| error.to_string())?;
+            if received != MESSAGE
+                || tls.conn.protocol_version() != Some(rustls::ProtocolVersion::TLSv1_3)
+            {
+                return Err("isolated server did not receive the TLS 1.3 probe".to_owned());
+            }
+            tls.write_all(MESSAGE).map_err(|error| error.to_string())?;
+            tls.flush().map_err(|error| error.to_string())?;
+            tls.conn.send_close_notify();
+            tls.flush().map_err(|error| error.to_string())?;
+            // Do not close the TCP socket while the Windows client is still
+            // reading the response. A reset during teardown is not a pin test.
+            wait_for_client
+                .recv_timeout(TIMEOUT)
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        });
+        let client_result = (|| -> Result<(), String> {
+            let stream =
+                TcpStream::connect_timeout(&address, TIMEOUT).map_err(|error| error.to_string())?;
+            stream
+                .set_read_timeout(Some(TIMEOUT))
+                .map_err(|error| error.to_string())?;
+            stream
+                .set_write_timeout(Some(TIMEOUT))
+                .map_err(|error| error.to_string())?;
+            let config = client_tls_config(pin).map_err(|error| error.to_string())?;
+            let connection = ClientConnection::new(
+                Arc::new(config),
+                ServerName::try_from("cmfd-pool.local").map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+            let mut tls = StreamOwned::new(connection, stream);
+            tls.write_all(MESSAGE).map_err(|error| error.to_string())?;
+            tls.flush().map_err(|error| error.to_string())?;
+            let mut received = [0_u8; MESSAGE.len()];
+            tls.read_exact(&mut received)
+                .map_err(|error| error.to_string())?;
+            if received != MESSAGE
+                || tls.conn.protocol_version() != Some(rustls::ProtocolVersion::TLSv1_3)
+            {
+                return Err("isolated client did not receive the TLS 1.3 probe".to_owned());
+            }
+            Ok(())
+        })();
+        let _ = client_done.send(());
+        let server_result = server
+            .join()
+            .map_err(|_| "isolated TLS thread panicked".to_owned())?;
+        // Preserve the client's explicit pin error rather than replacing it
+        // with the peer's secondary close/alert error. Always join the thread.
+        client_result?;
+        server_result
+    }
+
+    fn exercise_pool_tls_identity(certificate: Vec<u8>, key: Vec<u8>, pin: [u8; 32]) {
+        let key = zeroize::Zeroizing::new(key);
+        assert_eq!(
+            certificate_sha256(&certificate),
+            pin,
+            "certificate does not match the supplied public pin"
+        );
+        let server = server_tls_config(certificate.clone(), key.to_vec())
+            .expect("native TLS loader rejected the certificate/key pair");
+        identity_tls_round_trip(server, pin).expect("correct pin failed the TLS 1.3 round trip");
+
+        let mut wrong_pin = pin;
+        wrong_pin[0] ^= 1;
+        let server = server_tls_config(certificate.clone(), key.to_vec()).unwrap();
+        let error = identity_tls_round_trip(server, wrong_pin).unwrap_err();
+        assert!(
+            error.contains("pool certificate SHA-256 pin mismatch"),
+            "unexpected rejection: {error}"
+        );
+
+        let unrelated = generate_simple_self_signed(vec!["cmfd-pool.local".to_owned()]).unwrap();
+        assert!(
+            server_tls_config(certificate.clone(), unrelated.signing_key.serialize_der()).is_err(),
+            "native TLS loader accepted a mismatched private key"
+        );
+        assert!(server_tls_config(vec![0], key.to_vec()).is_err());
+        assert!(server_tls_config(certificate, vec![0]).is_err());
+    }
+
+    #[test]
+    fn isolated_pool_tls_identity_accepts_correct_pin_and_rejects_mutations() {
+        let identity = generate_simple_self_signed(vec!["cmfd-pool.local".to_owned()]).unwrap();
+        let certificate = identity.cert.der().to_vec();
+        let pin = certificate_sha256(&certificate);
+        exercise_pool_tls_identity(certificate, identity.signing_key.serialize_der(), pin);
+    }
+
+    #[test]
+    #[ignore = "operator-only: requires explicit certificate/key credential paths and expected public pin"]
+    fn operator_pool_tls_identity_uses_supplied_credentials_without_starting_a_node() {
+        fn read_bounded_credential(variable: &str) -> Vec<u8> {
+            let path = PathBuf::from(
+                std::env::var_os(variable).expect("explicit credential path is required"),
+            );
+            assert!(path.is_absolute(), "credential path must be absolute");
+            let metadata = fs::symlink_metadata(&path).expect("credential metadata unavailable");
+            assert!(
+                metadata.file_type().is_file(),
+                "credential must be a regular file, not a symlink"
+            );
+            assert!(
+                metadata.len() > 0 && metadata.len() <= 64 * 1024,
+                "unexpected credential size"
+            );
+            let file = fs::File::open(path).expect("credential is not readable");
+            let mut bytes = Vec::new();
+            file.take(64 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .expect("credential read failed");
+            assert!(
+                bytes.len() <= 64 * 1024,
+                "credential grew beyond its size limit"
+            );
+            bytes
+        }
+        let expected =
+            std::env::var("CMFD_POOL_TLS_EXPECTED_PIN").expect("explicit public pin is required");
+        assert!(
+            expected.len() == 64
+                && expected
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "public pin must be 64 lowercase hexadecimal characters"
+        );
+        let pin: [u8; 32] = hex::decode(&expected).unwrap().try_into().unwrap();
+        exercise_pool_tls_identity(
+            read_bounded_credential("CMFD_POOL_TLS_CERT_PATH"),
+            read_bounded_credential("CMFD_POOL_TLS_KEY_PATH"),
+            pin,
+        );
+        println!(
+            "CMFD_POOL_TLS_IDENTITY_OK tls=1.3 correct_pin=accepted wrong_pin=rejected mismatched_key=rejected malformed_der=rejected no_node=true no_gpu=true"
+        );
+    }
 }

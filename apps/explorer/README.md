@@ -41,6 +41,31 @@ faults refuse the response. The cache is discarded on restart and never particip
 admission, proof verification or fork choice. Individual block/transaction/address detail reads
 continue to authenticate their stored bodies.
 
+Each authenticated read also returns immutable query-local identity and wire-size
+metadata. Explorer rows reuse those checked scalars rather than hashing the full
+V4 proof or serializing the block again merely to rediscover its ID/length. The
+stored record still passes the same bounds, digest, version, canonical reencoding
+and block-identity checks. The consensus block-ID algorithm is unchanged; mutable
+public `Block` values do not acquire an unchecked ID cache.
+
+An optional CPU-only resource test, `preserved_full_v4_explorer_read_cost`, accepts
+an operator-selected preserved proof, strict statement, original candidate,
+release-pinned model bank and fixed record. It is ignored by ordinary test runs.
+Set `CMFD_EXPLORER_FULL_PROOF`, `CMFD_EXPLORER_FULL_PROOF_SHA256`,
+`CMFD_EXPLORER_STATEMENT`, `CMFD_EXPLORER_CANDIDATE`, `CMFD_EXPLORER_BANK` and
+`CMFD_EXPLORER_FIXED_RECORD` to explicit inputs. With the mainnet feature build
+gate's `CMFD_BUILD_SOURCE_COMMIT` set to the checked-out commit, run:
+
+```text
+cargo test --locked -p cmfd-node --lib --features production-mainnet preserved_full_v4_explorer_read_cost -- --ignored --nocapture --test-threads=1
+```
+
+The test deliberately opens an isolated RCNet data directory, authenticates the
+pinned inputs, submits the preserved block through normal CPU consensus, measures
+read methods and removes its temporary chain. It starts no network service, uses
+no GPU, generates no new proof and does not activate mainnet. Results are scoped
+to that preserved block/build/host, not general HTTP throughput or release approval.
+
 The `overview_cache` native tests include a bounded repeated-poll probe, print fixture/profile
 labels and retained metadata payload bytes, and check expiry, reorgs, live mempool/peer changes
 and storage faults. Those small-profile method-call measurements are not HTTP throughput,

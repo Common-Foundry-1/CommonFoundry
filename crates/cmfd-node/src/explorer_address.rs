@@ -1,9 +1,9 @@
 //! Read-only key-address balances and canonical activity, with tip-bound pages.
 
-use cmfd_consensus::{Block, InputWitness, MAX_BLOCK_TRANSACTIONS, OutputLock};
+use cmfd_consensus::{InputWitness, MAX_BLOCK_TRANSACTIONS, OutputLock};
 use serde::Serialize;
 
-use crate::explorer::parse_identifier;
+use crate::explorer::{AuthenticatedExplorerBlock, parse_identifier};
 use crate::explorer_address_index::AddressLocation;
 use crate::{Node, NodeError};
 
@@ -62,7 +62,7 @@ impl Node {
         );
         let has_more = page.len() > EXPLORER_ADDRESS_PAGE_SIZE;
         let mut history = Vec::with_capacity(EXPLORER_ADDRESS_PAGE_SIZE);
-        let mut retained_block: Option<Block> = None;
+        let mut retained_block: Option<AuthenticatedExplorerBlock> = None;
         let height = self.state.next_height().saturating_sub(1);
         for location in page.iter().take(EXPLORER_ADDRESS_PAGE_SIZE) {
             if retained_block
@@ -178,12 +178,13 @@ fn canonical_decimal(value: &str) -> bool {
 }
 
 fn activity_summary(
-    block: &Block,
+    checked: &AuthenticatedExplorerBlock,
     location: AddressLocation,
     address: [u8; 32],
     height: u64,
 ) -> Result<ExplorerAddressActivity, NodeError> {
-    if block.block_id() != location.block_id || block.challenge.height != location.height {
+    let block = checked.block();
+    if checked.block_id() != location.block_id || block.challenge.height != location.height {
         return Err(NodeError::CorruptLog(
             "explorer address locator does not match its authenticated block".to_owned(),
         ));

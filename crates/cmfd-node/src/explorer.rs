@@ -1,15 +1,38 @@
-use cmfd_consensus::{Block, BlockProof, Transaction, encode_block, encode_transaction};
+#[cfg(test)]
+use cmfd_consensus::encode_block;
+use cmfd_consensus::{Block, BlockProof, Transaction, encode_transaction};
 use serde::Serialize;
 use std::time::{Duration, Instant};
 
 use crate::{
-    BLOCK_LOG_FILE, Node, NodeError, ProofProfile, io_error, read_indexed_block,
+    BLOCK_LOG_FILE, Node, NodeError, ProofProfile, io_error, read_indexed_block_with_size,
     verify_retained_block_log_path,
 };
 
 const EXPLORER_BLOCK_LIMIT: usize = 12;
 const EXPLORER_TRANSACTION_LIMIT: usize = 24;
 const EXPLORER_CACHE_MAX_AGE: Duration = Duration::from_secs(30);
+
+/// Immutable, query-local body and scalar results of one authenticated read.
+/// No unchecked constructor, mutation accessor or consensus capability exists.
+/// This avoids rehashing a V4 proof just to obtain the same display identifier.
+pub(super) struct AuthenticatedExplorerBlock {
+    block: Block,
+    block_id: [u8; 32],
+    encoded_bytes: usize,
+}
+
+impl AuthenticatedExplorerBlock {
+    pub(super) fn block(&self) -> &Block {
+        &self.block
+    }
+    pub(super) fn block_id(&self) -> [u8; 32] {
+        self.block_id
+    }
+    pub(super) fn encoded_bytes(&self) -> usize {
+        self.encoded_bytes
+    }
+}
 
 /// Bounded, process-local display metadata, never proof or admission authority.
 /// Only fully authenticated reads populate this cache. It expires periodically
@@ -209,13 +232,13 @@ impl Node {
             .map(|(position, block_id)| (position, *block_id))
             .collect();
         for (position, block_id) in active_ids {
-            let block = self.read_explorer_block(block_id)?;
-            let encoded_bytes = encode_block(&block)?.len();
+            let checked = self.read_explorer_block(block_id)?;
+            let block = checked.block();
             let confirmations =
                 u64::try_from(self.index.active_chain.len() - position).map_err(|_| {
                     NodeError::CorruptLog("explorer confirmation depth does not fit u64".to_owned())
                 })?;
-            latest_blocks.push(block_summary(&block, encoded_bytes, confirmations)?);
+            latest_blocks.push(block_summary(&checked, confirmations)?);
             for transaction in &block.transactions {
                 if recent_transactions.len() >= EXPLORER_TRANSACTION_LIMIT {
                     break;
@@ -253,8 +276,8 @@ impl Node {
         if position == 0 {
             return Ok(None);
         }
-        let block = self.read_explorer_block(block_id)?;
-        let encoded_bytes = encode_block(&block)?.len();
+        let checked = self.read_explorer_block(block_id)?;
+        let block = checked.block();
         let confirmations =
             u64::try_from(self.index.active_chain.len() - position).map_err(|_| {
                 NodeError::CorruptLog("explorer confirmation depth does not fit u64".to_owned())
@@ -274,7 +297,7 @@ impl Node {
             })
             .collect::<Result<Vec<_>, NodeError>>()?;
         Ok(Some(ExplorerBlockDetail {
-            block: block_summary(&block, encoded_bytes, confirmations)?,
+            block: block_summary(&checked, confirmations)?,
             coinbase_outputs: block.coinbase.outputs.len(),
             transactions_detail,
         }))
@@ -306,7 +329,8 @@ impl Node {
         };
         // The index only chooses a locator. Reauthenticate the complete stored
         // block and check the exact transaction before reporting confirmation.
-        let block = self.read_explorer_block(location.block_id)?;
+        let checked = self.read_explorer_block(location.block_id)?;
+        let block = checked.block();
         let transaction = block
             .transactions
             .get(location.transaction_position)
@@ -342,31 +366,44 @@ impl Node {
             .map(|position| (position, block_id))
     }
 
-    pub(super) fn read_explorer_block(&mut self, block_id: [u8; 32]) -> Result<Block, NodeError> {
+    pub(super) fn read_explorer_block(
+        &mut self,
+        block_id: [u8; 32],
+    ) -> Result<AuthenticatedExplorerBlock, NodeError> {
+        if self.storage_faulted {
+            return Err(NodeError::StorageFaulted);
+        }
         #[cfg(test)]
         {
             self.explorer_block_reads += 1;
         }
-        let indexed = self.index.blocks.get(&block_id).cloned().ok_or_else(|| {
-            NodeError::CorruptLog("active explorer lookup refers to an absent block".to_owned())
-        })?;
-        let result = read_indexed_block(
-            &self.log,
-            &self.data_dir.join(crate::BLOCK_LOG_FILE),
-            &indexed,
-            block_id,
-            self.params.network_id,
-            matches!(self.profile.proof, ProofProfile::ProductionV3),
-        );
+        let result = (|| {
+            let indexed = self.index.blocks.get(&block_id).cloned().ok_or_else(|| {
+                NodeError::CorruptLog("active explorer lookup refers to an absent block".to_owned())
+            })?;
+            let (block, encoded_bytes) = read_indexed_block_with_size(
+                &self.log,
+                &self.data_dir.join(crate::BLOCK_LOG_FILE),
+                &indexed,
+                block_id,
+                self.params.network_id,
+                matches!(self.profile.proof, ProofProfile::ProductionV3),
+            )?;
+            Ok(AuthenticatedExplorerBlock {
+                block,
+                block_id,
+                encoded_bytes,
+            })
+        })();
         self.latch_authenticated_storage_failure(result)
     }
 }
 
 fn block_summary(
-    block: &Block,
-    encoded_bytes: usize,
+    checked: &AuthenticatedExplorerBlock,
     confirmations: u64,
 ) -> Result<ExplorerBlock, NodeError> {
+    let block = checked.block();
     let coinbase_atoms = block
         .coinbase
         .outputs
@@ -379,7 +416,7 @@ fn block_summary(
     let (nonce, work_digest) = proof_identity(&block.proof);
     Ok(ExplorerBlock {
         height: block.challenge.height,
-        block_id: hex::encode(block.block_id()),
+        block_id: hex::encode(checked.block_id()),
         previous_block: hex::encode(block.challenge.previous_block),
         transaction_root: hex::encode(block.challenge.transaction_root),
         timestamp: block.challenge.timestamp,
@@ -387,7 +424,7 @@ fn block_summary(
         nonce: nonce.to_string(),
         work_digest: hex::encode(work_digest),
         transactions: block.transactions.len(),
-        encoded_bytes,
+        encoded_bytes: checked.encoded_bytes(),
         coinbase_atoms: coinbase_atoms.to_string(),
         confirmations,
     })
@@ -596,6 +633,53 @@ mod tests {
         assert_eq!(confirmed.recent_transactions[0].status, "confirmed");
         assert_eq!(confirmed.recent_transactions[0].txid, txid);
         assert_eq!(node.explorer_block_reads - reads, 2);
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn authenticated_query_body_keeps_exact_identity_size_and_corruption_checks() {
+        let path = test_dir("explorer-checked-body");
+        let mut node = Node::open(&path).unwrap();
+        let original = mine(&mut node);
+        let block_id = original.block_id();
+        let checked = node.read_explorer_block(block_id).unwrap();
+        assert_eq!(checked.block(), &original);
+        assert_eq!(checked.block_id(), block_id);
+        assert_eq!(
+            checked.encoded_bytes(),
+            encode_block(&original).unwrap().len()
+        );
+        let summary = block_summary(&checked, 1).unwrap();
+        assert_eq!(summary.block_id, hex::encode(block_id));
+        assert_eq!(summary.encoded_bytes, checked.encoded_bytes());
+        drop(checked);
+        let original_locator = node.index.blocks[&block_id].locator;
+        for mutation in 0..4 {
+            let mut changed = original_locator;
+            match mutation {
+                0 => changed.block_id[0] ^= 1,
+                1 => changed.complete_digest[0] ^= 1,
+                2 => changed.offset += 1,
+                _ => changed.length -= 1,
+            }
+            Arc::get_mut(node.index.blocks.get_mut(&block_id).unwrap())
+                .unwrap()
+                .locator = changed;
+            assert!(matches!(
+                node.read_explorer_block(block_id),
+                Err(NodeError::CorruptLog(_))
+            ));
+            assert!(node.storage_faulted);
+            node.storage_faulted = false; // isolate the next in-memory fault injection
+        }
+        Arc::get_mut(node.index.blocks.get_mut(&block_id).unwrap())
+            .unwrap()
+            .locator = original_locator;
+        assert_eq!(
+            node.read_explorer_block(block_id).unwrap().block_id(),
+            block_id
+        );
         drop(node);
         clean_test_dir(&path);
     }

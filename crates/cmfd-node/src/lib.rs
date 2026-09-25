@@ -76,6 +76,8 @@ mod explorer_address_index;
 #[cfg(test)]
 mod explorer_address_tests;
 mod explorer_index;
+#[cfg(all(test, feature = "production-v4"))]
+mod explorer_resource_qualification;
 pub mod logging;
 #[cfg(feature = "production-v4")]
 pub mod mainnet_custody;
@@ -10158,13 +10160,35 @@ fn read_indexed_block(
     network_id: [u8; 32],
     require_v2: bool,
 ) -> Result<Block, NodeError> {
+    read_indexed_block_with_size(
+        file,
+        path,
+        indexed,
+        expected_block_id,
+        network_id,
+        require_v2,
+    )
+    .map(|(block, _)| block)
+}
+
+/// Returns size only after the exact stored frame has passed all locator,
+/// digest, decode/reencode and identity checks in read_located_record.
+fn read_indexed_block_with_size(
+    file: &File,
+    path: &Path,
+    indexed: &IndexedBlock,
+    expected_block_id: [u8; 32],
+    network_id: [u8; 32],
+    require_v2: bool,
+) -> Result<(Block, usize), NodeError> {
     if indexed.block_id() != expected_block_id {
         return Err(NodeError::CorruptLog(
             "fork index key does not match its durable record locator".to_owned(),
         ));
     }
-    let (_, block) = read_located_record(file, path, &indexed.locator, network_id, require_v2)?;
-    Ok(block)
+    let (record, block) =
+        read_located_record(file, path, &indexed.locator, network_id, require_v2)?;
+    Ok((block, record.block_bytes.len()))
 }
 
 fn replay_log(

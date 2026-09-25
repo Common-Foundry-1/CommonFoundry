@@ -242,7 +242,7 @@ impl Node {
             .map(|position| (position, block_id))
     }
 
-    fn read_explorer_block(&mut self, block_id: [u8; 32]) -> Result<Block, NodeError> {
+    pub(super) fn read_explorer_block(&mut self, block_id: [u8; 32]) -> Result<Block, NodeError> {
         #[cfg(test)]
         {
             self.explorer_block_reads += 1;
@@ -336,7 +336,7 @@ fn proof_identity(proof: &BlockProof) -> (u64, [u8; 32]) {
     }
 }
 
-fn parse_identifier(value: &str) -> Option<[u8; 32]> {
+pub(super) fn parse_identifier(value: &str) -> Option<[u8; 32]> {
     if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }

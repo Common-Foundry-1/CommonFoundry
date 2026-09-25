@@ -361,6 +361,7 @@ fn load_slot(
     // startup scan already decoded every authenticated record, and all of its
     // locators were compared above with the restored fork index.
     index.transactions = scanned.transactions;
+    index.addresses = scanned.addresses;
     verify_retained_block_log_path(log, log_path)?;
     Ok(Some(LoadedStartupSnapshot {
         state,

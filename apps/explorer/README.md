@@ -38,8 +38,38 @@ and reorganizations do not require rewriting the location index. A confirmed res
 its full stored block and exact transaction position/ID. A missing or orphan-only transaction reads
 no block bodies; a confirmed lookup reads only the matching block. Mempool lookup remains separate.
 The index itself is in memory and grows with retained transaction occurrences across forks. This
-does not yet provide address-history search or a disk-backed index for larger deployments; those
-remain separate preparation work, including memory/startup-cost qualification.
+does not provide a disk-backed index for larger deployments. Memory/startup-cost qualification
+and public integration of the native address API below remain preparation work.
+
+### Native address API (public UI/routing not yet enabled)
+
+The node now also supports read-only `GET /v1/explorer/address/{address}` and
+`GET /v1/explorer/address/{address}/{cursor}`. An address is a 64-character hexadecimal key
+destination. A valid but unseen address returns zero balances and empty history, not a guessed
+wallet or an exchange watch registration. The response carries `X-CMFD-Network-Id` as well.
+
+Balances use the active consensus UTXO set. `confirmed_atoms` includes both `spendable_atoms`
+and `immature_atoms`; spendable means eligible at the next block height, without subtracting
+mempool reservations. `balance_scope: "key_outputs"` explicitly excludes channel escrow, and
+`includes_mempool: false` excludes unconfirmed transactions. Atom amounts are decimal strings.
+Neither private wallet state nor the authenticated exchange's watch list is consulted.
+
+History is newest-first, canonical-only and capped at 20 entries per page. Each entry identifies
+its block and transaction/coinbase outpoint ID, confirmations, activity kind, received outputs
+and spent input count. `received_atoms` counts outputs to the address, including change; it is
+not a net transfer amount or a debit amount. `self` requires all inputs and outputs to belong to
+the address; an outgoing payment with change is `sent`. Coinbase entries should link to their
+block, since the ordinary transaction-detail endpoint does not index coinbase outpoint IDs.
+
+Pass the returned `next_cursor` unchanged. It binds the current tip and last history position;
+any tip change (extension or reorganization) returns HTTP 409 with `explorer_cursor_stale`, so
+the client must restart pagination. Malformed or unrelated-address cursors return HTTP 400.
+Address errors have a string `error` message plus top-level `code` and `retryable` fields;
+existing non-address RPC error contracts are unchanged.
+Every page reauthenticates its matching stored blocks, reading a shared block only once and
+at most 20 block bodies. Empty histories read none. These native routes are not yet allowed
+through the deployed Worker/tunnel or available in the frontend; integrate and qualify those
+surfaces before describing public address search as available.
 
 ## Mainnet preparation
 
@@ -73,7 +103,7 @@ signed a8b23ec runtime does not emit it. The expected ID is pinned to
 `packaging/mainnet/MAINNET-PLAN.json` by tests. Generate binding/runtime types
 with `npm run types` after configuration changes rather than editing them by hand.
 
-Before public cutover, finish address-history indexing and index resource qualification, prepare the
+Before public cutover, integrate address search into the Worker/frontend and complete index resource qualification, prepare the
 separate mainnet origin tunnel rule below, and qualify the actual native origin
 when its launch gate permits startup. Preserve the existing RC origin and pool
 rules. The new origin must expose only these anchored read-only route paths to

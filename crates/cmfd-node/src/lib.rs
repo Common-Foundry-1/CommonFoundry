@@ -71,6 +71,10 @@ pub(crate) mod exchange_signer;
 pub(crate) mod exchange_withdrawal;
 pub(crate) mod exchange_withdrawal_v3;
 pub mod explorer;
+pub mod explorer_address;
+mod explorer_address_index;
+#[cfg(test)]
+mod explorer_address_tests;
 mod explorer_index;
 pub mod logging;
 #[cfg(feature = "production-v4")]
@@ -488,6 +492,12 @@ pub enum NodeError {
     TemplateTimeUnavailable,
     #[error("miner destination must be a 64-character hex Schnorr public key")]
     InvalidMinerDestination,
+    #[error("explorer address must be a 64-character hexadecimal key destination")]
+    InvalidExplorerAddress,
+    #[error("explorer cursor is invalid for this address")]
+    InvalidExplorerCursor,
+    #[error("the chain tip changed; restart address pagination from the first page")]
+    StaleExplorerCursor,
     #[error("mining search attempts must be between 1 and {MAX_MINING_SEARCH_ATTEMPTS}")]
     InvalidMiningSearchAttempts,
     #[error("mining share target must be easier than or equal to the immutable block target")]
@@ -653,6 +663,9 @@ impl NodeError {
             Self::InvalidSystemTime => ("invalid_system_time", 500, false),
             Self::TemplateTimeUnavailable => ("template_time_unavailable", 503, true),
             Self::InvalidMinerDestination => ("invalid_miner_destination", 400, false),
+            Self::InvalidExplorerAddress => ("invalid_explorer_address", 400, false),
+            Self::InvalidExplorerCursor => ("invalid_explorer_cursor", 400, false),
+            Self::StaleExplorerCursor => ("explorer_cursor_stale", 409, true),
             Self::InvalidMiningSearchAttempts => ("invalid_mining_search_attempts", 400, false),
             Self::InvalidMiningShareTarget => ("invalid_mining_share_target", 400, false),
             Self::NonLoopbackRpc(_) => ("non_loopback_rpc", 400, false),
@@ -3597,6 +3610,7 @@ pub struct Node {
     block_preverifier: BlockPreverifier,
     state: ChainState,
     index: BlockIndex,
+    explorer_outputs: explorer_address_index::AddressOutputIndex,
     /// Monotonically changes after every successful block commit. External
     /// proof admissions bind to this value so branch snapshots cannot be
     /// committed after chain state or fork choice changes.
@@ -3698,6 +3712,7 @@ struct BlockIndex {
     /// Full-history transaction locations derived from the retained block log.
     /// Entries include side branches; queries check current canonical membership.
     transactions: explorer_index::TransactionIndex,
+    addresses: explorer_address_index::AddressHistoryIndex,
     /// Active block identifiers in height order, including virtual genesis at
     /// index zero.
     active_chain: Vec<[u8; 32]>,
@@ -3733,6 +3748,7 @@ impl BlockIndex {
             genesis,
             blocks: HashMap::new(),
             transactions: explorer_index::TransactionIndex::default(),
+            addresses: explorer_address_index::AddressHistoryIndex::default(),
             active_chain: vec![genesis],
             active_work: U512::zero(),
         }
@@ -3939,6 +3955,7 @@ struct PreparedBlock {
     activation_chain: Option<Vec<[u8; 32]>>,
     candidate: ValidatedCandidate,
     transaction_ids: Vec<[u8; 32]>,
+    address_entries: Vec<([u8; 32], explorer_address_index::AddressLocation)>,
 }
 
 impl PreparedBlock {
@@ -5082,6 +5099,8 @@ impl Node {
             } else {
                 ExchangeCustodyV3WalletState::Unclaimed
             };
+        let explorer_outputs =
+            explorer_address_index::AddressOutputIndex::from_utxos(state.utxos());
         let mut node = Self {
             instance_id: next_node_instance_id()?,
             data_dir,
@@ -5096,6 +5115,7 @@ impl Node {
             block_preverifier,
             state,
             index,
+            explorer_outputs,
             chain_revision,
             mempool: BTreeMap::new(),
             mempool_bytes: 0,
@@ -7287,6 +7307,14 @@ impl Node {
                 self.block_log_length = final_length;
                 let canonical_tip_changed = self.state.tip() != previous_tip;
                 if canonical_tip_changed {
+                    if block.challenge.previous_block != previous_tip
+                        || !self.explorer_outputs.apply_extension(&block)
+                    {
+                        self.explorer_outputs =
+                            explorer_address_index::AddressOutputIndex::from_utxos(
+                                self.state.utxos(),
+                            );
+                    }
                     self.revalidate_mempool(&confirmed_txids);
                 }
                 if let Some(guard) = commit_guard.take() {
@@ -8058,6 +8086,7 @@ fn prepare_block(
         activation_chain,
         candidate,
         transaction_ids: block.transactions.iter().map(Transaction::txid).collect(),
+        address_entries: explorer_address_index::AddressHistoryIndex::block_entries(block),
     })
 }
 
@@ -8237,6 +8266,7 @@ fn commit_prepared(
     index
         .transactions
         .insert_block(prepared.block_id, prepared.transaction_ids);
+    index.addresses.insert_entries(prepared.address_entries);
     if activates {
         if was_active {
             index.active_chain.push(prepared.block_id);
@@ -8361,6 +8391,20 @@ impl RpcResponse {
             _ => "Internal Server Error",
         };
         Self::json(error.status, reason, json!({ "error": error.message }))
+    }
+
+    fn explorer_address_error(error: NodeError) -> Self {
+        let client = error.client_error();
+        let response = Self::node_error(error);
+        Self::json(
+            response.status,
+            response.reason,
+            json!({
+                "error": client.message,
+                "code": client.code,
+                "retryable": client.retryable,
+            }),
+        )
     }
 }
 
@@ -8588,7 +8632,8 @@ fn route_rpc_request(request: RpcRequest, node: &mut Node) -> RpcResponse {
     let explorer_request = request.method == "GET"
         && (request.target == "/v1/explorer"
             || request.target.starts_with("/v1/explorer/block/")
-            || request.target.starts_with("/v1/explorer/transaction/"));
+            || request.target.starts_with("/v1/explorer/transaction/")
+            || request.target.starts_with("/v1/explorer/address/"));
     let mut response = route_rpc_request_inner(request, node);
     if explorer_request {
         // Bind this exact response (including not-found/errors) to the node
@@ -8656,6 +8701,21 @@ fn route_rpc_request_inner(request: RpcRequest, node: &mut Node) -> RpcResponse 
                 },
                 Ok(None) => RpcResponse::json_error(404, "Not Found", "transaction not found"),
                 Err(error) => RpcResponse::node_error(error),
+            }
+        }
+        ("GET", target) if target.starts_with("/v1/explorer/address/") => {
+            let mut parts = target[21..].split('/');
+            let address = parts.next().unwrap_or_default();
+            let cursor = parts.next();
+            if parts.next().is_some() {
+                return RpcResponse::explorer_address_error(NodeError::InvalidExplorerCursor);
+            }
+            match node.explorer_address(address, cursor) {
+                Ok(address) => match serde_json::to_value(address) {
+                    Ok(value) => RpcResponse::json(200, "OK", value),
+                    Err(error) => RpcResponse::json_error(500, "Internal Server Error", error),
+                },
+                Err(error) => RpcResponse::explorer_address_error(error),
             }
         }
         ("GET", "/v1/wallet") => match node.wallet_snapshot() {
@@ -9727,6 +9787,7 @@ struct ScannedReplayLog {
     records: Vec<BlockRecordLocator>,
     children: HashMap<[u8; 32], Vec<usize>>,
     transactions: explorer_index::TransactionIndex,
+    addresses: explorer_address_index::AddressHistoryIndex,
     last_record_digest: [u8; 32],
     log_length: u64,
 }
@@ -10498,6 +10559,7 @@ fn replay_log_into(
     verify_scanned_replay_log_unchanged(&replay_file, path, &scanned, params.network_id)?;
     verify_retained_block_log_path(log, path)?;
     index.transactions = scanned.transactions;
+    index.addresses = scanned.addresses;
     Ok(ReplayLogState {
         last_record_digest: scanned.last_record_digest,
         log_length: scanned.log_length,
@@ -10519,6 +10581,7 @@ fn scan_replay_log(
     let mut records = Vec::new();
     let mut children: HashMap<[u8; 32], Vec<usize>> = HashMap::new();
     let mut transactions = explorer_index::TransactionIndex::default();
+    let mut addresses = explorer_address_index::AddressHistoryIndex::default();
     let mut known_blocks = HashSet::from([params.genesis_hash]);
     loop {
         let offset = reader
@@ -10532,6 +10595,7 @@ fn scan_replay_log(
                 records,
                 children,
                 transactions,
+                addresses,
                 last_record_digest,
                 log_length,
             });
@@ -10599,6 +10663,9 @@ fn scan_replay_log(
         };
         let position = records.len();
         transactions.insert_block(block_id, block.transactions.iter().map(Transaction::txid));
+        addresses.insert_entries(explorer_address_index::AddressHistoryIndex::block_entries(
+            &block,
+        ));
         children.entry(parent).or_default().push(position);
         records.push(BlockRecordLocator {
             ordinal: record_index,
@@ -10762,12 +10829,12 @@ mod tests {
         fs::remove_dir_all(&directory).unwrap();
     }
 
-    fn test_dir(name: &str) -> PathBuf {
+    pub(super) fn test_dir(name: &str) -> PathBuf {
         let id = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("cmfd-node-{name}-{}-{id}", std::process::id()))
     }
 
-    fn clean_test_dir(path: &Path) {
+    pub(super) fn clean_test_dir(path: &Path) {
         if path.exists() {
             fs::remove_dir_all(path).expect("remove isolated test directory");
         }
@@ -12607,11 +12674,16 @@ mod tests {
         }
     }
 
-    fn mined_child(node: &Node, parent: [u8; 32], timestamp: u64, miner_seed: u8) -> Block {
+    pub(super) fn mined_child(
+        node: &Node,
+        parent: [u8; 32],
+        timestamp: u64,
+        miner_seed: u8,
+    ) -> Block {
         mined_child_with_transactions(node, parent, timestamp, miner_seed, Vec::new())
     }
 
-    fn mined_child_with_transactions(
+    pub(super) fn mined_child_with_transactions(
         node: &Node,
         parent: [u8; 32],
         timestamp: u64,
@@ -12664,7 +12736,7 @@ mod tests {
         }
     }
 
-    fn spend_coinbase_output(
+    pub(super) fn spend_coinbase_output(
         node: &Node,
         block: &Block,
         output_index: u32,

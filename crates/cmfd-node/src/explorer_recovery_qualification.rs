@@ -6,13 +6,13 @@ use crate::explorer_address_index::AddressOutputIndex;
 use crate::tests::{clean_test_dir, spend_coinbase_output, test_dir};
 use crate::*;
 
-fn input(name: &str, default: usize, maximum: usize) -> usize {
+fn input(name: &str, default: usize, minimum: usize, maximum: usize) -> usize {
     let value = match std::env::var(name) {
         Ok(value) => value.parse().expect("recovery input must be an integer"),
         Err(std::env::VarError::NotPresent) => default,
         Err(error) => panic!("{name}: {error}"),
     };
-    assert!((1..=maximum).contains(&value), "{name} out of bounds");
+    assert!((minimum..=maximum).contains(&value), "{name} out of bounds");
     value
 }
 
@@ -76,8 +76,10 @@ fn assert_recovered(
 #[test]
 #[ignore = "bounded valid tiny-profile transaction history and restart/recovery fixture; not full-size production startup qualification"]
 fn explorer_dense_valid_history_recovery() {
-    let block_count = input("CMFD_RECOVERY_BLOCKS", 512, 1024);
-    let lanes = input("CMFD_RECOVERY_TX_PER_BLOCK", 20, 20);
+    let block_count = input("CMFD_RECOVERY_BLOCKS", 512, 1, 1024);
+    let lanes = input("CMFD_RECOVERY_TX_PER_BLOCK", 20, 1, 20);
+    let fork_every = input("CMFD_RECOVERY_FORK_EVERY", 0, 0, 1024);
+    let mut side_blocks = 0;
     let path = test_dir("explorer-dense-valid-recovery");
     assert!(!path.exists(), "never overwrite a prior recovery fixture");
     let started = Instant::now();
@@ -170,6 +172,7 @@ fn explorer_dense_valid_history_recovery() {
             }
             transactions.push(transaction);
         }
+        let side_state = (fork_every != 0 && (index + 1) % fork_every == 0).then(|| state.clone());
         let template = build_template_from_state(
             &state,
             &params,
@@ -208,6 +211,50 @@ fn explorer_dense_valid_history_recovery() {
         digest = complete_record_digest(&record);
         log.write_all(&record).unwrap();
         state.commit_validated(validated).unwrap();
+        if let Some(mut side_state) = side_state {
+            // A real, separately validated sibling follows the first-seen
+            // canonical block at equal work. The same transactions can occur
+            // on both forks, but their rewards and block identities differ.
+            let template = build_template_from_state(
+                &side_state,
+                &params,
+                insecure_dev_destination(0x32),
+                now,
+                block.transactions.clone(),
+            )
+            .unwrap();
+            let proof = verifier
+                .mine(&template.challenge, 0, DEFAULT_MINING_ATTEMPTS)
+                .unwrap();
+            let sibling = Block {
+                version: BLOCK_VERSION,
+                challenge: template.challenge,
+                coinbase: template.coinbase,
+                transactions: template.transactions,
+                proof,
+            };
+            let validated = side_state
+                .validate_block(
+                    &sibling,
+                    BlockValidationContext {
+                        now_unix_seconds: now,
+                    },
+                )
+                .unwrap();
+            let delta = validated.encode_reversible_state_delta().unwrap();
+            let record = encode_record_v2(
+                now,
+                &encode_block(&sibling).unwrap(),
+                &delta,
+                digest,
+                params.network_id,
+            )
+            .unwrap();
+            digest = complete_record_digest(&record);
+            log.write_all(&record).unwrap();
+            side_state.commit_validated(validated).unwrap();
+            side_blocks += 1;
+        }
     }
     log.sync_all().unwrap();
     let log_bytes = log.metadata().unwrap().len();
@@ -228,6 +275,11 @@ fn explorer_dense_valid_history_recovery() {
         reopen_times.push(started.elapsed().as_secs_f64() * 1000.0);
         assert_eq!(reopened.startup_snapshot_used, expected_snapshot);
         assert_eq!(reopened.state.next_height(), block_count as u64 + 3);
+        assert_eq!(reopened.index.blocks.len(), block_count + 2 + side_blocks);
+        assert_eq!(
+            reopened.index.transactions.qualification_shape().1,
+            1 + (block_count + side_blocks) * lanes
+        );
         let views = assert_recovered(
             &mut reopened,
             &expected_state,
@@ -262,6 +314,8 @@ fn explorer_dense_valid_history_recovery() {
         json!({
             "scope": "consensus-valid tiny local proof profile only; not full-size V4 startup cost or mainnet acceptance",
             "blocks": block_count + 2,
+            "retained_records": block_count + 2 + side_blocks,
+            "side_blocks": side_blocks,
             "transactions": 1 + block_count * lanes,
             "record_log_bytes": log_bytes,
             "build_millis": build_time.as_secs_f64() * 1000.0,

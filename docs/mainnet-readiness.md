@@ -812,3 +812,11 @@ The valid-history fixture checks full replay, snapshot restart and recovery
 after a damaged optional cache against identical state and explorer results.
 This is progress on resource/recovery coverage, not completion of long-history
 production startup, final-package or deployment qualification.
+
+The local checkpoint path also supports retained branches now. It refreshes
+after nonwinning appends, authenticates the complete retained log, preserves
+the first-arrival equal-work winner, and checks active state/header consistency.
+Targeted regressions cover cached restart, full-replay fallback, losing-branch
+corruption and subsequent reorganization. This removes the linear-only
+eligibility restriction; it does not turn a checkpoint into an untrusted
+consensus snapshot or establish long full-size-history startup performance.

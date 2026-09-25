@@ -173,6 +173,28 @@ fn preserved_full_v4_explorer_read_cost() {
         assert_eq!(black_box(checked.block_id()), block_id);
     }
     let checked_identity_ns = checked_identity_start.elapsed().as_nanos();
+    let checkpoint_start = Instant::now();
+    let restored = crate::startup_snapshot::load_startup_snapshot(
+        &path,
+        &node.log,
+        &path.join(BLOCK_LOG_FILE),
+        node.params,
+        &node.verifier,
+    )
+    .unwrap()
+    .expect("normal full-proof admission must leave an eligible checkpoint");
+    assert_eq!(
+        restored.state.encode_local_snapshot().unwrap(),
+        node.state.encode_local_snapshot().unwrap()
+    );
+    assert_eq!(restored.index.active_chain, node.index.active_chain);
+    assert_eq!(restored.index.active_work, node.index.active_work);
+    assert_eq!(
+        restored.index.blocks[&block_id].locator,
+        node.index.blocks[&block_id].locator
+    );
+    let checkpoint_scan_ms = checkpoint_start.elapsed().as_millis();
+    drop(restored);
     println!(
         "FULL_V4_EXPLORER_READ_COST {}",
         serde_json::json!({
@@ -184,6 +206,8 @@ fn preserved_full_v4_explorer_read_cost() {
             "iterations": ITERATIONS, "block_detail_total_us": block_reads_us,
         "address_detail_total_us": address_reads_us, "twenty_block_id_hashes_us": repeated_identity_us,
         "twenty_authenticated_id_accesses_ns": checked_identity_ns,
+        "checkpoint_state_matched": true, "checkpoint_scan_ms": checkpoint_scan_ms,
+        "checkpoint_scope": "one full-size block with already initialized CPU verifier; not process startup or fork-history qualification",
         })
     );
     drop(node);

@@ -5177,8 +5177,9 @@ impl Node {
 
     /// Writes a two-slot, locally authenticated startup snapshot.
     ///
-    /// The current format deliberately supports only a linear active-chain
-    /// log. Nodes that have retained side branches continue to use full replay.
+    /// The canonical state and every retained fork locator are bound to the
+    /// exact log extent. Restart authenticates the complete retained record
+    /// chain before using this cache; an ineligible cache falls back to replay.
     pub fn persist_startup_snapshot(&self) -> Result<(), NodeError> {
         startup_snapshot::persist_startup_snapshot(self)
     }
@@ -7329,11 +7330,11 @@ impl Node {
                     guard.finish(RemoteProofRequestState::Completed);
                 }
                 // Keep the authenticated fast-start state current while the
-                // node is running. A snapshot failure is non-authoritative:
-                // startup safely falls back to replaying the block log.
-                if canonical_tip_changed {
-                    let _ = self.persist_startup_snapshot();
-                }
+                // node is running, including after nonwinning side-branch
+                // appends that change the retained log but not the active tip.
+                // A snapshot failure is non-authoritative: startup safely
+                // falls back to replaying the block log.
+                let _ = self.persist_startup_snapshot();
                 Ok(outcome.fees)
             }
             Err(error) => {
@@ -14720,14 +14721,20 @@ mod tests {
             )
         };
 
-        let node = Node::open(&path).unwrap();
-        assert_eq!(node.state.tip(), b2_id);
-        assert_ne!(node.state.tip(), a2_id);
-        assert_eq!(node.index.active_chain, vec![genesis, b1_id, b2_id]);
-        assert_eq!(node.index.active_work, work);
-        assert!(node.contains_block(a1_id));
-        assert!(node.contains_block(a2_id));
-        drop(node);
+        for expected_snapshot in [true, false] {
+            let node = Node::open(&path).unwrap();
+            assert_eq!(node.startup_snapshot_used, expected_snapshot);
+            assert_eq!(node.state.tip(), b2_id);
+            assert_ne!(node.state.tip(), a2_id);
+            assert_eq!(node.index.active_chain, vec![genesis, b1_id, b2_id]);
+            assert_eq!(node.index.active_work, work);
+            assert!(node.contains_block(a1_id));
+            assert!(node.contains_block(a2_id));
+            drop(node);
+            if expected_snapshot {
+                startup_snapshot::invalidate_fixture_snapshots(&path);
+            }
+        }
         clean_test_dir(&path);
     }
 
@@ -15811,8 +15818,8 @@ mod tests {
         drop(node);
         let mut node = Node::open(&path).unwrap();
         assert!(
-            !node.startup_snapshot_used,
-            "fork logs must use full replay"
+            node.startup_snapshot_used,
+            "a current fork snapshot should restore"
         );
         assert_eq!(
             node.explorer_transaction(&query).unwrap().unwrap().block_id,
@@ -15860,16 +15867,22 @@ mod tests {
             Some(hex::encode(confirmed.block_id()))
         );
         drop(node);
-        let mut reopened = Node::open(&path).unwrap();
-        assert_eq!(
-            reopened
-                .explorer_transaction(&query)
-                .unwrap()
-                .unwrap()
-                .block_height,
-            Some(6)
-        );
-        drop(reopened);
+        for expected_snapshot in [true, false] {
+            let mut reopened = Node::open(&path).unwrap();
+            assert_eq!(reopened.startup_snapshot_used, expected_snapshot);
+            assert_eq!(
+                reopened
+                    .explorer_transaction(&query)
+                    .unwrap()
+                    .unwrap()
+                    .block_height,
+                Some(6)
+            );
+            drop(reopened);
+            if expected_snapshot {
+                startup_snapshot::invalidate_fixture_snapshots(&path);
+            }
+        }
         clean_test_dir(&path);
     }
 

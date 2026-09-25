@@ -99,6 +99,43 @@ and `CMFD_RECOVERY_TX_PER_BLOCK` defaults to 20 (bounded 1-20). The two funding
 blocks and splitting transaction are additional. The test refuses an existing
 fixture directory and removes only its own disposable directory on success.
 
+`CMFD_RECOVERY_FORK_EVERY` defaults to zero (no siblings). Set it to a bounded
+interval of 1-1,024 to append a real, separately validated equal-work sibling
+after each selected canonical block. This mode tests checkpoint restoration
+with retained branches, including duplicate transactions across forks. The
+reported canonical block count and total retained record count stay separate.
+For example:
+
+```sh
+CMFD_RECOVERY_FORK_EVERY=16 cargo test --locked -p cmfd-node --lib \
+  explorer_dense_valid_history_recovery -- --ignored --nocapture --test-threads=1
+```
+
+The 16-block interval run passed on Windows and Linux with 514 canonical
+blocks, 32 retained siblings, 546 records, 10,241 distinct transactions and a
+6,498,990-byte log. The final record was an equal-work nonwinning sibling.
+Cached restart and both full-replay paths agreed on the exact state and all
+queried explorer views. Debug opening measurements were:
+
+| Path | Windows | Linux (WSL, same host) |
+| --- | ---: | ---: |
+| Full replay | 19.75 s | 14.07 s |
+| Current fork checkpoint | 0.226 s | 0.189 s |
+| Damaged-cache fallback | 21.32 s | 14.04 s |
+
+These runs overlapped other CPU-only checks and retain the tiny-profile scope
+above. They do not establish production startup or cross-platform speed ratios.
+Normal regressions additionally cover equal-work arrival-order selection,
+post-restart reorgs, invalid new-block rejection, forged losing-branch state,
+plausible active-header mutation and complete losing-record corruption.
+
+The preserved full-size V4 proof was also reaccepted by the normal Windows
+CPU verifier after the fork-checkpoint change. Its 12,025,864-byte encoded
+block scanned/restored matching checkpoint state in 39 ms using the already
+initialized verifier. Verifier/model opening took 114.16 seconds and CPU block
+admission 9.48 seconds in that debug run. This verifies one genuine full-size
+block; 39 ms is not process startup or full-size fork-history performance.
+
 ## What remains outside this evidence
 
 The tiny fixture's complete log is smaller than one production proof. It
@@ -106,8 +143,9 @@ does not establish startup time for a long chain of 12,025,320-byte V4 proofs.
 Separate preserved-proof checks have exercised normal full CPU admission on
 Windows and Linux; they are also not a dense production chain.
 
-Startup snapshots still require an exact linear active-chain log, still scan
-the full retained record chain, and fall back to full replay when retained
-side branches make the current snapshot format ineligible. Long full-size
-history, retained-fork growth, sustained query load, service-identity restore,
-final signed-package smoke and operational recovery remain separate gates.
+Startup snapshots now support retained branches but still scan the full
+retained record chain. Missing, stale, corrupt or inconsistent caches fall
+back to full replay; corrupt authoritative records still cause startup to
+fail. Long full-size history, retained-fork growth, sustained query load,
+service-identity restore, final signed-package smoke and operational recovery
+remain separate gates.

@@ -58,6 +58,9 @@ pub(super) fn load_startup_snapshot(
 }
 
 pub(super) fn persist_startup_snapshot(node: &Node) -> Result<(), NodeError> {
+    if node.storage_faulted {
+        return Err(NodeError::StorageFaulted);
+    }
     let log_path = node.data_dir.join(super::BLOCK_LOG_FILE);
     verify_retained_block_log_path(&node.log, &log_path)?;
     let observed_length = node
@@ -65,13 +68,12 @@ pub(super) fn persist_startup_snapshot(node: &Node) -> Result<(), NodeError> {
         .metadata()
         .map_err(|source| io_error("inspect block log for startup snapshot", &log_path, source))?
         .len();
-    if observed_length != node.block_log_length
-        || node.index.active_chain.len().checked_sub(1) != Some(node.index.blocks.len())
-    {
+    if observed_length != node.block_log_length {
         return Err(NodeError::CorruptLog(
-            "startup snapshots currently require an exact linear active-chain log".to_owned(),
+            "startup snapshot does not match the retained log length".to_owned(),
         ));
     }
+    validate_active_state(&node.state, &node.index)?;
     let state_bytes = node
         .state
         .encode_local_snapshot()
@@ -353,10 +355,8 @@ fn load_slot(
     }
     index.active_chain = vec![index.genesis];
     index.active_chain.extend(index.path_to(winning_tip)?);
-    if index.active_chain.len() != record_count.saturating_add(1) {
-        return Ok(None);
-    }
     index.active_work = winning_work;
+    validate_active_state(&state, &index)?;
     // Do not trust transaction locations serialized by a cache. The normal
     // startup scan already decoded every authenticated record, and all of its
     // locators were compared above with the restored fork index.
@@ -374,6 +374,43 @@ fn load_slot(
             })?,
         },
     }))
+}
+
+/// The cached state belongs to the selected chain, not necessarily the last
+/// appended record. Nonwinning branches remain in the index and are still
+/// checked against every record in the complete retained-log scan on load.
+fn validate_active_state(state: &ChainState, index: &BlockIndex) -> Result<(), NodeError> {
+    // Equal-work arrivals do not displace the first retained winner. Match
+    // live strict-greater activation and the full-replay ordinal tie-break.
+    let winner = index.blocks.values().max_by(|left, right| {
+        left.cumulative_work
+            .cmp(&right.cumulative_work)
+            .then_with(|| right.locator.ordinal.cmp(&left.locator.ordinal))
+    });
+    let winning_tip = winner.map_or(index.genesis, |entry| entry.block_id());
+    let winning_work = winner.map_or(U512::zero(), |entry| entry.cumulative_work);
+    let expected_len = usize::try_from(state.next_height()).map_err(|_| {
+        NodeError::CorruptLog("startup state height does not fit this platform".to_owned())
+    })?;
+    let mut active_chain = vec![index.genesis];
+    active_chain.extend(index.path_to(winning_tip)?);
+    if state.tip() != winning_tip
+        || active_chain.len() != expected_len
+        || index.active_chain != active_chain
+        || index.active_work != winning_work
+    {
+        return Err(NodeError::CorruptLog(
+            "startup state and active fork metadata disagree".to_owned(),
+        ));
+    }
+    if let Some(winner) = winner
+        && winner.successor_header != state.successor_header_preflight()?
+    {
+        return Err(NodeError::CorruptLog(
+            "startup active header does not match cached chain state".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn persist_slot(path: &Path, bytes: &[u8]) -> Result<(), NodeError> {
@@ -424,6 +461,26 @@ fn persist_slot(path: &Path, bytes: &[u8]) -> Result<(), NodeError> {
 fn snapshot_path(data_dir: &Path, slot: u8) -> PathBuf {
     data_dir.join(format!("{STARTUP_SNAPSHOT_FILE_PREFIX}.{slot}.bin"))
 }
+
+#[cfg(test)]
+pub(super) fn invalidate_fixture_snapshots(data_dir: &Path) {
+    assert!(data_dir.starts_with(std::env::temp_dir()));
+    let mut damaged = 0;
+    for slot in 0..=1 {
+        let path = snapshot_path(data_dir, slot);
+        if path.exists() {
+            let mut bytes = fs::read(&path).unwrap();
+            *bytes.last_mut().unwrap() ^= 1;
+            fs::write(path, bytes).unwrap();
+            damaged += 1;
+        }
+    }
+    assert!(damaged > 0, "fixture must exercise an existing cache");
+}
+
+#[cfg(test)]
+#[path = "startup_snapshot_fork_tests.rs"]
+mod fork_tests;
 
 fn write_count(bytes: &mut Vec<u8>, count: usize) -> Result<(), NodeError> {
     bytes.extend_from_slice(

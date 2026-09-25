@@ -55,9 +55,10 @@ arbitrary corruption, or replace offline backups.
 ## Fast-start checkpoints
 
 After a full successful replay, the node writes a two-slot, network-bound
-startup checkpoint for an exact linear active-chain log. Every accepted
-canonical block refreshes it, as does a clean node or pool shutdown; an
-operator can also request one explicitly:
+startup checkpoint for the canonical state and all retained branches. Every
+accepted block refreshes it, including a nonwinning side-branch append that
+changes the log without changing the active tip. A clean node or pool shutdown
+also refreshes it; an operator can request one explicitly:
 
 ```text
 cmfd-node --data-dir <node-data> storage-checkpoint
@@ -75,11 +76,20 @@ checkpoint is not eligible, the node reconstructs the same state through full
 deterministic replay. The status field `startup_snapshot_used` reports which
 path opened the node.
 
+Fork-aware loading recomputes cumulative work from retained targets, preserves
+the first accepted winner on equal work, and reconstructs the active ancestry.
+The restored state must agree with that winner, chain length, cumulative work
+and active successor-header metadata. The last appended record need not be
+on the winning branch. Corrupt losing-branch records are not ignored, and
+invalid new blocks still pass through normal admission rules after restart.
+
 This is a local crash-safe cache, not a consensus state root. It does not
 protect against an attacker able to replace both node storage and the cache,
-and it intentionally does not prune `blocks.log`. Side-branch-capable
-snapshots, historical serving policy, pruning, background log scrubbing, and a
-long-history bounded-startup measurement remain mainnet gates.
+and it intentionally does not prune `blocks.log`. Use checkpoints created by
+the matching local node or your own trusted backup, not untrusted third-party
+state downloads. Historical serving policy, pruning, background log scrubbing,
+long-history bounded-startup measurement and signed-package recovery remain
+separate qualification requirements.
 
 The [explorer resource qualification](explorer-resource-qualification.md)
 separates synthetic index memory measurements, valid tiny-profile recovery

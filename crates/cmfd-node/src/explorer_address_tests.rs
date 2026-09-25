@@ -282,11 +282,16 @@ fn address_history_and_balances_follow_forks_orphans_reconfirmation_and_replay()
     assert_eq!(expected.history.len(), 1);
     assert_eq!(expected.history[0].block_id, hex::encode(a2.block_id()));
     drop(node);
-    let mut reopened = Node::open(&path).unwrap();
-    assert!(!reopened.startup_snapshot_used);
-    assert_eq!(query(&mut reopened, recipient), expected);
-    assert_balance(&mut reopened, recipient);
-    drop(reopened);
+    for expected_snapshot in [true, false] {
+        let mut reopened = Node::open(&path).unwrap();
+        assert_eq!(reopened.startup_snapshot_used, expected_snapshot);
+        assert_eq!(query(&mut reopened, recipient), expected);
+        assert_balance(&mut reopened, recipient);
+        drop(reopened);
+        if expected_snapshot {
+            crate::startup_snapshot::invalidate_fixture_snapshots(&path);
+        }
+    }
     clean_test_dir(&path);
 }
 

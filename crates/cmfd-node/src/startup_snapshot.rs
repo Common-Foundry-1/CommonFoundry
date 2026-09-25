@@ -319,6 +319,12 @@ fn load_slot(
     if scanned.log_length != snapshot_log_length
         || scanned.last_record_digest != last_record_digest
         || scanned.records.len() != record_count
+        || scanned.records.iter().any(|locator| {
+            index
+                .blocks
+                .get(&locator.block_id)
+                .is_none_or(|entry| entry.locator != *locator)
+        })
     {
         return Err(NodeError::CorruptLog(
             "startup snapshot block-log chain binding mismatch".to_owned(),
@@ -351,6 +357,10 @@ fn load_slot(
         return Ok(None);
     }
     index.active_work = winning_work;
+    // Do not trust transaction locations serialized by a cache. The normal
+    // startup scan already decoded every authenticated record, and all of its
+    // locators were compared above with the restored fork index.
+    index.transactions = scanned.transactions;
     verify_retained_block_log_path(log, log_path)?;
     Ok(Some(LoadedStartupSnapshot {
         state,
@@ -565,6 +575,38 @@ mod tests {
         assert_eq!(reopened.status().unwrap().accepted_height, 1);
         drop(reopened);
         let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn nonterminal_snapshot_locator_must_match_the_scanned_record() {
+        let path = test_dir("nonterminal-locator");
+        let now = unix_time_seconds().unwrap();
+        {
+            let mut node = Node::open_with_profile(&path, DEVNET_PROFILE).unwrap();
+            node.mine_once(node.wallet_destination(), now, DEFAULT_MINING_ATTEMPTS)
+                .unwrap();
+            node.mine_once(node.wallet_destination(), now + 60, DEFAULT_MINING_ATTEMPTS)
+                .unwrap();
+        }
+        let snapshot = snapshot_path(&path, 0);
+        let mut bytes = fs::read(&snapshot).unwrap();
+        let state_length = usize::try_from(u64::from_le_bytes(
+            bytes[SNAPSHOT_HEADER_BYTES - 8..SNAPSHOT_HEADER_BYTES]
+                .try_into()
+                .unwrap(),
+        ))
+        .unwrap();
+        let accepted_at_offset = SNAPSHOT_HEADER_BYTES + state_length + 8 + 8 + 8 + 1 + 32;
+        bytes[accepted_at_offset..accepted_at_offset + 8].copy_from_slice(&(now + 1).to_le_bytes());
+        let digest_offset = bytes.len() - SNAPSHOT_DIGEST_BYTES;
+        let digest = snapshot_digest(&bytes[..digest_offset]);
+        bytes[digest_offset..].copy_from_slice(&digest);
+        fs::write(&snapshot, bytes).unwrap();
+        let reopened = Node::open_with_profile(&path, DEVNET_PROFILE).unwrap();
+        assert!(!reopened.startup_snapshot_used);
+        assert_eq!(reopened.state.next_height(), 3);
+        drop(reopened);
+        fs::remove_dir_all(&path).unwrap();
     }
 
     #[test]

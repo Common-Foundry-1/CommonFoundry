@@ -5,7 +5,6 @@ use crate::{Node, NodeError, ProofProfile, read_indexed_block};
 
 const EXPLORER_BLOCK_LIMIT: usize = 12;
 const EXPLORER_TRANSACTION_LIMIT: usize = 24;
-const EXPLORER_TRANSACTION_LOOKBACK: usize = 4_096;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ExplorerBlock {
@@ -185,6 +184,9 @@ impl Node {
         &mut self,
         query: &str,
     ) -> Result<Option<ExplorerTransaction>, NodeError> {
+        if self.storage_faulted {
+            return Err(NodeError::StorageFaulted);
+        }
         let Some(txid) = parse_identifier(query) else {
             return Ok(None);
         };
@@ -199,33 +201,30 @@ impl Node {
             )?));
         }
 
-        let active_ids: Vec<_> = self
-            .index
-            .active_chain
-            .iter()
-            .skip(1)
-            .rev()
-            .take(EXPLORER_TRANSACTION_LOOKBACK)
-            .copied()
-            .collect();
-        for block_id in active_ids {
-            let block = self.read_explorer_block(block_id)?;
-            if let Some(transaction) = block
-                .transactions
-                .iter()
-                .find(|transaction| transaction.txid() == txid)
-            {
-                return Ok(Some(transaction_summary(
-                    transaction,
-                    Some(block_id),
-                    Some(block.challenge.height),
-                    Some(block.challenge.timestamp),
-                    None,
-                    encode_transaction(transaction)?.len(),
-                )?));
-            }
-        }
-        Ok(None)
+        let Some(location) = self.index.transactions.active_location(&txid, &self.index) else {
+            return Ok(None);
+        };
+        // The index only chooses a locator. Reauthenticate the complete stored
+        // block and check the exact transaction before reporting confirmation.
+        let block = self.read_explorer_block(location.block_id)?;
+        let transaction = block
+            .transactions
+            .get(location.transaction_position)
+            .filter(|transaction| transaction.txid() == txid)
+            .ok_or_else(|| {
+                NodeError::CorruptLog(
+                    "explorer transaction index does not match its authenticated block".to_owned(),
+                )
+            });
+        let transaction = self.latch_authenticated_storage_failure(transaction)?;
+        Ok(Some(transaction_summary(
+            transaction,
+            Some(location.block_id),
+            Some(block.challenge.height),
+            Some(block.challenge.timestamp),
+            None,
+            encode_transaction(transaction)?.len(),
+        )?))
     }
 
     fn resolve_active_block(&self, query: &str) -> Option<(usize, [u8; 32])> {
@@ -244,6 +243,10 @@ impl Node {
     }
 
     fn read_explorer_block(&mut self, block_id: [u8; 32]) -> Result<Block, NodeError> {
+        #[cfg(test)]
+        {
+            self.explorer_block_reads += 1;
+        }
         let indexed = self.index.blocks.get(&block_id).cloned().ok_or_else(|| {
             NodeError::CorruptLog("active explorer lookup refers to an absent block".to_owned())
         })?;
@@ -363,7 +366,6 @@ mod tests {
         const {
             assert!(EXPLORER_BLOCK_LIMIT <= 32);
             assert!(EXPLORER_TRANSACTION_LIMIT <= 64);
-            assert!(EXPLORER_TRANSACTION_LOOKBACK <= 4_096);
         }
     }
 

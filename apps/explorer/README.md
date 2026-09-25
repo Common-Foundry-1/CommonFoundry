@@ -27,9 +27,19 @@ npm run types -- --check
 ```
 
 The node provides bounded read-only endpoints at `/v1/explorer`,
-`/v1/explorer/block/{height-or-id}`, and `/v1/explorer/transaction/{txid}`. Transaction lookup is
-currently bounded to the newest 4,096 canonical blocks; a persistent address and transaction index
-is the next scale-out step before public mainnet deployment.
+`/v1/explorer/block/{height-or-id}`, and `/v1/explorer/transaction/{txid}`. Transaction lookup covers
+the full retained canonical history, not only the latest 4,096 blocks. The native node maintains
+compact transaction locations for committed blocks and reconstructs them during the existing
+authenticated block-log startup scan, including when a startup snapshot is used. The snapshot and
+block-log formats are unchanged. No transaction hint from an independent cache is trusted.
+
+Queries check current active-chain membership, so side branches do not appear as confirmations
+and reorganizations do not require rewriting the location index. A confirmed result reauthenticates
+its full stored block and exact transaction position/ID. A missing or orphan-only transaction reads
+no block bodies; a confirmed lookup reads only the matching block. Mempool lookup remains separate.
+The index itself is in memory and grows with retained transaction occurrences across forks. This
+does not yet provide address-history search or a disk-backed index for larger deployments; those
+remain separate preparation work, including memory/startup-cost qualification.
 
 ## Mainnet preparation
 
@@ -63,7 +73,7 @@ signed a8b23ec runtime does not emit it. The expected ID is pinned to
 `packaging/mainnet/MAINNET-PLAN.json` by tests. Generate binding/runtime types
 with `npm run types` after configuration changes rather than editing them by hand.
 
-Before public cutover, finish historical transaction indexing, prepare the
+Before public cutover, finish address-history indexing and index resource qualification, prepare the
 separate mainnet origin tunnel rule below, and qualify the actual native origin
 when its launch gate permits startup. Preserve the existing RC origin and pool
 rules. The new origin must expose only these anchored read-only route paths to

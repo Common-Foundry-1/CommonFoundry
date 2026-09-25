@@ -71,6 +71,7 @@ pub(crate) mod exchange_signer;
 pub(crate) mod exchange_withdrawal;
 pub(crate) mod exchange_withdrawal_v3;
 pub mod explorer;
+mod explorer_index;
 pub mod logging;
 #[cfg(feature = "production-v4")]
 pub mod mainnet_custody;
@@ -3633,6 +3634,8 @@ pub struct Node {
     commit_race_barrier: Option<Arc<CommitRaceBarrier>>,
     #[cfg(test)]
     completion_fault_barrier: Option<Arc<CompletionFaultBarrier>>,
+    #[cfg(test)]
+    explorer_block_reads: usize,
     _lock: DataDirLock,
 }
 
@@ -3692,6 +3695,9 @@ impl IndexedBlock {
 struct BlockIndex {
     genesis: [u8; 32],
     blocks: HashMap<[u8; 32], Arc<IndexedBlock>>,
+    /// Full-history transaction locations derived from the retained block log.
+    /// Entries include side branches; queries check current canonical membership.
+    transactions: explorer_index::TransactionIndex,
     /// Active block identifiers in height order, including virtual genesis at
     /// index zero.
     active_chain: Vec<[u8; 32]>,
@@ -3726,6 +3732,7 @@ impl BlockIndex {
         Self {
             genesis,
             blocks: HashMap::new(),
+            transactions: explorer_index::TransactionIndex::default(),
             active_chain: vec![genesis],
             active_work: U512::zero(),
         }
@@ -3931,6 +3938,7 @@ struct PreparedBlock {
     ancestors: Vec<[u8; 32]>,
     activation_chain: Option<Vec<[u8; 32]>>,
     candidate: ValidatedCandidate,
+    transaction_ids: Vec<[u8; 32]>,
 }
 
 impl PreparedBlock {
@@ -5110,6 +5118,8 @@ impl Node {
             commit_race_barrier: None,
             #[cfg(test)]
             completion_fault_barrier: None,
+            #[cfg(test)]
+            explorer_block_reads: 0,
             _lock: lock,
         };
         // A persisted v3 marker or slot latches the native wallet closed before
@@ -8047,6 +8057,7 @@ fn prepare_block(
         ancestors,
         activation_chain,
         candidate,
+        transaction_ids: block.transactions.iter().map(Transaction::txid).collect(),
     })
 }
 
@@ -8223,6 +8234,9 @@ fn commit_prepared(
     if previous.is_some() {
         return Err(NodeError::DuplicateBlock(prepared.block_id));
     }
+    index
+        .transactions
+        .insert_block(prepared.block_id, prepared.transaction_ids);
     if activates {
         if was_active {
             index.active_chain.push(prepared.block_id);
@@ -9712,6 +9726,7 @@ enum BlockRecordVersion {
 struct ScannedReplayLog {
     records: Vec<BlockRecordLocator>,
     children: HashMap<[u8; 32], Vec<usize>>,
+    transactions: explorer_index::TransactionIndex,
     last_record_digest: [u8; 32],
     log_length: u64,
 }
@@ -10482,6 +10497,7 @@ fn replay_log_into(
 
     verify_scanned_replay_log_unchanged(&replay_file, path, &scanned, params.network_id)?;
     verify_retained_block_log_path(log, path)?;
+    index.transactions = scanned.transactions;
     Ok(ReplayLogState {
         last_record_digest: scanned.last_record_digest,
         log_length: scanned.log_length,
@@ -10502,6 +10518,7 @@ fn scan_replay_log(
     let mut saw_v2 = false;
     let mut records = Vec::new();
     let mut children: HashMap<[u8; 32], Vec<usize>> = HashMap::new();
+    let mut transactions = explorer_index::TransactionIndex::default();
     let mut known_blocks = HashSet::from([params.genesis_hash]);
     loop {
         let offset = reader
@@ -10514,6 +10531,7 @@ fn scan_replay_log(
             return Ok(ScannedReplayLog {
                 records,
                 children,
+                transactions,
                 last_record_digest,
                 log_length,
             });
@@ -10580,6 +10598,7 @@ fn scan_replay_log(
             ParsedRecordPayload::V2 { .. } => BlockRecordVersion::V2,
         };
         let position = records.len();
+        transactions.insert_block(block_id, block.transactions.iter().map(Transaction::txid));
         children.entry(parent).or_default().push(position);
         records.push(BlockRecordLocator {
             ordinal: record_index,
@@ -15522,6 +15541,375 @@ mod tests {
         );
         assert!(response.network_id.is_none());
         drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn explorer_transaction_index_covers_history_beyond_4096_blocks_and_both_restart_paths() {
+        let path = test_dir("explorer-full-history");
+        let mut node = Node::open(&path).unwrap();
+        let funding = node
+            .mine_once(
+                default_miner_destination(),
+                DEVNET_GENESIS_TIMESTAMP + 60,
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        let transaction = spend_coinbase_output(&node, &funding, 2, 0x12, 0x31, 1);
+        let query = hex::encode(transaction.txid());
+        node.submit_transaction(transaction).unwrap();
+        assert_eq!(
+            node.explorer_transaction(&query).unwrap().unwrap().status,
+            "mempool"
+        );
+        assert_eq!(node.explorer_block_reads, 0);
+        node.mine_once(
+            default_miner_destination(),
+            DEVNET_GENESIS_TIMESTAMP + 120,
+            DEFAULT_MINING_ATTEMPTS,
+        )
+        .unwrap();
+        let expected = node.explorer_transaction(&query).unwrap().unwrap();
+        assert_eq!(expected.block_height, Some(2));
+        assert_eq!(expected.status, "confirmed");
+        assert_eq!(node.explorer_block_reads, 1);
+        drop(node);
+
+        let mut node = Node::open(&path).unwrap();
+        assert!(node.startup_snapshot_used);
+        assert_eq!(
+            node.explorer_transaction(&query).unwrap(),
+            Some(expected.clone())
+        );
+        let params = node.params;
+        let verifier = node.verifier.clone();
+        let mut state = node.state.clone();
+        let mut previous_digest = node.last_record_digest;
+        drop(node);
+
+        // Produce a real, consensus-valid durable history without rewriting a
+        // startup snapshot and syncing the filesystem on every fixture block.
+        // The reopened node must fully replay every block and reversible delta.
+        let mut log = OpenOptions::new()
+            .append(true)
+            .open(path.join(BLOCK_LOG_FILE))
+            .unwrap();
+        for height in 3..=4_100 {
+            let now = DEVNET_GENESIS_TIMESTAMP + height * 60;
+            let template = build_template_from_state(
+                &state,
+                &params,
+                default_miner_destination(),
+                now,
+                Vec::new(),
+            )
+            .unwrap();
+            let proof = verifier
+                .mine(&template.challenge, 0, DEFAULT_MINING_ATTEMPTS)
+                .unwrap();
+            let block = Block {
+                version: BLOCK_VERSION,
+                challenge: template.challenge,
+                coinbase: template.coinbase,
+                transactions: template.transactions,
+                proof,
+            };
+            let validated = state
+                .validate_block(
+                    &block,
+                    BlockValidationContext {
+                        now_unix_seconds: now,
+                    },
+                )
+                .unwrap();
+            let delta = validated.encode_reversible_state_delta().unwrap();
+            let record = encode_record_v2(
+                now,
+                &encode_block(&block).unwrap(),
+                &delta,
+                previous_digest,
+                params.network_id,
+            )
+            .unwrap();
+            previous_digest = complete_record_digest(&record);
+            log.write_all(&record).unwrap();
+            state.commit_validated(validated).unwrap();
+        }
+        log.sync_all().unwrap();
+        drop(log);
+
+        for expected_snapshot in [false, true] {
+            let mut reopened = Node::open(&path).unwrap();
+            assert_eq!(reopened.startup_snapshot_used, expected_snapshot);
+            assert_eq!(reopened.state.next_height(), 4_101);
+            assert_eq!(
+                reopened.explorer_transaction(&query).unwrap(),
+                Some(expected.clone())
+            );
+            assert_eq!(
+                reopened.explorer_block_reads, 1,
+                "a confirmed lookup reads only its own block"
+            );
+            assert!(
+                reopened
+                    .explorer_transaction(&"ff".repeat(32))
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                reopened.explorer_block_reads, 1,
+                "a missing lookup must not scan blocks"
+            );
+        }
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn explorer_transaction_index_tracks_competing_forks_orphans_and_reconfirmation() {
+        let path = test_dir("explorer-index-reorg");
+        let mut node = Node::open(&path).unwrap();
+        let funding = node
+            .mine_once(
+                default_miner_destination(),
+                DEVNET_GENESIS_TIMESTAMP + 60,
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        let transaction = spend_coinbase_output(&node, &funding, 2, 0x12, 0x31, 1);
+        let query = hex::encode(transaction.txid());
+        let a2 = mined_child_with_transactions(
+            &node,
+            funding.block_id(),
+            DEVNET_GENESIS_TIMESTAMP + 120,
+            0x41,
+            vec![transaction.clone()],
+        );
+        node.submit_block(a2.clone(), a2.challenge.timestamp)
+            .unwrap();
+        let b2 = mined_child_with_transactions(
+            &node,
+            funding.block_id(),
+            DEVNET_GENESIS_TIMESTAMP + 120,
+            0x42,
+            vec![transaction.clone()],
+        );
+        node.submit_block(b2.clone(), b2.challenge.timestamp)
+            .unwrap();
+        assert_eq!(
+            node.explorer_transaction(&query).unwrap().unwrap().block_id,
+            Some(hex::encode(a2.block_id()))
+        );
+        let b3 = mined_child(&node, b2.block_id(), DEVNET_GENESIS_TIMESTAMP + 180, 0x42);
+        node.submit_block(b3.clone(), b3.challenge.timestamp)
+            .unwrap();
+        assert_eq!(
+            node.explorer_transaction(&query).unwrap().unwrap().block_id,
+            Some(hex::encode(b2.block_id()))
+        );
+        drop(node);
+        let mut node = Node::open(&path).unwrap();
+        assert!(
+            !node.startup_snapshot_used,
+            "fork logs must use full replay"
+        );
+        assert_eq!(
+            node.explorer_transaction(&query).unwrap().unwrap().block_id,
+            Some(hex::encode(b2.block_id()))
+        );
+
+        let mut parent = a2.block_id();
+        for height in 3..=4 {
+            let block = mined_child(&node, parent, DEVNET_GENESIS_TIMESTAMP + height * 60, 0x41);
+            parent = block.block_id();
+            node.submit_block(block.clone(), block.challenge.timestamp)
+                .unwrap();
+        }
+        assert_eq!(
+            node.explorer_transaction(&query).unwrap().unwrap().block_id,
+            Some(hex::encode(a2.block_id()))
+        );
+        parent = funding.block_id();
+        for height in 2..=5 {
+            let block = mined_child(&node, parent, DEVNET_GENESIS_TIMESTAMP + height * 60, 0x43);
+            parent = block.block_id();
+            node.submit_block(block.clone(), block.challenge.timestamp)
+                .unwrap();
+        }
+        let reads = node.explorer_block_reads;
+        assert!(
+            node.explorer_transaction(&query).unwrap().is_none(),
+            "orphaned occurrences are not confirmations"
+        );
+        assert_eq!(node.explorer_block_reads, reads);
+        node.submit_transaction(transaction).unwrap();
+        assert_eq!(
+            node.explorer_transaction(&query).unwrap().unwrap().status,
+            "mempool"
+        );
+        let confirmed = node
+            .mine_once(
+                default_miner_destination(),
+                DEVNET_GENESIS_TIMESTAMP + 360,
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        assert_eq!(
+            node.explorer_transaction(&query).unwrap().unwrap().block_id,
+            Some(hex::encode(confirmed.block_id()))
+        );
+        drop(node);
+        let mut reopened = Node::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .explorer_transaction(&query)
+                .unwrap()
+                .unwrap()
+                .block_height,
+            Some(6)
+        );
+        drop(reopened);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn explorer_transaction_index_preserves_multiple_positions_and_rejects_out_of_bounds_hints() {
+        let path = test_dir("explorer-index-positions");
+        let mut node = Node::open(&path).unwrap();
+        let funding = node
+            .mine_once(
+                default_miner_destination(),
+                DEVNET_GENESIS_TIMESTAMP + 60,
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        let first = spend_coinbase_output(&node, &funding, 1, 0x11, 0x31, 1);
+        let second = spend_coinbase_output(&node, &funding, 2, 0x12, 0x32, 2);
+        let block = mined_child_with_transactions(
+            &node,
+            funding.block_id(),
+            DEVNET_GENESIS_TIMESTAMP + 120,
+            0x41,
+            vec![first, second],
+        );
+        node.submit_block(block.clone(), block.challenge.timestamp)
+            .unwrap();
+        for (position, transaction) in block.transactions.iter().enumerate() {
+            let location = node
+                .index
+                .transactions
+                .active_location(&transaction.txid(), &node.index)
+                .unwrap();
+            assert_eq!(location.transaction_position, position);
+            let result = node
+                .explorer_transaction(&hex::encode(transaction.txid()))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                result.output_atoms,
+                transaction.outputs[0].value.to_string()
+            );
+            assert_eq!(result.block_id, Some(hex::encode(block.block_id())));
+        }
+        assert_eq!(node.explorer_block_reads, 2);
+        drop(node);
+        let mut reopened = Node::open(&path).unwrap();
+        assert!(reopened.startup_snapshot_used);
+        for (position, transaction) in block.transactions.iter().enumerate() {
+            assert_eq!(
+                reopened
+                    .index
+                    .transactions
+                    .active_location(&transaction.txid(), &reopened.index)
+                    .unwrap()
+                    .transaction_position,
+                position
+            );
+            assert!(
+                reopened
+                    .explorer_transaction(&hex::encode(transaction.txid()))
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        let forged = [0xcd; 32];
+        reopened
+            .index
+            .transactions
+            .insert_block(block.block_id(), [[0xab; 32], [0xbc; 32], forged]);
+        assert!(matches!(
+            reopened.explorer_transaction(&hex::encode(forged)),
+            Err(NodeError::CorruptLog(_))
+        ));
+        assert!(reopened.storage_faulted);
+        drop(reopened);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn explorer_transaction_index_rejects_invalid_admission_and_forged_lookup_hints() {
+        let path = test_dir("explorer-index-invalid");
+        let mut node = Node::open(&path).unwrap();
+        let funding = node
+            .mine_once(
+                default_miner_destination(),
+                DEVNET_GENESIS_TIMESTAMP + 60,
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        let transaction = spend_coinbase_output(&node, &funding, 2, 0x12, 0x31, 1);
+        let query = hex::encode(transaction.txid());
+        let valid = mined_child_with_transactions(
+            &node,
+            funding.block_id(),
+            DEVNET_GENESIS_TIMESTAMP + 120,
+            0x41,
+            vec![transaction],
+        );
+        let mut invalid = valid.clone();
+        invalid.challenge.transaction_root[0] ^= 1;
+        let length = node.block_log_length;
+        assert!(
+            node.submit_block(invalid, DEVNET_GENESIS_TIMESTAMP + 120)
+                .is_err()
+        );
+        assert_eq!(node.block_log_length, length);
+        assert!(node.explorer_transaction(&query).unwrap().is_none());
+        assert_eq!(node.explorer_block_reads, 0);
+        node.submit_block(valid.clone(), DEVNET_GENESIS_TIMESTAMP + 120)
+            .unwrap();
+        let forged = [0xab; 32];
+        node.index
+            .transactions
+            .insert_block(valid.block_id(), [forged]);
+        assert!(
+            matches!(node.explorer_transaction(&hex::encode(forged)), Err(NodeError::CorruptLog(message)) if message.contains("transaction index"))
+        );
+        assert!(node.storage_faulted);
+        assert!(matches!(
+            node.explorer_transaction(&query),
+            Err(NodeError::StorageFaulted)
+        ));
+        drop(node);
+
+        // Neither the poisoned hint nor its fault latch is persisted. Startup
+        // rebuilds locations from authenticated log bytes, not serialized hints.
+        let mut reopened = Node::open(&path).unwrap();
+        assert!(
+            reopened
+                .explorer_transaction(&hex::encode(forged))
+                .unwrap()
+                .is_none()
+        );
+        assert!(reopened.explorer_transaction(&query).unwrap().is_some());
+        let mut locator = reopened.index.blocks[&valid.block_id()].locator;
+        locator.complete_digest[0] ^= 1;
+        set_indexed_locator(&mut reopened, valid.block_id(), locator);
+        assert!(matches!(
+            reopened.explorer_transaction(&query),
+            Err(NodeError::CorruptLog(_))
+        ));
+        assert!(reopened.storage_faulted);
+        drop(reopened);
         clean_test_dir(&path);
     }
 

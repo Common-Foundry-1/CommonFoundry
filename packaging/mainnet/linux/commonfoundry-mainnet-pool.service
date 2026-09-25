@@ -19,6 +19,10 @@ LoadCredential=wallet-passphrase:/etc/commonfoundry-mainnet-pool/wallet-passphra
 LoadCredential=pool-private-key:/etc/commonfoundry-mainnet-pool/pool-key.der
 Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStartPre=/opt/commonfoundry-mainnet-pool/current/cmfd-node mainnet-launch-info
+# systemd may use an ACL-backed 0440 credential; the wallet requires 0600.
+# Copies remain in the service-owned 0700 runtime directory and vanish on stop.
+ExecStartPre=/usr/bin/install --mode=0600 %d/wallet-passphrase /run/commonfoundry-mainnet-pool/wallet-passphrase
+ExecStartPre=/usr/bin/install --mode=0600 %d/pool-private-key /run/commonfoundry-mainnet-pool/pool-private-key
 ExecStart=/usr/bin/python3 /opt/commonfoundry-mainnet-pool/current/mainnet-pool-service.py --run /etc/commonfoundry-mainnet-pool/pool.json
 KillSignal=SIGINT
 TimeoutStartSec=infinity

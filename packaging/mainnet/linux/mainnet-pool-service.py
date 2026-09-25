@@ -21,6 +21,7 @@ import sys
 INSTALL_BASE = Path("/opt/commonfoundry-mainnet-pool")
 ROOT = INSTALL_BASE / "current"
 STATE = Path("/var/lib/commonfoundry-mainnet-pool")
+RUNTIME = Path("/run/commonfoundry-mainnet-pool")
 CONFIG_BASE = Path("/etc/commonfoundry-mainnet-pool")
 RC_CERTIFICATE_SHA256 = "a4868a78e9d4d46bbb3c7867bd43bacbb4e8bb0a0ac61e54444b16250d525dc0"
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
@@ -324,8 +325,20 @@ def check_gpu_idle(expected_uuid: str) -> None:
 
 
 def credentials(config: dict, base: Path) -> tuple[Path, Path]:
+    try:
+        directory = base.lstat()
+    except OSError as exc:
+        raise PreflightError("private pool runtime credential directory is missing") from exc
+    if not stat.S_ISDIR(directory.st_mode):
+        raise PreflightError("pool runtime credential directory must not be a symlink")
+    if os.name == "posix" and (directory.st_uid != os.geteuid() or directory.st_mode & 0o077):
+        raise PreflightError("pool runtime credential directory must be service-owned and private")
     passphrase = base / "wallet-passphrase"
     private_key = base / "pool-private-key"
+    for path in (passphrase, private_key):
+        metadata = regular(path, "pool runtime credential")
+        if os.name == "posix" and (metadata.st_uid != os.geteuid() or metadata.st_mode & 0o077):
+            raise PreflightError("pool runtime credentials must be service-owned and 0600 or stricter")
     size = regular(passphrase, "pool wallet passphrase").st_size
     if not 12 <= size <= 1024:
         raise PreflightError("pool wallet passphrase must contain 12 to 1024 bytes")
@@ -409,11 +422,12 @@ def main() -> int:
     config_path = args.check or args.run
     if config_path != CONFIG_BASE / "pool.json":
         raise PreflightError("only the dedicated /etc/commonfoundry-mainnet-pool/pool.json is accepted")
-    credential_directory = os.environ.get("CREDENTIALS_DIRECTORY")
-    if not credential_directory:
-        raise PreflightError("systemd LoadCredential directory is required")
+    # The unit copies systemd's potentially ACL-backed credentials into its
+    # private runtime directory. Do not weaken the native wallet's 0600 policy.
+    if os.environ.get("RUNTIME_DIRECTORY") != str(RUNTIME):
+        raise PreflightError("the dedicated systemd RuntimeDirectory is required")
     config, data, scratch = preflight(config_path, ROOT, STATE, CONFIG_BASE, INSTALL_BASE,
-                                      Path(credential_directory))
+                                      RUNTIME)
     if args.check:
         print("Mainnet pool preflight passed; no beacon was fetched and no service was started.")
         return 0
@@ -429,7 +443,7 @@ def main() -> int:
     environment = dict(os.environ, CUDA_VISIBLE_DEVICES=config["gpu_uuid"],
                        RAYON_NUM_THREADS=str(config["worker_threads"]),
                        LD_LIBRARY_PATH=str(ROOT / "lib"))
-    os.execve(str(ROOT / "cmfd-node"), build_command(ROOT, STATE, Path(credential_directory), config), environment)
+    os.execve(str(ROOT / "cmfd-node"), build_command(ROOT, STATE, RUNTIME, config), environment)
     return 1
 
 

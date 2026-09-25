@@ -9,6 +9,15 @@
 
 ## Source baseline
 
+### September 25 pool credential compatibility
+
+Real systemd testing found that the pool passed an ACL-backed credential path
+to the wallet's stricter passphrase-file reader. The service now makes private,
+service-owned runtime copies, matching the seed template's approach, without
+relaxing wallet permissions. See the [reproduction and scoped test evidence](mainnet-pool-credential-qualification-20260925.md).
+This fix must be included in the newly reviewed source and final packages;
+no running pool or mainnet service was started or upgraded by the check.
+
 ### September 23-24 qualification checkpoint
 
 The owner has completed both separately encrypted reward wallets and selected

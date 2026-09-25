@@ -16,6 +16,7 @@ port, or service account may be reused.
 | Root-owned release copy | `/opt/commonfoundry-mainnet-pool/releases/<version>`; `current` points there |
 | Configuration and fresh certificate | `/etc/commonfoundry-mainnet-pool/pool.json`, `pool-cert.der` |
 | Root-only input credentials | `/etc/commonfoundry-mainnet-pool/wallet-passphrase`, `pool-key.der` |
+| Temporary service-owned credentials | `/run/commonfoundry-mainnet-pool/wallet-passphrase`, `pool-private-key` (0600; directory 0700) |
 | Pool state and encrypted wallet | `/var/lib/commonfoundry-mainnet-pool/data` |
 | GPU worker scratch | `/var/lib/commonfoundry-mainnet-pool/scratch` |
 | Miner TLS / P2P / loopback dashboard | TCP `29445` / `29454` / `29446` |
@@ -59,7 +60,14 @@ approved pool GPU still has a compute process. It never stops that process.
 4. Create a **new** pool wallet passphrase and a **new** DER TLS certificate
    and private key. Do not copy the RC encrypted wallet or RC TLS files.
    Store only the passphrase and private key as root-only files in `/etc`; the
-   unit passes them through systemd `LoadCredential`. Record hashes of the
+   unit passes them through systemd `LoadCredential`, then copies them as 0600
+   files into its private `RuntimeDirectory` before running the pool launcher.
+   This handles systemd versions that expose credentials with a named-user ACL
+   and a 0440 mode mask without weakening the wallet's 0600 requirement. The
+   runtime copies disappear when the service stops; keep the original root-only
+   files in `/etc`. Never put credentials in environment values or command-line
+   arguments. The launcher rejects a redirected/nonprivate runtime directory
+   or a group/world-accessible credential. Record hashes of the
    existing RC encrypted `wallet.key`, TLS private key and certificate into
    the three `forbidden_rc_*` fields without copying those secrets into the
    mainnet installation. The known AI01 public RC certificate fingerprint is

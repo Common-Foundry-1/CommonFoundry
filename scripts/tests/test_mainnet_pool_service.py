@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -35,6 +36,7 @@ class MainnetPoolServiceTests(unittest.TestCase):
         for directory in (self.root, self.state, self.config_base, self.credential_base):
             directory.mkdir(parents=True)
         self.state.chmod(0o700)
+        self.credential_base.chmod(0o700)
         self.assets = {
             "cmfd-node": b"mainnet node binary",
             "cmfd-launch": b"mainnet launch helper",
@@ -78,6 +80,8 @@ class MainnetPoolServiceTests(unittest.TestCase):
         (self.config_base / "pool-cert.der").write_bytes(cert)
         (self.credential_base / "pool-private-key").write_bytes(key)
         (self.credential_base / "wallet-passphrase").write_bytes(b"fresh random passphrase")
+        (self.credential_base / "pool-private-key").chmod(0o600)
+        (self.credential_base / "wallet-passphrase").chmod(0o600)
         self.config = {
             "schema": pool.SCHEMA, "expected_network_id": self.plan["network_id"],
             "expected_plan_digest": self.plan["launch_plan_digest"],
@@ -212,6 +216,7 @@ class MainnetPoolServiceTests(unittest.TestCase):
              mock.patch.object(pool, "STATE", self.state), \
              mock.patch.object(pool, "INSTALL_BASE", self.install), \
              mock.patch.object(pool, "CONFIG_BASE", self.config_base), \
+             mock.patch.object(pool, "RUNTIME", self.credential_base), \
              mock.patch.object(pool, "regular", side_effect=no_owner_check), \
              mock.patch.object(pool, "native_launch_info", return_value=self.info), \
              mock.patch.object(pool, "check_gpu"), \
@@ -220,7 +225,7 @@ class MainnetPoolServiceTests(unittest.TestCase):
              mock.patch.object(pool.subprocess, "run", side_effect=subprocess.CalledProcessError(1, "fetch")) as fetch, \
              mock.patch.object(pool.os, "execve") as execute, \
              mock.patch.object(sys, "argv", ["launcher", "--run", str(self.config_path)]), \
-             mock.patch.dict(pool.os.environ, {"CREDENTIALS_DIRECTORY": str(self.credential_base)}):
+             mock.patch.dict(pool.os.environ, {"RUNTIME_DIRECTORY": str(self.credential_base)}):
             with self.assertRaises(subprocess.CalledProcessError):
                 pool.main()
         fetch.assert_called_once_with([str(self.root / "cmfd-launch"), "fetch", "--runtime",
@@ -249,6 +254,7 @@ class MainnetPoolServiceTests(unittest.TestCase):
              mock.patch.object(pool, "STATE", self.state), \
              mock.patch.object(pool, "INSTALL_BASE", self.install), \
              mock.patch.object(pool, "CONFIG_BASE", self.config_base), \
+             mock.patch.object(pool, "RUNTIME", self.credential_base), \
              mock.patch.object(pool, "regular", side_effect=no_owner_check), \
              mock.patch.object(pool, "native_launch_info", return_value=self.info), \
              mock.patch.object(pool, "check_gpu"), \
@@ -257,13 +263,48 @@ class MainnetPoolServiceTests(unittest.TestCase):
              mock.patch.object(pool.subprocess, "run", side_effect=fetched) as fetch, \
              mock.patch.object(pool.os, "execve", side_effect=executed) as execute, \
              mock.patch.object(sys, "argv", ["launcher", "--run", str(self.config_path)]), \
-             mock.patch.dict(pool.os.environ, {"CREDENTIALS_DIRECTORY": str(self.credential_base)}):
+             mock.patch.dict(pool.os.environ, {"RUNTIME_DIRECTORY": str(self.credential_base)}):
             self.assertEqual(pool.main(), 1)  # mocked execve returns, unlike the real call
         fetch.assert_called_once()
         execute.assert_called_once()
         self.assertEqual(sequence, ["fetch", "competing-services", "gpu-idle", "exec"])
         self.assertIn("--enable-mainnet-payouts", execute.call_args.args[1])
         self.assertTrue((self.state / "mainnet-pool-deployment.json").exists())
+        command = execute.call_args.args[1]
+        self.assertEqual(command[command.index("--wallet-passphrase-file") + 1],
+                         str(self.credential_base / "wallet-passphrase"))
+        self.assertEqual(command[command.index("--private-key") + 1],
+                         str(self.credential_base / "pool-private-key"))
+
+    def test_runtime_directory_cannot_be_redirected_by_environment(self):
+        with mock.patch.object(pool, "CONFIG_BASE", self.config_base), \
+             mock.patch.object(pool, "preflight") as preflight, \
+             mock.patch.object(sys, "argv", ["launcher", "--check", str(self.config_path)]), \
+             mock.patch.dict(pool.os.environ, {"RUNTIME_DIRECTORY": str(self.base / "other"),
+                                                "CREDENTIALS_DIRECTORY": str(self.credential_base)}):
+            with self.assertRaisesRegex(pool.PreflightError, "dedicated systemd RuntimeDirectory"):
+                pool.main()
+        preflight.assert_not_called()
+
+    @unittest.skipUnless(os.name == "posix", "Unix credential mode checks")
+    def test_group_readable_runtime_credentials_rejected(self):
+        for name in ("wallet-passphrase", "pool-private-key"):
+            path = self.credential_base / name
+            path.chmod(0o640)
+            with self.assertRaisesRegex(pool.PreflightError, "0600 or stricter"):
+                pool.credentials(self.config, self.credential_base)
+            path.chmod(0o600)
+
+    @unittest.skipUnless(os.name == "posix", "Unix runtime mode/symlink checks")
+    def test_nonprivate_or_symlink_runtime_directory_rejected(self):
+        self.credential_base.chmod(0o750)
+        with self.assertRaisesRegex(pool.PreflightError, "service-owned and private"):
+            pool.credentials(self.config, self.credential_base)
+        self.credential_base.chmod(0o700)
+        alias = self.base / "runtime-alias"
+        alias.symlink_to(self.credential_base)
+        with self.assertRaisesRegex(pool.PreflightError, "must not be a symlink"):
+            pool.credentials(self.config, alias)
 
     def test_competing_rc_pool_refuses_start_without_stopping_it(self):
         result = subprocess.CompletedProcess([], 0, stdout="active\n", stderr="")
@@ -297,6 +338,13 @@ class MainnetPoolServiceTests(unittest.TestCase):
         self.assertIn("StateDirectory=commonfoundry-mainnet-pool", unit)
         self.assertIn("mainnet-launch-info", unit)
         self.assertIn("LoadCredential=wallet-passphrase:/etc/commonfoundry-mainnet-pool/", unit)
+        self.assertIn("RuntimeDirectoryMode=0700", unit)
+        for name in ("wallet-passphrase", "pool-private-key"):
+            copy = (f"ExecStartPre=/usr/bin/install --mode=0600 %d/{name} "
+                    f"/run/commonfoundry-mainnet-pool/{name}")
+            self.assertIn(copy, unit)
+            self.assertLess(unit.index("cmfd-node mainnet-launch-info"), unit.index(copy))
+            self.assertLess(unit.index(copy), unit.index("ExecStart=/usr/bin/python3"))
         self.assertIn("ProtectSystem=strict", unit)
         self.assertIn("ProtectClock=true", unit)
         self.assertIn("DevicePolicy=closed", unit)

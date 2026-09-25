@@ -1,3 +1,5 @@
+import { MAINNET_NETWORK_ID, NETWORK_HEADER } from "../shared/network";
+
 const SNAPSHOT_PATH = "/v1/explorer";
 const BLOCK_PATH = /^\/v1\/explorer\/block\/(?:[0-9]+|[0-9a-fA-F]{64})$/;
 const TRANSACTION_PATH = /^\/v1\/explorer\/transaction\/[0-9a-fA-F]{64}$/;
@@ -33,33 +35,65 @@ async function proxyExplorerRequest(request: Request, env: Env): Promise<Respons
     return Response.json({ error: "not_found" }, { status: 404 });
   }
 
-  const upstreamUrl = new URL(requestUrl.pathname, env.EXPLORER_ORIGIN);
+  const mainnet = env.EXPLORER_NETWORK === "mainnet";
+  if ((env.EXPLORER_NETWORK !== "rc" && !mainnet)
+      || (mainnet && env.EXPLORER_EXPECTED_NETWORK_ID !== MAINNET_NETWORK_ID)) {
+    return Response.json({ error: "explorer_configuration_invalid" }, {
+      status: 503, headers: { "Cache-Control": "no-store" },
+    });
+  }
   try {
+    const origin = new URL(env.EXPLORER_ORIGIN);
+    const localHttp = origin.protocol === "http:"
+      && ["127.0.0.1", "localhost", "[::1]"].includes(origin.hostname);
+    if ((!localHttp && origin.protocol !== "https:") || origin.username || origin.password
+        || origin.pathname !== "/" || origin.search || origin.hash) {
+      return Response.json({ error: "explorer_configuration_invalid" }, {
+        status: 503, headers: { "Cache-Control": "no-store" },
+      });
+    }
+    const upstreamUrl = new URL(requestUrl.pathname, origin);
     const upstream = await fetch(upstreamUrl, {
       headers: { Accept: "application/json" },
       method: "GET",
       redirect: "manual",
+      signal: AbortSignal.timeout(10_000),
     });
     if (upstream.status >= 300 && upstream.status < 400) {
+      await upstream.body?.cancel();
       return Response.json(
         { error: "explorer_origin_redirect_rejected" },
         { status: 502, headers: { "Cache-Control": "no-store" } },
       );
     }
+    if (mainnet && upstream.headers.get(NETWORK_HEADER) !== MAINNET_NETWORK_ID) {
+      await upstream.body?.cancel();
+      return Response.json({ error: "explorer_network_identity_rejected" }, {
+        status: 503, headers: { "Cache-Control": "no-store" },
+      });
+    }
+    if (upstream.headers.get("Content-Type")?.split(";", 1)[0].trim().toLowerCase() !== "application/json") {
+      await upstream.body?.cancel();
+      return Response.json({ error: "explorer_origin_invalid_response" }, {
+        status: 502, headers: { "Cache-Control": "no-store" },
+      });
+    }
     const headers = new Headers();
     headers.set("Cache-Control", "no-store");
     headers.set("Content-Type", upstream.headers.get("Content-Type") ?? "application/json");
+    const networkId = upstream.headers.get(NETWORK_HEADER);
+    if (networkId) headers.set(NETWORK_HEADER, networkId);
     return new Response(upstream.body, {
       status: upstream.status,
       statusText: upstream.statusText,
       headers,
     });
   } catch (error) {
-    console.error({
-      error: error instanceof Error ? error.message : String(error),
+    console.error(JSON.stringify({
+      error: error instanceof Error ? error.name : "UnknownError",
       message: "explorer_origin_unavailable",
       path: requestUrl.pathname,
-    });
+    }));
     return Response.json(
       { error: "explorer_origin_unavailable" },
       { status: 503, headers: { "Cache-Control": "no-store" } },

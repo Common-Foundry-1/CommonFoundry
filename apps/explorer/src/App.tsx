@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { AlertTriangle, LoaderCircle } from "lucide-react";
-import { loadBlock, loadExplorer, loadTransaction } from "./api";
+import { loadBlock, loadExplorer, loadTransaction, MAINNET_MODE } from "./api";
 import { demoBlock } from "./demoData";
 import type { ExplorerBlock, ExplorerSnapshot, ExplorerTransaction, ExplorerView } from "./types";
 import { BlockDetail, TransactionDetail } from "./components/DetailViews";
@@ -13,24 +13,37 @@ export default function App() {
   const [view, setView] = useState<ExplorerView>({ kind: "overview" });
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const refreshVersion = useRef(0);
+  const refreshInFlight = useRef(false);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (force = false) => {
+    if (refreshInFlight.current && !force) return;
+    refreshInFlight.current = true;
+    const version = ++refreshVersion.current;
     try {
       const loaded = await loadExplorer();
+      if (version !== refreshVersion.current) return;
       setSnapshot(loaded.data);
       setPreview(loaded.preview);
       setError(null);
     } catch (reason) {
+      if (version !== refreshVersion.current) return;
+      setSnapshot(null);
+      setPreview(false);
+      setView({ kind: "overview" });
       setError(reason instanceof Error ? reason.message : "The explorer node is unavailable.");
     } finally {
-      setLoading(false);
+      if (version === refreshVersion.current) {
+        refreshInFlight.current = false;
+        setLoading(false);
+      }
     }
   }, []);
 
   useEffect(() => {
     void refresh();
     const timer = window.setInterval(() => void refresh(), 10_000);
-    return () => window.clearInterval(timer);
+    return () => { window.clearInterval(timer); refreshVersion.current += 1; refreshInFlight.current = false; };
   }, [refresh]);
 
   const openBlock = async (block: ExplorerBlock | string) => {
@@ -83,7 +96,7 @@ export default function App() {
   };
 
   if (loading) return <div className="load-state"><LoaderCircle className="spin" /><span>Opening the chain…</span></div>;
-  if (!snapshot) return <div className="load-state error"><AlertTriangle /><strong>Explorer unavailable</strong><span>{error}</span><button type="button" onClick={() => void refresh()}>Retry</button></div>;
+  if (!snapshot) return <div className="load-state error"><AlertTriangle /><strong>{MAINNET_MODE ? "Mainnet explorer awaiting connection" : "Explorer unavailable"}</strong><span>{error}</span><button type="button" onClick={() => void refresh(true)}>Retry</button></div>;
 
   return <div className="app-shell"><Header network={snapshot.network_short_name} connected={!preview} onHome={home} onSearch={(query) => void search(query)} />{error && <div className="error-banner"><AlertTriangle size={15} />{error}<button type="button" onClick={() => setError(null)}>Dismiss</button></div>}{view.kind === "overview" && <Overview snapshot={snapshot} preview={preview} onBlock={(block) => void openBlock(block)} onTransaction={(tx) => void openTransaction(tx)} />}{view.kind === "block" && <BlockDetail block={view.block} onBack={home} onTransaction={(tx) => void openTransaction(tx)} />}{view.kind === "transaction" && <TransactionDetail transaction={view.transaction} onBack={home} />}<footer><span>Common Foundry Explorer</span><code>{snapshot.network_id.slice(0, 16)}…</code><span>Built for independently verifiable compute.</span></footer></div>;
 }

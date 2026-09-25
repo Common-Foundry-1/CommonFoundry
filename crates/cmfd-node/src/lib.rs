@@ -8313,6 +8313,7 @@ struct RpcResponse {
     content_type: &'static str,
     body: Vec<u8>,
     basic_auth_challenge: bool,
+    network_id: Option<[u8; 32]>,
 }
 
 impl RpcResponse {
@@ -8323,6 +8324,7 @@ impl RpcResponse {
             content_type: "application/json",
             body: serde_json::to_vec(&value).expect("JSON value serialization cannot fail"),
             basic_auth_challenge: false,
+            network_id: None,
         }
     }
 
@@ -8569,6 +8571,20 @@ fn handle_rpc_connection_shared(
 }
 
 fn route_rpc_request(request: RpcRequest, node: &mut Node) -> RpcResponse {
+    let explorer_request = request.method == "GET"
+        && (request.target == "/v1/explorer"
+            || request.target.starts_with("/v1/explorer/block/")
+            || request.target.starts_with("/v1/explorer/transaction/"));
+    let mut response = route_rpc_request_inner(request, node);
+    if explorer_request {
+        // Bind this exact response (including not-found/errors) to the node
+        // that produced it. A separate snapshot preflight could race a cutover.
+        response.network_id = Some(node.params.network_id);
+    }
+    response
+}
+
+fn route_rpc_request_inner(request: RpcRequest, node: &mut Node) -> RpcResponse {
     match (request.method.as_str(), request.target.as_str()) {
         ("GET", "/health") if node.storage_faulted => RpcResponse::json(
             503,
@@ -9207,13 +9223,17 @@ fn write_rpc_response(stream: &mut impl Write, response: RpcResponse) -> Result<
     } else {
         ""
     };
+    let network = response.network_id.map_or_else(String::new, |network_id| {
+        format!("X-CMFD-Network-Id: {}\r\n", hex::encode(network_id))
+    });
     let header = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\n{}\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\n{}{}\r\n",
         response.status,
         response.reason,
         response.content_type,
         response.body.len(),
         challenge,
+        network,
     );
     stream
         .write_all(header.as_bytes())
@@ -15453,6 +15473,56 @@ mod tests {
         assert_eq!(parsed.method, "POST");
         assert_eq!(parsed.target, "/v1/block");
         assert_eq!(parsed.body, b"abc");
+    }
+
+    #[test]
+    fn explorer_rpc_responses_bind_their_own_network_identity() {
+        let path = test_dir("explorer-response-network-identity");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        let expected = node.params.network_id;
+        for (target, status) in [
+            ("/v1/explorer".to_owned(), 200),
+            ("/v1/explorer/block/1".to_owned(), 404),
+            (format!("/v1/explorer/transaction/{}", "ab".repeat(32)), 404),
+        ] {
+            let response = route_rpc_request(
+                RpcRequest {
+                    method: "GET".to_owned(),
+                    target,
+                    content_type: None,
+                    body: Vec::new(),
+                },
+                &mut node,
+            );
+            assert_eq!(response.status, status);
+            assert_eq!(response.network_id, Some(expected));
+            let body_length = response.body.len();
+            let mut wire = Vec::new();
+            write_rpc_response(&mut wire, response).unwrap();
+            let wire = String::from_utf8(wire).unwrap();
+            let (headers, body) = wire.split_once("\r\n\r\n").unwrap();
+            assert_eq!(headers.matches("X-CMFD-Network-Id:").count(), 1);
+            assert!(headers.contains(&format!("X-CMFD-Network-Id: {}", hex::encode(expected))));
+            assert!(headers.contains(&format!("Content-Length: {body_length}\r\n")));
+            assert_eq!(body.len(), body_length);
+            if status == 200 {
+                let snapshot: serde_json::Value = serde_json::from_str(body).unwrap();
+                assert_eq!(snapshot["network_id"], hex::encode(expected));
+            }
+        }
+        let response = route_rpc_request(
+            RpcRequest {
+                method: "GET".to_owned(),
+                target: "/health".to_owned(),
+                content_type: None,
+                body: Vec::new(),
+            },
+            &mut node,
+        );
+        assert!(response.network_id.is_none());
+        drop(node);
+        clean_test_dir(&path);
     }
 
     #[test]

@@ -12,6 +12,7 @@ type HeaderProps = {
 export function Header({ network, connected, onHome, onSearch }: HeaderProps) {
   const [query, setQuery] = useState("");
   const [mobileOpen, setMobileOpen] = useState(false);
+  const home = () => { setMobileOpen(false); onHome(); };
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
@@ -21,7 +22,7 @@ export function Header({ network, connected, onHome, onSearch }: HeaderProps) {
 
   return (
     <header className="topbar">
-      <button className="brand" type="button" onClick={onHome} aria-label="Explorer overview">
+      <button className="brand" type="button" onClick={home} aria-label="Explorer overview">
         <img src={mark} alt="" />
         <span><strong>Common Foundry</strong><small>Explorer</small></span>
       </button>
@@ -30,10 +31,10 @@ export function Header({ network, connected, onHome, onSearch }: HeaderProps) {
         {mobileOpen ? <X size={19} /> : <Menu size={19} />}
       </button>
       <nav className={mobileOpen ? "is-open" : ""} aria-label="Explorer navigation">
-        <button type="button" onClick={onHome}>Overview</button>
-        <a href="#blocks">Blocks</a>
-        <a href="#transactions">Transactions</a>
-        <a href="#network">Network</a>
+        <button type="button" onClick={home}>Overview</button>
+        <a href="#blocks" onClick={() => setMobileOpen(false)}>Blocks</a>
+        <a href="#transactions" onClick={() => setMobileOpen(false)}>Transactions</a>
+        <a href="#network" onClick={() => setMobileOpen(false)}>Network</a>
       </nav>
 
       <form className="search-form" role="search" onSubmit={submit}>

@@ -7,6 +7,8 @@
     "dev": "vite --host 127.0.0.1",
     "dev:edge": "wrangler dev --var EXPLORER_ORIGIN:http://127.0.0.1:22443",
     "build": "tsc -b && vite build",
+    "build:mainnet": "tsc -b && vite build --mode mainnet --outDir dist-mainnet",
+    "types": "wrangler types worker/worker-configuration.d.ts --strict-vars false",
     "check": "tsc -b --pretty false && tsc -p tsconfig.worker.json --pretty false",
     "deploy": "npm run build && wrangler deploy",
     "test": "vitest run",

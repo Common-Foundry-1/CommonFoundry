@@ -12,13 +12,34 @@
     }
   ],
   "vars": {
-    "EXPLORER_ORIGIN": "https://devnet-explorer-origin.commonfoundry.ai"
+    "EXPLORER_ORIGIN": "https://devnet-explorer-origin.commonfoundry.ai",
+    "EXPLORER_NETWORK": "rc",
+    "EXPLORER_EXPECTED_NETWORK_ID": ""
   },
   "assets": {
     "directory": "./dist",
     "binding": "ASSETS",
     "not_found_handling": "single-page-application",
     "run_worker_first": true
+  },
+  "env": {
+    "mainnet": {
+      "name": "commonfoundry-mainnet-explorer",
+      "workers_dev": false,
+      "preview_urls": false,
+      "routes": [],
+      "vars": {
+        "EXPLORER_ORIGIN": "https://mainnet-explorer-origin.commonfoundry.ai",
+        "EXPLORER_NETWORK": "mainnet",
+        "EXPLORER_EXPECTED_NETWORK_ID": "4c128b19b8f663067cca1905f40993cfdbe7a4462f00b0a062d3f68d578175ec"
+      },
+      "assets": {
+        "directory": "./dist-mainnet",
+        "binding": "ASSETS",
+        "not_found_handling": "single-page-application",
+        "run_worker_first": true
+      }
+    }
   },
   "observability": {
     "enabled": true,

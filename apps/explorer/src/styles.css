@@ -228,10 +228,11 @@ footer code { font-size: .6rem; }
 @media (max-width: 780px) {
   .topbar { grid-template-columns: 1fr auto; gap: 10px; padding: 11px 5vw; }
   .mobile-menu { display: block; }
-  .topbar nav { position: absolute; top: 63px; right: 0; left: 0; display: none; padding: 12px 5vw; background: var(--graphite-900); border-top: 1px solid #303232; }
+  .topbar nav { position: absolute; top: 100%; right: 0; left: 0; display: none; padding: 12px 5vw; background: var(--graphite-900); border-top: 1px solid #303232; }
   .topbar nav.is-open { display: grid; }
   .search-form { grid-column: 1 / -1; grid-row: 2; }
-  .network-state { display: none; }
+  .network-state { display: flex; grid-column: 1 / -1; grid-row: 3; justify-content: flex-start; }
+  .error-banner { position: static; max-width: none; }
   main { width: min(100% - 30px, 1480px); }
   .hero { align-items: flex-start; padding-top: 44px; }
   .hero-mark { display: none; }

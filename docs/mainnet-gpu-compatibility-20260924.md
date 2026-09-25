@@ -39,6 +39,13 @@ physical Volta qualification.
   `f820434ab3c1743036c59da6fced71275e1a8b677a25afff72ee137f04af39e4`.
 - Both matching outputs contain all seven native targets and compute_70 PTX.
   This is an internal same-toolchain repeat build, not external reproduction.
+  A subsequent canonical committed-source export produced different bytes
+  (`f3482f74c6eaacb408592b3173d0a34181ca47c2e6a0c7b1ae59d847a42cb451`):
+  CUDA's anonymous-namespace kernel names included an absolute-path hash.
+  Therefore the matching worktree outputs are not final release candidates.
+- A compile-only two-directory fixture confirmed that a stable named namespace
+  removes that path dependence. The replay source now uses `cmfd_v4_replay`;
+  clean-source full-target rebuilds and all GPU qualification remain required.
 
 Compiler symbol seeding does not seed cryptographic randomness or mining nonces.
 Keep the toolchain, dependency checkout, source hashes, intermediates and logs

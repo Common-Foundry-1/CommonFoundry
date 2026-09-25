@@ -22,7 +22,10 @@
 static_assert(CUTLASS_MAJOR == 3 && CUTLASS_MINOR == 9 && CUTLASS_PATCH == 2,
               "benchmark requires the production-pinned CUTLASS v3.9.2");
 
-namespace {
+// CUDA embeds an absolute-source-path hash into anonymous-namespace kernel
+// names, even with --frandom-seed. A stable named namespace makes clean source
+// exports reproducible without changing the replay arithmetic or wire format.
+namespace cmfd_v4_replay {
 
 constexpr uint32_t KOALA_BEAR_MODULUS = 0x7f000001U;
 constexpr uint32_t PRODUCTION_ROWS = 128;
@@ -1096,9 +1099,10 @@ void run_persistent_server(const char* model_path) {
     }
 }
 
-}  // namespace
+}  // namespace cmfd_v4_replay
 
 int main(int argc, char** argv) {
+    using namespace cmfd_v4_replay;
     try {
         cudaDeviceProp properties{};
         cuda_check(cudaGetDeviceProperties(&properties, 0), "read CUDA device");

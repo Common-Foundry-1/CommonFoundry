@@ -170,6 +170,12 @@ esac
         self.assertNotIn('koala_four_limb_replay.cu', source)
         self.assertIn("CUDA_ARCHS='89;120'", source)
 
+    def test_replay_kernel_namespace_does_not_embed_checkout_path(self):
+        source = (BUILD.parent / 'cuda/koala_four_limb_replay.cu').read_text()
+        self.assertIn('namespace cmfd_v4_replay {', source)
+        self.assertIn('using namespace cmfd_v4_replay;', source)
+        self.assertNotRegex(source, r'\bnamespace\s*\{')
+
     def test_build_scripts_parse(self):
         for name in ('build-replay.sh', 'build.sh', 'test-build-arguments.sh'):
             result = subprocess.run(['bash', '-n', str(BUILD.parent / name)], capture_output=True, text=True)

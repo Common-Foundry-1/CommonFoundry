@@ -58,6 +58,11 @@ them as fresh-build evidence. See the [CUDA 12.9 release notes](https://docs.nvi
 
 Build into two different new output directories with the same pinned source,
 dependencies and toolchain, then compare the complete unmodified worker bytes.
+The replay kernels use a named namespace because CUDA's anonymous-namespace
+names otherwise contain an absolute-source-path hash even with a fixed seed.
+Include a clean committed-source export in the comparison, not just two builds
+from the original worktree. The source-path normalization must not be performed
+by editing compiled binaries.
 Retain both binaries, compiler logs and target-image inventories. A normal
 unseeded compilation is a development build, not reproducible-release evidence.
 Matching two builds remains separate from native/PTX correctness checks,

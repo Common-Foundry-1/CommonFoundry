@@ -21,6 +21,14 @@ pub(super) struct AddressHistoryIndex {
 }
 
 impl AddressHistoryIndex {
+    #[cfg(test)]
+    pub(super) fn qualification_shape(&self) -> (usize, usize) {
+        (
+            self.locations.len(),
+            self.locations.values().map(BTreeSet::len).sum(),
+        )
+    }
+
     pub fn block_entries(block: &Block) -> Vec<([u8; 32], AddressLocation)> {
         let mut entries = Vec::new();
         let block_id = block.block_id();
@@ -102,6 +110,21 @@ pub(super) struct AddressOutputIndex {
 }
 
 impl AddressOutputIndex {
+    /// Only the synthetic, metadata-only operator probe uses this. No output
+    /// value or consensus state is constructed or made authoritative here.
+    #[cfg(test)]
+    pub(super) fn insert_qualification_output(&mut self, address: [u8; 32], outpoint: OutPoint) {
+        self.outputs.entry(address).or_default().insert(outpoint);
+    }
+
+    #[cfg(test)]
+    pub(super) fn qualification_shape(&self) -> (usize, usize) {
+        (
+            self.outputs.len(),
+            self.outputs.values().map(HashSet::len).sum(),
+        )
+    }
+
     pub fn from_utxos(utxos: &UtxoSet) -> Self {
         let mut index = Self::default();
         for (outpoint, output) in utxos.iter() {

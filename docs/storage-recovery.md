@@ -66,14 +66,22 @@ cmfd-node --data-dir <node-data> storage-checkpoint
 The checkpoint contains the canonical chain state and compact fork index,
 binds the immutable network fingerprint, exact block-log length, terminal
 record digest, and every cached record locator, and has a domain-separated
-BLAKE3 integrity digest. Startup rechecks the retained log's file identity and
-the complete terminal record before using it. When a checkpoint is not
-eligible, the node reconstructs the same state through full deterministic
-replay. The status field `startup_snapshot_used` reports which path opened the
-node.
+BLAKE3 integrity digest. Startup rechecks the retained log's file identity,
+scans the complete retained record-digest chain, and compares every cached
+record locator against that scan before using the checkpoint. It also reads
+and authenticates the complete terminal record. A fast start therefore still
+reads the retained log; it is not a constant-time startup path. When a
+checkpoint is not eligible, the node reconstructs the same state through full
+deterministic replay. The status field `startup_snapshot_used` reports which
+path opened the node.
 
 This is a local crash-safe cache, not a consensus state root. It does not
 protect against an attacker able to replace both node storage and the cache,
 and it intentionally does not prune `blocks.log`. Side-branch-capable
 snapshots, historical serving policy, pruning, background log scrubbing, and a
 long-history bounded-startup measurement remain mainnet gates.
+
+The [explorer resource qualification](explorer-resource-qualification.md)
+separates synthetic index memory measurements, valid tiny-profile recovery
+fixtures and real full-size proof checks. None alone closes the production
+startup/recovery gate.

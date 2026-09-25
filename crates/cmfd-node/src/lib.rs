@@ -76,6 +76,10 @@ mod explorer_address_index;
 #[cfg(test)]
 mod explorer_address_tests;
 mod explorer_index;
+#[cfg(test)]
+mod explorer_index_qualification;
+#[cfg(test)]
+mod explorer_recovery_qualification;
 #[cfg(all(test, feature = "production-v4"))]
 mod explorer_resource_qualification;
 pub mod logging;

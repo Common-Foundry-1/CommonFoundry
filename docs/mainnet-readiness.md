@@ -801,3 +801,14 @@ key and existing RC release authorities remain untouched. The steward/community
 wallets, their passwords, the exact launch-plan bytes and the October 2/3 noon
 CDT schedule are unchanged. This records key selection, not publication or
 network activation; final release qualification is still required.
+
+## Explorer resource and dense-history checks (September 25)
+
+The [resource qualification record](explorer-resource-qualification.md) now
+separates bounded synthetic index memory, consensus-valid tiny-profile recovery
+and preserved full-size proof verification. Reserving one transaction location
+for new IDs reduces unnecessary allocation without dropping fork history.
+The valid-history fixture checks full replay, snapshot restart and recovery
+after a damaged optional cache against identical state and explorer results.
+This is progress on resource/recovery coverage, not completion of long-history
+production startup, final-package or deployment qualification.

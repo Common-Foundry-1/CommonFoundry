@@ -74,6 +74,8 @@ jobs:
           python3 -m unittest discover -s scripts/tests -p 'test_generate_mainnet_pins.py' -v
           python3 -m unittest discover -s scripts/tests -p 'test_mainnet_release.py' -v
           python3 -m unittest discover -s scripts/tests -p 'test_mainnet_storage.py' -v
+          python3 -m unittest discover -s scripts/tests -p 'test_production_v4_replay_build.py' -v
+          bash tools/production-v4-prover/test-build-arguments.sh
           python3 -m unittest discover -s scripts/tests -p 'test_wallet_ci_metadata.py' -v
           python3 -m unittest discover -s scripts/tests -p 'test_mainnet_ci_identities.py' -v
           bash -n scripts/release-linux-common.sh

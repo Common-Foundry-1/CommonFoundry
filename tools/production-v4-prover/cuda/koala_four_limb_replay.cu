@@ -65,6 +65,7 @@ using LocalityTensorCoreGemm = cutlass::gemm::device::Gemm<
     cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<8>, 3>;
 
 bool use_ada_gemm = false;
+bool use_dp4a_gemm = false;
 
 void cuda_check(cudaError_t result, const char* operation) {
     if (result != cudaSuccess) {
@@ -310,6 +311,74 @@ __global__ void reduce_layer_batch(
     write_centered_limbs(value, limbs + lane * 4 * cells, cells, within_lane);
 }
 
+// Volta has signed INT8 DP4A but not the SM75 INT8 Tensor Core instruction.
+// Keep this path entirely integral: each dot has at most 4096 terms, so even
+// (-128)*(-128) throughout is 2^26, safely inside the int32 accumulator.
+// A is row-major and B is already stored column-major by ProductionModel.
+__global__ void dp4a_gemm(const int8_t* activation, const int8_t* weights,
+                         int32_t* accumulators, uint32_t rows, uint32_t width) {
+    constexpr uint32_t tile_rows = 64;
+    constexpr uint32_t tile_columns = 64;
+    constexpr uint32_t tile_common = 32;
+    constexpr uint32_t packed_common = tile_common / 4;
+    // Padding avoids the repeated-column bank conflicts of an eight-word stride.
+    __shared__ int32_t left[tile_rows][packed_common + 1];
+    __shared__ int32_t right[tile_columns][packed_common + 1];
+    const uint32_t lane = threadIdx.y * 16 + threadIdx.x;
+    const uint32_t first_row = blockIdx.y * tile_rows;
+    const uint32_t first_column = blockIdx.x * tile_columns;
+    int32_t sums[4][4] = {};
+    for (uint32_t common = 0; common < width; common += tile_common) {
+        for (uint32_t entry = lane; entry < tile_rows * packed_common; entry += 256) {
+            const uint32_t row = entry / packed_common;
+            const uint32_t word = entry % packed_common;
+            const uint32_t input_common = common + 4 * word;
+            left[row][word] = first_row + row < rows && input_common + 3 < width
+                ? *reinterpret_cast<const int32_t*>(activation + size_t(first_row + row) * width + input_common)
+                : 0;
+            right[row][word] = first_column + row < width && input_common + 3 < width
+                ? *reinterpret_cast<const int32_t*>(weights + size_t(first_column + row) * width + input_common)
+                : 0;
+        }
+        __syncthreads();
+#pragma unroll
+        for (uint32_t word = 0; word < packed_common; ++word) {
+#pragma unroll
+            for (uint32_t row = 0; row < 4; ++row) {
+                const int32_t packed_left = left[threadIdx.y + 16 * row][word];
+#pragma unroll
+                for (uint32_t column = 0; column < 4; ++column) {
+                    sums[row][column] = __dp4a(
+                        packed_left, right[threadIdx.x + 16 * column][word], sums[row][column]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (uint32_t row = 0; row < 4; ++row) {
+        const uint32_t output_row = first_row + threadIdx.y + 16 * row;
+#pragma unroll
+        for (uint32_t column = 0; column < 4; ++column) {
+            const uint32_t output_column = first_column + threadIdx.x + 16 * column;
+            if (output_row < rows && output_column < width) {
+                accumulators[size_t(output_row) * width + output_column] = sums[row][column];
+            }
+        }
+    }
+}
+
+void launch_dp4a_gemm(const int8_t* activation, const int8_t* weights,
+                      int32_t* accumulators, uint32_t rows, uint32_t width) {
+    if (rows == 0 || width == 0 || width > PRODUCTION_WIDTH || width % 4 != 0) {
+        throw std::runtime_error("unsupported signed INT8 DP4A GEMM shape");
+    }
+    const dim3 threads(16, 16);
+    const dim3 blocks((width + 63) / 64, (rows + 63) / 64);
+    dp4a_gemm<<<blocks, threads>>>(activation, weights, accumulators, rows, width);
+    cuda_check(cudaGetLastError(), "launch signed INT8 DP4A GEMM");
+}
+
 template <typename Gemm>
 void launch_gemm(const int8_t* activation, const int8_t* weights,
                  int32_t* accumulators, uint32_t rows, uint32_t width) {
@@ -333,7 +402,9 @@ void launch_stacked_limb_gemm(const int8_t* limbs, const int8_t* weights,
                               int32_t* limb_accumulators, uint32_t rows,
                               uint32_t width) {
     // Preserve the low-latency SM120 tile below the miner's 32-forward batch.
-    if (use_blackwell_gemm && rows < 32 * PRODUCTION_ROWS) {
+    if (use_dp4a_gemm) {
+        launch_dp4a_gemm(limbs, weights, limb_accumulators, 4 * rows, width);
+    } else if (use_blackwell_gemm && rows < 32 * PRODUCTION_ROWS) {
         launch_gemm<BlackwellTensorCoreGemm>(
             limbs, weights, limb_accumulators, 4 * rows, width);
     } else if (use_blackwell_gemm || use_ada_gemm) {
@@ -466,6 +537,65 @@ void write_replay_outputs(const char* prefix, uint32_t* preactivation_trace,
                     path.c_str(),
                     static_cast<unsigned long long>(2 * bank_values * sizeof(uint32_t)));
     }
+}
+
+void run_dp4a_differential() {
+    // Include both tile tails and the complete production K dimension. The
+    // extreme columns prove signed-byte interpretation and exact accumulation.
+    for (const auto& shape : std::vector<std::pair<uint32_t, uint32_t>>{
+             {3, 4}, {7, 36}, {65, 128}, {3, PRODUCTION_WIDTH}}) {
+        const uint32_t rows = shape.first;
+        const uint32_t width = shape.second;
+        std::vector<int8_t> activation(size_t(rows) * width);
+        std::vector<int8_t> weights(size_t(width) * width);
+        std::vector<int32_t> actual(size_t(rows) * width);
+        for (uint32_t row = 0; row < rows; ++row) {
+            for (uint32_t common = 0; common < width; ++common) {
+                const int value = row == 0 ? -128 : row == 1 ? 127
+                    : static_cast<int>((uint64_t(row) * 73 + common * 29 + 19) % 256) - 128;
+                activation[size_t(row) * width + common] = static_cast<int8_t>(value);
+            }
+        }
+        for (uint32_t column = 0; column < width; ++column) {
+            for (uint32_t common = 0; common < width; ++common) {
+                const int value = column % 4 == 0 ? -128 : column % 4 == 1 ? 127
+                    : column % 4 == 2 ? (common % 2 == 0 ? -128 : 127)
+                    : static_cast<int>((uint64_t(column) * 37 + common * 67 + 11) % 256) - 128;
+                weights[size_t(column) * width + common] = static_cast<int8_t>(value);
+            }
+        }
+        int8_t* device_activation = nullptr;
+        int8_t* device_weights = nullptr;
+        int32_t* device_output = nullptr;
+        cuda_check(cudaMalloc(&device_activation, activation.size()), "allocate DP4A test activation");
+        cuda_check(cudaMalloc(&device_weights, weights.size()), "allocate DP4A test weights");
+        cuda_check(cudaMalloc(&device_output, actual.size() * sizeof(int32_t)), "allocate DP4A test output");
+        cuda_check(cudaMemcpy(device_activation, activation.data(), activation.size(), cudaMemcpyHostToDevice),
+                   "copy DP4A test activation");
+        cuda_check(cudaMemcpy(device_weights, weights.data(), weights.size(), cudaMemcpyHostToDevice),
+                   "copy DP4A test weights");
+        launch_dp4a_gemm(device_activation, device_weights, device_output, rows, width);
+        cuda_check(cudaMemcpy(actual.data(), device_output, actual.size() * sizeof(int32_t), cudaMemcpyDeviceToHost),
+                   "read DP4A test output");
+        for (uint32_t row = 0; row < rows; ++row) {
+            for (uint32_t column = 0; column < width; ++column) {
+                int64_t expected = 0;
+                for (uint32_t common = 0; common < width; ++common) {
+                    expected += int64_t(activation[size_t(row) * width + common])
+                              * int64_t(weights[size_t(column) * width + common]);
+                }
+                if (expected < std::numeric_limits<int32_t>::min()
+                    || expected > std::numeric_limits<int32_t>::max()
+                    || actual[size_t(row) * width + column] != expected) {
+                    throw std::runtime_error("signed INT8 DP4A differential mismatch");
+                }
+            }
+        }
+        cudaFree(device_output);
+        cudaFree(device_weights);
+        cudaFree(device_activation);
+    }
+    std::printf("dp4a_differential=EXACT tails_and_signed_extremes production_k=4096\n");
 }
 
 void run_small_differential() {
@@ -974,7 +1104,17 @@ int main(int argc, char** argv) {
         cuda_check(cudaGetDeviceProperties(&properties, 0), "read CUDA device");
         std::printf("device=%s compute=%d.%d\n", properties.name, properties.major,
                     properties.minor);
-        if (properties.major == 12 && properties.minor == 0) {
+        if (properties.major < 7) {
+            throw std::runtime_error("ProductionV4 replay requires compute capability 7.0 or newer");
+        }
+        cudaFuncAttributes portable_attributes{};
+        cuda_check(cudaFuncGetAttributes(&portable_attributes, dp4a_gemm),
+                   "read portable INT8 kernel target");
+        // A compute_70 JIT image must use DP4A even on a newer physical GPU:
+        // compiling the SM75/80 template stubs does not provide their MMA code.
+        use_dp4a_gemm = properties.major * 10 + properties.minor < 75
+                       || portable_attributes.ptxVersion < 75;
+        if (!use_dp4a_gemm && properties.major == 12 && properties.minor == 0) {
             cudaFuncAttributes attributes{};
             cuda_check(cudaFuncGetAttributes(
                            &attributes,
@@ -990,7 +1130,7 @@ int main(int argc, char** argv) {
                            "read batched Tensor Core kernel target");
                 use_blackwell_gemm = attributes.ptxVersion >= 80;
             }
-        } else if (properties.major == 8 && properties.minor == 9) {
+        } else if (!use_dp4a_gemm && properties.major == 8 && properties.minor == 9) {
             cudaFuncAttributes attributes{};
             cuda_check(cudaFuncGetAttributes(
                            &attributes,
@@ -999,9 +1139,15 @@ int main(int argc, char** argv) {
             use_ada_gemm = attributes.ptxVersion >= 80;
         }
         std::printf("gemm_backend=%s\n",
+                    use_dp4a_gemm ? "sm70_dp4a_int8" :
                     use_blackwell_gemm ? "sm80_m16n8k32_blackwell_sw8_batch" :
                     use_ada_gemm ? "sm80_m16n8k32_128x256_sw8" : "sm75_m8n8k16");
         run_small_differential();
+        if (argc == 2 && std::string(argv[1]) == "--self-test") {
+            run_dp4a_differential();
+            std::printf("replay_self_test=EXACT\n");
+            return 0;
+        }
         if (argc > 1 && std::string(argv[1]) == "--server") {
             if (argc != 3) throw std::runtime_error("usage: --server MODEL");
             run_persistent_server(argv[2]);

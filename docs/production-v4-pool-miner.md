@@ -68,3 +68,22 @@ starting the new one. Preserve your wallet address, complete pinned pool URL,
 and worker name. You may copy an existing authenticated `inputs/MODEL-V2.bank`
 into the new package's `inputs` directory; setup verifies it before use.
 Keep the previous package for rollback.
+
+## Mainnet compatibility build
+
+The current source restores native replay/search images for Volta (SM70),
+Turing/RTX 20 (SM75), Ampere (SM80/86), Ada/RTX 40 (SM89), Hopper (SM90), and
+RTX 50 (SM120), plus compute_70 PTX. Volta uses exact signed INT8 DP4A rather
+than unavailable SM75 INT8 Tensor Core instructions. Newer native cards retain
+their existing Tensor Core backends. Model, field arithmetic, work digest,
+proof rules and pool protocol do not change.
+
+These source changes do not update previously signed downloads. They need a
+fresh build, native/PTX inspection, differential tests, full-model/proof checks,
+and release signatures before distribution. Physical older-card qualification
+must be reported separately from forced-PTX testing on a newer card.
+
+The resident-model 32-lane search allocates about 6.45 GiB before driver/display
+overhead. A 6 GB GPU cannot fit this path; 8 GB is a capacity target, not a claim
+that every 8 GB board/driver configuration has been tested. Pool clients need
+only the replay/search worker. Full solo proving has separate GPU requirements.

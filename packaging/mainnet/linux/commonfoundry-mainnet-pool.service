@@ -30,6 +30,9 @@ LimitNOFILE=65536
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectClock=true
+# Install the host-specific NVIDIA DeviceAllow drop-in from POOL-SERVICE-SETUP.md.
+# Keep device access closed except for those explicitly selected GPU devices.
+DevicePolicy=closed
 ProtectControlGroups=true
 ProtectHome=true
 ProtectHostname=true

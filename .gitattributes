@@ -22,6 +22,7 @@ packaging/mainnet/linux/*.timer text eol=lf
 packaging/mainnet/*.json text eol=lf
 packaging/mainnet/*.allowed_signers text eol=lf
 tools/production-v4-prover/*.sh text eol=lf
+tools/production-v4-prover/cuda/*.cu text eol=lf
 tools/production-v4-prover/patches/*.patch text eol=lf
 packaging/mainnet/windows/*.ps1 text eol=lf
 packaging/mainnet/windows/*.bat text eol=crlf

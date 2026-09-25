@@ -9,7 +9,8 @@ Pinned dependencies:
 - SP1 `92b8eabaea9ab7306da5826caa700adabf7445ba`, plus
   `patches/sp1-gpu-production-v4.patch`;
 - CUTLASS 3.9.2 commit `ad7b2f5e84fcfa124cb02b91d5bd26d238c0459e`;
-- CUDA 12.8; the existing RC build targets `sm_120`.
+- CUDA 12.8 or 12.9. Full proof tools retain their single/dual architecture
+  targets below; the replay/search worker is built separately for broader GPUs.
 
 Run `prepare-dependencies.sh` once in a clean Ubuntu-22.04 WSL environment, then run `build.sh`.
 Both scripts fail closed if their pinned checkout identities do not match. The build emits the
@@ -17,11 +18,11 @@ three Rust tools plus `cmfd-v4-replay` and `cmfd-v4-fixed-row-cache` under `targ
 
 For a prospective **single worker set with native SM89 and SM120 code images**, run
 `build.sh --dual-arch` from the same pinned dependency checkouts. This opt-in mode passes
-`CUDA_ARCHS=89;120` to the Rust/SP1 build, gives both standalone CUDA tools explicit
+`CUDA_ARCHS=89;120` to the Rust/SP1 build, gives the fixed-row-cache tool explicit
 `compute_89 -> sm_89` and `compute_120 -> sm_120` `nvcc -gencode` targets, and writes to
 `target/dual-sm89-sm120/release`. Its separate Cargo target directory prevents a cached
 SM120-only dependency from being packaged as a dual-architecture worker. The ordinary
-`build.sh` command and its `target/release` output remain SM120-only. Both modes print
+`build.sh` command keeps its full proof tools SM120-only. Both modes print
 SHA-256 digests of their actual worker bytes after successful compilation; this output is
 an unsigned build record, not an approved release identity.
 
@@ -34,6 +35,48 @@ images and perform independent replay, proof generation, CPU proof verification,
 block-admission qualification on an SM89 RTX 4090 and an SM120 RTX 50-series host.
 The argument test alone cannot establish CUDA/SP1 compatibility, byte-for-byte
 reproducibility, GPU performance, or safe runtime deployment.
+
+## Cross-generation replay and pool search
+
+Both build modes delegate replay compilation to `build-replay.sh`. Run
+`bash build-replay.sh ABSOLUTE_NEW_OUTPUT_DIRECTORY` to build only that worker.
+It requires clean pinned CUTLASS, checks compiler target availability, then checks
+the actual output with cuobjdump for native SM70/75/80/86/89/90/120 images and
+compute_70 PTX. It refuses an existing output worker. `CUDACXX`,
+`CMFD_CUTLASS_ROOT`, and `CMFD_CUOBJDUMP` select existing tools/dependencies.
+CUDA 13 cannot be substituted when it lacks the required older targets.
+`--print-build-plan` needs no compiler or GPU and prints the actual argument array.
+GPU-free regression tests are in `scripts/tests/test_production_v4_replay_build.py`.
+
+For release-byte reproduction, select the pinned CUDA 12.9.1 compiler with
+`CUDACXX` and add `--reproducible`. This single-translation-unit build uses a
+fixed compiler symbol seed and retains fresh CUDA intermediates under the new
+output directory. The compiler seed is **not** a proof challenge, mining nonce,
+or runtime random-number seed. The builder rejects a compiler without NVIDIA's
+`--frandom-seed` option and refuses existing intermediates rather than reusing
+them as fresh-build evidence. See the [CUDA 12.9 release notes](https://docs.nvidia.com/cuda/archive/12.9.0/cuda-toolkit-release-notes/index.html).
+
+Build into two different new output directories with the same pinned source,
+dependencies and toolchain, then compare the complete unmodified worker bytes.
+Retain both binaries, compiler logs and target-image inventories. A normal
+unseeded compilation is a development build, not reproducible-release evidence.
+Matching two builds remains separate from native/PTX correctness checks,
+physical-card qualification and release signing.
+
+Volta/SM70 uses tiled signed INT8 DP4A with INT32 accumulation, not SM75 Tensor
+Core instructions and not floating-point emulation. The same four-limb field
+reconstruction and layer relation remain unchanged. The maximum absolute
+production dot sum is `4096 * 128 * 128 = 2^26`, within INT32. Native Turing uses
+the existing SM75 Tensor Core path; Ada/Blackwell keep their optimized paths.
+A compute_70 PTX image uses DP4A even when JIT-compiled for newer hardware.
+
+`cmfd-v4-replay --self-test` needs no model download and checks the selected
+backend against the CPU relation, plus DP4A tile tails, signed-byte extremes,
+and the full production K dimension. Also test `CUDA_FORCE_PTX_JIT=1` on the
+candidate worker, compare full-model search/replay outputs to the qualified
+reference, and verify a complete resulting proof separately. These checks are
+not substitutes for physical older-card or accepted-share qualification.
+Broader replay support does not widen the full proof worker's supported targets.
 
 The online proving path is:
 

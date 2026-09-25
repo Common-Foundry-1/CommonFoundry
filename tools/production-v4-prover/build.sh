@@ -35,7 +35,8 @@ for argument in "$@"; do
 done
 
 # The default is the already-qualified RC SM120 build. The opt-in mainnet
-# candidate is one binary per worker with native SM89 and SM120 code images.
+# candidate gives the full prover native SM89 and SM120 code images.
+# The replay/search worker uses its own cross-generation builder in both modes.
 # Keep its Cargo build directory separate: cached single-arch CUDA objects must
 # never be mistaken for dual-arch worker bytes submitted for signing.
 if "$dual_arch"; then
@@ -63,10 +64,8 @@ RUST_BUILD=(
     --bin real_bank0_relations
 )
 REPLAY_BUILD=(
-    "$CUDA_DIR/bin/nvcc" -O3 -std=c++17 "${NVCC_ARCH_FLAGS[@]}"
-    -I"$CUTLASS_DIR/include"
-    "$SCRIPT_DIR/cuda/koala_four_limb_replay.cu"
-    -o "$RELEASE_DIR/cmfd-v4-replay"
+    env "CUDACXX=$CUDA_DIR/bin/nvcc" "CMFD_CUTLASS_ROOT=$CUTLASS_DIR"
+    bash "$SCRIPT_DIR/build-replay.sh" "$RELEASE_DIR"
 )
 CACHE_BUILD=(
     "$CUDA_DIR/bin/nvcc" -O3 -std=c++17 "${NVCC_ARCH_FLAGS[@]}"
@@ -87,6 +86,7 @@ if "$print_build_plan"; then
         printf '%q ' "${command_args[@]}"
         printf '\n'
     done
+    "${REPLAY_BUILD[@]}" --print-build-plan
     exit 0
 fi
 

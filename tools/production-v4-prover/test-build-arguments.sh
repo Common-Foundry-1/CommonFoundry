@@ -43,14 +43,24 @@ check_plan() {
         --bin fixed_bank_artifact --bin real_dynamic_commitments \
         --bin real_bank0_relations)"
     expect_line "$plan" "$(expected_command REPLAY_BUILD \
-        "$CUDA_DIR/bin/nvcc" -O3 -std=c++17 "${flags[@]}" \
+        env "CUDACXX=$CUDA_DIR/bin/nvcc" "CMFD_CUTLASS_ROOT=$CUTLASS_DIR" \
+        bash "$SCRIPT_DIR/build-replay.sh" "$release_dir")"
+    expect_line "$plan" 'REPLAY_NATIVE_ARCHS=70 75 80 86 89 90 120'
+    expect_line "$plan" 'REPLAY_PTX_ARCH=70'
+    local -a replay_flags=()
+    for architecture in 70 75 80 86 89 90 120; do
+        replay_flags+=("--generate-code=arch=compute_$architecture,code=sm_$architecture")
+    done
+    replay_flags+=('--generate-code=arch=compute_70,code=compute_70')
+    expect_line "$plan" "$(expected_command REPLAY_COMPILE \
+        "$CUDA_DIR/bin/nvcc" -O3 -std=c++17 "${replay_flags[@]}" \
         -I"$CUTLASS_DIR/include" "$SCRIPT_DIR/cuda/koala_four_limb_replay.cu" \
         -o "$release_dir/cmfd-v4-replay")"
     expect_line "$plan" "$(expected_command CACHE_BUILD \
         "$CUDA_DIR/bin/nvcc" -O3 -std=c++17 "${flags[@]}" \
         "$SCRIPT_DIR/cuda/fixed_row_cache.cu" \
         -o "$release_dir/cmfd-v4-fixed-row-cache")"
-    test "$(wc -l <<< "$plan")" -eq 10 || {
+    test "$(wc -l <<< "$plan")" -eq 13 || {
         echo "$mode plan has unexpected extra lines" >&2
         exit 1
     }

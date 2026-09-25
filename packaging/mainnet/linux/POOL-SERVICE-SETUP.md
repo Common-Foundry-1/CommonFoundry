@@ -1,15 +1,11 @@
 # Staged Linux mainnet pool service
 
-This is an **offline template**, not an installed, enabled, or qualified pool.
-It does not alter the active AI01 RC pool. Do not deploy it by merely copying
-the unit: final mainnet plan pins, two approved reward destinations, signed
-packages, pool economics, the mainnet payout CLI, and a real launch rehearsal
-must be complete first. The current runtime package does **not** bundle these
-pool-service files, dashboard assets or the CUDA runtime copy expected below;
-include and verify them in a reviewed
-release before using the template. Signed package inclusion and a successful
-four-archive mainnet preflight are **unsatisfied launch gates**, not follow-up
-polish. No RC certificate, wallet, ledger, P2P seed,
+These are service templates; extracting an archive does not install or enable
+a pool. Mainnet runtime packages include the pool-service files, dashboard,
+CUDA runtime and workers. Verify the exact signed package and four-archive
+preflight, final mainnet plan, approved reward destinations, pool economics and
+the mainnet payout CLI before installation. Qualify the actual host service
+before enabling it. No RC certificate, wallet, ledger, P2P seed,
 port, or service account may be reused.
 
 ## Deliberately separate identity
@@ -73,8 +69,8 @@ approved pool GPU still has a compute process. It never stops that process.
    signing key cannot be detected by a file hash: independently compare the
    pool reward destinations before launch.
 5. Supply a reviewed, immutable mainnet dashboard directory. The assembler
-   now requires a frozen-source dashboard manifest and carries the exact asset
-   tree in all four archives; **actual signed archives do not yet exist**.
+   requires a frozen-source dashboard manifest and carries the exact asset
+   tree in all four archives.
    Hash its `index.html` from the approved asset set and verify the full tree
    against the final package receipt and independent reproduction evidence.
 6. Fill every field in `mainnet-pool.json.example` with **final approved**
@@ -101,6 +97,29 @@ device access, so this unit does not use `PrivateDevices=true`; it instead runs
 as the dedicated unprivileged account with only `video`/`render` groups and a
 read-only filesystem outside those two paths. Review actual device access and
 systemd sandbox behavior on AI01 before launch.
+
+The GPU character devices also need an explicit device-filter allowlist.
+`ProtectClock=true` implies a clock-device rule and can make the default device
+policy deny NVIDIA access even when the account belongs to video/render. Keep
+that protection enabled and create a root-owned mode-0644 drop-in at
+`/etc/systemd/system/commonfoundry-mainnet-pool.service.d/20-nvidia-devices.conf`.
+For a single approved GPU at `/dev/nvidia0`, use:
+
+```ini
+[Service]
+DevicePolicy=closed
+DeviceAllow=/dev/nvidia0 rw
+DeviceAllow=/dev/nvidiactl rw
+DeviceAllow=/dev/nvidia-uvm rw
+DeviceAllow=/dev/nvidia-uvm-tools rw
+```
+
+Confirm the device index maps to the configured GPU UUID. On another host,
+allow only its intended GPU nodes; do not copy a broad wildcard or change
+global device permissions. Reload systemd and test NVIDIA visibility and a
+complete proof as the actual service account with the same restrictions.
+An unrestricted shell query alone does not qualify the service sandbox.
+
 The dual-arch candidate proof worker dynamically requires the packaged
 `libcudart.so.12` plus host `libstdc++`, `libgcc_s`, glibc and the NVIDIA driver;
 the replay worker requires the standard host libraries. The mainnet package

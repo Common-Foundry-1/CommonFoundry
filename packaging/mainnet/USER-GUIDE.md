@@ -45,6 +45,14 @@ model inputs, waits for the authenticated launch certificate, then connects.
 Windows GPU mining uses WSL2 Ubuntu-22.04 with NVIDIA support. Linux GPU mining
 needs a compatible NVIDIA driver. Normal wallet operations do not require them.
 
+The replay/search build targets NVIDIA Volta and RTX 20/30/40/50 generations.
+Check the release's hardware-test matrix for the exact cards and drivers tested.
+The model/search path needs roughly 6.45 GiB of device allocation, plus CUDA and
+display overhead; 6 GB cards cannot hold it. Use a card with at least 8 GB and
+sufficient free memory. Pool mining uses the replay/search worker; full solo
+proving has a separate, narrower qualification matrix. A broad replay build
+does not establish full-prover support on every listed GPU.
+
 For a multi-GPU rig, run one miner process per GPU. List the physical indices
 and full UUIDs with `nvidia-smi --query-gpu=index,uuid --format=csv,noheader`.
 Set a different `GPU` in each Windows BAT copy, or start separate Linux

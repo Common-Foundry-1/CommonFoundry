@@ -210,6 +210,9 @@ export function App() {
   }
 
   const pool = document.pool;
+  const walletPackage = pool.network_short_name === "Mainnet"
+    ? "Mainnet runtime package (wallet + node)"
+    : `${pool.network_short_name} wallet package`;
   const ledger = pool.ledger;
   const protection = ledger.payout_protection;
   const payoutsHeld = protection?.requires_reconciliation === true;
@@ -257,7 +260,7 @@ export function App() {
             <p className="eyebrow">Common Foundry · {pool.network_short_name}</p>
             <h1 id="pool-title">ForgeMatrix Pool</h1>
             <p className="hero-copy">
-              ProductionV4 mining with authenticated shares, fair PPLNS accounting, and automatic Devnet payouts.
+              ProductionV4 mining with authenticated shares, PPLNS accounting, and clear payout tracking.
             </p>
           </div>
           <div className="hero-status">
@@ -355,7 +358,7 @@ export function App() {
               ))}
             </div>
             <ol className="connect-steps">
-              <li>Launch {platform === "windows" ? "START-WALLET.bat" : "./start-wallet.sh"} from the RCNet-1 wallet package.</li>
+              <li>Launch {platform === "windows" ? "START-WALLET.bat" : "./start-wallet.sh"} from the {walletPackage}.</li>
               <li>Open Mining, choose Pool mode, and paste the pool URL below.</li>
               <li>Enter a unique worker name; the wallet supplies its authenticated receive address.</li>
             </ol>
@@ -483,8 +486,8 @@ export function App() {
           <span>{pool.network_name}</span>
           <span>Proof profile {pool.proof_profile}</span>
           <span>Updated {new Date(pool.generated_at_unix_seconds * 1000).toLocaleTimeString()}</span>
-          <a href="https://commonfoundry.org" target="_blank" rel="noreferrer">
-            commonfoundry.org <ExternalLink size={13} aria-hidden="true" />
+          <a href="https://commonfoundry.ai" target="_blank" rel="noreferrer">
+            commonfoundry.ai <ExternalLink size={13} aria-hidden="true" />
           </a>
         </footer>
       </main>

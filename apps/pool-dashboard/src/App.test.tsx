@@ -174,21 +174,66 @@ describe("pool dashboard", () => {
     expect(rows[2]).toHaveTextContent("rig-02");
   });
 
-  it("directs Windows and Linux workers to the wallet package", async () => {
+  it.each([
+    ["Mainnet", "Mainnet runtime package (wallet + node)"],
+    ["RCNet-1", "RCNet-1 wallet package"],
+    ["Devnet-0", "Devnet-0 wallet package"],
+  ])("directs Windows and Linux workers to the %s wallet package", async (network, packageName) => {
+    const snapshot = structuredClone(fixture);
+    snapshot.pool.network_short_name = network;
+    snapshot.pool.network_name = `Common Foundry ${network}`;
     vi.stubGlobal(
       "fetch",
-      vi.fn().mockResolvedValue(new Response(JSON.stringify(fixture), { status: 200 })),
+      vi.fn().mockImplementation(() => Promise.resolve(new Response(JSON.stringify(snapshot), { status: 200 }))),
     );
     const user = userEvent.setup();
     const { container } = render(<App />);
     await screen.findByRole("heading", { name: "ForgeMatrix Pool" });
 
     expect(container.querySelector(".connect-steps")).toHaveTextContent("START-WALLET.bat");
-    expect(screen.getByText(/RCNet-1 wallet package/)).toBeVisible();
+    expect(container.querySelector(".connect-steps")).toHaveTextContent(`from the ${packageName}.`);
     expect(screen.queryByText(/miner package/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/automatic Devnet payouts/)).not.toBeInTheDocument();
+    if (network === "Mainnet") {
+      expect(screen.queryByText(/RCNet-1 wallet package/)).not.toBeInTheDocument();
+    }
 
     await user.click(screen.getByRole("tab", { name: "Linux" }));
     expect(container.querySelector(".connect-steps")).toHaveTextContent("./start-wallet.sh");
+    expect(container.querySelector(".connect-steps")).toHaveTextContent(`from the ${packageName}.`);
+    expect(container.querySelector(".connect-steps")).not.toHaveTextContent("START-WALLET.bat");
+
+    await user.click(screen.getByRole("tab", { name: "Windows" }));
+    expect(container.querySelector(".connect-steps")).toHaveTextContent("START-WALLET.bat");
+    expect(container.querySelector(".connect-steps")).not.toHaveTextContent("./start-wallet.sh");
+    expect(screen.getByRole("link", { name: "commonfoundry.ai" })).toHaveAttribute("href", "https://commonfoundry.ai");
+    expect(screen.queryByRole("link", { name: "commonfoundry.org" })).not.toBeInTheDocument();
+  });
+
+  it("updates package instructions with a refreshed network snapshot", async () => {
+    const mainnet = structuredClone(fixture);
+    mainnet.pool.network_short_name = "Mainnet";
+    mainnet.pool.network_name = "Common Foundry Mainnet";
+    vi.stubGlobal("fetch", vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify(fixture), { status: 200 }))
+      .mockImplementation(() => Promise.resolve(new Response(JSON.stringify(mainnet), { status: 200 }))));
+    const user = userEvent.setup();
+    render(<App />);
+    expect(await screen.findByText(/RCNet-1 wallet package/)).toBeVisible();
+    await user.click(screen.getByRole("tab", { name: "Linux" }));
+    await user.click(screen.getByRole("button", { name: /refresh/i }));
+    expect(await screen.findByText(/Mainnet runtime package/)).toHaveTextContent("./start-wallet.sh");
+    expect(screen.queryByText(/RCNet-1 wallet package/)).not.toBeInTheDocument();
+  });
+
+  it("does not promise automatic payouts while settlement is disabled", async () => {
+    const paused = structuredClone(fixture);
+    paused.pool.automatic_testnet_payouts = false;
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify(paused), { status: 200 })));
+    render(<App />);
+    expect(await screen.findByText("settlement paused")).toBeVisible();
+    expect(screen.getByText(/clear payout tracking/)).toBeVisible();
+    expect(screen.queryByText(/automatic Devnet payouts|automatic settlement on/)).not.toBeInTheDocument();
   });
 
   it("offers a retry when the pool API is unavailable", async () => {

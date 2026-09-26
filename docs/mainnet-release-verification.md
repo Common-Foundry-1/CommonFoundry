@@ -21,12 +21,16 @@ This policy is for release checksums; the separate
 `MAINNET-PRODUCER.allowed_signers` policy uses a different namespace for plan
 approval. Neither policy contains a private key.
 
-Obtain and check the release-key fingerprint through an independently controlled
-official project channel **before** trusting the download page. A key file,
-fingerprint, or checksum supplied only beside the packages cannot by itself
-authenticate that same package set. Publication of the independent fingerprint
-and its exact location is a remaining launch gate. Stop if the independently
-published fingerprint, this source policy, or the final release disagree.
+The selected public key is published at
+[commonfoundry.ai/mainnet-release-key.txt](https://commonfoundry.ai/mainnet-release-key.txt),
+separately from the package download. On September 25, 2026, the fetched file's
+SHA-256 was `49c382f071a5f04f12c86f98ce1f0d3a24c2cc14b3c294f19704220b254b3a7e`,
+matching this source policy byte for byte. Obtain and check the fingerprint from
+that official site **before** trusting the download page, and check it again at
+release time. A key file, fingerprint, or checksum supplied only beside the
+packages cannot by itself authenticate that same package set. Stop if the
+independently published fingerprint, this source policy, or the final release
+disagree.
 
 ## Verify the complete downloaded directory
 

@@ -1,5 +1,8 @@
 # Exchange integration preview
 
+For transaction-by-hash lookup, explicit address balances, and the restricted
+Singapore HTTPS transport, see [integration queries](exchange-integration-queries.md).
+
 Status: **exchange integration preview**. The chain, deposit, and legacy
 withdrawal contract remains v0.4. An explicit v0.5 custody candidate can be
 activated only after offline journal/keyring migration. Neither mode is a

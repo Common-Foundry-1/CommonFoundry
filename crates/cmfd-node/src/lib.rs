@@ -66,6 +66,7 @@ pub(crate) mod exchange_custody_v3;
 pub(crate) mod exchange_index;
 pub(crate) mod exchange_local_signer;
 pub(crate) mod exchange_policy;
+pub(crate) mod exchange_queries;
 pub mod exchange_rpc;
 pub(crate) mod exchange_signer;
 pub(crate) mod exchange_withdrawal;

@@ -1,5 +1,9 @@
 # Common Foundry Exchange Integration Kit v1
 
+The additive [transaction and address query contract](../docs/exchange-integration-queries.md)
+documents `getrawtransaction`, `gettransaction`, `getaddressbalance`, and
+`getbalance`, including confirmations, reorganization handling, and atom units.
+
 Status: **integration preview**. This kit describes the RPC implemented by the
 current pre-release source. It is not a production-custody certification,
 Bitcoin Core compatibility claim, independent audit opinion, or claim that a

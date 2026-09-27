@@ -130,6 +130,174 @@
       "tags": [{ "name": "chain" }]
     },
     {
+      "name": "getrawtransaction",
+      "summary": "Look up an active-chain or local mempool transaction by its identifier",
+      "description": "Full retained active-chain lookup; optional block hash can select an inactive block. Coinbase verbose objects have hex null. See docs/exchange-integration-queries.md.",
+      "paramStructure": "by-position",
+      "params": [
+        {
+          "name": "txid",
+          "required": true,
+          "schema": {
+            "$ref": "./schemas/exchange-rpc.schema.json#/$defs/Hash32"
+          }
+        },
+        {
+          "name": "verbose",
+          "required": false,
+          "schema": {
+            "oneOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "enum": [
+                  0,
+                  1
+                ]
+              }
+            ],
+            "default": false
+          }
+        },
+        {
+          "name": "blockhash",
+          "required": false,
+          "schema": {
+            "$ref": "./schemas/exchange-rpc.schema.json#/$defs/Hash32"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "./schemas/exchange-rpc.schema.json#/$defs/RawTransactionResult"
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/InvalidParams"
+        },
+        {
+          "$ref": "#/components/errors/InternalError"
+        }
+      ],
+      "tags": [
+        {
+          "name": "chain"
+        }
+      ]
+    },
+    {
+      "name": "gettransaction",
+      "summary": "Look up an active-chain or local mempool transaction by its identifier",
+      "description": "Full retained active-chain lookup; optional block hash can select an inactive block. Coinbase verbose objects have hex null. See docs/exchange-integration-queries.md.",
+      "paramStructure": "by-position",
+      "params": [
+        {
+          "name": "txid",
+          "required": true,
+          "schema": {
+            "$ref": "./schemas/exchange-rpc.schema.json#/$defs/Hash32"
+          }
+        },
+        {
+          "name": "blockhash",
+          "required": false,
+          "schema": {
+            "$ref": "./schemas/exchange-rpc.schema.json#/$defs/Hash32"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "./schemas/exchange-rpc.schema.json#/$defs/TransactionLookupResult"
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/InvalidParams"
+        },
+        {
+          "$ref": "#/components/errors/InternalError"
+        }
+      ],
+      "tags": [
+        {
+          "name": "chain"
+        }
+      ]
+    },
+    {
+      "name": "getaddressbalance",
+      "summary": "Read explicit key destination balances in integer atom strings",
+      "description": "Required 32-byte x-only destination. Returns confirmed, mature, available, immature and local mempool components. One CMFD is 100000000 atoms. No implicit wallet query.",
+      "paramStructure": "by-position",
+      "params": [
+        {
+          "name": "destination_hex",
+          "required": true,
+          "schema": {
+            "$ref": "./schemas/exchange-rpc.schema.json#/$defs/Hash32"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "./schemas/exchange-rpc.schema.json#/$defs/AddressBalance"
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/InvalidParams"
+        },
+        {
+          "$ref": "#/components/errors/InternalError"
+        }
+      ],
+      "tags": [
+        {
+          "name": "chain"
+        }
+      ]
+    },
+    {
+      "name": "getbalance",
+      "summary": "Read explicit key destination balances in integer atom strings",
+      "description": "Required 32-byte x-only destination. Returns confirmed, mature, available, immature and local mempool components. One CMFD is 100000000 atoms. No implicit wallet query.",
+      "paramStructure": "by-position",
+      "params": [
+        {
+          "name": "destination_hex",
+          "required": true,
+          "schema": {
+            "$ref": "./schemas/exchange-rpc.schema.json#/$defs/Hash32"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "./schemas/exchange-rpc.schema.json#/$defs/AddressBalance"
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/InvalidParams"
+        },
+        {
+          "$ref": "#/components/errors/InternalError"
+        }
+      ],
+      "tags": [
+        {
+          "name": "chain"
+        }
+      ]
+    },
+    {
       "name": "getrawmempool",
       "summary": "Return local mempool transaction IDs or verbose entries",
       "paramStructure": "by-position",

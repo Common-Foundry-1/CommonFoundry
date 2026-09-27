@@ -208,6 +208,231 @@
       ],
       "additionalProperties": false
     },
+    "TransactionLookupResult": {
+      "type": "object",
+      "required": [
+        "txid",
+        "hex",
+        "network_id",
+        "blockhash",
+        "blockheight",
+        "confirmations",
+        "time",
+        "vin",
+        "vout",
+        "coinbase",
+        "active",
+        "status",
+        "bestblock",
+        "height"
+      ],
+      "properties": {
+        "txid": {
+          "$ref": "#/$defs/Hash32"
+        },
+        "hex": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/EvenLowerHex"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "network_id": {
+          "$ref": "#/$defs/Hash32"
+        },
+        "blockhash": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Hash32"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "blockheight": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "confirmations": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": -1
+        },
+        "time": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "vin": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TransactionInput"
+          }
+        },
+        "vout": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TransactionOutput"
+          }
+        },
+        "coinbase": {
+          "type": "boolean"
+        },
+        "active": {
+          "type": "boolean"
+        },
+        "status": {
+          "enum": [
+            "confirmed",
+            "mempool",
+            "inactive"
+          ]
+        },
+        "bestblock": {
+          "$ref": "#/$defs/Hash32"
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "coinbase": {
+                "const": false
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "size",
+              "version"
+            ],
+            "properties": {
+              "hex": {
+                "type": "string"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "hex": {
+                "type": "null"
+              },
+              "vin": {
+                "maxItems": 0
+              }
+            }
+          }
+        }
+      ]
+    },
+    "RawTransactionResult": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/EvenLowerHex"
+        },
+        {
+          "$ref": "#/$defs/TransactionLookupResult"
+        }
+      ]
+    },
+    "AddressBalance": {
+      "type": "object",
+      "required": [
+        "balance_atoms",
+        "confirmed_atoms",
+        "spendable_atoms",
+        "immature_atoms",
+        "available_atoms",
+        "pending_incoming_atoms",
+        "pending_outgoing_atoms",
+        "destination_hex",
+        "network_id",
+        "bestblock",
+        "height",
+        "utxo_count",
+        "mempool_scope",
+        "unconfirmed_delta_atoms"
+      ],
+      "properties": {
+        "balance_atoms": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,38})$"
+        },
+        "confirmed_atoms": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,38})$"
+        },
+        "spendable_atoms": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,38})$"
+        },
+        "immature_atoms": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,38})$"
+        },
+        "available_atoms": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,38})$"
+        },
+        "pending_incoming_atoms": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,38})$"
+        },
+        "pending_outgoing_atoms": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,38})$"
+        },
+        "destination_hex": {
+          "$ref": "#/$defs/Hash32"
+        },
+        "network_id": {
+          "$ref": "#/$defs/Hash32"
+        },
+        "bestblock": {
+          "$ref": "#/$defs/Hash32"
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "utxo_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "mempool_scope": {
+          "const": "this_node_only"
+        },
+        "unconfirmed_delta_atoms": {
+          "type": "string",
+          "pattern": "^(0|-?[1-9][0-9]{0,38})$"
+        }
+      },
+      "additionalProperties": false
+    },
     "Transaction": {
       "type": "object",
       "required": ["txid", "hex", "size", "version", "network_id", "blockhash", "blockheight", "confirmations", "time", "vin", "vout"],

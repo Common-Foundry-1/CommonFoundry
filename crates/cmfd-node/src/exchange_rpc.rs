@@ -38,6 +38,7 @@ use crate::exchange_index::{
     MAX_WATCH_REGISTRATION_BATCH, RegisterWatchDestinationResult, RegisterWatchDestinationsResult,
     WatchDestinationRegistration, WatchDestinationView,
 };
+use crate::exchange_queries::{QueryError, TransactionBody, address_balance};
 use crate::exchange_withdrawal::{
     ExchangeWithdrawalError, ExchangeWithdrawalJournal, WithdrawalJournalAnchor,
     WithdrawalJournalInfo, WithdrawalRequest, WithdrawalView,
@@ -856,6 +857,14 @@ fn dispatch_shared_request_scoped_backend(
         let result = route_getblock_shared(&request.params, shared);
         return finish_request(request.id, result);
     }
+    if matches!(
+        request.method.as_str(),
+        "getrawtransaction" | "gettransaction"
+    ) {
+        let result =
+            route_get_transaction(&request.method, &request.params, shared, exchange_index);
+        return finish_request(request.id, result);
+    }
     let exchange_index_result = match request.method.as_str() {
         "getexchangeinfo" => Some(route_get_exchange_info(
             &request.params,
@@ -1614,6 +1623,10 @@ fn route_get_exchange_info(
                 "getbestblockhash",
                 "getblockhash",
                 "getblock",
+                "getrawtransaction",
+                "gettransaction",
+                "getaddressbalance",
+                "getbalance",
                 "getrawmempool",
                 "sendrawtransaction",
                 "registerwatchdestination",
@@ -1818,6 +1831,14 @@ fn route_method(
             Ok(json!(hex::encode(block_id)))
         }
         "getblock" => route_getblock(node, params),
+        "getaddressbalance" | "getbalance" => {
+            require_parameter_count(params, 1, 1)?;
+            let destination = hash_parameter(&params[0], "destination_hex")?;
+            k256::schnorr::VerifyingKey::from_bytes(&destination).map_err(|_| {
+                RpcFault::invalid_params("destination_hex must encode a valid x-only secp256k1 key")
+            })?;
+            address_balance(node, destination).map_err(node_fault)
+        }
         "getrawmempool" => {
             require_parameter_count(params, 0, 1)?;
             let verbose = match params.first() {
@@ -1870,6 +1891,110 @@ fn route_method(
             retryable: false,
         }),
     }
+}
+
+fn query_fault(error: QueryError) -> RpcFault {
+    match error {
+        QueryError::Node(error) => node_fault(error),
+        QueryError::ChainChanged => RpcFault {
+            code: -32020,
+            message: "active chain changed during transaction lookup; retry the read".into(),
+            data_code: "transaction_query_chain_changed",
+            retryable: true,
+        },
+        QueryError::Capacity => RpcFault {
+            code: -32021,
+            message: "transaction lookup index capacity reached; supply a block hash".into(),
+            data_code: "transaction_query_capacity",
+            retryable: false,
+        },
+    }
+}
+
+fn route_get_transaction(
+    method: &str,
+    params: &[Value],
+    shared: &Arc<Mutex<Node>>,
+    exchange_index: &SharedExchangeDepositIndex,
+) -> Result<Value, RpcFault> {
+    require_parameter_count(params, 1, if method == "getrawtransaction" { 3 } else { 2 })?;
+    let txid = hash_parameter(&params[0], "txid")?;
+    let verbose = if method == "gettransaction" {
+        true
+    } else {
+        match params.get(1) {
+            None => false,
+            Some(Value::Bool(value)) => *value,
+            Some(value) if value.as_u64() == Some(0) => false,
+            Some(value) if value.as_u64() == Some(1) => true,
+            _ => {
+                return Err(RpcFault::invalid_params(
+                    "verbose must be true, false, 0, or 1",
+                ));
+            }
+        }
+    };
+    let hint_position = if method == "getrawtransaction" { 2 } else { 1 };
+    let hint = params
+        .get(hint_position)
+        .map(|value| hash_parameter(value, "blockhash"))
+        .transpose()?;
+    let read = lock_exchange_index(exchange_index)?
+        .transaction_lookup
+        .lookup(shared, txid, hint)
+        .map_err(query_fault)?
+        .ok_or_else(|| {
+            RpcFault::not_found(
+                "transaction_not_found",
+                "transaction was not found in the active chain or local mempool",
+            )
+        })?;
+    let mut document = match read.body {
+        TransactionBody::Regular(transaction) => {
+            if !verbose {
+                return Ok(json!(hex::encode(
+                    encode_transaction(&transaction)
+                        .map_err(NodeError::from)
+                        .map_err(node_fault)?
+                )));
+            }
+            let mut document = transaction_document(
+                &transaction,
+                read.block_id,
+                read.height,
+                Some(read.confirmations),
+                read.timestamp,
+            )
+            .map_err(node_fault)?;
+            document["coinbase"] = json!(false);
+            document
+        }
+        TransactionBody::Coinbase(block) => {
+            if !verbose {
+                return Err(RpcFault::invalid_params(
+                    "coinbase is a block component with no standalone transaction frame; request verbose output",
+                ));
+            }
+            json!({
+                "txid": hex::encode(txid), "hex": Value::Null, "coinbase": true,
+                "network_id": hex::encode(block.challenge.network_id),
+                "blockhash": read.block_id.map(hex::encode), "blockheight": read.height,
+                "confirmations": read.confirmations, "time": read.timestamp,
+                "vin": [], "vout": outputs_document(&block.coinbase.outputs),
+            })
+        }
+    };
+    document["active"] = json!(read.confirmations > 0);
+    document["status"] = json!(if read.confirmations > 0 {
+        "confirmed"
+    } else if read.confirmations == 0 {
+        "mempool"
+    } else {
+        "inactive"
+    });
+    document["bestblock"] = json!(hex::encode(read.tip));
+    document["height"] = json!(read.tip_height);
+    Ok(document)
 }
 
 fn prepare_broadcast_transaction(
@@ -3721,6 +3846,238 @@ mod tests {
 
         drop(node);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn integration_transaction_lookup_and_balance_follow_mempool_confirmation_and_restart() {
+        let directory = test_directory("integration-queries");
+        let mut node = Node::open_with_profile(&directory, DEVNET_PROFILE).unwrap();
+        let destination = node.wallet_destination();
+        let mut first = None;
+        for height in 1..=100 {
+            let block = node
+                .mine_once(
+                    destination,
+                    DEVNET_PROFILE.virtual_genesis_timestamp + height * 60,
+                    DEFAULT_MINING_ATTEMPTS,
+                )
+                .unwrap();
+            if height == 1 {
+                first = Some(block);
+            }
+        }
+        let first = first.unwrap();
+        let (transaction, _) = node.prepare_dev_wallet_payment(destination, 1, 1).unwrap();
+        let txid = hex::encode(transaction.txid());
+        let raw = hex::encode(encode_transaction(&transaction).unwrap());
+        let shared = Arc::new(Mutex::new(node));
+        let index = Arc::new(Mutex::new(
+            ExchangeDepositIndex::open_and_sync(&shared).unwrap(),
+        ));
+        let query = |method: &str, params: Value| {
+            shared_call(
+                json!({"jsonrpc":"2.0", "id":"query", "method":method, "params":params}),
+                &shared,
+                &index,
+            )
+        };
+        let before = query("getaddressbalance", json!([hex::encode(destination)]));
+        assert!(
+            before["result"]["available_atoms"]
+                .as_str()
+                .unwrap()
+                .parse::<u128>()
+                .unwrap()
+                > 0
+        );
+        assert!(
+            before["result"]["immature_atoms"]
+                .as_str()
+                .unwrap()
+                .parse::<u128>()
+                .unwrap()
+                > 0
+        );
+        assert_eq!(
+            query("getbalance", json!([hex::encode(destination)]))["result"],
+            before["result"]
+        );
+        assert_eq!(query("sendrawtransaction", json!([raw]))["result"], txid);
+        assert_eq!(query("sendrawtransaction", json!([raw]))["result"], txid);
+        let pending = query("gettransaction", json!([txid]));
+        assert_eq!(pending["result"]["confirmations"], 0);
+        assert_eq!(pending["result"]["status"], "mempool");
+        assert_eq!(query("getrawtransaction", json!([txid]))["result"], raw);
+        assert_eq!(
+            query("getrawtransaction", json!([txid, 1]))["result"]["hex"],
+            raw
+        );
+        let pending_balance = query("getbalance", json!([hex::encode(destination)]));
+        assert_eq!(pending_balance["result"]["unconfirmed_delta_atoms"], "-1");
+        assert_eq!(
+            pending_balance["result"]["confirmed_atoms"],
+            before["result"]["confirmed_atoms"]
+        );
+        assert_eq!(pending_balance["result"]["available_atoms"], "0");
+        let confirmed = shared
+            .lock()
+            .unwrap()
+            .mine_once(
+                destination,
+                DEVNET_PROFILE.virtual_genesis_timestamp + 101 * 60,
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        let found = query("gettransaction", json!([txid]));
+        assert_eq!(found["result"]["confirmations"], 1);
+        assert_eq!(
+            found["result"]["blockhash"],
+            hex::encode(confirmed.block_id())
+        );
+        assert_eq!(found["result"]["hex"], raw);
+        assert_eq!(
+            query(
+                "getrawtransaction",
+                json!([txid, false, hex::encode(confirmed.block_id())])
+            )["result"],
+            raw
+        );
+        let coinbase = query(
+            "gettransaction",
+            json!([hex::encode(first.coinbase_outpoint_id())]),
+        );
+        assert_eq!(coinbase["result"]["coinbase"], true);
+        assert_eq!(coinbase["result"]["confirmations"], 101);
+        assert!(coinbase["result"]["hex"].is_null());
+        assert_eq!(
+            query("gettransaction", json!(["00".repeat(32)]))["error"]["data"]["code"],
+            "transaction_not_found"
+        );
+        for params in [
+            json!([]),
+            json!(["bad"]),
+            json!([txid, "yes"]),
+            json!([txid, 2]),
+        ] {
+            assert_eq!(query("getrawtransaction", params)["error"]["code"], -32602);
+        }
+        assert_eq!(query("getbalance", json!([]))["error"]["code"], -32602);
+        assert_eq!(
+            query("getbalance", json!(["ff".repeat(32)]))["error"]["code"],
+            -32602
+        );
+        drop(index);
+        drop(shared);
+        let node = Node::open_with_profile(&directory, DEVNET_PROFILE).unwrap();
+        let shared = Arc::new(Mutex::new(node));
+        let index = Arc::new(Mutex::new(
+            ExchangeDepositIndex::open_and_sync(&shared).unwrap(),
+        ));
+        let restarted = shared_call(
+            json!({"jsonrpc":"2.0","id":1,"method":"gettransaction","params":[txid]}),
+            &shared,
+            &index,
+        );
+        assert_eq!(
+            restarted["result"]["blockhash"],
+            found["result"]["blockhash"]
+        );
+        assert_eq!(restarted["result"]["hex"], raw);
+        Arc::make_mut(
+            shared
+                .lock()
+                .unwrap()
+                .index
+                .blocks
+                .get_mut(&confirmed.block_id())
+                .unwrap(),
+        )
+        .locator
+        .complete_digest[0] ^= 1;
+        let corrupt = shared_call(
+            json!({"jsonrpc":"2.0","id":2,"method":"gettransaction","params":[txid]}),
+            &shared,
+            &index,
+        );
+        assert_eq!(corrupt["error"]["data"]["code"], "corrupt_block_log");
+        assert!(shared.lock().unwrap().storage_faulted);
+        drop(index);
+        drop(shared);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn transaction_lookup_removes_reorganized_coinbase_and_supports_explicit_side_block() {
+        let directory = test_directory("query-reorg");
+        let fork_directory = test_directory("query-reorg-fork");
+        let mut node = Node::open_with_profile(&directory, DEVNET_PROFILE).unwrap();
+        let destination = node.wallet_destination();
+        let old = node
+            .mine_once(
+                destination,
+                DEVNET_PROFILE.virtual_genesis_timestamp + 60,
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        let shared = Arc::new(Mutex::new(node));
+        let index = Arc::new(Mutex::new(
+            ExchangeDepositIndex::open_and_sync(&shared).unwrap(),
+        ));
+        let old_id = hex::encode(old.coinbase_outpoint_id());
+        assert_eq!(
+            shared_call(
+                json!({"jsonrpc":"2.0","id":1,"method":"gettransaction","params":[old_id]}),
+                &shared,
+                &index
+            )["result"]["confirmations"],
+            1
+        );
+        let mut fork = Node::open_with_profile(&fork_directory, DEVNET_PROFILE).unwrap();
+        let fork_destination = fork.wallet_destination();
+        for height in 1..=3 {
+            let block = fork
+                .mine_once(
+                    fork_destination,
+                    DEVNET_PROFILE.virtual_genesis_timestamp + height * 60,
+                    DEFAULT_MINING_ATTEMPTS,
+                )
+                .unwrap();
+            shared
+                .lock()
+                .unwrap()
+                .submit_block(
+                    block,
+                    DEVNET_PROFILE.virtual_genesis_timestamp + height * 60,
+                )
+                .unwrap();
+        }
+        let removed = shared_call(
+            json!({"jsonrpc":"2.0","id":2,"method":"gettransaction","params":[old_id]}),
+            &shared,
+            &index,
+        );
+        assert_eq!(removed["error"]["data"]["code"], "transaction_not_found");
+        let side = shared_call(
+            json!({"jsonrpc":"2.0","id":3,"method":"gettransaction","params":[old_id,hex::encode(old.block_id())]}),
+            &shared,
+            &index,
+        );
+        assert_eq!(side["result"]["confirmations"], -1);
+        assert_eq!(side["result"]["active"], false);
+        assert_eq!(side["result"]["status"], "inactive");
+        assert_eq!(
+            shared_call(
+                json!({"jsonrpc":"2.0","id":4,"method":"getbalance","params":[hex::encode(destination)]}),
+                &shared,
+                &index
+            )["result"]["balance_atoms"],
+            "0"
+        );
+        drop(index);
+        drop(shared);
+        drop(fork);
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(fork_directory).unwrap();
     }
 
     #[test]

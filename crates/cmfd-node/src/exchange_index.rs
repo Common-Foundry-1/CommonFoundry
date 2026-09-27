@@ -271,6 +271,9 @@ struct IndexState {
 }
 
 pub(crate) struct ExchangeDepositIndex {
+    // Ephemeral and rebuilt from authenticated history; never persisted in the
+    // deposit event journal or treated as a consensus capability.
+    pub(crate) transaction_lookup: crate::exchange_queries::TransactionLookupIndex,
     data_dir: PathBuf,
     network_id: [u8; 32],
     consensus_fingerprint: [u8; 32],
@@ -306,6 +309,7 @@ impl ExchangeDepositIndex {
             |loaded| (loaded.state, loaded.needs_redundancy, loaded.needs_marker),
         );
         let mut index = Self {
+            transaction_lookup: Default::default(),
             data_dir: binding.data_dir,
             network_id: binding.network_id,
             consensus_fingerprint: binding.consensus_fingerprint,
@@ -2376,6 +2380,7 @@ mod tests {
             .unwrap();
         }
         let index = ExchangeDepositIndex {
+            transaction_lookup: Default::default(),
             data_dir: PathBuf::new(),
             network_id: [3_u8; 32],
             consensus_fingerprint: [4_u8; 32],

@@ -12,6 +12,45 @@
   ],
   "groups": [
     {
+      "scope": [
+        "gettransaction",
+        "getrawtransaction"
+      ],
+      "jsonrpc_code": -5,
+      "retryable": false,
+      "data_codes": [
+        "transaction_not_found"
+      ],
+      "meaning": "Identifier absent from the active chain/local mempool or specified block.",
+      "action": "Check identifier, network, node synchronization and optional block hash."
+    },
+    {
+      "scope": [
+        "gettransaction",
+        "getrawtransaction"
+      ],
+      "jsonrpc_code": -32020,
+      "retryable": true,
+      "data_codes": [
+        "transaction_query_chain_changed"
+      ],
+      "meaning": "Chain changed during an authenticated off-lock read.",
+      "action": "Retry the read; this error never authorizes an automatic transaction broadcast retry."
+    },
+    {
+      "scope": [
+        "gettransaction",
+        "getrawtransaction"
+      ],
+      "jsonrpc_code": -32021,
+      "retryable": false,
+      "data_codes": [
+        "transaction_query_capacity"
+      ],
+      "meaning": "Rebuildable transaction index reached its configured capacity.",
+      "action": "Supply the transaction block hash or increase qualified index capacity."
+    },
+    {
       "scope": ["request-envelope"],
       "jsonrpc_code": -32700,
       "retryable": false,

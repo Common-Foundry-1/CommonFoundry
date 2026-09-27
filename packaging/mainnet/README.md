@@ -1,7 +1,10 @@
 # Mainnet launchers
 
 The committed `MAINNET-PLAN.json` and `REWARD-CUSTODY.json` are the public output
-of the owner's completed September 23 custody setup with two different passwords.
+of the owner's custody setup. The September 27 replacement retained the exact
+Steward key and replaced the Community key and release signer after the owner
+reported the other passwords unavailable. The new Community destination derives
+a new mainnet network identity; the earlier pending packages are superseded.
 They bind the two reward destinations, 5x RC starting difficulty and October 3
 17:00 UTC launch. They contain no wallet keys or passwords and are not launch
 approvals. Do not regenerate or replace them with fixture destinations. See
@@ -17,6 +20,9 @@ existing authenticated model-input preparation tools under the names below.
   fixed record. The preparation tool takes an explicit destination directory.
 - Miner package: cmfd-miner, cmfd-launch, replay worker, and the existing
   `PREPARE-V4-INPUTS.ps1` / `PREPARE-V4-INPUTS.sh` and authenticated manifests.
+- HiveOS package: the same native Linux miner and workers, with the custom-miner
+  callbacks described in `hiveos/README.md`. Its archive root and installation
+  directory are `commonfoundry-mainnet-hiveos`, with no version subdirectory.
 - Each package contains `production-mainnet/MAINNET-PLAN.json`. The future
   beacon is downloaded as `production-mainnet/LAUNCH-BEACON.json` after launch.
 
@@ -50,11 +56,11 @@ process-interruption protection, not a claim of power-loss qualification.
 ## Native package assembly
 
 `scripts/package_mainnet.py` assembles the runtime (wallet + node) and standalone
-miner archives on each native platform. It requires an exact clean frozen source
+miner archives on each native platform and the Linux HiveOS archive. It requires an exact clean frozen source
 commit, matching package versions, a canonical plan, mainnet-feature binaries,
 the launch helper, both Linux GPU workers, a reviewed built pool-dashboard tree,
 and an exact-hash-pinned Linux x86-64 CUDA 12 runtime library. It does not build
-the executables or dashboard. All four archives carry the same dashboard assets
+the executables or dashboard. All five archives carry the same dashboard assets
 and `lib/libcudart.so.12` so the Linux pool and WSL mining workers use one
 reconciled runtime set. The Linux runtime also carries the separate mainnet
 pool service templates; none is installed automatically.
@@ -77,6 +83,7 @@ py -3 scripts/package_mainnet.py --platform windows-x86_64 --kind runtime `
 
 For a miner archive, use `--kind miner --miner $MinerBinary` instead of the node
 and wallet arguments. On Linux use python3 and `--platform linux-x86_64`.
+The HiveOS archive uses `--platform linux-x86_64 --kind hiveos --miner $MinerBinary`.
 The source node/wallet/miner versions must match; RC versions are not accepted.
 Linux staging uses the native temporary filesystem so Windows-mounted output
 directories cannot silently mark configuration files executable. Set `TMPDIR`
@@ -127,12 +134,13 @@ cross-platform reconciliation, owner approval, signing/checksum inventory,
 and full signed-package launch rehearsal remain required. Fixture archive tests
 are not qualification of actual mainnet binaries.
 
-## Offline four-package preflight
+## Offline five-package preflight
 
-After both native platforms assemble their runtime and miner archives, use
+After both native platforms assemble their runtime and miner archives and Linux
+also assembles the HiveOS archive, use
 `scripts/verify_mainnet_packages.py` with the same `--repo`, `--commit`,
 `--version`, and `--plan`, plus absolute paths for `--windows-runtime`,
-`--windows-miner`, `--linux-runtime`, `--linux-miner`, the reviewed
+`--windows-miner`, `--linux-runtime`, `--linux-miner`, `--linux-hiveos`, the reviewed
 `--dashboard-manifest`, the reviewed `--cuda-sha256`, and a new `--output` report.
 This requires Python 3.11+ and the same pinned dependencies as assembly.
 
@@ -140,12 +148,12 @@ The verifier does not execute or extract packaged files. It checks canonical
 ZIP/USTAR/gzip structure, bounded member sizes, exact source-script bytes,
 executable and CUDA-library architectures and permissions, plan bytes,
 dashboard asset manifest/hash/size matches, and producer receipt hashes.
-The four native identity records must agree, both packages on a platform must
-have the same launch-helper binary, and all four must contain identical Linux/WSL
+The five native identity records must agree, all packages on a platform must
+have the same launch-helper binary, and all five must contain identical Linux/WSL
 workers, dashboard assets and CUDA runtime. Extra files (including wallet keys or a preloaded beacon), missing roles,
 symlinks, duplicate members, noncanonical trailers and changed archives fail.
 
-The output binds the four archive hashes and explicitly remains unapproved and
+The output binds the five archive hashes and explicitly remains unapproved and
 not independently reproduced. It is input to internal rebuild comparison, review
 and final signing, not a substitute for those steps. It never uploads anything.
 

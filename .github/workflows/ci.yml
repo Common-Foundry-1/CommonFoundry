@@ -68,6 +68,8 @@ jobs:
           python3 -m unittest discover -s scripts/tests -p 'test_update_rollback_qualification.py' -v
           python3 -m unittest discover -s scripts/tests -p 'test_runtime_bootstrap_integrity.py' -v
           python3 -m unittest discover -s scripts/tests -p 'test_mainnet_packages.py' -v
+          python3 -m unittest discover -s scripts/tests -p 'test_hiveos_adapter.py' -v
+          bash -n packaging/mainnet/hiveos/h-config.sh packaging/mainnet/hiveos/h-run.sh packaging/mainnet/hiveos/h-stats.sh
           python3 -m unittest discover -s scripts/tests -p 'test_mainnet_package_preflight.py' -v
           python3 -m unittest discover -s scripts/tests -p 'test_mainnet_plan_approval.py' -v
           python3 -m unittest discover -s scripts/tests -p 'test_mainnet_qualification.py' -v

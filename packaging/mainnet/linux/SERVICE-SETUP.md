@@ -10,7 +10,7 @@ mainnet release, configuration, runtime and data directories:
 - `/run/commonfoundry-mainnet` (systemd runtime directory, 0700)
 
 Create the dedicated unprivileged `commonfoundry-mainnet` account and matching
-group before installation. Verify the signed release, four-package preflight and final
+group before installation. Verify the signed release, five-package preflight and final
 mainnet plan before copying the runtime package. Prepare and authenticate the
 model inputs before enabling a service. Keep the executables, Python/scripts,
 model files and configuration root-owned and not writable by the service user.

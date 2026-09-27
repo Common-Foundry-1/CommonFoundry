@@ -49,7 +49,7 @@ struct ReadPlan {
 
 pub(crate) enum TransactionBody {
     Regular(Transaction),
-    Coinbase(Block),
+    Coinbase(Box<Block>),
 }
 
 pub(crate) struct TransactionRead {
@@ -254,7 +254,7 @@ impl TransactionLookupIndex {
         let height = block.challenge.height;
         let timestamp = block.challenge.timestamp;
         let body = if block.coinbase_outpoint_id() == txid {
-            TransactionBody::Coinbase(block)
+            TransactionBody::Coinbase(Box::new(block))
         } else {
             let Some(transaction) = block.transactions.into_iter().find(|tx| tx.txid() == txid)
             else {

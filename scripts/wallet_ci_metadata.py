@@ -39,7 +39,7 @@ def metadata(repo: Path, platform: str) -> dict[str, str]:
     if platform not in ("Windows", "Linux"):
         raise ValueError("unsupported desktop CI platform")
     if not is_rc:
-        # Mainnet distribution uses the reconciled four-archive release path,
+        # Mainnet distribution uses the reconciled five-archive release path,
         # not RC-only installers/bootstrap archives with a renamed version.
         return {**common, "bundle_path": "", "deb_path": "", "bootstrap_path": ""}
     if platform == "Windows":

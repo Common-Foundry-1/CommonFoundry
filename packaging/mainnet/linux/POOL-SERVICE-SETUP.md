@@ -2,7 +2,7 @@
 
 These are service templates; extracting an archive does not install or enable
 a pool. Mainnet runtime packages include the pool-service files, dashboard,
-CUDA runtime and workers. Verify the exact signed package and four-archive
+CUDA runtime and workers. Verify the exact signed package and five-archive
 preflight, final mainnet plan, approved reward destinations, pool economics and
 the mainnet payout CLI before installation. Qualify the actual host service
 before enabling it. No RC certificate, wallet, ledger, P2P seed,
@@ -78,7 +78,7 @@ approved pool GPU still has a compute process. It never stops that process.
    pool reward destinations before launch.
 5. Supply a reviewed, immutable mainnet dashboard directory. The assembler
    requires a frozen-source dashboard manifest and carries the exact asset
-   tree in all four archives.
+   tree in all five archives.
    Hash its `index.html` from the approved asset set and verify the full tree
    against the final package receipt and independent reproduction evidence.
 6. Fill every field in `mainnet-pool.json.example` with **final approved**

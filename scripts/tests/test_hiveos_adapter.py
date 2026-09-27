@@ -12,9 +12,16 @@ from unittest import mock
 ROOT=Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(ROOT/'scripts'))
 import package_mainnet as package
+import mainnet_release as release
 
 
 class HivePackageIdentityTests(unittest.TestCase):
+    def test_release_inventory_contains_all_five_archives_and_evidence(self):
+        names=(ROOT/'packaging/releases/v1.0.0.inventory').read_text().splitlines()
+        expected=release.BASE_EVIDENCE | set(release.archive_names('1.0.0').values()) | {
+            release.REPRODUCTION, release.REPRODUCTION_SIGNATURE}
+        self.assertEqual(names,sorted(expected))
+
     def test_custom_get_filename_and_top_level_match_manifest_paths(self):
         root,archive=package.package_names('linux-x86_64','hiveos','1.0.0')
         self.assertEqual(root,'commonfoundry-mainnet-hiveos')

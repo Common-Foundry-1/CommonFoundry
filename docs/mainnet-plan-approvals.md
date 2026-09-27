@@ -77,14 +77,15 @@ code, dependency, version or trust changes after the reviewed commit require a
 fresh review/signature. Mainnet builds still reject absent pins and RC identities.
 The RC activation pin is not overwritten or reinterpreted as mainnet approval.
 
-## 5. Build, internally reproduce and sign the four packages
+## 5. Build, internally reproduce and sign the five packages
 
-Build Windows/Linux runtime and miner archives from the clean pinned commit.
+Build Windows/Linux runtime and miner archives, plus the Linux HiveOS archive,
+from the clean pinned commit.
 Prepare reviewed dashboard assets using `scripts/prepare_mainnet_dashboard.py`
 and preserve the build evidence. Pin the exact authorized Linux CUDA runtime.
-Run `scripts/verify_mainnet_packages.py` to reconcile all four archives.
+Run `scripts/verify_mainnet_packages.py` to reconcile all five archives.
 
-The producer and separate internal rebuild stages contain the four archives and:
+The producer and separate internal rebuild stages contain the five archives and:
 
 - `MAINNET-PLAN.json`, `MAINNET-APPROVALS.json`
 - `MAINNET-QUALIFICATION-SUBJECT.json`, `MAINNET-APPROVAL-TRUST.json`
@@ -105,7 +106,7 @@ The **same owner signer** signs the result under the producer namespace. Stage i
 as `MAINNET-INTERNAL-REBUILD.json` and `MAINNET-INTERNAL-REBUILD.json.sig`.
 Commit the release inventory before review freeze. The ordinary
 `release_integrity.py finalize` / `verify` gates recheck the plan signature,
-qualification, applied pins, all four packages, asset evidence and signed
+qualification, applied pins, all five packages, asset evidence and signed
 internal-build statement. Checksums, provenance, SBOM and final release signing
 remain required. The brief final-package smoke and deployment checks also remain;
 the previously waived six-hour GPU-dropout test is not reinstated.

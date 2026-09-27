@@ -67,6 +67,186 @@ fn digest(report: &RewardCustodyReport) -> [u8; 32] {
 }
 
 #[test]
+fn community_replacement_retains_steward_and_rebinds_encrypted_custody() {
+    let original = Fixture::new();
+    let previous = original.prepare();
+    let input = original.paths.backups_directory.join("steward.cmfdwallet");
+    let original_bytes = fs::read(&input).unwrap();
+    let old_community = fs::read(
+        original
+            .paths
+            .wallets_directory
+            .join("community/wallet.key"),
+    )
+    .unwrap();
+    let source = CommunityReplacementSource {
+        steward_backup: input.clone(),
+        expected_steward_backup_sha256: Sha256::digest(&original_bytes).into(),
+        plan: original.paths.public_directory.join(PLAN_FILE),
+        expected_plan_digest: digest(&previous),
+    };
+    let replacement = Fixture::new();
+    let new_password = b"disposable replacement community password";
+    let report = replace_community_with_distinct_passwords(
+        &replacement.paths,
+        &source,
+        STEWARD_PASSWORD,
+        new_password,
+    )
+    .unwrap();
+    assert!(report.retained_steward_key_verified);
+    assert!(!report.original_files_changed);
+    assert_eq!(
+        report.custody.wallets[0].destination,
+        previous.wallets[0].destination
+    );
+    assert_ne!(
+        report.custody.wallets[1].destination,
+        previous.wallets[1].destination
+    );
+    assert_ne!(report.custody.network_id, previous.network_id);
+    assert_ne!(
+        report.custody.launch_plan_digest,
+        previous.launch_plan_digest
+    );
+    assert_eq!(fs::read(&input).unwrap(), original_bytes);
+    assert_eq!(
+        fs::read(
+            original
+                .paths
+                .wallets_directory
+                .join("community/wallet.key")
+        )
+        .unwrap(),
+        old_community
+    );
+    let mut old_plan: serde_json::Value =
+        serde_json::from_slice(&fs::read(&source.plan).unwrap()).unwrap();
+    let new_plan: serde_json::Value = serde_json::from_slice(
+        &fs::read(replacement.paths.public_directory.join(PLAN_FILE)).unwrap(),
+    )
+    .unwrap();
+    old_plan["payload"]["rules"]["reward_destinations"]["community_xonly_public_key"] =
+        new_plan["payload"]["rules"]["reward_destinations"]["community_xonly_public_key"].clone();
+    assert_eq!(old_plan["payload"], new_plan["payload"]);
+    verify_reward_custody_with_distinct_passwords(
+        &replacement.paths,
+        digest(&report.custody),
+        STEWARD_PASSWORD,
+        new_password,
+    )
+    .unwrap();
+    let saved = fs::read(
+        replacement
+            .paths
+            .backups_directory
+            .join("steward.cmfdwallet"),
+    )
+    .unwrap();
+    let new_network: [u8; 32] = hex::decode(&report.custody.network_id)
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let old_network: [u8; 32] = hex::decode(&previous.network_id)
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let (old_key, _) =
+        wallet_backup::decrypt_wallet_key_bytes(&original_bytes, old_network, STEWARD_PASSWORD)
+            .unwrap();
+    let (new_key, _) =
+        wallet_backup::decrypt_wallet_key_bytes(&saved, new_network, STEWARD_PASSWORD).unwrap();
+    assert_eq!(*old_key, *new_key);
+    assert!(
+        wallet_backup::decrypt_wallet_key_bytes(&saved, old_network, STEWARD_PASSWORD).is_err()
+    );
+    assert!(
+        replace_community_with_distinct_passwords(
+            &replacement.paths,
+            &source,
+            STEWARD_PASSWORD,
+            new_password
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn community_replacement_rejects_wrong_password_pins_and_steward_identity_before_outputs() {
+    let original = Fixture::new();
+    let previous = original.prepare();
+    let input = original.paths.backups_directory.join("steward.cmfdwallet");
+    let mut source = CommunityReplacementSource {
+        steward_backup: input.clone(),
+        expected_steward_backup_sha256: Sha256::digest(fs::read(&input).unwrap()).into(),
+        plan: original.paths.public_directory.join(PLAN_FILE),
+        expected_plan_digest: digest(&previous),
+    };
+    let fresh = Fixture::new();
+    let replacement_password = b"disposable replacement community password";
+    assert!(
+        replace_community_with_distinct_passwords(
+            &fresh.paths,
+            &source,
+            b"incorrect existing steward password",
+            replacement_password
+        )
+        .is_err()
+    );
+    fresh.no_outputs();
+    assert!(
+        replace_community_with_distinct_passwords(
+            &fresh.paths,
+            &source,
+            STEWARD_PASSWORD,
+            STEWARD_PASSWORD
+        )
+        .is_err()
+    );
+    fresh.no_outputs();
+    source.expected_steward_backup_sha256[0] ^= 1;
+    assert!(
+        replace_community_with_distinct_passwords(
+            &fresh.paths,
+            &source,
+            STEWARD_PASSWORD,
+            replacement_password
+        )
+        .is_err()
+    );
+    fresh.no_outputs();
+    source.expected_steward_backup_sha256[0] ^= 1;
+    source.expected_plan_digest[0] ^= 1;
+    assert!(
+        replace_community_with_distinct_passwords(
+            &fresh.paths,
+            &source,
+            STEWARD_PASSWORD,
+            replacement_password
+        )
+        .is_err()
+    );
+    fresh.no_outputs();
+    source.expected_plan_digest[0] ^= 1;
+    source.steward_backup = original
+        .paths
+        .backups_directory
+        .join("community.cmfdwallet");
+    source.expected_steward_backup_sha256 =
+        Sha256::digest(fs::read(&source.steward_backup).unwrap()).into();
+    assert!(
+        replace_community_with_distinct_passwords(
+            &fresh.paths,
+            &source,
+            COMMUNITY_PASSWORD,
+            replacement_password
+        )
+        .is_err()
+    );
+    fresh.no_outputs();
+}
+
+#[test]
 fn distinct_in_memory_passwords_protect_the_two_wallets_separately() {
     let mut fixture = Fixture::new();
     fixture.paths.steward_passphrase_file = fixture.root.join("unused-steward-password");

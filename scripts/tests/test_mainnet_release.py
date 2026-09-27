@@ -32,9 +32,8 @@ class MainnetReleaseTests(unittest.TestCase):
         self.package_fixture = self.plan_fixture.fixture
         real_repo = self.package_fixture.repo
         paths = set()
-        for platform in package.PLATFORMS:
-            for kind in ("runtime", "miner"):
-                paths.update(package.package_sources(platform, kind).values())
+        for platform, kind in package.PACKAGE_ROLES:
+            paths.update(package.package_sources(platform, kind).values())
         for relative in paths:
             target = self.repo / relative
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -120,10 +119,9 @@ class MainnetReleaseTests(unittest.TestCase):
                              "proof_approval_trust": self.fixture.fields["approval_trust"]})
         self.first, self.second = self.root / "producer-stage", self.root / "reproducer-stage"
         self.first.mkdir()
-        for platform in package.PLATFORMS:
-            for kind in ("runtime", "miner"):
-                archive = fixture.assemble(fixture.args(platform, kind, "release-" + platform + kind))
-                shutil.copyfile(archive, self.first / archive.name)
+        for platform, kind in package.PACKAGE_ROLES:
+            archive = fixture.assemble(fixture.args(platform, kind, "release-" + platform + kind))
+            shutil.copyfile(archive, self.first / archive.name)
         evidence = {release.PLAN: self.fixture.plan_path, release.MANIFEST: self.fixture.manifest_path,
                     release.QUALIFICATION: self.fixture.qualification_path, release.TRUST: self.fixture.trust_path,
                     release.PROOF_PIN: self.fixture.proof_path,

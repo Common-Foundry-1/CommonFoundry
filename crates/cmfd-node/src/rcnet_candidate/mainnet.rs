@@ -215,6 +215,31 @@ impl MainnetLaunchPlan {
         })
     }
 
+    /// Derive a new candidate identity while preserving all approved rules,
+    /// dates, targets, artifact pins and the existing Steward destination.
+    pub fn with_replacement_community(
+        &self,
+        community: [u8; 32],
+    ) -> Result<Self, RcnetCandidateError> {
+        let previous = self.reward_destinations()?;
+        if community == previous.community || community == previous.steward {
+            return Err(RcnetCandidateError::InvalidField(
+                "replacement community destination",
+            ));
+        }
+        let mut payload = self.payload.clone();
+        payload.rules.reward_destinations.community_xonly_public_key = hex::encode(community);
+        let digest = payload_digest(&payload)?;
+        let candidate = Self {
+            schema: self.schema.clone(),
+            network_id: hex::encode(derive(MAINNET_NETWORK_DOMAIN, &digest)),
+            launch_plan_digest: hex::encode(digest),
+            payload,
+        };
+        candidate.validate()?;
+        Ok(candidate)
+    }
+
     pub fn authenticate_genesis(
         &self,
         certificate: &BeaconCertificate,

@@ -48,6 +48,26 @@ pub struct RewardWalletReport {
     pub encrypted_backup_sha256: String,
 }
 
+pub struct CommunityReplacementSource {
+    pub steward_backup: PathBuf,
+    pub expected_steward_backup_sha256: [u8; 32],
+    pub plan: PathBuf,
+    pub expected_plan_digest: [u8; 32],
+}
+
+#[derive(Debug, Serialize)]
+pub struct CommunityReplacementReport {
+    pub schema: &'static str,
+    pub previous_plan_digest: String,
+    pub previous_network_id: String,
+    pub previous_community_destination: String,
+    pub retained_steward_destination: String,
+    pub retained_steward_key_verified: bool,
+    pub source_backup_sha256: String,
+    pub original_files_changed: bool,
+    pub custody: RewardCustodyReport,
+}
+
 #[derive(Debug, Error)]
 pub enum RewardCustodyError {
     #[error("reward custody path rejected: {0}")]
@@ -416,6 +436,15 @@ fn prepare_inner(
         return Err(RewardCustodyError::Artifact("reward keys must be distinct"));
     }
     let plan = MainnetLaunchPlan::from_release_artifacts(pow_limit, initial_target, rewards)?;
+    persist_prepared_artifacts(&dirs, &passwords, &secrets, &plan)
+}
+
+fn persist_prepared_artifacts(
+    dirs: &[PathBuf; 3],
+    passwords: &[Zeroizing<Vec<u8>>; 2],
+    secrets: &[Zeroizing<[u8; 32]>; 2],
+    plan: &MainnetLaunchPlan,
+) -> Result<RewardCustodyReport, RewardCustodyError> {
     let network_id = plan.network_id()?;
     let mut live = Vec::new();
     let mut backups = Vec::new();
@@ -437,7 +466,7 @@ fn prepare_inner(
             .0,
         );
     }
-    for dir in &dirs {
+    for dir in dirs {
         create_directory(dir)?;
     }
     write_new(
@@ -465,7 +494,7 @@ fn prepare_inner(
             true,
         )?;
     }
-    let report = authenticate_artifacts(&dirs, &passwords, &plan)?;
+    let report = authenticate_artifacts(dirs, passwords, plan)?;
     // Public output is published locally only after all encrypted files have
     // authenticated. A candidate plan is not a release or activation approval.
     write_new(&dirs[2].join(PLAN_FILE), &plan.canonical_json()?, false)?;
@@ -474,6 +503,82 @@ fn prepare_inner(
     write_new(&dirs[2].join(REPORT_FILE), &report_bytes, false)?;
     fs::remove_file(dirs[0].join(INCOMPLETE_FILE))?;
     sync_parent_directory(&dirs[0].join(INCOMPLETE_FILE))?;
+    Ok(report)
+}
+
+/// Replace only Community. Steward is authenticated from its hash-pinned
+/// encrypted backup, retained byte-for-byte in memory, and re-encrypted for
+/// the newly derived network. Original files are opened read-only.
+pub fn replace_community_with_distinct_passwords(
+    paths: &RewardCustodyPaths,
+    source: &CommunityReplacementSource,
+    steward_password: &[u8],
+    community_password: &[u8],
+) -> Result<CommunityReplacementReport, RewardCustodyError> {
+    let dirs = directories(paths, true)?;
+    let passwords = passwords(paths, &dirs, Some([steward_password, community_password]))?;
+    for path in [&source.steward_backup, &source.plan] {
+        absolute_clean(path)?;
+        outside_repository(path)?;
+    }
+    let old_plan = MainnetLaunchPlan::parse_pinned(
+        &read_bounded(&source.plan, 32 * 1024, false)?,
+        source.expected_plan_digest,
+    )?;
+    let old_network = old_plan.network_id()?;
+    let old_rewards = old_plan.reward_destinations()?;
+    let encoded = read_bounded(&source.steward_backup, ENCRYPTED_WALLET_KEY_BYTES, true)?;
+    let source_hash: [u8; 32] = Sha256::digest(&encoded).into();
+    if source_hash != source.expected_steward_backup_sha256 {
+        return Err(RewardCustodyError::Artifact(
+            "retained Steward backup hash mismatch",
+        ));
+    }
+    let (steward, info) =
+        wallet_backup::decrypt_wallet_key_bytes(&encoded, old_network, &passwords[0])?;
+    if info.destination != old_rewards.steward || destination(&steward)? != old_rewards.steward {
+        return Err(RewardCustodyError::Artifact(
+            "retained key is not the approved Steward",
+        ));
+    }
+    let community = fresh_secret()?;
+    let community_destination = destination(&community)?;
+    let plan = old_plan.with_replacement_community(community_destination)?;
+    let secrets = [steward, community];
+    let custody = persist_prepared_artifacts(&dirs, &passwords, &secrets, &plan)?;
+    // Independently authenticate the persisted new-network Steward copy and
+    // compare its secret with the original, not just the public address.
+    let saved = read_bounded(
+        &dirs[0].join("steward").join(WALLET_KEY_FILE),
+        ENCRYPTED_WALLET_KEY_BYTES,
+        true,
+    )?;
+    let (recovered, _) =
+        wallet_backup::decrypt_wallet_key_bytes(&saved, plan.network_id()?, &passwords[0])?;
+    if *recovered != *secrets[0] {
+        return Err(RewardCustodyError::Artifact(
+            "Steward key changed during network rebinding",
+        ));
+    }
+    if read_bounded(&source.steward_backup, ENCRYPTED_WALLET_KEY_BYTES, true)? != encoded {
+        return Err(RewardCustodyError::Artifact(
+            "source Steward backup changed during migration",
+        ));
+    }
+    let report = CommunityReplacementReport {
+        schema: "CMFD_COMMUNITY_REPLACEMENT_V1",
+        previous_plan_digest: hex::encode(source.expected_plan_digest),
+        previous_network_id: hex::encode(old_network),
+        previous_community_destination: hex::encode(old_rewards.community),
+        retained_steward_destination: hex::encode(old_rewards.steward),
+        retained_steward_key_verified: true,
+        source_backup_sha256: hex::encode(source_hash),
+        original_files_changed: false,
+        custody,
+    };
+    let mut bytes = serde_json::to_vec_pretty(&report)?;
+    bytes.push(b'\n');
+    write_new(&dirs[2].join("COMMUNITY-REPLACEMENT.json"), &bytes, false)?;
     Ok(report)
 }
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline four-package mainnet preflight. Never extracts or executes archive files.
+"""Offline mainnet package preflight, including the dedicated HiveOS archive.
 
 Checks package bytes against the frozen source and reconciles native producer
 receipts. A consistent producer receipt is NOT independent reproduction, a
@@ -207,9 +207,8 @@ def inspect_package(path: Path, repo: Path, platform: str, kind: str, plan_bytes
     package.validate_catalog(sources, plan)
     expected, directories, executables, assets = expected_layout(
         platform, kind, sources, plan_bytes, dashboard_manifest_bytes, dashboard_manifest)
-    root = f"commonfoundry-mainnet-{kind}-{platform}-v{version}"
-    suffix = ".zip" if platform == "windows-x86_64" else ".tar.gz"
-    if path.name != root + suffix:
+    root, expected_name = package.package_names(platform, kind, version)
+    if path.name != expected_name:
         raise Error("mainnet package filename does not match its requested role/platform/version")
     rows, identity = inspect_archive(path, platform, root, expected, directories,
                                      executables, assets, cuda_sha256, epoch)
@@ -226,9 +225,9 @@ def verify_set(repo: Path, commit: str, version: str, plan_path: Path, archives:
     package.nonzero_hex(commit, 40, "source commit")
     if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-mainnet\.[0-9]+)?", version):
         raise Error("mainnet preflight does not accept an RC/devnet version")
-    expected = {(platform, kind) for platform in package.PLATFORMS for kind in ("runtime", "miner")}
+    expected = set(package.PACKAGE_ROLES)
     if set(archives) != expected:
-        raise Error("mainnet preflight requires exactly four platform/role packages")
+        raise Error("mainnet preflight requires exactly five platform/role packages including HiveOS")
     plan_bytes = package.read_regular(plan_path, 32 * 1024, "mainnet plan")
     plan = package.validate_plan(plan_bytes)
     dashboard_manifest_bytes = package.read_regular(dashboard_manifest_path, package.MAX_INFO, "reviewed dashboard asset manifest")
@@ -261,6 +260,9 @@ def verify_set(repo: Path, commit: str, version: str, plan_path: Path, archives:
         helper = "cmfd-launch.exe" if platform == "windows-x86_64" else "cmfd-launch"
         if packages[platform, "runtime"]["receipt"]["files"][helper] != packages[platform, "miner"]["receipt"]["files"][helper]:
             raise Error("runtime and miner packages contain different native launch helpers")
+    for executable in ("cmfd-miner", "cmfd-launch"):
+        if packages["linux-x86_64", "miner"]["receipt"]["files"][executable] != packages["linux-x86_64", "hiveos"]["receipt"]["files"][executable]:
+            raise Error("HiveOS and standalone Linux packages must contain the same native binaries")
     # All source snapshots and package observations refer to the same frozen tree.
     package.source_snapshot(repo, commit, package.package_sources("linux-x86_64", "runtime"), version)
     for key, inspected in packages.items():
@@ -288,6 +290,7 @@ def main():
     for platform in ("windows", "linux"):
         for kind in ("runtime", "miner"):
             parser.add_argument(f"--{platform}-{kind}", type=Path, required=True)
+    parser.add_argument("--linux-hiveos", type=Path, required=True)
     args = parser.parse_args()
     for name, value in vars(args).items():
         if isinstance(value, Path) and not value.is_absolute():
@@ -295,6 +298,7 @@ def main():
     try:
         archives = {(platform + "-x86_64", kind): getattr(args, platform + "_" + kind)
                     for platform in ("windows", "linux") for kind in ("runtime", "miner")}
+        archives[("linux-x86_64", "hiveos")] = args.linux_hiveos
         report = verify_set(args.repo, args.commit, args.version, args.plan, archives,
                             args.dashboard_manifest, args.cuda_sha256)
         integrity._write_new(args.output, package.canonical(report))

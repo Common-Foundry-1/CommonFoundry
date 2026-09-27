@@ -44,6 +44,8 @@ MAX_INFO = 128 * 1024
 FIXED = "FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json"
 SHARED = "packaging/production-v4-pool/shared"
 PLATFORMS = ("windows-x86_64", "linux-x86_64")
+PACKAGE_ROLES = tuple((platform, kind) for platform in PLATFORMS for kind in ("runtime", "miner")) + (("linux-x86_64", "hiveos"),)
+HIVEOS_NAME = "commonfoundry-mainnet-hiveos"
 PLAN_SCHEMA = "CMFD_MAINNET_LAUNCH_PLAN_V2"
 PLAN_DOMAIN = b"CMFD/MAINNET/LAUNCH-PLAN/V2\0"
 NETWORK_DOMAIN = "CMFD/MAINNET/NETWORK-ID/V2"
@@ -355,7 +357,20 @@ def validate_review_ancestry(repo: Path, review_commit: str, release_commit: str
         raise Error("release source changed beyond the reviewed mainnet pin files; fresh review is required")
 
 
+def package_names(platform: str, kind: str, version: str) -> tuple[str, str]:
+    if (platform, kind) not in PACKAGE_ROLES:
+        raise Error("unsupported mainnet package platform/role")
+    if kind == "hiveos":
+        if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+            raise Error("HiveOS custom-get requires a version without hyphens")
+        return HIVEOS_NAME, f"{HIVEOS_NAME}-{version}.tar.gz"
+    root = f"commonfoundry-mainnet-{kind}-{platform}-v{version}"
+    return root, root + (".zip" if platform == "windows-x86_64" else ".tar.gz")
+
+
 def package_sources(platform: str, kind: str) -> dict[str, str]:
+    if (platform, kind) not in PACKAGE_ROLES:
+        raise Error("unsupported mainnet package platform/role")
     sources = {"README.md": "packaging/mainnet/USER-GUIDE.md", "LICENSE": "LICENSE",
                "THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md",
                "production-v4-inputs.py": "scripts/production-v4-inputs.py"}
@@ -375,6 +390,11 @@ def package_sources(platform: str, kind: str) -> dict[str, str]:
             for name in ("POOL-SERVICE-SETUP.md", "commonfoundry-mainnet-pool.service",
                          "mainnet-pool-service.py", "mainnet-pool.json.example"):
                 sources[name] = f"packaging/mainnet/linux/{name}"
+    elif kind == "hiveos":
+        launchers = ()
+        sources["README.md"] = "packaging/mainnet/hiveos/README.md"
+        for name in ("h-manifest.conf", "h-config.sh", "h-run.sh", "h-stats.sh", "hive-adapter.py"):
+            sources[name] = "packaging/mainnet/hiveos/" + name
     else:
         launchers = ("START-MINER.bat", "START-MINER.ps1") if windows else ("start-miner.sh",)
     sources.update({name: f"packaging/mainnet/{directory}/{name}" for name in launchers})
@@ -487,7 +507,7 @@ def assemble(args: argparse.Namespace) -> Path:
         raise Error("use a mainnet version, not an RC/devnet version")
     if args.kind == "runtime" and (args.node is None or args.wallet is None or args.miner is not None):
         raise Error("runtime packages require node and wallet, not a miner executable")
-    if args.kind == "miner" and (args.miner is None or args.node is not None or args.wallet is not None):
+    if args.kind in ("miner", "hiveos") and (args.miner is None or args.node is not None or args.wallet is not None):
         raise Error("miner packages require only the miner executable")
     plan_bytes = read_regular(args.plan, 32 * 1024, "mainnet plan")
     plan = validate_plan(plan_bytes)
@@ -501,9 +521,13 @@ def assemble(args: argparse.Namespace) -> Path:
     dashboard_manifest = validate_dashboard_manifest(dashboard_manifest_bytes, commit)
     assets = dashboard_assets(args.dashboard_dist, dashboard_manifest)
     cuda_pin = nonzero_hex(args.cuda_sha256, 64, "reviewed CUDA runtime SHA-256")
-    name = f"commonfoundry-mainnet-{args.kind}-{args.platform}-v{args.version}"
+    name, archive_name = package_names(args.platform, args.kind, args.version)
     suffix = ".zip" if args.platform == "windows-x86_64" else ".tar.gz"
-    output = args.output / (name + suffix)
+    if args.kind == "hiveos":
+        hive_manifest = sources["h-manifest.conf"].decode()
+        if f"CUSTOM_NAME={HIVEOS_NAME}\n" not in hive_manifest or f"CUSTOM_VERSION={args.version}\n" not in hive_manifest:
+            raise Error("HiveOS manifest identity must match archive name and version")
+    output = args.output / archive_name
     if output.exists() or output.is_symlink():
         raise Error(f"package already exists: {output}")
     args.output.mkdir(parents=True, exist_ok=True)
@@ -607,7 +631,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--platform", choices=PLATFORMS, required=True)
-    parser.add_argument("--kind", choices=("runtime", "miner"), required=True)
+    parser.add_argument("--kind", choices=("runtime", "miner", "hiveos"), required=True)
     parser.add_argument("--commit", required=True)
     parser.add_argument("--version", required=True)
     for name in ("plan", "approval-manifest", "output", "launch", "replay-worker", "relation-worker",

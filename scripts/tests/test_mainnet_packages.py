@@ -127,7 +127,7 @@ class MainnetPackageTests(unittest.TestCase):
                                   version="1.0.0", plan=self.plan_path, approval_manifest=self.approval_path, output=self.root / output,
                                   node=binaries / "cmfd-node" if kind == "runtime" else None,
                                   wallet=binaries / "common-foundry-wallet" if kind == "runtime" else None,
-                                  miner=binaries / "cmfd-miner" if kind == "miner" else None,
+                                  miner=binaries / "cmfd-miner" if kind in ("miner", "hiveos") else None,
                                   launch=binaries / "cmfd-launch", replay_worker=binaries / "cmfd-v4-replay",
                                   relation_worker=binaries / "real_bank0_relations",
                                   dashboard_dist=self.dashboard_dist, dashboard_manifest=self.dashboard_manifest_path,
@@ -193,31 +193,30 @@ class MainnetPackageTests(unittest.TestCase):
         with tarfile.open(archive) as handle:
             return {row.name.split("/", 1)[1]: handle.extractfile(row).read() for row in handle.getmembers() if row.isfile()}
 
-    def test_all_four_packages_are_deterministic_and_self_contained(self):
-        for platform in packages.PLATFORMS:
-            for kind in ("runtime", "miner"):
-                with self.subTest(platform=platform, kind=kind):
-                    args = self.args(platform, kind, platform + kind)
-                    archive = self.assemble(args)
-                    content = self.contents(archive)
-                    receipt = json.loads(content.pop("MAINNET-PACKAGE.json"))
-                    self.assertFalse(receipt["release_approved"])
-                    self.assertEqual(receipt["files"], {name: {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()} for name, data in content.items()})
-                    self.assertEqual(content["production-mainnet/MAINNET-PLAN.json"], self.plan_path.read_bytes())
-                    self.assertNotIn("production-mainnet/LAUNCH-BEACON.json", content)
-                    self.assertEqual(content[packages.DASHBOARD_MANIFEST], self.dashboard_manifest_path.read_bytes())
-                    self.assertEqual(content[packages.CUDA_RUNTIME], self.cuda_runtime_path.read_bytes())
-                    self.assertEqual(content["dashboard/index.html"], (self.dashboard_dist / "index.html").read_bytes())
-                    if kind == "runtime":
-                        # The fixture models frozen Git blobs, not checkout CRLF.
-                        self.assertEqual(content["RECOVERY.md"], (self.repo / "packaging/mainnet/RECOVERY.md").read_bytes().replace(b"\r\n", b"\n"))
-                        self.assertEqual(content["STORAGE-RECOVERY.md"], (self.repo / "docs/storage-recovery.md").read_bytes().replace(b"\r\n", b"\n"))
-                    worker = "production-v4/" if kind == "runtime" else ""
-                    self.assertIn(worker + "cmfd-v4-replay", content)
-                    self.assertIn(worker + "real_bank0_relations", content)
-                    args.output = self.root / (platform + kind + "-repeat")
-                    repeat = self.assemble(args)
-                    self.assertEqual(archive.read_bytes(), repeat.read_bytes())
+    def test_all_five_packages_are_deterministic_and_self_contained(self):
+        for platform, kind in packages.PACKAGE_ROLES:
+            with self.subTest(platform=platform, kind=kind):
+                args = self.args(platform, kind, platform + kind)
+                archive = self.assemble(args)
+                content = self.contents(archive)
+                receipt = json.loads(content.pop("MAINNET-PACKAGE.json"))
+                self.assertFalse(receipt["release_approved"])
+                self.assertEqual(receipt["files"], {name: {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()} for name, data in content.items()})
+                self.assertEqual(content["production-mainnet/MAINNET-PLAN.json"], self.plan_path.read_bytes())
+                self.assertNotIn("production-mainnet/LAUNCH-BEACON.json", content)
+                self.assertEqual(content[packages.DASHBOARD_MANIFEST], self.dashboard_manifest_path.read_bytes())
+                self.assertEqual(content[packages.CUDA_RUNTIME], self.cuda_runtime_path.read_bytes())
+                self.assertEqual(content["dashboard/index.html"], (self.dashboard_dist / "index.html").read_bytes())
+                if kind == "runtime":
+                    # The fixture models frozen Git blobs, not checkout CRLF.
+                    self.assertEqual(content["RECOVERY.md"], (self.repo / "packaging/mainnet/RECOVERY.md").read_bytes().replace(b"\r\n", b"\n"))
+                    self.assertEqual(content["STORAGE-RECOVERY.md"], (self.repo / "docs/storage-recovery.md").read_bytes().replace(b"\r\n", b"\n"))
+                worker = "production-v4/" if kind == "runtime" else ""
+                self.assertIn(worker + "cmfd-v4-replay", content)
+                self.assertIn(worker + "real_bank0_relations", content)
+                args.output = self.root / (platform + kind + "-repeat")
+                repeat = self.assemble(args)
+                self.assertEqual(archive.read_bytes(), repeat.read_bytes())
         self.assertTrue(any(name == "real_bank0_relations" and arguments == ["network-info"] for name, arguments in self.calls))
 
     def test_linux_packages_reject_a_legacy_only_proof_worker(self):

@@ -22,14 +22,13 @@ import test_mainnet_packages as fixtures
 
 class MainnetPreflightTests(unittest.TestCase):
     def setUp(self):
-        self.fixture = fixtures.MainnetPackageTests("test_all_four_packages_are_deterministic_and_self_contained")
+        self.fixture = fixtures.MainnetPackageTests("test_all_five_packages_are_deterministic_and_self_contained")
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
         self.archives = {}
-        for platform in package.PLATFORMS:
-            for kind in ("runtime", "miner"):
-                args = self.fixture.args(platform, kind, platform + kind)
-                self.archives[platform, kind] = self.fixture.assemble(args)
+        for platform, kind in package.PACKAGE_ROLES:
+            args = self.fixture.args(platform, kind, platform + kind)
+            self.archives[platform, kind] = self.fixture.assemble(args)
 
     def verify(self, archives=None):
         with mock.patch.object(package, "source_snapshot", side_effect=self.fixture.sources), \
@@ -70,7 +69,7 @@ class MainnetPreflightTests(unittest.TestCase):
         self.assertTrue(report["consistent"])
         self.assertFalse(report["release_approved"])
         self.assertFalse(report["independent_reproduction_verified"])
-        self.assertEqual(len(report["packages"]), 4)
+        self.assertEqual(len(report["packages"]), 5)
         self.assertIn(package.CUDA_RUNTIME, report["pool_runtime_assets"])
         self.assertIn("dashboard/index.html", report["pool_runtime_assets"])
         for row in report["packages"]:
@@ -82,9 +81,8 @@ class MainnetPreflightTests(unittest.TestCase):
         frozen = self.fixture.root / "frozen-fixture-source"
         frozen.mkdir()
         sources = set()
-        for platform in package.PLATFORMS:
-            for kind in ("runtime", "miner"):
-                sources.update(package.package_sources(platform, kind).values())
+        for platform, kind in package.PACKAGE_ROLES:
+            sources.update(package.package_sources(platform, kind).values())
         for relative in sources:
             target = frozen / relative
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -111,9 +109,8 @@ class MainnetPreflightTests(unittest.TestCase):
         self.fixture.approval_path.write_bytes(package.canonical(self.fixture.approval_manifest))
         self.fixture.info["mainnet_approval_manifest_sha256"] = hashlib.sha256(self.fixture.approval_path.read_bytes()).hexdigest()
         archives = {}
-        for platform in package.PLATFORMS:
-            for kind in ("runtime", "miner"):
-                archives[platform, kind] = self.fixture.assemble(self.fixture.args(platform, kind, "cli-" + platform + kind))
+        for platform, kind in package.PACKAGE_ROLES:
+            archives[platform, kind] = self.fixture.assemble(self.fixture.args(platform, kind, "cli-" + platform + kind))
         output = self.fixture.root / "preflight.json"
         command = [sys.executable, str(real_repo / "scripts/verify_mainnet_packages.py"),
                    "--repo", str(frozen), "--commit", self.fixture.commit, "--version", "1.0.0",
@@ -136,7 +133,7 @@ class MainnetPreflightTests(unittest.TestCase):
     def test_missing_platform_or_role_is_rejected(self):
         partial = dict(self.archives)
         partial.pop(("linux-x86_64", "miner"))
-        with self.assertRaisesRegex(package.Error, "four"):
+        with self.assertRaisesRegex(package.Error, "five"):
             self.verify(partial)
 
     def test_source_script_change_is_rejected_even_with_forged_receipt(self):

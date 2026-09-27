@@ -347,6 +347,21 @@ enum Command {
         #[command(flatten)]
         paths: MainnetCustodyPaths,
     },
+    /// Replace Community while retaining the approved Steward key. Offline,
+    /// create-new outputs only; passwords arrive through the protected stdin frame.
+    #[cfg(feature = "production-v4")]
+    MainnetCustodyReplaceCommunity {
+        #[arg(long)]
+        retained_steward_backup: PathBuf,
+        #[arg(long, value_parser = parse_hex32)]
+        expected_steward_backup_sha256: [u8; 32],
+        #[arg(long)]
+        source_plan: PathBuf,
+        #[arg(long, value_parser = parse_hex32)]
+        expected_plan_digest: [u8; 32],
+        #[command(flatten)]
+        paths: MainnetCustodyPaths,
+    },
     /// Write the October mainnet plan from release-pinned artifacts and explicit
     /// reward addresses. Does not activate mainnet or alter RCNet storage.
     #[cfg(feature = "production-v4")]
@@ -1029,6 +1044,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     #[cfg(feature = "production-v4")]
+    if let Command::MainnetCustodyReplaceCommunity {
+        retained_steward_backup,
+        expected_steward_backup_sha256,
+        source_plan,
+        expected_plan_digest,
+        paths,
+    } = &cli.command
+    {
+        let Some([steward, community]) = paths.read_distinct_stdin_passwords()? else {
+            return Err("community replacement requires --distinct-passphrases-stdin".into());
+        };
+        let source = cmfd_node::mainnet_custody::CommunityReplacementSource {
+            steward_backup: retained_steward_backup.clone(),
+            expected_steward_backup_sha256: *expected_steward_backup_sha256,
+            plan: source_plan.clone(),
+            expected_plan_digest: *expected_plan_digest,
+        };
+        let report = cmfd_node::mainnet_custody::replace_community_with_distinct_passwords(
+            &paths.runtime_paths(),
+            &source,
+            &steward,
+            &community,
+        )?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    #[cfg(feature = "production-v4")]
     if let Command::MainnetCustodyPrepare {
         pow_limit,
         initial_target,
@@ -1324,6 +1366,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(feature = "production-v4")]
         Command::MainnetPlan { .. }
         | Command::MainnetCustodyPrepare { .. }
+        | Command::MainnetCustodyReplaceCommunity { .. }
         | Command::MainnetCustodyVerify { .. } => {
             unreachable!("mainnet plan generation exits before node initialization")
         }

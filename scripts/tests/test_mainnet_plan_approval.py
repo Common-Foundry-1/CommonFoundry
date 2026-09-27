@@ -20,7 +20,7 @@ import test_mainnet_qualification as proof_fixtures
 
 class MainnetPlanApprovalTests(unittest.TestCase):
     def setUp(self):
-        self.fixture = package_fixtures.MainnetPackageTests("test_all_four_packages_are_deterministic_and_self_contained")
+        self.fixture = package_fixtures.MainnetPackageTests("test_all_five_packages_are_deterministic_and_self_contained")
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
         self.root = self.fixture.root

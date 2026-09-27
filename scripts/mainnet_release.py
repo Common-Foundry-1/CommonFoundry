@@ -32,7 +32,7 @@ CUDA_RUNTIME_PIN = "CUDA-RUNTIME-SHA256.txt"
 REPRODUCTION = "MAINNET-INTERNAL-REBUILD.json"
 REPRODUCTION_SIGNATURE = REPRODUCTION + ".sig"
 REPRODUCTION_SCHEMA = "CMFD_MAINNET_OWNER_INTERNAL_REBUILD_V1"
-REPRODUCTION_STATEMENT = "I performed an internal rebuild of the reviewed source and reproduced the exact four package archives identified here. This does not claim independent review."
+REPRODUCTION_STATEMENT = "I performed an internal rebuild of the reviewed source and reproduced the exact five package archives identified here. This does not claim independent review."
 ROLE_FILES = {
     "producer": ("MAINNET-PLAN-PRODUCER-APPROVAL.json", "MAINNET-PLAN-PRODUCER-APPROVAL.json.sig", "MAINNET-PRODUCER.allowed_signers"),
 }
@@ -44,9 +44,8 @@ GENERATED = {integrity.BUILDINFO_NAME, integrity.SOURCE_SBOM_NAME, integrity.PRO
 
 
 def archive_names(version: str) -> dict:
-    return {(platform, kind): f"commonfoundry-mainnet-{kind}-{platform}-v{version}" +
-            (".zip" if platform == "windows-x86_64" else ".tar.gz")
-            for platform in package.PLATFORMS for kind in ("runtime", "miner")}
+    return {(platform, kind): package.package_names(platform, kind, version)[1]
+            for platform, kind in package.PACKAGE_ROLES}
 
 
 def plan_material(files: dict, trust: dict, verifier: Path) -> dict:

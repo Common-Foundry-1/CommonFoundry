@@ -9,7 +9,7 @@ export const EMISSION_URL = "/docs/emission.md";
 export const MAINNET_LAUNCH_AT = "2026-10-03T17:00:00Z";
 export const SOURCE_RELEASE_AT = "2026-10-02T17:00:00Z";
 export const MAINNET_RELEASE_KEY_URL = "/mainnet-release-key.txt";
-export const MAINNET_RELEASE_KEY_FINGERPRINT = "SHA256:hhfV/4M5XDL2hLzeX0q/IMCR4fjSq5Kb8BjMC/Zj96Q";
+export const MAINNET_RELEASE_KEY_FINGERPRINT = "SHA256:cA1Tsf8hL/pxDV5WpOE3iPW3b4uDQosu1dOh//4a/fk";
 
 export type SectionId =
   | "launch"

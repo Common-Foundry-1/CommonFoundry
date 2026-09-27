@@ -13,7 +13,7 @@ In your flight sheet, choose **Custom** and use the installation URL for
 - **Extra config:** optional JSON, for example `{"gpus":[0,2]}`
 
 By default, the wrapper starts one worker for each NVIDIA GPU. Each worker gets
-its own scratch directory and a `.g0`, `.g1`, etc. suffix. Extra config can set
+its own scratch directory and the native miner's `.gpu0`, `.gpu1`, etc. suffix. Extra config can set
 `gpus`, `worker` (up to 24 characters), `model_dir`, and `state_dir`.
 
 HiveOS installs the package directly at:

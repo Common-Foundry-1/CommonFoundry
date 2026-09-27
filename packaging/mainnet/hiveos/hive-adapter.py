@@ -22,6 +22,8 @@ INSTALL=Path('/hive/miners/custom')/NAME
 DEFAULT_DATA=Path('/hive/miners/custom/commonfoundry-data')
 GPU_PATTERN=re.compile(r'GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}')
 RATE=re.compile(r'MINER STATS \| (?:GPU \d+ \(GPU-[0-9a-fA-F-]+\) \| )?height \d+ \| hashrate ([0-9.]+) FW/s \| accepted (\d+) \| rejected (\d+) \| stale (\d+) \| blocks \d+ \| credit \d+ atoms \| power .*? \| efficiency .*? \| temp .*? \| uptime (\d+):(\d+):(\d+)')
+TIMED_RATE=re.compile(r'^([0-9]+\.[0-9]{6}) '+RATE.pattern,re.MULTILINE)
+MAX_SAMPLE_AGE=45
 
 
 def validate_config(value,root):
@@ -160,9 +162,9 @@ def run(args):
             # Old-session rates must not leak into the new process's stats.
             logfile.write_text('')
             handler=RotatingFileHandler(logfile,maxBytes=2*1024*1024,backupCount=1)
-            handler.setFormatter(logging.Formatter('%(message)s'));handlers.append(handler)
+            handler.setFormatter(logging.Formatter('%(cmfd_monotonic).6f %(message)s'));handlers.append(handler)
             command=[str(root/'cmfd-miner'),'pool','--pool',config['pool'],'--miner',config['wallet'],
-                '--worker',config['worker']+'.g'+str(gpu['index']),'--gpu',gpu['uuid'],
+                '--worker',config['worker'],'--gpu',gpu['uuid'],
                 '--production-v4-bank',str(Path(config['model_dir'])/'MODEL-V2.bank'),
                 '--production-v4-replay-worker',str(root/'cmfd-v4-replay'),
                 '--production-v4-scratch',str(scratch),'--stats-seconds','5']
@@ -173,7 +175,9 @@ def run(args):
                 try:
                     for line in stream:
                         text=line.rstrip('\r\n')
-                        writer.emit(logging.LogRecord(NAME,logging.INFO,'',0,text,(),None))
+                        record=logging.LogRecord(NAME,logging.INFO,'',0,text,(),None)
+                        record.cmfd_monotonic=time.monotonic()
+                        writer.emit(record)
                         print('[GPU '+str(index)+'] '+text,flush=True)
                 finally:stream.close()
             collector=threading.Thread(target=collect,args=(child.stdout,handler,gpu['index']),daemon=True)
@@ -203,12 +207,15 @@ def stats(args):
             if process_identity(worker['pid'])!=worker['start']:return empty
             path=Path(worker['log'])
             if path.is_symlink() or not path.is_file() or path.resolve().parent!=args.log_base.parent.resolve():return empty
-            if time.time()-path.stat().st_mtime>45:return empty
+            if time.time()-path.stat().st_mtime>MAX_SAMPLE_AGE:return empty
             with path.open('rb') as stream:
                 stream.seek(max(0,path.stat().st_size-128*1024));tail=stream.read(128*1024).decode('utf-8','replace')
-            matches=list(RATE.finditer(tail))
+            matches=list(TIMED_RATE.finditer(tail))
             if not matches:return empty
-            rate,good,bad,stale,hours,minutes,seconds=matches[-1].groups()
+            sampled_at,rate,good,bad,stale,hours,minutes,seconds=matches[-1].groups()
+            # Retry/debug output must not refresh an old mining sample. The
+            # collector and callback share the same system monotonic clock.
+            if not 0<=time.monotonic()-float(sampled_at)<=MAX_SAMPLE_AGE:return empty
             rates.append(float(rate));accepted+=int(good);rejected+=int(bad)
             uptimes.append(int(hours)*3600+int(minutes)*60+int(seconds))
             gpu=current.get(worker['gpu']['uuid'],worker['gpu'])

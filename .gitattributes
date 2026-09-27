@@ -1,3 +1,4 @@
 *.pdf binary
 packaging/standalone-miner/linux/start-miner.sh text eol=lf
 packaging/standalone-miner/windows/*.bat text eol=crlf
+apps/website/public/mainnet-release-key.txt text eol=lf

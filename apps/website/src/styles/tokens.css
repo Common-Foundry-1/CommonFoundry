@@ -1,0 +1,37 @@
+:root {
+  color: #f2f0ec;
+  background: #050606;
+  font-family: "Inter Variable", Inter, ui-sans-serif, system-ui, sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  --graphite-1000: #050606;
+  --graphite-950: #090a0a;
+  --graphite-900: #101212;
+  --graphite-850: #171919;
+  --graphite-800: #202222;
+  --mineral-50: #fbfaf7;
+  --mineral-100: #f2f0ec;
+  --mineral-300: #c9c6c1;
+  --mineral-500: #94928e;
+  --copper-300: #f6a05a;
+  --copper-400: #ec7a30;
+  --copper-500: #dd5c1c;
+  --copper-600: #bd4210;
+  --copper-dark: #5c220d;
+  --line: rgba(230, 112, 42, 0.48);
+  --line-soft: rgba(230, 112, 42, 0.2);
+  --white-line: rgba(242, 240, 236, 0.12);
+  --display: "Rajdhani", "Arial Narrow", sans-serif;
+  --body: "Inter Variable", Inter, ui-sans-serif, system-ui, sans-serif;
+  --page-gutter: clamp(1.25rem, 3.6vw, 4rem);
+  --max-width: 1560px;
+  --header-height: 110px;
+  --focus: 0 0 0 3px rgba(236, 122, 48, 0.36);
+}
+
+@media (max-width: 760px) {
+  :root {
+    --page-gutter: 1.4rem;
+    --header-height: 92px;
+  }
+}

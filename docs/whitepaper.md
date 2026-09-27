@@ -1,248 +1,266 @@
 # Common Foundry
 
-## Matrix-Bound Proof of Work and Direct GPU Inference Markets
+## Inference First. Built to Lead.
 
-Technical White Paper - Devnet-0 and ForgeMatrix v2 Research Architecture
+Technical Whitepaper | Version 0.4 | Mainnet Launch Edition | September 24, 2026
 
-Version 0.1 - August 2026
+Open GPU compute. Verifiable work. Direct service settlement.
 
-Common Foundry Research
+Common Foundry is building an operator-owned route into the AI compute economy: a GPU-oriented monetary network today, with a direct inference-service layer as its next product horizon. This paper explains the opportunity, the working architecture, the decisions behind it, and the evidence that supports the launch candidate.
 
-> **Status: research protocol - not mainnet.** Common Foundry Devnet-0 is a private, valueless test network. It implements canonical ledger rules, exact tiny-profile ForgeMatrix v2 replay, multi-node synchronization, fork choice, fee burning, inference-channel settlement accounting, and a pinned-TLS pool test protocol with volatile session counters. The proposed production ForgeMatrix profile and succinct proof system are hard-disabled. They require cryptographic implementation, benchmark evidence, independent implementations, public adversarial testing, and two external audits before any public-value activation.
+Source and matching launch packages are planned for **October 2, 2026 at noon US Central (CDT / 17:00 UTC)**. Mainnet mining is planned for **October 3, 2026 at the same time**. Mainnet is not live as of this edition. Final package and deployment checks remain in progress. Customer-paid inference is in development and is not a feature of the initial mainnet launch.
 
 ---
 
-## Abstract
+## 1. The case for Common Foundry
 
-Common Foundry is a research architecture for a proposed permissionless proof-of-work ledger that coordinates GPU computation. It separates two activities that are often conflated in claims about "useful proof of work." First, a deterministic, public, matrix-heavy function called ForgeMatrix orders blocks and secures settlement. Second, the proposed market would let customers purchase actual inference directly from GPU providers through prepaid, progressively authorized payment channels denominated in CMFD. The mining function is not customer inference, and an inference receipt is not a proof that a model answer is correct. This separation is intentional: consensus must remain deterministic, self-contained, and independently verifiable, while commercial inference is heterogeneous, latency-sensitive, and frequently private.
+### 1.1 AI compute should have more participants
 
-ForgeMatrix v2 is designed around signed INT8 by signed INT8 matrix multiplication with exact INT32 accumulation over a seedless committed 6 GiB weight bank. Its proposed production profile evaluates 384 sequential 4096 by 4096 layers over a batch of 128 rows, totaling 824,633,720,832 multiply-accumulate operations per nonce. A block-specific affine mask and a range-bound cubic transition over the prime 134,217,689 prevent the earlier small-modulus accumulator shortcut. The intended verifier is a non-zero-knowledge GKR/sumcheck protocol backed by a transparent multilinear polynomial commitment scheme. The proof must bind every layer, exact integer ranges, the model artifact, the block challenge, the winning nonce, the target, and the final activation digest.
+The opportunity is to bring three things together: people who can operate compute, a network that can independently validate their mining work, and payment rules suited to buying useful services directly from those operators.
 
-The current software does not yet contain that production proof. Devnet-0 deliberately uses a tiny 2 by 4 by 4 profile and validates it by full recomputation. This paper therefore distinguishes three states throughout: **implemented**, **Devnet reference**, and **production proposal**. It also states a fundamental limitation: software consensus can prove evaluation of a committed arithmetic relation, but cannot prove which physical processor ran it or that bytes resided in GPU VRAM.
+A capable GPU is only one part of a service business. Operators also need a way to agree terms, deliver work and collect payment. Customers need a clear scope, useful output and predictable settlement. Common Foundry is building toward those connections: an open operator base with shared payment rules, where delivering a service does not require the protocol to appoint one central seller or custodian.
 
-The monetary policy has a five-year, per-block linear bootstrap emission followed by a permanent 5 CMFD miner tail. Before the tail, each subsidy is split approximately 70% to miners, 25% to a steward destination, and 5% to a community destination. All transaction and inference-channel close fees are burned. The steward and community outputs are transparent and immediately spendable on a per-block basis; if both remain under founder control, they are economically a disclosed nominal 30% founder-controlled pre-tail stream, not a decentralized treasury.
+Common Foundry's proposition is **inference first**. The long-term product is an open service economy in which customers choose providers and providers compete on what they deliver. The initial network establishes the operator base, settlement asset and technical foundation from which that economy can grow. Mining is the first participation path, not the final definition of the project.
 
-The objective is not to declare the design production-ready. It is to make the research claim precise, executable, falsifiable, and governed by measurable activation gates.
+The project takes an operator-first route. A miner can install software and contribute work before a complete inference marketplace exists. A developer can build wallets, miners, pool services or integrations against a concrete protocol. A community member can help another operator get online. Each contribution helps turn a protocol into infrastructure people can actually use.
 
-## 1. Status vocabulary and scope
+**The strategic thesis:** recruit capable GPU operators through a functioning proof-of-work network, make their work independently checkable, then connect that operator ecosystem to customer demand through direct, metered settlement. This is a development strategy, not a claim that mining itself already fulfills AI requests.
 
-This paper uses the following labels as protocol terms:
+### 1.2 The differentiators, and why they matter
 
-| Label | Meaning |
+| Distinctive choice | What Common Foundry does | Why it matters |
+|---|---|---|
+| Compute-oriented mining | ForgeMatrix evaluates a fixed, block-bound, 384-layer matrix workload | Builds operational experience around matrix-capable GPUs, kernels, memory and power management |
+| GPU production, CPU verification | Accelerators generate the work and proof; ordinary nodes verify on the CPU | Mining performance does not become authority over block validity; non-miners can validate |
+| Transparent proof architecture | Structured sumchecks and a BaseFold commitment/opening argument connect every bank to the final output | Large matrix work is checked through a proof rather than replayed by every node |
+| A shared launch boundary | A signed plan and a pinned future randomness-beacon round determine genesis | Early source access supports preparation without intentionally granting an advance-mining window |
+| Direct provider settlement | Customer-signed cumulative payment states authorize payment to the selected service provider | Supports streamed service without a chain transaction for every output chunk |
+| Explicit monetary rules | No premine or token sale; declining issuance, disclosed allocations, fee burning and a miner-only tail | Participants can calculate distribution and understand who receives newly issued CMFD |
+| Multiple participation paths | Wallets, CPU nodes, pool search, solo proving and pool operation have different responsibilities | A newcomer does not need to run the entire GPU stack to join the network |
+| Operationally grounded software | Encrypted wallets, signed artifacts, authenticated inputs and reorganization-aware pool accounting | Turns protocol ideas into deployable tools and identifiable operating responsibilities |
+
+The differentiation is the combination, not a claim that each primitive is unprecedented. Common Foundry specializes established cryptographic tools for its own workload and integrates them with a purpose-built Rust ledger and operator software. It is not a Bitcoin Core version or a renamed Bitcoin client. Familiar UTXO and cumulative-work concepts are combined with a different proof-of-work and proof-validation design. [P1-P4]
+
+### 1.3 A reason to participate now
+
+For miners, Common Foundry offers a compute-oriented network with solo and pool participation, visible work statistics and room for implementation competition. For developers, it offers a specialized proof workload and settlement primitives that can support new products. For infrastructure partners, it offers an identifiable path from operator onboarding to a focused service pilot.
+
+For the wider community, the invitation is straightforward: join before launch, understand the rules, help test or build, and take part in the shared start. Participation does not require buying an allocation in a token sale. It does require treating hardware support, operating costs and service demand as things to measure rather than assume.
+
+## 2. A product architecture with a clear next step
+
+### 2.1 Mining and inference have different jobs
+
+**Mining secures the chain. Inference serves a customer.** Keeping those roles separate is a deliberate product and consensus decision.
+
+ForgeMatrix is a deterministic public workload. A validator needs one exact answer for a given block candidate. An inference service has different requirements: a customer selects a model, runtime, input, provider, price and delivery policy. Those choices should be able to evolve without turning every model deployment into a consensus change.
+
+This separation also keeps block production independent of customer-job availability. The ledger can operate while the service market is being built, and providers can later deliver inference without also mining. Mining rewards and customer service payments are distinct revenue paths; neither is a promise of profitability.
+
+### 2.2 Four layers, one direction
+
+| Layer | Responsibility | Launch relationship |
+|---|---|---|
+| Ledger and consensus | Ownership, signatures, issuance, difficulty, fees and channel spends | Foundation of the mainnet candidate |
+| ForgeMatrix | Block-bound computation, work digest and transparent proof | Active proof-of-work/proof design |
+| Operator software | Wallets, nodes, solo miners, pool search clients and pool accounting | Existing RC operation plus launch-candidate packaging |
+| Inference service product | Provider discovery, quotes, execution, streaming and customer workflows | Next product layer; settlement primitives exist, end-to-end service remains in development |
+
+### 2.3 What is ready, and what comes next
+
+The released RC environment has demonstrated wallet transfers, node synchronization, pool mining and full-sized proof production. The mainnet candidate adds a distinct launch identity, authenticated activation, encrypted prelaunch wallet preparation and updated operating protections. A running RC pool is evidence of operation, not evidence that mainnet has already launched.
+
+The first inference pilot should be deliberately narrow: a defined model/runtime combination, a small provider cohort, a complete quote-to-settlement flow, and measurable customer experience. Expansion should follow completed jobs and repeat use. Provider count, time to first output, job completion rate and cost per delivered result will be more useful evidence than unsupported market-share claims.
+
+The product sequence is therefore: **launch the network; improve operator deployment and efficiency; complete a focused paid-inference pilot; expand on demonstrated demand.** [P1, P5]
+
+### 2.4 Why build a dedicated ledger?
+
+A dedicated ledger makes ForgeMatrix verification, channel spending, fee burning and launch identity explicit consensus rules. They are enforced together rather than treated as claims supplied by an application operator. The tradeoff is real: Common Foundry must develop its own network participation, integrations and operating history. Using familiar primitives does not automatically inherit another chain's security or ecosystem.
+
+## 3. ForgeMatrix: compute with an exact acceptance rule
+
+### 3.1 Production geometry
+
+The ProductionV4 relation uses 128 batch rows, dimension 4,096 and 384 sequential layers, organized into three banks of 128 layers. The public weight bank contains 6,442,450,944 raw weight bytes, exactly 6 GiB. The base table adds 524,288 bytes; the distributed model file also includes framing. This model bank is the public mining dataset, not a customer-selected trained inference model.
+
+```text
+B = 128       D = 4,096       L = 384
+p = 0x7f000001 = 2,130,706,433
+F = GF(p)
+EF = F[X] / (X^4 - 3)
+```
+
+Weight and base-table bytes from 0 through 250 are mapped through x - 125 into the field. Initial activation and each layer combine a challenge-derived coordinate mask with an elementwise cube:
+
+```text
+A_0       = (Base + Mask_initial(challenge))^3
+Z_l       = A_l * W_l + Mask_l(challenge)
+A_(l + 1) = Z_l^3,                   0 <= l < 384
+```
+
+The arithmetic is exact KoalaBear field arithmetic. Stored layout, index order, masks, reduction semantics and encoding are part of the protocol, not discretionary GPU settings. [P2-P3]
+
+### 3.2 Why matrices, finite fields and cubic transitions?
+
+Dense matrices create a substantial, regular workload with reusable data and a natural optimization target for GPU implementers. The production shape contains 824,633,720,832 logical matrix multiply-accumulate terms per complete evaluation and 201,850,880 cubic activation outputs including the initial activation.
+
+Finite-field semantics provide exact cross-implementation answers and a direct algebraic language for proving those answers. A cubic transition adds a sequential nonlinear relation while remaining a low-degree polynomial that the proof system can check. The design is about making the entire computation bind together, not merely asking a miner to report that a matrix multiplication occurred.
+
+The three-bank organization gives the prover a defined way to manage a large workload while preserving cross-bank constraints. Fixed weights can be authenticated and preprocessed; candidate-specific execution remains tied to the challenge.
+
+### 3.3 An important precision about INT8
+
+Earlier Common Foundry designs and descriptions emphasized INT8 x INT8 matrix multiplication. Compact byte-valued weights remain part of the data representation, but **the launch candidate's consensus relation is field-native, not simply a raw signed-INT8 GEMM**. Activations and arithmetic follow the field equations above. A kernel may exploit device-specific arithmetic, decomposition or specialized units only if its result matches those exact semantics.
+
+This distinction matters for honest hardware claims. The protocol does not prove that a particular tensor core, GPU model or amount of physical VRAM was used. Nor does it establish permanent ASIC resistance. A faster implementation that produces the same valid relation and proof is legitimate competition; an implementation that changes the required result is not.
+
+### 3.4 Work is bound to the block, not to a miner's story
+
+The challenge commits to the full network identifier, parent block, transaction root, height, timestamp, target, algorithm version, proof version, proof-system identity, model-manifest identity and nonce. The transaction root commits the coinbase, including reward destinations.
+
+The terminal activation consists of 524,288 canonical field values in row-major order. A domain-separated BLAKE3 digest binds those values to the challenge. A further work digest binds the algorithm, proof system, model, challenge and terminal digest. That work digest must meet the target independently derived by the node.
+
+```text
+challenge = BLAKE3-DK(challenge_domain, canonical_block_inputs || nonce)
+final     = BLAKE3-DK(final_domain,
+                     challenge || field_count || canonical_final_values)
+work      = BLAKE3-DK(work_domain,
+                     versions || proof_system || model || challenge || final)
+accept only if work <= expected_target and the complete proof verifies
+```
+
+These are explanatory abbreviations; the core binding specification gives the exact byte order and domains. Proof randomness is excluded from work identity. Re-encoding a proof is not another chance at the mining target. [P2]
+
+## 4. The proof: expensive work, independently checkable results
+
+### 4.1 A specialized transparent argument
+
+Common Foundry uses a specialized transparent argument built around sumchecks and BaseFold polynomial commitments. It draws on the same broad family of algebraic and hash-based techniques associated with STARK-style systems, but the precise description is a **BaseFold-based transparent proof for the ForgeMatrix relation**. It is not a claim of private, zero-knowledge inference. The terminal activation is public, and this deployment does not make a general zero-knowledge privacy guarantee. [P3, R1]
+
+The project-specific contribution is the relation, its block binding, claim routing, transcript, codec, GPU path and node integration. Common Foundry did not invent BLAKE3, Schnorr signatures, sumcheck or BaseFold. It composes and specializes them for a concrete mining workload.
+
+Transparent verification avoids a secret proof-setup trapdoor. Public model and preprocessing artifacts still have exact identities and must be authenticated. Transparency does not mean that any arbitrary file, parser or implementation should be trusted.
+
+### 4.2 What a valid proof establishes
+
+Each bank has a fixed weight commitment and a dynamic execution commitment. Two relation repetitions per bank connect three properties:
+
+1. **Matrix correctness:** the preactivation equals the committed matrix product plus the public mask.
+2. **Layer continuity:** each layer consumes the preceding layer's activation, including boundaries between banks.
+3. **Cubic correctness:** the next activation is the cube of the preactivation under the canonical field rules.
+
+Opening claims bind these relations to the committed data. Twelve claims per bank are padded to sixteen in a specified order. The final bank is linked to the published final activation, whose BLAKE3 digest determines the candidate's work identity. This is the complete path from public model and block challenge to target-tested output, rather than a proof about an unrelated intermediate table. [P2-P3]
+
+### 4.3 Transcript and opening parameters
+
+| Parameter | ProductionV4 value |
 |---|---|
-| **Implemented** | Enforced by the current Rust consensus or node code and covered by executable tests. |
-| **Devnet reference** | Operational on the private, valueless Devnet, but intentionally tiny, slow, insecure for custody, or unsuitable for public adversaries. |
-| **Production proposal** | Specified research design that is not accepted by current consensus and must not be represented as deployed. |
-| **Activation gate** | A measurable requirement that must be met before a production profile can be enabled. |
+| Base field / extension | KoalaBear / degree 4, X^4 - 3 |
+| Challenger | KoalaBearDegree4Duplex; Poseidon2 width 16, digest 8 |
+| Fixed / dynamic columns | 256 / 16 |
+| Row variables | 23 |
+| BaseFold log blowup / queries | 1 / 270 |
+| FRI rounds | 23 |
+| Relation repetitions per bank | 2 |
+| Batch / proof grinding | 5 / 16 bits |
+| Padded opening claims per bank | 16 |
 
-This revision describes the `v0.1.0-devnet.10` research prerelease; its annotated release tag identifies the exact source commit. Devnet-0 uses a tiny ForgeMatrix v2 descriptor with batch 2, dimension 4, and 4 layers. Its 177-byte proof payload, or 193 bytes as a standalone framed proof, is a serialized claim rather than a succinct cryptographic proof: validators recompute the entire tiny relation from the pinned model. The candidate production descriptor with batch 128, dimension 4096, and 384 layers is rejected by code.
+The matrix sumcheck has 19 variables and degree 3; the shift sumcheck has 7 variables and degree 2; the cubic sumcheck has 26 variables and degree 4. Opening reduction uses a 23-variable degree-2 sumcheck. Fiat-Shamir challenges follow the frozen domain and message order. These parameters describe the implementation; they are not a substitute for an end-to-end soundness analysis or an advertised security-bit estimate.
 
-This white paper describes the intended system, the rationale behind its choices, the exact consensus relations already specified, and the unresolved work. It does not offer CMFD for sale, promise financial returns, or assert that the current network is safe for real value.
+The transcript starts from the complete public-statement digest. Commitment order, relation order, claim routing, canonical field encoding and the pinned dependency revision all affect proof-system identity. Another implementation must reproduce them, not just recognize the same high-level equations.
 
-## 2. Why Common Foundry is needed
+### 4.4 Why CPU verification is central to the product
 
-### 2.1 Three coordination problems
+GPU search finds a candidate; replay and proving build its evidence. The producer performs a mandatory CPU self-check before submission. Receiving nodes independently validate the proof and normal ledger rules before accepting the block.
 
-Modern GPU operators face three distinct coordination problems:
+This division allows miners to improve accelerator code without making every user depend on that accelerator implementation. A wallet user or validating-node operator does not need a GPU. CPU verification still requires the appropriate authenticated artifacts, memory, storage and processing time; GPU-free is not resource-free.
 
-1. **Permissionless settlement needs an objective ordering rule.** A ledger needs a public predicate that every validator can evaluate identically without relying on a customer, cloud provider, model vendor, or external oracle.
-2. **Inference providers need low-friction incremental payment.** Model execution is often streamed, usage-metered, and too granular for an on-chain transaction per token chunk. Neither party should need to extend unlimited credit.
-3. **A new protocol needs visible, continuing infrastructure funding.** Engineering, audits, ecosystem tools, and operator support require resources, but hidden premines and discretionary inflation weaken credibility.
+### 4.5 Proof size: the actual deployed design
 
-Many "useful work" proposals try to solve all three with one mechanism: make arbitrary customer jobs determine block validity. That creates hard consensus dependencies. Customer models can be unavailable or proprietary. Inputs can be private. GPU kernels can be nondeterministic. Different runtimes may disagree. A task can have commercial value while being difficult to verify more cheaply than repeating it. Demand arrives irregularly, while block production must continue on schedule.
+The full transparent proof is **12,025,320 bytes**, approximately 11.47 MiB. It contains a 16-byte header, 2,097,152 bytes of final-activation values, and three bank sections of 3,309,384 bytes each. The production profile allows a 13 MiB proof frame and a 16 MiB block frame.
 
-Common Foundry therefore separates the responsibilities.
+The proof makes verification far cheaper than evaluating every matrix term, but it is not a sub-256-KiB object. The current design publishes the final table and hashes it directly; it does not deploy a compressed, succinct BLAKE3 argument for that table. Further proof compression is an optimization opportunity, not a launch claim.
 
-```mermaid
-flowchart LR
-    M[Miners] -->|ForgeMatrix work| C[Consensus and ordering]
-    C -->|Blocks and UTXO settlement| L[CMFD ledger]
-    U[Inference customers] -->|Cumulative signed states| P[GPU providers]
-    P -->|Output chunks and receipts| U
-    U -->|Fund channel| L
-    P -->|Close chosen customer-signed state| L
-    C -->|Per-block subsidy| M
-    C -->|Pre-tail allocations| F[Steward and community funds]
-    T[Transaction users] -->|Fees burned| L
-```
+At one continuously full 16 MiB block every 60 seconds, block payload alone would average about 2.24 Mbit/s and 22.5 GiB per day before database overhead. Real growth follows actual encoded blocks and block cadence. Bandwidth, storage and propagation must therefore remain first-class operator metrics.
 
-### 2.2 The central thesis
+## 5. Integrity without trusting the miner
 
-Common Foundry is a research-first attempt to align permissionless monetary security, GPU matrix computation, direct inference payments, and transparent public-goods funding without pretending that consensus can prove which physical device or memory tier performed the work.
+### 5.1 Acceptance is a chain of checks
 
-The intended alignment is economic rather than magical:
+| Attempted substitution | Relevant enforcement |
+|---|---|
+| Reuse work on another network or parent | Full network and parent binding in the challenge and transcript |
+| Change transactions or reward destination | Transaction-root and coinbase commitment |
+| Declare an easier target | Node-derived target plus target binding in the proof statement |
+| Substitute weights or proof parameters | Authenticated model and proof-system identities |
+| Supply an unrelated terminal activation | Final-bank opening claims, canonical terminal values and BLAKE3 digest linkage |
+| Change a nonce while retaining the proof | Nonce-derived challenge, masks and transcript |
+| Submit malformed or oversized proof bytes | Exact topology, bounded framing, canonical field parsing, no trailing bytes |
+| Treat a pool share as an accepted block | Separate share, candidate-proof and node-admission stages |
 
-- ForgeMatrix makes large exact matrix multiplication the dominant candidate cost.
-- That work favors hardware and operational skills also useful for machine learning.
-- The same operators may separately sell inference.
-- The chain supplies neutral asset settlement and bounded-exposure channels.
-- Public-goods allocations are explicit in every pre-tail coinbase instead of hidden in a premine.
+In September 24 internal checks, fresh complete proofs produced on an RTX 4090 and RTX 5090 were validated in separate verifier processes. Nine targeted tamper cases were rejected, including an alternate-network statement with recomputed digest claims. That last case matters: changing only the outer labels was not enough to make the old algebraic proof valid. [P6]
 
-The design does **not** assert that a mined block performed a customer's useful inference. It also does not require inference demand for liveness. If no customer jobs exist, consensus can still advance. If a marketplace runtime fails, ledger verification remains self-contained.
+These are concrete regression results, not a declaration that cheating is mathematically impossible. Honest assurance names the enforced statement, assumptions and tested attacks. Implementation bugs, undiscovered algebraic shortcuts, majority-work attacks and network failures remain distinct concerns. There is no claimed external cryptographic audit in this edition.
 
-### 2.3 Why not a conventional hash loop?
+### 5.2 Clear boundaries improve the business case
 
-A conventional hash-based proof of work is compact, mature, and easy to verify. ForgeMatrix deliberately accepts greater implementation complexity in pursuit of a different hardware-cost shape: a large public data set, repeated dense matrix reuse, exact arithmetic, and sequential nonlinear transitions.
+A proof of the ForgeMatrix relation is not proof that a customer received a correct AI answer. A valid pool share is not a matured mining reward. A signed release is not proof of bug-free software. Keeping those categories precise is useful to miners, customers and partners because it tells each participant what can be independently checked and what still requires operational judgment.
 
-The hoped-for benefit is a mining ecosystem closer to commodity ML acceleration than a narrow hash-only pipeline. The cost is substantial: consensus needs a sound succinct proof, a fixed model artifact, exact cross-platform semantics, stronger parser defenses, and evidence that the intended resident execution is actually economically dominant. Until those gates are satisfied, a conventional hash loop remains the lower-risk engineering choice. The project treats this as an empirical hypothesis, not a foregone conclusion.
+## 6. A launch designed around one shared start
 
-## 3. System architecture
+### 6.1 Preparation and mining are separate milestones
 
-Common Foundry consists of four layers:
+| Milestone | Scheduled time | Purpose |
+|---|---|---|
+| Public source and matching launch packages | October 2, 2026, noon CDT / 17:00 UTC | Inspect, build, download and prepare |
+| Mainnet mining | October 3, 2026, noon CDT / 17:00 UTC | Begin work against the authenticated mainnet genesis |
 
-1. **Consensus library.** Canonical transactions and blocks, UTXO state transitions, reward allocation, fee burning, difficulty, proof selection, and wire encoding.
-2. **ForgeMatrix proof-of-work.** A public, block-bound computation and its proposed succinct proof.
-3. **Inference payment protocol.** Signed cumulative customer authorizations, provider receipts, and on-chain settlement or refund.
-4. **Node and wallet runtime.** Static private peer synchronization, forks, persistence, mempool, mining templates, loopback RPC, a CMFD-specific Devnet pool service, and a Devnet wallet interface.
+The preparation window is exactly 24 hours. Mainnet begins with a fresh chain; RC balances do not transfer. No premine or token sale supplies an earlier coin allocation.
 
-The crates separate responsibilities for review. Consensus explicitly imports the marketplace types and rules that govern channel spends, while the node consumes canonical consensus objects; this is an audit boundary, not cryptographic or dependency isolation. Any marketplace function reached from consensus is consensus-critical and must be versioned, reviewed, and tested with the same discipline as the ledger rules.
+Releasing software early is not, by itself, enough to prevent advance mining. Common Foundry therefore binds launch to a future, externally generated beacon result rather than relying only on a local clock or a promise not to start.
 
-### 3.1 End-to-end block path
+### 6.2 A plan-bound, beacon-derived genesis
 
-```mermaid
-flowchart TD
-    A[Confirmed UTXO set] --> B[Bounded mempool]
-    B --> C[Deterministic transaction ordering]
-    C --> D[Coinbase plus transaction Merkle root]
-    D --> E[Chain-derived target]
-    E --> F[ForgeMatrix challenge]
-    F --> G[Nonce evaluation]
-    G -->|losing digest| F
-    G -->|digest at or below target| H[Generate winner proof]
-    H --> I[Canonical block encoding]
-    I --> J[Peer pull and full validation]
-    J --> K[Append plus fsync]
-    K --> L[Atomic state commit]
-```
-
-The block challenge includes the network, model, parent, transaction root, height, timestamp, target, and nonce. A miner cannot change the reward outputs or ordinary transactions after finding work because the coinbase commitment and transaction identifiers are included in the Merkle root.
-
-## 4. Ledger and consensus core
-
-### 4.1 UTXO state
-
-Common Foundry uses an unspent transaction output model. Each input names a prior transaction identifier and output index. Ordinary key-locked outputs are controlled by a 32-byte x-only secp256k1 public key and a 64-byte Schnorr signature. Inference-channel outputs use a distinct structured lock enforced by consensus.
-
-Every transaction commits to the full 32-byte network identifier. Signatures and identifiers use domain-separated hashing so an object valid on one network cannot be replayed on another network with merely a colliding four-byte wire magic.
-
-Validation enforces:
-
-- the expected transaction and block versions;
-- exact network identity;
-- canonical bounded encoding;
-- unique inputs and available UTXOs;
-- signature validity and lock semantics;
-- coinbase maturity;
-- nonzero outputs and no value creation;
-- transaction, input, output, byte, and signature-count caps;
-- exact channel settlement or timeout-refund accounting.
-
-### 4.2 Coinbase and maturity
-
-Every pre-tail block creates exactly three consensus outputs:
-
-1. the miner reward;
-2. the steward award;
-3. the community award.
-
-The miner output matures after 100 blocks. Steward and community outputs are marked spendable at their creation height; because transactions are validated before the current block's coinbase is inserted, they can first be consumed by a later block. There is no 90-day delay.
-
-The destinations and reward rules are immutable network parameters committed into the consensus fingerprint. A node cannot accept a different community key, monetary schedule, proof profile, or resource limit while claiming compatibility with the same fingerprint.
-
-### 4.3 Canonical wire format
-
-Top-level transactions, proofs, and blocks use a fixed 16-byte frame header:
+The signed launch plan commits the economic rules, starting and easiest targets, reward destinations, proof/artifact identities, schedule and beacon policy. The candidate pins quicknet round **32,747,812**, scheduled for the announced mining start. It does not select whichever round happens to be newest when a node starts. [P7]
 
 ```text
-offset  size  field
-0       4     ASCII "CMFD"
-4       4     network-derived magic
-8       2     little-endian wire version
-10      1     object kind
-11      1     flags, currently zero
-12      4     little-endian payload length
+genesis = SHA256(
+  "CMFD/MAINNET/BEACON-GENESIS/V1\0"
+  || canonical_launch_plan_sha256[32]
+  || pinned_quicknet_chain_hash[32]
+  || pinned_round_big_endian_u64[8]
+  || verified_compressed_G1_signature[48])
 ```
 
-The decoder rejects unknown tags or kinds, nonzero flags, excessive counts or lengths, truncation, malformed fixed-width fields, noncanonical nested encodings, and trailing bytes. Consensus validation separately rejects duplicate transaction inputs and duplicate or retired channel identifiers. Current upper bounds are:
+The launch helper verifies the pinned BLS signature scheme and public key, and derives the result locally. It does not trust a relay's claimed randomness or substitute public key. Multiple relays provide transport alternatives for the same required round. If that round is delayed, the system waits for it instead of accepting operator-generated fallback entropy.
 
-| Resource | Bound |
-|---|---:|
-| Block frame | 1 MiB |
-| Transaction frame | 64 KiB |
-| Proof frame | 256 KiB |
-| Transactions per block | 1,024 |
-| Inputs per transaction | 128 |
-| Outputs per transaction | 128 |
-| Aggregate regular inputs per block | 4,096 |
-| Aggregate regular outputs per block | 4,096 |
-| Signature checks per block | 2,048 |
-| Coinbase outputs | 3 |
+Node opening, mining work, replay and block admission use the authenticated runtime context. Prelaunch wallet preparation can create an encrypted wallet and show its receiving address without opening the live chain. After beacon verification, the user can unlock and connect. Source availability, wallet preparation and network activation are separate actions.
 
-These are consensus and parser-safety choices, not throughput claims. Fixed-width little-endian fields and explicit count caps were chosen over general-purpose serialization because consensus must reject ambiguous representations and allocate only after checking declared sizes.
+### 6.3 What fairness means here
 
-### 4.4 Difficulty adjustment
+This mechanism is designed to prevent useful advance work against a genesis that is not yet known, assuming the pinned beacon's threshold-security conditions hold and the launch gate is enforced. It does not promise identical Internet latency, identical hardware, or equal access to kernel optimization. It also introduces a launch-time dependency on the beacon's availability and future-round unpredictability. [R3]
 
-The target interval is 60 seconds. The next target uses at most the most recent 180 header-work records. Let `Nw` be the number of records in the window, `T_i` the encoded targets, and `t_i` the effective timestamps. For `Nw > 1`:
+The practical offer is a published preparation window, explicit parameters and a common authenticated start condition. That is stronger and more inspectable than an undisclosed launch time or an operator-controlled random seed.
+
+## 7. CMFD: transparent distribution and durable incentives
+
+### 7.1 A calculable issuance schedule
+
+One CMFD equals 100,000,000 atomic units. The bootstrap spans 2,628,000 blocks, about five 365-day years at the 60-second target spacing. Real calendar duration depends on actual block production.
 
 ```text
-average_target = floor(sum(T_i) / Nw)
-expected_span  = (Nw - 1) * 60
-actual_span    = clamp(t_last - t_first,
-                       expected_span / 3,
-                       3 * expected_span)
-next_target    = min(pow_limit,
-                     max(1,
-                         floor(average_target * actual_span /
-                               expected_span)))
+N  = 2,628,000
+R0 = 50,000,000,000 atoms
+R(h) = floor(R0 * (N - h + 1) / N),  1 <= h <= N
+R(h) = 500,000,000 atoms,             h >= N + 1
 ```
 
-The block must carry exactly this independently derived target before proof verification. Arithmetic uses checked 256- and 512-bit integers.
+Block one issues 500 CMFD. The bootstrap subsidy then declines linearly toward a very small final bootstrap reward. On block 2,628,001 the permanent 5 CMFD miner-only tail begins. The tail is a deliberate step up from the final bootstrap reward, not a hard supply cap or a schedule that simply stops declining at 5 CMFD. [P4]
 
-Raw timestamps must exceed the median of the preceding 11 timestamps and must not be more than 24 hours beyond the validating node's locally supplied acceptance time. Effective median timestamps, rather than raw miner timestamps, enter the retarget history. This reduces timestamp manipulation, although it still requires reasonably synchronized operator clocks.
+### 7.2 Funding the network in public
 
-### 4.5 Chainwork and fork choice
-
-The work assigned to a target `T` is:
-
-```text
-work(T) = floor(2^256 / (T + 1))
-```
-
-Cumulative work is stored in 512 bits. A side branch activates only when its fully validated cumulative work is **strictly greater** than the active branch. Equal-work branches retain the existing active tip. There is no finality rule; the system inherits Nakamoto-style majority-work assumptions and reorganization risk.
-
-## 5. Monetary policy and funding
-
-### 5.1 Units and five-year bootstrap
-
-One CMFD contains 100,000,000 atomic units. With a nominal 60-second block target, five 365-day years contain:
-
-```text
-N = 5 * 365 * 24 * 60 = 2,628,000 blocks
-```
-
-The initial subsidy is 500 CMFD. For real block height `h`, where `1 <= h <= N`:
-
-```text
-R(h) = floor(50,000,000,000 * (N - h + 1) / N) atoms
-```
-
-At height `N + 1` and thereafter, the subsidy is a permanent miner-only 5 CMFD tail.
-
-| Height | Total subsidy | Miner | Steward | Community |
-|---:|---:|---:|---:|---:|
-| 1 | 500.00000000 | 350.00000000 | 125.00000000 | 25.00000000 |
-| 525,600 | 400.00019025 | 280.00013318 | 100.00004756 | 20.00000951 |
-| 1,314,000 | 250.00019025 | 175.00013318 | 62.50004756 | 12.50000951 |
-| 2,628,000 | 0.00019025 | 0.00013318 | 0.00004756 | 0.00000951 |
-| 2,628,001 | 5.00000000 | 5.00000000 | 0 | 0 |
-
-The change from 0.00019025 to 5 CMFD is an intentional discontinuity. It is not a rounding accident.
-
-<!-- PDF_FIGURE:emission -->
-
-### 5.2 Per-block allocation
-
-Before the tail:
+During the bootstrap, 25% goes to stewardship, 5% to the community allocation, and the remainder to the miner. Integer-rounding remainder belongs to the miner. At the initial 500 CMFD subsidy, that means 350 CMFD to the miner, 125 to stewardship and 25 to the community allocation.
 
 ```text
 steward   = floor(R(h) * 25 / 100)
@@ -250,931 +268,237 @@ community = floor(R(h) *  5 / 100)
 miner     = R(h) - steward - community
 ```
 
-Rounding remainder belongs to the miner so the three outputs sum exactly to the scheduled subsidy. Once the tail begins, the entire 5 CMFD goes to the miner and both public-goods streams stop.
-
-The exact aggregate pre-tail issuance is:
-
-```text
-E_pre = sum from k=1 to N of floor(R0 * k / N)
-
-      = (R0*N + R0 - N + gcd(R0,N)) / 2
-
-      = 65,700,024,998,688,000 atoms
-      = 657,000,249.98688000 CMFD
-```
-
-Its implemented aggregate distribution is:
-
-| Recipient | Pre-tail CMFD |
+| Recipient | Aggregate bootstrap CMFD |
 |---|---:|
 | Miners | 459,900,175.01312000 |
-| Steward | 164,250,062.48688000 |
+| Stewardship | 164,250,062.48688000 |
 | Community | 32,850,012.48688000 |
-| Steward plus community | 197,100,074.97376000 |
 | Total | 657,000,249.98688000 |
 
-There is no finite maximum supply. At height `H >= N + 1`:
+Both non-miner allocations end with the bootstrap. The 5 CMFD tail goes entirely to miners. The two allocation destinations are distinct addresses committed in the launch plan; at launch, **both wallets are controlled by the project owner**. The community label is a funding purpose, not a claim of decentralized voting, multisignature control or an independently governed treasury.
 
-```text
-gross_issuance(H)
-  = 657,000,249.98688
-    + 5 * (H - 2,628,000) CMFD
-```
+The commercial rationale is continuing engineering and ecosystem funding without an upfront token sale. Accountability still depends on how the funds are used and reported; the protocol fixes distribution, not spending quality. Miner coinbase outputs mature after 100 blocks. Stewardship/community outputs do not have that miner-maturity delay and can be consumed in a later block.
 
-At target spacing the tail adds 2,628,000 CMFD per 365-day year. The first tail year's gross inflation is about 0.4% of pre-tail issuance and declines proportionally as the base grows. Protocol-tracked unburned supply equals gross issuance minus burned fees. Outputs controlled by lost keys remain outstanding in ledger accounting even though they are economically inaccessible.
+### 7.3 Burn transactions, preserve an ongoing miner budget
 
-### 5.3 Why a linear decline?
-
-A linear per-block decline avoids discrete halving cliffs. It makes the schedule transparent at every height and reduces recurring moments where miner revenue changes abruptly by 50%. Height, rather than timestamp, controls the reward, so miners cannot directly accelerate issuance by selecting timestamps.
-
-The tradeoff is front-loading: the five-year bootstrap allocates a large share early. Calendar completion is nominal, not guaranteed, because five years assumes the observed average remains near one block per minute.
-
-### 5.4 Why a permanent tail?
-
-All fees are burned, so long-run miner security cannot rely on fee revenue. A permanent tail provides a predictable security budget and avoids assuming that a transaction-fee market alone will sustain proof of work.
-
-The current boundary is deliberately exposed as an experiment. Total subsidy jumps by roughly 26,281 times from the final declining block to the first tail block; miner subsidy jumps by roughly 37,543 times. Immediately before the boundary, miner compensation is extremely small. Testnet modeling must determine whether late-bootstrap hash security and the abrupt reset are acceptable. A smoother floor or earlier tail transition would reduce the discontinuity but would change the requested policy and issuance totals.
-
-### 5.5 Why burn every fee?
-
-For an ordinary transaction:
+The mainnet candidate enforces a minimum 0.1 CMFD burn per non-coinbase transaction, including channel-close transactions. Fees are not added to miner coinbase rewards.
 
 ```text
 fee_burned = sum(input values) - sum(output values)
+net_protocol_supply = gross_issuance - cumulative_burned_fees
 ```
 
-No output pays that difference to a miner. Inference-channel closure similarly burns its exact close fee. The coinbase is validated solely against scheduled emission.
+At target spacing, the permanent tail issues 2,628,000 CMFD per 365-day year, about 0.4% of aggregate bootstrap issuance in its first year. Transaction activity removes coins through burning. Whether net supply increases or decreases depends on actual issuance and actual burned fees; the protocol does not guarantee net deflation or price appreciation.
 
-The reasons are:
+The design separates two purposes: scheduled issuance supports network security, while transaction fees are a cost of using the ledger and reduce outstanding supply. Inference service payments are different: the provider is paid for the job, and only the transaction/channel-close fee is burned. **It would be incorrect to say that all inference revenue is burned.**
 
-- transaction demand cannot become an unauthorized second coinbase stream;
-- congestion is not directly paid to the miner who can order it;
-- usage offsets some permanent tail issuance;
-- the scarcity effect accrues generally rather than only to the winning miner.
+## 8. Direct inference settlement: pay for the service you choose
 
-The tradeoff is equally important: miners have no marginal fee incentive to include transactions. The Devnet relay floor of one atom per started KiB limits trivial local spam but is not a consensus fee market. A directly mined zero-fee transaction remains valid. Production must study inclusion incentives, congestion, and mempool eviction rather than assuming fee burning solves them.
+### 8.1 Why a payment channel?
 
-### 5.6 Steward and community control
+Token-by-token inference produces many small delivery events. Requiring a new on-chain transaction for each event would attach chain latency, bandwidth and fees to the streaming loop. Common Foundry's cumulative payment-channel design moves authorization off-chain while retaining a defined on-chain settlement path.
 
-Per-block awards avoid an up-front premine and make the distribution visible in every block. They decline with issuance and terminate at the tail. Immediate spendability allows continuous engineering and ecosystem operations.
+A customer funds a channel for a specific provider and job. That provider earns the service payment directly; the payment is not divided among miners, stewardship or the community allocation. Providers can compete on models, pricing, latency and reliability independently of mining participation. [P5]
 
-Labels do not determine control. If a founder controls both fixed destinations, the system economically grants that founder control over a nominal 30% pre-tail stream totaling 197,100,074.97376000 CMFD. Current Devnet keys are deterministic and public, not secure treasury keys. There is presently no multisignature treasury, on-chain vote, vesting, spending-purpose restriction, recipient rotation, or reporting mechanism.
+### 8.2 Exact terms, integer prices
 
-Before any public-value network, the project must publish the beneficial owners, key custody, signer threshold, conflicts policy, permitted uses, reporting cadence, and a credible change process. A "community fund" should be evaluated by who can spend it and under what accountability, not by its name.
-
-## 6. ForgeMatrix: design goals and evolution
-
-### 6.1 What the proof of work can establish
-
-ForgeMatrix seeks to make exact dense integer matrix multiplication the dominant cost of evaluating a nonce. A valid block should establish that the miner evaluated the exact committed function for the exact block challenge and found a resulting digest at or below the chain-derived target.
-
-It cannot establish:
-
-- that a GPU was used;
-- that the complete bank physically resided in VRAM;
-- that a particular instruction sequence or kernel ran;
-- that no CPU, FPGA, ASIC, compression scheme, or algebraically equivalent implementation exists;
-- that the computation answered a customer inference request.
-
-These are fundamental limits of ordinary software consensus. The protocol can make a resident GPU path economically favorable and measure that advantage, but cannot convert an economic performance claim into a physical proof.
-
-### 6.2 Why v1 was insufficient
-
-ForgeMatrix v1 remains useful as an exact full-recomputation oracle. It is not a production candidate for two central reasons.
-
-First, its model can be expanded from a 32-byte seed. That gives every miner a consensus-approved regeneration path instead of forcing access to the intended byte bank. A large nominal model size is irrelevant if the canonical description is tiny.
-
-Second, an earlier transition reduced the dot product into a small modulus before the final output. A miner could evaluate losing nonces with modular accumulators and reconstruct exact witnesses only for a winner. Consensus cannot force a miner to use an unnecessarily expensive instruction sequence when a cheaper equivalent computes the same function.
-
-V2 responds by committing actual seedless bytes and by making the full signed dot-product interval uniquely recoverable from a canonical residue under a larger prime.
-
-## 7. ForgeMatrix v2 exact relation
-
-### 7.1 Proposed production parameters
-
-| Parameter | Value |
-|---|---:|
-| Batch rows `B` | 128 |
-| Matrix dimension `D` | 4,096 |
-| Sequential layers `L` | 384 |
-| Layer banks | 3 banks of 128 |
-| Raw byte alphabet | 0 through 250 |
-| Centered value | raw byte minus 125 |
-| Transition prime `P` | 134,217,689 |
-| Output alphabet modulus | 251 |
-| Proof base field | Goldilocks, `2^64 - 2^32 + 1` |
-| Fiat-Shamir challenge space | at least 192 bits |
-
-The weight bank contains:
+A channel binds the network and job identifiers, customer/provider keys, model/runtime/input digests, deposit, close fee, base price, input/output token prices, token limits, output-chunk size and refund height.
 
 ```text
-L * D * D
-= 384 * 4096 * 4096
-= 6,442,450,944 bytes
-= exactly 6 GiB
+provider_payment = base_price
+  + ceil(input_tokens  * input_price_per_1000  / 1000)
+  + ceil(output_tokens * output_price_per_1000 / 1000)
+
+deposit = provider_payment + customer_refund + close_fee_burn
 ```
 
-The base table adds `B * D = 524,288` bytes. One nonce performs:
+Amounts are integer CMFD atoms. Exact conservation makes the provider payment, unused balance and burned fee independently computable. The signed terms prevent a party from silently substituting a different quoted model, runtime, input or price schedule.
 
-```text
-L * B * D * D
-= 384 * 128 * 4096 * 4096
-= 824,633,720,832 multiply-accumulate operations
-```
+### 8.3 Stream, acknowledge, settle
 
-The virtual input and 384 real layers perform 201,850,880 cubic output reductions.
+1. The provider signs a quote; the customer locks the agreed maximum deposit.
+2. The customer signs an initial cumulative authorization covering the agreed initial charges and first output chunk.
+3. The provider delivers a chunk and signs a receipt with token counts and a rolling output digest.
+4. The customer checks delivery and authorizes the next cumulative state.
+5. The provider can settle an authorized state without another customer interaction. At the refund height, the customer has the timeout-refund path.
 
-### 7.2 Seedless model bank and dual commitment
+After either terminal spend, the channel identifier is retired to prevent replay of an old state into a later channel. Cumulative states make progress explicit: an older authorized state pays the provider less, so the provider has an incentive to retain and settle the newest valid one.
 
-The canonical artifact has a fixed 184-byte header followed by the row-major base table and row-major matrices `W_0` through `W_383`, with no trailing bytes. Every payload byte must lie in `0..250`; values `251..255` are invalid.
+Granularity bounds incremental exposure. The initial authorization includes the base/input charges and first output chunk; subsequent progress adds at most one configured chunk ahead. It is not a blanket guarantee that a customer's entire initial deposit or initial charge is risk-free.
 
-```text
-header field                         size
-magic "CMFDBNK2"                    8 bytes
-format version                       u32 little-endian
-header length                        u32 little-endian, 184
-model version                        u32 little-endian
-dimension D                          u32 little-endian
-batch B                              u32 little-endian
-layers L                             u32 little-endian
-base length                          u64 little-endian
-bytes per layer                      u64 little-endian
-payload length                       u64 little-endian
-raw BLAKE3 root                      32 bytes
-aggregate layer-root commitment      32 bytes
-PCS parameter digest                 32 bytes
-PCS commitment root                  32 bytes
-```
+### 8.4 Correct payment is not the same as correct inference
 
-Two commitments are required because they answer different questions:
+A receipt authenticates what the provider signed. It does not, by itself, prove that an arbitrary neural-network answer is correct, private or useful. Deterministic runtimes, repeated execution, spot checks, provider reputation or later verifiable-inference proofs are application choices for different workloads.
 
-- The BLAKE3 root identifies the exact distributable byte artifact.
-- The polynomial commitment binds the multilinear polynomials opened by a succinct proof.
+This boundary lets the ledger do what it can enforce precisely: authorize ownership transfers, honor channel terms and provide a timeout path. The product layer must supply discovery, job transport, actual model execution, delivery checks and customer experience.
 
-Merely listing both digests in one manifest does not prove they encode the same data. Production therefore requires an independently verifiable byte-to-field link certificate, or a deterministic activation procedure in which every validator recomputes both commitments from the complete artifact. That link is not implemented.
+Those settlement primitives are implemented in the source. A complete customer-paid inference marketplace is not part of initial mainnet. The next commercial milestone is a real end-to-end pilot, not a relabeling of mining as paid inference.
 
-The intended polynomial ordering is explicit:
+## 9. Built for people who operate the network
 
-- base table: `[column bits, row bits]`;
-- each 128-layer weight bank: `[column bits, common bits, layer bits]`;
-- activation and witness banks: `[column bits, row bits, layer bits]`.
+### 9.1 Three practical ways to join
 
-Coordinates are least-significant, fastest row-major axis first. The production PCS must be transparent; the design rejects a trusted setup and its associated toxic-waste governance.
-
-### 7.3 Block challenge and mask
-
-The challenge `C` is a domain-separated BLAKE3 digest over canonical encodings of:
-
-- the 32-byte network identifier;
-- algorithm, proof, and model versions;
-- model dimensions and bank structure;
-- manifest digest, raw root, PCS parameter digest, and PCS root;
-- previous block identifier;
-- transaction Merkle root, including coinbase;
-- height and timestamp;
-- independently derived target;
-- nonce.
-
-For a virtual input layer and every real layer, BLAKE3-XOF rejection sampling derives 20 coefficients in `0..250`: one constant, seven row-bit coefficients, and twelve column-bit coefficients. The virtual layer uses the canonical tag `u32_le(0xffffffff)`; real layers use `u32_le(0)` through `u32_le(383)`. For row index bits `r_i` and column index bits `c_j`:
-
-```text
-M(layer,r,c)
-  = a_layer
-    + sum(i=0..6,  b_layer,i * r_i)
-    + sum(j=0..11, d_layer,j * c_j)
-```
-
-This is an ordinary nonnegative integer in `0..5000`; it is not reduced before addition to the accumulator. The mask is block- and coordinate-specific, yet its multilinear extension is inexpensive for a proof system to evaluate.
-
-### 7.4 Exact layer computation
-
-Decode every byte as a centered signed value:
-
-```text
-signed(raw) = raw - 125, so signed(raw) is in [-125,125]
-```
-
-The base table passes through the same transition as a virtual layer to produce `X_0`. For every real layer `l`, row `r`, and output column `c`:
-
-```text
-s_l[r,c] = sum(k=0..4095, X_l[r,k] * W_l[k,c])
-z         = s_l[r,c] + M(l,r,c)
-```
-
-This is exact signed-integer arithmetic. Floating point, TF32, stochastic rounding, saturation, wraparound, and implementation-defined overflow are not consensus operations.
-
-The nonlinear transition is:
-
-```text
-e = z                 when z >= 0
-e = P + z             when z < 0
-
-e^2    = P*q2 + r2
-r2*e   = P*q3 + h
-h      = 251*t + v
-
-0 <= e,r2,h < P
-0 <= v <= 250
-
-X_(l+1) = v - 125
-```
-
-The complete real-layer bounds are:
-
-```text
--64,000,000 <= s <= 64,000,000
--64,000,000 <= z <= 64,005,000
-0 <= q2,q3 <= 134,217,687
-0 <= t <= 534,731
-```
-
-For the virtual base transition, `-125 <= s_virtual <= 125` and `-125 <= z_virtual <= 5,125`.
-
-All dot products and masked sums fit signed 32 bits. Modular products fit unsigned 64 bits and the Goldilocks proof field.
-
-The allowed interval for `z` has width 128,005,000, which is smaller than `P`. A canonical residue plus the range constraints therefore identifies one exact signed integer. A miner that retains only `s mod 251` cannot in general recover the required canonical `e` and quotient witnesses.
-
-Because `P mod 3 = 2`, `gcd(3,P-1) = 1`; cubing is a permutation of the transition field. The cubic is deliberately non-affine while remaining proof-friendly.
-
-```mermaid
-flowchart LR
-    X[Signed activation X_l] --> G[Exact int32 GEMM with W_l]
-    G --> S[s_l]
-    M[Challenge-derived affine mask] --> Z[z = s_l + M]
-    S --> Z
-    Z --> E[Canonical signed-to-P residue e]
-    E --> Q[e cubed mod P with quotient ranges]
-    Q --> V[h mod 251 = v]
-    V --> O[Centered X_l+1 = v - 125]
-```
-
-### 7.5 Work output
-
-After layer 383, the 524,288 canonical final raw bytes are hashed:
-
-```text
-final_activation_digest =
-  BLAKE3-DERIVE-KEY("CMFD/FORGEMATRIX/OUTPUT/V2",
-                    C || u64_le(final_length) || final_raw_bytes)
-
-work_digest =
-  BLAKE3-DERIVE-KEY("CMFD/FORGEMATRIX/WORK/V2",
-                    C || raw_byte_root || PCS_root ||
-                    final_activation_digest)
-```
-
-The work digest is interpreted as an unsigned big-endian 256-bit integer. A valid winner satisfies `work_digest <= target`.
-
-The work hash is deterministic and does not include randomized proof bytes. Otherwise a winning computation would permit additional free grinding over prover randomness.
-
-## 8. Succinct verification proposal
-
-### 8.1 Why full replay is insufficient
-
-Full recomputation is valuable as a reference oracle because it makes the intended relation executable. At production scale, requiring every validator to repeat 824.6 billion MACs per block would make synchronization and independent verification impractical. A production block therefore needs a proof whose verification cost is far below evaluation cost.
-
-Generic circuit systems are not automatically a solution. A naive circuit would expose hundreds of billions of multiplication constraints plus more than 200 million nonlinear transitions and range checks. A generic execution trace would be enormous. The proof must exploit the algebraic structure of batched matrix multiplication.
-
-### 8.2 Why GKR and sumcheck
-
-The recommended construction is a public, non-zero-knowledge GKR/sumcheck argument over a transparent multilinear polynomial commitment scheme.
-
-For each layer, multilinear extensions obey:
-
-```text
-S_tilde_l(r,c)
-  = sum over k in {0,1}^12 of
-      X_tilde_l(r,k) * W_tilde_l(k,c)
-```
-
-A degree-two sumcheck reduces this identity over the 12 common-dimension bits to a small number of terminal evaluations. Batching coefficients sampled only after commitments bind the three banks and all layers. A separate transition argument enforces signed encoding, squares, cubes, quotient/remainder equations, ranges, output reduction, and successor wiring across bank boundaries.
-
-The reason for **non-zero-knowledge** is simple: the model, block header, and mining trace relation are public. Hiding them adds prover cost and complexity without providing a consensus benefit.
-
-The reason for a **transparent PCS** is governance: consensus should not depend on a secret setup whose compromise could permit forged openings. The exact PCS suite, canonical encoding, and parameter set remain unselected.
-
-### 8.3 Required committed witness
-
-The winning prover must commit, in three 128-layer banks, to oracles for:
-
-```text
-X, S, E, Q2, R2, Q3, H, T, V
-```
-
-and to packed range-decomposition bits or equivalent reviewed range arguments. The verifier must establish:
-
-- every matrix-product identity;
-- every exact signed range;
-- every signed-to-prime residue;
-- both quotient/remainder equations used by the cubic;
-- `h = 251*t + v` and `0 <= v <= 250`;
-- centered successor values;
-- the virtual base transition;
-- all 381 same-bank successor links;
-- both cross-bank links;
-- the final activation identity.
-
-Field congruence alone is insufficient. Without canonical range proofs, a prover can exploit field wraparound and satisfy equations that do not correspond to the specified integers.
-
-### 8.4 Transcript and soundness
-
-All public inputs, commitments, claims, round messages, and opening requests must enter a domain-separated Fiat-Shamir transcript before the challenges that depend on them. Decoders must reject noncanonical field representatives, duplicate elements, alternate encodings, and trailing bytes.
-
-Goldilocks supplies about 64 bits per base-field challenge, which is insufficient for the aggregate protocol. The proposal therefore requires at least 192 bits of transcript challenge space, conservatively a reviewed degree-four Goldilocks extension, and at least 128 bits of soundness after a machine-generated union bound across all sumchecks, range arguments, PCS openings, and Fiat-Shamir reductions.
-
-The current repository sumcheck is only a test skeleton: the verifier API is given all three matrices in full, each capped at 4,096 elements; it recomputes multilinear openings, uses base-field challenges, and is not connected to block validation. It demonstrates algebra and transcript testing, not succinctness or production soundness.
-
-### 8.5 Winner-only proving
-
-Generating a full proof for every losing nonce would make proof construction, not matrix evaluation, the effective mining function. The intended mining loop evaluates the deterministic relation and work digest for each nonce, then constructs one expensive proof only after finding a winner.
-
-```mermaid
-flowchart TD
-    T[Canonical block template] --> C[Challenge for nonce]
-    C --> E[Evaluate 384-layer relation]
-    E --> W[Compute deterministic work digest]
-    W -->|above target| C
-    W -->|at or below target| P[Generate complete succinct proof once]
-    P --> B[Broadcast canonical block and proof]
-    B --> V[Fast validator verification]
-```
-
-### 8.6 The unresolved final-digest binding
-
-A proof of matrix and transition relations is incomplete if the final BLAKE3 digest is accepted as an unproved miner-supplied field. Production must choose one of:
-
-1. arithmetize BLAKE3 inside the proof;
-2. publish all 524,288 final bytes so validators hash them directly;
-3. introduce a reviewed proof-native digest under a new algorithm version.
-
-Option 2 adds 512 KiB to every block before proof overhead. No option is currently selected or implemented. This is a production blocker.
-
-## 9. GPU memory and hardware economics
-
-### 9.1 The 16 GiB design target
-
-The raw weight bank is 6 GiB. A resident implementation also needs activations, CUDA/runtime state, proof staging, and safety headroom. The proposed activation gate caps peak device allocation at 13.5 GiB on named 16 GiB cards.
-
-This is a design target, not a consensus minimum. A 2 GiB or 4 GiB card can remain valid by tiling matrices, streaming weights over PCIe, regenerating a lossless representation, or spilling proof state to host memory or storage. It may be slower, but it cannot be rejected for having less VRAM.
-
-### 9.2 What must be measured
-
-The resident-memory claim must survive adversarial implementation work. Benchmarks must compare, for identical nonces and outputs:
-
-- fully resident execution;
-- pinned-host streaming;
-- pageable-host streaming;
-- exact lossless regeneration or decompression;
-- physical 2, 4, 6, and 8 GiB cards;
-- named 16 GiB baseline cards;
-- fixed CPU, PCIe generation, host RAM, storage, driver, compiler, and kernel versions.
-
-Tests need warm-up, repeated trials, confidence intervals, power draw, accepted outputs, and proof-generation peak memory. Artificial allocation caps on one large card are not a substitute for physical low-memory measurements.
-
-The current proposed gate requires resident execution to be at least four times faster than the best valid nonresident or at-most-4-GiB path on every named baseline card. If that result does not hold, the profile must change rather than the paper claiming it anyway.
-
-### 9.3 Specialized hardware
-
-ASIC and FPGA resistance is not claimed. Matrix orientation may delay or alter specialization, but any valuable proof of work invites optimized hardware. An ASIC that evaluates the exact committed relation is valid. Long-run decentralization depends on capital cost, supply, memory bandwidth, developer access, and market concentration, none of which follows automatically from using matrix multiplication.
-
-## 10. Direct inference market
-
-### 10.1 Separate payment from consensus
-
-Inference customers do not pay miners merely because miners own GPUs. They pay the provider that accepts and serves a job. These payments are separate from subsidy, steward awards, and community awards.
-
-This avoids tying consensus liveness to job availability or correctness. It also means the ledger can settle inference even when the provider is not currently mining, and a miner earns no inference income without serving customers.
-
-### 10.2 Channel terms and pricing
-
-An inference channel commits to:
-
-- network and job identifiers;
-- customer and provider public keys;
-- model, runtime, and input digests;
-- deposit and burned close fee;
-- base price;
-- input and output prices per 1,000 tokens;
-- maximum input and output tokens;
-- a nonzero configured output chunk size;
-- refund height.
-
-For atomic CMFD prices:
-
-```text
-provider_payment
-  = base_price
-    + ceil(input_tokens * input_price_per_1000 / 1000)
-    + ceil(output_tokens * output_price_per_1000 / 1000)
-
-deposit
-  = provider_payment + customer_refund + close_fee_burn
-```
-
-The arithmetic is exact integer arithmetic. Thirty-two output tokens are used in current examples, but chunk size is a channel term, not a global consensus constant.
-
-### 10.3 Progressive authorization
-
-```mermaid
-sequenceDiagram
-    participant C as Customer
-    participant L as CMFD ledger
-    participant P as GPU provider
-    C->>L: Lock maximum deposit in channel output
-    C->>P: Sign cumulative state for base, input, and first chunk
-    P->>C: Stream output chunk and signed rolling-digest receipt
-    C->>P: Verify delivery, authorize next cumulative state
-    P->>C: Repeat bounded chunks
-    P->>L: Close a chosen customer-signed state, normally newest
-    L-->>P: Exact provider payment
-    L-->>C: Unused deposit refund
-    L-->>L: Burn close fee
-```
-
-Consensus accepts any correctly priced, customer-signed state; it cannot determine which signed state is latest. Because authorization and charges are nondecreasing, a stale state never pays the provider more, but it may pay the same. The provider normally prefers the newest state only when it carries a strictly larger payment. The provider can close without further customer cooperation. If the provider disappears, the customer can use the exact timeout-refund path after `refund_height`; the close fee is still burned and the channel identifier is retired against replay.
-
-Receipt chaining is enforced off chain. For a sequence greater than zero, unilateral close verifies exact pricing and allocation, the customer signature, and the provider settlement signature, but it does not reconstruct or verify the receipt chain; `previous_receipt` is only a committed digest. The customer signature is therefore the on-chain authorization.
-
-The customer's initial exposure includes the base price, all metered input charges, the first authorized output chunk, and the close fee. After service begins, each incremental authorization exposes at most one additional configured output chunk.
-
-### 10.4 What receipts prove
-
-A provider receipt proves that the provider key signed token counts and a rolling output digest. It does not prove:
-
-- that the claimed model produced the output;
-- that the output is correct or high quality;
-- that a GPU performed the work;
-- that latency or availability met an agreement.
-
-Depending on job value, correctness can be addressed through deterministic runtimes, redundant providers, spot checks, reputation, escrow, or later specialized proofs. None is currently integrated.
-
-### 10.5 Current marketplace boundary
-
-The implemented libraries contain terms, channel identifiers, exact pricing, customer states, provider receipts, settlement signatures, timeout refunds, close-fee burning, and consensus channel locks. They do not yet provide provider discovery, a signed quote transport, inference execution, model distribution, scheduling, streaming, reputation, dispute resolution, a price oracle, or marketplace wallet flows.
-
-Prices are directly denominated in CMFD atoms. Volatility and hedging are outside the current protocol.
-
-## 11. Node and network runtime
-
-### 11.1 Private static network
-
-Devnet-0 is designed for a small group of explicitly configured peers. RPC is
-loopback-only on `127.0.0.1:18443`. P2P defaults to TCP port 18444 on an exact
-loopback, RFC1918, IPv6 ULA, or IPv6 link-local address. Public numeric addresses
-require explicit `--allow-public-peers` opt-in; unspecified, duplicate, self,
-and zero-port peer configurations remain rejected.
-
-Peers exchange the network identifier, consensus fingerprint, a process-scoped node nonce, tip, height, and 512-bit cumulative work. The fingerprint detects mismatches in committed network parameters; it does not authenticate the peer, encrypt traffic, or prove that two binaries implement identical semantics.
-
-When one or more static peers are configured, the default live poller runs every two seconds and:
-
-1. performs a mutual compatibility handshake;
-2. requests at most 16 parent-ordered blocks;
-3. checks every body against its requested identifier;
-4. assigns local acceptance time and fully validates it;
-5. requests deterministic mempool inventory;
-6. downloads at most 64 unknown transaction bodies;
-7. verifies each transaction ID and applies ordinary mempool admission;
-8. offers up to 16 locally active blocks following the peer's advertised tip;
-9. requires an explicit accepted, already-known, or rejected result for every
-   submitted block.
-
-Remote height and chainwork are hints. Local verification and locally calculated cumulative work decide acceptance.
-
-The standalone multi-GPU miner uses the same bounded peer transport as a thin
-client. It requests a complete template keyed to its payout destination,
-evaluates only the immutable `BlockChallenge`, inserts the resulting proof, and
-submits the canonical block. It does not maintain a chain database. The node
-retains mempool selection, chain synchronization, consensus validation,
-durability, and fork choice. A miner reports success only after a node returns
-an accepted or already-known acknowledgement. This separation avoids turning
-every mining rig into an additional syncing node while preserving full node
-validation of untrusted miner output.
-
-Bounded request/response synchronization was chosen to simplify the first
-deployment. Static links now move blocks in both directions, while transaction
-propagation remains pull-only. Convergence still depends on static topology and
-polling, so this is not a final public gossip protocol.
-
-### 11.2 Persistence and crash consistency
-
-Each data directory contains:
-
-- `node.lock`, held through a nonblocking operating-system exclusive lock;
-- `network.meta`, containing the immutable consensus fingerprint;
-- `blocks.log`, an append-only sequence of canonical, checksummed block records.
-
-A candidate block is fully validated before mutation. The node then appends and synchronizes its record before committing the prepared state transition in memory. A storage failure latches the node unhealthy. If durable append succeeds but memory commit fails, the process stops accepting work so restart can replay disk as the source of truth.
-
-On restart, the node checks record magic, version, sizes, checksums, canonical re-encoding, network fingerprint, consensus validity, parent relations, forks, and cumulative work. It reconstructs the active branch deterministically.
-
-This append-and-replay model favors auditability. It lacks production snapshots, pruning, automatic repair, authenticated checkpoints, bounded startup time, and protection against a local attacker who can rewrite records and checksums.
-
-### 11.3 Mempool and templates
-
-The volatile mempool is capped at 1,024 transactions and 512 KiB. It accepts confirmed inputs only, rejects unconfirmed parents, applies first-spend-wins conflict handling, has no replace-by-fee or package relay, and is discarded on restart. A relay candidate must burn at least one atom per started KiB, although consensus itself permits a zero-fee transaction.
-
-Transaction identifiers determine template order. Nodes holding the same set therefore build the same ordered template regardless of arrival order. Reorganizations revalidate the pool against the new active state.
-
-These rules are deliberately small and deterministic. A public network would need economically meaningful eviction, package handling, transaction rebroadcast, and stronger spam controls.
-
-### 11.4 Wallet and miner UTXO hygiene
-
-The Devnet wallet signs in Rust; the browser receives no private key. It reconstructs balance and history from the active chain and marks mempool-spent outputs reserved. Mining rewards mature after 100 blocks.
-
-Normal sends choose mature, unreserved outputs largest-first, then apply a stable outpoint tie-break. This minimizes input count and avoids failing a 128-input transaction when a later large output could fund it.
-
-Miner consolidation deliberately chooses mature, unreserved outputs smallest-first. It spends between 2 and 128 inputs into exactly one self-owned output, minus a burned fee. This removes dust-like reward fragments and keeps later sends within consensus input limits. Consolidation consumes block space and burns a fee; it should be done when fragmentation warrants it, not automatically after every reward.
-
-Current key custody remains intentionally unsafe. A new data directory generates a distinct Schnorr test key and stores its raw 32-byte secret in `wallet.key`; the browser and RPC do not receive that secret. An existing nonempty Devnet-2 directory retains the old public demonstration key during migration so prior test outputs are not stranded. The file is unencrypted, backup is manual, Windows protection depends on directory ACLs, and there is no mnemonic recovery, hardware-wallet integration, or audited production custody. The GUI and wallet must never be used for value.
-
-### 11.5 Devnet pool protocol
-
-Devnet-0 implements a small Common Foundry job/share protocol so several wallet
-miners can exercise coordinated ForgeMatrix work. It is not Bitcoin Stratum
-and does not reuse Stratum job semantics. The service accepts only numeric
-loopback, RFC1918 IPv4, or IPv6 unique-local endpoints and uses TLS 1.3. Each
-message is JSON inside a 4-byte big-endian length prefix with a 16 KiB maximum.
-The pool command also runs the node's private P2P inbound listener and optional
-static-peer poller against the same node state, allowing accepted pool blocks
-to propagate through an explicitly configured private topology.
-
-Pool clients pin the SHA-256 digest of the exact DER-encoded leaf certificate.
-The custom verifier compares all 32 digest bytes and still verifies the TLS
-handshake signature using the pinned certificate. It does not use public CA
-trust, DNS identity, or client certificates. The pin therefore has to be
-transferred and verified through a separate trusted channel. TLS authenticates
-the pinned server endpoint and encrypts this pool socket; worker and payout
-claims are not client-authenticated, so session counters are not
-identity-secure. TLS does not protect the independent P2P transport. Operators
-publish the certificate and pin but never the private key. Generated key files
-use mode `0600` on Unix; Windows deployments depend on restrictive directory
-ACLs for both the key and pool data.
-
-The initial client message supplies protocol version, network ID, consensus
-fingerprint, worker label, and payout label. The server checks compatibility,
-assigns a session ID, states the volatile accounting semantics, and returns a
-job containing:
-
-- a server-issued job identifier;
-- the complete immutable `BlockChallenge`; and
-- a separate share target that is easier than or equal to the challenge's
-  chain target.
-
-The job identifier binds fresh server/job entropy, a sequence, the challenge,
-and the selected share target. A worker evaluates the committed relation over
-that challenge and submits only the job identifier and nonce. It does not
-supply a trusted proof or work digest.
-
-Let `E(C, n)` be exact ForgeMatrix evaluation of challenge `C` at nonce `n`,
-let `D(E)` be its 256-bit work digest, let `T_c` be the chain target committed
-inside `C`, and let `T_s` be the separately transported share target. Threshold
-ordering uses the ordinary lower-digest-wins convention, so the server requires
-`T_s >= T_c`. For every submission it independently computes:
-
-```text
-P = E(C, n)
-d = D(P)
-share accepted       iff d <= T_s
-block candidate      iff d <= T_c
-```
-
-This is targetless relation evaluation followed by two independent target
-comparisons. `T_s` is never written into or substituted for `C.target`.
-Consequently a proof that qualifies only as a share cannot be converted into a
-block. When `d <= T_c`, the server reconstructs the candidate from the original
-job and recomputed proof, then sends it through ordinary node block submission,
-which again enforces consensus validation. Tip changes rotate the job; stale
-job IDs, repeated nonces, low-difficulty shares, malformed frames, and excess
-resource use are rejected.
-
-The current compile-time limits are 64 concurrent sessions, 1,000,000 messages
-per session, 65,536 valid nonce records per job, 1,024 recent session records,
-and 1,024 recent payout-label records. Finished connection threads are reaped;
-inactive accounting records are pruned within the stated caps. These bounds are
-Devnet engineering controls, not evidence of public-network denial-of-service
-maturity.
-
-The pool ledger is deliberately bounded, volatile test instrumentation.
-Accepted/rejected shares, found blocks, and credited Devnet atoms are tracked
-by connection session and payout label in memory, then discarded on process
-restart. The default counter adds one test atom per accepted share. These
-numbers are valueless and nonwithdrawable: they are not funds, debt, custody,
-or an on-chain balance. The payout field is an untrusted label and does not
-control the miner reward output. A valid block sends that output to the pool
-server's configured destination. Distinct local wallet keys do not fix this:
-the pool has no authenticated payout identity or payout mechanism.
-
-A production pool requires unique user and operator key custody, durable
-auditable share records, reorganization-aware reward maturity and reversal,
-explicit payout construction and confirmation, withdrawal limits, optimized
-GPU miners and proof generation, bounded verification queues, share-proof DoS
-analysis, monitoring, load and fuzz testing, independent implementations, and
-external audits. The implemented pool is only a private Devnet interoperability
-path.
-
-## 12. Security model
-
-### 12.1 Consensus assumptions
-
-Common Foundry assumes:
-
-- honest nodes enforce identical canonical consensus rules;
-- the active branch with strictly greatest valid cumulative work is authoritative;
-- an adversary does not sustain a majority of effective work;
-- BLAKE3 and BIP340 Schnorr retain their expected cryptographic properties;
-- any activated polynomial commitment and Fiat-Shamir proof meet their analyzed binding and soundness levels;
-- operator clocks remain sufficiently synchronized for the future-time rule.
-- the honest network eventually delivers valid blocks sufficiently quickly for Nakamoto-style convergence.
-
-It does not assume miners follow a reference kernel. Any implementation computing the exact relation is valid. A sub-majority-work assumption alone does not rule out selfish-mining advantages or partition-induced divergence; those remain network and economic risks.
-
-### 12.2 Threat matrix
-
-| Threat or shortcut | Control | Current status |
+| Participation | What you run | What you contribute |
 |---|---|---|
-| Skip a layer or bank | Bind all sequential transitions and bank boundaries | Tiny Devnet fully replays four layers; production proof absent |
-| Use another model | Manifest, raw root, PCS root, and link certificate | Raw format exists; PCS and link absent |
-| Regenerate from a short seed | Seedless activated bytes | V2 format implemented; production ceremony absent |
-| Compress the bank | Structural review and competing implementations | Cannot be prohibited by consensus |
-| Retain only low accumulator bits | Exact signed interval plus canonical prime residue | Relation implemented at tiny scale; production range proof absent |
-| Substitute final output | Prove final digest or publish bytes | Unresolved production blocker |
-| Reuse proof on another block | Challenge binds network, model, parent, root, height, time, target, nonce | Implemented in reference path |
-| Claim an easier target | Chain independently derives target before proof verification | Implemented |
-| Substitute a pool share target for chain work | Targetless relation replay, separate comparisons, immutable challenge target | Implemented for Devnet pool |
-| Claim an uncomputed pool share | Submit nonce only; server independently recomputes proof and digest | Implemented at tiny Devnet scale |
-| Treat pool counters as owned funds | Explicit volatile/nonwithdrawable semantics and operator-directed miner output | No production payout ledger or user custody |
-| Cross-network replay | Full network ID in objects and fingerprint handshake | Implemented |
-| Forge polynomial openings | Transparent PCS with canonical openings | Not implemented |
-| Fake raw-to-PCS equivalence | Verifiable link certificate | Not implemented |
-| Transcript grinding | Canonical transcript, post-commit challenges, large extension field | Only toy transcript exists |
-| Parser memory or CPU denial | Bounded canonical framing and proof-specific resource caps | Devnet wire bounded; production proof parser absent |
-| False remote height or work | Treat advertisement as hint and recompute locally | Implemented |
-| Peer spoofing, eclipse, MITM | Authenticated encrypted peer layer, discovery, reputation | Not implemented; private static peers only |
-| Local wallet compromise | Encrypted custody, backup/recovery, and process isolation | Distinct unencrypted Devnet keys only; production custody not implemented |
-| VRAM residency claim | No general software proof exists | Explicitly not claimed |
-| Inference correctness | Determinism, redundancy, reputation, or job-specific proof | Receipts only; no general correctness proof |
+| Wallet or validating node | CPU-based validation and wallet/node software with authenticated artifacts | Ownership, transfers and independent rule enforcement; no GPU required |
+| Pool search | A GPU search client connected to a pool | Candidate/share search; the pool handles winner proving and submission |
+| Solo miner or pool operator | Search, full proving stack, node and operating infrastructure | Complete candidate production and, for pools, accounting and payouts |
 
-Devnet fork choice is functionally testable, but its tiny CPU-recomputed work profile and easy eight-leading-zero-bit proof-of-work limit provide no public-value security. Acquiring majority Devnet work is trivial compared with the intended production setting.
+Pool search and solo proving have different setup footprints. Existing RC packages use roughly 6.4 GB of authenticated model data for the lighter role and roughly 61 GB of model/preprocessed inputs for the complete solo stack, plus working storage. Final launch-package instructions are authoritative for exact downloads and prerequisites. Windows workflows can include WSL2/Linux GPU-worker components; Windows support should not be mistaken for every proving component being a native Windows executable. [P1]
 
-### 12.3 Public-network gaps
+Hardware claims must also remain role-specific. Fresh September qualification exercised full proofs on RTX 4090 and RTX 5090 devices. Earlier qualification demonstrated a full proof path on an RTX 5070 Ti 16 GB. Pool-search measurements also covered an RTX 4070 Ti SUPER. These results do not certify every NVIDIA generation, every 8 GB card, every driver or every mixed-GPU rig.
 
-Devnet's parser caps, local RPC restriction, consensus fingerprint, durable replay, full body validation, and pinned-TLS pool transport are meaningful controls. They do not make a public node or pool safe. The P2P layer has no peer identity authentication, encryption, discovery, ban system, reputation, eclipse resistance, or mature denial-of-service strategy. The pool has no client identity, secure pin distribution, persistent or reorganization-aware payout accounting, withdrawal path, production share proof, or hardened verification queue. Side-branch reconstruction replays from genesis. RPC is single-threaded around shared node state. Storage has no pruning or snapshot path. Logs and peer observability are minimal.
+### 9.2 An approachable wallet with explicit custody
 
-Release artifacts have SHA-256 checksums, and CI contains checked-in Windows
-and Linux desktop build jobs. The release tag and binaries remain unsigned,
-however, and the workflow does not yet provide byte-for-byte reproducibility,
-an SBOM, signed provenance, or an attestation.
+The Rust-backed desktop wallet provides sending, receiving, balances, peer information and mining-related workflows. Encrypted live keys and backups use XChaCha20-Poly1305 with Argon2id-derived keys. Authenticated metadata binds the format, KDF parameters, network and wallet destination. Restore validates the recovered key and refuses to overwrite an existing wallet key. [P8]
 
-## 13. Implementation status
+Prelaunch preparation supports creating the mainnet wallet and an encrypted backup before activation. A public receiving address is not a private key. A backup password is not a network account reset token: losing the only usable key/backup credentials is a custody problem, not something a server administrator can reverse.
 
-| Component | Implemented or Devnet reference | Production requirement |
+Signed manifests, checksums, pinned artifact identities and resumable input downloads help users install the intended software and data. These are distribution and integrity mechanisms; they do not replace software testing or guarantee uptime.
+
+### 9.3 Pool accounting that treats reorganizations seriously
+
+Pools offer frequent share feedback and a simpler client, but their accounting must distinguish an observed block from a canonical mature reward and a paid credit.
+
+The launch-candidate source includes persistent payout holds when a previously credited or paid reward loses canonical mature backing. Affected payments and automatic retries pause. Exact signed transactions and reservations are retained to avoid accidentally issuing a conflicting replacement. Insufficient shared backing can hold the whole pool. Restarting does not clear the incident. [P9]
+
+Reconciliation requires an explicit operator review against a fresh chain tip, the exact ledger generation and sufficient funds. The policy does not silently debit unrelated miners or recover losses through a hidden levy on future earnings. The dashboard can expose the hold without publishing private operator notes.
+
+These protections are implemented and internally tested; this edition does not claim they have already been rolled out to the live RC service. Pool decentralization is also an adoption goal, not an accomplished fact: additional independently operated pools improve operator choice, while any pool operator remains responsible for its own policy and deployment.
+
+### 9.4 Nodes, recovery and chain selection
+
+The ledger uses UTXOs, 32-byte x-only secp256k1 public keys and 64-byte BIP340 Schnorr signatures. It checks canonical encodings, signatures, input availability/uniqueness, maturity, value conservation and channel rules. Consensus identifiers and signatures are network-bound and domain-separated. [P4, R2]
+
+The target block interval is 60 seconds. Difficulty uses up to 180 effective header-work records, including startup history; it does not wait for 180 mined blocks before changing. Timestamp rules include a median of the preceding eleven timestamps. Cumulative work is checked with 512-bit arithmetic; a fully validated branch replaces the active chain only when its cumulative work is strictly greater.
+
+The candidate separates its 5x-RC starting difficulty from the easier RC-level floor. The retarget uses the window's average target and a measured time span clamped between one-third and three times the expected span. That clamp is relative to the window average, not necessarily the immediately preceding target. Difficulty changes when blocks arrive; it cannot create missing hashrate or guarantee rapid recovery if block production stops.
+
+Checksummed block logs, deterministic replay, controlled backups and authenticated startup state support recovery. Growing chain history still requires deliberate storage provisioning and retention policy. Pool holdings and already-signed transactions must be reconciled when recovering accounting data; restoring an old directory is not a license to pay the same credit again.
+
+## 10. Evidence that can be inspected
+
+### 10.1 Measured speed, with the measurement boundary intact
+
+| Hardware / date | Measured path | Recorded result |
 |---|---|---|
-| Canonical ledger | Bounded UTXO transactions, Schnorr locks, coinbase, burned fees | Broader public adversarial validation |
-| Monetary policy | Exact five-year decline, split, tail, supply arithmetic | Economic modeling and public governance disclosure |
-| Difficulty | 60-second target, 180-record window, timestamp constraints | Long-running public test data |
-| Fork choice | Validated side branches and strictly greater cumulative work | Scalable branch/state storage |
-| V2 arithmetic | Exact CPU evaluator and witness checks at tiny scale | Optimized production-scale miner and prover |
-| Devnet proof | 177-byte payload, 193-byte standalone frame, plus full tiny replay | Succinct transparent all-layer proof |
-| Model bank | Seedless format, lengths, roots, byte checks | Published 6 GiB artifact, ceremony, PCS, byte-to-PCS link |
-| Matrix sumcheck | Standalone small educational skeleton | Batched GKR, openings, ranges, 128-bit aggregate soundness |
-| Final digest | Fully replayed on tiny profile | In-proof hash, public bytes, or new proof-native digest |
-| CUDA | Tiny arithmetic differential smoke fixture | Independent optimized miner/prover and hardware matrix |
-| P2P | Bounded static private pull plus thin-miner template/submission messages | Authenticated public discovery/gossip and DoS defenses |
-| Storage | Checksummed append, fsync, deterministic replay | Snapshots, pruning, repair, indexing, bounded startup |
-| Mempool | Deterministic capped confirmed-input pool | Fee-burn inclusion/eviction economics and package policy |
-| Pool | Pinned-TLS CMFD job/share transport, server replay, volatile bounded counters | Unique custody, persistent reorg-aware ledger, payouts, optimized proofs and DoS hardening |
-| Wallet | Real Devnet balance, send, receive, solo/pool mine, consolidation | Production custody, backup, recovery, hardware signing |
-| Inference channel | Pricing, signed states/receipts, close/refund accounting | Quote/job transport, execution, discovery, reputation, disputes |
-| Governance | Fixed visible steward/community destinations | Secure multisig, beneficial-owner disclosure, reporting, change process |
-| Audits | Internal tests and review only | Two independent external audits |
+| RTX 5090, earlier V4 baseline | Warm online proof construction only | 6.093 seconds |
+| RTX 5090, same baseline | Mandatory CPU self-verification | 0.311 seconds |
+| RTX 5090, same baseline | Peak proving allocation | 8.080 GiB |
+| RTX 5070 Ti 16 GB, earlier qualification | Complete three-process proof path | 74.294 seconds; CPU verified |
+| RTX 5090, September 21 qualification | Complete winning replay/proof path, first use / warm | 56.409 / 18.557 seconds |
+| Two isolated node instances, September 21 | Normal CPU block admission | 0.365-0.403 seconds in the recorded cases |
 
-The CUDA fixture checks arithmetic only. It consumes CPU-generated mask coefficients rather than independently deriving them from the BLAKE3 challenge, so end-to-end CPU/GPU parity remains an activation requirement.
+The first four rows are historical baselines retained with their original scope. The September 21 complete path includes costs omitted from an online-prover-only number. These are not universal speed promises, average block times or an apples-to-apples hardware ranking. Search time, initialization, artifact authentication, proving, CPU checking and network propagation are distinct stages. [P6, P10]
 
-## 14. Activation roadmap
+The two September 21 full blocks survived node reopen, and CPU-only recovery without startup caches reconstructed the same height, tip and next target. Both node instances were exercised within one test process; this was not a separate-host network rehearsal.
 
-Production ForgeMatrix must remain disabled until all of the following are met:
+On September 24, fresh full proofs from RTX 4090 and RTX 5090 devices passed separate-process cryptographic verification, including the BaseFold Merkle/query-fold checks and final low-degree checks. Other workloads remained active, so those smoke-run elapsed times are not presented as comparative benchmarks. The checks did not submit mainnet blocks. [P6]
 
-1. A frozen specification and canonical vectors cover every field, index order, range, commitment, transcript message, and rejection case.
-2. A transparent PCS is selected, implemented, parameterized without toxic waste, and assigned a canonical wire encoding.
-3. The 6 GiB artifact is produced by a publicly reviewed, auditable ceremony. Entropy sources, transcript, exact resulting bytes, and structural analyses are published without making a short generation seed part of consensus, and the raw bytes are cryptographically linked to the PCS commitment.
-4. GKR/sumcheck binds all 384 layers, all transition/range constraints, both bank boundaries, the virtual input, and the final output.
-5. The final activation digest is proven or independently recomputable within the total payload cap.
-6. Aggregate proof soundness is at least 128 bits, with at least 192 bits of transcript challenge space and a machine-generated union-bound report.
-7. A winning proof is at most 256 KiB, preferably 64 KiB, and verifies in less than 100 ms on a specified ordinary CPU core.
-8. Peak device allocation is no more than 13.5 GiB on named 16 GiB cards.
-9. Winning proof construction is under 10 seconds, preferably under 5 seconds, on named hardware.
-10. Resident execution is at least four times faster than the best valid nonresident or at-most-4-GiB path on every named baseline card.
-11. Two independent implementations reproduce canonical CPU and GPU vectors.
-12. Proof and wire parsers pass fuzzing, malformed-proof, allocation, timeout, and resource-exhaustion testing.
-13. An adversarial public testnet exercises forks, reorgs, restart, model distribution, proof propagation, mixed hardware, and economic attacks.
-14. Two teams independent of the designers complete cryptographic and implementation audits.
+### 10.2 Evidence of an operating release cycle
 
-Public-network readiness additionally requires secure wallet and pool custody,
-authenticated peer design or a documented alternative trust model, persistent
-and reorganization-aware pool payouts, hardened share-proof admission, DDoS and
-eclipse testing, scalable state/storage, operational telemetry, incident
-response, signed releases, and transparent governance of the steward and
-community destinations.
+The RC community pool began operating September 6. A dated September 7 observation recorded 66 pool blocks and 7,836 accepted shares. Those numbers establish an early operational milestone, not current live counters or adoption scale.
 
-## 15. Design alternatives considered
+The published miner.2 comparisons recorded console search rates of 20.285 FW/s on an RTX 4070 Ti SUPER, 27.59 FW/s on an RTX 5070 Ti, and 34.84 FW/s on an RTX 5090 under the documented conditions. The 5090 shared hardware with pool/proof activity. These are search rates, not full proofs per second. Accepted/rejected shares and stale work are necessary companions to console speed. [P1]
 
-### 15.1 Proof of stake
+### 10.3 What this edition does not call complete
 
-Proof of stake would avoid the need to prove a massive matrix computation and would greatly simplify validation economics. It was not selected because the project objective is an open GPU work market with a work-based permissionless issuance path. This is a value choice, not a claim that proof of stake is technically impossible or universally inferior.
+Mainnet publication, production service activation and the exact final-package smoke check are still ahead as of September 24. Native Windows/Linux application rebuilds matched in the recorded internal checks, but complete release reproducibility is not claimed while GPU-worker/package reconciliation remains open. The owner waived the extended six-hour GPU-dropout rehearsal; targeted proof/recovery checks do not substitute for that test.
 
-### 15.2 KAWPOW or another existing GPU hash
+Qualification is internal. Separate verifier processes and a separate verification path provide useful evidence, but are not an external audit or independent organizational reproduction. The selected release-approval policy uses one owner signer. The paper describes implemented controls and observed results without presenting them as an unconditional assurance of security.
 
-An established GPU-oriented hash would reduce research risk. It was not selected because Common Foundry specifically investigates matrix-heavy arithmetic and alignment with inference-class hardware. That choice creates a much higher proof, audit, and benchmarking burden, which the activation gates acknowledge.
+## 11. The next chapter: turn capability into demand
 
-### 15.3 Direct useful-inference consensus
+Common Foundry's launch is a starting point for adoption, not the end of development. The near-term work should make it easier to become a reliable operator: install successfully, authenticate the right inputs, mine accepted work, understand power and latency, recover cleanly and upgrade predictably.
 
-Making customer jobs the block predicate would entangle liveness with external demand, privacy, model availability, runtime determinism, and cheap verification. Common Foundry keeps actual inference in a market layer and uses a fixed public relation for consensus.
+The next product step is paid inference. That means completing the parts a customer actually touches: finding a provider, receiving a quote, funding a job, getting useful output, authorizing progress and settling correctly. A pilot should demonstrate that entire flow before the project claims a working marketplace.
 
-### 15.4 Generic SNARK or STARK over every MAC
+| Next milestone | A meaningful success measure |
+|---|---|
+| Launch execution | Published source/packages, verified shared activation and working mainnet operations |
+| Operator reach | Successful installs and accepted work across documented physical hardware configurations |
+| Network resilience | Measured propagation, recovery, storage growth and multiple independently operated services |
+| Proof efficiency | Lower complete-path latency, propagation cost and resource requirements under unchanged acceptance rules |
+| Inference pilot | Completed customer-funded jobs, useful delivery, correct settlement and repeat usage |
+| Service expansion | Additional providers/models supported by measured reliability and actual customer demand |
 
-A direct circuit or execution trace over 824.6 billion MACs and 201.9 million nonlinear outputs is not a credible base design. Even a linear-time prover would perform enormous field work and materialize impractical traces. Specialized matrix sumcheck exploits algebraic structure; a generic succinct system may later compress the specialized verifier, but should not replace the structured relation with one constraint per operation.
+There is no promised exchange listing, token price, investment return or guaranteed demand in this roadmap. The sales case is the product: a distinctive compute-oriented foundation, a public rule set, working operator software and a credible path into direct GPU services.
 
-### 15.5 Freivalds or sampled rows
+**Your hardware. Your ideas. A place in the Foundry.** Join the community, choose where you can contribute, and help build the inference layer people will want to use.
 
-Probabilistic matrix-product checks are attractive because they reduce verification work, but without commitments and openings they require too much witness data and do not bind every nonlinear transition. Once made noninteractive, committed, and succinct, the design converges toward sumcheck and a PCS. Sampling layers or rows before commitments also permits selective cheating.
+Website: https://commonfoundry.ai/
 
-### 15.6 Trusted-setup polynomial commitments
+Community and launch guidance: https://discord.gg/XGuutqWMWP
 
-A trusted setup may yield smaller or faster proofs, but it creates a ceremony and toxic-waste failure mode at the consensus root. The production requirement therefore prefers transparency even if proofs or proving time are larger.
+## Appendix A. Protocol quick reference
 
-### 15.7 Zero knowledge
+| Parameter | Mainnet candidate / current V4 design |
+|---|---|
+| Source release / mining start | October 2 / October 3, 2026; both 17:00 UTC |
+| Proof geometry | 128 batch rows x 4,096 dimensions x 384 layers |
+| Bank organization | 3 banks x 128 layers |
+| Raw weights / base table | 6,442,450,944 / 524,288 bytes |
+| Base field / extension degree | 2,130,706,433 / 4 |
+| Public final activation | 524,288 canonical fields; 2,097,152 bytes |
+| Transparent proof | 12,025,320 bytes |
+| Proof frame / block frame caps | 13 MiB / 16 MiB |
+| Transaction frame / per-transaction inputs and outputs | 64 KiB / 128 each |
+| Block transaction / aggregate input / aggregate output caps | 1,024 / 4,096 / 4,096 |
+| Block signature-check cap | 2,048 |
+| Target spacing / retarget history | 60 seconds / up to 180 records |
+| Initial difficulty / easiest floor | 5x RC / 1x RC |
+| Miner coinbase maturity | 100 blocks |
+| CMFD precision | 100,000,000 atoms per CMFD |
+| Bootstrap / tail start height | 2,628,000 blocks / 2,628,001 |
+| Initial subsidy / miner-only tail | 500 CMFD / 5 CMFD per block |
+| Bootstrap distribution | 70% miner, 25% stewardship, 5% community; integer remainder to miner |
+| Minimum non-coinbase fee burn | 0.1 CMFD |
+| Launch beacon | Pinned quicknet round 32,747,812 |
+| Release authorization | One owner signer; internal qualification |
 
-Mining uses public models, public block data, and a public relation. Hiding the witness brings little consensus value and adds complexity. The proposed proof targets integrity and succinctness, not confidentiality. Customer inference privacy belongs in the separate service protocol and execution environment.
-
-### 15.8 Fee payment to miners
-
-Paying fees to miners creates a conventional inclusion market and may strengthen security revenue. The current design instead burns every fee to make issuance and service usage mechanically distinct and to offset the permanent tail. This choice leaves transaction inclusion incentives as an explicit research risk.
-
-## 16. Conclusion
-
-Common Foundry proposes a clear separation of concerns. A fixed, deterministic matrix relation secures ledger ordering. The proposed market would let customers and GPU providers negotiate real inference independently and settle bounded exposure through cumulative payment channels. A visible five-year funding stream supports miners, stewardship, and community work; all usage fees are burned; a miner-only tail sustains long-run proof-of-work issuance.
-
-The current Devnet demonstrates that these components can be made concrete
-enough to test: canonical encoding, network-bound signatures, exact v2
-arithmetic, chain-derived targets, cumulative-work reorganization, durable
-replay, deterministic mempool behavior, real fee burning, channel settlement
-accounting, miner UTXO consolidation, and pinned-TLS nonce-only pool shares with
-server recomputation all execute today at research scale.
-
-The most important work is unfinished. Production needs a transparent succinct
-proof for the entire 384-layer relation, a published and linked seedless model
-bank, a sound final-digest construction, optimized independent miners and
-provers, evidence across low- and high-memory hardware, public-network
-hardening, secure custody, durable pool payouts and share-proof DoS defenses,
-marketplace transport, governance disclosure, and external audits.
-
-That honesty is part of the design. Common Foundry should become valuable only after its central claims are independently demonstrated, not because a white paper treats proposals as facts.
-
-## Appendix A. Consensus parameter summary
-
-| Category | Parameter | Current or proposed value |
-|---|---|---:|
-| Currency | Atomic units per CMFD | 100,000,000 |
-| Timing | Target block interval | 60 seconds |
-| Timing | Difficulty window | Up to 180 records |
-| Timing | Median-time-past window | 11 timestamps |
-| Timing | Maximum future offset | 24 hours |
-| Rewards | Initial subsidy | 500 CMFD |
-| Rewards | Bootstrap length | 2,628,000 blocks |
-| Rewards | Tail start | Height 2,628,001 |
-| Rewards | Tail subsidy | 5 CMFD, miner only |
-| Rewards | Pre-tail miner allocation | Remainder after 25% and 5% floors, about 70% |
-| Rewards | Pre-tail steward allocation | 25% |
-| Rewards | Pre-tail community allocation | 5% |
-| Rewards | Miner maturity | 100 blocks |
-| Rewards | Steward/community delay | None; usable from a later block |
-| Fees | Ordinary transaction fees | Burned |
-| Fees | Channel close fee | Burned |
-| Ledger | Maximum block frame | 1 MiB |
-| Ledger | Maximum transaction frame | 64 KiB |
-| Ledger | Maximum proof frame | 256 KiB |
-| Ledger | Transactions per block | 1,024 |
-| Ledger | Inputs/outputs per transaction | 128 / 128 |
-| Ledger | Signature checks per block | 2,048 |
-| Devnet PoW | V2 batch/dimension/layers | 2 / 4 / 4 |
-| Devnet pool | Protocol / transport | CMFD pool v1 / TLS 1.3, exact leaf pin |
-| Devnet pool | Default address | `127.0.0.1:18445` |
-| Devnet pool | Maximum framed message | 16 KiB |
-| Devnet pool | Connections / messages per session | 64 / 1,000,000 |
-| Devnet pool | Valid nonce records per job | 65,536 |
-| Devnet pool | Recent session / payout-label records | 1,024 / 1,024 |
-| Devnet pool | Default share threshold | 7 leading zero bits |
-| Devnet pool | Accounting | Bounded in-memory test counters; no payout |
-| Proposed PoW | V2 batch/dimension/layers | 128 / 4,096 / 384 |
-| Proposed PoW | Raw model bank | 6 GiB weights + 512 KiB base + 184-byte header |
-| Proposed proof | Aggregate soundness | At least 128 bits |
-| Proposed proof | Challenge space | At least 192 bits |
-
-## Appendix B. Domain separation and binding checklist
-
-Most protocol hashes are domain-separated. Two specified exceptions are the plain-BLAKE3 raw payload root and individual layer roots; their aggregate and manifest are domain-separated. A production freeze must inventory every tag and canonical byte sequence. At minimum, the following objects require independent domains:
-
-- transaction signing messages;
-- transaction identifiers;
-- coinbase identifiers;
-- Merkle leaves and internal nodes;
-- block identifiers;
-- model manifest roots;
-- layer-root aggregation;
-- ForgeMatrix challenge;
-- mask-coefficient expansion;
-- final activation digest;
-- work digest;
-- proof transcript;
-- node storage-record checksums;
-- network consensus fingerprint;
-- Devnet pool job identifiers;
-- inference channel identifiers, states, receipts, and transaction-contained settlement or refund paths.
-
-Every challenge-dependent proof step must absorb the public inputs, prior commitments, the current claim, and the prover message before deriving its next challenge. Network identity must be present inside canonical objects, not inferred solely from a short transport magic.
-
-## Appendix C. Production proof checklist
-
-A production verifier must reject if any of these are missing or malformed:
-
-1. exact network, algorithm, proof, model, and PCS versions;
-2. exact manifest, raw root, PCS parameter digest, and PCS root;
-3. exact parent, transaction root, height, timestamp, target, and nonce;
-4. canonical commitments to all witness banks;
-5. full matrix-product claims for every layer;
-6. virtual-input transition;
-7. signed accumulator bounds and canonical signed-to-prime encoding;
-8. both cubic quotient/remainder relations and all ranges;
-9. reduction to `0..250` and centered successor encoding;
-10. successor wiring within and across all three banks;
-11. terminal linkage to the final activation;
-12. cryptographic binding of final activation to the work digest;
-13. work digest at or below the independently derived target;
-14. canonical transcript and proof encoding with no trailing data;
-15. proof size, allocation, round-count, and verification-work caps.
-
-## Appendix D. Inference-channel state machine
+### Retarget arithmetic
 
 ```text
-UNFUNDED
-   |
-   | on-chain output with channel-ID commitment and exact deposit
-   v
-FUNDED
-   |
-   | customer signs cumulative authorization
-   v
-AUTHORIZED <------------------------------+
-   |                                      |
-   | provider streams chunk               |
-   v                                      |
-DELIVERED                                 |
-   |                                      |
-   | provider signs receipt               |
-   v                                      |
-RECEIPTED                                 |
-   | customer verifies and signs next ----+
-   |
-   +--> provider settles chosen signed state, normally newest --> SETTLED
-   |
-   +--> timeout reached, customer refund -> REFUNDED
-
-SETTLED and REFUNDED both retire the channel identifier.
-Both burn the exact close fee.
+average_target = floor(sum(T_i) / Nw)
+expected_span  = (Nw - 1) * 60
+actual_span    = clamp(t_last - t_first,
+                       expected_span / 3, 3 * expected_span)
+next_target    = min(pow_limit,
+                    max(1, floor(average_target * actual_span
+                                 / expected_span)))
+work(T)        = floor(2^256 / (T + 1))
 ```
 
-The funding output contains the exact deposit and a `channel_id` commitment. Full terms are supplied and checked when the output is spent in a settlement or refund witness, and they must hash back to that identifier.
+The formula applies when the selected history contains at least two records. With a single history record, its target is retained subject to the easiest-target cap. Targets use inclusive comparison. The normative implementation, not this explanatory table, defines all edge cases and encoding details.
 
-## Appendix E. References
+## Appendix B. Evidence and technical references
 
-1. Satoshi Nakamoto, *Bitcoin: A Peer-to-Peer Electronic Cash System*, 2008. https://bitcoin.org/bitcoin.pdf
-2. Shafi Goldwasser, Yael Tauman Kalai, and Guy N. Rothblum, *Delegating Computation: Interactive Proofs for Muggles*, STOC 2008. https://www.microsoft.com/en-us/research/wp-content/uploads/2016/12/2008-DelegatingComputation.pdf
-3. Justin Thaler, *The Unreasonable Power of the Sum-Check Protocol*, 2022. https://people.cs.georgetown.edu/jthaler/blogpost.pdf
-4. Tianyi Liu, Xiang Xie, and Yupeng Zhang, *zkCNN: Zero Knowledge Proofs for Convolutional Neural Network Predictions and Accuracy*, CCS 2021. https://eprint.iacr.org/2021/673.pdf
-5. Eli Ben-Sasson et al., *Scalable, Transparent, and Post-Quantum Secure Computational Integrity*, 2018. https://eprint.iacr.org/2018/046.pdf
-6. Alexander Golovnev, Jonathan Lee, Srinath Setty, Justin Thaler, and Riad S. Wahby, *Brakedown: Linear-time and field-agnostic SNARKs for R1CS*, 2021. https://eprint.iacr.org/2021/1043.pdf
-7. Bitcoin Improvement Proposal 340, *Schnorr Signatures for secp256k1*. https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki
-8. BLAKE3 team, *BLAKE3 Specification*. https://github.com/BLAKE3-team/BLAKE3-specs
-9. Srinath Setty, *Nova: Recursive Zero-Knowledge Arguments from Folding Schemes*, 2021. https://eprint.iacr.org/2021/370.pdf
-10. Common Foundry source and specifications, research prerelease `v0.1.0-devnet.10`; the annotated Git tag identifies the exact source commit.
+This edition was checked against the private launch-candidate source at commit `a8b23ec66a5a9f42bd2821408b6b9a886cffd392`, with proof-qualification evidence for the reviewed `fd319a9` source. The candidate source is scheduled to become public with the October 2 release. File references below identify the implementation evidence; they do not imply those private source files are already publicly accessible.
 
-## Appendix F. Non-claims
+**P1. Distributed RC software and performance.** Common Foundry RC5 and miner.2 release notes; Windows/Linux setup, pool search, accepted-share observations and measurement conditions. https://github.com/JustAResearcher/CommonFoundry-Binaries/releases
 
-For avoidance of doubt, this paper does not claim that:
+**P2. Work and block binding.** `docs/consensus/production-v4-core-spec-v1.md`, its canonical vector, and `crates/cmfd-consensus/src/forgematrix_v4.rs`. Exact challenge, final-activation, work and statement digest preimages; proof/artifact identity.
 
-- physical GPU use or VRAM residency can be proven by the current protocol;
-- a 16 GiB card is a consensus requirement;
-- lower-memory cards cannot mine;
-- ForgeMatrix mining performs paid customer inference;
-- the current compact Devnet proof is succinct;
-- the current toy sumcheck is production-sound;
-- the manifest's PCS fields are a working deployed polynomial commitment;
-- the CUDA fixture is an optimized miner or prover, or independently rederives the BLAKE3 challenge-to-mask coefficients;
-- the 6 GiB model is mathematically incompressible;
-- inference receipts prove model correctness;
-- Devnet pool credits are spendable rewards, a debt, or an on-chain balance;
-- the pinned pool server certificate authenticates workers or Devnet P2P peers;
-- the steward or community destinations are decentralized merely because they are named funds;
-- the private Devnet, its unencrypted test wallet, or an unsigned prerelease is suitable for value;
-- mainnet is ready.
+**P3. Proof algebra and codec.** `docs/consensus/production-v4-proof-algebra-v1.md`, `production-v4-message-order-v1.json`, and the candidate's prover/verifier implementations. The BaseFold dependency revision is `92b8eabaea9ab7306da5826caa700adabf7445ba`.
+
+**P4. Monetary and ledger rules.** `crates/cmfd-consensus/src/economics.rs`, `difficulty.rs`, `network.rs`, and chain validation. The mainnet release configuration fixes both target values and the two reward destinations.
+
+**P5. Service settlement.** `crates/cmfd-marketplace`, consensus channel-lock validation, and `docs/marketplace/payment-channels.md`. Implementation state takes precedence over older planning language in historical notes.
+
+**P6. September qualification.** Internal September 24 full-proof smoke records for SM89/RTX 4090 and SM120/RTX 5090, separate-process verification reports, and nine-case `FRESH-PROOF-ADVERSARIAL-CHECKS.json`. These records explicitly declare internal verification, not external audit, mainnet authorization or a comparative benchmark. Final-activation bytes agreed across the two devices; both full proofs were 12,025,320 bytes.
+
+**P7. Mainnet launch identity.** `docs/mainnet-readiness.md`, `docs/mainnet-target-binding-v2.md`, the compiled mainnet release configuration, launch-plan parsing and launch-helper implementation. Historical notes can retain older pending states; the exact frozen source and signed release material govern the launch candidate.
+
+**P8. Wallet and distribution.** `docs/wallet-custody.md`, wallet security implementation and release-integrity tooling. Argon2id/XChaCha20-Poly1305 wallet format, authenticated backup metadata, prelaunch preparation and no-overwrite restore.
+
+**P9. Pool reorganization protection.** `docs/pool-deep-reorg-policy.md` and shared node/pool accounting implementation and tests. Source implementation is distinguished from live deployment.
+
+**P10. Performance boundaries and recovery.** Earlier V4 qualification baselines and `docs/mainnet-5x-live-qualification-20260921.md`. Two complete proof/block paths, CPU node admission, reopened state and CPU-only cold recovery; the original scope limitations are retained.
+
+**R1. BaseFold.** BaseFold: Efficient Field-Agnostic Polynomial Commitment Schemes from Foldable Codes. Primary research paper: https://eprint.iacr.org/2023/1705
+
+**R2. Schnorr and hashing primitives.** BIP340 Schnorr signatures: https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki . BLAKE3 official implementation and specification links: https://github.com/BLAKE3-team/BLAKE3
+
+**R3. Launch beacon.** drand protocol specification and security model: https://docs.drand.love/docs/specification/ and https://docs.drand.love/docs/security-model/ . Common Foundry pins its chain, key, round and verification scheme rather than accepting relay-selected identities.
+
+The technical contribution is a specialized composition and an operating software stack. Public implementation, reproducible measurements, useful operator participation and completed service flows are how the project should continue earning confidence.

@@ -1,5 +1,24 @@
 # Preparing the two mainnet reward wallets
 
+## Current owner custody after the September 27 replacement
+
+The owner retained the Steward key/address and replaced the inaccessible
+Community key before mainnet launch. The replacement backups were authenticated
+with their new passwords; the same Steward secret was encrypted for the new
+address-bound network. Older encrypted backups are preserved, not overwritten.
+
+- Steward: `5321229f3d3e3fccb900f95c7baee2b27a929afe70f95a0bde0394dba79c9684`
+- Community: `fbe36f76cad922c1c911d8cecc2eed21c853d10fb99e450fc14ac7e54bf59a3f`
+- Plan: `2133726558490606e89a8fe3499f32c9a35722ed0022e09b7cd1cd30239d04af`
+- Network: `88296bc39c10e8bc1dd4818d4d42412fe5f08210651110377f495da299812f62`
+
+The updated public records are in `packaging/mainnet`. An encrypted replacement
+archive was verified on the PC and AI01; this is off-host retention, not a claim
+of offline physical storage. The September 23 section below is historical and
+its old Community address/plan must not be used for the replacement release.
+
+## Preparation procedure
+
 The owner controls both destinations: **steward** and **community**. They must
 be different keys. Neither an RC receiving address nor a test fixture is selected
 automatically.

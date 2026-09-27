@@ -471,11 +471,11 @@ class CommittedOwnerPlanTests(unittest.TestCase):
 
     def test_owner_plan_identity_and_approved_parameters(self):
         self.assertEqual(hashlib.sha256(self.plan_bytes).hexdigest(),
-                         "1dfcdfbb6739f10051f6325a3d884997cd65b468cc3594f7b03a9c83d42f3db7")
+                         "f0f9cd3921162734cdc5aa8da1b59f9835a1e6f6270bf3794d60c0ad62a70a77")
         self.assertEqual(self.plan["launch_plan_digest"],
-                         "6c839b274f6385e7f4040a715436b739612527f29bfa9bdf5d2f89de1f440b52")
+                         "2133726558490606e89a8fe3499f32c9a35722ed0022e09b7cd1cd30239d04af")
         self.assertEqual(self.plan["network_id"],
-                         "4c128b19b8f663067cca1905f40993cfdbe7a4462f00b0a062d3f68d578175ec")
+                         "88296bc39c10e8bc1dd4818d4d42412fe5f08210651110377f495da299812f62")
         payload = self.plan["payload"]
         self.assertEqual(payload["initial_target"],
                          "000ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccb")
@@ -505,8 +505,21 @@ class CommittedOwnerPlanTests(unittest.TestCase):
                          signer_identity=trust["producer"]["signer_identity"], role="producer")}
         self.assertEqual(authority, trust["producer"])
         self.assertEqual(authority["key_blob_sha256"],
-                         "8617d5ff83395c32f684bcde5f4abf20c091e1f8d2ab929bf018cc0bf663f7a4")
+                         "700d53b1ff212ffa710d5e56a4e13788f5b76f8b83428b2ed5d3a1fffe1afdf9")
         packages.nonzero_hex(trust["ssh_keygen_sha256"], 64, "mainnet SSH verifier digest")
+
+    def test_release_instructions_match_selected_signer_and_complete_inventory(self):
+        trust = packages.strict_json((self.root / "APPROVAL-TRUST.json").read_bytes(),
+                                     "mainnet owner trust")
+        fingerprint = trust["producer"]["key_fingerprint"]
+        instructions = (self.repo / "docs/mainnet-release-verification.md").read_text()
+        guide = (self.root / "USER-GUIDE.md").read_text()
+        self.assertIn(fingerprint, instructions)
+        self.assertIn(fingerprint, guide)
+        self.assertIn(hashlib.sha256((self.root / "MAINNET-RELEASE.allowed_signers").read_bytes()).hexdigest(),
+                      instructions)
+        self.assertIn("five archives", instructions)
+        self.assertNotIn("including the four archives", instructions)
 
     def test_custody_record_is_public_only_and_matches_each_plan_role(self):
         data = (self.root / "REWARD-CUSTODY.json").read_bytes()

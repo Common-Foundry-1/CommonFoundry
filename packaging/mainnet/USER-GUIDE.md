@@ -10,7 +10,7 @@ The published source includes `docs/mainnet-release-verification.md` and the
 release checksum policy `packaging/mainnet/MAINNET-RELEASE.allowed_signers`.
 Check that policy's Ed25519 fingerprint independently before using its
 `verify-download` procedure on the complete release directory. The expected
-fingerprint is `SHA256:hhfV/4M5XDL2hLzeX0q/IMCR4fjSq5Kb8BjMC/Zj96Q`.
+fingerprint is `SHA256:cA1Tsf8hL/pxDV5WpOE3iPW3b4uDQosu1dOh//4a/fk`.
 The embedded MAINNET-PACKAGE.json records the producer's package inventory and
 native identity checks; it is not an independent approval or a signature.
 production-mainnet/MAINNET-APPROVALS.json identifies the plan-review records

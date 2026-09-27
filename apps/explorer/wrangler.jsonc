@@ -31,7 +31,7 @@
       "vars": {
         "EXPLORER_ORIGIN": "https://mainnet-explorer-origin.commonfoundry.ai",
         "EXPLORER_NETWORK": "mainnet",
-        "EXPLORER_EXPECTED_NETWORK_ID": "4c128b19b8f663067cca1905f40993cfdbe7a4462f00b0a062d3f68d578175ec"
+        "EXPLORER_EXPECTED_NETWORK_ID": "88296bc39c10e8bc1dd4818d4d42412fe5f08210651110377f495da299812f62"
       },
       "assets": {
         "directory": "./dist-mainnet",

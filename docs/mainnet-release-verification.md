@@ -11,23 +11,26 @@ Ed25519 key under the `commonfoundry-release` OpenSSH signature namespace. Its
 approved public-key fingerprint is:
 
 ```text
-SHA256:hhfV/4M5XDL2hLzeX0q/IMCR4fjSq5Kb8BjMC/Zj96Q
+SHA256:cA1Tsf8hL/pxDV5WpOE3iPW3b4uDQosu1dOh//4a/fk
 ```
 
 The source tree carries the corresponding public policy at
 `packaging/mainnet/MAINNET-RELEASE.allowed_signers`. Its SHA-256 is
-`49c382f071a5f04f12c86f98ce1f0d3a24c2cc14b3c294f19704220b254b3a7e`.
+`9c5be92681092801d89687823837823d0966055c03a84e64551e26387da179d2`.
 This policy is for release checksums; the separate
 `MAINNET-PRODUCER.allowed_signers` policy uses a different namespace for plan
 approval. Neither policy contains a private key.
 
-The selected public key is published at
+Obtain the independently published release policy from
 [commonfoundry.ai/mainnet-release-key.txt](https://commonfoundry.ai/mainnet-release-key.txt),
-separately from the package download. On September 25, 2026, the fetched file's
-SHA-256 was `49c382f071a5f04f12c86f98ce1f0d3a24c2cc14b3c294f19704220b254b3a7e`,
-matching this source policy byte for byte. Obtain and check the fingerprint from
-that official site **before** trusting the download page, and check it again at
-release time. A key file, fingerprint, or checksum supplied only beside the
+separately from the package download, and require the fingerprint and policy
+hash above to match. The owner replaced the previous pending mainnet signer
+before the first mainnet release; the inaccessible old key did not cross-sign
+the replacement. An earlier website verification is not evidence for this key.
+The official endpoint must be updated and independently verified before the
+replacement release can be published. If it still serves a different key, stop.
+Check the fingerprint **before** trusting the download page and again at release
+time. A key file, fingerprint, or checksum supplied only beside the
 packages cannot by itself authenticate that same package set. Stop if the
 independently published fingerprint, this source policy, or the final release
 disagree.
@@ -35,7 +38,8 @@ disagree.
 ## Verify the complete downloaded directory
 
 Keep all files from the one `1.0.0` release together in a new directory,
-including the four archives, `SHA256SUMS.txt`, `SHA256SUMS.txt.sig`, and the
+including the five archives (Windows/Linux runtime and miner, plus HiveOS),
+`SHA256SUMS.txt`, `SHA256SUMS.txt.sig`, and the
 release metadata. Use Python 3.11 or newer and the pinned dependencies in
 `scripts/requirements-release-integrity.txt` from the published source. From
 that source checkout, run one of these commands with an independently checked

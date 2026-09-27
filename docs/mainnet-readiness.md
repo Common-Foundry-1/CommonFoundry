@@ -1,5 +1,18 @@
 # October 3 mainnet readiness
 
+## September 27 owner replacement supersedes earlier identity checkpoints
+
+The owner retained the Steward address and replaced the Community and release
+signing keys before publication. The current public plan/trust records are in
+`packaging/mainnet`; the updated custody and signing instructions are in
+[mainnet-reward-custody.md](mainnet-reward-custody.md) and
+[mainnet-release-verification.md](mainnet-release-verification.md).
+
+Earlier dated checkpoints below retain their original historical identities.
+They are not authorization to publish or activate the superseded release.
+Publication, startup, explorer switching and operational backups remain held
+until the replacement release and its deployed bindings pass their checks.
+
 ## Fixed schedule
 
 - Source and matching packages: **2026-10-02 17:00:00 UTC**, noon CDT.

@@ -2,7 +2,8 @@
 
 The additive [transaction and address query contract](../docs/exchange-integration-queries.md)
 documents `getrawtransaction`, `gettransaction`, `getaddressbalance`, and
-`getbalance`, including confirmations, reorganization handling, and atom units.
+`getbalance`, and `getaddressutxos`, including confirmations, reorganization
+handling, atom units, and spendable-output pagination.
 
 Status: **integration preview**. This kit describes the RPC implemented by the
 current pre-release source. It is not a production-custody certification,

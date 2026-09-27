@@ -7,10 +7,22 @@
     "Authenticated JSON-RPC failures return HTTP 200.",
     "The ordered pair (error.code, error.data.code) is the routing key; each pair has one handling rule.",
     "Messages are diagnostic text and are not routing keys.",
-    "retryable=true authorizes only an unchanged retry after the transient condition clears.",
+    "retryable=true authorizes an unchanged retry after the transient condition clears, except utxo_snapshot_changed which requires restarting pagination without a cursor.",
     "Underlying node failures not reachable in an ordinary exchange workflow may retain their NodeError client code and map to -32603."
   ],
   "groups": [
+    {
+      "scope": [
+        "getaddressutxos"
+      ],
+      "jsonrpc_code": -32022,
+      "retryable": true,
+      "data_codes": [
+        "utxo_snapshot_changed"
+      ],
+      "meaning": "The chain tip or available outputs changed between UTXO pages.",
+      "action": "Discard the prior pages and restart the read without a cursor; do not retry the stale cursor or automatically broadcast."
+    },
     {
       "scope": [
         "gettransaction",

@@ -73,6 +73,40 @@ Confirmed balance does not subtract pending spends. `available_atoms` does,
 and excludes pending incoming outputs. The query does not count inference
 channel locks as key address balances. It never returns node wallet keys.
 
+## Spendable outputs
+
+`getaddressutxos [destination_hex, limit=1000, cursor=null]` returns the confirmed
+key outputs currently available to spend at the next block height. The address
+format is the same as `getaddressbalance`. Immature outputs, inputs spent by
+local mempool transactions, and withdrawal reservations are excluded. Pending
+incoming outputs are not included. Calling this method does not reserve coins.
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"getaddressutxos","params":["<64-character-destination-public-key>"]}
+```
+
+The `utxos` array contains `txid`, `vout`, `value_atoms`, `spendable_height`,
+`lock_type` (`key`), and `destination_hex`. Use `txid` and `vout` for transaction
+inputs, and read `value_atoms` as a decimal integer string. Amounts use the same
+atom unit as balances. Outputs are sorted by txid bytes, then output index.
+
+The response also includes `network_id`, `bestblock`, `height`, `snapshot`,
+`total_utxos`, `returned_utxos`, `available_atoms`, `has_more`, `next_cursor`, and
+`mempool_scope`. `available_atoms` is the sum across all available outputs,
+including pages not yet returned. It equals `getbalance.available_atoms` when
+both calls observe the same chain and local pending/reservation state.
+
+`limit` must be from 1 to 1,000. When `has_more` is true, pass the returned
+`next_cursor` object as the third parameter to get the next page. The cursor
+contains `snapshot`, `txid`, and `vout`; pass it unchanged. An empty address
+returns an empty array, zero total/amount, `has_more:false`, and `next_cursor:null`.
+
+If the chain tip or available outputs change between pages, the method returns
+-32022 / `utxo_snapshot_changed`. Discard those pages and start again without a
+cursor. Invalid parameters or a cursor outpoint absent from an otherwise
+matching snapshot return -32602 / `invalid_params`. A listing is an observation;
+transaction submission still checks that its inputs remain spendable.
+
 ## Restricted remote deployment
 
 The native exchange listener remains loopback-only and Basic authenticated.

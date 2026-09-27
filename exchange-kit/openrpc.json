@@ -230,6 +230,65 @@
       ]
     },
     {
+      "name": "getaddressutxos",
+      "summary": "List confirmed key outputs currently available to spend",
+      "description": "Excludes immature outputs, local pending spends and withdrawal reservations. Returns atom strings. Pagination is tied to the chain tip and available outputs; restart without a cursor on utxo_snapshot_changed.",
+      "paramStructure": "by-position",
+      "params": [
+        {
+          "name": "destination_hex",
+          "required": true,
+          "schema": {
+            "$ref": "./schemas/exchange-rpc.schema.json#/$defs/Hash32"
+          }
+        },
+        {
+          "name": "limit",
+          "required": false,
+          "schema": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000,
+            "default": 1000
+          }
+        },
+        {
+          "name": "cursor",
+          "required": false,
+          "schema": {
+            "oneOf": [
+              {
+                "$ref": "./schemas/exchange-rpc.schema.json#/$defs/UtxoCursor"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "./schemas/exchange-rpc.schema.json#/$defs/AddressUtxos"
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/InvalidParams"
+        },
+        {
+          "$ref": "#/components/errors/InternalError"
+        }
+      ],
+      "tags": [
+        {
+          "name": "chain"
+        }
+      ]
+    },
+    {
       "name": "getaddressbalance",
       "summary": "Read explicit key destination balances in integer atom strings",
       "description": "Required 32-byte x-only destination. Returns confirmed, mature, available, immature and local mempool components. One CMFD is 100000000 atoms. No implicit wallet query.",

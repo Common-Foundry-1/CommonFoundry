@@ -38,7 +38,9 @@ use crate::exchange_index::{
     MAX_WATCH_REGISTRATION_BATCH, RegisterWatchDestinationResult, RegisterWatchDestinationsResult,
     WatchDestinationRegistration, WatchDestinationView,
 };
-use crate::exchange_queries::{QueryError, TransactionBody, address_balance};
+use crate::exchange_queries::{
+    MAX_UTXO_PAGE, QueryError, TransactionBody, UtxoCursor, address_balance, address_utxos,
+};
 use crate::exchange_withdrawal::{
     ExchangeWithdrawalError, ExchangeWithdrawalJournal, WithdrawalJournalAnchor,
     WithdrawalJournalInfo, WithdrawalRequest, WithdrawalView,
@@ -1626,6 +1628,7 @@ fn route_get_exchange_info(
                 "getrawtransaction",
                 "gettransaction",
                 "getaddressbalance",
+                "getaddressutxos",
                 "getbalance",
                 "getrawmempool",
                 "sendrawtransaction",
@@ -1831,6 +1834,7 @@ fn route_method(
             Ok(json!(hex::encode(block_id)))
         }
         "getblock" => route_getblock(node, params),
+        "getaddressutxos" => route_get_address_utxos(node, params),
         "getaddressbalance" | "getbalance" => {
             require_parameter_count(params, 1, 1)?;
             let destination = hash_parameter(&params[0], "destination_hex")?;
@@ -1908,7 +1912,57 @@ fn query_fault(error: QueryError) -> RpcFault {
             data_code: "transaction_query_capacity",
             retryable: false,
         },
+        QueryError::UtxoSnapshotChanged => RpcFault {
+            code: -32022,
+            message: "available outputs changed; restart UTXO pagination without a cursor".into(),
+            data_code: "utxo_snapshot_changed",
+            retryable: true,
+        },
+        QueryError::InvalidUtxoCursor => {
+            RpcFault::invalid_params("cursor outpoint is not in this UTXO snapshot")
+        }
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UtxoCursorParameter {
+    snapshot: String,
+    txid: String,
+    vout: u32,
+}
+
+fn route_get_address_utxos(node: &Node, params: &[Value]) -> Result<Value, RpcFault> {
+    require_parameter_count(params, 1, 3)?;
+    let destination = hash_parameter(&params[0], "destination_hex")?;
+    k256::schnorr::VerifyingKey::from_bytes(&destination).map_err(|_| {
+        RpcFault::invalid_params("destination_hex must encode a valid x-only secp256k1 key")
+    })?;
+    let limit = match params.get(1) {
+        Some(value) => usize::try_from(unsigned_integer(value, "limit")?)
+            .map_err(|_| RpcFault::invalid_params("limit must be between 1 and 1000"))?,
+        None => MAX_UTXO_PAGE,
+    };
+    if !(1..=MAX_UTXO_PAGE).contains(&limit) {
+        return Err(RpcFault::invalid_params("limit must be between 1 and 1000"));
+    }
+    let cursor = match params.get(2) {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let parameter: UtxoCursorParameter =
+                serde_json::from_value(value.clone()).map_err(|_| {
+                    RpcFault::invalid_params("cursor must contain snapshot, txid, and vout")
+                })?;
+            Some(UtxoCursor {
+                snapshot: hash_parameter(&json!(parameter.snapshot), "cursor snapshot")?,
+                after: cmfd_consensus::OutPoint {
+                    txid: hash_parameter(&json!(parameter.txid), "cursor txid")?,
+                    index: parameter.vout,
+                },
+            })
+        }
+    };
+    address_utxos(node, destination, limit, cursor).map_err(query_fault)
 }
 
 fn route_get_transaction(
@@ -4024,6 +4078,14 @@ mod tests {
             ExchangeDepositIndex::open_and_sync(&shared).unwrap(),
         ));
         let old_id = hex::encode(old.coinbase_outpoint_id());
+        let steward = hex::encode(DEVNET_PROFILE.rewards.steward);
+        let old_utxos = shared_call(
+            json!({"jsonrpc":"2.0","id":"utxos-before","method":"getaddressutxos","params":[steward]}),
+            &shared,
+            &index,
+        );
+        assert_eq!(old_utxos["result"]["total_utxos"], 1);
+        assert_eq!(old_utxos["result"]["utxos"][0]["txid"], old_id);
         assert_eq!(
             shared_call(
                 json!({"jsonrpc":"2.0","id":1,"method":"gettransaction","params":[old_id]}),
@@ -4065,6 +4127,19 @@ mod tests {
         assert_eq!(side["result"]["confirmations"], -1);
         assert_eq!(side["result"]["active"], false);
         assert_eq!(side["result"]["status"], "inactive");
+        let replacement_utxos = shared_call(
+            json!({"jsonrpc":"2.0","id":"utxos-after","method":"getaddressutxos","params":[steward]}),
+            &shared,
+            &index,
+        );
+        assert_eq!(replacement_utxos["result"]["total_utxos"], 3);
+        assert!(
+            !replacement_utxos["result"]["utxos"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|output| output["txid"] == old_id)
+        );
         assert_eq!(
             shared_call(
                 json!({"jsonrpc":"2.0","id":4,"method":"getbalance","params":[hex::encode(destination)]}),
@@ -4078,6 +4153,213 @@ mod tests {
         drop(fork);
         fs::remove_dir_all(directory).unwrap();
         fs::remove_dir_all(fork_directory).unwrap();
+    }
+
+    #[test]
+    fn address_utxos_builds_a_signed_spend_and_pages_consistently() {
+        use cmfd_consensus::{OutPoint, TRANSACTION_VERSION, TxInput};
+        let directory = test_directory("address-utxos");
+        let mut node = Node::open_with_profile(&directory, DEVNET_PROFILE).unwrap();
+        let destination = node.wallet_destination();
+        let address = hex::encode(destination);
+        for height in 1..=103 {
+            node.mine_once(
+                destination,
+                DEVNET_PROFILE.virtual_genesis_timestamp + height * 60,
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        }
+        let query = |node: &mut Node, params: Value| {
+            call(
+                json!({
+                    "jsonrpc":"2.0","id":1,"method":"getaddressutxos","params":params
+                }),
+                node,
+            )
+        };
+        let all = query(&mut node, json!([address]));
+        assert_eq!(all["result"]["total_utxos"], 4);
+        assert_eq!(all["result"]["returned_utxos"], 4);
+        assert_eq!(all["result"]["has_more"], false);
+        assert!(all["result"]["next_cursor"].is_null());
+        let balance = call(
+            json!({"jsonrpc":"2.0","id":2,"method":"getbalance","params":[address]}),
+            &mut node,
+        );
+        assert_eq!(
+            all["result"]["available_atoms"],
+            balance["result"]["available_atoms"]
+        );
+        let page_one = query(&mut node, json!([address, 1]));
+        let mut pages = page_one["result"]["utxos"].as_array().unwrap().clone();
+        let mut cursor = page_one["result"]["next_cursor"].clone();
+        while !cursor.is_null() {
+            let page = query(&mut node, json!([address, 1, cursor]));
+            assert_eq!(page["result"]["snapshot"], all["result"]["snapshot"]);
+            assert_eq!(page["result"]["total_utxos"], 4);
+            pages.extend(page["result"]["utxos"].as_array().unwrap().clone());
+            cursor = page["result"]["next_cursor"].clone();
+        }
+        assert_eq!(pages, *all["result"]["utxos"].as_array().unwrap());
+
+        // Construct and sign using only RPC output fields and the sender's key.
+        let selected = &pages[0];
+        let previous = OutPoint {
+            txid: hex::decode(selected["txid"].as_str().unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            index: selected["vout"].as_u64().unwrap() as u32,
+        };
+        let value = selected["value_atoms"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        let mut transaction = Transaction {
+            network_id: DEVNET_PROFILE.network_id,
+            version: TRANSACTION_VERSION,
+            inputs: vec![TxInput {
+                previous,
+                witness: InputWitness::Key {
+                    public_key: [0; 32],
+                    signature: Vec::new(),
+                },
+            }],
+            outputs: vec![TxOutput {
+                value: value - 1,
+                lock: OutputLock::Key(destination),
+                spendable_height: 104,
+            }],
+        };
+        transaction.sign_all(&[&node.wallet_signing_key]).unwrap();
+        let txid = hex::encode(transaction.txid());
+        let raw = hex::encode(encode_transaction(&transaction).unwrap());
+        assert_eq!(
+            call(
+                json!({"jsonrpc":"2.0","id":3,"method":"sendrawtransaction","params":[raw]}),
+                &mut node
+            )["result"],
+            txid
+        );
+        let pending = query(&mut node, json!([address]));
+        assert_eq!(pending["result"]["total_utxos"], 3);
+        assert!(
+            !pending["result"]["utxos"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["txid"] == selected["txid"] && item["vout"] == selected["vout"])
+        );
+        assert!(
+            !pending["result"]["utxos"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["txid"] == txid)
+        );
+        assert_eq!(
+            query(
+                &mut node,
+                json!([address, 1, page_one["result"]["next_cursor"]])
+            )["error"]["data"]["code"],
+            "utxo_snapshot_changed"
+        );
+
+        let first_remaining = &pending["result"]["utxos"][0];
+        let reserved = OutPoint {
+            txid: hex::decode(first_remaining["txid"].as_str().unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            index: first_remaining["vout"].as_u64().unwrap() as u32,
+        };
+        let before_reservation = query(&mut node, json!([address, 1]));
+        node.exchange_withdrawal_reservations
+            .insert(reserved, [0x42; 32]);
+        assert_eq!(
+            query(&mut node, json!([address]))["result"]["total_utxos"],
+            2
+        );
+        assert_eq!(
+            query(
+                &mut node,
+                json!([address, 1, before_reservation["result"]["next_cursor"]])
+            )["error"]["data"]["code"],
+            "utxo_snapshot_changed"
+        );
+        node.exchange_withdrawal_reservations.remove(&reserved);
+
+        let mut invalid_cursor = before_reservation["result"]["next_cursor"].clone();
+        invalid_cursor["txid"] = json!("00".repeat(32));
+        assert_eq!(
+            query(&mut node, json!([address, 1, invalid_cursor]))["error"]["code"],
+            -32602
+        );
+        for params in [
+            json!([]),
+            json!(["bad"]),
+            json!(["ff".repeat(32)]),
+            json!([address, 0]),
+            json!([address, 1001]),
+            json!([address, -1]),
+            json!([address, 1.5]),
+            json!([address, 1, {}]),
+            json!([address,1,{"snapshot":"00".repeat(32),"txid":"00".repeat(32),"vout":-1}]),
+        ] {
+            assert_eq!(query(&mut node, params)["error"]["code"], -32602);
+        }
+        let other = k256::schnorr::SigningKey::from_bytes(&[77; 32]).unwrap();
+        let empty = query(
+            &mut node,
+            json!([hex::encode(other.verifying_key().to_bytes())]),
+        );
+        assert_eq!(empty["result"]["utxos"], json!([]));
+        assert_eq!(empty["result"]["available_atoms"], "0");
+        let mined = node
+            .mine_once(
+                destination,
+                DEVNET_PROFILE.virtual_genesis_timestamp + 104 * 60,
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        assert_eq!(mined.transactions.len(), 1);
+        let confirmed = query(&mut node, json!([address]));
+        assert!(
+            confirmed["result"]["utxos"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["txid"] == txid)
+        );
+        assert!(
+            !confirmed["result"]["utxos"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["txid"] == selected["txid"] && item["vout"] == selected["vout"])
+        );
+        assert_eq!(
+            query(
+                &mut node,
+                json!([address, 1, before_reservation["result"]["next_cursor"]])
+            )["error"]["data"]["code"],
+            "utxo_snapshot_changed"
+        );
+        drop(node);
+        let mut node = Node::open_with_profile(&directory, DEVNET_PROFILE).unwrap();
+        assert_eq!(
+            query(&mut node, json!([address]))["result"],
+            confirmed["result"]
+        );
+        node.storage_faulted = true;
+        assert_eq!(
+            query(&mut node, json!([address]))["error"]["data"]["code"],
+            "storage_faulted"
+        );
+        drop(node);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

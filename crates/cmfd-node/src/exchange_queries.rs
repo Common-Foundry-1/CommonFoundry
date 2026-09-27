@@ -6,12 +6,13 @@ use std::fs::File;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use cmfd_consensus::{Block, OutputLock, Transaction};
+use cmfd_consensus::{Block, OutPoint, OutputLock, Transaction};
 use serde_json::{Value, json};
 
 use crate::{BLOCK_LOG_FILE, BlockRecordLocator, Node, NodeError, ProofProfile};
 
 const MAX_LOOKUP_TRANSACTIONS: usize = 5_000_000;
+pub(crate) const MAX_UTXO_PAGE: usize = 1_000;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum QueryError {
@@ -19,6 +20,10 @@ pub(crate) enum QueryError {
     ChainChanged,
     #[error("transaction lookup index capacity reached")]
     Capacity,
+    #[error("available outputs changed; restart UTXO pagination")]
+    UtxoSnapshotChanged,
+    #[error("UTXO cursor outpoint is not in this snapshot")]
+    InvalidUtxoCursor,
     #[error(transparent)]
     Node(#[from] NodeError),
 }
@@ -269,16 +274,122 @@ impl TransactionLookupIndex {
     }
 }
 
+fn pending_spends(node: &Node) -> HashSet<OutPoint> {
+    node.mempool
+        .values()
+        .flat_map(|entry| entry.transaction.inputs.iter().map(|input| input.previous))
+        .collect()
+}
+
+pub(crate) struct UtxoCursor {
+    pub snapshot: [u8; 32],
+    pub after: OutPoint,
+}
+
+/// Lists only confirmed outputs that can fund a transaction at the next
+/// height. Reading never reserves inputs or changes the wallet/mempool.
+pub(crate) fn address_utxos(
+    node: &Node,
+    destination: [u8; 32],
+    limit: usize,
+    cursor: Option<UtxoCursor>,
+) -> Result<Value, QueryError> {
+    if node.storage_faulted {
+        return Err(NodeError::StorageFaulted.into());
+    }
+    let next_height = node.state.next_height();
+    let pending = pending_spends(node);
+    let mut available: Vec<_> = node
+        .state
+        .utxos()
+        .iter()
+        .filter(|(outpoint, output)| {
+            output.lock == OutputLock::Key(destination)
+                && output.spendable_height <= next_height
+                && !pending.contains(outpoint)
+                && !node.exchange_withdrawal_reservations.contains_key(outpoint)
+        })
+        .collect();
+    available.sort_unstable_by_key(|(outpoint, _)| (outpoint.txid, outpoint.index));
+
+    // Bind pagination to both chain state and the outputs still available
+    // locally. A new pending spend or reservation invalidates old cursors.
+    let mut digest = blake3::Hasher::new_derive_key("CMFD/EXCHANGE/ADDRESS_UTXOS/V1");
+    digest.update(&node.params.network_id);
+    digest.update(&destination);
+    digest.update(&node.state.tip());
+    digest.update(&next_height.to_le_bytes());
+    let mut available_atoms = 0u128;
+    for (outpoint, output) in &available {
+        digest.update(&outpoint.txid);
+        digest.update(&outpoint.index.to_le_bytes());
+        digest.update(&output.value.to_le_bytes());
+        digest.update(&output.spendable_height.to_le_bytes());
+        available_atoms += u128::from(output.value);
+    }
+    let snapshot = *digest.finalize().as_bytes();
+    let start = match cursor {
+        None => 0,
+        Some(cursor) => {
+            if cursor.snapshot != snapshot {
+                return Err(QueryError::UtxoSnapshotChanged);
+            }
+            available
+                .binary_search_by_key(&(cursor.after.txid, cursor.after.index), |(outpoint, _)| {
+                    (outpoint.txid, outpoint.index)
+                })
+                .map_err(|_| QueryError::InvalidUtxoCursor)?
+                + 1
+        }
+    };
+    let end = start
+        .saturating_add(limit.min(MAX_UTXO_PAGE))
+        .min(available.len());
+    let has_more = end < available.len();
+    let next_cursor = if has_more && end > start {
+        let (outpoint, _) = available[end - 1];
+        Some(
+            json!({"snapshot":hex::encode(snapshot), "txid":hex::encode(outpoint.txid), "vout":outpoint.index}),
+        )
+    } else {
+        None
+    };
+    let destination_hex = hex::encode(destination);
+    let utxos: Vec<_> = available[start..end]
+        .iter()
+        .map(|(outpoint, output)| {
+            json!({
+                "txid": hex::encode(outpoint.txid),
+                "vout": outpoint.index,
+                "value_atoms": output.value.to_string(),
+                "spendable_height": output.spendable_height,
+                "lock_type": "key",
+                "destination_hex": destination_hex,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "destination_hex": destination_hex,
+        "network_id": hex::encode(node.params.network_id),
+        "bestblock": hex::encode(node.state.tip()),
+        "height": next_height.saturating_sub(1),
+        "snapshot": hex::encode(snapshot),
+        "available_atoms": available_atoms.to_string(),
+        "total_utxos": available.len(),
+        "returned_utxos": utxos.len(),
+        "utxos": utxos,
+        "has_more": has_more,
+        "next_cursor": next_cursor,
+        "mempool_scope": "this_node_only",
+    }))
+}
+
 pub(crate) fn address_balance(node: &Node, destination: [u8; 32]) -> Result<Value, NodeError> {
     if node.storage_faulted {
         return Err(NodeError::StorageFaulted);
     }
     let next_height = node.state.next_height();
-    let pending_spends = node
-        .mempool
-        .values()
-        .flat_map(|entry| entry.transaction.inputs.iter().map(|input| input.previous))
-        .collect::<HashSet<_>>();
+    let pending_spends = pending_spends(node);
     let mut confirmed = 0u128;
     let mut spendable = 0u128;
     let mut available = 0u128;

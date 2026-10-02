@@ -430,6 +430,18 @@ class MainnetPoolServiceTests(unittest.TestCase):
             with self.assertRaisesRegex(pool.PreflightError, "real dedicated directory"):
                 pool.check_isolation(self.root, self.state, self.config_path, self.install, self.config_base)
 
+    def test_idle_search_is_explicit_boolean_and_command_opt_in(self):
+        legacy = pool.validate_config(self.config)
+        command = pool.build_command(self.root, self.state, self.credential_base, legacy)
+        self.assertNotIn("--production-v4-pool-idle-search", command)
+        for enabled in (False, True):
+            config = pool.validate_config(dict(self.config, idle_gpu_search=enabled))
+            command = pool.build_command(self.root, self.state, self.credential_base, config)
+            self.assertEqual("--production-v4-pool-idle-search" in command, enabled)
+        for bad in (None, 0, 1, "true", "false", []):
+            with self.assertRaises(pool.PreflightError):
+                pool.validate_config(dict(self.config, idle_gpu_search=bad))
+
     def test_fresh_install_dropin_only_replaces_launcher(self):
         dropin = (SOURCE / "30-fresh-install.conf").read_text(encoding="utf-8")
         lines = [line.strip() for line in dropin.splitlines()

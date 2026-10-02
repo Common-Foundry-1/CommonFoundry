@@ -42,6 +42,7 @@ HASH_FIELDS = (
 )
 RC_FILE_HASH_FIELDS = {"forbidden_rc_private_key_sha256", "forbidden_rc_wallet_file_sha256"}
 PREVIOUS_RC_FIELD = "has_previous_rc_installation"
+IDLE_SEARCH_FIELD = "idle_gpu_search"
 NUMBER_FIELDS = {
     "worker_threads": (1, 96), "share_leading_zero_bits": (0, 7),
     "minimum_payout_atoms": (1, 2**64 - 1),
@@ -146,9 +147,11 @@ def parse_seed(value: object) -> str:
 
 
 def validate_config(config: dict) -> dict:
-    if (set(config) not in (CONFIG_FIELDS, CONFIG_FIELDS | {PREVIOUS_RC_FIELD})
+    if (set(config) - {PREVIOUS_RC_FIELD, IDLE_SEARCH_FIELD} != CONFIG_FIELDS
             or config.get("schema") != SCHEMA):
         raise PreflightError("pool.json is incomplete or has unexpected fields")
+    if type(config.get(IDLE_SEARCH_FIELD, False)) is not bool:
+        raise PreflightError("idle_gpu_search must be true or false")
     # Existing v1 configurations keep the original RC migration checks.
     previous_rc = config.get(PREVIOUS_RC_FIELD, True)
     if type(previous_rc) is not bool:
@@ -371,7 +374,7 @@ def build_command(root: Path, state: Path, credential_base: Path, config: dict) 
     def socket(address: str, port: int) -> str:
         return f"[{address}]:{port}" if ":" in address else f"{address}:{port}"
     pin = config["expected_tls_certificate_sha256"]
-    return [
+    command = [
         str(root / "cmfd-node"), "--data-dir", str(state / "data"),
         "--wallet-passphrase-file", str(credential_base / "wallet-passphrase"),
         "--production-v4-bank", str(root / "production-v4/MODEL-V2.bank"),
@@ -395,6 +398,9 @@ def build_command(root: Path, state: Path, credential_base: Path, config: dict) 
         "--pool-public-url", f"cmfd+tls://{socket(config['public_numeric_ip'], 29445)}?pin={pin}",
         "--shutdown-request-file", str(state / "shutdown.request"),
     ]
+    if config.get(IDLE_SEARCH_FIELD, False):
+        command.append("--production-v4-pool-idle-search")
+    return command
 
 
 def preflight(config_path: Path, root: Path, state: Path, config_base: Path, install_base: Path,
@@ -406,6 +412,11 @@ def preflight(config_path: Path, root: Path, state: Path, config_base: Path, ins
                  "mainnet pool certificate", static=True)
     credentials(config, credential_base)
     require_hash(root / "cmfd-node", config["expected_node_sha256"], "node", static=True)
+    if config.get(IDLE_SEARCH_FIELD, False):
+        help_result = subprocess.run([str(root / "cmfd-node"), "pool-serve", "--help"],
+                                     check=True, capture_output=True, text=True, timeout=15)
+        if "--production-v4-pool-idle-search" not in help_result.stdout:
+            raise PreflightError("this node does not support coordinated idle GPU search")
     info = native_launch_info(root / "cmfd-node")
     bank, record = validate_info(info, config)
     plan = strict_json(bounded_file(root / "production-mainnet/MAINNET-PLAN.json",

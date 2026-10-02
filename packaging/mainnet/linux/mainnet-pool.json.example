@@ -1,6 +1,7 @@
 {
   "schema": "CommonFoundry/MainnetPoolService/v1",
   "has_previous_rc_installation": false,
+  "idle_gpu_search": false,
   "expected_network_id": "SET_FROM_FINAL_MAINNET_PLAN",
   "expected_plan_digest": "SET_FROM_FINAL_MAINNET_PLAN",
   "public_numeric_ip": "SET_PUBLIC_NUMERIC_IP",

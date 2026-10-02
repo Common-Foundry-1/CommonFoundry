@@ -1,5 +1,6 @@
 {
   "schema": "CommonFoundry/MainnetPoolService/v1",
+  "has_previous_rc_installation": false,
   "expected_network_id": "SET_FROM_FINAL_MAINNET_PLAN",
   "expected_plan_digest": "SET_FROM_FINAL_MAINNET_PLAN",
   "public_numeric_ip": "SET_PUBLIC_NUMERIC_IP",
@@ -16,8 +17,8 @@
   "expected_tls_certificate_sha256": "SET_FROM_NEW_MAINNET_POOL_CERTIFICATE",
   "expected_tls_private_key_sha256": "SET_FROM_NEW_MAINNET_POOL_PRIVATE_KEY",
   "forbidden_rc_certificate_sha256": "a4868a78e9d4d46bbb3c7867bd43bacbb4e8bb0a0ac61e54444b16250d525dc0",
-  "forbidden_rc_private_key_sha256": "SET_FROM_EXISTING_RC_KEY_OFFLINE",
-  "forbidden_rc_wallet_file_sha256": "SET_FROM_EXISTING_RC_WALLET_OFFLINE",
+  "forbidden_rc_private_key_sha256": null,
+  "forbidden_rc_wallet_file_sha256": null,
   "share_leading_zero_bits": "SET_APPROVED_VALUE_0_TO_7",
   "minimum_payout_atoms": "SET_APPROVED_MAINNET_VALUE",
   "payout_fee_atoms": "SET_APPROVED_MAINNET_VALUE",

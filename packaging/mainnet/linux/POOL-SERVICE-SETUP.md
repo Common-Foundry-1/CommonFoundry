@@ -8,6 +8,32 @@ the mainnet payout CLI before installation. Qualify the actual host service
 before enabling it. No RC certificate, wallet, ledger, P2P seed,
 port, or service account may be reused.
 
+## Fresh installation or RC migration
+
+For a host with no previous RC pool key or wallet, use the updated launcher
+with these fields in `pool.json`:
+
+```json
+"has_previous_rc_installation": false,
+"forbidden_rc_private_key_sha256": null,
+"forbidden_rc_wallet_file_sha256": null
+```
+
+Keep `forbidden_rc_certificate_sha256` at the supplied known RC certificate
+hash. Every `expected_*` field still requires its real value for the new
+mainnet files. Do not create dummy RC files or use empty-file hashes.
+
+For an RC migration, set `has_previous_rc_installation` to `true` and supply
+the actual old private-key and encrypted-wallet file hashes. Existing v1
+configs without this new field retain those migration checks unchanged.
+The fresh-install mode still requires an empty data directory before first
+startup and is bound into its deployment marker. Do not change modes or
+delete a deployment marker to bypass a check on an existing installation.
+
+The original signed v1.0.0 launcher predates this option. See
+[the launcher update instructions](POOL-LAUNCHER-UPDATE.md) for using this fix
+with that package without modifying its signed contents.
+
 ## Deliberately separate identity
 
 | Purpose | Mainnet pool only |
@@ -69,8 +95,9 @@ approved pool GPU still has a compute process. It never stops that process.
    arguments. The launcher rejects a redirected/nonprivate runtime directory
    or a group/world-accessible credential. Record hashes of the
    existing RC encrypted `wallet.key`, TLS private key and certificate into
-   the three `forbidden_rc_*` fields without copying those secrets into the
-   mainnet installation. The known AI01 public RC certificate fingerprint is
+   the three `forbidden_rc_*` fields when migrating an RC installation, without
+   copying those secrets into the mainnet installation. On a fresh host use
+   the explicit false/null configuration above. The known AI01 public RC certificate fingerprint is
    also rejected by code. The first start refuses nonempty unmarked pool data;
    later starts bind the data to one plan/network/certificate marker and reject
    a byte-identical RC encrypted wallet. A newly re-encrypted copy of an RC

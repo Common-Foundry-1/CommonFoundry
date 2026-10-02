@@ -157,6 +157,7 @@ pub fn production_v4_pool_searcher_config(
 #[derive(Debug)]
 pub struct ProductionV4PersistentPoolVerifier {
     gpu_gate: crate::pool_gpu_gate::PoolGpuGate,
+    idle_search_enabled: std::sync::atomic::AtomicBool,
     searcher: ProductionV4PersistentPoolSearcher,
     expected_network_id: [u8; 32],
     scratch_directory: PathBuf,
@@ -316,6 +317,7 @@ impl ProductionV4PersistentPoolVerifier {
         Ok(Self {
             searcher,
             gpu_gate: crate::pool_gpu_gate::PoolGpuGate::default(),
+            idle_search_enabled: std::sync::atomic::AtomicBool::new(false),
             expected_network_id,
             scratch_directory: config.scratch_directory,
             worker_scratch_directory: config.worker_scratch_directory,
@@ -438,6 +440,20 @@ impl ProductionV4PersistentPoolVerifier {
             return Err(pool_replay_failure(
                 "search replay and full replay final activations differ",
             ));
+        }
+        if self
+            .idle_search_enabled
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            // The full trace is on disk and its final activation was checked.
+            // Release the replay model during proving. RUN/RUNBATCH will load
+            // the same pinned model again after verification releases the gate.
+            search_state.replay.invoke_interruptible(
+                &["EVICT".to_owned()],
+                "CMFD_V4_REPLAY_EVICTED",
+                Duration::from_secs(30),
+                None,
+            )?;
         }
         let proof_started = Instant::now();
         state.proof.invoke(
@@ -653,6 +669,8 @@ impl ProductionV4PoolShareVerifier for ProductionV4PersistentPoolVerifier {
         nonce: u64,
         stop: &std::sync::atomic::AtomicBool,
     ) -> Result<Option<PoolWorkSearchResult>, PoolError> {
+        self.idle_search_enabled
+            .store(true, std::sync::atomic::Ordering::Release);
         let Some(_permit) = self.gpu_gate.try_search().map_err(pool_replay_failure)? else {
             return Ok(None);
         };

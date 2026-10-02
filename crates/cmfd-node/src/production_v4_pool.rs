@@ -158,6 +158,7 @@ pub fn production_v4_pool_searcher_config(
 
 #[derive(Debug)]
 pub struct ProductionV4PersistentPoolVerifier {
+    gpu_gate: crate::pool_gpu_gate::PoolGpuGate,
     searcher: ProductionV4PersistentPoolSearcher,
     expected_network_id: [u8; 32],
     scratch_directory: PathBuf,
@@ -314,6 +315,7 @@ impl ProductionV4PersistentPoolVerifier {
         getrandom::fill(&mut startup_id).map_err(replay_error)?;
         Ok(Self {
             searcher,
+            gpu_gate: crate::pool_gpu_gate::PoolGpuGate::default(),
             expected_network_id,
             scratch_directory: config.scratch_directory,
             worker_scratch_directory: config.worker_scratch_directory,
@@ -639,17 +641,44 @@ impl ProductionV4PersistentPoolSearcher {
 }
 
 impl ProductionV4PoolShareVerifier for ProductionV4PersistentPoolVerifier {
+    fn supports_idle_search(&self) -> bool {
+        true
+    }
+
+    fn idle_search(
+        &self,
+        job: &PoolJob,
+        nonce: u64,
+        stop: &std::sync::atomic::AtomicBool,
+    ) -> Result<Option<PoolWorkSearchResult>, PoolError> {
+        let Some(_permit) = self.gpu_gate.try_search().map_err(pool_replay_failure)? else {
+            return Ok(None);
+        };
+        // Reuse the pool's existing replay worker. Never create a second CUDA
+        // context/model allocation which could exhaust VRAM during proving.
+        let result = self.searcher.search(job, nonce, stop);
+        if result.is_err() {
+            self.gpu_gate.disable_search();
+        }
+        result.map(Some)
+    }
+
     fn evaluate(
         &self,
         template: &BlockTemplate,
         nonce: u64,
         share_target: [u8; 32],
     ) -> Result<ProductionV4PoolShareEvaluation, PoolError> {
+        let _permit = self.gpu_gate.verification().map_err(pool_replay_failure)?;
         let mut state = self
             .state
             .lock()
             .map_err(|_| pool_replay_failure("persistent worker lock is poisoned"))?;
-        self.evaluate_locked(&mut state, template, nonce, share_target)
+        let result = self.evaluate_locked(&mut state, template, nonce, share_target);
+        if result.is_err() {
+            self.gpu_gate.disable_search();
+        }
+        result
     }
 }
 

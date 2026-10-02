@@ -93,6 +93,9 @@ pub mod p2p;
 pub mod peer;
 pub mod pool;
 pub mod pool_dashboard;
+pub mod pool_idle_search;
+#[cfg(feature = "production-v4")]
+mod pool_gpu_gate;
 #[cfg(feature = "production-v4")]
 pub mod production_v4_pool;
 #[cfg(feature = "production-v4")]

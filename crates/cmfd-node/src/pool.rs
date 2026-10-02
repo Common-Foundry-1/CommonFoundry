@@ -5697,6 +5697,74 @@ mod tests {
         (root, server, node, pin)
     }
 
+    #[derive(Debug)]
+    struct IdleTransportFixture;
+
+    impl ProductionV4PoolShareVerifier for IdleTransportFixture {
+        fn supports_idle_search(&self) -> bool {
+            true
+        }
+        fn idle_search(
+            &self,
+            job: &PoolJob,
+            nonce: u64,
+            stop: &AtomicBool,
+        ) -> Result<Option<PoolWorkSearchResult>, PoolError> {
+            PoolMiningWork::from_job(job.clone())?
+                .search_range(nonce, 64, || stop.load(Ordering::Acquire))
+                .map(Some)
+        }
+        fn evaluate(
+            &self,
+            _: &crate::BlockTemplate,
+            _: u64,
+            _: [u8; 32],
+        ) -> Result<ProductionV4PoolShareEvaluation, PoolError> {
+            panic!("reference transport fixture must use normal reference verification");
+        }
+    }
+
+    #[test]
+    fn idle_search_uses_real_pinned_tls_and_normal_share_accounting() {
+        let (_root, server, _node, pin) = server_with_address_only("idle-tls", true);
+        let destination = default_miner_destination();
+        let client = PoolClientConfig::devnet_address_only(
+            server.local_addr(),
+            pin,
+            "pool-idle-search",
+            destination,
+        )
+        .unwrap();
+        let handle =
+            crate::pool_idle_search::spawn_pool_idle_search(Arc::new(IdleTransportFixture), client)
+                .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let ledger = server.ledger_snapshot().unwrap();
+            if ledger.accepted_shares >= 3 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "idle client did not earn ordinary share credits"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        drop(handle);
+        let ledger = server.ledger_snapshot().unwrap();
+        assert!(ledger.accepted_shares >= 3);
+        assert!(
+            ledger
+                .sessions
+                .iter()
+                .any(|session| session.worker == "pool-idle-search")
+        );
+        let count = ledger.accepted_shares;
+        thread::sleep(Duration::from_millis(250));
+        assert_eq!(server.ledger_snapshot().unwrap().accepted_shares, count);
+        server.stop().unwrap();
+    }
+
     #[test]
     fn pool_test_root_skips_a_precreated_random_candidate() {
         let label = "precreated";

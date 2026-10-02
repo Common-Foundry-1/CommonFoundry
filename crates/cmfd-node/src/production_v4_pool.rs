@@ -7,11 +7,11 @@
 
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use cmfd_consensus::forgematrix_v4_proof::{
     forgematrix_v4_final_activation_digest, forgematrix_v4_mask_coefficients,
@@ -33,8 +33,6 @@ use crate::pool::{
 };
 use crate::{BlockTemplate, COMPILED_NETWORK_PROFILE};
 
-const WORKER_OUTPUT_MAX_LINES: usize = 4_096;
-const WORKER_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
 const FROZEN_TEMPLATE_FORMAT_VERSION: u16 = 1;
 pub const PRODUCTION_V4_POOL_SEARCH_MAX_BATCH_SIZE: u32 = 64;
 
@@ -266,8 +264,10 @@ struct SearchWorkerState {
 #[derive(Debug)]
 struct PersistentWorker {
     child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    io: crate::pool_worker_io::WorkerIo,
+    command: ProductionV4PoolWorkerCommand,
+    ready_marker: String,
+    retired: bool,
     label: &'static str,
 }
 
@@ -601,7 +601,7 @@ impl ProductionV4PersistentPoolSearcher {
             coefficients.extend_from_slice(&production_v4_replay_coefficients(challenge_digest));
         }
         write_new_file(&coefficients_path, &coefficients)?;
-        state.replay.invoke(
+        state.replay.invoke_interruptible(
             &[
                 "RUNBATCH".to_owned(),
                 batch_size.to_string(),
@@ -609,6 +609,8 @@ impl ProductionV4PersistentPoolSearcher {
                 self.worker_path(&search_prefix)?,
             ],
             "CMFD_V4_REPLAY_DONE",
+            Duration::from_secs(30),
+            Some(stop),
         )?;
         let expected_bytes = FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES
             .checked_mul(batch_size as usize)
@@ -688,20 +690,34 @@ impl PersistentWorker {
         ready_marker: &str,
         label: &'static str,
     ) -> Result<Self, PoolError> {
+        Self::start_with_timeout(command, ready_marker, label, Duration::from_secs(180))
+    }
+
+    fn start_with_timeout(
+        command: &ProductionV4PoolWorkerCommand,
+        ready_marker: &str,
+        label: &'static str,
+        timeout: Duration,
+    ) -> Result<Self, PoolError> {
         if !command.program.is_absolute() || !command.program.is_file() {
             return Err(pool_replay_failure(format!(
                 "{label} program must be an existing absolute file: {}",
                 command.program.display()
             )));
         }
-        let mut child = Command::new(&command.program)
+        let mut process = Command::new(&command.program);
+        process
             .args(&command.arguments)
             .envs(command.environment.iter().cloned())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(replay_error)?;
+            .stderr(Stdio::inherit());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            process.process_group(0);
+        }
+        let mut child = process.spawn().map_err(replay_error)?;
         let stdin = child
             .stdin
             .take()
@@ -710,17 +726,43 @@ impl PersistentWorker {
             .stdout
             .take()
             .ok_or_else(|| pool_replay_failure(format!("{label} stdout is unavailable")))?;
+        let io = match crate::pool_worker_io::WorkerIo::new(stdin, stdout) {
+            Ok(io) => io,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(replay_error(error));
+            }
+        };
         let mut worker = Self {
             child,
-            stdin,
-            stdout: BufReader::new(stdout),
+            io,
+            command: command.clone(),
+            ready_marker: ready_marker.to_owned(),
+            retired: false,
             label,
         };
-        worker.read_until(ready_marker)?;
+        if let Err(error) = worker
+            .io
+            .marker(ready_marker, Instant::now() + timeout, None)
+        {
+            let _ = worker.terminate();
+            return Err(pool_replay_failure(format!("{label}: {error}")));
+        }
         Ok(worker)
     }
 
     fn invoke(&mut self, fields: &[String], done_marker: &str) -> Result<(), PoolError> {
+        self.invoke_interruptible(fields, done_marker, Duration::from_secs(300), None)
+    }
+
+    fn invoke_interruptible(
+        &mut self,
+        fields: &[String],
+        done_marker: &str,
+        timeout: Duration,
+        stop: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<(), PoolError> {
         if fields.is_empty()
             || fields.iter().any(|field| {
                 field.is_empty()
@@ -734,52 +776,67 @@ impl PersistentWorker {
                 self.label
             )));
         }
-        self.stdin
-            .write_all(fields.join("\t").as_bytes())
-            .and_then(|()| self.stdin.write_all(b"\n"))
-            .and_then(|()| self.stdin.flush())
-            .map_err(replay_error)?;
-        self.read_until(done_marker)
+        if stop.is_some_and(|stop| stop.load(std::sync::atomic::Ordering::Acquire)) {
+            return Err(pool_replay_failure("worker operation cancelled"));
+        }
+        if self.retired {
+            // Only a confirmed reaped worker can be replaced. Keep the exact
+            // pinned command; never select a new GPU or substitute a worker.
+            let replacement = Self::start(&self.command, &self.ready_marker, self.label)?;
+            *self = replacement;
+        }
+        let deadline = Instant::now() + timeout;
+        let bytes = (fields.join("\t") + "\n").into_bytes();
+        let result = self
+            .io
+            .write(bytes, deadline, stop)
+            .and_then(|()| self.io.marker(done_marker, deadline, stop));
+        if let Err(error) = result {
+            let termination = self.terminate();
+            return Err(pool_replay_failure(format!(
+                "{}: {error}; termination={termination:?}",
+                self.label
+            )));
+        }
+        Ok(())
     }
 
-    fn read_until(&mut self, marker: &str) -> Result<(), PoolError> {
-        let mut total_bytes = 0_usize;
-        for _ in 0..WORKER_OUTPUT_MAX_LINES {
-            let mut line = String::new();
-            let bytes = self.stdout.read_line(&mut line).map_err(replay_error)?;
-            if bytes == 0 {
-                let status = self.child.try_wait().map_err(replay_error)?;
-                return Err(pool_replay_failure(format!(
-                    "{} closed stdout before {marker}; status={status:?}",
-                    self.label
-                )));
-            }
-            total_bytes = total_bytes
-                .checked_add(bytes)
-                .ok_or_else(|| pool_replay_failure("worker output byte count overflow"))?;
-            if total_bytes > WORKER_OUTPUT_MAX_BYTES {
-                return Err(pool_replay_failure(format!(
-                    "{} exceeded its output limit",
-                    self.label
-                )));
-            }
-            if line.trim_end_matches(['\r', '\n']) == marker {
-                return Ok(());
+    fn terminate(&mut self) -> Result<(), String> {
+        if self.retired {
+            return Ok(());
+        }
+        // This process group belongs to this worker. Descendants must not keep
+        // CUDA allocations or inherited pipe handles after a timeout.
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-(self.child.id() as i32), libc::SIGKILL);
+        }
+        let _ = self.child.kill();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => {
+                    self.retired = true;
+                    break;
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Ok(None) => {
+                    self.io.close(Instant::now());
+                    return Err("worker exit could not be confirmed; replacement forbidden".into());
+                }
+                Err(error) => return Err(error.to_string()),
             }
         }
-        Err(pool_replay_failure(format!(
-            "{} did not emit {marker} within its line limit",
-            self.label
-        )))
+        self.io.close(deadline);
+        Ok(())
     }
 }
 
 impl Drop for PersistentWorker {
     fn drop(&mut self) {
-        let _ = self.stdin.write_all(b"QUIT\n");
-        let _ = self.stdin.flush();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.terminate();
     }
 }
 
@@ -1076,6 +1133,163 @@ fn pool_replay_failure(message: impl Into<String>) -> PoolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Spawned only by pipe tests, never a GPU process. Child-only environment
+    // selects deterministic failure cases without changing the parent env.
+    #[test]
+    #[ignore]
+    fn worker_pipe_fixture() {
+        use std::io::BufRead;
+        let mode =
+            std::env::var("CF_POOL_PIPE_FIXTURE").expect("fixture invoked by transport test");
+        if mode == "startup-hang" {
+            std::thread::sleep(Duration::from_secs(60));
+            return;
+        }
+        println!("CMFD_V4_REPLAY_READY");
+        std::io::stdout().flush().unwrap();
+        for line in std::io::stdin().lock().lines() {
+            let _ = line.unwrap();
+            if mode == "oversize" {
+                std::io::stdout()
+                    .write_all(&vec![b'x'; 1024 * 1024 + 8192])
+                    .unwrap();
+                std::io::stdout().flush().unwrap();
+                std::thread::sleep(Duration::from_secs(60));
+            }
+            if mode == "hang" {
+                std::thread::sleep(Duration::from_secs(60));
+            }
+            if mode == "hang-once" {
+                let path = PathBuf::from(std::env::var_os("CF_POOL_PIPE_MARKER").unwrap());
+                if OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)
+                    .is_ok()
+                {
+                    std::thread::sleep(Duration::from_secs(60));
+                }
+            }
+            println!("CMFD_V4_REPLAY_DONE");
+            std::io::stdout().flush().unwrap();
+        }
+    }
+
+    fn fixture_command(mode: &str) -> ProductionV4PoolWorkerCommand {
+        ProductionV4PoolWorkerCommand {
+            program: std::env::current_exe().unwrap(),
+            arguments: vec![
+                "--exact".into(),
+                "production_v4_pool::tests::worker_pipe_fixture".into(),
+                "--ignored".into(),
+                "--nocapture".into(),
+            ],
+            environment: vec![("CF_POOL_PIPE_FIXTURE".into(), mode.into())],
+        }
+    }
+
+    #[test]
+    fn worker_startup_has_an_elapsed_deadline() {
+        let started = Instant::now();
+        let result = PersistentWorker::start_with_timeout(
+            &fixture_command("startup-hang"),
+            "CMFD_V4_REPLAY_READY",
+            "fixture",
+            Duration::from_millis(150),
+        );
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn stalled_worker_is_reaped_and_exact_command_can_restart() {
+        let marker = std::env::temp_dir().join(format!(
+            "cmfd-pipe-restart-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut command = fixture_command("hang-once");
+        command
+            .environment
+            .push(("CF_POOL_PIPE_MARKER".into(), marker.as_os_str().to_owned()));
+        let mut worker =
+            PersistentWorker::start(&command, "CMFD_V4_REPLAY_READY", "fixture").unwrap();
+        let first_pid = worker.child.id();
+        let started = Instant::now();
+        assert!(
+            worker
+                .invoke_interruptible(
+                    &["RUN".into()],
+                    "CMFD_V4_REPLAY_DONE",
+                    Duration::from_millis(150),
+                    None
+                )
+                .is_err()
+        );
+        assert!(worker.retired);
+        assert!(worker.child.try_wait().unwrap().is_some());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        worker
+            .invoke_interruptible(
+                &["RUN".into()],
+                "CMFD_V4_REPLAY_DONE",
+                Duration::from_secs(3),
+                None,
+            )
+            .unwrap();
+        assert_ne!(worker.child.id(), first_pid);
+        drop(worker);
+        std::fs::remove_file(marker).unwrap();
+    }
+
+    #[test]
+    fn partial_line_output_is_bounded() {
+        let mut worker = PersistentWorker::start(
+            &fixture_command("oversize"),
+            "CMFD_V4_REPLAY_READY",
+            "fixture",
+        )
+        .unwrap();
+        let result = worker.invoke_interruptible(
+            &["RUN".into()],
+            "CMFD_V4_REPLAY_DONE",
+            Duration::from_secs(3),
+            None,
+        );
+        assert!(format!("{}", result.unwrap_err()).contains("byte limit"));
+        assert!(worker.retired);
+    }
+
+    #[test]
+    fn shutdown_cancels_a_stalled_search() {
+        let mut worker =
+            PersistentWorker::start(&fixture_command("hang"), "CMFD_V4_REPLAY_READY", "fixture")
+                .unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel = std::sync::Arc::clone(&stop);
+        let task = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            cancel.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let started = Instant::now();
+        assert!(
+            worker
+                .invoke_interruptible(
+                    &["RUN".into()],
+                    "CMFD_V4_REPLAY_DONE",
+                    Duration::from_secs(30),
+                    Some(&stop)
+                )
+                .is_err()
+        );
+        task.join().unwrap();
+        assert!(worker.retired);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
 
     #[test]
     fn replay_coefficients_have_the_exact_production_shape() {

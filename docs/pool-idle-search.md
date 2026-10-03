@@ -1,8 +1,9 @@
 # Pool-owned idle GPU search (experimental, not released)
 
-This branch prototypes opt-in native Linux search on the pool's own prover GPU.
-It is not in v1.0.0, is not approved for launch deployment, and must not be
-installed over the pinned mainnet node or scheduled launch controller.
+This update adds opt-in native Linux search on the pool's own prover GPU.
+It is not in the original v1.0.0 package. Use the separately signed update in a
+controlled maintenance window after launch; keep the original scheduled launch
+controller and its pinned node intact through activation.
 
 ## Design
 
@@ -33,9 +34,8 @@ miners. No payout percentage, proof rule, difficulty or network message changes.
 
 The node's existing `pool-serve` command gains
 `--production-v4-pool-idle-search` alongside `--allow-address-only-payouts`.
-It defaults off and rejects Windows/WSL use. This is a developer interface, not
-an instruction to run it on mainnet yet. No launcher/systemd auto-enable is
-provided by the node itself. The updated service launcher also accepts the
+It defaults off and rejects Windows/WSL use. The node does not install or enable
+systemd units. The updated service launcher also accepts the
 optional JSON boolean `idle_gpu_search`, defaulting to `false`. Set it to
 `true` only with the matching new node binary. Preflight refuses a binary
 whose `pool-serve --help` lacks the new option. Do not start an additional
@@ -55,24 +55,38 @@ terminates the owned worker process group on Linux and waits up to three
 seconds to confirm the parent exited. A later verification may restart only
 the exact recorded worker command after that exit has been confirmed. Idle
 search remains disabled after a worker fault; the operator must investigate
-before restarting the pool. Neither PID scans nor broad miner-kill commands
+before restarting the pool. The prover's CUDA allocator retains allocations
+after a completed job, so in idle-search mode the pool retires that owned
+prover process after each successful full proof and restarts its exact pinned
+command for the next candidate. This frees its context before search reloads
+the replay model. Neither PID scans nor broad miner-kill commands
 are used by this feature.
 
-## Release gates still required
+## Qualification
 
-- Compile and test the native Linux CLI and real client/server integration.
-- Repeated full proof cycles on the intended RTX 5070 Ti, including VRAM
-  measurement and comparisons against a dedicated-prover baseline.
-- Candidates from remote rigs during a local batch; multiple queued candidates;
-  stale jobs and reorgs; invalid submissions; ordinary payout accounting.
-- Native Windows and Linux timeout, output-limit, cancellation and worker
-  replacement tests now pass. GPU-driver failure cases still need the hardware
-  qualification below; a confirmed CPU child exit alone is not a performance
-  or memory-capacity measurement.
-- Crash/EOF/error paths, memory release, clean shutdown, connection recovery
-  policy, and performance/fairness under sustained load.
-- Reviewed packaging, signed build, operator documentation and independent
-  release verification. Existing launch artifacts stay unchanged.
+On the physical RTX 5070 Ti (16 GB), three consecutive synthetic-template full
+proof cycles completed with the real input set and CPU verification. Each
+12,025,320-byte proof was followed by resumed idle search. End-to-end cycle
+times, including reload/restart and resume, were approximately 53.0, 68.7 and
+71.4 seconds on that host. These are qualification observations, not a sustained
+pool throughput guarantee or live mainnet block acceptance. The first candidate
+found a retained-prover-memory failure; retiring the completed prover context
+fixed it. That failure was preserved in the private operations evidence.
 
-Offline scheduling tests do not establish actual GPU memory use, proof
-success, mainnet acceptance, payouts, or production readiness.
+Native Linux scheduler, real TLS/share accounting, worker timeout/cancellation,
+output-limit and exact-command restart tests passed. Existing pool protocol,
+accounting and payout-protection tests passed as well. Service configuration
+tests cover the opt-in boolean and legacy configuration behavior. Root launch
+plan and verified-beacon requirements are unchanged.
+
+## Operator validation after launch
+
+- Verify accepted shares and independently propagated full blocks on the actual
+  network; retain your normal mature-payout and reorg reconciliation checks.
+- Measure remote-miner latency and available VRAM on your own host. Incoming
+  work takes priority; search may remain idle under sustained verification load.
+- Treat startup/reload time as part of prover capacity planning. Qualification
+  on one GPU and host does not establish performance on every architecture.
+
+Synthetic hardware proof tests do not establish live mainnet transactions,
+maturity, payouts or chain admission. Those checks require the activated network.

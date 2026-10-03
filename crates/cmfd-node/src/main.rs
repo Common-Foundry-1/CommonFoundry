@@ -774,6 +774,10 @@ enum Command {
         /// Run the V4 pool workers through this WSL distribution.
         #[arg(long)]
         production_v4_pool_wsl_distribution: Option<String>,
+        /// EXPERIMENTAL: search between verification jobs using the pool's own GPU worker.
+        /// Native Linux only; requires address-only payouts. Never start a second miner on this GPU.
+        #[arg(long, requires = "allow_address_only_payouts")]
+        production_v4_pool_idle_search: bool,
         /// Enable automatic on-chain settlement of authenticated test-network share credits.
         #[arg(long, conflicts_with = "enable_mainnet_payouts")]
         enable_testnet_payouts: bool,
@@ -1877,6 +1881,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             production_v4_pool_proof_worker,
             production_v4_pool_scratch,
             production_v4_pool_wsl_distribution,
+            production_v4_pool_idle_search,
             enable_testnet_payouts,
             enable_mainnet_payouts,
             pool_minimum_payout_atoms,
@@ -1892,6 +1897,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             shutdown_request_file,
         } => {
             require_pool_mining_profile()?;
+            if production_v4_pool_idle_search
+                && (!cfg!(target_os = "linux") || production_v4_pool_wsl_distribution.is_some())
+            {
+                return Err("experimental pool idle search requires native Linux workers".into());
+            }
             let automatic_payouts = pool_payouts_enabled(
                 enable_testnet_payouts,
                 enable_mainnet_payouts,
@@ -1995,7 +2005,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 production_v4_pool_scratch.as_ref(),
                 production_v4_pool_wsl_distribution.as_deref(),
             )?;
+            let idle_verifier = if production_v4_pool_idle_search {
+                let verifier = config
+                    .production_v4_share_verifier
+                    .clone()
+                    .ok_or("pool idle search requires a ProductionV4 verifier")?;
+                if !verifier.supports_idle_search() {
+                    return Err("pool verifier does not support coordinated idle search".into());
+                }
+                Some(verifier)
+            } else {
+                None
+            };
             let pool = spawn_pool_server(Arc::clone(&node), config)?;
+            let idle_search = if let Some(verifier) = idle_verifier {
+                let mut address = pool.local_addr();
+                if address.ip().is_unspecified() {
+                    address.set_ip(if address.is_ipv4() {
+                        std::net::Ipv4Addr::LOCALHOST.into()
+                    } else {
+                        std::net::Ipv6Addr::LOCALHOST.into()
+                    });
+                }
+                let client = cmfd_node::pool::PoolClientConfig::compiled_network_address_only(
+                    address,
+                    pin,
+                    "pool-idle-search",
+                    miner_destination,
+                )?;
+                Some(cmfd_node::pool_idle_search::spawn_pool_idle_search(
+                    verifier, client,
+                )?)
+            } else {
+                None
+            };
             let dashboard = match dashboard_request {
                 Some((assets_directory, public_pool_url)) => Some(spawn_pool_dashboard(
                     pool.dashboard_source(),
@@ -2059,6 +2102,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(dashboard) => dashboard.stop().map(Some),
                 None => Ok(None),
             };
+            // Stop the optional client while the server and proof verifier can
+            // still finish its in-flight share.
+            drop(idle_search);
             if let Ok(node) = node.lock() {
                 if let Err(error) = node.persist_startup_snapshot() {
                     eprintln!("startup checkpoint not written: {error}");
@@ -3162,6 +3208,38 @@ mod tests {
         assert_eq!(pool_dashboard_bind, DEFAULT_POOL_DASHBOARD_ADDRESS);
         assert_eq!(pool_operator_fee_bps, 300);
         assert_eq!(pool_pplns_window_shares, 0);
+    }
+
+    #[test]
+    fn pool_idle_search_is_opt_in_and_requires_address_only_authorization() {
+        let args = [
+            "cmfd-node",
+            "pool-serve",
+            "--certificate",
+            "cert.der",
+            "--private-key",
+            "key.der",
+        ];
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::PoolServe {
+                production_v4_pool_idle_search: false,
+                ..
+            }
+        ));
+        let mut opted_in = args.to_vec();
+        opted_in.push("--production-v4-pool-idle-search");
+        assert!(Cli::try_parse_from(&opted_in).is_err());
+        opted_in.push("--allow-address-only-payouts");
+        let cli = Cli::try_parse_from(&opted_in).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::PoolServe {
+                production_v4_pool_idle_search: true,
+                ..
+            }
+        ));
     }
 
     #[test]

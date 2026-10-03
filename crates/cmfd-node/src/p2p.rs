@@ -1166,10 +1166,12 @@ fn perform_sync_from_peer_once_inner_with_policy(
     nonce_override: Option<[u8; 32]>,
     active_sockets: Option<&Arc<ActiveSocketRegistry>>,
 ) -> Result<SyncReport, P2pError> {
-    let (hello, locator) = {
+    let observation_address = observed_address(PeerDirection::Outbound, address);
+    let (hello, locator, mut sync_cursor) = {
         let node = lock_node(&shared)?;
         let hello = node.peer_hello();
-        (hello, node.block_locator(MAX_BLOCKS_PER_SYNC))
+        let (locator, cursor) = node.peer_sync_locator(&observation_address, MAX_BLOCKS_PER_SYNC);
+        (hello, locator, cursor)
     };
     let block_batch_limit = block_sync_batch_limit(hello.network_id, limits);
     let hello = with_nonce(hello, nonce_override);
@@ -1212,6 +1214,13 @@ fn perform_sync_from_peer_once_inner_with_policy(
             node.contains_block(*requested)
         };
         if known {
+            if lock_node(&shared)?.advance_peer_sync_cursor(
+                &observation_address,
+                sync_cursor,
+                *requested,
+            ) {
+                sync_cursor = Some(*requested);
+            }
             already_known += 1;
             previous_inventory_id = Some(*requested);
             continue;
@@ -1267,6 +1276,13 @@ fn perform_sync_from_peer_once_inner_with_policy(
             Err(error) => return Err(error.into()),
         };
         drop(monitor);
+        if lock_node(&shared)?.advance_peer_sync_cursor(
+            &observation_address,
+            sync_cursor,
+            *requested,
+        ) {
+            sync_cursor = Some(*requested);
+        }
         if accepted {
             accepted_blocks += 1;
         } else {
@@ -1419,9 +1435,10 @@ fn perform_relay_blocks_to_peer_once_inner_with_policy(
     connection.send_hello()?;
     let remote_hello = expect_hello(connection.receive()?)?;
 
-    let block_ids = {
+    let observation_address = observed_address(PeerDirection::Outbound, address);
+    let (block_ids, mut relay_cursor) = {
         let node = lock_node(&shared)?;
-        node.relay_inventory_after(remote_hello.tip, block_batch_limit)
+        node.peer_relay_inventory(&observation_address, remote_hello.tip, block_batch_limit)
     };
     let mut accepted_blocks = 0;
     let mut already_known = 0;
@@ -1457,11 +1474,19 @@ fn perform_relay_blocks_to_peer_once_inner_with_policy(
             BlockSubmissionStatus::Accepted => accepted_blocks += 1,
             BlockSubmissionStatus::AlreadyKnown => already_known += 1,
             BlockSubmissionStatus::Rejected => {
+                lock_node(&shared)?.set_peer_relay_cursor(&observation_address, relay_cursor, None);
                 return Err(P2pError::RejectedBlockSubmission(*block_id));
             }
             BlockSubmissionStatus::Busy => {
                 return Err(P2pError::BusyBlockSubmission(*block_id));
             }
+        }
+        if lock_node(&shared)?.set_peer_relay_cursor(
+            &observation_address,
+            relay_cursor,
+            Some(*block_id),
+        ) {
+            relay_cursor = Some(*block_id);
         }
     }
 
@@ -3565,6 +3590,82 @@ mod tests {
     }
 
     #[test]
+    fn single_block_batches_continue_a_competing_branch_across_sessions() {
+        check_single_block_fork_continuation(false, false);
+    }
+
+    #[test]
+    fn single_block_fork_continuation_recovers_after_receiver_restart() {
+        check_single_block_fork_continuation(true, false);
+    }
+
+    #[test]
+    fn single_block_fork_continuation_survives_a_changing_remote_tip() {
+        check_single_block_fork_continuation(false, true);
+    }
+
+    fn check_single_block_fork_continuation(restart: bool, grow: bool) {
+        let source_path = test_dir("single-fork-source");
+        let target_path = test_dir("single-fork-target");
+        let source = open_shared(&source_path);
+        let mut target = open_shared(&target_path);
+        let now = unix_time_seconds().unwrap();
+        mine(&source, 4, now);
+        mine(&target, 2, now + 20);
+        let limits = PeerLimits {
+            max_bytes_per_peer: (MAX_TRANSACTIONS_PER_SYNC * MAX_TRANSACTION_BYTES) as u64
+                + SYNC_CONTROL_RESERVE_BYTES
+                + max_block_bytes_for_network(crate::DEVNET_PROFILE.network_id) as u64,
+            ..test_limits()
+        };
+        assert_eq!(
+            block_sync_batch_limit(crate::DEVNET_PROFILE.network_id, limits),
+            1
+        );
+        let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = socket.local_addr().unwrap();
+        let listener =
+            spawn_inbound_listener_inner(Arc::clone(&source), socket, limits, Some(SOURCE_NONCE))
+                .unwrap();
+        for session in 0..(4 + usize::from(grow)) {
+            let report =
+                sync_from_peer_once_inner(Arc::clone(&target), address, limits, Some(TARGET_NONCE))
+                    .unwrap();
+            assert_eq!(report.inventory_items, 1);
+            assert_eq!(
+                report.accepted_blocks, 1,
+                "session {session} repeated a known side-chain prefix instead of continuing"
+            );
+            if session == 0 {
+                if grow {
+                    mine(&source, 1, now + 4);
+                }
+                if restart {
+                    drop(target);
+                    target = Arc::new(Mutex::new(
+                        Node::open_with_profile(&target_path, crate::DEVNET_PROFILE).unwrap(),
+                    ));
+                    let recovered = sync_from_peer_once_inner(
+                        Arc::clone(&target),
+                        address,
+                        limits,
+                        Some(TARGET_NONCE),
+                    )
+                    .unwrap();
+                    assert_eq!(recovered.already_known, 1);
+                    assert_eq!(recovered.accepted_blocks, 0);
+                }
+            }
+        }
+        assert!(tips_match(&source, &target));
+        listener.stop().unwrap();
+        drop(source);
+        drop(target);
+        clean_test_dir(&source_path);
+        clean_test_dir(&target_path);
+    }
+
+    #[test]
     fn longer_fork_converges_without_trusting_advertised_work() {
         let source_path = test_dir("fork-source");
         let target_path = test_dir("fork-target");
@@ -3590,6 +3691,71 @@ mod tests {
             target.lock().unwrap().cumulative_work()
         );
 
+        listener.stop().unwrap();
+        drop(source);
+        drop(target);
+        clean_test_dir(&source_path);
+        clean_test_dir(&target_path);
+    }
+
+    #[test]
+    fn single_block_push_batches_continue_a_competing_branch() {
+        let source_path = test_dir("single-push-source");
+        let target_path = test_dir("single-push-target");
+        let source = open_shared(&source_path);
+        let target = open_shared(&target_path);
+        let now = unix_time_seconds().unwrap();
+        mine(&source, 4, now);
+        mine(&target, 2, now + 20);
+        let target_branch = {
+            let mut node = target.lock().unwrap();
+            let genesis = node.block_locator(1);
+            node.inventory_after(&genesis, [0; 32], 2)
+                .into_iter()
+                .map(|id| {
+                    decode_block(
+                        &node.canonical_block(id).unwrap().unwrap(),
+                        crate::DEVNET_PROFILE.network_id,
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        for block in target_branch {
+            source
+                .lock()
+                .unwrap()
+                .submit_block(block, now + 30)
+                .unwrap();
+        }
+        let limits = PeerLimits {
+            max_bytes_per_peer: (MAX_TRANSACTIONS_PER_SYNC * MAX_TRANSACTION_BYTES) as u64
+                + SYNC_CONTROL_RESERVE_BYTES
+                + max_block_bytes_for_network(crate::DEVNET_PROFILE.network_id) as u64,
+            ..test_limits()
+        };
+        let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = socket.local_addr().unwrap();
+        let listener =
+            spawn_inbound_listener_inner(Arc::clone(&target), socket, limits, Some(TARGET_NONCE))
+                .unwrap();
+        for session in 0..4 {
+            let report = relay_blocks_to_peer_once_inner_with_policy(
+                Arc::clone(&source),
+                address,
+                limits,
+                PeerAddressPolicy::PrivateOnly,
+                Some(SOURCE_NONCE),
+                None,
+            )
+            .unwrap();
+            assert_eq!(report.offered_blocks, 1);
+            assert_eq!(
+                report.accepted_blocks, 1,
+                "push session {session} repeated an acknowledged prefix"
+            );
+        }
+        assert!(tips_match(&source, &target));
         listener.stop().unwrap();
         drop(source);
         drop(target);

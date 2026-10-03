@@ -2372,6 +2372,8 @@ struct PeerObservationRecord {
     active_connections: usize,
     remote_height: Option<u64>,
     remote_tip: Option<[u8; 32]>,
+    sync_cursor: Option<[u8; 32]>,
+    relay_cursor: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone)]
@@ -5564,6 +5566,8 @@ impl Node {
                     active_connections: 0,
                     remote_height: None,
                     remote_tip: None,
+                    sync_cursor: None,
+                    relay_cursor: None,
                 }),
         )
     }
@@ -6603,6 +6607,116 @@ impl Node {
             Ok(Some(record.block_bytes))
         })();
         self.latch_authenticated_storage_failure(result)
+    }
+
+    /// Include this peer's last locally validated side block before the active
+    /// locator. This bounded runtime-only hint never selects a winning chain.
+    pub(crate) fn peer_sync_locator(
+        &self,
+        address: &str,
+        max: usize,
+    ) -> (Vec<[u8; 32]>, Option<[u8; 32]>) {
+        let key = PeerObservationKey {
+            direction: PeerDirection::Outbound,
+            address: address.to_owned(),
+        };
+        let cursor = self
+            .peer_observations
+            .get(&key)
+            .and_then(|record| record.sync_cursor);
+        if let Some(block_id) = cursor.filter(|id| {
+            max > 1 && self.index.contains(*id) && self.index.active_position(*id).is_none()
+        }) {
+            let mut locator = self.block_locator(max - 1);
+            locator.insert(0, block_id);
+            (locator, cursor)
+        } else {
+            (self.block_locator(max), cursor)
+        }
+    }
+
+    /// Only durable, consensus-validated blocks may become continuation hints.
+    /// Compare-and-set prevents an older concurrent session rewinding progress.
+    pub(crate) fn advance_peer_sync_cursor(
+        &mut self,
+        address: &str,
+        expected: Option<[u8; 32]>,
+        block_id: [u8; 32],
+    ) -> bool {
+        if !self.index.contains(block_id) {
+            return false;
+        }
+        let key = PeerObservationKey {
+            direction: PeerDirection::Outbound,
+            address: address.to_owned(),
+        };
+        let Some(record) = self.peer_observations.get_mut(&key) else {
+            return false;
+        };
+        if record.sync_cursor != expected {
+            return false;
+        }
+        record.sync_cursor = Some(block_id);
+        true
+    }
+
+    /// Resume acknowledged pushes independently of this peer's pull cursor.
+    /// Peer acknowledgements are scheduling hints, never consensus evidence.
+    pub(crate) fn peer_relay_inventory(
+        &self,
+        address: &str,
+        peer_tip: [u8; 32],
+        max: usize,
+    ) -> (Vec<[u8; 32]>, Option<[u8; 32]>) {
+        let key = PeerObservationKey {
+            direction: PeerDirection::Outbound,
+            address: address.to_owned(),
+        };
+        let cursor = self
+            .peer_observations
+            .get(&key)
+            .and_then(|record| record.relay_cursor);
+        let effective_tip = cursor
+            .filter(|id| {
+                self.index
+                    .active_position(*id)
+                    .is_some_and(|cursor_position| {
+                        self.index
+                            .active_position(peer_tip)
+                            .is_none_or(|peer_position| peer_position < cursor_position)
+                    })
+            })
+            .unwrap_or(peer_tip);
+        let mut inventory = self.relay_inventory_after(effective_tip, max);
+        // The receiver may have restored older data after its acknowledgement.
+        // Do not let an exhausted remembered cursor hide its current branch.
+        if inventory.is_empty() && effective_tip != peer_tip {
+            inventory = self.relay_inventory_after(peer_tip, max);
+        }
+        (inventory, cursor)
+    }
+
+    pub(crate) fn set_peer_relay_cursor(
+        &mut self,
+        address: &str,
+        expected: Option<[u8; 32]>,
+        next: Option<[u8; 32]>,
+    ) -> bool {
+        if next.is_some_and(|id| !self.index.contains(id)) {
+            return false;
+        }
+        let key = PeerObservationKey {
+            direction: PeerDirection::Outbound,
+            address: address.to_owned(),
+        };
+        let Some(record) = self.peer_observations.get_mut(&key) else {
+            return false;
+        };
+        if record.relay_cursor != expected {
+            return false;
+        }
+        record.relay_cursor = next;
+        true
     }
 
     /// Builds a bounded, newest-first active-chain locator. For every nonzero
@@ -14957,6 +15071,31 @@ mod tests {
         node.submit_block(side, DEVNET_GENESIS_TIMESTAMP + 61)
             .unwrap();
         assert_eq!(node.index.active_position(side_id), None);
+        let peer = "127.0.0.1:29444";
+        node.record_peer_started(PeerDirection::Outbound, peer.to_owned(), 100);
+        assert!(!node.advance_peer_sync_cursor(peer, None, [0xaa; 32]));
+        assert!(node.advance_peer_sync_cursor(peer, None, side_id));
+        assert!(!node.advance_peer_sync_cursor(peer, None, ids[0]));
+        assert_eq!(
+            node.peer_sync_locator(peer, 2),
+            (vec![side_id, genesis], Some(side_id))
+        );
+        assert_eq!(node.peer_sync_locator(peer, 1).0, vec![genesis]);
+        assert!(node.peer_sync_locator(peer, 0).0.is_empty());
+        let continued = node.peer_sync_locator(peer, 6).0;
+        assert_eq!(continued.first(), Some(&side_id));
+        assert_eq!(continued.last(), Some(&genesis));
+        assert!(continued.len() <= 6);
+        assert_eq!(node.peer_sync_locator("127.0.0.2:29444", 6).0, locator);
+        assert!(!node.set_peer_relay_cursor(peer, None, Some([0xaa; 32])));
+        assert!(node.set_peer_relay_cursor(peer, None, Some(ids[3])));
+        assert_eq!(node.peer_relay_inventory(peer, side_id, 1).0, vec![ids[4]]);
+        assert_eq!(node.peer_relay_inventory(peer, ids[5], 1).0, vec![ids[6]]);
+        assert_eq!(node.peer_sync_locator(peer, 2).0, vec![side_id, genesis]);
+        assert!(!node.set_peer_relay_cursor(peer, None, None));
+        assert!(node.set_peer_relay_cursor(peer, Some(ids[3]), ids.last().copied()));
+        assert_eq!(node.peer_relay_inventory(peer, side_id, 1).0, vec![ids[0]]);
+        assert!(node.set_peer_relay_cursor(peer, ids.last().copied(), None));
         assert_eq!(
             node.inventory_after(&[side_id, ids[3]], [0; 32], 3),
             ids[4..7].to_vec()

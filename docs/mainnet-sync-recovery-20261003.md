@@ -6,6 +6,18 @@ fork state. The receiver treated that disconnect like cancellation of an
 unsolicited submission, discarded the completed download, and retried the same
 block. Its generic cancellation error could appear as a proof-capacity timeout.
 
+An additional starvation bug affected competing branches longer than the per-
+session block batch. The active-chain-only locator omitted validated side-chain
+progress, so a one-block mainnet batch could request the same known prefix forever.
+Each outbound peer now retains a bounded, runtime-only continuation hint, updated
+only after a block is locally validated or already known. A side-block hint leads
+the next locator, followed by an active-chain fallback and genesis. Concurrent
+sessions cannot overwrite a newer hint with stale state. After restart the first
+known prefix rebuilds the hint; no chain data is erased or trusted from the peer.
+One-sided push relay separately retains the last acknowledged block. It resumes
+the next bounded push from that block, clearing the hint if the receiver rejects
+the continuation. Acknowledgements never determine local chain selection.
+
 The serving side now allows the existing bounded 120-second block-processing
 budget for the next message after serving a block. The overall session deadline,
 message/byte limits and shutdown cancellation remain enforced.

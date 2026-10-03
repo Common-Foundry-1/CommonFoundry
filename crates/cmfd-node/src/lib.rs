@@ -6626,8 +6626,10 @@ impl Node {
         self.latch_authenticated_storage_failure(result)
     }
 
-    /// Include this peer's last locally validated side block before the active
-    /// locator. This bounded runtime-only hint never selects a winning chain.
+    /// Include this peer's last locally validated block before the active
+    /// locator. A sparse locator can skip the shared fork point, so continuation
+    /// must also advance through already-known active blocks. This bounded
+    /// runtime-only hint never selects a winning chain.
     pub(crate) fn peer_sync_locator(
         &self,
         address: &str,
@@ -6641,10 +6643,11 @@ impl Node {
             .peer_observations
             .get(&key)
             .and_then(|record| record.sync_cursor);
-        if let Some(block_id) = cursor.filter(|id| {
-            max > 1 && self.index.contains(*id) && self.index.active_position(*id).is_none()
-        }) {
+        if let Some(block_id) =
+            cursor.filter(|id| max > 1 && *id != self.index.genesis && self.index.contains(*id))
+        {
             let mut locator = self.block_locator(max - 1);
+            locator.retain(|id| *id != block_id);
             locator.insert(0, block_id);
             (locator, cursor)
         } else {
@@ -15281,6 +15284,28 @@ mod tests {
             node.inventory_after(&[side_id, ids[3]], [0; 32], 3),
             ids[4..7].to_vec()
         );
+        for block_id in [ids[0], ids[3], *ids.last().unwrap(), genesis] {
+            let previous = node.peer_sync_locator(peer, 0).1;
+            assert!(node.advance_peer_sync_cursor(peer, previous, block_id));
+            assert!(!node.advance_peer_sync_cursor(peer, previous, side_id));
+            for max in [0, 1, 2, 6, 64] {
+                let (continued, token) = node.peer_sync_locator(peer, max);
+                assert_eq!(token, Some(block_id));
+                assert!(continued.len() <= max);
+                let unique: std::collections::HashSet<_> = continued.iter().collect();
+                assert_eq!(unique.len(), continued.len());
+                if max == 0 {
+                    assert!(continued.is_empty());
+                } else {
+                    assert_eq!(continued.last(), Some(&genesis));
+                    if max > 1 && block_id != genesis {
+                        assert_eq!(continued.first(), Some(&block_id));
+                    } else {
+                        assert_eq!(continued, node.block_locator(max));
+                    }
+                }
+            }
+        }
         drop(node);
         clean_test_dir(&path);
     }

@@ -3634,6 +3634,94 @@ mod tests {
     }
 
     #[test]
+    fn single_block_sync_crosses_a_known_active_prefix_after_sparse_locator() {
+        let source_path = test_dir("sparse-active-prefix-source");
+        let target_path = test_dir("sparse-active-prefix-target");
+        let source = open_shared(&source_path);
+        let target = open_shared(&target_path);
+        let now = unix_time_seconds().unwrap();
+        for offset in 0..16 {
+            let block = source
+                .lock()
+                .unwrap()
+                .mine_once(
+                    default_miner_destination(),
+                    now + offset,
+                    DEFAULT_MINING_ATTEMPTS,
+                )
+                .unwrap();
+            target
+                .lock()
+                .unwrap()
+                .submit_block(block, now + offset)
+                .unwrap();
+        }
+        mine(&target, 13, now + 100);
+        mine(&source, 14, now + 16);
+        let (common_tip, first_known, expected_progress) = {
+            let node = source.lock().unwrap();
+            (
+                node.active_block_id_at_height(16).unwrap(),
+                node.active_block_id_at_height(14).unwrap(),
+                (14..=30)
+                    .map(|height| node.active_block_id_at_height(height).unwrap())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let locator = target.lock().unwrap().block_locator(MAX_BLOCKS_PER_SYNC);
+        assert!(!locator.contains(&common_tip));
+        assert_eq!(
+            source.lock().unwrap().inventory_after(&locator, [0; 32], 1),
+            vec![first_known],
+            "the sparse locator must initially return a known active block before the fork"
+        );
+        let limits = PeerLimits {
+            max_bytes_per_peer: (MAX_TRANSACTIONS_PER_SYNC * MAX_TRANSACTION_BYTES) as u64
+                + SYNC_CONTROL_RESERVE_BYTES
+                + max_block_bytes_for_network(crate::DEVNET_PROFILE.network_id) as u64,
+            ..test_limits()
+        };
+        assert_eq!(
+            block_sync_batch_limit(crate::DEVNET_PROFILE.network_id, limits),
+            1
+        );
+        let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = socket.local_addr().unwrap();
+        let listener =
+            spawn_inbound_listener_inner(Arc::clone(&source), socket, limits, Some(SOURCE_NONCE))
+                .unwrap();
+        let observation = observed_address(PeerDirection::Outbound, address);
+        for (session, expected_cursor) in expected_progress.into_iter().enumerate() {
+            let report =
+                sync_from_peer_once_inner(Arc::clone(&target), address, limits, Some(TARGET_NONCE))
+                    .unwrap();
+            let cursor = target
+                .lock()
+                .unwrap()
+                .peer_sync_locator(&observation, MAX_BLOCKS_PER_SYNC)
+                .1;
+            assert_eq!(report.inventory_items, 1);
+            assert_eq!(
+                cursor,
+                Some(expected_cursor),
+                "session {session} repeated a known active prefix: requested={}, accepted={}, already_known={}",
+                report.requested_blocks,
+                report.accepted_blocks,
+                report.already_known
+            );
+            assert_eq!(report.already_known, usize::from(session < 3));
+            assert_eq!(report.accepted_blocks, usize::from(session >= 3));
+        }
+        assert!(tips_match(&source, &target));
+        assert_eq!(target.lock().unwrap().peer_hello().height, 30);
+        listener.stop().unwrap();
+        drop(source);
+        drop(target);
+        clean_test_dir(&source_path);
+        clean_test_dir(&target_path);
+    }
+
+    #[test]
     fn single_block_fork_continuation_recovers_after_receiver_restart() {
         check_single_block_fork_continuation(true, false);
     }

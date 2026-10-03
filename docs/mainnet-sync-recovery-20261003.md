@@ -1,5 +1,15 @@
 # Mainnet block-download timeout recovery
 
+The sync.4 follow-up also preserves continuation through already-known active
+blocks. A sparse locator can skip the actual shared fork point. With a one-block
+batch, the peer then returns a known active ancestor before the competing branch.
+Ignoring that active cursor repeated the same ancestor forever without requesting
+the next block. Any locally validated non-genesis cursor now leads the next
+locator, with duplicates removed and the bounded active-chain/genesis fallback
+retained. The regression uses 16 shared blocks followed by competing branches;
+it fails on the second poll before the fix and then advances through three known
+blocks and fourteen new blocks to the exact stronger-chain tip afterward.
+
 The sync.3 follow-up distinguishes intrinsic invalid transactions from local
 chain/mempool policy rejections when scoring a peer. Missing or immature inputs,
 conflicts and local policy differences must not ban an honest ahead peer during
@@ -23,7 +33,7 @@ An additional starvation bug affected competing branches longer than the per-
 session block batch. The active-chain-only locator omitted validated side-chain
 progress, so a one-block mainnet batch could request the same known prefix forever.
 Each outbound peer now retains a bounded, runtime-only continuation hint, updated
-only after a block is locally validated or already known. A side-block hint leads
+only after a block is locally validated or already known. The validated hint leads
 the next locator, followed by an active-chain fallback and genesis. Concurrent
 sessions cannot overwrite a newer hint with stale state. After restart the first
 known prefix rebuilds the hint; no chain data is erased or trusted from the peer.

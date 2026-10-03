@@ -1,5 +1,18 @@
 # Mainnet block-download timeout recovery
 
+The sync.3 follow-up distinguishes intrinsic invalid transactions from local
+chain/mempool policy rejections when scoring a peer. Missing or immature inputs,
+conflicts and local policy differences must not ban an honest ahead peer during
+catch-up. Transaction acceptance rules are unchanged; intrinsic key-signature and
+wire/protocol protections remain, and logs include the actual rejection cause.
+
+Ancestor reconstruction also consults the existing generation-bound successful
+proof cache. Every cache miss still executes the real verifier, and successful
+evidence is retained immediately so a canceled retry does not repeat all prior
+proof work. Durable records are still authenticated and every transaction/state
+transition is checked. The cache remains process-local and bounded at 1,024
+entries; this is not an unbounded-history state-checkpoint mechanism.
+
 A serving peer previously returned a requested block, then applied its ordinary
 10-second idle timeout while the receiver verified the proof or reconstructed
 fork state. The receiver treated that disconnect like cancellation of an

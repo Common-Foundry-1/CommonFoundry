@@ -2130,6 +2130,22 @@ impl BlockPreverifier {
         }
     }
 
+    /// Reuses only successful process-local proof evidence while reconstructing
+    /// authenticated ancestors. Cache misses still execute the configured
+    /// verifier; neither a durable locator nor a startup snapshot grants proof
+    /// authority. The bounded cache may evict old history, which must be verified
+    /// again rather than treated as a trusted checkpoint.
+    fn preverify_replay_cached(&self, block: &Block) -> Result<PreverifiedBlockProof, NodeError> {
+        let cache_key = canonical_block_cache_digest(block)?;
+        if let Some(preverified) = self.cached_preverification(cache_key)? {
+            return Ok(preverified);
+        }
+        let generation = self.backend_generation.load(Ordering::Acquire);
+        let preverified = self.preverify_unqueued(block, None)?;
+        self.remember_preverification(cache_key, generation, preverified.clone())?;
+        Ok(preverified)
+    }
+
     #[cfg(test)]
     pub(crate) fn set_proof_dispatch_delay(&self, delay: Option<Duration>) {
         *self.proof_dispatch_delay.lock().unwrap() = delay;
@@ -4159,14 +4175,15 @@ fn complete_branch_state_plan(
         let context = BlockValidationContext {
             now_unix_seconds: entry.accepted_at(),
         };
-        // This reconstruction path exists only for externally admitted
-        // ProductionV3 side branches. Never recover proof authority from the
-        // index: freshly preverify the exact locator-backed block each time.
-        let preverified = match block_preverifier.preverify_unqueued(&block, None) {
+        // Never recover proof authority from the index. Reuse only an exact
+        // successful process-local capability, or verify the locator-backed
+        // block on a cache miss. Retaining successful evidence lets a later
+        // request make progress after an earlier replay loses its checkpoint.
+        let preverified = match block_preverifier.preverify_replay_cached(&block) {
             Ok(preverified) => preverified,
             Err(NodeError::ProofVerifierWorker(VerifierWorkerError::ProofRejected(error))) => {
                 return Err(NodeError::CorruptLog(format!(
-                    "indexed production block proof is rejected during fresh fork replay: {error}"
+                    "indexed production block proof is rejected during fork replay: {error}"
                 )));
             }
             Err(error) => return Err(error),
@@ -4175,7 +4192,7 @@ fn complete_branch_state_plan(
             .validate_block_preverified(&block, context, &preverified)
             .map_err(|error| {
                 NodeError::CorruptLog(format!(
-                    "captured production fork block fails freshly preverified replay: {error}"
+                    "captured production fork block fails preverified replay: {error}"
                 ))
             })?;
         state.commit_validated(validated).map_err(|error| {
@@ -12258,6 +12275,69 @@ mod tests {
     }
 
     #[test]
+    fn replay_capability_cache_is_exact_generation_bound_and_preserves_body_checks() {
+        let path = test_dir("replay-capability-cache-authority");
+        clean_test_dir(&path);
+        let node = Node::open(&path).unwrap();
+        let now = DEVNET_GENESIS_TIMESTAMP + 60;
+        let block = mined_candidate(&node, now);
+        let verifier = node.block_preverifier.clone();
+        let capability = verifier.preverify_replay_cached(&block).unwrap();
+        assert_eq!(verifier.worker_dispatches.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            verifier.preverify_replay_cached(&block).unwrap(),
+            capability
+        );
+        assert_eq!(verifier.worker_dispatches.load(Ordering::Relaxed), 1);
+
+        let mut changed_proof = block.clone();
+        let BlockProof::V2Reference(proof) = &mut changed_proof.proof else {
+            unreachable!();
+        };
+        proof.work_digest[0] ^= 1;
+        assert!(verifier.preverify_replay_cached(&changed_proof).is_err());
+        assert_eq!(verifier.worker_dispatches.load(Ordering::Relaxed), 2);
+        assert!(
+            verifier
+                .cached_preverification(canonical_block_cache_digest(&changed_proof).unwrap())
+                .unwrap()
+                .is_none()
+        );
+
+        let mut changed_body = block.clone();
+        changed_body.coinbase.outputs[0].value += 1;
+        assert_ne!(
+            canonical_block_cache_digest(&changed_body).unwrap(),
+            canonical_block_cache_digest(&block).unwrap()
+        );
+        assert!(
+            node.state
+                .validate_block_preverified(
+                    &changed_body,
+                    BlockValidationContext {
+                        now_unix_seconds: now
+                    },
+                    &capability,
+                )
+                .is_err(),
+            "a proof capability must never authorize changed transaction/coinbase state"
+        );
+
+        // Even if stale entries remain present, a new backend generation must
+        // really verify again before issuing reusable evidence for that epoch.
+        verifier.backend_generation.fetch_add(1, Ordering::AcqRel);
+        verifier.preverify_replay_cached(&block).unwrap();
+        assert_eq!(verifier.worker_dispatches.load(Ordering::Relaxed), 3);
+        verifier.shutdown();
+        assert!(matches!(
+            verifier.preverify_replay_cached(&block),
+            Err(NodeError::ProofVerifierShuttingDown)
+        ));
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
     fn cached_proof_waits_for_remote_admission_without_redispatch() {
         let path = test_dir("proof-capability-cache-remote-admission");
         clean_test_dir(&path);
@@ -12572,6 +12652,88 @@ mod tests {
     }
 
     #[test]
+    fn replay_capability_cache_reuses_completed_slices_and_verifies_new_candidate() {
+        let path = test_dir("replay-capability-cache-retry");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        let slice = MAX_EXTERNAL_RECONSTRUCTION_BLOCKS_PER_SLICE as u64;
+        let mut parent = node.params.genesis_hash;
+        let mut fork_parent = parent;
+        for height in 1..=slice + 2 {
+            let now = DEVNET_GENESIS_TIMESTAMP + height * 60;
+            let block = mined_child(&node, parent, now, height as u8);
+            node.submit_block(block.clone(), now).unwrap();
+            parent = block.block_id();
+            if height == slice + 1 {
+                fork_parent = parent;
+            }
+        }
+        let now = DEVNET_GENESIS_TIMESTAMP + (slice + 2) * 60;
+        let candidate = mined_child(&node, fork_parent, now, 0xE1);
+        node.profile.proof = ProofProfile::ProductionV4;
+        let verifier = node.block_preverifier.clone();
+        let initial_dispatches = verifier.worker_dispatches.load(Ordering::Relaxed);
+
+        // A canceled request drops its work-local state, but successful proof
+        // evidence from its completed slice must survive for the next request.
+        let first = node
+            .begin_external_block_admission(&candidate, now)
+            .unwrap()
+            .unwrap()
+            .complete(&candidate)
+            .unwrap();
+        assert!(matches!(
+            first,
+            ExternalBlockAdmissionProgress::Checkpoint { .. }
+        ));
+        drop(first);
+        assert_eq!(
+            verifier.worker_dispatches.load(Ordering::Relaxed),
+            initial_dispatches + slice
+        );
+
+        let retry = node
+            .begin_external_block_admission(&candidate, now)
+            .unwrap()
+            .unwrap()
+            .complete(&candidate)
+            .unwrap();
+        let ExternalBlockAdmissionProgress::Checkpoint { checkpoint } = retry else {
+            panic!("retry should still need its final ancestor slice");
+        };
+        assert_eq!(
+            verifier.worker_dispatches.load(Ordering::Relaxed),
+            initial_dispatches + slice,
+            "retry must not redispatch successfully verified ancestors"
+        );
+        let completed = node
+            .continue_external_block_admission(&candidate, now, checkpoint)
+            .unwrap()
+            .complete(&candidate)
+            .unwrap();
+        assert!(matches!(
+            completed,
+            ExternalBlockAdmissionProgress::Ready(_)
+        ));
+        drop(completed);
+        assert_eq!(
+            verifier.worker_dispatches.load(Ordering::Relaxed),
+            initial_dispatches + slice + 1
+        );
+
+        let shared = Arc::new(Mutex::new(node));
+        submit_shared_block(&shared, candidate.clone(), now).unwrap();
+        assert_eq!(
+            verifier.worker_dispatches.load(Ordering::Relaxed),
+            initial_dispatches + slice + 2,
+            "only the new candidate should need another real verification"
+        );
+        assert!(shared.lock().unwrap().index.contains(candidate.block_id()));
+        drop(shared);
+        clean_test_dir(&path);
+    }
+
+    #[test]
     fn production_side_admission_is_external_revision_bound_and_fail_closed() {
         let path = test_dir("production-side-admission");
         clean_test_dir(&path);
@@ -12677,6 +12839,22 @@ mod tests {
             .unwrap();
         let child = mined_child(&node, side.block_id(), t2, 0x62);
 
+        // A warm proof cache must not bypass the durable record authentication
+        // performed before any replay capability is consulted.
+        node.profile.proof = ProofProfile::ProductionV3;
+        drop(
+            node.begin_external_block_admission(&child, t2)
+                .unwrap()
+                .unwrap()
+                .complete(&child)
+                .unwrap(),
+        );
+        assert!(
+            node.block_preverifier
+                .cached_preverification(canonical_block_cache_digest(&side).unwrap())
+                .unwrap()
+                .is_some()
+        );
         let original_locator = node.index.blocks[&side.block_id()].locator;
         Arc::get_mut(node.index.blocks.get_mut(&side.block_id()).unwrap())
             .unwrap()
@@ -12729,6 +12907,9 @@ mod tests {
             .unwrap();
         let child = mined_child(&node, side.block_id(), t2, 0x73);
 
+        node.block_preverifier
+            .preverify_replay_cached(&side)
+            .unwrap();
         // Preserve every field used by cheap successor preflight while making
         // the retained index snapshot unequal to the freshly replayed state.
         let mut alternate_params = node.params;

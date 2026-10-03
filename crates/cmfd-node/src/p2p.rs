@@ -16,7 +16,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cmfd_consensus::{
-    Block, MAX_TRANSACTION_BYTES, Transaction, WireError, decode_block, max_block_bytes_for_network,
+    Block, ChainError, MAX_TRANSACTION_BYTES, Transaction, WireError, decode_block,
+    max_block_bytes_for_network,
 };
 use thiserror::Error;
 
@@ -1731,6 +1732,7 @@ fn perform_respond_to_peer_inner_with_policy(
                 connection.send(PeerMessage::Transaction(transaction))?;
             }
             PeerMessage::Transaction(transaction) => {
+                let txid = transaction.txid();
                 let admission = {
                     let mut node = lock_node(&shared)?;
                     node.submit_transaction(transaction)
@@ -1739,11 +1741,20 @@ fn perform_respond_to_peer_inner_with_policy(
                     Ok(_) | Err(NodeError::DuplicateMempoolTransaction(_)) => {}
                     Err(NodeError::MempoolTransactionLimit | NodeError::MempoolByteLimit) => {}
                     Err(error) if error.client_error().status < 500 => {
-                        if options.security.record_failure(
-                            remote_address.ip(),
-                            INVALID_TRANSACTION_PENALTY,
-                            "deterministically rejected transaction",
-                        )? {
+                        let peer_fault = transaction_rejection_is_peer_fault(&error);
+                        tracing::debug!(
+                            txid = %hex::encode(txid),
+                            %error,
+                            peer_fault,
+                            "rejected relayed transaction"
+                        );
+                        if peer_fault
+                            && options.security.record_failure(
+                                remote_address.ip(),
+                                INVALID_TRANSACTION_PENALTY,
+                                "intrinsically invalid transaction",
+                            )?
+                        {
                             return Err(P2pError::PeerTemporarilyBanned(remote_address.ip()));
                         }
                     }
@@ -1830,6 +1841,34 @@ fn perform_respond_to_peer_inner_with_policy(
 
 fn is_retryable_block_admission(error: &NodeError) -> bool {
     error.client_error().retryable
+}
+
+/// Blame a relaying peer only for invalidity intrinsic to the transaction.
+/// Missing/immature inputs, conflicts, fees, custody policy and aggregate
+/// mempool limits can differ between honest nodes, especially during catch-up.
+/// Unknown errors stay nonpunitive; malformed wire frames are handled separately.
+fn transaction_rejection_is_peer_fault(error: &NodeError) -> bool {
+    matches!(
+        error,
+        NodeError::Chain(
+            ChainError::WrongNetwork
+                | ChainError::UnsupportedTransactionVersion
+                | ChainError::NoInputs
+                | ChainError::NoOutputs
+                | ChainError::ZeroValueOutput
+                | ChainError::MalformedSignature
+                | ChainError::InvalidSignature
+                | ChainError::TransactionInputLimit
+                | ChainError::TransactionOutputLimit
+                | ChainError::SignatureLength
+        ) | NodeError::Wire(
+            WireError::WrongNetworkId { .. }
+                | WireError::SizeLimit { .. }
+                | WireError::CountLimit { .. }
+                | WireError::SignatureLength { .. }
+                | WireError::LengthOverflow
+        )
+    )
 }
 
 fn inbound_reputation_penalty(error: &P2pError) -> (u16, &'static str) {
@@ -3898,6 +3937,222 @@ mod tests {
         drop(seed);
         clean_test_dir(&wallet_path);
         clean_test_dir(&seed_path);
+    }
+
+    #[test]
+    fn transaction_peer_fault_classification_excludes_local_state_and_policy() {
+        let outpoint = OutPoint {
+            txid: [0x31; 32],
+            index: 0,
+        };
+        let nonpunitive = [
+            NodeError::DuplicateMempoolTransaction([0x32; 32]),
+            NodeError::MempoolUnconfirmedInput(outpoint),
+            NodeError::MempoolInputConflict(outpoint),
+            NodeError::ExchangeWithdrawalInputReserved(outpoint),
+            NodeError::ExchangeWithdrawalReservationMismatch(outpoint),
+            NodeError::ExchangeCustodyV3WalletExclusive,
+            NodeError::MempoolTransactionLimit,
+            NodeError::MempoolByteLimit,
+            NodeError::MempoolFeeTooLow {
+                required: 2,
+                actual: 1,
+            },
+            NodeError::Chain(ChainError::MissingInput),
+            NodeError::Chain(ChainError::ImmatureInput(100)),
+            NodeError::Chain(ChainError::DuplicateInput),
+            NodeError::Chain(ChainError::WrongOwner),
+            NodeError::Chain(ChainError::WrongWitness),
+            NodeError::Chain(ChainError::CreatesValue),
+            NodeError::Chain(ChainError::FeeTooLow {
+                required: 2,
+                actual: 1,
+            }),
+            NodeError::Chain(ChainError::AmountOverflow),
+            NodeError::Chain(ChainError::ChannelCloseShape),
+            NodeError::Chain(ChainError::BlockTransactionLimit),
+            NodeError::Chain(ChainError::BlockAggregateLimit),
+            NodeError::Chain(ChainError::BlockSignatureLimit),
+        ];
+        for error in nonpunitive {
+            assert!(!transaction_rejection_is_peer_fault(&error), "{error}");
+        }
+        let intrinsic = [
+            NodeError::Chain(ChainError::WrongNetwork),
+            NodeError::Chain(ChainError::UnsupportedTransactionVersion),
+            NodeError::Chain(ChainError::NoInputs),
+            NodeError::Chain(ChainError::NoOutputs),
+            NodeError::Chain(ChainError::ZeroValueOutput),
+            NodeError::Chain(ChainError::MalformedSignature),
+            NodeError::Chain(ChainError::InvalidSignature),
+            NodeError::Chain(ChainError::TransactionInputLimit),
+            NodeError::Chain(ChainError::TransactionOutputLimit),
+            NodeError::Chain(ChainError::SignatureLength),
+            NodeError::Wire(WireError::SignatureLength { actual: 63 }),
+        ];
+        for error in intrinsic {
+            assert!(transaction_rejection_is_peer_fault(&error), "{error}");
+        }
+        let malformed_frame =
+            P2pError::Peer(PeerError::ConsensusWire(WireError::SignatureLength {
+                actual: 63,
+            }));
+        assert_eq!(
+            inbound_reputation_penalty(&malformed_frame).0,
+            PROTOCOL_VIOLATION_PENALTY
+        );
+    }
+
+    #[test]
+    fn relayed_invalid_signatures_still_ban_the_peer() {
+        let path = test_dir("invalid-signature-relay");
+        let target = open_shared(&path);
+        let invalid = {
+            let mut node = target.lock().unwrap();
+            let funding = node
+                .mine_once(
+                    default_miner_destination(),
+                    unix_time_seconds().unwrap(),
+                    DEFAULT_MINING_ATTEMPTS,
+                )
+                .unwrap();
+            let mut transaction = spend_community_output(&node, &funding, 10);
+            transaction.outputs[0].value -= 1;
+            assert!(matches!(
+                node.submit_transaction(transaction.clone()),
+                Err(NodeError::Chain(ChainError::InvalidSignature))
+            ));
+            transaction
+        };
+        let initial_tip = target.lock().unwrap().peer_hello().tip;
+        let (listener, address) = start_listener(Arc::clone(&target), TARGET_NONCE);
+        let hello = with_nonce(target.lock().unwrap().peer_hello(), Some(SOURCE_NONCE));
+        let session = PeerSession::new(hello, test_limits()).unwrap();
+        let mut client = PeerConnection::connect(address, session).unwrap();
+        client.send_hello().unwrap();
+        assert!(matches!(client.receive().unwrap(), PeerMessage::Hello(_)));
+        for index in 0..4 {
+            client
+                .send(PeerMessage::Transaction(invalid.clone()))
+                .unwrap();
+            client.send(PeerMessage::GetMempool).unwrap();
+            let response = client.receive();
+            if index < 3 {
+                assert_eq!(
+                    response.unwrap(),
+                    PeerMessage::TransactionInventory { txids: Vec::new() }
+                );
+            } else {
+                assert!(response.is_err());
+            }
+        }
+        assert!(listener.peer_is_temporarily_banned(address.ip()).unwrap());
+        assert_eq!(target.lock().unwrap().mempool_entries().len(), 0);
+        assert_eq!(target.lock().unwrap().peer_hello().tip, initial_tip);
+        drop(client);
+        listener.stop().unwrap();
+        drop(target);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn ahead_peer_transactions_do_not_ban_a_catching_up_receiver() {
+        let source_path = test_dir("ahead-transaction-source");
+        let target_path = test_dir("ahead-transaction-target");
+        let source = open_shared(&source_path);
+        let target = open_shared(&target_path);
+        let transactions = {
+            let mut node = source.lock().unwrap();
+            let now = unix_time_seconds().unwrap();
+            let funding: Vec<_> = (0..4)
+                .map(|offset| {
+                    node.mine_once(
+                        default_miner_destination(),
+                        now + offset,
+                        DEFAULT_MINING_ATTEMPTS,
+                    )
+                    .unwrap()
+                })
+                .collect();
+            funding
+                .iter()
+                .map(|block| {
+                    let transaction = spend_community_output(&node, block, 10);
+                    node.submit_transaction(transaction.clone()).unwrap();
+                    transaction
+                })
+                .collect::<Vec<_>>()
+        };
+        let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = socket.local_addr().unwrap();
+        let discovery = Arc::new(PeerDiscovery::open(
+            &target_path,
+            target.lock().unwrap().peer_hello(),
+            address,
+            PeerAddressPolicy::PrivateOnly,
+        ));
+        let listener = spawn_inbound_listener_inner_with_policy(
+            Arc::clone(&target),
+            socket,
+            test_limits(),
+            PeerAddressPolicy::PrivateOnly,
+            Some(TARGET_NONCE),
+            Some(Arc::clone(&discovery)),
+        )
+        .unwrap();
+        let hello = with_nonce(source.lock().unwrap().peer_hello(), Some(SOURCE_NONCE));
+        let session = PeerSession::new(hello, test_limits()).unwrap();
+        let mut client = PeerConnection::connect(address, session).unwrap();
+        client.send_hello().unwrap();
+        assert!(matches!(client.receive().unwrap(), PeerMessage::Hello(_)));
+
+        for transaction in transactions {
+            client.send(PeerMessage::Transaction(transaction)).unwrap();
+            client.send(PeerMessage::GetMempool).unwrap();
+            let response = client.receive();
+            assert!(
+                !listener.peer_is_temporarily_banned(address.ip()).unwrap(),
+                "an honest ahead peer must not be banned for inputs absent from the local chain"
+            );
+            assert_eq!(
+                response.unwrap(),
+                PeerMessage::TransactionInventory { txids: Vec::new() }
+            );
+        }
+        assert_eq!(target.lock().unwrap().mempool_entries().len(), 0);
+        assert_eq!(target.lock().unwrap().peer_hello().height, 0);
+        drop(client);
+
+        let (source_listener, source_address) = start_listener(Arc::clone(&source), SOURCE_NONCE);
+        let poller = spawn_peer_polling_inner(
+            Arc::clone(&target),
+            StaticPeerConfig {
+                listen_address: address,
+                peers: vec![source_address],
+                limits: test_limits(),
+                address_policy: PeerAddressPolicy::PrivateOnly,
+            },
+            Duration::from_millis(10),
+            Some(TARGET_NONCE),
+            Some(discovery),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !tips_match(&source, &target) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            tips_match(&source, &target),
+            "block synchronization must remain available"
+        );
+        assert!(!listener.peer_is_temporarily_banned(address.ip()).unwrap());
+        poller.stop().unwrap();
+        source_listener.stop().unwrap();
+        listener.stop().unwrap();
+        drop(source);
+        drop(target);
+        clean_test_dir(&source_path);
+        clean_test_dir(&target_path);
     }
 
     #[test]

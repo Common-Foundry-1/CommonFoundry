@@ -67,11 +67,10 @@ use cmfd_node::wallet_backup::{
 };
 use cmfd_node::{
     COMPILED_NETWORK_PROFILE, DEFAULT_DATA_DIR, DEFAULT_MINING_ATTEMPTS, ExchangeCustodyV3Config,
-    ExchangeWithdrawalSecurityConfig, MainnetProofVerifierTuning, Node,
-    ProductionV4VerifierArtifacts, ProofProfile, canonical_network_info_json_with_record,
-    canonical_network_info_json_with_v4_artifacts, compiled_production_v3_worker_sha256,
-    parse_miner_destination, production_v3_package_layout, production_v4_package_artifacts,
-    spawn_rpc_server, unix_time_seconds,
+    ExchangeWithdrawalSecurityConfig, Node, ProductionV4VerifierArtifacts, ProofProfile,
+    canonical_network_info_json_with_record, canonical_network_info_json_with_v4_artifacts,
+    compiled_production_v3_worker_sha256, parse_miner_destination, production_v3_package_layout,
+    production_v4_package_artifacts, spawn_rpc_server, unix_time_seconds,
 };
 use cmfd_proof_worker::{ProductionV3VerifierRecord, VerifierWorkerConfig};
 use serde_json::json;
@@ -172,10 +171,6 @@ struct Cli {
     /// Kill the proof-verifier worker after this many milliseconds.
     #[arg(long, global = true, default_value_t = 30_000)]
     proof_verifier_timeout_ms: u64,
-    /// Opt in to 1-4 parallel mainnet block-proof verifiers on a qualified host.
-    /// Without this flag, the release's original single-verifier limits apply.
-    #[arg(long, global = true)]
-    mainnet_proof_verifiers: Option<usize>,
     /// Kill startup if model authentication and the capability handshake do not
     /// complete within this many milliseconds.
     #[arg(long, global = true, default_value_t = 900_000)]
@@ -848,19 +843,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(cmfd_proof_worker::worker_main());
     }
     let cli = parse_cli()?;
-    let mainnet_proof_tuning = cli
-        .mainnet_proof_verifiers
-        .map(MainnetProofVerifierTuning::new)
-        .transpose()?;
-    if mainnet_proof_tuning.is_some()
-        && (!cfg!(feature = "production-mainnet")
-            || !matches!(
-                &cli.command,
-                Command::Run { .. } | Command::PoolServe { .. }
-            ))
-    {
-        return Err("--mainnet-proof-verifiers is only for mainnet run and pool-serve".into());
-    }
     validate_exchange_withdrawal_cli(&cli)?;
     if matches!(
         &cli.command,
@@ -1614,14 +1596,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (peers, allow_public_peers) =
                 effective_operational_peers(peers, allow_public_peers, no_default_seeds)?;
             let address_policy = peer_address_policy(allow_public_peers);
-            let mut node = open_node_tuned(
+            let mut node = open_node(
                 &cli.data_dir,
                 production_v3_record.as_ref(),
                 production_v4_artifacts.as_ref(),
                 verifier_worker.as_ref(),
                 wallet_passphrase.as_ref().map(|value| value.as_slice()),
                 exchange_withdrawal_security.as_ref(),
-                mainnet_proof_tuning,
             )?;
             node.set_public_peer_mode(allow_public_peers);
             let discovery_hello = node.peer_hello();
@@ -1940,14 +1921,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             let address_policy = peer_address_policy(allow_public_peers);
-            let mut node_instance = open_node_tuned(
+            let mut node_instance = open_node(
                 &cli.data_dir,
                 production_v3_record.as_ref(),
                 production_v4_artifacts.as_ref(),
                 verifier_worker.as_ref(),
                 wallet_passphrase.as_ref().map(|value| value.as_slice()),
                 exchange_withdrawal_security.as_ref(),
-                mainnet_proof_tuning,
             )?;
             node_instance.set_public_peer_mode(allow_public_peers);
             let discovery_hello = node_instance.peer_hello();
@@ -2599,36 +2579,14 @@ fn open_node(
     wallet_passphrase: Option<&[u8]>,
     exchange_withdrawal_security: Option<&ExchangeWithdrawalSecurityConfig>,
 ) -> Result<Node, Box<dyn std::error::Error>> {
-    open_node_tuned(
-        data_dir,
-        production_v3_record,
-        production_v4_artifacts,
-        verifier_worker,
-        wallet_passphrase,
-        exchange_withdrawal_security,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn open_node_tuned(
-    data_dir: &PathBuf,
-    production_v3_record: Option<&ProductionV3VerifierRecord>,
-    production_v4_artifacts: Option<&ProductionV4VerifierArtifacts>,
-    verifier_worker: Option<&VerifierWorkerConfig>,
-    wallet_passphrase: Option<&[u8]>,
-    exchange_withdrawal_security: Option<&ExchangeWithdrawalSecurityConfig>,
-    tuning: Option<MainnetProofVerifierTuning>,
-) -> Result<Node, Box<dyn std::error::Error>> {
     Ok(
-        Node::open_with_runtime_security_wallet_and_exchange_withdrawal_tuned(
+        Node::open_with_runtime_security_wallet_and_exchange_withdrawal(
             data_dir,
             production_v3_record,
             production_v4_artifacts,
             verifier_worker,
             wallet_passphrase,
             exchange_withdrawal_security,
-            tuning,
         )?,
     )
 }
@@ -2954,17 +2912,6 @@ fn peer_warning(allow_public_peers: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn mainnet_verifier_capacity_is_explicit_and_bounded() {
-        let default = Cli::try_parse_from(["cmfd-node", "run"]).unwrap();
-        assert_eq!(default.mainnet_proof_verifiers, None);
-        let tuned =
-            Cli::try_parse_from(["cmfd-node", "--mainnet-proof-verifiers", "4", "run"]).unwrap();
-        assert_eq!(tuned.mainnet_proof_verifiers, Some(4));
-        assert!(MainnetProofVerifierTuning::new(4).is_ok());
-        assert!(MainnetProofVerifierTuning::new(5).is_err());
-    }
 
     #[cfg(feature = "production-v4")]
     fn distinct_frame(steward: &[u8], community: &[u8]) -> Vec<u8> {

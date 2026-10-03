@@ -371,6 +371,8 @@ pub enum PeerError {
     IdleTimeout,
     #[error("peer block-submission response exceeded its dedicated timeout")]
     SubmitBlockResponseTimeout,
+    #[error("peer did not resume after the bounded downloaded-block validation wait")]
+    BlockValidationWaitTimeout,
     #[error("peer connection was cancelled")]
     Cancelled,
     #[error("peer closed the connection")]
@@ -1620,6 +1622,20 @@ impl PeerConnection {
             .checked_add(SUBMIT_BLOCK_RESPONSE_BUDGET)
             .ok_or(PeerError::InvalidLimits)?;
         self.receive_before(Some(deadline))
+    }
+
+    /// A peer that requested a block may need to verify its proof and replay
+    /// fork state before requesting the next item. Keep this one receive
+    /// bounded by both the block-validation budget and the session lifetime.
+    pub(crate) fn receive_after_served_block(&mut self) -> Result<PeerMessage, PeerError> {
+        let deadline = Instant::now()
+            .checked_add(SUBMIT_BLOCK_RESPONSE_BUDGET)
+            .ok_or(PeerError::InvalidLimits)?;
+        self.receive_before(Some(deadline))
+            .map_err(|error| match error {
+                PeerError::SubmitBlockResponseTimeout => PeerError::BlockValidationWaitTimeout,
+                other => other,
+            })
     }
 
     fn receive_before(

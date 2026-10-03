@@ -180,6 +180,7 @@ impl P2pError {
                     | PeerError::TotalTimeout
                     | PeerError::IdleTimeout
                     | PeerError::SubmitBlockResponseTimeout
+                    | PeerError::BlockValidationWaitTimeout
                     | PeerError::Io(_)
             )
         )
@@ -1246,7 +1247,14 @@ fn perform_sync_from_peer_once_inner_with_policy(
         let acceptance_deadline =
             checked_submit_deadline(Instant::now(), SUBMIT_BLOCK_ACCEPTANCE_BUDGET)?;
         let request = RemoteProofRequest::new(acceptance_deadline);
-        let monitor = PeerSubmissionMonitor::start(&connection, request.clone())?;
+        // We requested and received this complete, bounded block. Its source
+        // may close an idle connection while we verify it or reconstruct a
+        // fork. That must not discard local progress and repeat the same work
+        // forever. Local shutdown and the fixed admission deadline still win.
+        let monitor = PeerSubmissionMonitor::local_validation(
+            active_sockets.map(|registry| Arc::clone(&registry.stopping)),
+            request.clone(),
+        )?;
         let accepted = match submit_shared_peer_block_cancellable(
             &shared,
             block,
@@ -1637,8 +1645,15 @@ fn perform_respond_to_peer_inner_with_policy(
         remote_hello,
     );
 
+    let mut block_was_served = false;
     loop {
-        let message = match connection.receive() {
+        let received = if block_was_served {
+            connection.receive_after_served_block()
+        } else {
+            connection.receive()
+        };
+        block_was_served = false;
+        let message = match received {
             Ok(message) => message,
             Err(PeerError::ConnectionClosed) => return Ok(()),
             Err(error) => return Err(error.into()),
@@ -1665,6 +1680,7 @@ fn perform_respond_to_peer_inner_with_policy(
                     });
                 }
                 connection.send(PeerMessage::Block(block))?;
+                block_was_served = true;
             }
             PeerMessage::GetMempool => {
                 let txids = {
@@ -1806,6 +1822,7 @@ fn inbound_reputation_penalty(error: &P2pError) -> (u16, &'static str) {
             | PeerError::TotalTimeout
             | PeerError::IdleTimeout
             | PeerError::SubmitBlockResponseTimeout
+            | PeerError::BlockValidationWaitTimeout
             | PeerError::Io(_),
         ) => (TRANSIENT_FAILURE_PENALTY, "inbound transport churn"),
         P2pError::Peer(_) | P2pError::UnexpectedMessage { .. } => {
@@ -1830,6 +1847,7 @@ fn outbound_reputation_penalty(error: &P2pError) -> (u16, &'static str) {
             | PeerError::TotalTimeout
             | PeerError::IdleTimeout
             | PeerError::SubmitBlockResponseTimeout
+            | PeerError::BlockValidationWaitTimeout
             | PeerError::Cancelled
             | PeerError::Io(_),
         )
@@ -1886,6 +1904,35 @@ struct PeerSubmissionMonitor {
 }
 
 impl PeerSubmissionMonitor {
+    fn local_validation(
+        cancellation: Option<Arc<AtomicBool>>,
+        request: RemoteProofRequest,
+    ) -> Result<Self, P2pError> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = if let Some(cancellation) = cancellation {
+            let watcher_stop = Arc::clone(&stop);
+            Some(
+                thread::Builder::new()
+                    .name("cmfd-pull-validation-monitor".to_owned())
+                    .spawn(move || {
+                        while !watcher_stop.load(Ordering::Acquire) {
+                            if cancellation.load(Ordering::Acquire)
+                                || Instant::now() >= request.deadline()
+                            {
+                                request.cancel();
+                                break;
+                            }
+                            thread::sleep(PEER_DISCONNECT_POLL_INTERVAL);
+                        }
+                    })
+                    .map_err(P2pError::ListenerIo)?,
+            )
+        } else {
+            None
+        };
+        Ok(Self { stop, thread })
+    }
+
     fn start(connection: &PeerConnection, request: RemoteProofRequest) -> Result<Self, P2pError> {
         let stream = connection.try_clone_stream()?;
         stream
@@ -4248,6 +4295,237 @@ mod tests {
         assert!(matches!(error, P2pError::Peer(PeerError::ConnectionClosed)));
         assert!(error.is_transport_disconnect());
         server.join().unwrap();
+    }
+
+    #[test]
+    fn downloaded_block_wait_keeps_the_total_session_deadline() {
+        let source_path = test_dir("download-wait-bounded-source");
+        let source = open_shared(&source_path);
+        let block = source
+            .lock()
+            .unwrap()
+            .mine_once(
+                default_miner_destination(),
+                unix_time_seconds().unwrap(),
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        let mut limits = test_limits();
+        limits.idle_timeout = Duration::from_millis(100);
+        limits.total_timeout = Duration::from_millis(650);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle =
+            spawn_inbound_listener_inner(Arc::clone(&source), listener, limits, Some(SOURCE_NONCE))
+                .unwrap();
+        let mut hello = source.lock().unwrap().peer_hello();
+        hello.node_nonce = TARGET_NONCE;
+        let session = PeerSession::new(hello, test_limits()).unwrap();
+        let mut client = PeerConnection::connect(address, session).unwrap();
+        client.send_hello().unwrap();
+        assert!(matches!(client.receive().unwrap(), PeerMessage::Hello(_)));
+        client
+            .send(PeerMessage::GetBlock {
+                block_id: block.block_id(),
+            })
+            .unwrap();
+        assert!(matches!(client.receive().unwrap(), PeerMessage::Block(_)));
+        let mut socket = client.try_clone_stream().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let started = Instant::now();
+        assert_eq!(socket.read(&mut [0u8; 1]).unwrap(), 0);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(socket);
+        drop(client);
+        handle.stop().unwrap();
+        drop(source);
+        clean_test_dir(&source_path);
+    }
+
+    #[test]
+    fn downloaded_block_validation_outlives_ordinary_peer_idle_timeout() {
+        let source_path = test_dir("slow-download-source");
+        let target_path = test_dir("slow-download-target");
+        let source = open_shared(&source_path);
+        let target = open_shared(&target_path);
+        mine(&source, 1, unix_time_seconds().unwrap());
+        target
+            .lock()
+            .unwrap()
+            .block_preverifier
+            .set_proof_dispatch_delay(Some(Duration::from_millis(400)));
+        let mut limits = test_limits();
+        limits.idle_timeout = Duration::from_millis(100);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle =
+            spawn_inbound_listener_inner(Arc::clone(&source), listener, limits, Some(SOURCE_NONCE))
+                .unwrap();
+        let report =
+            sync_from_peer_once_inner(Arc::clone(&target), address, limits, Some(TARGET_NONCE))
+                .unwrap();
+        assert_eq!(report.accepted_blocks, 1);
+        assert!(tips_match(&source, &target));
+        handle.stop().unwrap();
+        drop(source);
+        drop(target);
+        clean_test_dir(&source_path);
+        clean_test_dir(&target_path);
+    }
+
+    #[test]
+    fn downloaded_block_validation_stops_on_local_shutdown() {
+        let source_path = test_dir("stop-download-source");
+        let target_path = test_dir("stop-download-target");
+        let source = open_shared(&source_path);
+        let target = open_shared(&target_path);
+        let block = source
+            .lock()
+            .unwrap()
+            .mine_once(
+                default_miner_destination(),
+                unix_time_seconds().unwrap(),
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        let block_id = block.block_id();
+        target
+            .lock()
+            .unwrap()
+            .block_preverifier
+            .set_proof_dispatch_delay(Some(Duration::from_millis(500)));
+        let mut hello = source.lock().unwrap().peer_hello();
+        hello.node_nonce = SOURCE_NONCE;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let observer = Arc::clone(&target);
+        let registry = Arc::new(ActiveSocketRegistry::default());
+        let stopper = Arc::clone(&registry);
+        let server = thread::spawn(move || {
+            let mut connection = accept_test_peer(listener, hello);
+            assert!(matches!(
+                connection.receive().unwrap(),
+                PeerMessage::GetHeaders { .. }
+            ));
+            connection
+                .send(PeerMessage::Inventory {
+                    block_ids: vec![block_id],
+                })
+                .unwrap();
+            assert!(matches!(
+                connection.receive().unwrap(),
+                PeerMessage::GetBlock { .. }
+            ));
+            connection.send(PeerMessage::Block(block)).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while observer
+                .lock()
+                .unwrap()
+                .block_preverifier
+                .worker_dispatches
+                .load(Ordering::Acquire)
+                == 0
+            {
+                assert!(Instant::now() < deadline);
+                thread::yield_now();
+            }
+            stopper.stop().unwrap();
+        });
+        let result = sync_from_peer_once_inner_with_policy(
+            Arc::clone(&target),
+            address,
+            test_limits(),
+            PeerAddressPolicy::PrivateOnly,
+            Some(TARGET_NONCE),
+            Some(&registry),
+        );
+        server.join().unwrap();
+        assert!(result.is_err());
+        assert!(!target.lock().unwrap().contains_block(block_id));
+        assert_eq!(target.lock().unwrap().peer_hello().height, 0);
+        drop(source);
+        drop(target);
+        clean_test_dir(&source_path);
+        clean_test_dir(&target_path);
+    }
+
+    #[test]
+    fn downloaded_block_survives_source_disconnect_during_validation() {
+        let source_path = test_dir("download-disconnect-source");
+        let target_path = test_dir("download-disconnect-target");
+        let source = open_shared(&source_path);
+        let target = open_shared(&target_path);
+        let block = source
+            .lock()
+            .unwrap()
+            .mine_once(
+                default_miner_destination(),
+                unix_time_seconds().unwrap(),
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        let block_id = block.block_id();
+        target
+            .lock()
+            .unwrap()
+            .block_preverifier
+            .set_proof_dispatch_delay(Some(Duration::from_millis(500)));
+        let mut hello = source.lock().unwrap().peer_hello();
+        hello.node_nonce = SOURCE_NONCE;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let observer = Arc::clone(&target);
+        let server = thread::spawn(move || {
+            let mut connection = accept_test_peer(listener, hello);
+            assert!(matches!(
+                connection.receive().unwrap(),
+                PeerMessage::GetHeaders { .. }
+            ));
+            connection
+                .send(PeerMessage::Inventory {
+                    block_ids: vec![block_id],
+                })
+                .unwrap();
+            assert!(
+                matches!(connection.receive().unwrap(), PeerMessage::GetBlock { block_id: id } if id == block_id)
+            );
+            connection.send(PeerMessage::Block(block)).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while observer
+                .lock()
+                .unwrap()
+                .block_preverifier
+                .worker_dispatches
+                .load(Ordering::Acquire)
+                == 0
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "download never reached proof validation"
+                );
+                thread::yield_now();
+            }
+            // Models the source's ordinary idle timeout after delivering the
+            // complete requested block, while local validation is still busy.
+            drop(connection);
+        });
+        let _transport_result = sync_from_peer_once_inner(
+            Arc::clone(&target),
+            address,
+            test_limits(),
+            Some(TARGET_NONCE),
+        );
+        server.join().unwrap();
+        assert!(
+            target.lock().unwrap().contains_block(block_id),
+            "a complete solicited block was discarded when its source closed the connection"
+        );
+        drop(source);
+        drop(target);
+        clean_test_dir(&source_path);
+        clean_test_dir(&target_path);
     }
 
     #[test]

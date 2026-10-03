@@ -137,8 +137,6 @@ pub const MAX_OBSERVED_PEERS: usize = 64;
 /// Proof verification is intentionally serialized until production resource
 /// measurements justify a larger parallel allowance.
 pub const MAX_CONCURRENT_PROOF_VERIFICATIONS: usize = 1;
-/// Opt-in host-local bound; other nodes retain the original single verifier.
-pub const MAX_MAINNET_TUNED_PROOF_VERIFICATIONS: usize = 4;
 /// Bounded waiters prevent peer floods from creating unbounded verifier work.
 pub const MAX_QUEUED_PROOF_VERIFICATIONS: usize = 8;
 /// Local tip submissions have a separate bounded lane so a full remote queue
@@ -409,22 +407,7 @@ const RPC_TOTAL_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const RPC_ACCEPT_POLL: Duration = Duration::from_millis(50);
 const EXCHANGE_RPC_JSON_BODY_LIMIT: usize = MAX_TRANSACTION_BYTES * 2 + 16 * 1024;
 const PROOF_VERIFICATION_QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
-const TUNED_PROOF_VERIFICATION_QUEUE_TIMEOUT: Duration = Duration::from_secs(30);
 const WALLET_JSON_BODY_LIMIT: usize = 2 * 1024;
-
-#[derive(Debug, Clone, Copy)]
-pub struct MainnetProofVerifierTuning {
-    max_active: usize,
-}
-
-impl MainnetProofVerifierTuning {
-    pub fn new(max_active: usize) -> Result<Self, NodeError> {
-        if !(1..=MAX_MAINNET_TUNED_PROOF_VERIFICATIONS).contains(&max_active) {
-            return Err(NodeError::InvalidMainnetProofVerifierTuning);
-        }
-        Ok(Self { max_active })
-    }
-}
 
 #[derive(Debug, Error)]
 pub enum NodeError {
@@ -469,8 +452,6 @@ pub enum NodeError {
     ),
     #[error("the compiled ProductionV4 network requires its in-process verifier authority")]
     ProductionV4Unavailable,
-    #[error("mainnet verifier capacity must be between 1 and 4 and is available only for ProductionV4 mainnet")]
-    InvalidMainnetProofVerifierTuning,
     #[error("mainnet awaits its verified launch beacon: October 3, 2026 at 17:00 UTC (noon US Central)")]
     MainnetLaunchRequired,
     #[error("mainnet launch evidence is invalid: {0}")]
@@ -668,7 +649,6 @@ impl NodeError {
             #[cfg(feature = "production-v3")]
             Self::ProductionV3Artifacts(_) => ("proof_verifier_configuration", 500, false),
             Self::ProductionV4Unavailable => ("production_v4_unavailable", 503, false),
-            Self::InvalidMainnetProofVerifierTuning => ("proof_verifier_configuration", 400, false),
             Self::MainnetLaunchRequired => ("mainnet_launch_required", 503, true),
             Self::MainnetLaunchEvidence(_) => ("mainnet_launch_evidence", 500, false),
             Self::ProductionV4ArtifactsMissing => ("production_v4_artifacts_missing", 500, false),
@@ -1963,19 +1943,6 @@ impl BlockPreverifier {
             MAX_QUEUED_PROOF_VERIFICATIONS,
             PROOF_VERIFICATION_QUEUE_TIMEOUT,
             backend,
-        )
-    }
-
-    fn new_mainnet_tuned(
-        verifier: ConsensusPowVerifier,
-        tuning: MainnetProofVerifierTuning,
-    ) -> Self {
-        Self::with_limits_and_backend(
-            verifier,
-            tuning.max_active,
-            MAX_QUEUED_PROOF_VERIFICATIONS,
-            TUNED_PROOF_VERIFICATION_QUEUE_TIMEOUT,
-            ProofVerificationBackend::InProcess,
         )
     }
 
@@ -4798,7 +4765,6 @@ impl Node {
             wallet_passphrase,
             None,
             Some(launch),
-            None,
         )
     }
 
@@ -4966,47 +4932,20 @@ impl Node {
         wallet_passphrase: Option<&[u8]>,
         exchange_withdrawal_security: Option<&ExchangeWithdrawalSecurityConfig>,
     ) -> Result<Self, NodeError> {
-        Self::open_with_runtime_security_wallet_and_exchange_withdrawal_tuned(
-            data_dir,
-            production_v3_record,
-            production_v4_artifacts,
-            verifier_worker,
-            wallet_passphrase,
-            exchange_withdrawal_security,
-            None,
-        )
-    }
-
-    /// Opt-in host-local throughput. This alters admission capacity only; the
-    /// compiled network, proof verifier, launch plan and block rules are shared.
-    #[allow(clippy::too_many_arguments)]
-    pub fn open_with_runtime_security_wallet_and_exchange_withdrawal_tuned(
-        data_dir: impl AsRef<Path>,
-        production_v3_record: Option<&ProductionV3VerifierRecord>,
-        production_v4_artifacts: Option<&ProductionV4VerifierArtifacts>,
-        verifier_worker: Option<&VerifierWorkerConfig>,
-        wallet_passphrase: Option<&[u8]>,
-        exchange_withdrawal_security: Option<&ExchangeWithdrawalSecurityConfig>,
-        tuning: Option<MainnetProofVerifierTuning>,
-    ) -> Result<Self, NodeError> {
         if production_v4_artifacts.is_some()
             && (production_v3_record.is_some() || verifier_worker.is_some())
         {
             return Err(NodeError::ProductionV4ArtifactsUnexpected);
         }
-        let (profile, launch) =
-            mainnet_runtime::resolve_compiled_profile(COMPILED_NETWORK_PROFILE)?;
-        Self::open_with_profile_artifacts_worker_exchange_and_launch(
+        Self::open_with_profile_artifacts_worker_and_exchange_withdrawal(
             data_dir,
-            profile,
+            COMPILED_NETWORK_PROFILE,
             production_v3_record,
             None,
             production_v4_artifacts,
             verifier_worker.cloned(),
             wallet_passphrase,
             exchange_withdrawal_security,
-            launch,
-            tuning,
         )
     }
 
@@ -5071,7 +5010,6 @@ impl Node {
             wallet_passphrase,
             exchange_withdrawal_security,
             launch,
-            None,
         )
     }
 
@@ -5086,7 +5024,6 @@ impl Node {
         wallet_passphrase: Option<&[u8]>,
         exchange_withdrawal_security: Option<&ExchangeWithdrawalSecurityConfig>,
         launch: Option<&mainnet_runtime::AuthenticatedMainnetRuntime>,
-        tuning: Option<MainnetProofVerifierTuning>,
     ) -> Result<Self, NodeError> {
         let (params, verifier) = network_params_and_verifier_with_launch(
             profile,
@@ -5094,16 +5031,7 @@ impl Node {
             production_v4_artifacts,
             launch,
         )?;
-        let block_preverifier = if let Some(tuning) = tuning {
-            if !cfg!(feature = "production-mainnet")
-                || !matches!(profile.proof, ProofProfile::ProductionV4)
-            {
-                return Err(NodeError::InvalidMainnetProofVerifierTuning);
-            }
-            BlockPreverifier::new_mainnet_tuned(verifier.clone(), tuning)
-        } else {
-            BlockPreverifier::new(verifier.clone(), profile.proof)
-        };
+        let block_preverifier = BlockPreverifier::new(verifier.clone(), profile.proof);
         let external_replay = verifier_worker.is_some();
         if let Some(config) = verifier_worker {
             install_external_proof_verifier(profile, &block_preverifier, config)?;
@@ -10898,57 +10826,6 @@ mod tests {
     use super::*;
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
-
-    #[test]
-    fn mainnet_verifier_tuning_is_bounded_without_changing_the_default() {
-        assert_eq!(MAX_CONCURRENT_PROOF_VERIFICATIONS, 1);
-        assert_eq!(PROOF_VERIFICATION_QUEUE_TIMEOUT, Duration::from_secs(5));
-        for capacity in 1..=4 {
-            assert_eq!(
-                MainnetProofVerifierTuning::new(capacity)
-                    .unwrap()
-                    .max_active,
-                capacity
-            );
-        }
-        assert!(matches!(
-            MainnetProofVerifierTuning::new(0),
-            Err(NodeError::InvalidMainnetProofVerifierTuning)
-        ));
-        assert!(matches!(
-            MainnetProofVerifierTuning::new(5),
-            Err(NodeError::InvalidMainnetProofVerifierTuning)
-        ));
-        assert_eq!(
-            TUNED_PROOF_VERIFICATION_QUEUE_TIMEOUT,
-            Duration::from_secs(30)
-        );
-        let verifier = ConsensusPowVerifier::v2_reference(v2_test_reference().unwrap());
-        let tuned = BlockPreverifier::new_mainnet_tuned(
-            verifier,
-            MainnetProofVerifierTuning::new(4).unwrap(),
-        );
-        assert_eq!(tuned.queue.max_active, 4);
-        assert_eq!(tuned.queue.max_queued, MAX_QUEUED_PROOF_VERIFICATIONS);
-        assert_eq!(tuned.queue.wait_timeout, Duration::from_secs(30));
-        let mut active = (0..4)
-            .map(|_| tuned.queue.acquire().unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(tuned.queue.counts().unwrap(), (4, 0));
-        let waiter_queue = Arc::clone(&tuned.queue);
-        let waiter = thread::spawn(move || waiter_queue.acquire().map(drop));
-        for _ in 0..10_000 {
-            if tuned.queue.counts().unwrap() == (4, 1) {
-                break;
-            }
-            thread::yield_now();
-        }
-        assert_eq!(tuned.queue.counts().unwrap(), (4, 1));
-        drop(active.pop());
-        waiter.join().unwrap().unwrap();
-        drop(active);
-        assert_eq!(tuned.queue.counts().unwrap(), (0, 0));
-    }
 
     /// A packaged ProductionV3 node canonicalizes its own sidecars before
     /// handing them to the trusted ceremony filesystem, which rejects `\\?\`

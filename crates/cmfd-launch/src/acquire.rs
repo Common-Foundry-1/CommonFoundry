@@ -15,8 +15,8 @@ use thiserror::Error;
 
 use crate::{
     AuthenticatedLaunch, BeaconCertificate, LaunchError, MAINNET_BEACON_ROUND,
-    MAINNET_LAUNCH_UNIX_SECONDS, MAINNET_LAUNCH_UTC, MAX_BEACON_DOCUMENT_BYTES,
-    QUICKNET_CHAIN_HASH, SOURCE_RELEASE_UTC, parse_certificate, verify_mainnet_launch,
+    MAINNET_LAUNCH_UNIX_SECONDS, MAINNET_LAUNCH_UTC, MAX_BEACON_DOCUMENT_BYTES, QUICKNET_BEACON_ID,
+    SOURCE_RELEASE_UTC, parse_certificate, verify_mainnet_launch,
 };
 
 const MAX_RUNTIME_INFO_BYTES: usize = 128 * 1024;
@@ -239,7 +239,7 @@ fn publish(
 }
 
 fn relay_url(relay: &str) -> String {
-    format!("{relay}/v2/beacons/{QUICKNET_CHAIN_HASH}/rounds/{MAINNET_BEACON_ROUND}")
+    format!("{relay}/v2/beacons/{QUICKNET_BEACON_ID}/rounds/{MAINNET_BEACON_ROUND}")
 }
 
 fn curl(url: &str, cancel: &AtomicBool) -> Result<Vec<u8>, AcquireError> {

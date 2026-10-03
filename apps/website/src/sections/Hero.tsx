@@ -2,7 +2,8 @@ import { useRef, type PointerEvent } from "react";
 import heroApparatus from "../assets/hero-apparatus.png";
 import { ButtonLink } from "../components/ButtonLink";
 import { ShieldIcon } from "../components/Icons";
-import { DISCORD_URL } from "../content";
+import { MainnetCountdown } from "../components/MainnetCountdown";
+import { DISCORD_URL, MINING_GUIDE_URL } from "../content";
 
 export function Hero() {
   const visualRef = useRef<HTMLDivElement>(null);
@@ -23,6 +24,7 @@ export function Hero() {
 
   return (
     <section id="top" className="hero section-grid" aria-labelledby="hero-heading">
+      <MainnetCountdown />
       <div className="hero__copy">
         <a className="hero__launch-label" href="#launch">Mainnet coming October 3, 2026 <span aria-hidden="true">↗</span></a>
         <h1 id="hero-heading">
@@ -45,6 +47,10 @@ export function Hero() {
         </div>
 
         <p className="hero__support">Setup help. Mining guidance. Launch announcements.</p>
+        <p className="hero__guide">
+          New to mining? <a href={MINING_GUIDE_URL} target="_blank" rel="noopener noreferrer">Windows + Linux mining guide (PDF)</a>
+          <br />Official pool miner? <a href="#pool-setup">Mainnet pool connection details</a>
+        </p>
 
         <div className="trust-note">
           <ShieldIcon />

@@ -467,6 +467,15 @@ impl ProductionV4PersistentPoolVerifier {
             "CMFD_V4_PROOF_DONE",
         )?;
         let proof_seconds = proof_started.elapsed().as_secs_f64();
+        if self
+            .idle_search_enabled
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            // The prover's allocator retains CUDA buffers after RUN. Retire its
+            // owned context before allowing the replay model to load again.
+            // The next candidate restarts the exact pinned command.
+            state.proof.terminate().map_err(pool_replay_failure)?;
+        }
         let transparent_proof = read_bounded_file(&proof_path, PRODUCTION_V4_MAX_PROOF_BYTES)?;
         let decoded =
             decode_forgematrix_v4_transparent_proof(&transparent_proof).map_err(replay_error)?;

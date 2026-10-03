@@ -45,6 +45,8 @@ shell, redirects, or curlrc. It requests only quicknet round 32747812 from the
 three pinned drand.sh relays. The node/miner reports its release-pinned plan
 before any relay request. Responses have byte and time bounds. An old round,
 invalid signature, relay timeout, or malformed response cannot start mining.
+The v2 request path uses the `quicknet` beacon ID; verification remains pinned
+to the compiled quicknet chain hash and public key.
 
 Use Ctrl+C to stop waiting. A verified cached beacon is reused. Publication
 uses a synced temporary file and no-overwrite persistence; interruption before

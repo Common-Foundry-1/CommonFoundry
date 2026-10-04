@@ -48,6 +48,10 @@ NUMBER_FIELDS = {
 }
 CONFIG_FIELDS = {"schema", "public_numeric_ip", "private_bind_ip", "mainnet_seed",
                  "gpu_uuid", "automatic_payouts", *HASH_FIELDS, *NUMBER_FIELDS}
+# Optional: relay nodes the pool also treats as static peers (announced to first,
+# compressed block frames). Same numeric IP:29444 form as mainnet_seed.
+OPTIONAL_FIELDS = {"mainnet_relays"}
+MAX_RELAYS = 8
 COMPETING_UNITS = (
     "commonfoundry-pool-public.service", "commonfoundry-pool-ai01.service",
     "catstack-owner-zcl.service", "vast-idle-xmrig.service",
@@ -130,21 +134,31 @@ def parse_numeric_ip(value: object, label: str, *, public: bool) -> str:
     return address.compressed
 
 
-def parse_seed(value: object) -> str:
+def parse_seed(value: object, label: str = "mainnet_seed") -> str:
     if not isinstance(value, str):
-        raise PreflightError("mainnet_seed must be a numeric IP and port")
+        raise PreflightError(f"{label} must be a numeric IP and port")
     if value.startswith("["):
         host, separator, port = value[1:].partition("]:")
     else:
         host, separator, port = value.rpartition(":")
     if not separator or port != "29444":
-        raise PreflightError("mainnet_seed must use the mainnet seed P2P port 29444")
-    address = parse_numeric_ip(host, "mainnet_seed", public=True)
+        raise PreflightError(f"{label} must use the mainnet seed P2P port 29444")
+    address = parse_numeric_ip(host, label, public=True)
     return f"[{address}]:29444" if ":" in address else f"{address}:29444"
 
 
+def parse_relays(value: object, seed: str) -> list:
+    if not isinstance(value, list) or not 1 <= len(value) <= MAX_RELAYS:
+        raise PreflightError(f"mainnet_relays must list 1 to {MAX_RELAYS} relay nodes")
+    relays = [parse_seed(item, "mainnet_relays") for item in value]
+    if len(set(relays)) != len(relays) or seed in relays:
+        raise PreflightError("mainnet_relays must be distinct from each other and from mainnet_seed")
+    return relays
+
+
 def validate_config(config: dict) -> dict:
-    if set(config) != CONFIG_FIELDS or config.get("schema") != SCHEMA:
+    fields = set(config)
+    if not CONFIG_FIELDS <= fields or fields - CONFIG_FIELDS - OPTIONAL_FIELDS or config.get("schema") != SCHEMA:
         raise PreflightError("pool.json is incomplete or has unexpected fields")
     for field in HASH_FIELDS:
         if (not isinstance(config[field], str) or not HEX64.fullmatch(config[field])
@@ -163,6 +177,8 @@ def validate_config(config: dict) -> dict:
     config["public_numeric_ip"] = parse_numeric_ip(config["public_numeric_ip"], "public_numeric_ip", public=True)
     config["private_bind_ip"] = parse_numeric_ip(config["private_bind_ip"], "private_bind_ip", public=False)
     config["mainnet_seed"] = parse_seed(config["mainnet_seed"])
+    if "mainnet_relays" in config:
+        config["mainnet_relays"] = parse_relays(config["mainnet_relays"], config["mainnet_seed"])
     for fresh, old in (("expected_tls_certificate_sha256", "forbidden_rc_certificate_sha256"),
                        ("expected_tls_private_key_sha256", "forbidden_rc_private_key_sha256")):
         if config[fresh] == config[old]:
@@ -357,7 +373,9 @@ def build_command(root: Path, state: Path, credential_base: Path, config: dict) 
         "--production-v4-fixed-record", str(root / "production-v4/FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json"),
         "-vv", "pool-serve", "--bind", socket(config["private_bind_ip"], 29445),
         "--p2p-bind", socket(config["private_bind_ip"], 29454),
-        "--peer", config["mainnet_seed"], "--no-default-seeds", "--allow-public-peers",
+        "--peer", config["mainnet_seed"],
+        *[argument for relay in config.get("mainnet_relays", []) for argument in ("--peer", relay)],
+        "--no-default-seeds", "--allow-public-peers",
         "--allow-public-pool-clients", "--allow-address-only-payouts",
         "--certificate", str(CONFIG_BASE / "pool-cert.der"),
         "--private-key", str(credential_base / "pool-private-key"),

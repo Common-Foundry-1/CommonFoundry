@@ -88,7 +88,10 @@ approved pool GPU still has a compute process. It never stops that process.
    network ID and plan digest are all mandatory. The file cannot contain
    placeholders. It must name the exact private bind IP of this host and a
    public numeric IP that routes to TCP `29445`. The expected certificate hash
-   becomes the miner URL pin. `automatic_payouts` must be explicitly true; the
+   becomes the miner URL pin. The optional `mainnet_relays` list names up to
+   eight relay nodes (`numeric-ip:29444`) that the pool node also treats as
+   static peers: a found block is announced to them first and block frames to
+   them are compressed. `automatic_payouts` must be explicitly true; the
    launcher uses the **mainnet-specific** `--enable-mainnet-payouts` flag, never
    `--enable-testnet-payouts`. A runtime without that flag fails closed.
    The burned payout fee must meet the exact minimum in the pinned launch

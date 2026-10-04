@@ -137,6 +137,26 @@ class MainnetPoolServiceTests(unittest.TestCase):
         self.assertNotIn("19445", " ".join(command))
         self.assertNotIn("/var/lib/commonfoundry-pool-public", " ".join(command))
 
+    def test_optional_relays_become_additional_static_peers(self):
+        self.config["mainnet_relays"] = ["1.1.1.1:29444", "[2606:4700:4700::1111]:29444"]
+        self.save_config()
+        config, _, _ = self.preflight()
+        with mock.patch.object(pool, "CONFIG_BASE", self.config_base):
+            command = pool.build_command(self.root, self.state, self.credential_base, config)
+        peers = [command[index + 1] for index, argument in enumerate(command) if argument == "--peer"]
+        self.assertEqual(peers, ["9.9.9.9:29444", "1.1.1.1:29444", "[2606:4700:4700::1111]:29444"])
+        for bad in (["1.1.1.1:29445"], ["9.9.9.9:29444"], ["1.1.1.1:29444"] * 2,
+                    ["127.0.0.1:29444"], ["203.0.113.5:29444"], "1.1.1.1:29444", []):
+            self.config["mainnet_relays"] = bad
+            self.save_config()
+            with self.assertRaisesRegex(pool.PreflightError, "mainnet_relays"):
+                self.preflight()
+        del self.config["mainnet_relays"]
+        self.config["unexpected_field"] = 1
+        self.save_config()
+        with self.assertRaisesRegex(pool.PreflightError, "unexpected fields"):
+            self.preflight()
+
     def test_placeholder_or_legacy_payout_config_fails_closed(self):
         self.config["operator_fee_bps"] = "SET_APPROVED_MAINNET_VALUE"
         self.save_config()

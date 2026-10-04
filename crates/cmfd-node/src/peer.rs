@@ -222,7 +222,9 @@ impl Default for PeerLimits {
             connect_timeout: Duration::from_secs(5),
             idle_timeout: Duration::from_secs(10),
             total_timeout: Duration::from_secs(5 * 60),
-            max_peers: 16,
+            // Public seeds saturated at 16 concurrent sessions and silently
+            // refused honest peers. Per-IP limits still bound any one source.
+            max_peers: 64,
             max_messages_per_peer: 512,
             max_bytes_per_peer: 32 * 1024 * 1024,
         }
@@ -351,6 +353,11 @@ pub enum PeerError {
     SequenceExhausted,
     #[error("per-peer message or byte budget exhausted")]
     PeerBudgetExceeded,
+    /// A frame within its protocol size limit would exceed this session's
+    /// byte budget. Peers may run different valid budgets, so this ends the
+    /// session without implying that the frame stream was abusive.
+    #[error("per-peer session byte budget reached")]
+    PeerByteBudgetReached,
     #[error("peer limits are zero, unusable for a mutual hello, or exceed hard protocol bounds")]
     InvalidLimits,
     #[error(
@@ -371,6 +378,8 @@ pub enum PeerError {
     IdleTimeout,
     #[error("peer block-submission response exceeded its dedicated timeout")]
     SubmitBlockResponseTimeout,
+    #[error("peer did not resume after the bounded downloaded-block validation wait")]
+    BlockValidationWaitTimeout,
     #[error("peer connection was cancelled")]
     Cancelled,
     #[error("peer closed the connection")]
@@ -1314,10 +1323,11 @@ impl PeerSession {
             .bytes_used
             .checked_add(frame_bytes as u64)
             .ok_or(PeerError::PeerBudgetExceeded)?;
-        if next_messages > self.limits.max_messages_per_peer
-            || next_bytes > self.limits.max_bytes_per_peer
-        {
+        if next_messages > self.limits.max_messages_per_peer {
             return Err(PeerError::PeerBudgetExceeded);
+        }
+        if next_bytes > self.limits.max_bytes_per_peer {
+            return Err(PeerError::PeerByteBudgetReached);
         }
         Ok(())
     }
@@ -1620,6 +1630,20 @@ impl PeerConnection {
             .checked_add(SUBMIT_BLOCK_RESPONSE_BUDGET)
             .ok_or(PeerError::InvalidLimits)?;
         self.receive_before(Some(deadline))
+    }
+
+    /// A peer that requested a block may need to verify its proof and replay
+    /// fork state before requesting the next item. Keep this one receive
+    /// bounded by both the block-validation budget and the session lifetime.
+    pub(crate) fn receive_after_served_block(&mut self) -> Result<PeerMessage, PeerError> {
+        let deadline = Instant::now()
+            .checked_add(SUBMIT_BLOCK_RESPONSE_BUDGET)
+            .ok_or(PeerError::InvalidLimits)?;
+        self.receive_before(Some(deadline))
+            .map_err(|error| match error {
+                PeerError::SubmitBlockResponseTimeout => PeerError::BlockValidationWaitTimeout,
+                other => other,
+            })
     }
 
     fn receive_before(

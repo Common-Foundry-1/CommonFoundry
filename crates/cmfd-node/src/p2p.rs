@@ -5,7 +5,7 @@
 //! defaults to loopback/private addresses; public peers require an explicit
 //! unsafe Devnet opt-in enforced by `peer`.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -15,8 +15,13 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(all(test, feature = "production-v4", any(windows, target_os = "linux")))]
+#[path = "real_peer_catchup_tests.rs"]
+mod real_peer_catchup_tests;
+
 use cmfd_consensus::{
-    Block, MAX_TRANSACTION_BYTES, Transaction, WireError, decode_block, max_block_bytes_for_network,
+    Block, ChainError, MAX_TRANSACTION_BYTES, Transaction, WireError, decode_block,
+    max_block_bytes_for_network,
 };
 use thiserror::Error;
 
@@ -51,6 +56,11 @@ const PEER_CACHE_MAGIC: &str = "CMFD_PEERS_V1";
 const MAX_DISCOVERED_PEERS: usize = 64;
 const MAX_PEER_CACHE_BYTES: u64 = 16 * 1024;
 const MAX_DYNAMIC_TARGETS_PER_ROUND: usize = 2;
+const MAX_CATCHUP_EXTRA_SESSIONS_PER_PEER: usize = 3;
+const MAX_CATCHUP_EXTRA_SESSIONS_PER_ROUND: usize = 8;
+// This limits starts after the normal fair peer pass, not an in-flight proof.
+// Every started session retains its existing byte/message/deadline bounds.
+const CATCHUP_EXTRA_SESSION_START_BUDGET: Duration = Duration::from_secs(30);
 const MAX_UNVERIFIED_PEER_FAILURES: u8 = 3;
 const MAX_DISCOVERED_PEERS_PER_IP: usize = 8;
 // Keep source-tracking memory fixed, prevent one address from consuming the
@@ -71,6 +81,16 @@ const INVALID_TRANSACTION_PENALTY: u16 = 25;
 const PROTOCOL_VIOLATION_PENALTY: u16 = 50;
 const RESOURCE_ABUSE_PENALTY: u16 = PEER_BAN_SCORE;
 const DYNAMIC_PEER_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+// A newly active tip is pushed to peers immediately instead of waiting for the
+// serial poll round to reach each of them. Bounded in targets and concurrency,
+// and skipped while the chain is far behind (catch-up blocks are not news).
+const TIP_ANNOUNCE_CHECK_INTERVAL: Duration = Duration::from_millis(200);
+const MAX_TIP_ANNOUNCE_TARGETS: usize = 16;
+// Bounded header re-requests per session while walking an already-stored prefix.
+const MAX_KNOWN_PREFIX_HEADER_ROUNDS: usize = 64;
+const MAX_TIP_ANNOUNCE_IN_FLIGHT: usize = 8;
+const MAX_TIP_ANNOUNCE_REPEATS: usize = 3;
+const TIP_ANNOUNCE_MAX_MEDIAN_AGE_SECONDS: u64 = 30 * 60;
 const MAX_DYNAMIC_PEER_BACKOFF: Duration = Duration::from_secs(5 * 60);
 const DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const DISCOVERY_UNSUPPORTED_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -146,7 +166,9 @@ pub enum P2pError {
     },
     #[error("peer rejected submitted block {0:?}")]
     RejectedBlockSubmission([u8; 32]),
-    #[error("peer deferred submitted block {0:?} because admission is busy")]
+    #[error(
+        "peer deferred submitted block {0:?} (retryable: verifier busy, stale tip, missing parent, or fork reconstruction)"
+    )]
     BusyBlockSubmission([u8; 32]),
     #[error("peer inventory is not parent-ordered at block {block_id:?}")]
     NonContiguousInventory { block_id: [u8; 32] },
@@ -180,6 +202,7 @@ impl P2pError {
                     | PeerError::TotalTimeout
                     | PeerError::IdleTimeout
                     | PeerError::SubmitBlockResponseTimeout
+                    | PeerError::BlockValidationWaitTimeout
                     | PeerError::Io(_)
             )
         )
@@ -681,6 +704,20 @@ impl PeerDiscovery {
         Ok(())
     }
 
+    /// Verified peers without a recent failure, for immediate new-tip relay.
+    fn announce_targets(&self, limit: usize) -> Result<Vec<SocketAddr>, P2pError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| P2pError::PoisonedPeerDiscovery)?;
+        Ok(state
+            .peers
+            .iter()
+            .filter_map(|(address, peer)| (peer.verified && peer.failures == 0).then_some(*address))
+            .take(limit)
+            .collect())
+    }
+
     fn gossip_addresses(&self, exclude: SocketAddr) -> Result<Vec<SocketAddr>, P2pError> {
         let state = self
             .state
@@ -1157,6 +1194,22 @@ fn sync_from_peer_once_inner_with_policy(
     result
 }
 
+/// Peers advertise using their own bounded session budget. A larger offer is
+/// not resource abuse: accept the protocol-sized offer, but download only the
+/// prefix that fits our unchanged local session budget.
+fn expect_sync_inventory(message: PeerMessage) -> Result<Vec<[u8; 32]>, P2pError> {
+    let inventory = expect_inventory(message)?;
+    if inventory.len() > MAX_BLOCKS_PER_SYNC {
+        return Err(PeerError::CountLimit {
+            field: "sync inventory",
+            actual: inventory.len(),
+            max: MAX_BLOCKS_PER_SYNC,
+        }
+        .into());
+    }
+    Ok(inventory)
+}
+
 fn perform_sync_from_peer_once_inner_with_policy(
     shared: Arc<Mutex<Node>>,
     address: SocketAddr,
@@ -1165,10 +1218,12 @@ fn perform_sync_from_peer_once_inner_with_policy(
     nonce_override: Option<[u8; 32]>,
     active_sockets: Option<&Arc<ActiveSocketRegistry>>,
 ) -> Result<SyncReport, P2pError> {
-    let (hello, locator) = {
+    let observation_address = observed_address(PeerDirection::Outbound, address);
+    let (hello, locator, mut sync_cursor) = {
         let node = lock_node(&shared)?;
         let hello = node.peer_hello();
-        (hello, node.block_locator(MAX_BLOCKS_PER_SYNC))
+        let (locator, cursor) = node.peer_sync_locator(&observation_address, MAX_BLOCKS_PER_SYNC);
+        (hello, locator, cursor)
     };
     let block_batch_limit = block_sync_batch_limit(hello.network_id, limits);
     let hello = with_nonce(hello, nonce_override);
@@ -1190,81 +1245,124 @@ fn perform_sync_from_peer_once_inner_with_policy(
         locator,
         stop: remote_hello.tip,
     })?;
-    let inventory = expect_inventory(connection.receive()?)?;
-    if inventory.len() > block_batch_limit {
-        return Err(PeerError::CountLimit {
-            field: "sync inventory",
-            actual: inventory.len(),
-            max: block_batch_limit,
-        }
-        .into());
-    }
+    let mut inventory = expect_sync_inventory(connection.receive()?)?;
+    let mut inventory_items = inventory.len();
+    let mut header_rounds = 1;
 
     let mut requested_blocks = 0;
     let mut accepted_blocks = 0;
     let mut already_known = 0;
     let mut previous_inventory_id = None;
 
-    for requested in &inventory {
-        let known = {
-            let node = lock_node(&shared)?;
-            node.contains_block(*requested)
-        };
-        if known {
-            already_known += 1;
-            previous_inventory_id = Some(*requested);
-            continue;
-        }
+    loop {
+        let mut reached_unknown = false;
+        // Already-stored blocks cost no download budget: walking a known prefix
+        // one id per session made a deep, already-partly-stored branch unreachable.
+        for requested in inventory.iter() {
+            let known = {
+                let node = lock_node(&shared)?;
+                node.contains_block(*requested)
+            };
+            if known {
+                if lock_node(&shared)?.advance_peer_sync_cursor(
+                    &observation_address,
+                    sync_cursor,
+                    *requested,
+                ) {
+                    sync_cursor = Some(*requested);
+                }
+                already_known += 1;
+                previous_inventory_id = Some(*requested);
+                continue;
+            }
+            reached_unknown = true;
+            if requested_blocks >= block_batch_limit {
+                break;
+            }
 
-        connection.send(PeerMessage::GetBlock {
-            block_id: *requested,
-        })?;
-        let block = expect_block(connection.receive()?)?;
-        requested_blocks += 1;
-
-        let actual = block.block_id();
-        if actual != *requested {
-            return Err(P2pError::WrongBlock {
-                requested: *requested,
-                actual,
-            });
-        }
-
-        let parent_is_ordered = if let Some(previous) = previous_inventory_id {
-            block.challenge.previous_block == previous
-        } else {
-            let node = lock_node(&shared)?;
-            node.contains_block(block.challenge.previous_block)
-        };
-        if !parent_is_ordered {
-            return Err(P2pError::NonContiguousInventory {
+            connection.send(PeerMessage::GetBlock {
                 block_id: *requested,
-            });
-        }
+            })?;
+            let block = expect_block(connection.receive()?)?;
+            requested_blocks += 1;
 
-        let accepted_at = unix_time_seconds()?;
-        let acceptance_deadline =
-            checked_submit_deadline(Instant::now(), SUBMIT_BLOCK_ACCEPTANCE_BUDGET)?;
-        let request = RemoteProofRequest::new(acceptance_deadline);
-        let monitor = PeerSubmissionMonitor::start(&connection, request.clone())?;
-        let accepted = match submit_shared_peer_block_cancellable(
-            &shared,
-            block,
-            accepted_at,
-            proof_peer,
-            request,
-        ) {
-            Ok(_) => true,
-            Err(NodeError::DuplicateBlock(_)) => false,
-            Err(error) => return Err(error.into()),
-        };
-        drop(monitor);
-        if accepted {
-            accepted_blocks += 1;
-        } else {
-            already_known += 1;
+            let actual = block.block_id();
+            if actual != *requested {
+                return Err(P2pError::WrongBlock {
+                    requested: *requested,
+                    actual,
+                });
+            }
+
+            let parent_is_ordered = if let Some(previous) = previous_inventory_id {
+                block.challenge.previous_block == previous
+            } else {
+                let node = lock_node(&shared)?;
+                node.contains_block(block.challenge.previous_block)
+            };
+            if !parent_is_ordered {
+                return Err(P2pError::NonContiguousInventory {
+                    block_id: *requested,
+                });
+            }
+
+            let accepted_at = unix_time_seconds()?;
+            let acceptance_deadline =
+                checked_submit_deadline(Instant::now(), SUBMIT_BLOCK_ACCEPTANCE_BUDGET)?;
+            let request = RemoteProofRequest::new(acceptance_deadline);
+            // We requested and received this complete, bounded block. Its source
+            // may close an idle connection while we verify it or reconstruct a
+            // fork. That must not discard local progress and repeat the same work
+            // forever. Local shutdown and the fixed admission deadline still win.
+            let monitor = PeerSubmissionMonitor::local_validation(
+                active_sockets.map(|registry| Arc::clone(&registry.stopping)),
+                request.clone(),
+            )?;
+            let accepted = match submit_shared_peer_block_cancellable(
+                &shared,
+                block,
+                accepted_at,
+                proof_peer,
+                request,
+            ) {
+                Ok(_) => true,
+                Err(NodeError::DuplicateBlock(_)) => false,
+                Err(error) => return Err(error.into()),
+            };
+            drop(monitor);
+            if lock_node(&shared)?.advance_peer_sync_cursor(
+                &observation_address,
+                sync_cursor,
+                *requested,
+            ) {
+                sync_cursor = Some(*requested);
+            }
+            if accepted {
+                accepted_blocks += 1;
+            } else {
+                already_known += 1;
+            }
+            previous_inventory_id = Some(*requested);
         }
-        previous_inventory_id = Some(*requested);
+        // Peers offer only what fits their own budget (one id for stock mainnet
+        // nodes). When the whole offer is already stored, ask again from the
+        // advanced cursor in the same session instead of ending it.
+        if reached_unknown
+            || inventory.is_empty()
+            || header_rounds >= MAX_KNOWN_PREFIX_HEADER_ROUNDS
+        {
+            break;
+        }
+        let locator = lock_node(&shared)?
+            .peer_sync_locator(&observation_address, MAX_BLOCKS_PER_SYNC)
+            .0;
+        connection.send(PeerMessage::GetHeaders {
+            locator,
+            stop: remote_hello.tip,
+        })?;
+        inventory = expect_sync_inventory(connection.receive()?)?;
+        inventory_items += inventory.len();
+        header_rounds += 1;
     }
 
     connection.send(PeerMessage::GetMempool)?;
@@ -1314,7 +1412,7 @@ fn perform_sync_from_peer_once_inner_with_policy(
 
     Ok(SyncReport {
         remote_hello,
-        inventory_items: inventory.len(),
+        inventory_items,
         requested_blocks,
         accepted_blocks,
         already_known,
@@ -1411,9 +1509,10 @@ fn perform_relay_blocks_to_peer_once_inner_with_policy(
     connection.send_hello()?;
     let remote_hello = expect_hello(connection.receive()?)?;
 
-    let block_ids = {
+    let observation_address = observed_address(PeerDirection::Outbound, address);
+    let (block_ids, mut relay_cursor) = {
         let node = lock_node(&shared)?;
-        node.relay_inventory_after(remote_hello.tip, block_batch_limit)
+        node.peer_relay_inventory(&observation_address, remote_hello.tip, block_batch_limit)
     };
     let mut accepted_blocks = 0;
     let mut already_known = 0;
@@ -1449,11 +1548,19 @@ fn perform_relay_blocks_to_peer_once_inner_with_policy(
             BlockSubmissionStatus::Accepted => accepted_blocks += 1,
             BlockSubmissionStatus::AlreadyKnown => already_known += 1,
             BlockSubmissionStatus::Rejected => {
+                lock_node(&shared)?.set_peer_relay_cursor(&observation_address, relay_cursor, None);
                 return Err(P2pError::RejectedBlockSubmission(*block_id));
             }
             BlockSubmissionStatus::Busy => {
                 return Err(P2pError::BusyBlockSubmission(*block_id));
             }
+        }
+        if lock_node(&shared)?.set_peer_relay_cursor(
+            &observation_address,
+            relay_cursor,
+            Some(*block_id),
+        ) {
+            relay_cursor = Some(*block_id);
         }
     }
 
@@ -1572,6 +1679,7 @@ fn respond_to_peer_inner_with_options(
     let observation_address = observed_address(PeerDirection::Inbound, remote_address);
     record_peer_started(&shared, PeerDirection::Inbound, observation_address.clone());
     let security = Arc::clone(&options.security);
+    let mut handshake_complete = false;
     let result = perform_respond_to_peer_inner_with_policy(
         Arc::clone(&shared),
         stream,
@@ -1579,6 +1687,7 @@ fn respond_to_peer_inner_with_options(
         remote_address,
         observation_address.clone(),
         options,
+        &mut handshake_complete,
     );
     match &result {
         Ok(()) => {
@@ -1587,7 +1696,7 @@ fn respond_to_peer_inner_with_options(
             }
         }
         Err(error) => {
-            let (penalty, reason) = inbound_reputation_penalty(error);
+            let (penalty, reason) = inbound_reputation_penalty(error, handshake_complete);
             if let Err(reputation_error) =
                 security.record_failure(remote_address.ip(), penalty, reason)
             {
@@ -1614,6 +1723,7 @@ fn perform_respond_to_peer_inner_with_policy(
     remote_address: SocketAddr,
     observation_address: String,
     options: InboundPeerOptions,
+    handshake_complete: &mut bool,
 ) -> Result<(), P2pError> {
     let hello = {
         let node = lock_node(&shared)?;
@@ -1629,6 +1739,7 @@ fn perform_respond_to_peer_inner_with_policy(
     }
     connection.send_hello()?;
     let remote_hello = expect_hello(connection.receive()?)?;
+    *handshake_complete = true;
     let proof_peer = next_remote_proof_peer_id()?;
     record_peer_succeeded(
         &shared,
@@ -1637,8 +1748,15 @@ fn perform_respond_to_peer_inner_with_policy(
         remote_hello,
     );
 
+    let mut block_was_served = false;
     loop {
-        let message = match connection.receive() {
+        let received = if block_was_served {
+            connection.receive_after_served_block()
+        } else {
+            connection.receive()
+        };
+        block_was_served = false;
+        let message = match received {
             Ok(message) => message,
             Err(PeerError::ConnectionClosed) => return Ok(()),
             Err(error) => return Err(error.into()),
@@ -1665,6 +1783,7 @@ fn perform_respond_to_peer_inner_with_policy(
                     });
                 }
                 connection.send(PeerMessage::Block(block))?;
+                block_was_served = true;
             }
             PeerMessage::GetMempool => {
                 let txids = {
@@ -1690,6 +1809,7 @@ fn perform_respond_to_peer_inner_with_policy(
                 connection.send(PeerMessage::Transaction(transaction))?;
             }
             PeerMessage::Transaction(transaction) => {
+                let txid = transaction.txid();
                 let admission = {
                     let mut node = lock_node(&shared)?;
                     node.submit_transaction(transaction)
@@ -1698,11 +1818,20 @@ fn perform_respond_to_peer_inner_with_policy(
                     Ok(_) | Err(NodeError::DuplicateMempoolTransaction(_)) => {}
                     Err(NodeError::MempoolTransactionLimit | NodeError::MempoolByteLimit) => {}
                     Err(error) if error.client_error().status < 500 => {
-                        if options.security.record_failure(
-                            remote_address.ip(),
-                            INVALID_TRANSACTION_PENALTY,
-                            "deterministically rejected transaction",
-                        )? {
+                        let peer_fault = transaction_rejection_is_peer_fault(&error);
+                        tracing::debug!(
+                            txid = %hex::encode(txid),
+                            %error,
+                            peer_fault,
+                            "rejected relayed transaction"
+                        );
+                        if peer_fault
+                            && options.security.record_failure(
+                                remote_address.ip(),
+                                INVALID_TRANSACTION_PENALTY,
+                                "intrinsically invalid transaction",
+                            )?
+                        {
                             return Err(P2pError::PeerTemporarilyBanned(remote_address.ip()));
                         }
                     }
@@ -1723,6 +1852,7 @@ fn perform_respond_to_peer_inner_with_policy(
             PeerMessage::SubmitBlock(block) => {
                 let started = Instant::now();
                 let block_id = block.block_id();
+                let block_height = block.challenge.height;
                 let accepted_at = unix_time_seconds()?;
                 let acceptance_deadline =
                     checked_submit_deadline(started, SUBMIT_BLOCK_ACCEPTANCE_BUDGET)?;
@@ -1740,9 +1870,27 @@ fn perform_respond_to_peer_inner_with_policy(
                     Ok(_) => BlockSubmissionStatus::Accepted,
                     Err(NodeError::DuplicateBlock(_)) => BlockSubmissionStatus::AlreadyKnown,
                     Err(error) if is_retryable_block_admission(&error) => {
+                        // The wire status cannot carry a reason, and peers
+                        // report every retryable cause with the same deferred status.
+                        tracing::warn!(
+                            block_id = %hex::encode(block_id),
+                            height = block_height,
+                            reason = error.client_error().code,
+                            %error,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "deferred submitted block"
+                        );
                         BlockSubmissionStatus::Busy
                     }
                     Err(error) if error.client_error().status < 500 => {
+                        tracing::warn!(
+                            block_id = %hex::encode(block_id),
+                            height = block_height,
+                            reason = error.client_error().code,
+                            %error,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "rejected submitted block"
+                        );
                         BlockSubmissionStatus::Rejected
                     }
                     Err(error) => return Err(error.into()),
@@ -1791,23 +1939,65 @@ fn is_retryable_block_admission(error: &NodeError) -> bool {
     error.client_error().retryable
 }
 
-fn inbound_reputation_penalty(error: &P2pError) -> (u16, &'static str) {
+/// Blame a relaying peer only for invalidity intrinsic to the transaction.
+/// Missing/immature inputs, conflicts, fees, custody policy and aggregate
+/// mempool limits can differ between honest nodes, especially during catch-up.
+/// Unknown errors stay nonpunitive; malformed wire frames are handled separately.
+fn transaction_rejection_is_peer_fault(error: &NodeError) -> bool {
+    matches!(
+        error,
+        NodeError::Chain(
+            ChainError::WrongNetwork
+                | ChainError::UnsupportedTransactionVersion
+                | ChainError::NoInputs
+                | ChainError::NoOutputs
+                | ChainError::ZeroValueOutput
+                | ChainError::MalformedSignature
+                | ChainError::InvalidSignature
+                | ChainError::TransactionInputLimit
+                | ChainError::TransactionOutputLimit
+                | ChainError::SignatureLength
+        ) | NodeError::Wire(
+            WireError::WrongNetworkId { .. }
+                | WireError::SizeLimit { .. }
+                | WireError::CountLimit { .. }
+                | WireError::SignatureLength { .. }
+                | WireError::LengthOverflow
+        )
+    )
+}
+
+fn inbound_reputation_penalty(error: &P2pError, handshake_complete: bool) -> (u16, &'static str) {
     match error {
         P2pError::Peer(
             PeerError::PayloadTooLarge { .. }
             | PeerError::CountLimit { .. }
             | PeerError::PeerBudgetExceeded,
         ) => (RESOURCE_ABUSE_PENALTY, "peer resource limit violation"),
-        P2pError::Peer(PeerError::Cancelled) | P2pError::PeerTemporarilyBanned(_) => {
-            (0, "no peer fault")
-        }
+        // A peer with a larger valid session budget may relay more
+        // protocol-sized blocks than ours accepts. Closing the session already
+        // bounds the cost, and the next session resumes after the accepted
+        // prefix. Oversized frames and message floods remain abuse above.
+        P2pError::Peer(PeerError::Cancelled | PeerError::PeerByteBudgetReached)
+        | P2pError::PeerTemporarilyBanned(_) => (0, "no peer fault"),
         P2pError::Peer(
             PeerError::ConnectionClosed
             | PeerError::TotalTimeout
             | PeerError::IdleTimeout
             | PeerError::SubmitBlockResponseTimeout
+            | PeerError::BlockValidationWaitTimeout
             | PeerError::Io(_),
-        ) => (TRANSIENT_FAILURE_PENALTY, "inbound transport churn"),
+        ) => {
+            // Stock clients send their hello immediately after connecting, but
+            // may pause between later requests while their node validates a
+            // block or waits for its node lock. Such slowness is bounded by
+            // the session timeouts and per-IP limits, not evidence of abuse.
+            if handshake_complete {
+                (0, "no peer fault")
+            } else {
+                (TRANSIENT_FAILURE_PENALTY, "inbound transport churn")
+            }
+        }
         P2pError::Peer(_) | P2pError::UnexpectedMessage { .. } => {
             (PROTOCOL_VIOLATION_PENALTY, "peer protocol violation")
         }
@@ -1823,13 +2013,15 @@ fn outbound_reputation_penalty(error: &P2pError) -> (u16, &'static str) {
         P2pError::Peer(
             PeerError::PayloadTooLarge { .. }
             | PeerError::CountLimit { .. }
-            | PeerError::PeerBudgetExceeded,
+            | PeerError::PeerBudgetExceeded
+            | PeerError::PeerByteBudgetReached,
         ) => (RESOURCE_ABUSE_PENALTY, "remote resource limit violation"),
         P2pError::Peer(
             PeerError::ConnectionClosed
             | PeerError::TotalTimeout
             | PeerError::IdleTimeout
             | PeerError::SubmitBlockResponseTimeout
+            | PeerError::BlockValidationWaitTimeout
             | PeerError::Cancelled
             | PeerError::Io(_),
         )
@@ -1886,6 +2078,35 @@ struct PeerSubmissionMonitor {
 }
 
 impl PeerSubmissionMonitor {
+    fn local_validation(
+        cancellation: Option<Arc<AtomicBool>>,
+        request: RemoteProofRequest,
+    ) -> Result<Self, P2pError> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = if let Some(cancellation) = cancellation {
+            let watcher_stop = Arc::clone(&stop);
+            Some(
+                thread::Builder::new()
+                    .name("cmfd-pull-validation-monitor".to_owned())
+                    .spawn(move || {
+                        while !watcher_stop.load(Ordering::Acquire) {
+                            if cancellation.load(Ordering::Acquire)
+                                || Instant::now() >= request.deadline()
+                            {
+                                request.cancel();
+                                break;
+                            }
+                            thread::sleep(PEER_DISCONNECT_POLL_INTERVAL);
+                        }
+                    })
+                    .map_err(P2pError::ListenerIo)?,
+            )
+        } else {
+            None
+        };
+        Ok(Self { stop, thread })
+    }
+
     fn start(connection: &PeerConnection, request: RemoteProofRequest) -> Result<Self, P2pError> {
         let stream = connection.try_clone_stream()?;
         stream
@@ -2174,6 +2395,7 @@ fn listener_loop(
                     }
                 };
                 if !reserve_connection(&active, limits.max_peers) {
+                    tracing::debug!(peer = %remote_address, "rejected inbound peer: connection capacity reached");
                     let _ = stream.shutdown(Shutdown::Both);
                     continue;
                 }
@@ -2336,6 +2558,7 @@ pub struct StaticPeerPollHandle {
     stop: Arc<(Mutex<bool>, Condvar)>,
     active_sockets: Arc<ActiveSocketRegistry>,
     thread: Option<JoinHandle<()>>,
+    announcer: Option<JoinHandle<()>>,
 }
 
 struct PeerPollOptions {
@@ -2358,9 +2581,14 @@ impl StaticPeerPollHandle {
             .ok_or(P2pError::ThreadPanicked)?
             .join()
             .map_err(|_| P2pError::ThreadPanicked);
+        let announcer_result = match self.announcer.take() {
+            Some(announcer) => announcer.join().map_err(|_| P2pError::ThreadPanicked),
+            None => Ok(()),
+        };
         signal_result?;
         socket_result?;
-        join_result
+        join_result?;
+        announcer_result
     }
 }
 
@@ -2419,6 +2647,20 @@ fn spawn_peer_polling_inner(
     let active_sockets = Arc::new(ActiveSocketRegistry::default());
     let thread_stop = Arc::clone(&stop);
     let thread_active_sockets = Arc::clone(&active_sockets);
+    let announcer = TipAnnouncer {
+        shared: Arc::clone(&shared),
+        config: config.clone(),
+        stop: Arc::clone(&stop),
+        active_sockets: Arc::clone(&active_sockets),
+        nonce_override,
+        discovery: discovery.clone(),
+        security: Arc::clone(&security),
+        in_flight: Arc::new(Mutex::new(HashSet::new())),
+    };
+    let announcer = thread::Builder::new()
+        .name("cmfd-tip-announce".to_owned())
+        .spawn(move || tip_announce_loop(announcer))
+        .map_err(P2pError::ListenerIo)?;
     let options = PeerPollOptions {
         nonce_override,
         discovery,
@@ -2436,12 +2678,304 @@ fn spawn_peer_polling_inner(
                 options,
             )
         })
-        .map_err(P2pError::ListenerIo)?;
+        .map_err(P2pError::ListenerIo);
+    let thread = match thread {
+        Ok(thread) => thread,
+        Err(error) => {
+            let _ = signal_poll_stop(&stop);
+            let _ = announcer.join();
+            return Err(error);
+        }
+    };
     Ok(StaticPeerPollHandle {
         stop,
         active_sockets,
         thread: Some(thread),
+        announcer: Some(announcer),
     })
+}
+
+#[derive(Clone)]
+struct TipAnnouncer {
+    shared: Arc<Mutex<Node>>,
+    config: StaticPeerConfig,
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    active_sockets: Arc<ActiveSocketRegistry>,
+    nonce_override: Option<[u8; 32]>,
+    discovery: Option<Arc<PeerDiscovery>>,
+    security: Arc<PeerSecurity>,
+    in_flight: Arc<Mutex<HashSet<SocketAddr>>>,
+}
+
+impl TipAnnouncer {
+    /// The active tip and whether it is recent enough to be news worth
+    /// pushing; `None` when the node lock is busy.
+    fn observe_tip(&self) -> Option<([u8; 32], bool)> {
+        let node = self.shared.try_lock().ok()?;
+        let fresh = unix_time_seconds().is_ok_and(|now| {
+            now.saturating_sub(node.state.median_time_past()) <= TIP_ANNOUNCE_MAX_MEDIAN_AGE_SECONDS
+        });
+        Some((node.state.tip(), fresh))
+    }
+
+    fn targets(&self) -> Vec<SocketAddr> {
+        let mut targets = self.config.peers.clone();
+        if let Some(discovery) = self.discovery.as_ref() {
+            match discovery.announce_targets(MAX_TIP_ANNOUNCE_TARGETS) {
+                Ok(dynamic) => {
+                    for address in dynamic {
+                        if !targets.contains(&address) {
+                            targets.push(address);
+                        }
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "tip announce target selection failed"),
+            }
+        }
+        targets.retain(|peer| matches!(self.security.is_banned(peer.ip()), Ok(false)));
+        targets
+    }
+
+    fn claim(&self, peer: SocketAddr) -> bool {
+        self.in_flight
+            .lock()
+            .is_ok_and(|mut in_flight| in_flight.insert(peer))
+    }
+
+    fn release(&self, peer: SocketAddr) {
+        if let Ok(mut in_flight) = self.in_flight.lock() {
+            in_flight.remove(&peer);
+        }
+    }
+
+    /// Relays through the ordinary bounded relay path, so every limit, cursor
+    /// and validation rule is unchanged. Repeats only if the tip moved while
+    /// the previous relay was in flight.
+    fn announce(&self, peer: SocketAddr) {
+        for _ in 0..MAX_TIP_ANNOUNCE_REPEATS {
+            if poll_stopped(&self.stop) || !matches!(self.security.is_banned(peer.ip()), Ok(false))
+            {
+                break;
+            }
+            let Ok(started_tip) = lock_node(&self.shared).map(|node| node.state.tip()) else {
+                break;
+            };
+            let result = relay_blocks_to_peer_once_inner_with_policy(
+                Arc::clone(&self.shared),
+                peer,
+                self.config.limits,
+                self.config.address_policy,
+                self.nonce_override,
+                Some(&self.active_sockets),
+            );
+            if let Err(error) = &result {
+                let (penalty, reason) = outbound_reputation_penalty(error);
+                if let Err(reputation_error) =
+                    self.security.record_failure(peer.ip(), penalty, reason)
+                {
+                    tracing::warn!(%reputation_error, %peer, "failed to update outbound peer reputation");
+                }
+                break;
+            }
+            if lock_node(&self.shared).map_or(true, |node| node.state.tip() == started_tip) {
+                break;
+            }
+        }
+        self.release(peer);
+    }
+}
+
+fn tip_announce_loop(announcer: TipAnnouncer) {
+    let mut announced: Option<[u8; 32]> = None;
+    let mut workers = Vec::new();
+    loop {
+        {
+            let (mutex, wake) = &*announcer.stop;
+            let Ok(stopped) = mutex.lock() else {
+                break;
+            };
+            match wake.wait_timeout_while(stopped, TIP_ANNOUNCE_CHECK_INTERVAL, |value| !*value) {
+                Ok((stopped, _)) if !*stopped => {}
+                _ => break,
+            }
+        }
+        reap_workers(&mut workers);
+        let Some((tip, fresh)) = announcer.observe_tip() else {
+            continue;
+        };
+        // The tip present at startup is not news; ordinary polling covers it.
+        let previous = announced.replace(tip);
+        if previous.is_none_or(|previous| previous == tip) || !fresh {
+            continue;
+        }
+        for peer in announcer.targets() {
+            if workers.len() >= MAX_TIP_ANNOUNCE_IN_FLIGHT {
+                break;
+            }
+            if !announcer.claim(peer) {
+                continue;
+            }
+            let worker = announcer.clone();
+            match thread::Builder::new()
+                .name("cmfd-tip-announce-peer".to_owned())
+                .spawn(move || worker.announce(peer))
+            {
+                Ok(handle) => workers.push(handle),
+                Err(error) => {
+                    announcer.release(peer);
+                    tracing::warn!(%error, %peer, "failed to start tip announcement");
+                }
+            }
+        }
+    }
+    for worker in workers {
+        let _ = worker.join();
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CatchupCandidate {
+    address: SocketAddr,
+    remote_hello: PeerHello,
+    remaining_sessions: usize,
+}
+
+struct CatchupRound {
+    pending: VecDeque<CatchupCandidate>,
+    started_at: Instant,
+    reserved_sessions: usize,
+}
+
+impl CatchupRound {
+    fn new(pending: VecDeque<CatchupCandidate>, started_at: Instant) -> Self {
+        Self {
+            pending,
+            started_at,
+            reserved_sessions: 0,
+        }
+    }
+
+    fn next(&mut self, now: Instant, stopped: bool) -> Option<CatchupCandidate> {
+        if stopped
+            || self.reserved_sessions >= MAX_CATCHUP_EXTRA_SESSIONS_PER_ROUND
+            || now.saturating_duration_since(self.started_at) >= CATCHUP_EXTRA_SESSION_START_BUDGET
+        {
+            return None;
+        }
+        let candidate = self.pending.pop_front()?;
+        // A candidate that became banned or up to date may leave this slot
+        // unused. It must never increase the round's total allowance.
+        self.reserved_sessions += 1;
+        Some(candidate)
+    }
+
+    fn complete(&mut self, mut candidate: CatchupCandidate, continuation: Option<PeerHello>) {
+        candidate.remaining_sessions = candidate.remaining_sessions.saturating_sub(1);
+        if let Some(remote_hello) = continuation
+            && candidate.remaining_sessions > 0
+        {
+            candidate.remote_hello = remote_hello;
+            self.pending.push_back(candidate);
+        }
+    }
+}
+
+fn peer_sync_progress_cursor(shared: &Arc<Mutex<Node>>, address: SocketAddr) -> Option<[u8; 32]> {
+    let node = lock_node(shared).ok()?;
+    node.peer_sync_locator(
+        &observed_address(PeerDirection::Outbound, address),
+        MAX_BLOCKS_PER_SYNC,
+    )
+    .1
+}
+
+fn validated_sync_cursor_advanced(
+    node: &Node,
+    before: Option<[u8; 32]>,
+    after: Option<[u8; 32]>,
+) -> bool {
+    let Some(after) = after.filter(|id| *id != node.index.genesis) else {
+        return false;
+    };
+    let Some(after_entry) = node.index.blocks.get(&after) else {
+        return false;
+    };
+    let Some(before) = before else {
+        return true;
+    };
+    let before_height = if before == node.index.genesis {
+        0
+    } else if let Some(entry) = node.index.blocks.get(&before) {
+        entry.height()
+    } else {
+        return false;
+    };
+    after_entry.height() > before_height
+        && node.index.ancestor_at_height(after, before_height).ok() == Some(before)
+}
+
+fn catchup_remote_after_result(
+    result: &Result<SyncReport, P2pError>,
+    cursor_advanced: bool,
+    local: PeerHello,
+) -> Option<PeerHello> {
+    // An error after a durable block is still an error. It receives normal
+    // accounting and waits for the next ordinary pass, never an extra retry.
+    let report = result.as_ref().ok()?;
+    let progressed = report.accepted_blocks > 0 || (report.already_known > 0 && cursor_advanced);
+    (progressed
+        && report.remote_hello.tip != local.tip
+        && report.remote_hello.cumulative_work > local.cumulative_work)
+        .then_some(report.remote_hello)
+}
+
+fn catchup_remote_after_sync(
+    shared: &Arc<Mutex<Node>>,
+    address: SocketAddr,
+    cursor_before: Option<[u8; 32]>,
+    result: &Result<SyncReport, P2pError>,
+) -> Option<PeerHello> {
+    result.as_ref().ok()?;
+    let node = lock_node(shared).ok()?;
+    let cursor_after = node
+        .peer_sync_locator(
+            &observed_address(PeerDirection::Outbound, address),
+            MAX_BLOCKS_PER_SYNC,
+        )
+        .1;
+    catchup_remote_after_result(
+        result,
+        validated_sync_cursor_advanced(&node, cursor_before, cursor_after),
+        node.peer_hello(),
+    )
+}
+
+fn record_poll_sync_result(
+    options: &PeerPollOptions,
+    peer: SocketAddr,
+    result: &Result<SyncReport, P2pError>,
+) -> bool {
+    let banned = result.as_ref().err().is_some_and(|error| {
+        let (penalty, reason) = outbound_reputation_penalty(error);
+        options
+            .security
+            .record_failure(peer.ip(), penalty, reason)
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, %peer, "failed to update outbound peer reputation");
+                false
+            })
+    });
+    if let Some(discovery) = options.discovery.as_ref() {
+        let update = if result.is_ok() {
+            discovery.mark_verified(peer)
+        } else {
+            discovery.mark_failed(peer)
+        };
+        if let Err(error) = update {
+            tracing::warn!(%error, %peer, "failed to update peer discovery state");
+        }
+    }
+    banned
 }
 
 fn static_peer_poll_loop(
@@ -2469,6 +3003,7 @@ fn static_peer_poll_loop(
                 Err(error) => tracing::warn!(%error, "peer discovery target selection failed"),
             }
         }
+        let mut catchup_candidates = VecDeque::new();
         for peer in targets {
             if poll_stopped(&stop) {
                 return;
@@ -2486,6 +3021,7 @@ fn static_peer_poll_loop(
             }
             // Errors are already logged via tracing inside these calls;
             // a failure with one peer must not stop later peers or rounds.
+            let cursor_before = peer_sync_progress_cursor(&shared, peer);
             let sync_result = sync_from_peer_once_inner_with_policy(
                 Arc::clone(&shared),
                 peer,
@@ -2495,26 +3031,7 @@ fn static_peer_poll_loop(
                 Some(&active_sockets),
             );
             let mut round_succeeded = sync_result.is_ok();
-            let sync_banned = sync_result.as_ref().err().is_some_and(|error| {
-                let (penalty, reason) = outbound_reputation_penalty(error);
-                options
-                    .security
-                    .record_failure(peer.ip(), penalty, reason)
-                    .unwrap_or_else(|reputation_error| {
-                        tracing::warn!(%reputation_error, %peer, "failed to update outbound peer reputation");
-                        false
-                    })
-            });
-            if let Some(discovery) = options.discovery.as_ref() {
-                let discovery_result = if sync_result.is_ok() {
-                    discovery.mark_verified(peer)
-                } else {
-                    discovery.mark_failed(peer)
-                };
-                if let Err(error) = discovery_result {
-                    tracing::warn!(%error, peer = %peer, "failed to update peer discovery state");
-                }
-            }
+            let sync_banned = record_poll_sync_result(&options, peer, &sync_result);
             if sync_banned {
                 continue;
             }
@@ -2570,6 +3087,61 @@ fn static_peer_poll_loop(
                     }
                 }
             }
+            // A non-banning reverse-relay failure must not suppress useful
+            // downloads. Keep combined success only for reputation credit.
+            if let Some(remote_hello) =
+                catchup_remote_after_sync(&shared, peer, cursor_before, &sync_result)
+            {
+                catchup_candidates.push_back(CatchupCandidate {
+                    address: peer,
+                    remote_hello,
+                    remaining_sessions: MAX_CATCHUP_EXTRA_SESSIONS_PER_PEER,
+                });
+            }
+        }
+
+        // Every selected peer has received its ordinary turn. Only useful,
+        // successful pulls get bounded extra sessions, interleaved fairly.
+        let mut catchup = CatchupRound::new(catchup_candidates, Instant::now());
+        while let Some(candidate) = catchup.next(Instant::now(), poll_stopped(&stop)) {
+            let peer = candidate.address;
+            match options.security.is_banned(peer.ip()) {
+                Ok(false) => {}
+                Ok(true) => continue,
+                Err(error) => {
+                    tracing::warn!(%error, %peer, "failed to consult catch-up peer reputation");
+                    continue;
+                }
+            }
+            let still_ahead = lock_node(&shared).is_ok_and(|node| {
+                candidate.remote_hello.tip != node.peer_hello().tip
+                    && candidate.remote_hello.cumulative_work > node.cumulative_work()
+            });
+            if !still_ahead || poll_stopped(&stop) {
+                continue;
+            }
+            let cursor_before = peer_sync_progress_cursor(&shared, peer);
+            if poll_stopped(&stop)
+                || Instant::now().saturating_duration_since(catchup.started_at)
+                    >= CATCHUP_EXTRA_SESSION_START_BUDGET
+            {
+                break;
+            }
+            let result = sync_from_peer_once_inner_with_policy(
+                Arc::clone(&shared),
+                peer,
+                config.limits,
+                config.address_policy,
+                options.nonce_override,
+                Some(&active_sockets),
+            );
+            let banned = record_poll_sync_result(&options, peer, &result);
+            let continuation = if banned {
+                None
+            } else {
+                catchup_remote_after_sync(&shared, peer, cursor_before, &result)
+            };
+            catchup.complete(candidate, continuation);
         }
 
         let (mutex, wake) = &*stop;
@@ -2863,6 +3435,192 @@ mod tests {
         }
     }
 
+    fn test_catchup_candidate(index: u8) -> CatchupCandidate {
+        let mut remote_hello = test_thin_miner_hello();
+        remote_hello.tip = [index; 32];
+        remote_hello.cumulative_work.0[63] = 100;
+        CatchupCandidate {
+            address: SocketAddr::from(([127, 0, 0, 1], 29000 + u16::from(index))),
+            remote_hello,
+            remaining_sessions: MAX_CATCHUP_EXTRA_SESSIONS_PER_PEER,
+        }
+    }
+
+    fn test_catchup_report(remote_hello: PeerHello) -> SyncReport {
+        SyncReport {
+            remote_hello,
+            inventory_items: 0,
+            requested_blocks: 0,
+            accepted_blocks: 0,
+            already_known: 0,
+            transaction_inventory_items: 0,
+            requested_transactions: 0,
+            accepted_transactions: 0,
+            already_known_transactions: 0,
+            rejected_transactions: 0,
+        }
+    }
+
+    #[test]
+    fn catchup_round_is_round_robin_and_globally_bounded() {
+        let now = Instant::now();
+        let peers: Vec<_> = (1..=4).map(test_catchup_candidate).collect();
+        let mut round = CatchupRound::new(peers.iter().copied().collect(), now);
+        let mut order = Vec::new();
+        for _ in 0..MAX_CATCHUP_EXTRA_SESSIONS_PER_ROUND {
+            let peer = round.next(now, false).unwrap();
+            order.push(peer.address);
+            round.complete(peer, Some(peer.remote_hello));
+        }
+        assert_eq!(
+            order,
+            peers
+                .iter()
+                .cycle()
+                .take(8)
+                .map(|p| p.address)
+                .collect::<Vec<_>>()
+        );
+        assert!(round.next(now, false).is_none());
+        assert!(
+            !round.pending.is_empty(),
+            "global cap must stop otherwise eligible work"
+        );
+    }
+
+    #[test]
+    fn catchup_round_caps_each_peer_and_does_not_requeue_failed_progress() {
+        let now = Instant::now();
+        let candidate = test_catchup_candidate(1);
+        let mut round = CatchupRound::new([candidate].into(), now);
+        for _ in 0..MAX_CATCHUP_EXTRA_SESSIONS_PER_PEER {
+            let peer = round.next(now, false).unwrap();
+            round.complete(peer, Some(peer.remote_hello));
+        }
+        assert!(round.next(now, false).is_none());
+        let mut round = CatchupRound::new([candidate, test_catchup_candidate(2)].into(), now);
+        let failed = round.next(now, false).unwrap();
+        round.complete(failed, None);
+        let other = round.next(now, false).unwrap();
+        assert_ne!(other.address, failed.address);
+        round.complete(other, None);
+        assert!(round.next(now, false).is_none());
+    }
+
+    #[test]
+    fn catchup_round_stops_new_sessions_at_time_budget_or_shutdown() {
+        let now = Instant::now();
+        let mut expired = CatchupRound::new([test_catchup_candidate(1)].into(), now);
+        assert!(
+            expired
+                .next(now + CATCHUP_EXTRA_SESSION_START_BUDGET, false)
+                .is_none()
+        );
+        assert_eq!(expired.reserved_sessions, 0);
+        let mut stopped = CatchupRound::new([test_catchup_candidate(1)].into(), now);
+        assert!(stopped.next(now, true).is_none());
+        assert_eq!(stopped.reserved_sessions, 0);
+        let mut live = CatchupRound::new([test_catchup_candidate(1)].into(), now);
+        assert!(
+            live.next(
+                now + CATCHUP_EXTRA_SESSION_START_BUDGET - Duration::from_millis(1),
+                false
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn catchup_requires_valid_progress_not_claimed_work_or_height() {
+        let remote = test_catchup_candidate(1).remote_hello;
+        let mut local = test_thin_miner_hello();
+        local.cumulative_work.0[63] = 10;
+        local.height = 775;
+        let mut report = test_catchup_report(remote);
+        report.remote_hello.height = 751;
+        report.remote_hello.cumulative_work.0 = [0xff; 64];
+        assert!(catchup_remote_after_result(&Ok(report), true, local).is_none());
+        report.inventory_items = 1;
+        report.already_known = 1;
+        assert!(catchup_remote_after_result(&Ok(report), false, local).is_none());
+        assert!(catchup_remote_after_result(&Ok(report), true, local).is_some());
+        report.already_known = 0;
+        report.requested_blocks = 1;
+        report.accepted_blocks = 1;
+        assert!(
+            catchup_remote_after_result(&Ok(report), false, local).is_some(),
+            "a shorter but higher-work branch must remain eligible"
+        );
+        report.remote_hello.cumulative_work = local.cumulative_work;
+        assert!(catchup_remote_after_result(&Ok(report), true, local).is_none());
+        report.remote_hello.cumulative_work.0 = [0xff; 64];
+        report.remote_hello.tip = local.tip;
+        assert!(catchup_remote_after_result(&Ok(report), true, local).is_none());
+        for error in [
+            P2pError::Peer(PeerError::CountLimit {
+                field: "sync inventory",
+                actual: 17,
+                max: 16,
+            }),
+            P2pError::Peer(PeerError::ConnectionClosed),
+            P2pError::Peer(PeerError::Cancelled),
+        ] {
+            assert!(
+                catchup_remote_after_result(&Err(error), true, local).is_none(),
+                "errors, including after durable progress, never authorize an extra retry"
+            );
+        }
+    }
+
+    #[test]
+    fn catchup_known_cursor_must_advance_along_validated_ancestry() {
+        let path = test_dir("catchup-cursor-ancestry");
+        let node = open_shared(&path);
+        let now = unix_time_seconds().unwrap();
+        mine(&node, 3, now);
+        {
+            let mut node = node.lock().unwrap();
+            let genesis = node.index.genesis;
+            let first = node.active_block_id_at_height(1).unwrap();
+            let second = node.active_block_id_at_height(2).unwrap();
+            let side = crate::tests::mined_child(&node, genesis, now + 10, 0x71);
+            let side_id = side.block_id();
+            node.submit_block(side, now + 10).unwrap();
+            let child = crate::tests::mined_child(&node, side_id, now + 11, 0x72);
+            let child_id = child.block_id();
+            node.submit_block(child, now + 11).unwrap();
+            assert!(validated_sync_cursor_advanced(&node, None, Some(first)));
+            assert!(validated_sync_cursor_advanced(
+                &node,
+                Some(first),
+                Some(second)
+            ));
+            assert!(!validated_sync_cursor_advanced(
+                &node,
+                Some(second),
+                Some(first)
+            ));
+            assert!(!validated_sync_cursor_advanced(
+                &node,
+                Some(first),
+                Some(first)
+            ));
+            assert!(!validated_sync_cursor_advanced(
+                &node,
+                Some(first),
+                Some(child_id)
+            ));
+            assert!(!validated_sync_cursor_advanced(
+                &node,
+                None,
+                Some([0xab; 32])
+            ));
+            assert!(!validated_sync_cursor_advanced(&node, None, Some(genesis)));
+        }
+        drop(node);
+        clean_test_dir(&path);
+    }
+
     #[test]
     fn block_sync_batch_limit_tracks_the_network_frame_size() {
         let limits = test_limits();
@@ -2985,9 +3743,10 @@ mod tests {
 
         assert_eq!(outbound_reputation_penalty(&transport).0, 0);
         assert_eq!(
-            inbound_reputation_penalty(&transport).0,
+            inbound_reputation_penalty(&transport, false).0,
             TRANSIENT_FAILURE_PENALTY
         );
+        assert_eq!(inbound_reputation_penalty(&transport, true).0, 0);
         assert_eq!(
             outbound_reputation_penalty(&malformed).0,
             PROTOCOL_VIOLATION_PENALTY
@@ -3518,6 +4277,821 @@ mod tests {
     }
 
     #[test]
+    fn known_side_branch_prefix_does_not_consume_the_download_budget() {
+        let source_path = test_dir("known-prefix-source");
+        let target_path = test_dir("known-prefix-target");
+        let source = open_shared(&source_path);
+        let target = open_shared(&target_path);
+        let now = unix_time_seconds().unwrap();
+        let source_blocks: Vec<Block> = (0..5)
+            .map(|offset| {
+                source
+                    .lock()
+                    .unwrap()
+                    .mine_once(
+                        default_miner_destination(),
+                        now + offset,
+                        DEFAULT_MINING_ATTEMPTS,
+                    )
+                    .unwrap()
+            })
+            .collect();
+        {
+            let mut node = target.lock().unwrap();
+            for offset in 0..6 {
+                node.mine_once(
+                    insecure_dev_destination(0x75),
+                    now + 1 + offset,
+                    DEFAULT_MINING_ATTEMPTS,
+                )
+                .unwrap();
+            }
+        }
+        // The target already stores the first three source blocks as a side
+        // branch beneath its own longer chain.
+        for block in &source_blocks[..3] {
+            crate::submit_shared_block(&target, block.clone(), now + 10).unwrap();
+        }
+        let active_tip = target.lock().unwrap().peer_hello().tip;
+        assert!(
+            !target
+                .lock()
+                .unwrap()
+                .contains_block(source_blocks[3].block_id())
+        );
+
+        let reserve =
+            (MAX_TRANSACTIONS_PER_SYNC * MAX_TRANSACTION_BYTES) as u64 + SYNC_CONTROL_RESERVE_BYTES;
+        let block_bytes = max_block_bytes_for_network(crate::DEVNET_PROFILE.network_id) as u64;
+        let receiver_limits = PeerLimits {
+            max_bytes_per_peer: reserve + block_bytes,
+            ..test_limits()
+        };
+        assert_eq!(
+            block_sync_batch_limit(crate::DEVNET_PROFILE.network_id, receiver_limits),
+            1
+        );
+        // Like stock mainnet nodes, the source offers one id per request.
+        let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = socket.local_addr().unwrap();
+        let listener = spawn_inbound_listener_inner(
+            Arc::clone(&source),
+            socket,
+            receiver_limits,
+            Some(SOURCE_NONCE),
+        )
+        .unwrap();
+        let report = sync_from_peer_once_inner_with_policy(
+            Arc::clone(&target),
+            address,
+            receiver_limits,
+            PeerAddressPolicy::PrivateOnly,
+            Some(TARGET_NONCE),
+            None,
+        )
+        .unwrap();
+
+        // One session walks the whole known prefix and still downloads the
+        // first unknown block of the branch.
+        assert_eq!(report.already_known, 3);
+        assert_eq!(report.accepted_blocks, 1);
+        assert!(
+            target
+                .lock()
+                .unwrap()
+                .contains_block(source_blocks[3].block_id())
+        );
+        assert_eq!(target.lock().unwrap().peer_hello().tip, active_tip);
+
+        listener.stop().unwrap();
+        drop(source);
+        drop(target);
+        clean_test_dir(&source_path);
+        clean_test_dir(&target_path);
+    }
+
+    #[test]
+    fn larger_valid_inventory_respects_receiver_budget_without_banning_peer() {
+        let source_path = test_dir("heterogeneous-budget-source");
+        let target_path = test_dir("heterogeneous-budget-target");
+        let limited_path = test_dir("heterogeneous-budget-direct");
+        let source = open_shared(&source_path);
+        let target = open_shared(&target_path);
+        let limited = open_shared(&limited_path);
+        mine(&source, 3, unix_time_seconds().unwrap());
+        let reserve =
+            (MAX_TRANSACTIONS_PER_SYNC * MAX_TRANSACTION_BYTES) as u64 + SYNC_CONTROL_RESERVE_BYTES;
+        let block_bytes = max_block_bytes_for_network(crate::DEVNET_PROFILE.network_id) as u64;
+        let receiver_limits = PeerLimits {
+            max_bytes_per_peer: reserve + block_bytes,
+            ..test_limits()
+        };
+        let sender_limits = PeerLimits {
+            max_bytes_per_peer: reserve + 2 * block_bytes,
+            ..test_limits()
+        };
+        assert_eq!(
+            block_sync_batch_limit(crate::DEVNET_PROFILE.network_id, receiver_limits),
+            1
+        );
+        assert_eq!(
+            block_sync_batch_limit(crate::DEVNET_PROFILE.network_id, sender_limits),
+            2
+        );
+        let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = socket.local_addr().unwrap();
+        let source_discovery = Arc::new(PeerDiscovery::open(
+            &source_path,
+            source.lock().unwrap().peer_hello(),
+            address,
+            PeerAddressPolicy::PrivateOnly,
+        ));
+        let listener = spawn_inbound_listener_inner_with_policy(
+            Arc::clone(&source),
+            socket,
+            sender_limits,
+            PeerAddressPolicy::PrivateOnly,
+            Some(SOURCE_NONCE),
+            Some(source_discovery),
+        )
+        .unwrap();
+        let target_address = "127.0.0.1:28447".parse().unwrap();
+        let discovery = Arc::new(PeerDiscovery::open(
+            &target_path,
+            target.lock().unwrap().peer_hello(),
+            target_address,
+            PeerAddressPolicy::PrivateOnly,
+        ));
+        let poller = spawn_peer_polling_inner(
+            Arc::clone(&target),
+            StaticPeerConfig {
+                listen_address: target_address,
+                peers: vec![address],
+                limits: receiver_limits,
+                address_policy: PeerAddressPolicy::PrivateOnly,
+            },
+            Duration::from_secs(30),
+            Some(TARGET_NONCE),
+            Some(Arc::clone(&discovery)),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while target.lock().unwrap().peer_hello().height == 0
+            && !discovery.security.is_banned(address.ip()).unwrap()
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let banned = discovery.security.is_banned(address.ip()).unwrap();
+        let height = target.lock().unwrap().peer_hello().height;
+        poller.stop().unwrap();
+        assert!(
+            !banned,
+            "a valid two-block offer must not become a resource-abuse peer ban"
+        );
+        assert!(
+            height > 0,
+            "a receiver with a smaller local budget must still make progress"
+        );
+
+        // Exercise one direct session separately, so later catch-up scheduling
+        // cannot hide an accidental increase in the per-session download cap.
+        let report = sync_from_peer_once_inner(
+            Arc::clone(&limited),
+            address,
+            receiver_limits,
+            Some(TARGET_NONCE),
+        )
+        .unwrap();
+        assert_eq!(report.inventory_items, 2);
+        assert_eq!(report.requested_blocks, 1);
+        assert_eq!(report.accepted_blocks, 1);
+        assert_eq!(limited.lock().unwrap().peer_hello().height, 1);
+        listener.stop().unwrap();
+        drop(source);
+        drop(target);
+        drop(limited);
+        clean_test_dir(&source_path);
+        clean_test_dir(&target_path);
+        clean_test_dir(&limited_path);
+    }
+
+    #[test]
+    fn sync_inventory_above_protocol_offer_limit_remains_resource_abuse() {
+        let path = test_dir("oversized-sync-offer");
+        let target = open_shared(&path);
+        let mut hello = target.lock().unwrap().peer_hello();
+        hello.node_nonce = SOURCE_NONCE;
+        let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = socket.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut connection = accept_test_peer(socket, hello);
+            assert!(matches!(
+                connection.receive().unwrap(),
+                PeerMessage::GetHeaders { .. }
+            ));
+            let block_ids = (1..=MAX_BLOCKS_PER_SYNC + 1)
+                .map(|value| [value as u8; 32])
+                .collect();
+            connection
+                .send(PeerMessage::Inventory { block_ids })
+                .unwrap();
+            assert!(matches!(
+                connection.receive(),
+                Err(PeerError::ConnectionClosed)
+            ));
+        });
+        let limits = PeerLimits {
+            max_bytes_per_peer: (MAX_TRANSACTIONS_PER_SYNC * MAX_TRANSACTION_BYTES) as u64
+                + SYNC_CONTROL_RESERVE_BYTES
+                + max_block_bytes_for_network(crate::DEVNET_PROFILE.network_id) as u64,
+            ..test_limits()
+        };
+        let error =
+            sync_from_peer_once_inner(Arc::clone(&target), address, limits, Some(TARGET_NONCE))
+                .unwrap_err();
+        assert!(matches!(
+            error,
+            P2pError::Peer(PeerError::CountLimit {
+                field: "sync inventory",
+                actual: 17,
+                max: MAX_BLOCKS_PER_SYNC,
+            })
+        ));
+        let (penalty, reason) = outbound_reputation_penalty(&error);
+        assert_eq!(penalty, RESOURCE_ABUSE_PENALTY);
+        let security = PeerSecurity::default();
+        assert!(
+            security
+                .record_failure(address.ip(), penalty, reason)
+                .unwrap()
+        );
+        assert!(security.is_banned(address.ip()).unwrap());
+        assert_eq!(target.lock().unwrap().peer_hello().height, 0);
+        server.join().unwrap();
+        drop(target);
+        clean_test_dir(&path);
+    }
+
+    fn wait_for_failed_inbound_sessions(node: &Arc<Mutex<Node>>, failed: u64) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let recorded = node
+                .lock()
+                .unwrap()
+                .status()
+                .unwrap()
+                .peers
+                .iter()
+                .filter(|peer| peer.direction == PeerDirection::Inbound)
+                .map(|peer| peer.failed_sessions)
+                .sum::<u64>();
+            if recorded >= failed || Instant::now() >= deadline {
+                assert!(
+                    recorded >= failed,
+                    "inbound session outcome was not recorded"
+                );
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn larger_valid_relay_respects_receiver_budget_without_banning_peer() {
+        let source_path = test_dir("heterogeneous-relay-source");
+        let target_path = test_dir("heterogeneous-relay-target");
+        let source = open_shared(&source_path);
+        let target = open_shared(&target_path);
+        let start_time = unix_time_seconds().unwrap();
+        let blocks = (0..3)
+            .map(|offset| {
+                source
+                    .lock()
+                    .unwrap()
+                    .mine_once(
+                        default_miner_destination(),
+                        start_time + offset,
+                        DEFAULT_MINING_ATTEMPTS,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let frame_bytes = blocks
+            .iter()
+            .map(|block| {
+                encode_peer_frame(&PeerFrame {
+                    sequence: 1,
+                    message: PeerMessage::SubmitBlock(block.clone()),
+                })
+                .unwrap()
+                .len() as u64
+            })
+            .collect::<Vec<_>>();
+        let largest = *frame_bytes.iter().max().unwrap();
+        let smallest = *frame_bytes.iter().min().unwrap();
+        let hello = source.lock().unwrap().peer_hello();
+        let network_id = hello.network_id;
+        let frame_len = |message: PeerMessage| {
+            encode_peer_frame(&PeerFrame {
+                sequence: 1,
+                message,
+            })
+            .unwrap()
+            .len() as u64
+        };
+        let handshake_bytes = 2 * frame_len(PeerMessage::Hello(hello));
+        let result_bytes = frame_len(PeerMessage::BlockSubmissionResult(BlockSubmissionResult {
+            block_id: [0; 32],
+            status: BlockSubmissionStatus::Accepted,
+            peer_height: 0,
+            peer_tip: [0; 32],
+        }));
+        let mempool_bytes = frame_len(PeerMessage::GetMempool)
+            + frame_len(PeerMessage::TransactionInventory { txids: Vec::new() });
+        // Room for the handshake, one valid block, its acknowledgement, and an
+        // empty mempool exchange, but never for a second block in one session.
+        let receiver_limits = PeerLimits {
+            max_bytes_per_peer: handshake_bytes + largest + result_bytes + mempool_bytes,
+            ..test_limits()
+        };
+        assert!(largest + mempool_bytes < 2 * smallest);
+        let sender_limits = test_limits();
+        assert!(block_sync_batch_limit(network_id, sender_limits) >= blocks.len());
+
+        let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = socket.local_addr().unwrap();
+        let listener = spawn_inbound_listener_inner(
+            Arc::clone(&target),
+            socket,
+            receiver_limits,
+            Some(TARGET_NONCE),
+        )
+        .unwrap();
+
+        // The sender offers its whole valid, protocol-sized batch. The
+        // receiver accepts what fits its own budget and closes the session at
+        // the next block frame instead of treating the peer as an abuser.
+        for (session, expected_height) in [1_u64, 2, 3].into_iter().enumerate() {
+            let result = relay_blocks_to_peer_once_inner_with_policy(
+                Arc::clone(&source),
+                address,
+                sender_limits,
+                PeerAddressPolicy::PrivateOnly,
+                Some(SOURCE_NONCE),
+                None,
+            );
+            if expected_height < blocks.len() as u64 {
+                assert!(
+                    result.is_err(),
+                    "the receiver must close the over-budget session"
+                );
+                wait_for_failed_inbound_sessions(&target, session as u64 + 1);
+            } else {
+                assert_eq!(result.unwrap().accepted_blocks, 1);
+            }
+            assert!(
+                !listener.peer_is_temporarily_banned(address.ip()).unwrap(),
+                "a valid block stream above the receiver budget must not ban the sender"
+            );
+            assert_eq!(
+                target.lock().unwrap().peer_hello().height,
+                expected_height,
+                "each relay session must still deliver the block that fits"
+            );
+        }
+        assert!(tips_match(&source, &target));
+
+        listener.stop().unwrap();
+        drop(source);
+        drop(target);
+        clean_test_dir(&source_path);
+        clean_test_dir(&target_path);
+    }
+
+    #[test]
+    fn inbound_message_floods_and_oversized_frames_remain_resource_abuse() {
+        for error in [
+            PeerError::PeerBudgetExceeded,
+            PeerError::PayloadTooLarge { actual: 2, max: 1 },
+            PeerError::CountLimit {
+                field: "test",
+                actual: 2,
+                max: 1,
+            },
+        ] {
+            assert_eq!(
+                inbound_reputation_penalty(&P2pError::Peer(error), true).0,
+                RESOURCE_ABUSE_PENALTY
+            );
+        }
+    }
+
+    #[test]
+    fn slow_inbound_peer_after_handshake_is_not_banned_for_transport_churn() {
+        let path = test_dir("slow-handshaken-peer");
+        let shared = open_shared(&path);
+        let security = Arc::new(PeerSecurity::default());
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        // Earlier transient failures leave the address one penalty short of a ban.
+        assert!(
+            !security
+                .record_failure(
+                    loopback,
+                    PEER_BAN_SCORE - TRANSIENT_FAILURE_PENALTY,
+                    "earlier transport churn",
+                )
+                .unwrap()
+        );
+        let client_hello = with_nonce(shared.lock().unwrap().peer_hello(), Some(SOURCE_NONCE));
+
+        // A handshaken peer that pauses past the idle timeout, as a stock
+        // client does while its node validates, ends the session unpenalized.
+        // A connection that never sends its hello is still churn.
+        for (sends_hello, banned_after) in [(true, false), (false, true)] {
+            let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = socket.local_addr().unwrap();
+            let client = thread::spawn(move || {
+                let mut stream = Some(TcpStream::connect(address).unwrap());
+                let mut connection = None;
+                if sends_hello {
+                    let mut handshaken = PeerConnection::from_stream(
+                        stream.take().unwrap(),
+                        PeerSession::new(client_hello, test_limits()).unwrap(),
+                    )
+                    .unwrap();
+                    handshaken.send_hello().unwrap();
+                    assert!(matches!(
+                        handshaken.receive().unwrap(),
+                        PeerMessage::Hello(_)
+                    ));
+                    connection = Some(handshaken);
+                }
+                thread::sleep(test_limits().idle_timeout + Duration::from_millis(500));
+                drop((stream, connection));
+            });
+            let (stream, _) = socket.accept().unwrap();
+            let error = respond_to_peer_inner_with_options(
+                Arc::clone(&shared),
+                stream,
+                test_limits(),
+                InboundPeerOptions {
+                    address_policy: PeerAddressPolicy::PrivateOnly,
+                    nonce_override: Some(TARGET_NONCE),
+                    cancellation: None,
+                    discovery: None,
+                    security: Arc::clone(&security),
+                },
+            )
+            .unwrap_err();
+            assert!(matches!(error, P2pError::Peer(PeerError::IdleTimeout)));
+            assert_eq!(security.is_banned(loopback).unwrap(), banned_after);
+            client.join().unwrap();
+        }
+        drop(shared);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn single_block_batches_continue_a_competing_branch_across_sessions() {
+        check_single_block_fork_continuation(false, false);
+    }
+
+    #[test]
+    fn single_block_sync_crosses_a_known_active_prefix_after_sparse_locator() {
+        let source_path = test_dir("sparse-active-prefix-source");
+        let target_path = test_dir("sparse-active-prefix-target");
+        let source = open_shared(&source_path);
+        let target = open_shared(&target_path);
+        let now = unix_time_seconds().unwrap();
+        for offset in 0..16 {
+            let block = source
+                .lock()
+                .unwrap()
+                .mine_once(
+                    default_miner_destination(),
+                    now + offset,
+                    DEFAULT_MINING_ATTEMPTS,
+                )
+                .unwrap();
+            target
+                .lock()
+                .unwrap()
+                .submit_block(block, now + offset)
+                .unwrap();
+        }
+        mine(&target, 13, now + 100);
+        mine(&source, 14, now + 16);
+        let (common_tip, first_known, expected_progress) = {
+            let node = source.lock().unwrap();
+            (
+                node.active_block_id_at_height(16).unwrap(),
+                node.active_block_id_at_height(14).unwrap(),
+                (14..=30)
+                    .map(|height| node.active_block_id_at_height(height).unwrap())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let locator = target.lock().unwrap().block_locator(MAX_BLOCKS_PER_SYNC);
+        assert!(!locator.contains(&common_tip));
+        assert_eq!(
+            source.lock().unwrap().inventory_after(&locator, [0; 32], 1),
+            vec![first_known],
+            "the sparse locator must initially return a known active block before the fork"
+        );
+        let limits = PeerLimits {
+            max_bytes_per_peer: (MAX_TRANSACTIONS_PER_SYNC * MAX_TRANSACTION_BYTES) as u64
+                + SYNC_CONTROL_RESERVE_BYTES
+                + max_block_bytes_for_network(crate::DEVNET_PROFILE.network_id) as u64,
+            ..test_limits()
+        };
+        assert_eq!(
+            block_sync_batch_limit(crate::DEVNET_PROFILE.network_id, limits),
+            1
+        );
+        let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = socket.local_addr().unwrap();
+        let listener =
+            spawn_inbound_listener_inner(Arc::clone(&source), socket, limits, Some(SOURCE_NONCE))
+                .unwrap();
+        let observation = observed_address(PeerDirection::Outbound, address);
+        // The first session walks the three known active blocks and downloads
+        // the first fork block; every later session downloads one block.
+        for (session, expected_cursor) in expected_progress.into_iter().skip(3).enumerate() {
+            let report =
+                sync_from_peer_once_inner(Arc::clone(&target), address, limits, Some(TARGET_NONCE))
+                    .unwrap();
+            let cursor = target
+                .lock()
+                .unwrap()
+                .peer_sync_locator(&observation, MAX_BLOCKS_PER_SYNC)
+                .1;
+            assert_eq!(report.inventory_items, if session == 0 { 4 } else { 1 });
+            assert_eq!(
+                cursor,
+                Some(expected_cursor),
+                "session {session} repeated a known active prefix: requested={}, accepted={}, already_known={}",
+                report.requested_blocks,
+                report.accepted_blocks,
+                report.already_known
+            );
+            assert_eq!(report.already_known, if session == 0 { 3 } else { 0 });
+            assert_eq!(report.accepted_blocks, 1);
+        }
+        assert!(tips_match(&source, &target));
+        assert_eq!(target.lock().unwrap().peer_hello().height, 30);
+        listener.stop().unwrap();
+        drop(source);
+        drop(target);
+        clean_test_dir(&source_path);
+        clean_test_dir(&target_path);
+    }
+
+    #[test]
+    fn single_block_fork_continuation_recovers_after_receiver_restart() {
+        check_single_block_fork_continuation(true, false);
+    }
+
+    #[test]
+    fn single_block_fork_continuation_survives_a_changing_remote_tip() {
+        check_single_block_fork_continuation(false, true);
+    }
+
+    #[test]
+    fn repeated_competing_forks_reuse_state_while_both_tips_move() {
+        fn mine_active(node: &Arc<Mutex<Node>>, timestamp: u64, payout: u8) -> Block {
+            let block = {
+                let node = node.lock().unwrap();
+                let template = node
+                    .build_template(insecure_dev_destination(payout), timestamp)
+                    .unwrap();
+                let proof = node
+                    .verifier
+                    .mine(&template.challenge, 0, DEFAULT_MINING_ATTEMPTS)
+                    .unwrap();
+                Block {
+                    version: cmfd_consensus::BLOCK_VERSION,
+                    challenge: template.challenge,
+                    proof,
+                    coinbase: template.coinbase,
+                    transactions: template.transactions,
+                }
+            };
+            crate::submit_shared_block(node, block.clone(), timestamp).unwrap();
+            block
+        }
+
+        let source_path = test_dir("repeated-fork-state-source");
+        let target_path = test_dir("repeated-fork-state-target");
+        let source = open_shared(&source_path);
+        let target = open_shared(&target_path);
+        let start = unix_time_seconds().unwrap().saturating_sub(600);
+        for offset in 0..16 {
+            let block = mine_active(&source, start + offset, 0x81);
+            target
+                .lock()
+                .unwrap()
+                .submit_block(block, start + offset)
+                .unwrap();
+        }
+        // Exercise production branch admission with cheap deterministic V2
+        // proofs; this is a state-reuse regression, not a V4 speed benchmark.
+        target.lock().unwrap().profile.proof = crate::ProofProfile::ProductionV4;
+        let replayed = Arc::clone(&target.lock().unwrap().block_preverifier.replay_state_blocks);
+        let limits = PeerLimits {
+            max_bytes_per_peer: (MAX_TRANSACTIONS_PER_SYNC * MAX_TRANSACTION_BYTES) as u64
+                + SYNC_CONTROL_RESERVE_BYTES
+                + max_block_bytes_for_network(crate::DEVNET_PROFILE.network_id) as u64,
+            ..test_limits()
+        };
+        assert_eq!(
+            block_sync_batch_limit(crate::DEVNET_PROFILE.network_id, limits),
+            1
+        );
+        let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = socket.local_addr().unwrap();
+        let listener =
+            spawn_inbound_listener_inner(Arc::clone(&source), socket, limits, Some(SOURCE_NONCE))
+                .unwrap();
+
+        for round in 0..3 {
+            assert!(tips_match(&source, &target));
+            let round_replays = replayed.load(Ordering::Relaxed);
+            let timestamp = start + 100 + round * 100;
+            let transaction = {
+                let mut node = source.lock().unwrap();
+                let tip = node.peer_hello().tip;
+                let funding = decode_block(
+                    &node.canonical_block(tip).unwrap().unwrap(),
+                    node.peer_hello().network_id,
+                )
+                .unwrap();
+                spend_community_output(&node, &funding, 10)
+            };
+            let source_output = OutPoint {
+                txid: transaction.txid(),
+                index: 0,
+            };
+            let mut competing_transaction = transaction.clone();
+            competing_transaction.outputs[0].lock = OutputLock::Key(insecure_dev_destination(0x92));
+            competing_transaction
+                .sign_all(&[&SigningKey::from_bytes(&[0x12; 32]).unwrap()])
+                .unwrap();
+            let target_output = OutPoint {
+                txid: competing_transaction.txid(),
+                index: 0,
+            };
+            source
+                .lock()
+                .unwrap()
+                .submit_transaction(transaction)
+                .unwrap();
+            target
+                .lock()
+                .unwrap()
+                .submit_transaction(competing_transaction)
+                .unwrap();
+            for offset in 1..=3 {
+                mine_active(&source, timestamp + offset, 0x81);
+            }
+            mine_active(&target, timestamp + 21, 0x91);
+            let mut local_tip = mine_active(&target, timestamp + 22, 0x91).block_id();
+            let mut warmed_replays = None;
+
+            for session in 0..5 {
+                let report = sync_from_peer_once_inner(
+                    Arc::clone(&target),
+                    address,
+                    limits,
+                    Some(TARGET_NONCE),
+                )
+                .unwrap();
+                assert_eq!(report.inventory_items, 1);
+                assert_eq!(report.requested_blocks, 1);
+                assert_eq!(report.accepted_blocks, 1);
+                assert_eq!(report.already_known, 0);
+                let completed_replays = replayed.load(Ordering::Relaxed);
+                if let Some(warmed) = warmed_replays {
+                    assert_eq!(
+                        completed_replays, warmed,
+                        "round {round} session {session} replayed ancestors instead of reusing the validated side tip"
+                    );
+                } else {
+                    assert!(
+                        completed_replays - round_replays
+                            <= crate::ACTIVE_BRANCH_CHECKPOINT_INTERVAL,
+                        "round {round} lost its recent active anchor before the next fork"
+                    );
+                    warmed_replays = Some(completed_replays);
+                }
+                if session < 3 {
+                    let node = target.lock().unwrap();
+                    assert_eq!(
+                        node.peer_hello().tip,
+                        local_tip,
+                        "equal or lower work must not switch branches"
+                    );
+                    assert!(node.state.utxos().get(&target_output).is_some());
+                    assert!(node.state.utxos().get(&source_output).is_none());
+                }
+                if session == 0 {
+                    // Change both tips while the target retains a validated
+                    // side branch. A new local revision must not lose it.
+                    local_tip = mine_active(&target, timestamp + 23, 0x91).block_id();
+                    mine_active(&source, timestamp + 4, 0x81);
+                } else if session == 1 {
+                    mine_active(&source, timestamp + 5, 0x81);
+                }
+            }
+            assert!(tips_match(&source, &target));
+            let source_node = source.lock().unwrap();
+            let target_node = target.lock().unwrap();
+            assert_eq!(source_node.cumulative_work(), target_node.cumulative_work());
+            assert_eq!(
+                source_node.state.encode_local_snapshot().unwrap(),
+                target_node.state.encode_local_snapshot().unwrap(),
+                "round {round} must converge on the exact transaction and chain state"
+            );
+            assert!(target_node.state.utxos().get(&source_output).is_some());
+            assert!(target_node.state.utxos().get(&target_output).is_none());
+        }
+        listener.stop().unwrap();
+        drop(source);
+        drop(target);
+        clean_test_dir(&source_path);
+        clean_test_dir(&target_path);
+    }
+
+    fn check_single_block_fork_continuation(restart: bool, grow: bool) {
+        let source_path = test_dir("single-fork-source");
+        let target_path = test_dir("single-fork-target");
+        let source = open_shared(&source_path);
+        let mut target = open_shared(&target_path);
+        let now = unix_time_seconds().unwrap();
+        mine(&source, 4, now);
+        mine(&target, 2, now + 20);
+        let limits = PeerLimits {
+            max_bytes_per_peer: (MAX_TRANSACTIONS_PER_SYNC * MAX_TRANSACTION_BYTES) as u64
+                + SYNC_CONTROL_RESERVE_BYTES
+                + max_block_bytes_for_network(crate::DEVNET_PROFILE.network_id) as u64,
+            ..test_limits()
+        };
+        assert_eq!(
+            block_sync_batch_limit(crate::DEVNET_PROFILE.network_id, limits),
+            1
+        );
+        let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = socket.local_addr().unwrap();
+        let listener =
+            spawn_inbound_listener_inner(Arc::clone(&source), socket, limits, Some(SOURCE_NONCE))
+                .unwrap();
+        let total_blocks = 4 + usize::from(grow);
+        let mut fetched = 0;
+        let mut session = 0;
+        while fetched < total_blocks {
+            let report =
+                sync_from_peer_once_inner(Arc::clone(&target), address, limits, Some(TARGET_NONCE))
+                    .unwrap();
+            assert_eq!(report.inventory_items, 1);
+            assert_eq!(
+                report.accepted_blocks, 1,
+                "session {session} repeated a known side-chain prefix instead of continuing"
+            );
+            fetched += 1;
+            if session == 0 {
+                if grow {
+                    mine(&source, 1, now + 4);
+                }
+                if restart {
+                    drop(target);
+                    target = Arc::new(Mutex::new(
+                        Node::open_with_profile(&target_path, crate::DEVNET_PROFILE).unwrap(),
+                    ));
+                    let recovered = sync_from_peer_once_inner(
+                        Arc::clone(&target),
+                        address,
+                        limits,
+                        Some(TARGET_NONCE),
+                    )
+                    .unwrap();
+                    // The restarted receiver walks the stored block and
+                    // continues with the next one in the same session.
+                    assert_eq!(recovered.already_known, 1);
+                    assert_eq!(recovered.accepted_blocks, 1);
+                    fetched += 1;
+                }
+            }
+            session += 1;
+        }
+        assert!(tips_match(&source, &target));
+        listener.stop().unwrap();
+        drop(source);
+        drop(target);
+        clean_test_dir(&source_path);
+        clean_test_dir(&target_path);
+    }
+
+    #[test]
     fn longer_fork_converges_without_trusting_advertised_work() {
         let source_path = test_dir("fork-source");
         let target_path = test_dir("fork-target");
@@ -3543,6 +5117,71 @@ mod tests {
             target.lock().unwrap().cumulative_work()
         );
 
+        listener.stop().unwrap();
+        drop(source);
+        drop(target);
+        clean_test_dir(&source_path);
+        clean_test_dir(&target_path);
+    }
+
+    #[test]
+    fn single_block_push_batches_continue_a_competing_branch() {
+        let source_path = test_dir("single-push-source");
+        let target_path = test_dir("single-push-target");
+        let source = open_shared(&source_path);
+        let target = open_shared(&target_path);
+        let now = unix_time_seconds().unwrap();
+        mine(&source, 4, now);
+        mine(&target, 2, now + 20);
+        let target_branch = {
+            let mut node = target.lock().unwrap();
+            let genesis = node.block_locator(1);
+            node.inventory_after(&genesis, [0; 32], 2)
+                .into_iter()
+                .map(|id| {
+                    decode_block(
+                        &node.canonical_block(id).unwrap().unwrap(),
+                        crate::DEVNET_PROFILE.network_id,
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        for block in target_branch {
+            source
+                .lock()
+                .unwrap()
+                .submit_block(block, now + 30)
+                .unwrap();
+        }
+        let limits = PeerLimits {
+            max_bytes_per_peer: (MAX_TRANSACTIONS_PER_SYNC * MAX_TRANSACTION_BYTES) as u64
+                + SYNC_CONTROL_RESERVE_BYTES
+                + max_block_bytes_for_network(crate::DEVNET_PROFILE.network_id) as u64,
+            ..test_limits()
+        };
+        let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = socket.local_addr().unwrap();
+        let listener =
+            spawn_inbound_listener_inner(Arc::clone(&target), socket, limits, Some(TARGET_NONCE))
+                .unwrap();
+        for session in 0..4 {
+            let report = relay_blocks_to_peer_once_inner_with_policy(
+                Arc::clone(&source),
+                address,
+                limits,
+                PeerAddressPolicy::PrivateOnly,
+                Some(SOURCE_NONCE),
+                None,
+            )
+            .unwrap();
+            assert_eq!(report.offered_blocks, 1);
+            assert_eq!(
+                report.accepted_blocks, 1,
+                "push session {session} repeated an acknowledged prefix"
+            );
+        }
+        assert!(tips_match(&source, &target));
         listener.stop().unwrap();
         drop(source);
         drop(target);
@@ -3685,6 +5324,222 @@ mod tests {
         drop(seed);
         clean_test_dir(&wallet_path);
         clean_test_dir(&seed_path);
+    }
+
+    #[test]
+    fn transaction_peer_fault_classification_excludes_local_state_and_policy() {
+        let outpoint = OutPoint {
+            txid: [0x31; 32],
+            index: 0,
+        };
+        let nonpunitive = [
+            NodeError::DuplicateMempoolTransaction([0x32; 32]),
+            NodeError::MempoolUnconfirmedInput(outpoint),
+            NodeError::MempoolInputConflict(outpoint),
+            NodeError::ExchangeWithdrawalInputReserved(outpoint),
+            NodeError::ExchangeWithdrawalReservationMismatch(outpoint),
+            NodeError::ExchangeCustodyV3WalletExclusive,
+            NodeError::MempoolTransactionLimit,
+            NodeError::MempoolByteLimit,
+            NodeError::MempoolFeeTooLow {
+                required: 2,
+                actual: 1,
+            },
+            NodeError::Chain(ChainError::MissingInput),
+            NodeError::Chain(ChainError::ImmatureInput(100)),
+            NodeError::Chain(ChainError::DuplicateInput),
+            NodeError::Chain(ChainError::WrongOwner),
+            NodeError::Chain(ChainError::WrongWitness),
+            NodeError::Chain(ChainError::CreatesValue),
+            NodeError::Chain(ChainError::FeeTooLow {
+                required: 2,
+                actual: 1,
+            }),
+            NodeError::Chain(ChainError::AmountOverflow),
+            NodeError::Chain(ChainError::ChannelCloseShape),
+            NodeError::Chain(ChainError::BlockTransactionLimit),
+            NodeError::Chain(ChainError::BlockAggregateLimit),
+            NodeError::Chain(ChainError::BlockSignatureLimit),
+        ];
+        for error in nonpunitive {
+            assert!(!transaction_rejection_is_peer_fault(&error), "{error}");
+        }
+        let intrinsic = [
+            NodeError::Chain(ChainError::WrongNetwork),
+            NodeError::Chain(ChainError::UnsupportedTransactionVersion),
+            NodeError::Chain(ChainError::NoInputs),
+            NodeError::Chain(ChainError::NoOutputs),
+            NodeError::Chain(ChainError::ZeroValueOutput),
+            NodeError::Chain(ChainError::MalformedSignature),
+            NodeError::Chain(ChainError::InvalidSignature),
+            NodeError::Chain(ChainError::TransactionInputLimit),
+            NodeError::Chain(ChainError::TransactionOutputLimit),
+            NodeError::Chain(ChainError::SignatureLength),
+            NodeError::Wire(WireError::SignatureLength { actual: 63 }),
+        ];
+        for error in intrinsic {
+            assert!(transaction_rejection_is_peer_fault(&error), "{error}");
+        }
+        let malformed_frame =
+            P2pError::Peer(PeerError::ConsensusWire(WireError::SignatureLength {
+                actual: 63,
+            }));
+        assert_eq!(
+            inbound_reputation_penalty(&malformed_frame, true).0,
+            PROTOCOL_VIOLATION_PENALTY
+        );
+    }
+
+    #[test]
+    fn relayed_invalid_signatures_still_ban_the_peer() {
+        let path = test_dir("invalid-signature-relay");
+        let target = open_shared(&path);
+        let invalid = {
+            let mut node = target.lock().unwrap();
+            let funding = node
+                .mine_once(
+                    default_miner_destination(),
+                    unix_time_seconds().unwrap(),
+                    DEFAULT_MINING_ATTEMPTS,
+                )
+                .unwrap();
+            let mut transaction = spend_community_output(&node, &funding, 10);
+            transaction.outputs[0].value -= 1;
+            assert!(matches!(
+                node.submit_transaction(transaction.clone()),
+                Err(NodeError::Chain(ChainError::InvalidSignature))
+            ));
+            transaction
+        };
+        let initial_tip = target.lock().unwrap().peer_hello().tip;
+        let (listener, address) = start_listener(Arc::clone(&target), TARGET_NONCE);
+        let hello = with_nonce(target.lock().unwrap().peer_hello(), Some(SOURCE_NONCE));
+        let session = PeerSession::new(hello, test_limits()).unwrap();
+        let mut client = PeerConnection::connect(address, session).unwrap();
+        client.send_hello().unwrap();
+        assert!(matches!(client.receive().unwrap(), PeerMessage::Hello(_)));
+        for index in 0..4 {
+            client
+                .send(PeerMessage::Transaction(invalid.clone()))
+                .unwrap();
+            client.send(PeerMessage::GetMempool).unwrap();
+            let response = client.receive();
+            if index < 3 {
+                assert_eq!(
+                    response.unwrap(),
+                    PeerMessage::TransactionInventory { txids: Vec::new() }
+                );
+            } else {
+                assert!(response.is_err());
+            }
+        }
+        assert!(listener.peer_is_temporarily_banned(address.ip()).unwrap());
+        assert_eq!(target.lock().unwrap().mempool_entries().len(), 0);
+        assert_eq!(target.lock().unwrap().peer_hello().tip, initial_tip);
+        drop(client);
+        listener.stop().unwrap();
+        drop(target);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn ahead_peer_transactions_do_not_ban_a_catching_up_receiver() {
+        let source_path = test_dir("ahead-transaction-source");
+        let target_path = test_dir("ahead-transaction-target");
+        let source = open_shared(&source_path);
+        let target = open_shared(&target_path);
+        let transactions = {
+            let mut node = source.lock().unwrap();
+            let now = unix_time_seconds().unwrap();
+            let funding: Vec<_> = (0..4)
+                .map(|offset| {
+                    node.mine_once(
+                        default_miner_destination(),
+                        now + offset,
+                        DEFAULT_MINING_ATTEMPTS,
+                    )
+                    .unwrap()
+                })
+                .collect();
+            funding
+                .iter()
+                .map(|block| {
+                    let transaction = spend_community_output(&node, block, 10);
+                    node.submit_transaction(transaction.clone()).unwrap();
+                    transaction
+                })
+                .collect::<Vec<_>>()
+        };
+        let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = socket.local_addr().unwrap();
+        let discovery = Arc::new(PeerDiscovery::open(
+            &target_path,
+            target.lock().unwrap().peer_hello(),
+            address,
+            PeerAddressPolicy::PrivateOnly,
+        ));
+        let listener = spawn_inbound_listener_inner_with_policy(
+            Arc::clone(&target),
+            socket,
+            test_limits(),
+            PeerAddressPolicy::PrivateOnly,
+            Some(TARGET_NONCE),
+            Some(Arc::clone(&discovery)),
+        )
+        .unwrap();
+        let hello = with_nonce(source.lock().unwrap().peer_hello(), Some(SOURCE_NONCE));
+        let session = PeerSession::new(hello, test_limits()).unwrap();
+        let mut client = PeerConnection::connect(address, session).unwrap();
+        client.send_hello().unwrap();
+        assert!(matches!(client.receive().unwrap(), PeerMessage::Hello(_)));
+
+        for transaction in transactions {
+            client.send(PeerMessage::Transaction(transaction)).unwrap();
+            client.send(PeerMessage::GetMempool).unwrap();
+            let response = client.receive();
+            assert!(
+                !listener.peer_is_temporarily_banned(address.ip()).unwrap(),
+                "an honest ahead peer must not be banned for inputs absent from the local chain"
+            );
+            assert_eq!(
+                response.unwrap(),
+                PeerMessage::TransactionInventory { txids: Vec::new() }
+            );
+        }
+        assert_eq!(target.lock().unwrap().mempool_entries().len(), 0);
+        assert_eq!(target.lock().unwrap().peer_hello().height, 0);
+        drop(client);
+
+        let (source_listener, source_address) = start_listener(Arc::clone(&source), SOURCE_NONCE);
+        let poller = spawn_peer_polling_inner(
+            Arc::clone(&target),
+            StaticPeerConfig {
+                listen_address: address,
+                peers: vec![source_address],
+                limits: test_limits(),
+                address_policy: PeerAddressPolicy::PrivateOnly,
+            },
+            Duration::from_millis(10),
+            Some(TARGET_NONCE),
+            Some(discovery),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !tips_match(&source, &target) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            tips_match(&source, &target),
+            "block synchronization must remain available"
+        );
+        assert!(!listener.peer_is_temporarily_banned(address.ip()).unwrap());
+        poller.stop().unwrap();
+        source_listener.stop().unwrap();
+        listener.stop().unwrap();
+        drop(source);
+        drop(target);
+        clean_test_dir(&source_path);
+        clean_test_dir(&target_path);
     }
 
     #[test]
@@ -4251,6 +6106,237 @@ mod tests {
     }
 
     #[test]
+    fn downloaded_block_wait_keeps_the_total_session_deadline() {
+        let source_path = test_dir("download-wait-bounded-source");
+        let source = open_shared(&source_path);
+        let block = source
+            .lock()
+            .unwrap()
+            .mine_once(
+                default_miner_destination(),
+                unix_time_seconds().unwrap(),
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        let mut limits = test_limits();
+        limits.idle_timeout = Duration::from_millis(100);
+        limits.total_timeout = Duration::from_millis(650);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle =
+            spawn_inbound_listener_inner(Arc::clone(&source), listener, limits, Some(SOURCE_NONCE))
+                .unwrap();
+        let mut hello = source.lock().unwrap().peer_hello();
+        hello.node_nonce = TARGET_NONCE;
+        let session = PeerSession::new(hello, test_limits()).unwrap();
+        let mut client = PeerConnection::connect(address, session).unwrap();
+        client.send_hello().unwrap();
+        assert!(matches!(client.receive().unwrap(), PeerMessage::Hello(_)));
+        client
+            .send(PeerMessage::GetBlock {
+                block_id: block.block_id(),
+            })
+            .unwrap();
+        assert!(matches!(client.receive().unwrap(), PeerMessage::Block(_)));
+        let mut socket = client.try_clone_stream().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let started = Instant::now();
+        assert_eq!(socket.read(&mut [0u8; 1]).unwrap(), 0);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(socket);
+        drop(client);
+        handle.stop().unwrap();
+        drop(source);
+        clean_test_dir(&source_path);
+    }
+
+    #[test]
+    fn downloaded_block_validation_outlives_ordinary_peer_idle_timeout() {
+        let source_path = test_dir("slow-download-source");
+        let target_path = test_dir("slow-download-target");
+        let source = open_shared(&source_path);
+        let target = open_shared(&target_path);
+        mine(&source, 1, unix_time_seconds().unwrap());
+        target
+            .lock()
+            .unwrap()
+            .block_preverifier
+            .set_proof_dispatch_delay(Some(Duration::from_millis(400)));
+        let mut limits = test_limits();
+        limits.idle_timeout = Duration::from_millis(100);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle =
+            spawn_inbound_listener_inner(Arc::clone(&source), listener, limits, Some(SOURCE_NONCE))
+                .unwrap();
+        let report =
+            sync_from_peer_once_inner(Arc::clone(&target), address, limits, Some(TARGET_NONCE))
+                .unwrap();
+        assert_eq!(report.accepted_blocks, 1);
+        assert!(tips_match(&source, &target));
+        handle.stop().unwrap();
+        drop(source);
+        drop(target);
+        clean_test_dir(&source_path);
+        clean_test_dir(&target_path);
+    }
+
+    #[test]
+    fn downloaded_block_validation_stops_on_local_shutdown() {
+        let source_path = test_dir("stop-download-source");
+        let target_path = test_dir("stop-download-target");
+        let source = open_shared(&source_path);
+        let target = open_shared(&target_path);
+        let block = source
+            .lock()
+            .unwrap()
+            .mine_once(
+                default_miner_destination(),
+                unix_time_seconds().unwrap(),
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        let block_id = block.block_id();
+        target
+            .lock()
+            .unwrap()
+            .block_preverifier
+            .set_proof_dispatch_delay(Some(Duration::from_millis(500)));
+        let mut hello = source.lock().unwrap().peer_hello();
+        hello.node_nonce = SOURCE_NONCE;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let observer = Arc::clone(&target);
+        let registry = Arc::new(ActiveSocketRegistry::default());
+        let stopper = Arc::clone(&registry);
+        let server = thread::spawn(move || {
+            let mut connection = accept_test_peer(listener, hello);
+            assert!(matches!(
+                connection.receive().unwrap(),
+                PeerMessage::GetHeaders { .. }
+            ));
+            connection
+                .send(PeerMessage::Inventory {
+                    block_ids: vec![block_id],
+                })
+                .unwrap();
+            assert!(matches!(
+                connection.receive().unwrap(),
+                PeerMessage::GetBlock { .. }
+            ));
+            connection.send(PeerMessage::Block(block)).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while observer
+                .lock()
+                .unwrap()
+                .block_preverifier
+                .worker_dispatches
+                .load(Ordering::Acquire)
+                == 0
+            {
+                assert!(Instant::now() < deadline);
+                thread::yield_now();
+            }
+            stopper.stop().unwrap();
+        });
+        let result = sync_from_peer_once_inner_with_policy(
+            Arc::clone(&target),
+            address,
+            test_limits(),
+            PeerAddressPolicy::PrivateOnly,
+            Some(TARGET_NONCE),
+            Some(&registry),
+        );
+        server.join().unwrap();
+        assert!(result.is_err());
+        assert!(!target.lock().unwrap().contains_block(block_id));
+        assert_eq!(target.lock().unwrap().peer_hello().height, 0);
+        drop(source);
+        drop(target);
+        clean_test_dir(&source_path);
+        clean_test_dir(&target_path);
+    }
+
+    #[test]
+    fn downloaded_block_survives_source_disconnect_during_validation() {
+        let source_path = test_dir("download-disconnect-source");
+        let target_path = test_dir("download-disconnect-target");
+        let source = open_shared(&source_path);
+        let target = open_shared(&target_path);
+        let block = source
+            .lock()
+            .unwrap()
+            .mine_once(
+                default_miner_destination(),
+                unix_time_seconds().unwrap(),
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        let block_id = block.block_id();
+        target
+            .lock()
+            .unwrap()
+            .block_preverifier
+            .set_proof_dispatch_delay(Some(Duration::from_millis(500)));
+        let mut hello = source.lock().unwrap().peer_hello();
+        hello.node_nonce = SOURCE_NONCE;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let observer = Arc::clone(&target);
+        let server = thread::spawn(move || {
+            let mut connection = accept_test_peer(listener, hello);
+            assert!(matches!(
+                connection.receive().unwrap(),
+                PeerMessage::GetHeaders { .. }
+            ));
+            connection
+                .send(PeerMessage::Inventory {
+                    block_ids: vec![block_id],
+                })
+                .unwrap();
+            assert!(
+                matches!(connection.receive().unwrap(), PeerMessage::GetBlock { block_id: id } if id == block_id)
+            );
+            connection.send(PeerMessage::Block(block)).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while observer
+                .lock()
+                .unwrap()
+                .block_preverifier
+                .worker_dispatches
+                .load(Ordering::Acquire)
+                == 0
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "download never reached proof validation"
+                );
+                thread::yield_now();
+            }
+            // Models the source's ordinary idle timeout after delivering the
+            // complete requested block, while local validation is still busy.
+            drop(connection);
+        });
+        let _transport_result = sync_from_peer_once_inner(
+            Arc::clone(&target),
+            address,
+            test_limits(),
+            Some(TARGET_NONCE),
+        );
+        server.join().unwrap();
+        assert!(
+            target.lock().unwrap().contains_block(block_id),
+            "a complete solicited block was discarded when its source closed the connection"
+        );
+        drop(source);
+        drop(target);
+        clean_test_dir(&source_path);
+        clean_test_dir(&target_path);
+    }
+
+    #[test]
     fn honest_submit_longer_than_idle_timeout_is_accepted_within_submit_budget() {
         let source_path = test_dir("delayed-submit-source");
         let target_path = test_dir("delayed-submit-target");
@@ -4751,6 +6837,53 @@ mod tests {
     }
 
     #[test]
+    fn new_local_tip_is_announced_without_waiting_for_the_next_poll() {
+        let miner_path = test_dir("announce-miner");
+        let wallet_path = test_dir("announce-wallet");
+        let miner = open_shared(&miner_path);
+        let wallet = open_shared(&wallet_path);
+        mine(&miner, 1, unix_time_seconds().unwrap());
+        let (listener, address) = start_listener(Arc::clone(&wallet), TARGET_NONCE);
+        let poller = spawn_static_peer_polling_inner(
+            Arc::clone(&miner),
+            StaticPeerConfig {
+                listen_address: "127.0.0.1:28444".parse().unwrap(),
+                peers: vec![address],
+                limits: test_limits(),
+                address_policy: PeerAddressPolicy::PrivateOnly,
+            },
+            Duration::from_secs(60),
+            Some(SOURCE_NONCE),
+        )
+        .unwrap();
+
+        // The first ordinary round relays the initial block; the next ordinary
+        // round is a full minute away.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !tips_match(&miner, &wallet) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(tips_match(&miner, &wallet));
+        thread::sleep(Duration::from_millis(300));
+
+        // A newly found block must reach the peer promptly, not after the poll.
+        mine(&miner, 1, unix_time_seconds().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !tips_match(&miner, &wallet) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(tips_match(&miner, &wallet));
+        assert_eq!(wallet.lock().unwrap().peer_hello().height, 2);
+
+        poller.stop().unwrap();
+        listener.stop().unwrap();
+        drop(miner);
+        drop(wallet);
+        clean_test_dir(&miner_path);
+        clean_test_dir(&wallet_path);
+    }
+
+    #[test]
     fn one_sided_relay_crosses_an_equal_work_fork_after_local_extension() {
         let miner_path = test_dir("fork-relay-miner");
         let wallet_path = test_dir("fork-relay-wallet");
@@ -4826,6 +6959,253 @@ mod tests {
         drop(wallet);
         clean_test_dir(&miner_path);
         clean_test_dir(&wallet_path);
+    }
+
+    #[test]
+    fn successful_pull_continues_after_nonbanning_reverse_relay_failure() {
+        fn serve(
+            source: &Arc<Mutex<Node>>,
+            stream: TcpStream,
+            limits: PeerLimits,
+            pulls: &AtomicUsize,
+            relay_failures: &AtomicUsize,
+        ) -> Result<(), PeerError> {
+            stream.set_nonblocking(false).unwrap();
+            let hello = with_nonce(source.lock().unwrap().peer_hello(), Some(SOURCE_NONCE));
+            let mut connection =
+                PeerConnection::from_stream(stream, PeerSession::new(hello, limits)?)?;
+            connection.send_hello()?;
+            assert!(matches!(connection.receive()?, PeerMessage::Hello(_)));
+            match connection.receive()? {
+                PeerMessage::GetMempool => {
+                    // An outbound relay begins here when the source is ahead.
+                    // Close without a reply; its pull service still works.
+                    relay_failures.fetch_add(1, Ordering::Release);
+                    Ok(())
+                }
+                PeerMessage::GetHeaders { locator, stop } => {
+                    pulls.fetch_add(1, Ordering::Release);
+                    let block_ids = source.lock().unwrap().inventory_after(&locator, stop, 1);
+                    connection.send(PeerMessage::Inventory { block_ids })?;
+                    loop {
+                        match connection.receive()? {
+                            PeerMessage::GetBlock { block_id } => {
+                                let canonical = source
+                                    .lock()
+                                    .unwrap()
+                                    .canonical_block(block_id)
+                                    .unwrap()
+                                    .unwrap();
+                                let block = decode_block(&canonical, hello.network_id).unwrap();
+                                connection.send(PeerMessage::Block(block))?;
+                            }
+                            PeerMessage::GetMempool => {
+                                connection.send(PeerMessage::TransactionInventory {
+                                    txids: Vec::new(),
+                                })?;
+                                return Ok(());
+                            }
+                            _ => panic!("unexpected pull request"),
+                        }
+                    }
+                }
+                _ => panic!("unexpected first request"),
+            }
+        }
+
+        let source_path = test_dir("relay-failure-catchup-source");
+        let target_path = test_dir("relay-failure-catchup-target");
+        let source = open_shared(&source_path);
+        let target = open_shared(&target_path);
+        mine(&source, 6, unix_time_seconds().unwrap());
+        let limits = PeerLimits {
+            max_bytes_per_peer: (MAX_TRANSACTIONS_PER_SYNC * MAX_TRANSACTION_BYTES) as u64
+                + SYNC_CONTROL_RESERVE_BYTES
+                + max_block_bytes_for_network(crate::DEVNET_PROFILE.network_id) as u64,
+            ..test_limits()
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server_stop = Arc::new(AtomicBool::new(false));
+        let pulls = Arc::new(AtomicUsize::new(0));
+        let relay_failures = Arc::new(AtomicUsize::new(0));
+        let worker_stop = Arc::clone(&server_stop);
+        let worker_pulls = Arc::clone(&pulls);
+        let worker_failures = Arc::clone(&relay_failures);
+        let worker_source = Arc::clone(&source);
+        let worker = thread::spawn(move || {
+            while !worker_stop.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let result = serve(
+                            &worker_source,
+                            stream,
+                            limits,
+                            &worker_pulls,
+                            &worker_failures,
+                        );
+                        assert!(
+                            result.is_ok() || matches!(result, Err(PeerError::ConnectionClosed))
+                        );
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("fixture accept failed: {error}"),
+                }
+            }
+        });
+        let poller = spawn_static_peer_polling_inner(
+            Arc::clone(&target),
+            StaticPeerConfig {
+                listen_address: "127.0.0.1:28448".parse().unwrap(),
+                peers: vec![address],
+                limits,
+                address_policy: PeerAddressPolicy::PrivateOnly,
+            },
+            Duration::from_secs(30),
+            Some(TARGET_NONCE),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let ready = target
+                .lock()
+                .unwrap()
+                .peer_observations()
+                .iter()
+                .any(|peer| {
+                    peer.direction == PeerDirection::Outbound
+                        && peer.address == address.to_string()
+                        && peer.successful_sessions == 4
+                        && peer.active_connections == 0
+                });
+            if ready || Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        poller.stop().unwrap();
+        server_stop.store(true, Ordering::Release);
+        worker.join().unwrap();
+        assert_eq!(
+            pulls.load(Ordering::Acquire),
+            4,
+            "working downloads must continue despite the failed reverse relay"
+        );
+        assert_eq!(relay_failures.load(Ordering::Acquire), 1);
+        let node = target.lock().unwrap();
+        assert_eq!(node.peer_hello().height, 4);
+        let peer = node
+            .peer_observations()
+            .into_iter()
+            .find(|peer| {
+                peer.direction == PeerDirection::Outbound && peer.address == address.to_string()
+            })
+            .unwrap();
+        assert_eq!(
+            peer.failed_sessions, 1,
+            "the relay error must remain an error"
+        );
+        assert_eq!(peer.successful_sessions, 4);
+        drop(node);
+        drop(source);
+        drop(target);
+        clean_test_dir(&source_path);
+        clean_test_dir(&target_path);
+    }
+
+    #[test]
+    fn one_block_catchup_continues_before_revisiting_a_stalled_peer() {
+        let source_path = test_dir("catchup-burst-source");
+        let target_path = test_dir("catchup-burst-target");
+        let source = open_shared(&source_path);
+        let target = open_shared(&target_path);
+        mine(&source, 6, unix_time_seconds().unwrap());
+        let limits = PeerLimits {
+            connect_timeout: Duration::from_millis(100),
+            idle_timeout: Duration::from_millis(100),
+            max_bytes_per_peer: (MAX_TRANSACTIONS_PER_SYNC * MAX_TRANSACTION_BYTES) as u64
+                + SYNC_CONTROL_RESERVE_BYTES
+                + max_block_bytes_for_network(crate::DEVNET_PROFILE.network_id) as u64,
+            ..test_limits()
+        };
+        assert_eq!(
+            block_sync_batch_limit(crate::DEVNET_PROFILE.network_id, limits),
+            1
+        );
+        let source_socket = TcpListener::bind("127.0.0.1:0").unwrap();
+        let source_address = source_socket.local_addr().unwrap();
+        let source_listener = spawn_inbound_listener_inner(
+            Arc::clone(&source),
+            source_socket,
+            limits,
+            Some(SOURCE_NONCE),
+        )
+        .unwrap();
+        let stalled_socket = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stalled_address = stalled_socket.local_addr().unwrap();
+        stalled_socket.set_nonblocking(true).unwrap();
+        let stalled_stop = Arc::new(AtomicBool::new(false));
+        let stalled_connections = Arc::new(AtomicUsize::new(0));
+        let worker_stop = Arc::clone(&stalled_stop);
+        let worker_connections = Arc::clone(&stalled_connections);
+        let stalled_worker = thread::spawn(move || {
+            let mut sockets = Vec::new();
+            while !worker_stop.load(Ordering::Acquire) {
+                match stalled_socket.accept() {
+                    Ok((stream, _)) => {
+                        sockets.push(stream);
+                        worker_connections.fetch_add(1, Ordering::Release);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("stalled fixture accept failed: {error}"),
+                }
+            }
+        });
+        let poller = spawn_static_peer_polling_inner(
+            Arc::clone(&target),
+            StaticPeerConfig {
+                listen_address: "127.0.0.1:28446".parse().unwrap(),
+                peers: vec![stalled_address, source_address],
+                limits,
+                address_policy: PeerAddressPolicy::PrivateOnly,
+            },
+            // Make the round boundary explicit: only bounded continuations,
+            // not another periodic pass, can deliver the remaining blocks.
+            Duration::from_secs(30),
+            Some(TARGET_NONCE),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while target.lock().unwrap().peer_hello().height < 4 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let height = target.lock().unwrap().peer_hello().height;
+        let stalled_attempts = stalled_connections.load(Ordering::Acquire);
+        poller.stop().unwrap();
+        stalled_stop.store(true, Ordering::Release);
+        stalled_worker.join().unwrap();
+        source_listener.stop().unwrap();
+        assert_eq!(
+            height, 4,
+            "one-block catch-up unnecessarily waited for another full polling round"
+        );
+        assert_eq!(
+            stalled_attempts, 2,
+            "failed pull and relay must not join the continuation queue"
+        );
+        assert_eq!(
+            target.lock().unwrap().peer_hello().tip,
+            source.lock().unwrap().active_block_id_at_height(4).unwrap()
+        );
+        drop(source);
+        drop(target);
+        clean_test_dir(&source_path);
+        clean_test_dir(&target_path);
     }
 
     #[test]

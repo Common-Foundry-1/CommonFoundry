@@ -1285,7 +1285,10 @@ impl DurableLedger {
             candidate.generation = candidate.generation.checked_add(1).ok_or_else(|| {
                 PoolError::LedgerCorrupt("ledger generation exhausted".to_owned())
             })?;
-            validate_ledger(&candidate)?;
+            // Invariants are checked once per persisted snapshot (below), not
+            // per update: validate_ledger walks every PPLNS share record and
+            // cost ~260 ms on a full 65,536-share window, which serialized all
+            // share credits and session handshakes behind one lock.
             working.pending = Some(candidate);
             working.applied = working.applied.wrapping_add(1);
             (output, working.applied)
@@ -1363,6 +1366,9 @@ impl DurableLedger {
             };
             (pending.clone(), working.applied)
         };
+        // Nothing invalid becomes durable or visible to readers: the batch is
+        // validated here, before it is written and before `state` is replaced.
+        validate_ledger(&snapshot)?;
         #[cfg(test)]
         {
             self.persist_count.fetch_add(1, Ordering::Relaxed);
@@ -7303,6 +7309,151 @@ mod tests {
         assert_eq!(state.generation, generation + 2);
         assert_eq!(state.sessions[&1].accepted_shares, CREDITS + 1);
         assert_eq!(state.sessions[&2].accepted_shares, CREDITS + 1);
+    }
+
+    #[test]
+    #[ignore = "profiles a real pool ledger copy; set CMFD_LEDGER_BENCH_DIR"]
+    fn real_ledger_transaction_cost_breakdown() {
+        let Ok(source) = std::env::var("CMFD_LEDGER_BENCH_DIR") else {
+            return;
+        };
+        let root = TestRoot::new("real-ledger-bench");
+        let directory = root.path().join("ledger");
+        fs::create_dir_all(&directory).unwrap();
+        for name in [
+            "pool-ledger-v2.0.json",
+            "pool-ledger-v2.1.json",
+            POOL_LEDGER_GUARD_FILE,
+        ] {
+            fs::copy(Path::new(&source).join(name), directory.join(name)).unwrap();
+        }
+        let network: [u8; 32] =
+            hex::decode("88296bc39c10e8bc1dd4818d4d42412fe5f08210651110377f495da299812f62")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let fingerprint: [u8; 32] =
+            hex::decode("e9d81f15c580031302656609eb24fa8351efe0a34135ad894c793f3dd9044079")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let started = Instant::now();
+        let ledger = DurableLedger::open(Some(directory), network, fingerprint).unwrap();
+        eprintln!("open {:?}", started.elapsed());
+        let payout = {
+            let state = ledger.state.lock().unwrap();
+            let payout = *state.payouts.keys().next().unwrap();
+            eprintln!(
+                "sessions {} payouts {} pplns_shares {} pplns_blocks {} earning_events {} blocks {} payout_txs {}",
+                state.sessions.len(),
+                state.payouts.len(),
+                state.pplns_shares.len(),
+                state.pplns_blocks.len(),
+                state.earning_events.len(),
+                state.blocks.len(),
+                state.payout_transactions.len()
+            );
+            let t = Instant::now();
+            let cloned = state.clone();
+            eprintln!("clone {:?}", t.elapsed());
+            let t = Instant::now();
+            validate_ledger(&cloned).unwrap();
+            eprintln!("validate {:?}", t.elapsed());
+            let t = Instant::now();
+            let bytes = serde_json::to_vec(&ledger_payload(&cloned)).unwrap();
+            eprintln!("serialize {:?} bytes {}", t.elapsed(), bytes.len());
+            payout
+        };
+        let next_id = ledger.next_session_id().unwrap();
+        for i in 0..5_u64 {
+            let t = Instant::now();
+            register_session(&ledger, next_id + i, format!("bench{i}"), payout).unwrap();
+            eprintln!("register_session {:?}", t.elapsed());
+        }
+        for _ in 0..5 {
+            let t = Instant::now();
+            credit_accepted_share(&ledger, next_id, 7).unwrap();
+            eprintln!("credit_accepted_share {:?}", t.elapsed());
+        }
+        for _ in 0..3 {
+            let t = Instant::now();
+            credit_rejected_share(&ledger, next_id, true).unwrap();
+            eprintln!("credit_rejected_share {:?}", t.elapsed());
+        }
+        let t = Instant::now();
+        ledger
+            .transaction(|state| {
+                if let Some(session) = state.sessions.get_mut(&next_id) {
+                    session.connected = false;
+                }
+                Ok(())
+            })
+            .unwrap();
+        eprintln!("disconnect {:?}", t.elapsed());
+        eprintln!("persists {}", ledger.persist_count.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    #[ignore = "profiles a real pool ledger copy under a handshake burst; set CMFD_LEDGER_BENCH_DIR"]
+    fn real_ledger_handshake_burst_is_batched() {
+        let Ok(source) = std::env::var("CMFD_LEDGER_BENCH_DIR") else {
+            return;
+        };
+        let root = TestRoot::new("real-ledger-burst");
+        let directory = root.path().join("ledger");
+        fs::create_dir_all(&directory).unwrap();
+        for name in [
+            "pool-ledger-v2.0.json",
+            "pool-ledger-v2.1.json",
+            POOL_LEDGER_GUARD_FILE,
+        ] {
+            fs::copy(Path::new(&source).join(name), directory.join(name)).unwrap();
+        }
+        let network: [u8; 32] =
+            hex::decode("88296bc39c10e8bc1dd4818d4d42412fe5f08210651110377f495da299812f62")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let fingerprint: [u8; 32] =
+            hex::decode("e9d81f15c580031302656609eb24fa8351efe0a34135ad894c793f3dd9044079")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let ledger = Arc::new(DurableLedger::open(Some(directory), network, fingerprint).unwrap());
+        let payout = *ledger.state.lock().unwrap().payouts.keys().next().unwrap();
+        let next_id = ledger.next_session_id().unwrap();
+        const BURST: u64 = 48;
+        let persists_before = ledger.persist_count.load(Ordering::Relaxed);
+        let started = Instant::now();
+        let workers = (0..BURST)
+            .map(|i| {
+                let ledger = Arc::clone(&ledger);
+                thread::spawn(move || {
+                    let t = Instant::now();
+                    register_session(&ledger, next_id + i, format!("burst{i}"), payout).unwrap();
+                    credit_accepted_share(&ledger, next_id + i, 7).unwrap();
+                    t.elapsed()
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut latencies = workers
+            .into_iter()
+            .map(|w| w.join().unwrap())
+            .collect::<Vec<_>>();
+        latencies.sort();
+        let wall = started.elapsed();
+        let persists = ledger.persist_count.load(Ordering::Relaxed) - persists_before;
+        eprintln!(
+            "burst of {BURST} register+credit: wall {:?}, persists {persists}, median latency {:?}, max latency {:?}",
+            wall,
+            latencies[latencies.len() / 2],
+            latencies[latencies.len() - 1]
+        );
+        let state = ledger.state.lock().unwrap();
+        for i in 0..BURST {
+            assert_eq!(state.sessions[&(next_id + i)].accepted_shares, 1);
+        }
+        assert!(wall < Duration::from_secs(8), "burst took {wall:?}");
     }
 
     #[test]

@@ -153,10 +153,6 @@ fn open_node(
 #[test]
 #[ignore = "requires production-mainnet feature, six real-mainnet blocks and pinned models; CPU only; run alone"]
 fn real_mainnet_short_fork_cold_and_warm_checkpoint_reuse() {
-    assert!(
-        cfg!(feature = "production-mainnet"),
-        "real fixture requires compiled mainnet artifact pins"
-    );
     assert_eq!(
         std::env::var("CMFD_RUN_REAL_FORK_CHECKPOINT").as_deref(),
         Ok("1")

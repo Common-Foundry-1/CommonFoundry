@@ -2340,6 +2340,7 @@ fn listener_loop(
                     }
                 };
                 if !reserve_connection(&active, limits.max_peers) {
+                    tracing::debug!(peer = %remote_address, "rejected inbound peer: connection capacity reached");
                     let _ = stream.shutdown(Shutdown::Both);
                     continue;
                 }

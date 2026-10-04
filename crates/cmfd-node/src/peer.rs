@@ -222,7 +222,9 @@ impl Default for PeerLimits {
             connect_timeout: Duration::from_secs(5),
             idle_timeout: Duration::from_secs(10),
             total_timeout: Duration::from_secs(5 * 60),
-            max_peers: 16,
+            // Public seeds saturated at 16 concurrent sessions and silently
+            // refused honest peers. Per-IP limits still bound any one source.
+            max_peers: 64,
             max_messages_per_peer: 512,
             max_bytes_per_peer: 32 * 1024 * 1024,
         }

@@ -3115,7 +3115,8 @@ fn process_share(
 
     // Evaluation is intentionally outside the node lock. Recheck the active
     // parent afterwards, then keep the node lock through duplicate reservation
-    // and ledger credit so P2P cannot advance the tip between those steps.
+    // (and, for a block, its pending ledger reservation) so P2P cannot advance
+    // the tip between those steps.
     let node = shared
         .node
         .lock()
@@ -3146,6 +3147,11 @@ fn process_share(
     };
 
     let Some(block) = block else {
+        // The share was checked against the current tip above. Persisting its
+        // credit rewrites the whole ledger, so do it without the node lock:
+        // holding the lock here starved block import under many miners and
+        // left the pool mining on stale parents.
+        drop(node);
         let session = record_accepted_share(
             &shared.ledger,
             session_id,
@@ -3153,7 +3159,6 @@ fn process_share(
             shared.pplns_policy,
             active.wire.share_target,
         )?;
-        drop(node);
         return Ok(PoolShareResult {
             job_id,
             nonce,

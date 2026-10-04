@@ -1,4 +1,4 @@
-use std::{fs::File, path::Path, sync::Arc, time::Instant};
+use std::{fs::File, io::Read, path::Path, sync::Arc, time::Instant};
 
 use anyhow::{ensure, Context, Result};
 use cmfd_consensus::{
@@ -10,6 +10,7 @@ use cmfd_consensus::{
     ForgeMatrixV4FixedBankArtifactV1,
 };
 use memmap2::{Mmap, MmapOptions};
+use rayon::prelude::*;
 use serde::{de::DeserializeOwned, Serialize};
 use slop_algebra::{AbstractField, PrimeField32};
 use slop_alloc::Buffer;
@@ -59,8 +60,26 @@ pub struct FixedArtifactMaps {
     commitment: GpuDigest,
     codeword: Arc<Mmap>,
     row_major: bool,
-    tree: Arc<Mmap>,
+    tree: Arc<FixedBytes>,
     root: GpuDigest,
+}
+
+/// A fixed artifact's bytes: a file mapping, or a heap copy whose reads never
+/// wait on the page cache.
+enum FixedBytes {
+    Mapped(Mmap),
+    Resident(Vec<u8>),
+}
+
+impl std::ops::Deref for FixedBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Mapped(map) => &map[..],
+            Self::Resident(bytes) => &bytes[..],
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -397,14 +416,19 @@ fn add_ext_in_place(
 }
 
 impl FixedArtifactMaps {
-    pub fn open(artifact_dir: &Path, artifact: ForgeMatrixV4FixedBankArtifactV1) -> Result<Self> {
+    /// `resident_tree` reads the Merkle tree onto the heap instead of mapping it.
+    pub fn open(
+        artifact_dir: &Path,
+        artifact: ForgeMatrixV4FixedBankArtifactV1,
+        resident_tree: bool,
+    ) -> Result<Self> {
         let bank = artifact.bank();
         let canonical_path =
             artifact_dir.join(format!("FORGEMATRIX-V4-FIXED-BANK-{bank}.codeword"));
         let row_major_path = artifact_dir.join(format!(
             "FORGEMATRIX-V4-FIXED-BANK-{bank}.row-major.codeword"
         ));
-        let tree_file =
+        let mut tree_file =
             File::open(artifact_dir.join(format!("FORGEMATRIX-V4-FIXED-BANK-{bank}.tree")))?;
         ensure!(
             tree_file.metadata()?.len() == artifact.tree_bytes(),
@@ -429,7 +453,17 @@ impl FixedArtifactMaps {
         } else {
             None
         };
-        let tree = Arc::new(unsafe { MmapOptions::new().map(&tree_file)? });
+        let tree = Arc::new(if resident_tree {
+            let mut bytes = Vec::with_capacity(usize::try_from(artifact.tree_bytes())?);
+            tree_file.read_to_end(&mut bytes)?;
+            ensure!(
+                bytes.len() as u64 == artifact.tree_bytes(),
+                "fixed tree length mismatch"
+            );
+            FixedBytes::Resident(bytes)
+        } else {
+            FixedBytes::Mapped(unsafe { MmapOptions::new().map(&tree_file)? })
+        });
         ensure!(
             blake3::Hasher::new()
                 .update_rayon(&tree)
@@ -444,7 +478,8 @@ impl FixedArtifactMaps {
             "fixed tree root mismatch"
         );
         // The row-major file is an untrusted read cache. Every value used from it is opened
-        // against the digest-pinned Merkle tree, and the finished proof is CPU-self-verified.
+        // against the digest-pinned Merkle tree, and the finished proof is CPU-verified (by
+        // this worker in standalone mode, by the node's consensus verifier in server mode).
         let (codeword, row_major) = if row_major_path.is_file() {
             let row_major_file = File::open(row_major_path)?;
             ensure!(
@@ -479,26 +514,39 @@ impl FixedArtifactMaps {
         let row_major = self.row_major;
         let root = self.root;
         Box::new(move |query_indices| {
+            // Each query reads a random codeword row that is usually not in the
+            // page cache. Fault the rows in concurrently; collect keeps query order.
+            let openings = query_indices
+                .par_iter()
+                .map(|query_index| {
+                    if *query_index >= CODEWORD_ROWS {
+                        return None;
+                    }
+                    let row = (0..FIXED_COLUMNS)
+                        .map(|column| {
+                            let word_index = if row_major {
+                                query_index * FIXED_COLUMNS + column
+                            } else {
+                                column * CODEWORD_ROWS + query_index
+                            };
+                            raw_felt(&codeword, word_index)
+                        })
+                        .collect::<Option<Vec<_>>>()?;
+                    let mut path = Vec::with_capacity(TREE_HEIGHT);
+                    let mut node = CODEWORD_ROWS - 1 + query_index;
+                    for _ in 0..TREE_HEIGHT {
+                        let sibling = if node & 1 == 0 { node - 1 } else { node + 1 };
+                        path.push(raw_digest(&tree, sibling).ok()?);
+                        node = (node - 1) >> 1;
+                    }
+                    Some((row, path))
+                })
+                .collect::<Option<Vec<_>>>()?;
             let mut values = Vec::with_capacity(query_indices.len() * FIXED_COLUMNS);
             let mut paths = Vec::with_capacity(query_indices.len() * TREE_HEIGHT);
-            for query_index in query_indices {
-                if *query_index >= CODEWORD_ROWS {
-                    return None;
-                }
-                for column in 0..FIXED_COLUMNS {
-                    let word_index = if row_major {
-                        query_index * FIXED_COLUMNS + column
-                    } else {
-                        column * CODEWORD_ROWS + query_index
-                    };
-                    values.push(raw_felt(&codeword, word_index)?);
-                }
-                let mut node = CODEWORD_ROWS - 1 + query_index;
-                for _ in 0..TREE_HEIGHT {
-                    let sibling = if node & 1 == 0 { node - 1 } else { node + 1 };
-                    paths.push(raw_digest(&tree, sibling).ok()?);
-                    node = (node - 1) >> 1;
-                }
+            for (row, path) in openings {
+                values.extend(row);
+                paths.extend(path);
             }
             Some(slop_merkle_tree::MerkleTreeOpeningAndProof {
                 values: Tensor::from(values).reshape([query_indices.len(), FIXED_COLUMNS]),

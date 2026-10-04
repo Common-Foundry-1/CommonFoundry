@@ -1933,9 +1933,12 @@ fn inbound_reputation_penalty(error: &P2pError) -> (u16, &'static str) {
             | PeerError::CountLimit { .. }
             | PeerError::PeerBudgetExceeded,
         ) => (RESOURCE_ABUSE_PENALTY, "peer resource limit violation"),
-        P2pError::Peer(PeerError::Cancelled) | P2pError::PeerTemporarilyBanned(_) => {
-            (0, "no peer fault")
-        }
+        // A peer with a larger valid session budget may relay more
+        // protocol-sized blocks than ours accepts. Closing the session already
+        // bounds the cost, and the next session resumes after the accepted
+        // prefix. Oversized frames and message floods remain abuse above.
+        P2pError::Peer(PeerError::Cancelled | PeerError::PeerByteBudgetReached)
+        | P2pError::PeerTemporarilyBanned(_) => (0, "no peer fault"),
         P2pError::Peer(
             PeerError::ConnectionClosed
             | PeerError::TotalTimeout
@@ -1959,7 +1962,8 @@ fn outbound_reputation_penalty(error: &P2pError) -> (u16, &'static str) {
         P2pError::Peer(
             PeerError::PayloadTooLarge { .. }
             | PeerError::CountLimit { .. }
-            | PeerError::PeerBudgetExceeded,
+            | PeerError::PeerBudgetExceeded
+            | PeerError::PeerByteBudgetReached,
         ) => (RESOURCE_ABUSE_PENALTY, "remote resource limit violation"),
         P2pError::Peer(
             PeerError::ConnectionClosed
@@ -4381,6 +4385,160 @@ mod tests {
         server.join().unwrap();
         drop(target);
         clean_test_dir(&path);
+    }
+
+    fn wait_for_failed_inbound_sessions(node: &Arc<Mutex<Node>>, failed: u64) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let recorded = node
+                .lock()
+                .unwrap()
+                .status()
+                .unwrap()
+                .peers
+                .iter()
+                .filter(|peer| peer.direction == PeerDirection::Inbound)
+                .map(|peer| peer.failed_sessions)
+                .sum::<u64>();
+            if recorded >= failed || Instant::now() >= deadline {
+                assert!(
+                    recorded >= failed,
+                    "inbound session outcome was not recorded"
+                );
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn larger_valid_relay_respects_receiver_budget_without_banning_peer() {
+        let source_path = test_dir("heterogeneous-relay-source");
+        let target_path = test_dir("heterogeneous-relay-target");
+        let source = open_shared(&source_path);
+        let target = open_shared(&target_path);
+        let start_time = unix_time_seconds().unwrap();
+        let blocks = (0..3)
+            .map(|offset| {
+                source
+                    .lock()
+                    .unwrap()
+                    .mine_once(
+                        default_miner_destination(),
+                        start_time + offset,
+                        DEFAULT_MINING_ATTEMPTS,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let frame_bytes = blocks
+            .iter()
+            .map(|block| {
+                encode_peer_frame(&PeerFrame {
+                    sequence: 1,
+                    message: PeerMessage::SubmitBlock(block.clone()),
+                })
+                .unwrap()
+                .len() as u64
+            })
+            .collect::<Vec<_>>();
+        let largest = *frame_bytes.iter().max().unwrap();
+        let smallest = *frame_bytes.iter().min().unwrap();
+        let hello = source.lock().unwrap().peer_hello();
+        let network_id = hello.network_id;
+        let frame_len = |message: PeerMessage| {
+            encode_peer_frame(&PeerFrame {
+                sequence: 1,
+                message,
+            })
+            .unwrap()
+            .len() as u64
+        };
+        let handshake_bytes = 2 * frame_len(PeerMessage::Hello(hello));
+        let result_bytes = frame_len(PeerMessage::BlockSubmissionResult(BlockSubmissionResult {
+            block_id: [0; 32],
+            status: BlockSubmissionStatus::Accepted,
+            peer_height: 0,
+            peer_tip: [0; 32],
+        }));
+        let mempool_bytes = frame_len(PeerMessage::GetMempool)
+            + frame_len(PeerMessage::TransactionInventory { txids: Vec::new() });
+        // Room for the handshake, one valid block, its acknowledgement, and an
+        // empty mempool exchange, but never for a second block in one session.
+        let receiver_limits = PeerLimits {
+            max_bytes_per_peer: handshake_bytes + largest + result_bytes + mempool_bytes,
+            ..test_limits()
+        };
+        assert!(largest + mempool_bytes < 2 * smallest);
+        let sender_limits = test_limits();
+        assert!(block_sync_batch_limit(network_id, sender_limits) >= blocks.len());
+
+        let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = socket.local_addr().unwrap();
+        let listener = spawn_inbound_listener_inner(
+            Arc::clone(&target),
+            socket,
+            receiver_limits,
+            Some(TARGET_NONCE),
+        )
+        .unwrap();
+
+        // The sender offers its whole valid, protocol-sized batch. The
+        // receiver accepts what fits its own budget and closes the session at
+        // the next block frame instead of treating the peer as an abuser.
+        for (session, expected_height) in [1_u64, 2, 3].into_iter().enumerate() {
+            let result = relay_blocks_to_peer_once_inner_with_policy(
+                Arc::clone(&source),
+                address,
+                sender_limits,
+                PeerAddressPolicy::PrivateOnly,
+                Some(SOURCE_NONCE),
+                None,
+            );
+            if expected_height < blocks.len() as u64 {
+                assert!(
+                    result.is_err(),
+                    "the receiver must close the over-budget session"
+                );
+                wait_for_failed_inbound_sessions(&target, session as u64 + 1);
+            } else {
+                assert_eq!(result.unwrap().accepted_blocks, 1);
+            }
+            assert!(
+                !listener.peer_is_temporarily_banned(address.ip()).unwrap(),
+                "a valid block stream above the receiver budget must not ban the sender"
+            );
+            assert_eq!(
+                target.lock().unwrap().peer_hello().height,
+                expected_height,
+                "each relay session must still deliver the block that fits"
+            );
+        }
+        assert!(tips_match(&source, &target));
+
+        listener.stop().unwrap();
+        drop(source);
+        drop(target);
+        clean_test_dir(&source_path);
+        clean_test_dir(&target_path);
+    }
+
+    #[test]
+    fn inbound_message_floods_and_oversized_frames_remain_resource_abuse() {
+        for error in [
+            PeerError::PeerBudgetExceeded,
+            PeerError::PayloadTooLarge { actual: 2, max: 1 },
+            PeerError::CountLimit {
+                field: "test",
+                actual: 2,
+                max: 1,
+            },
+        ] {
+            assert_eq!(
+                inbound_reputation_penalty(&P2pError::Peer(error)).0,
+                RESOURCE_ABUSE_PENALTY
+            );
+        }
     }
 
     #[test]

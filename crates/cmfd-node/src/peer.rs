@@ -353,6 +353,11 @@ pub enum PeerError {
     SequenceExhausted,
     #[error("per-peer message or byte budget exhausted")]
     PeerBudgetExceeded,
+    /// A frame within its protocol size limit would exceed this session's
+    /// byte budget. Peers may run different valid budgets, so this ends the
+    /// session without implying that the frame stream was abusive.
+    #[error("per-peer session byte budget reached")]
+    PeerByteBudgetReached,
     #[error("peer limits are zero, unusable for a mutual hello, or exceed hard protocol bounds")]
     InvalidLimits,
     #[error(
@@ -1318,10 +1323,11 @@ impl PeerSession {
             .bytes_used
             .checked_add(frame_bytes as u64)
             .ok_or(PeerError::PeerBudgetExceeded)?;
-        if next_messages > self.limits.max_messages_per_peer
-            || next_bytes > self.limits.max_bytes_per_peer
-        {
+        if next_messages > self.limits.max_messages_per_peer {
             return Err(PeerError::PeerBudgetExceeded);
+        }
+        if next_bytes > self.limits.max_bytes_per_peer {
+            return Err(PeerError::PeerByteBudgetReached);
         }
         Ok(())
     }

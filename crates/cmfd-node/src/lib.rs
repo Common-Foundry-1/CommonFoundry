@@ -170,6 +170,7 @@ const MAX_PARALLEL_REPLAY_PROOF_VERIFICATIONS: usize = 4;
 const MAX_BRANCH_STATE_CHECKPOINTS: usize = 4;
 const MAX_BRANCH_STATE_CHECKPOINT_BYTES: usize = 128 * 1024 * 1024;
 const ACTIVE_BRANCH_CHECKPOINT_INTERVAL: u64 = 16;
+const BRANCH_CHECKPOINT_RETURN_WAIT: Duration = Duration::from_millis(250);
 pub const PRODUCTION_V3_PACKAGE_ARTIFACT_DIRECTORY: &str = "production-v3";
 pub const PRODUCTION_V3_PACKAGE_BANK: &str = "MODEL-V2.bank";
 pub const PRODUCTION_V3_PACKAGE_MANIFEST: &str = "MODEL-V2.manifest.json";
@@ -4217,8 +4218,25 @@ impl Drop for PendingExternalWork {
             state,
             path: plan.path,
         };
-        if let Ok(mut node) = self.shared.try_lock() {
-            node.remember_branch_checkpoint(checkpoint);
+        return_branch_checkpoint(&self.shared, checkpoint);
+    }
+}
+
+/// Cleanup never blocks indefinitely on Node (the dropping thread may itself
+/// hold it), but a busy lock is retried briefly instead of discarding the
+/// completed replay progress on the first contended attempt.
+fn return_branch_checkpoint(shared: &Arc<Mutex<Node>>, checkpoint: BranchStateCheckpoint) {
+    let deadline = Instant::now() + BRANCH_CHECKPOINT_RETURN_WAIT;
+    loop {
+        match shared.try_lock() {
+            Ok(mut node) => {
+                node.remember_branch_checkpoint(checkpoint);
+                return;
+            }
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(2));
+            }
+            Err(_) => return,
         }
     }
 }
@@ -4228,9 +4246,7 @@ impl Drop for PendingExternalAdmission {
         let Some(checkpoint) = self.progress.take().and_then(|p| p.into_checkpoint()) else {
             return;
         };
-        if let Ok(mut node) = self.shared.try_lock() {
-            node.remember_branch_checkpoint(checkpoint);
-        }
+        return_branch_checkpoint(&self.shared, checkpoint);
     }
 }
 
@@ -7519,7 +7535,29 @@ impl Node {
         let Some((position, _)) = best else {
             return Ok(None);
         };
-        let cached = self.branch_checkpoints.remove(position);
+        // An active-chain anchor stays cached and the replay uses a copy. Its
+        // return after a cancelled attempt is best-effort and can be lost; a
+        // lost anchor turned a one-block reorganization after a restart into
+        // a replay from genesis.
+        let entry = &self.branch_checkpoints.entries[position];
+        let anchor_is_active = usize::try_from(entry.anchor.height)
+            .ok()
+            .and_then(|height| self.index.active_chain.get(height))
+            == Some(&entry.checkpoint.block_id);
+        let cached = if anchor_is_active {
+            CachedBranchCheckpoint {
+                checkpoint: BranchStateCheckpoint {
+                    context: entry.checkpoint.context,
+                    block_id: entry.checkpoint.block_id,
+                    state: entry.checkpoint.state.clone(),
+                    path: entry.checkpoint.path.clone(),
+                },
+                anchor: entry.anchor,
+                charge: entry.charge,
+            }
+        } else {
+            self.branch_checkpoints.remove(position)
+        };
         let log_path = self.data_dir.join(BLOCK_LOG_FILE);
         let authenticated = (|| {
             verify_retained_block_log_path(&self.log, &log_path)?;
@@ -13290,7 +13328,8 @@ mod tests {
             .begin_external_block_admission(&candidate, now)
             .unwrap()
             .unwrap();
-        assert!(shared.lock().unwrap().branch_checkpoints.entries.is_empty());
+        // An active-chain checkpoint stays cached while a copy is in use.
+        assert_eq!(shared.lock().unwrap().branch_checkpoints.entries.len(), 1);
         let blocked = Arc::new(ProofVerificationQueue::new(1, 0, Duration::from_millis(1)));
         let _held = blocked.acquire().unwrap();
         {
@@ -13366,7 +13405,10 @@ mod tests {
             .take_branch_checkpoint(blocks[3].block_id())
             .unwrap()
             .unwrap();
-        assert_eq!(node.branch_checkpoints.charged_bytes, 0);
+        // Active anchors stay cached on checkout; clear them so each check
+        // below observes only whether the tampered copy is accepted.
+        assert!(node.branch_checkpoints.charged_bytes > 0);
+        node.branch_checkpoints = BranchCheckpointCache::default();
         checkpoint.context.node_instance_id ^= 1;
         node.remember_branch_checkpoint(checkpoint);
         assert!(node.branch_checkpoints.entries.is_empty());
@@ -13375,6 +13417,7 @@ mod tests {
             .take_branch_checkpoint(blocks[3].block_id())
             .unwrap()
             .unwrap();
+        node.branch_checkpoints = BranchCheckpointCache::default();
         checkpoint.context.network_id[0] ^= 1;
         node.remember_branch_checkpoint(checkpoint);
         assert!(node.branch_checkpoints.entries.is_empty());
@@ -13383,6 +13426,7 @@ mod tests {
             .take_branch_checkpoint(blocks[3].block_id())
             .unwrap()
             .unwrap();
+        node.branch_checkpoints = BranchCheckpointCache::default();
         checkpoint.path[0][0] ^= 1;
         node.remember_branch_checkpoint(checkpoint);
         assert!(node.branch_checkpoints.entries.is_empty());
@@ -13444,6 +13488,7 @@ mod tests {
             .take_branch_checkpoint(node.state.tip())
             .unwrap()
             .unwrap();
+        node.branch_checkpoints = BranchCheckpointCache::default();
         let mut oversized_path = Vec::with_capacity(MAX_BRANCH_STATE_CHECKPOINT_BYTES / 32 + 1);
         oversized_path.extend_from_slice(&oversized.path);
         oversized.path = oversized_path;
@@ -13493,6 +13538,43 @@ mod tests {
         let shared = Arc::new(Mutex::new(node));
         submit_shared_block(&shared, candidate.clone(), now).unwrap();
         assert_eq!(verifier.replay_state_blocks.load(Ordering::Relaxed), 15);
+        assert!(shared.lock().unwrap().index.contains(candidate.block_id()));
+        drop(shared);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn active_anchor_survives_an_abandoned_short_fork_attempt() {
+        let (mut node, path, _) = branch_checkpoint_fixture("checkpoint-anchor-kept", 0);
+        let mut parent = node.params.genesis_hash;
+        let mut fork_parent = parent;
+        for height in 1..=64 {
+            let now = DEVNET_GENESIS_TIMESTAMP + height * 60;
+            let block = mined_child(&node, parent, now, height as u8);
+            parent = block.block_id();
+            if height == 63 {
+                fork_parent = parent;
+            }
+            node.submit_block(block, now).unwrap();
+        }
+        let now = DEVNET_GENESIS_TIMESTAMP + 64 * 60;
+        let candidate = mined_child(&node, fork_parent, now, 0xf1);
+        // An attempt checks out the nearest anchor and is then abandoned
+        // without returning anything to the cache.
+        let abandoned = node
+            .begin_external_block_admission(&candidate, now)
+            .unwrap()
+            .unwrap();
+        drop(abandoned);
+        let verifier = node.block_preverifier.clone();
+        let before = verifier.replay_state_blocks.load(Ordering::Relaxed);
+        let shared = Arc::new(Mutex::new(node));
+        submit_shared_block(&shared, candidate.clone(), now).unwrap();
+        // The retry still starts from the same anchor instead of genesis.
+        assert_eq!(
+            verifier.replay_state_blocks.load(Ordering::Relaxed) - before,
+            15
+        );
         assert!(shared.lock().unwrap().index.contains(candidate.block_id()));
         drop(shared);
         clean_test_dir(&path);

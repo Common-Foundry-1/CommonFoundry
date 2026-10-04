@@ -3281,10 +3281,22 @@ fn process_share(
         return rejected_result(shared, session_id, job_id, nonce, "low_difficulty_share");
     }
     let block = if let Some(proof) = &evaluation.chain_proof {
-        let Some(block) = active.mining.build_block_if_chain_valid(proof)? else {
-            return rejected_result(shared, session_id, job_id, nonce, "invalid_chain_proof");
-        };
-        Some(block)
+        match active.mining.build_block_if_chain_valid(proof) {
+            Ok(Some(block)) => Some(block),
+            Ok(None) => {
+                log_pool_block(&active, nonce, "invalid_chain_proof", None);
+                return rejected_result(shared, session_id, job_id, nonce, "invalid_chain_proof");
+            }
+            Err(error) => {
+                log_pool_block(
+                    &active,
+                    nonce,
+                    &format!("verification_error: {error}"),
+                    None,
+                );
+                return Err(error.into());
+            }
+        }
     } else {
         None
     };
@@ -3298,6 +3310,14 @@ fn process_share(
         .lock()
         .map_err(|_| PoolError::SharedStatePoisoned)?;
     if node.state.tip() != active.wire.challenge.previous_block {
+        if block.is_some() {
+            log_pool_block(
+                &active,
+                nonce,
+                "stale_before_reservation",
+                Some(node.state.tip()),
+            );
+        }
         drop(node);
         rotate_if_tip_changed(shared)?;
         return rejected_result(shared, session_id, job_id, nonce, "stale_job");
@@ -3373,13 +3393,18 @@ fn process_share(
     let node_submission_started = Instant::now();
     loop {
         match submit_shared_tip_block(&shared.node, (*block).clone(), unix_time_seconds()?) {
-            Ok(_) => break,
+            Ok(_) => {
+                log_pool_block(&active, nonce, "accepted", None);
+                break;
+            }
             Err(NodeError::StaleBlockAdmission | NodeError::UnknownParent(_)) => {
+                log_pool_block(&active, nonce, "stale_at_submission", None);
                 discard_pending_pool_block(&shared.ledger, block_credit.block_id)?;
                 rotate_if_tip_changed(shared)?;
                 return rejected_result(shared, session_id, job_id, nonce, "stale_job");
             }
             Err(NodeError::DuplicateBlock(_)) => {
+                log_pool_block(&active, nonce, "duplicate", None);
                 reconcile_pool_blocks(shared)?;
                 let session = pool_block_session_snapshot(&shared.ledger, block_credit.block_id)?;
                 rotate_if_tip_changed(shared)?;
@@ -3410,6 +3435,7 @@ fn process_share(
                     .tip()
                     == active.wire.challenge.previous_block;
                 if !parent_is_current {
+                    log_pool_block(&active, nonce, "stale_while_verifier_busy", None);
                     discard_pending_pool_block(&shared.ledger, block_credit.block_id)?;
                     rotate_if_tip_changed(shared)?;
                     return rejected_result(shared, session_id, job_id, nonce, "stale_job");
@@ -3417,6 +3443,7 @@ fn process_share(
                 thread::sleep(Duration::from_millis(10));
             }
             Err(error) if error.client_error().retryable => {
+                log_pool_block(&active, nonce, &format!("verifier_busy: {error}"), None);
                 if nonce_reserved {
                     release_valid_share(&active, nonce)?;
                 }
@@ -3424,6 +3451,7 @@ fn process_share(
                 return retryable_result(shared, session_id, job_id, nonce, "verifier_busy");
             }
             Err(error) => {
+                log_pool_block(&active, nonce, &format!("submit_error: {error}"), None);
                 reconcile_pool_blocks_with_recovery(shared, true)?;
                 return Err(PoolError::Node(error));
             }
@@ -3459,6 +3487,18 @@ fn process_share(
         code: "block_accepted".to_owned(),
         session,
     })
+}
+
+/// Every chain-winning share is rare and valuable; record what happened to it.
+fn log_pool_block(active: &ActiveJob, nonce: u64, outcome: &str, node_tip: Option<[u8; 32]>) {
+    tracing::warn!(
+        height = active.wire.challenge.height,
+        parent = %hex::encode(&active.wire.challenge.previous_block[..8]),
+        node_tip = %node_tip.map(|tip| hex::encode(&tip[..8])).unwrap_or_default(),
+        nonce,
+        outcome,
+        "pool block candidate"
+    );
 }
 
 fn rejected_result(

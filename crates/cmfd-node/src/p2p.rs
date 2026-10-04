@@ -5,7 +5,7 @@
 //! defaults to loopback/private addresses; public peers require an explicit
 //! unsafe Devnet opt-in enforced by `peer`.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -73,6 +73,8 @@ const MAX_INBOUND_ATTEMPTS_PER_WINDOW: u16 = 64;
 const INBOUND_ATTEMPT_WINDOW: Duration = Duration::from_secs(10);
 const PEER_BAN_DURATION: Duration = Duration::from_secs(5 * 60);
 const PEER_BAN_SCORE: u16 = 100;
+const COMPRESSED_PEER_STRIKES: u8 = 2;
+const COMPRESSED_PEER_COOLDOWN: Duration = Duration::from_secs(60 * 60);
 const CLEAN_SESSION_CREDIT: u16 = 10;
 const TRANSIENT_FAILURE_PENALTY: u16 = 5;
 const UNKNOWN_REQUEST_PENALTY: u16 = 10;
@@ -293,6 +295,12 @@ struct PeerReputationEntry {
     attempt_window_started: Instant,
     connection_attempts: u16,
     last_updated: Instant,
+    /// The peer sent us a version-5 frame, so it accepts compressed blocks.
+    compresses_blocks: bool,
+    /// Consecutive version-5 sessions that died in transport before any
+    /// reply, the signature of a version-4 peer rejecting our hello.
+    compressed_strikes: u8,
+    compressed_cooldown_until: Option<Instant>,
 }
 
 impl PeerReputationEntry {
@@ -304,6 +312,9 @@ impl PeerReputationEntry {
             attempt_window_started: now,
             connection_attempts: 0,
             last_updated: now,
+            compresses_blocks: false,
+            compressed_strikes: 0,
+            compressed_cooldown_until: None,
         }
     }
 
@@ -325,6 +336,9 @@ impl PeerReputationEntry {
 #[derive(Debug, Default)]
 struct PeerSecurityState {
     reputations: BTreeMap<PeerReputationKey, PeerReputationEntry>,
+    /// Operator-configured peers; assumed to accept compressed blocks until
+    /// they prove otherwise.
+    static_peers: BTreeSet<PeerReputationKey>,
 }
 
 #[derive(Debug, Default)]
@@ -408,6 +422,87 @@ impl PeerSecurity {
         entry.refresh(now);
         if entry.banned_until.is_none() {
             entry.score = entry.score.saturating_sub(CLEAN_SESSION_CREDIT);
+        }
+        Ok(())
+    }
+
+    fn register_static_peers(&self, peers: &[SocketAddr]) -> Result<(), P2pError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| P2pError::PoisonedPeerReputation)?;
+        state.static_peers.extend(
+            peers
+                .iter()
+                .map(|peer| PeerReputationKey::from_ip(peer.ip())),
+        );
+        Ok(())
+    }
+
+    /// Whether to send this peer version-5 (compressed block) frames: it is a
+    /// configured static peer or has sent us version 5, and recent version-5
+    /// sessions to it did not all die in the handshake.
+    fn compresses_blocks(&self, ip: IpAddr) -> Result<bool, P2pError> {
+        let now = Instant::now();
+        let key = PeerReputationKey::from_ip(ip);
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| P2pError::PoisonedPeerReputation)?;
+        let entry = state.reputations.get(&key);
+        if entry.is_some_and(|entry| {
+            entry
+                .compressed_cooldown_until
+                .is_some_and(|until| until > now)
+        }) {
+            return Ok(false);
+        }
+        Ok(state.static_peers.contains(&key) || entry.is_some_and(|entry| entry.compresses_blocks))
+    }
+
+    fn record_compressed_peer(&self, ip: IpAddr) -> Result<(), P2pError> {
+        let now = Instant::now();
+        let key = PeerReputationKey::from_ip(ip);
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| P2pError::PoisonedPeerReputation)?;
+        if let Some(entry) = peer_reputation_entry(&mut state, key, now) {
+            entry.compresses_blocks = true;
+            entry.compressed_strikes = 0;
+            entry.compressed_cooldown_until = None;
+        }
+        Ok(())
+    }
+
+    /// Outcome of a session we opened with version 5. A version-4 peer closes
+    /// the connection on our hello, so two such closures in a row pause
+    /// compression toward that peer; any completed session resets the count.
+    fn record_compressed_session(
+        &self,
+        ip: IpAddr,
+        result: Result<(), &P2pError>,
+    ) -> Result<(), P2pError> {
+        let now = Instant::now();
+        let key = PeerReputationKey::from_ip(ip);
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| P2pError::PoisonedPeerReputation)?;
+        let Some(entry) = peer_reputation_entry(&mut state, key, now) else {
+            return Ok(());
+        };
+        match result {
+            Ok(()) => entry.compressed_strikes = 0,
+            Err(P2pError::Peer(PeerError::ConnectionClosed | PeerError::Io(_))) => {
+                entry.compressed_strikes = entry.compressed_strikes.saturating_add(1);
+                if entry.compressed_strikes >= COMPRESSED_PEER_STRIKES {
+                    entry.compressed_strikes = 0;
+                    entry.compressed_cooldown_until = Some(now + COMPRESSED_PEER_COOLDOWN);
+                    tracing::warn!(peer = %ip, "peer rejected compressed-block frames; falling back to version 4 for an hour");
+                }
+            }
+            Err(_) => {}
         }
         Ok(())
     }
@@ -1737,6 +1832,7 @@ fn perform_respond_to_peer_inner_with_policy(
     };
     let network_id = hello.network_id;
     let block_batch_limit = block_sync_batch_limit(network_id, limits);
+    let limits = compressed_limits(&options.security, remote_address, limits);
     let session = PeerSession::new(hello, limits)?;
     let mut connection =
         PeerConnection::from_stream_with_policy(stream, session, options.address_policy)?;
@@ -1746,6 +1842,11 @@ fn perform_respond_to_peer_inner_with_policy(
     connection.send_hello()?;
     let remote_hello = expect_hello(connection.receive()?)?;
     *handshake_complete = true;
+    if connection.remote_compresses_blocks() {
+        options
+            .security
+            .record_compressed_peer(remote_address.ip())?;
+    }
     let proof_peer = next_remote_proof_peer_id()?;
     record_peer_succeeded(
         &shared,
@@ -2712,6 +2813,7 @@ fn spawn_peer_polling_inner(
         || Arc::new(PeerSecurity::default()),
         |discovery| Arc::clone(&discovery.security),
     );
+    security.register_static_peers(&config.peers)?;
     let stop = Arc::new((Mutex::new(false), Condvar::new()));
     let active_sockets = Arc::new(ActiveSocketRegistry::default());
     let thread_stop = Arc::clone(&stop);
@@ -2836,14 +2938,16 @@ impl TipAnnouncer {
             let Ok(started_tip) = lock_node(&self.shared).map(|node| node.state.tip()) else {
                 break;
             };
+            let limits = compressed_limits(&self.security, peer, self.config.limits);
             let result = relay_blocks_to_peer_once_inner_with_policy(
                 Arc::clone(&self.shared),
                 peer,
-                self.config.limits,
+                limits,
                 self.config.address_policy,
                 self.nonce_override,
                 Some(&self.active_sockets),
             );
+            record_compressed_outcome(&self.security, peer, limits, &result);
             self.relay_backoff.record(peer, &result, Instant::now());
             if let Err(error) = &result {
                 let (penalty, reason) = outbound_reputation_penalty(error);
@@ -3027,6 +3131,33 @@ fn catchup_remote_after_sync(
     )
 }
 
+/// Session limits for `peer`, sending compressed block frames only when the
+/// peer is known to accept them.
+fn compressed_limits(security: &PeerSecurity, peer: SocketAddr, limits: PeerLimits) -> PeerLimits {
+    let mut limits = limits;
+    limits.compress_blocks = security
+        .compresses_blocks(peer.ip())
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, %peer, "failed to consult peer compression capability");
+            false
+        });
+    limits
+}
+
+fn record_compressed_outcome<T>(
+    security: &PeerSecurity,
+    peer: SocketAddr,
+    limits: PeerLimits,
+    result: &Result<T, P2pError>,
+) {
+    if !limits.compress_blocks {
+        return;
+    }
+    if let Err(error) = security.record_compressed_session(peer.ip(), result.as_ref().map(|_| ())) {
+        tracing::warn!(%error, %peer, "failed to record compressed-session outcome");
+    }
+}
+
 fn record_poll_sync_result(
     options: &PeerPollOptions,
     peer: SocketAddr,
@@ -3099,14 +3230,16 @@ fn static_peer_poll_loop(
             // Errors are already logged via tracing inside these calls;
             // a failure with one peer must not stop later peers or rounds.
             let cursor_before = peer_sync_progress_cursor(&shared, peer);
+            let limits = compressed_limits(&options.security, peer, config.limits);
             let sync_result = sync_from_peer_once_inner_with_policy(
                 Arc::clone(&shared),
                 peer,
-                config.limits,
+                limits,
                 config.address_policy,
                 options.nonce_override,
                 Some(&active_sockets),
             );
+            record_compressed_outcome(&options.security, peer, limits, &sync_result);
             let mut round_succeeded = sync_result.is_ok();
             let sync_banned = record_poll_sync_result(&options, peer, &sync_result);
             if sync_banned {
@@ -3116,14 +3249,16 @@ fn static_peer_poll_loop(
                 return;
             }
             let relay_result = if options.relay_backoff.allows(peer, Instant::now()) {
+                let limits = compressed_limits(&options.security, peer, config.limits);
                 let result = relay_blocks_to_peer_once_inner_with_policy(
                     Arc::clone(&shared),
                     peer,
-                    config.limits,
+                    limits,
                     config.address_policy,
                     options.nonce_override,
                     Some(&active_sockets),
                 );
+                record_compressed_outcome(&options.security, peer, limits, &result);
                 options.relay_backoff.record(peer, &result, Instant::now());
                 Some(result)
             } else {
@@ -3213,14 +3348,16 @@ fn static_peer_poll_loop(
             {
                 break;
             }
+            let limits = compressed_limits(&options.security, peer, config.limits);
             let result = sync_from_peer_once_inner_with_policy(
                 Arc::clone(&shared),
                 peer,
-                config.limits,
+                limits,
                 config.address_policy,
                 options.nonce_override,
                 Some(&active_sockets),
             );
+            record_compressed_outcome(&options.security, peer, limits, &result);
             let banned = record_poll_sync_result(&options, peer, &result);
             let continuation = if banned {
                 None
@@ -3518,7 +3655,47 @@ mod tests {
             max_peers: 4,
             max_messages_per_peer: 256,
             max_bytes_per_peer: 32 * 1024 * 1024,
+            compress_blocks: false,
         }
+    }
+
+    #[test]
+    fn compressed_block_capability_is_static_or_learned_and_backs_off_on_rejection() {
+        let security = PeerSecurity::default();
+        let stranger: IpAddr = "203.0.113.9".parse().unwrap();
+        let static_peer: SocketAddr = "198.51.100.7:29444".parse().unwrap();
+        assert!(!security.compresses_blocks(stranger).unwrap());
+        security.register_static_peers(&[static_peer]).unwrap();
+        assert!(security.compresses_blocks(static_peer.ip()).unwrap());
+        // A peer that sent us version 5 is remembered.
+        security.record_compressed_peer(stranger).unwrap();
+        assert!(security.compresses_blocks(stranger).unwrap());
+        // One transport failure is tolerated; two in a row pause compression.
+        let closed = P2pError::Peer(PeerError::ConnectionClosed);
+        security
+            .record_compressed_session(static_peer.ip(), Err(&closed))
+            .unwrap();
+        assert!(security.compresses_blocks(static_peer.ip()).unwrap());
+        security
+            .record_compressed_session(static_peer.ip(), Ok(()))
+            .unwrap();
+        security
+            .record_compressed_session(static_peer.ip(), Err(&closed))
+            .unwrap();
+        assert!(security.compresses_blocks(static_peer.ip()).unwrap());
+        security
+            .record_compressed_session(static_peer.ip(), Err(&closed))
+            .unwrap();
+        assert!(!security.compresses_blocks(static_peer.ip()).unwrap());
+        // Non-transport errors never count as a rejection.
+        let other: IpAddr = "203.0.113.10".parse().unwrap();
+        security.record_compressed_peer(other).unwrap();
+        for _ in 0..3 {
+            security
+                .record_compressed_session(other, Err(&P2pError::UnknownRequestedBlock([1; 32])))
+                .unwrap();
+        }
+        assert!(security.compresses_blocks(other).unwrap());
     }
 
     fn test_catchup_candidate(index: u8) -> CatchupCandidate {
@@ -4411,6 +4588,7 @@ mod tests {
         let block_bytes = max_block_bytes_for_network(crate::DEVNET_PROFILE.network_id) as u64;
         let receiver_limits = PeerLimits {
             max_bytes_per_peer: reserve + block_bytes,
+            compress_blocks: false,
             ..test_limits()
         };
         assert_eq!(
@@ -4470,10 +4648,12 @@ mod tests {
         let block_bytes = max_block_bytes_for_network(crate::DEVNET_PROFILE.network_id) as u64;
         let receiver_limits = PeerLimits {
             max_bytes_per_peer: reserve + block_bytes,
+            compress_blocks: false,
             ..test_limits()
         };
         let sender_limits = PeerLimits {
             max_bytes_per_peer: reserve + 2 * block_bytes,
+            compress_blocks: false,
             ..test_limits()
         };
         assert_eq!(
@@ -4699,6 +4879,7 @@ mod tests {
         // empty mempool exchange, but never for a second block in one session.
         let receiver_limits = PeerLimits {
             max_bytes_per_peer: handshake_bytes + largest + result_bytes + mempool_bytes,
+            compress_blocks: false,
             ..test_limits()
         };
         assert!(largest + mempool_bytes < 2 * smallest);

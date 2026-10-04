@@ -24,6 +24,12 @@ use thiserror::Error;
 
 pub const PEER_MAGIC: [u8; 4] = *b"CMFP";
 pub const PEER_PROTOCOL_VERSION: u16 = 4;
+/// Version 4 plus DEFLATE-compressed block frames. Every node accepts frames
+/// of both versions; a node sends version 5 only to peers it knows accept it
+/// (its configured static peers and peers that already sent it version 5),
+/// because a version-4 peer treats any unknown version as a protocol
+/// violation.
+pub const PEER_PROTOCOL_VERSION_COMPRESSED: u16 = 5;
 pub const PEER_FRAME_HEADER_BYTES: usize = 20;
 pub const MAX_PEER_PAYLOAD_BYTES: usize = MAX_BLOCK_BYTES;
 pub const MAX_HEADER_LOCATORS: usize = 32;
@@ -80,6 +86,11 @@ pub const MINING_TEMPLATE_KIND: u8 = 13;
 // ordinary synchronization remains compatible during a rolling upgrade.
 pub const GET_PEERS_KIND: u8 = 14;
 pub const PEERS_KIND: u8 = 15;
+/// Version 5 only: `Block` and `SubmitBlock` carrying a DEFLATE-compressed
+/// canonical block encoding (about 30% smaller for ProductionV4 proofs).
+pub const COMPRESSED_BLOCK_KIND: u8 = 20;
+pub const COMPRESSED_SUBMIT_BLOCK_KIND: u8 = 21;
+const BLOCK_COMPRESSION_LEVEL: u32 = 6;
 
 const BLOCK_CHALLENGE_BYTES: usize = 32 + 32 + 32 + 8 + 8 + 32;
 
@@ -214,6 +225,9 @@ pub struct PeerLimits {
     pub max_peers: usize,
     pub max_messages_per_peer: u64,
     pub max_bytes_per_peer: u64,
+    /// Send protocol version 5 (compressed block frames) to this peer. Only
+    /// set for peers known to accept it; see `PEER_PROTOCOL_VERSION_COMPRESSED`.
+    pub compress_blocks: bool,
 }
 
 impl Default for PeerLimits {
@@ -227,6 +241,7 @@ impl Default for PeerLimits {
             max_peers: 64,
             max_messages_per_peer: 512,
             max_bytes_per_peer: 32 * 1024 * 1024,
+            compress_blocks: false,
         }
     }
 }
@@ -311,6 +326,8 @@ pub enum PeerError {
     NonZeroFlags,
     #[error("unknown peer message kind {0}")]
     UnknownKind(u8),
+    #[error("compressed block payload is corrupt or not canonical")]
+    CorruptCompressedBlock,
     #[error("peer address family or canonical encoding is invalid")]
     InvalidPeerAddressEncoding,
     #[error("peer discovery listening port must be nonzero")]
@@ -519,7 +536,21 @@ fn encode_peer_frame_for_network(
     frame: &PeerFrame,
     expected_network_id: [u8; 32],
 ) -> Result<Vec<u8>, PeerError> {
-    let (kind, payload) = encode_message(&frame.message)?;
+    encode_peer_frame_for_network_version(frame, expected_network_id, PEER_PROTOCOL_VERSION)
+}
+
+fn encode_peer_frame_for_network_version(
+    frame: &PeerFrame,
+    expected_network_id: [u8; 32],
+    version: u16,
+) -> Result<Vec<u8>, PeerError> {
+    if !matches!(
+        version,
+        PEER_PROTOCOL_VERSION | PEER_PROTOCOL_VERSION_COMPRESSED
+    ) {
+        return Err(PeerError::UnsupportedVersion(version));
+    }
+    let (kind, payload) = encode_message(&frame.message, version)?;
     let payload_limit = peer_payload_limit(kind, expected_network_id);
     if payload.len() > payload_limit {
         return Err(PeerError::PayloadTooLarge {
@@ -533,7 +564,7 @@ fn encode_peer_frame_for_network(
     })?;
     let mut encoded = Vec::with_capacity(PEER_FRAME_HEADER_BYTES + payload.len());
     encoded.extend_from_slice(&PEER_MAGIC);
-    encoded.extend_from_slice(&PEER_PROTOCOL_VERSION.to_le_bytes());
+    encoded.extend_from_slice(&version.to_le_bytes());
     encoded.push(kind);
     encoded.push(0);
     encoded.extend_from_slice(&frame.sequence.to_le_bytes());
@@ -546,6 +577,14 @@ pub fn decode_peer_frame(
     bytes: &[u8],
     expected_network_id: [u8; 32],
 ) -> Result<PeerFrame, PeerError> {
+    decode_peer_frame_with_version(bytes, expected_network_id).map(|(frame, _)| frame)
+}
+
+/// Decodes a version-4 or version-5 frame and reports which version it used.
+pub fn decode_peer_frame_with_version(
+    bytes: &[u8],
+    expected_network_id: [u8; 32],
+) -> Result<(PeerFrame, u16), PeerError> {
     if bytes.len() < PEER_FRAME_HEADER_BYTES {
         return Err(PeerError::Truncated {
             needed: PEER_FRAME_HEADER_BYTES,
@@ -556,7 +595,10 @@ pub fn decode_peer_frame(
         return Err(PeerError::InvalidMagic);
     }
     let version = u16::from_le_bytes([bytes[4], bytes[5]]);
-    if version != PEER_PROTOCOL_VERSION {
+    if !matches!(
+        version,
+        PEER_PROTOCOL_VERSION | PEER_PROTOCOL_VERSION_COMPRESSED
+    ) {
         return Err(PeerError::UnsupportedVersion(version));
     }
     let kind = bytes[6];
@@ -589,19 +631,55 @@ pub fn decode_peer_frame(
     if bytes.len() > expected_len {
         return Err(PeerError::TrailingBytes(bytes.len() - expected_len));
     }
-    let message = decode_message(kind, &bytes[PEER_FRAME_HEADER_BYTES..], expected_network_id)?;
-    Ok(PeerFrame { sequence, message })
+    let message = decode_message(
+        kind,
+        &bytes[PEER_FRAME_HEADER_BYTES..],
+        expected_network_id,
+        version,
+    )?;
+    Ok((PeerFrame { sequence, message }, version))
 }
 
 fn peer_payload_limit(kind: u8, network_id: [u8; 32]) -> usize {
     match kind {
         TRANSACTION_KIND => MAX_TRANSACTION_BYTES,
-        BLOCK_KIND | SUBMIT_BLOCK_KIND => max_block_bytes_for_network(network_id),
+        BLOCK_KIND | SUBMIT_BLOCK_KIND | COMPRESSED_BLOCK_KIND | COMPRESSED_SUBMIT_BLOCK_KIND => {
+            max_block_bytes_for_network(network_id)
+        }
         _ => MAX_PEER_PAYLOAD_BYTES,
     }
 }
 
-fn encode_message(message: &PeerMessage) -> Result<(u8, Vec<u8>), PeerError> {
+fn compress_block_payload(block: &[u8]) -> Result<Vec<u8>, PeerError> {
+    let mut encoder = flate2::write::DeflateEncoder::new(
+        Vec::with_capacity(block.len() / 2),
+        flate2::Compression::new(BLOCK_COMPRESSION_LEVEL),
+    );
+    encoder
+        .write_all(block)
+        .and_then(|()| encoder.finish())
+        .map_err(|_| PeerError::CorruptCompressedBlock)
+}
+
+/// Inflates at most `max_bytes` of canonical block encoding; a payload that
+/// would inflate further is rejected before it is decoded.
+fn decompress_block_payload(payload: &[u8], max_bytes: usize) -> Result<Vec<u8>, PeerError> {
+    let mut block = Vec::new();
+    flate2::read::DeflateDecoder::new(payload)
+        .take(max_bytes as u64 + 1)
+        .read_to_end(&mut block)
+        .map_err(|_| PeerError::CorruptCompressedBlock)?;
+    if block.len() > max_bytes {
+        return Err(PeerError::PayloadTooLarge {
+            actual: block.len(),
+            max: max_bytes,
+        });
+    }
+    Ok(block)
+}
+
+fn encode_message(message: &PeerMessage, version: u16) -> Result<(u8, Vec<u8>), PeerError> {
+    let compressed = version == PEER_PROTOCOL_VERSION_COMPRESSED;
     match message {
         PeerMessage::Hello(hello) => {
             validate_hello(hello)?;
@@ -634,6 +712,14 @@ fn encode_message(message: &PeerMessage) -> Result<(u8, Vec<u8>), PeerError> {
             Ok((INVENTORY_KIND, payload))
         }
         PeerMessage::GetBlock { block_id } => Ok((GET_BLOCK_KIND, block_id.to_vec())),
+        PeerMessage::Block(block) if compressed => Ok((
+            COMPRESSED_BLOCK_KIND,
+            compress_block_payload(&encode_block(block)?)?,
+        )),
+        PeerMessage::SubmitBlock(block) if compressed => Ok((
+            COMPRESSED_SUBMIT_BLOCK_KIND,
+            compress_block_payload(&encode_block(block)?)?,
+        )),
         PeerMessage::Block(block) => Ok((BLOCK_KIND, encode_block(block)?)),
         PeerMessage::SubmitBlock(block) => Ok((SUBMIT_BLOCK_KIND, encode_block(block)?)),
         PeerMessage::BlockSubmissionResult(result) => {
@@ -693,8 +779,26 @@ fn decode_message(
     kind: u8,
     payload: &[u8],
     expected_network_id: [u8; 32],
+    version: u16,
 ) -> Result<PeerMessage, PeerError> {
     match kind {
+        COMPRESSED_BLOCK_KIND | COMPRESSED_SUBMIT_BLOCK_KIND
+            if version == PEER_PROTOCOL_VERSION_COMPRESSED =>
+        {
+            let encoded = decompress_block_payload(
+                payload,
+                max_block_bytes_for_network(expected_network_id),
+            )?;
+            let block = decode_block(&encoded, expected_network_id)?;
+            if encode_block(&block)? != encoded {
+                return Err(PeerError::NonCanonicalBlock);
+            }
+            Ok(if kind == COMPRESSED_BLOCK_KIND {
+                PeerMessage::Block(block)
+            } else {
+                PeerMessage::SubmitBlock(block)
+            })
+        }
         HELLO_KIND => {
             let mut reader = PayloadReader::new(payload);
             let hello = PeerHello {
@@ -1203,6 +1307,10 @@ pub struct PeerSession {
     messages_used: u64,
     bytes_used: u64,
     limits: PeerLimits,
+    /// Version written on every outbound frame.
+    outbound_version: u16,
+    /// Version of the remote hello frame, once received.
+    remote_version: Option<u16>,
 }
 
 impl PeerSession {
@@ -1218,11 +1326,22 @@ impl PeerSession {
             messages_used: 0,
             bytes_used: 0,
             limits,
+            outbound_version: if limits.compress_blocks {
+                PEER_PROTOCOL_VERSION_COMPRESSED
+            } else {
+                PEER_PROTOCOL_VERSION
+            },
+            remote_version: None,
         })
     }
 
     pub fn limits(&self) -> PeerLimits {
         self.limits
+    }
+
+    /// The remote peer sent version-5 frames, so it accepts compressed blocks.
+    pub fn remote_compresses_blocks(&self) -> bool {
+        self.remote_version == Some(PEER_PROTOCOL_VERSION_COMPRESSED)
     }
 
     pub fn local_hello(&self) -> PeerHello {
@@ -1260,9 +1379,10 @@ impl PeerSession {
         let next_sequence = sequence
             .checked_add(1)
             .ok_or(PeerError::SequenceExhausted)?;
-        let encoded = encode_peer_frame_for_network(
+        let encoded = encode_peer_frame_for_network_version(
             &PeerFrame { sequence, message },
             self.local_hello.network_id,
+            self.outbound_version,
         )?;
         self.ensure_budget(encoded.len())?;
         self.charge(encoded.len());
@@ -1275,7 +1395,7 @@ impl PeerSession {
 
     pub fn accept_inbound(&mut self, bytes: &[u8]) -> Result<PeerMessage, PeerError> {
         self.ensure_budget(bytes.len())?;
-        let frame = decode_peer_frame(bytes, self.local_hello.network_id)?;
+        let (frame, version) = decode_peer_frame_with_version(bytes, self.local_hello.network_id)?;
         if frame.sequence != self.next_inbound_sequence {
             return Err(PeerError::UnexpectedSequence {
                 expected: self.next_inbound_sequence,
@@ -1308,6 +1428,7 @@ impl PeerSession {
         self.next_inbound_sequence = next_sequence;
         if let PeerMessage::Hello(hello) = frame.message {
             self.remote_hello = Some(hello);
+            self.remote_version = Some(version);
             Ok(PeerMessage::Hello(hello))
         } else {
             Ok(frame.message)
@@ -1587,6 +1708,11 @@ impl PeerConnection {
 
     pub fn session(&self) -> &PeerSession {
         &self.session
+    }
+
+    /// The remote peer's hello arrived as a version-5 frame.
+    pub fn remote_compresses_blocks(&self) -> bool {
+        self.session.remote_compresses_blocks()
     }
 
     pub(crate) fn try_clone_stream(&self) -> Result<TcpStream, PeerError> {
@@ -1879,27 +2005,39 @@ fn validate_frame_header(header: &[u8]) -> Result<(), PeerError> {
         return Err(PeerError::InvalidMagic);
     }
     let version = u16::from_le_bytes([header[4], header[5]]);
-    if version != PEER_PROTOCOL_VERSION {
+    if !matches!(
+        version,
+        PEER_PROTOCOL_VERSION | PEER_PROTOCOL_VERSION_COMPRESSED
+    ) {
         return Err(PeerError::UnsupportedVersion(version));
     }
-    if !matches!(
+    let compressed_kind = matches!(
         header[6],
-        HELLO_KIND
-            | GET_HEADERS_KIND
-            | INVENTORY_KIND
-            | GET_BLOCK_KIND
-            | BLOCK_KIND
-            | GET_MEMPOOL_KIND
-            | TRANSACTION_INVENTORY_KIND
-            | GET_TRANSACTION_KIND
-            | TRANSACTION_KIND
-            | SUBMIT_BLOCK_KIND
-            | BLOCK_SUBMISSION_RESULT_KIND
-            | GET_MINING_TEMPLATE_KIND
-            | MINING_TEMPLATE_KIND
-            | GET_PEERS_KIND
-            | PEERS_KIND
-    ) {
+        COMPRESSED_BLOCK_KIND | COMPRESSED_SUBMIT_BLOCK_KIND
+    );
+    if compressed_kind && version != PEER_PROTOCOL_VERSION_COMPRESSED {
+        return Err(PeerError::UnknownKind(header[6]));
+    }
+    if !compressed_kind
+        && !matches!(
+            header[6],
+            HELLO_KIND
+                | GET_HEADERS_KIND
+                | INVENTORY_KIND
+                | GET_BLOCK_KIND
+                | BLOCK_KIND
+                | GET_MEMPOOL_KIND
+                | TRANSACTION_INVENTORY_KIND
+                | GET_TRANSACTION_KIND
+                | TRANSACTION_KIND
+                | SUBMIT_BLOCK_KIND
+                | BLOCK_SUBMISSION_RESULT_KIND
+                | GET_MINING_TEMPLATE_KIND
+                | MINING_TEMPLATE_KIND
+                | GET_PEERS_KIND
+                | PEERS_KIND
+        )
+    {
         return Err(PeerError::UnknownKind(header[6]));
     }
     if header[7] != 0 {
@@ -2119,7 +2257,7 @@ mod tests {
             Err(PeerError::InvalidMagic)
         ));
         let mut bad_version = encoded.clone();
-        bad_version[4..6].copy_from_slice(&(PEER_PROTOCOL_VERSION + 1).to_le_bytes());
+        bad_version[4..6].copy_from_slice(&(PEER_PROTOCOL_VERSION_COMPRESSED + 1).to_le_bytes());
         assert!(matches!(
             decode_peer_frame(&bad_version, NETWORK_ID),
             Err(PeerError::UnsupportedVersion(_))
@@ -2889,5 +3027,166 @@ mod tests {
         };
         assert!(matches!(error, PeerError::TotalTimeout));
         writer.join().unwrap();
+    }
+
+    #[test]
+    fn compressed_block_frames_round_trip_only_in_version_5() {
+        let block = sample_block();
+        let network_id = block.challenge.network_id;
+        let raw = encode_block(&block).unwrap();
+        for message in [
+            PeerMessage::Block(block.clone()),
+            PeerMessage::SubmitBlock(block.clone()),
+        ] {
+            let frame = PeerFrame {
+                sequence: 3,
+                message: message.clone(),
+            };
+            let v5 = encode_peer_frame_for_network_version(
+                &frame,
+                network_id,
+                PEER_PROTOCOL_VERSION_COMPRESSED,
+            )
+            .unwrap();
+            let v4 = encode_peer_frame_for_network(&frame, network_id).unwrap();
+            assert_eq!(&v5[4..6], &PEER_PROTOCOL_VERSION_COMPRESSED.to_le_bytes());
+            let expected_kind = if matches!(message, PeerMessage::Block(_)) {
+                COMPRESSED_BLOCK_KIND
+            } else {
+                COMPRESSED_SUBMIT_BLOCK_KIND
+            };
+            assert_eq!(v5[6], expected_kind);
+            assert!(
+                v5.len() < v4.len(),
+                "compressed {} vs raw {}",
+                v5.len(),
+                v4.len()
+            );
+            assert_eq!(v4.len(), PEER_FRAME_HEADER_BYTES + raw.len());
+            let (decoded, version) = decode_peer_frame_with_version(&v5, network_id).unwrap();
+            assert_eq!(version, PEER_PROTOCOL_VERSION_COMPRESSED);
+            assert_eq!(decoded.sequence, 3);
+            assert!(matches!(
+                (&decoded.message, &message),
+                (PeerMessage::Block(a), PeerMessage::Block(b))
+                    | (PeerMessage::SubmitBlock(a), PeerMessage::SubmitBlock(b)) if a == b
+            ));
+            // The same compressed kind inside a version-4 frame is unknown there.
+            let mut downgraded = v5.clone();
+            downgraded[4..6].copy_from_slice(&PEER_PROTOCOL_VERSION.to_le_bytes());
+            assert!(matches!(
+                decode_peer_frame(&downgraded, network_id),
+                Err(PeerError::UnknownKind(kind)) if kind == expected_kind
+            ));
+            assert!(matches!(
+                validate_frame_header(&downgraded[..PEER_FRAME_HEADER_BYTES]),
+                Err(PeerError::UnknownKind(_))
+            ));
+            validate_frame_header(&v5[..PEER_FRAME_HEADER_BYTES]).unwrap();
+            // Version-4 frames decode unchanged and report their version.
+            let (decoded, version) = decode_peer_frame_with_version(&v4, network_id).unwrap();
+            assert_eq!(version, PEER_PROTOCOL_VERSION);
+            assert!(matches!(
+                decoded.message,
+                PeerMessage::Block(_) | PeerMessage::SubmitBlock(_)
+            ));
+        }
+        assert!(matches!(
+            encode_peer_frame_for_network_version(
+                &PeerFrame {
+                    sequence: 0,
+                    message: PeerMessage::GetMempool
+                },
+                network_id,
+                6
+            ),
+            Err(PeerError::UnsupportedVersion(6))
+        ));
+    }
+
+    #[test]
+    fn compressed_block_payloads_are_bounded_and_canonical() {
+        let block = sample_block();
+        let network_id = block.challenge.network_id;
+        let max = max_block_bytes_for_network(network_id);
+        // A stream that inflates past the block limit is rejected before decoding.
+        let bomb = compress_block_payload(&vec![0_u8; max + 1]).unwrap();
+        assert!(matches!(
+            decompress_block_payload(&bomb, max),
+            Err(PeerError::PayloadTooLarge { max: limit, .. }) if limit == max
+        ));
+        assert!(matches!(
+            decode_message(
+                COMPRESSED_BLOCK_KIND,
+                &bomb,
+                network_id,
+                PEER_PROTOCOL_VERSION_COMPRESSED
+            ),
+            Err(PeerError::PayloadTooLarge { .. })
+        ));
+        assert!(matches!(
+            decode_message(
+                COMPRESSED_BLOCK_KIND,
+                b"not deflate",
+                network_id,
+                PEER_PROTOCOL_VERSION_COMPRESSED
+            ),
+            Err(PeerError::CorruptCompressedBlock)
+        ));
+        // Trailing garbage after a canonical block is not canonical.
+        let mut padded = encode_block(&block).unwrap();
+        padded.push(0);
+        let compressed = compress_block_payload(&padded).unwrap();
+        assert!(
+            decode_message(
+                COMPRESSED_BLOCK_KIND,
+                &compressed,
+                network_id,
+                PEER_PROTOCOL_VERSION_COMPRESSED
+            )
+            .is_err()
+        );
+        let exact = compress_block_payload(&encode_block(&block).unwrap()).unwrap();
+        assert!(matches!(
+            decode_message(COMPRESSED_SUBMIT_BLOCK_KIND, &exact, network_id, PEER_PROTOCOL_VERSION_COMPRESSED),
+            Ok(PeerMessage::SubmitBlock(decoded)) if decoded == block
+        ));
+    }
+
+    #[test]
+    fn sessions_learn_the_remote_version_from_its_hello() {
+        let compressed = PeerLimits {
+            compress_blocks: true,
+            ..PeerLimits::default()
+        };
+        let mut new_node = PeerSession::new(hello(1, 1, 1), compressed).unwrap();
+        let mut old_node = PeerSession::new(hello(2, 2, 2), PeerLimits::default()).unwrap();
+        let new_hello = new_node.encode_hello().unwrap();
+        let old_hello = old_node.encode_hello().unwrap();
+        assert_eq!(
+            &new_hello[4..6],
+            &PEER_PROTOCOL_VERSION_COMPRESSED.to_le_bytes()
+        );
+        assert_eq!(&old_hello[4..6], &PEER_PROTOCOL_VERSION.to_le_bytes());
+        old_node.accept_inbound(&new_hello).unwrap();
+        new_node.accept_inbound(&old_hello).unwrap();
+        assert!(old_node.remote_compresses_blocks());
+        assert!(!new_node.remote_compresses_blocks());
+        // Each side keeps writing its own version; both decode either.
+        let block = sample_block();
+        let from_new = new_node
+            .encode_outbound(PeerMessage::Block(block.clone()))
+            .unwrap();
+        let from_old = old_node
+            .encode_outbound(PeerMessage::Block(block.clone()))
+            .unwrap();
+        assert_eq!(from_new[6], COMPRESSED_BLOCK_KIND);
+        assert_eq!(from_old[6], BLOCK_KIND);
+        assert!(
+            matches!(old_node.accept_inbound(&from_new), Ok(PeerMessage::Block(b)) if b == block)
+        );
+        assert!(
+            matches!(new_node.accept_inbound(&from_old), Ok(PeerMessage::Block(b)) if b == block)
+        );
     }
 }

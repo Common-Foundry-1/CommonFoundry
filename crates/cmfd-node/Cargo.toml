@@ -32,6 +32,8 @@ cmfd-consensus = { path = "../cmfd-consensus" }
 cmfd-launch = { path = "../cmfd-launch", optional = true }
 cmfd-proof-worker = { path = "../cmfd-proof-worker" }
 ctrlc = { workspace = true, features = ["termination"] }
+# Pure-Rust DEFLATE (miniz_oxide) for block compression; same pin as cmfd-consensus.
+flate2 = "=1.1.9"
 fs2.workspace = true
 getrandom = "0.3"
 hex.workspace = true

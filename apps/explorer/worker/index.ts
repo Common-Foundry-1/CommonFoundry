@@ -9,16 +9,19 @@ export function isExplorerApiPath(pathname: string): boolean {
   return pathname === SNAPSHOT_PATH || BLOCK_PATH.test(pathname) || TRANSACTION_PATH.test(pathname) || isAddressApiPath(pathname);
 }
 
+// Static assets bypass the Worker (run_worker_first is /v1/* only), so public/_headers repeats these.
+export const SECURITY_HEADERS: Record<string, string> = {
+  "Content-Security-Policy":
+    "default-src 'self'; connect-src 'self'; font-src 'self' data:; img-src 'self' data:; object-src 'none'; script-src 'self'; style-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+  "Permissions-Policy": "camera=(), geolocation=(), microphone=()",
+  "Referrer-Policy": "strict-origin-when-cross-origin",
+  "X-Content-Type-Options": "nosniff",
+  "X-Frame-Options": "DENY",
+};
+
 function withSecurityHeaders(response: Response): Response {
   const headers = new Headers(response.headers);
-  headers.set(
-    "Content-Security-Policy",
-    "default-src 'self'; connect-src 'self'; font-src 'self' data:; img-src 'self' data:; object-src 'none'; script-src 'self'; style-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
-  );
-  headers.set("Permissions-Policy", "camera=(), geolocation=(), microphone=()");
-  headers.set("Referrer-Policy", "strict-origin-when-cross-origin");
-  headers.set("X-Content-Type-Options", "nosniff");
-  headers.set("X-Frame-Options", "DENY");
+  for (const [name, value] of Object.entries(SECURITY_HEADERS)) headers.set(name, value);
 
   return new Response(response.body, {
     status: response.status,

@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import worker, { isExplorerApiPath } from "./index";
+import worker, { isExplorerApiPath, SECURITY_HEADERS } from "./index";
 import { MAINNET_NETWORK_ID, NETWORK_HEADER } from "../shared/network";
 
 function environment(overrides: Partial<Env> = {}): Env {
@@ -59,6 +59,19 @@ describe("mainnet explorer identity gate", () => {
     expect(config.env.mainnet.workers_dev).toBe(false);
     expect(config.env.mainnet.preview_urls).toBe(false);
     expect(config.routes[0].pattern).toBe("explorer.commonfoundry.ai");
+  });
+
+  it("invokes the Worker only for API paths and serves static security headers without it", () => {
+    const config = JSON.parse(readFileSync(new URL("../wrangler.jsonc", import.meta.url), "utf8"));
+    expect(config.assets.run_worker_first).toEqual(["/v1/*"]);
+    expect(config.env.mainnet.assets.run_worker_first).toEqual(["/v1/*"]);
+    const rules = readFileSync(new URL("../public/_headers", import.meta.url), "utf8").split(/\r?\n/);
+    expect(rules[0]).toBe("/*");
+    const declared = Object.fromEntries(rules.slice(1).filter(Boolean).map((line) => {
+      const separator = line.indexOf(":");
+      return [line.slice(0, separator).trim(), line.slice(separator + 1).trim()];
+    }));
+    expect(declared).toEqual(SECURITY_HEADERS);
   });
 
   it.each(["bad", `${"ab".repeat(32)}.0.0`, `${"ab".repeat(32)}.01.0`, `${"ab".repeat(32)}.1.1025`, `${"ab".repeat(32)}.18446744073709551616.0`, `${"ab".repeat(32)}.1.0/extra`])(

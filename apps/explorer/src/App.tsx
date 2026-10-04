@@ -45,8 +45,14 @@ export default function App() {
 
   useEffect(() => {
     void refresh();
-    const timer = window.setInterval(() => void refresh(), 10_000);
-    return () => { window.clearInterval(timer); refreshVersion.current += 1; navigationVersion.current += 1; refreshInFlight.current = false; };
+    // Every API poll is a billed Worker invocation; skip hidden tabs and catch up when shown.
+    const refreshIfVisible = () => { if (!document.hidden) void refresh(); };
+    const timer = window.setInterval(refreshIfVisible, 30_000);
+    document.addEventListener("visibilitychange", refreshIfVisible);
+    return () => {
+      window.clearInterval(timer); document.removeEventListener("visibilitychange", refreshIfVisible);
+      refreshVersion.current += 1; navigationVersion.current += 1; refreshInFlight.current = false;
+    };
   }, [refresh]);
 
   const navigate = async (load: () => Promise<ExplorerView>) => {

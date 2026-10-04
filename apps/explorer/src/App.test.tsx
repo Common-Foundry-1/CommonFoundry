@@ -24,7 +24,7 @@ function capturePoll() {
   let poll: (() => void) | undefined;
   const original = window.setInterval.bind(window);
   vi.spyOn(window, "setInterval").mockImplementation((handler, delay) => {
-    if (delay === 10_000 && typeof handler === "function") { poll = () => handler(); return -1; }
+    if (delay === 30_000 && typeof handler === "function") { poll = () => handler(); return -1; }
     return original(handler, delay);
   });
   return () => { if (!poll) throw new Error("Refresh interval missing"); poll(); };

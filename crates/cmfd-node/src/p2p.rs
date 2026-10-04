@@ -81,6 +81,14 @@ const INVALID_TRANSACTION_PENALTY: u16 = 25;
 const PROTOCOL_VIOLATION_PENALTY: u16 = 50;
 const RESOURCE_ABUSE_PENALTY: u16 = PEER_BAN_SCORE;
 const DYNAMIC_PEER_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+// A newly active tip is pushed to peers immediately instead of waiting for the
+// serial poll round to reach each of them. Bounded in targets and concurrency,
+// and skipped while the chain is far behind (catch-up blocks are not news).
+const TIP_ANNOUNCE_CHECK_INTERVAL: Duration = Duration::from_millis(200);
+const MAX_TIP_ANNOUNCE_TARGETS: usize = 16;
+const MAX_TIP_ANNOUNCE_IN_FLIGHT: usize = 8;
+const MAX_TIP_ANNOUNCE_REPEATS: usize = 3;
+const TIP_ANNOUNCE_MAX_MEDIAN_AGE_SECONDS: u64 = 30 * 60;
 const MAX_DYNAMIC_PEER_BACKOFF: Duration = Duration::from_secs(5 * 60);
 const DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const DISCOVERY_UNSUPPORTED_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -692,6 +700,20 @@ impl PeerDiscovery {
             state.next_discovery.remove(&address);
         }
         Ok(())
+    }
+
+    /// Verified peers without a recent failure, for immediate new-tip relay.
+    fn announce_targets(&self, limit: usize) -> Result<Vec<SocketAddr>, P2pError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| P2pError::PoisonedPeerDiscovery)?;
+        Ok(state
+            .peers
+            .iter()
+            .filter_map(|(address, peer)| (peer.verified && peer.failures == 0).then_some(*address))
+            .take(limit)
+            .collect())
     }
 
     fn gossip_addresses(&self, exclude: SocketAddr) -> Result<Vec<SocketAddr>, P2pError> {
@@ -2480,6 +2502,7 @@ pub struct StaticPeerPollHandle {
     stop: Arc<(Mutex<bool>, Condvar)>,
     active_sockets: Arc<ActiveSocketRegistry>,
     thread: Option<JoinHandle<()>>,
+    announcer: Option<JoinHandle<()>>,
 }
 
 struct PeerPollOptions {
@@ -2502,9 +2525,14 @@ impl StaticPeerPollHandle {
             .ok_or(P2pError::ThreadPanicked)?
             .join()
             .map_err(|_| P2pError::ThreadPanicked);
+        let announcer_result = match self.announcer.take() {
+            Some(announcer) => announcer.join().map_err(|_| P2pError::ThreadPanicked),
+            None => Ok(()),
+        };
         signal_result?;
         socket_result?;
-        join_result
+        join_result?;
+        announcer_result
     }
 }
 
@@ -2563,6 +2591,20 @@ fn spawn_peer_polling_inner(
     let active_sockets = Arc::new(ActiveSocketRegistry::default());
     let thread_stop = Arc::clone(&stop);
     let thread_active_sockets = Arc::clone(&active_sockets);
+    let announcer = TipAnnouncer {
+        shared: Arc::clone(&shared),
+        config: config.clone(),
+        stop: Arc::clone(&stop),
+        active_sockets: Arc::clone(&active_sockets),
+        nonce_override,
+        discovery: discovery.clone(),
+        security: Arc::clone(&security),
+        in_flight: Arc::new(Mutex::new(HashSet::new())),
+    };
+    let announcer = thread::Builder::new()
+        .name("cmfd-tip-announce".to_owned())
+        .spawn(move || tip_announce_loop(announcer))
+        .map_err(P2pError::ListenerIo)?;
     let options = PeerPollOptions {
         nonce_override,
         discovery,
@@ -2580,12 +2622,159 @@ fn spawn_peer_polling_inner(
                 options,
             )
         })
-        .map_err(P2pError::ListenerIo)?;
+        .map_err(P2pError::ListenerIo);
+    let thread = match thread {
+        Ok(thread) => thread,
+        Err(error) => {
+            let _ = signal_poll_stop(&stop);
+            let _ = announcer.join();
+            return Err(error);
+        }
+    };
     Ok(StaticPeerPollHandle {
         stop,
         active_sockets,
         thread: Some(thread),
+        announcer: Some(announcer),
     })
+}
+
+#[derive(Clone)]
+struct TipAnnouncer {
+    shared: Arc<Mutex<Node>>,
+    config: StaticPeerConfig,
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    active_sockets: Arc<ActiveSocketRegistry>,
+    nonce_override: Option<[u8; 32]>,
+    discovery: Option<Arc<PeerDiscovery>>,
+    security: Arc<PeerSecurity>,
+    in_flight: Arc<Mutex<HashSet<SocketAddr>>>,
+}
+
+impl TipAnnouncer {
+    /// The active tip and whether it is recent enough to be news worth
+    /// pushing; `None` when the node lock is busy.
+    fn observe_tip(&self) -> Option<([u8; 32], bool)> {
+        let node = self.shared.try_lock().ok()?;
+        let fresh = unix_time_seconds().is_ok_and(|now| {
+            now.saturating_sub(node.state.median_time_past()) <= TIP_ANNOUNCE_MAX_MEDIAN_AGE_SECONDS
+        });
+        Some((node.state.tip(), fresh))
+    }
+
+    fn targets(&self) -> Vec<SocketAddr> {
+        let mut targets = self.config.peers.clone();
+        if let Some(discovery) = self.discovery.as_ref() {
+            match discovery.announce_targets(MAX_TIP_ANNOUNCE_TARGETS) {
+                Ok(dynamic) => {
+                    for address in dynamic {
+                        if !targets.contains(&address) {
+                            targets.push(address);
+                        }
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "tip announce target selection failed"),
+            }
+        }
+        targets.retain(|peer| matches!(self.security.is_banned(peer.ip()), Ok(false)));
+        targets
+    }
+
+    fn claim(&self, peer: SocketAddr) -> bool {
+        self.in_flight
+            .lock()
+            .is_ok_and(|mut in_flight| in_flight.insert(peer))
+    }
+
+    fn release(&self, peer: SocketAddr) {
+        if let Ok(mut in_flight) = self.in_flight.lock() {
+            in_flight.remove(&peer);
+        }
+    }
+
+    /// Relays through the ordinary bounded relay path, so every limit, cursor
+    /// and validation rule is unchanged. Repeats only if the tip moved while
+    /// the previous relay was in flight.
+    fn announce(&self, peer: SocketAddr) {
+        for _ in 0..MAX_TIP_ANNOUNCE_REPEATS {
+            if poll_stopped(&self.stop) || !matches!(self.security.is_banned(peer.ip()), Ok(false))
+            {
+                break;
+            }
+            let Ok(started_tip) = lock_node(&self.shared).map(|node| node.state.tip()) else {
+                break;
+            };
+            let result = relay_blocks_to_peer_once_inner_with_policy(
+                Arc::clone(&self.shared),
+                peer,
+                self.config.limits,
+                self.config.address_policy,
+                self.nonce_override,
+                Some(&self.active_sockets),
+            );
+            if let Err(error) = &result {
+                let (penalty, reason) = outbound_reputation_penalty(error);
+                if let Err(reputation_error) =
+                    self.security.record_failure(peer.ip(), penalty, reason)
+                {
+                    tracing::warn!(%reputation_error, %peer, "failed to update outbound peer reputation");
+                }
+                break;
+            }
+            if lock_node(&self.shared).map_or(true, |node| node.state.tip() == started_tip) {
+                break;
+            }
+        }
+        self.release(peer);
+    }
+}
+
+fn tip_announce_loop(announcer: TipAnnouncer) {
+    let mut announced: Option<[u8; 32]> = None;
+    let mut workers = Vec::new();
+    loop {
+        {
+            let (mutex, wake) = &*announcer.stop;
+            let Ok(stopped) = mutex.lock() else {
+                break;
+            };
+            match wake.wait_timeout_while(stopped, TIP_ANNOUNCE_CHECK_INTERVAL, |value| !*value) {
+                Ok((stopped, _)) if !*stopped => {}
+                _ => break,
+            }
+        }
+        reap_workers(&mut workers);
+        let Some((tip, fresh)) = announcer.observe_tip() else {
+            continue;
+        };
+        // The tip present at startup is not news; ordinary polling covers it.
+        let previous = announced.replace(tip);
+        if previous.is_none_or(|previous| previous == tip) || !fresh {
+            continue;
+        }
+        for peer in announcer.targets() {
+            if workers.len() >= MAX_TIP_ANNOUNCE_IN_FLIGHT {
+                break;
+            }
+            if !announcer.claim(peer) {
+                continue;
+            }
+            let worker = announcer.clone();
+            match thread::Builder::new()
+                .name("cmfd-tip-announce-peer".to_owned())
+                .spawn(move || worker.announce(peer))
+            {
+                Ok(handle) => workers.push(handle),
+                Err(error) => {
+                    announcer.release(peer);
+                    tracing::warn!(%error, %peer, "failed to start tip announcement");
+                }
+            }
+        }
+    }
+    for worker in workers {
+        let _ = worker.join();
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -6258,6 +6447,53 @@ mod tests {
             wallet.lock().unwrap().peer_hello().height,
             (MAX_BLOCKS_PER_SYNC + 1) as u64
         );
+
+        poller.stop().unwrap();
+        listener.stop().unwrap();
+        drop(miner);
+        drop(wallet);
+        clean_test_dir(&miner_path);
+        clean_test_dir(&wallet_path);
+    }
+
+    #[test]
+    fn new_local_tip_is_announced_without_waiting_for_the_next_poll() {
+        let miner_path = test_dir("announce-miner");
+        let wallet_path = test_dir("announce-wallet");
+        let miner = open_shared(&miner_path);
+        let wallet = open_shared(&wallet_path);
+        mine(&miner, 1, unix_time_seconds().unwrap());
+        let (listener, address) = start_listener(Arc::clone(&wallet), TARGET_NONCE);
+        let poller = spawn_static_peer_polling_inner(
+            Arc::clone(&miner),
+            StaticPeerConfig {
+                listen_address: "127.0.0.1:28444".parse().unwrap(),
+                peers: vec![address],
+                limits: test_limits(),
+                address_policy: PeerAddressPolicy::PrivateOnly,
+            },
+            Duration::from_secs(60),
+            Some(SOURCE_NONCE),
+        )
+        .unwrap();
+
+        // The first ordinary round relays the initial block; the next ordinary
+        // round is a full minute away.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !tips_match(&miner, &wallet) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(tips_match(&miner, &wallet));
+        thread::sleep(Duration::from_millis(300));
+
+        // A newly found block must reach the peer promptly, not after the poll.
+        mine(&miner, 1, unix_time_seconds().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !tips_match(&miner, &wallet) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(tips_match(&miner, &wallet));
+        assert_eq!(wallet.lock().unwrap().peer_hello().height, 2);
 
         poller.stop().unwrap();
         listener.stop().unwrap();

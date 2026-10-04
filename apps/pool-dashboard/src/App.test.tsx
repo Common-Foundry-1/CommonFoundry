@@ -17,7 +17,7 @@ const fixture: DashboardDocument = {
     accepted_height: 212,
     tip: "12".repeat(32),
     current_job_id: "34".repeat(32),
-    share_target: "ff".repeat(32),
+    share_target: `01${"ff".repeat(31)}`,
     active_connections: 2,
     connection_capacity: 64,
     max_connections_per_source: 4,
@@ -51,6 +51,9 @@ const fixture: DashboardDocument = {
         telemetry_age_seconds: 3,
         earned_atoms_last_24h: 40_000_000,
         estimated_24h_earnings_atoms: 100_000_000,
+        low_difficulty_shares: 0,
+        duplicate_shares: 0,
+        invalid_proof_shares: 0,
       },
       {
         worker: "rig-01",
@@ -66,6 +69,9 @@ const fixture: DashboardDocument = {
         telemetry_age_seconds: 2,
         earned_atoms_last_24h: 90_000_000,
         estimated_24h_earnings_atoms: 160_000_000,
+        low_difficulty_shares: 0,
+        duplicate_shares: 0,
+        invalid_proof_shares: 0,
       },
     ],
     ledger: {
@@ -152,6 +158,8 @@ describe("pool dashboard", () => {
     expect(screen.getByText("rig-01")).toBeVisible();
     expect(screen.getByText("rig-02")).toBeVisible();
     expect(screen.getByText("Height 212")).toBeVisible();
+    expect(screen.getByText("Share difficulty 7 bits")).toBeVisible();
+    expect(screen.getByRole("columnheader", { name: /Low diff/ })).toBeVisible();
     expect(screen.getByText("3.00%")).toBeVisible();
     expect(screen.getByText("Maturing 2/100")).toBeVisible();
   });

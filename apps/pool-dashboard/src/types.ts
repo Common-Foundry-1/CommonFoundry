@@ -12,6 +12,9 @@ export interface PoolWorker {
   telemetry_age_seconds: number | null;
   earned_atoms_last_24h: number;
   estimated_24h_earnings_atoms: number | null;
+  low_difficulty_shares: number;
+  duplicate_shares: number;
+  invalid_proof_shares: number;
 }
 
 export interface PoolPayout {

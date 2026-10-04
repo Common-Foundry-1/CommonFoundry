@@ -564,6 +564,14 @@ pub struct PoolDashboardWorkerStats {
     pub telemetry_age_seconds: Option<u64>,
     pub earned_atoms_last_24h: u64,
     pub estimated_24h_earnings_atoms: Option<u64>,
+    /// Rejection reasons counted in memory since the pool process started; the
+    /// durable ledger only persists the rejected and stale totals.
+    #[serde(default)]
+    pub low_difficulty_shares: u64,
+    #[serde(default)]
+    pub duplicate_shares: u64,
+    #[serde(default)]
+    pub invalid_proof_shares: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2436,6 +2444,7 @@ struct SharedServer {
     active_connections: AtomicUsize,
     active_sockets: Mutex<HashMap<u64, TcpStream>>,
     worker_telemetry: Mutex<HashMap<u64, WorkerTelemetry>>,
+    rejected_share_reasons: Mutex<HashMap<u64, RejectedShareReasons>>,
     source_admission: PoolSourceAdmission,
     share_verification: ShareVerificationGate,
     next_connection_id: AtomicU64,
@@ -2455,6 +2464,18 @@ struct SharedServer {
     tls: Arc<ServerConfig>,
     startup_nonce: [u8; 32],
 }
+
+/// Per-session rejection reasons beyond the ledger's rejected/stale totals.
+/// Memory-only: pruned to live ledger sessions on every dashboard snapshot and
+/// cleared outright if it outgrows the ledger's session cap without a poll.
+#[derive(Clone, Copy, Default)]
+struct RejectedShareReasons {
+    low_difficulty: u64,
+    duplicate: u64,
+    invalid_proof: u64,
+}
+
+const MAX_REJECTED_SHARE_REASON_SESSIONS: usize = 4096;
 
 #[derive(Clone, Copy)]
 struct WorkerTelemetry {
@@ -2507,6 +2528,15 @@ impl PoolDashboardSource {
                 ledger.earning_events.iter().cloned().collect::<Vec<_>>(),
             )
         };
+        let session_reasons = {
+            let mut reasons = self
+                .shared
+                .rejected_share_reasons
+                .lock()
+                .map_err(|_| PoolError::SharedStatePoisoned)?;
+            reasons.retain(|session_id, _| session_stales.contains_key(session_id));
+            reasons.clone()
+        };
         let mut ledger = snapshot_ledger(&self.shared.ledger)?;
         let telemetry = self
             .shared
@@ -2533,6 +2563,9 @@ impl PoolDashboardSource {
                     telemetry_age_seconds: None,
                     earned_atoms_last_24h: 0,
                     estimated_24h_earnings_atoms: None,
+                    low_difficulty_shares: 0,
+                    duplicate_shares: 0,
+                    invalid_proof_shares: 0,
                 });
             worker.connected |= session.connected;
             worker.accepted_shares = checked_ledger_add(
@@ -2553,6 +2586,23 @@ impl PoolDashboardSource {
                     .unwrap_or_default(),
                 "dashboard worker stale shares",
             )?;
+            if let Some(reasons) = session_reasons.get(&session.session_id) {
+                worker.low_difficulty_shares = checked_ledger_add(
+                    worker.low_difficulty_shares,
+                    reasons.low_difficulty,
+                    "dashboard worker low-difficulty shares",
+                )?;
+                worker.duplicate_shares = checked_ledger_add(
+                    worker.duplicate_shares,
+                    reasons.duplicate,
+                    "dashboard worker duplicate shares",
+                )?;
+                worker.invalid_proof_shares = checked_ledger_add(
+                    worker.invalid_proof_shares,
+                    reasons.invalid_proof,
+                    "dashboard worker invalid-proof shares",
+                )?;
+            }
             worker.pool_blocks = checked_ledger_add(
                 worker.pool_blocks,
                 session.pool_blocks,
@@ -2609,6 +2659,9 @@ impl PoolDashboardSource {
                     telemetry_age_seconds: None,
                     earned_atoms_last_24h: 0,
                     estimated_24h_earnings_atoms: None,
+                    low_difficulty_shares: 0,
+                    duplicate_shares: 0,
+                    invalid_proof_shares: 0,
                 });
             worker.earned_atoms_last_24h = checked_ledger_add(
                 worker.earned_atoms_last_24h,
@@ -2912,6 +2965,7 @@ pub fn spawn_pool_server(
         active_connections: AtomicUsize::new(0),
         active_sockets: Mutex::new(HashMap::new()),
         worker_telemetry: Mutex::new(HashMap::new()),
+        rejected_share_reasons: Mutex::new(HashMap::new()),
         source_admission: PoolSourceAdmission::new(config.max_connections_per_source),
         share_verification: ShareVerificationGate::new(
             config.max_concurrent_share_verifications,
@@ -3642,6 +3696,7 @@ fn rejected_result(
     code: &str,
 ) -> Result<PoolShareResult, PoolError> {
     let session = credit_rejected_share(&shared.ledger, session_id, code == "stale_job")?;
+    record_rejected_share_reason(shared, session_id, code)?;
     Ok(PoolShareResult {
         job_id,
         nonce,
@@ -3650,6 +3705,28 @@ fn rejected_result(
         code: code.to_owned(),
         session,
     })
+}
+
+fn record_rejected_share_reason(
+    shared: &SharedServer,
+    session_id: u64,
+    code: &str,
+) -> Result<(), PoolError> {
+    let mut reasons = shared
+        .rejected_share_reasons
+        .lock()
+        .map_err(|_| PoolError::SharedStatePoisoned)?;
+    if reasons.len() >= MAX_REJECTED_SHARE_REASON_SESSIONS && !reasons.contains_key(&session_id) {
+        reasons.clear();
+    }
+    let entry = reasons.entry(session_id).or_default();
+    match code {
+        "low_difficulty_share" => entry.low_difficulty = entry.low_difficulty.saturating_add(1),
+        "duplicate_share" => entry.duplicate = entry.duplicate.saturating_add(1),
+        "invalid_chain_proof" => entry.invalid_proof = entry.invalid_proof.saturating_add(1),
+        _ => {}
+    }
+    Ok(())
 }
 
 fn retryable_result(
@@ -6564,9 +6641,21 @@ mod tests {
         let duplicate = client.submit_share(work.job().job_id, nonce).unwrap();
         assert!(!duplicate.accepted);
         assert_eq!(duplicate.code, "duplicate_share");
+        let non_share = (0_u64..)
+            .find(|candidate| {
+                matches!(
+                    work.search_range(*candidate, 1, || false).unwrap(),
+                    PoolWorkSearchResult::Exhausted { .. }
+                )
+            })
+            .unwrap();
+        let low_difficulty = client.submit_share(work.job().job_id, non_share).unwrap();
+        assert!(!low_difficulty.accepted);
+        assert_eq!(low_difficulty.code, "low_difficulty_share");
         let ledger = server.ledger_snapshot().unwrap();
         assert_eq!(ledger.accepted_shares, 1);
-        assert_eq!(ledger.rejected_shares, 1);
+        assert_eq!(ledger.rejected_shares, 2);
+        assert_eq!(ledger.stale_shares, 0);
         assert_eq!(ledger.pool_blocks, 0);
         assert_eq!(ledger.credited_devnet_atoms, 1);
         let dashboard = server.dashboard_source().snapshot().unwrap();
@@ -6584,12 +6673,16 @@ mod tests {
         );
         assert!(dashboard.storage_healthy);
         assert_eq!(dashboard.ledger.accepted_shares, 1);
-        assert_eq!(dashboard.ledger.rejected_shares, 1);
+        assert_eq!(dashboard.ledger.rejected_shares, 2);
         assert_eq!(dashboard.ledger.credited_devnet_atoms, 1);
         assert_eq!(dashboard.workers.len(), 1);
         assert_eq!(dashboard.workers[0].worker, "worker-a");
         assert_eq!(dashboard.workers[0].accepted_shares, 1);
-        assert_eq!(dashboard.workers[0].rejected_shares, 1);
+        assert_eq!(dashboard.workers[0].rejected_shares, 2);
+        assert_eq!(dashboard.workers[0].stale_shares, 0);
+        assert_eq!(dashboard.workers[0].duplicate_shares, 1);
+        assert_eq!(dashboard.workers[0].low_difficulty_shares, 1);
+        assert_eq!(dashboard.workers[0].invalid_proof_shares, 0);
         assert_eq!(dashboard.workers[0].credited_devnet_atoms, 1);
         server.stop().unwrap();
     }

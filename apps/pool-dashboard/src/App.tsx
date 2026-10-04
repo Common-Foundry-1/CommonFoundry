@@ -28,6 +28,7 @@ type WorkerSort =
   | "accepted_shares"
   | "stale_shares"
   | "rejected_shares"
+  | "low_difficulty_shares"
   | "pool_blocks"
   | "earned_atoms_last_24h"
   | "estimated_24h_earnings_atoms";
@@ -57,6 +58,20 @@ function formatWorkRate(value: number) {
 function shortHex(value: string, lead = 10, tail = 8) {
   if (value.length <= lead + tail + 1) return value;
   return `${value.slice(0, lead)}…${value.slice(-tail)}`;
+}
+
+function leadingZeroBits(targetHex: string) {
+  let bits = 0;
+  for (const digit of targetHex) {
+    const nibble = Number.parseInt(digit, 16);
+    if (Number.isNaN(nibble)) return bits;
+    if (nibble === 0) {
+      bits += 4;
+      continue;
+    }
+    return bits + Math.clz32(nibble) - 28;
+  }
+  return bits;
 }
 
 function humanState(value: string) {
@@ -269,6 +284,7 @@ export function App() {
             </span>
             <span>Height {formatCount(pool.accepted_height)}</span>
             <span title={pool.current_job_id}>Job {shortHex(pool.current_job_id, 8, 6)}</span>
+            <span title={`Share target ${pool.share_target} · every worker mines at this fixed difficulty`}>Share difficulty {leadingZeroBits(pool.share_target)} bits</span>
           </div>
         </section>
 
@@ -324,6 +340,7 @@ export function App() {
                       <SortableHead label="Accepted" sortKey="accepted_shares" active={workerSort} ascending={sortAscending} onSort={selectSort} numeric />
                       <SortableHead label="Stale" sortKey="stale_shares" active={workerSort} ascending={sortAscending} onSort={selectSort} numeric />
                       <SortableHead label="Rejected" sortKey="rejected_shares" active={workerSort} ascending={sortAscending} onSort={selectSort} numeric />
+                      <SortableHead label="Low diff" sortKey="low_difficulty_shares" active={workerSort} ascending={sortAscending} onSort={selectSort} numeric />
                       <SortableHead label="Blocks" sortKey="pool_blocks" active={workerSort} ascending={sortAscending} onSort={selectSort} numeric />
                       <SortableHead label="Earned · 24h" sortKey="earned_atoms_last_24h" active={workerSort} ascending={sortAscending} onSort={selectSort} numeric />
                       <SortableHead label="Estimated · 24h" sortKey="estimated_24h_earnings_atoms" active={workerSort} ascending={sortAscending} onSort={selectSort} numeric />
@@ -560,7 +577,8 @@ function WorkerRow({ worker }: { worker: PoolWorker }) {
       <td className="numeric" title="Average miner-reported Forge Work rate">{formatWorkRate(worker.reported_average_work_rate_fw_per_second)}</td>
       <td className="numeric strong-cell">{formatCount(worker.accepted_shares)}</td>
       <td className="numeric">{formatCount(worker.stale_shares)}</td>
-      <td className="numeric">{formatCount(worker.rejected_shares)}</td>
+      <td className="numeric" title={`${formatCount(worker.stale_shares)} stale · ${formatCount(worker.low_difficulty_shares)} low difficulty · ${formatCount(worker.duplicate_shares)} duplicate · ${formatCount(worker.invalid_proof_shares)} invalid proof (reasons counted since pool start)`}>{formatCount(worker.rejected_shares)}</td>
+      <td className="numeric" title="Shares below the pool share target since pool start">{formatCount(worker.low_difficulty_shares)}</td>
       <td className="numeric">{formatCount(worker.pool_blocks)}</td>
       <td className="numeric strong-cell">{formatAtoms(worker.earned_atoms_last_24h)}</td>
       <td className="numeric">{worker.estimated_24h_earnings_atoms === null ? "Collecting" : formatAtoms(worker.estimated_24h_earnings_atoms)}</td>

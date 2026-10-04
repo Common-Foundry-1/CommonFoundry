@@ -50,7 +50,7 @@ use cpu_slop_algebra::AbstractField as CpuAbstractField;
 use memmap2::{Mmap, MmapOptions};
 use rayon::prelude::*;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use slop_algebra::{AbstractExtensionField, AbstractField, PrimeField32};
+use slop_algebra::{AbstractField, PrimeField32};
 use slop_alloc::{Buffer, CpuBackend};
 use slop_basefold::FriConfig;
 use slop_challenger::{CanObserve, FieldChallenger, IopCtx};
@@ -542,7 +542,6 @@ fn prove_complete_proof(
             statement,
             base_input,
             &encoded_banks[0],
-            dynamic_values[0],
             dynamic_device,
             &initial_activation,
             &mut cpu_challenger,
@@ -563,7 +562,6 @@ fn prove_complete_proof(
             statement,
             base_input,
             &encoded_banks[1],
-            dynamic_values[1],
             next_dynamic_device,
             boundary,
             &mut cpu_challenger,
@@ -593,7 +591,6 @@ fn prove_complete_proof(
             statement,
             base_input,
             &encoded_banks[2],
-            dynamic_values[2],
             final_dynamic_device,
             boundary,
             &mut cpu_challenger,
@@ -748,7 +745,6 @@ fn prove_bank_relations(
     statement: ForgeMatrixV4TranscriptStatement,
     base_input: &[u8],
     encoded_bank: &[u8],
-    dynamic_values: &[Felt],
     dynamic: JaggedTraceMle<Felt, TaskScope>,
     boundary_activation: &[Felt],
     cpu_challenger: &mut cmfd_consensus::forgematrix_v4_basefold::ForgeMatrixV4Challenger,
@@ -959,20 +955,14 @@ fn prove_bank_relations(
         );
         observe_bytes(gpu_challenger, CUBIC_PROOF_DOMAIN);
         let cubic_started = Instant::now();
-        let preactivation = dynamic_values[..BANK_VALUES]
-            .par_iter()
-            .map(|value| Ext::from_base(*value))
-            .collect::<Vec<_>>();
-        let next_activation = dynamic_values[BANK_VALUES..]
-            .par_iter()
-            .map(|value| Ext::from_base(*value))
-            .collect::<Vec<_>>();
+        let preactivation = lift_dynamic_half(&dynamic_tensor, 0, scope)?;
+        let next_activation = lift_dynamic_half(&dynamic_tensor, BANK_VALUES, scope)?;
         let equality: Mle<Ext, TaskScope> = DevicePoint::from_host(&gpu_cubic_point, scope)?
             .partial_lagrange()
             .into();
         let (cubic_sumcheck, cubic_endpoints) = cubic_transition_sumcheck(
-            upload_ext(preactivation, scope),
-            upload_ext(next_activation, scope),
+            preactivation,
+            next_activation,
             equality,
             &mut *gpu_challenger,
             Ext::zero(),
@@ -1134,6 +1124,34 @@ fn reduce_batches(
     }
     scope.synchronize_blocking()?;
     Ok(result.to_host()?)
+}
+
+/// Lifts half of the device-resident base-field dynamic trace (pre-activations at offset 0,
+/// next activations at `BANK_VALUES`) into an extension-field MLE on the GPU.
+///
+/// A width-one dot with `Ext::one()` writes `[x, 0, 0, 0]` for each canonical Montgomery word
+/// `x`, which are the same words the host `Ext::from_base` lift used to upload. The cubic
+/// sumcheck inputs, and therefore the transcript and proof, are unchanged; this only removes
+/// a 2 GiB host conversion and pageable upload per repetition.
+fn lift_dynamic_half(
+    dynamic: &TensorView<'_, Felt, TaskScope>,
+    offset: usize,
+    scope: &TaskScope,
+) -> Result<Mle<Ext, TaskScope>> {
+    ensure!(
+        offset + BANK_VALUES <= dynamic.total_len(),
+        "dynamic trace lift is out of range"
+    );
+    let one = DeviceTensor::from_host(&Tensor::from(vec![Ext::one()]), scope)?;
+    let view = unsafe {
+        TensorView::from_raw_parts(
+            dynamic.as_ptr().add(offset),
+            Dimensions::try_from([1, BANK_VALUES])?,
+            scope.clone(),
+        )
+    };
+    let lifted = dot_along_dim_view(view, one.as_view(), 0);
+    Ok(Mle::new(lifted.reshape([1, BANK_VALUES])))
 }
 
 fn reduce_weights(

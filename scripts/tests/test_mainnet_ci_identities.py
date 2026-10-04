@@ -22,7 +22,7 @@ class MainnetCiIdentityTests(unittest.TestCase):
         (self.repo / "packaging/mainnet").mkdir(parents=True)
         (self.repo / "apps/wallet").mkdir(parents=True)
         (self.repo / "packaging/mainnet/MAINNET-PLAN.json").write_bytes(self.fixture.plan_path.read_bytes())
-        (self.repo / "apps/wallet/package.json").write_text('{"version":"1.0.0"}')
+        (self.repo / "apps/wallet/package.json").write_text('{"version":"1.0.1"}')
 
     def run_check(self, output=None, commit=None):
         with mock.patch.object(check.package, "native_output", side_effect=output or self.fixture.output):

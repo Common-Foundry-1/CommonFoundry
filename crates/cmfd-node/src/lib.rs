@@ -2862,6 +2862,33 @@ impl MiningJob {
         })))
     }
 
+    /// Constructs the immutable template's block when the proof's committed
+    /// work digest meets the original chain target. This performs no proof
+    /// verification: committing the block through
+    /// [`submit_shared_tip_block_preverified`] requires the capability
+    /// returned by [`Self::preverify_block`].
+    pub fn chain_block_candidate(&self, proof: &BlockProof) -> Option<Box<Block>> {
+        (proof.work_digest() <= self.template.challenge.target).then(|| {
+            Box::new(Block {
+                version: BLOCK_VERSION,
+                challenge: self.template.challenge,
+                proof: proof.clone(),
+                coinbase: self.template.coinbase.clone(),
+                transactions: self.template.transactions.clone(),
+            })
+        })
+    }
+
+    /// Runs the full consensus proof verification of `block` (including its
+    /// chain target) without the node mutex or the shared proof queue. The
+    /// returned process-local capability binds the exact challenge and proof,
+    /// so [`submit_shared_tip_block_preverified`] commits the block without
+    /// repeating the same relation check. Every state-dependent consensus
+    /// check still runs at commit.
+    pub fn preverify_block(&self, block: &Block) -> Result<PreverifiedBlockProof, NodeError> {
+        Ok(self.verifier.preverify(&block.challenge, &block.proof)?)
+    }
+
     fn validate_share_target(&self, share_target: [u8; 32]) -> Result<(), NodeError> {
         if share_target < self.template.challenge.target {
             return Err(NodeError::InvalidMiningShareTarget);
@@ -8223,6 +8250,7 @@ pub fn submit_shared_block(
         SharedBlockPolicy::AnyBranch,
         None,
         None,
+        None,
     )
 }
 
@@ -8243,6 +8271,7 @@ pub(crate) fn submit_shared_peer_block_cancellable(
         SharedBlockPolicy::AnyBranch,
         Some(peer),
         Some(request),
+        None,
     )
 }
 
@@ -8261,6 +8290,30 @@ pub fn submit_shared_tip_block(
         SharedBlockPolicy::ActiveTipOnly,
         None,
         None,
+        None,
+    )
+}
+
+/// [`submit_shared_tip_block`] for a locally mined block whose proof already
+/// passed the full consensus verifier in [`MiningJob::preverify_block`]. The
+/// block neither waits behind another proof verification nor is verified a
+/// second time; commit still checks the capability against this node's
+/// verifier and the exact block, then repeats every state-dependent consensus
+/// check.
+pub fn submit_shared_tip_block_preverified(
+    shared: &Arc<Mutex<Node>>,
+    block: Block,
+    accepted_at: u64,
+    preverified: PreverifiedBlockProof,
+) -> Result<u64, NodeError> {
+    submit_shared_block_with_policy(
+        shared,
+        block,
+        accepted_at,
+        SharedBlockPolicy::ActiveTipOnly,
+        None,
+        None,
+        Some(preverified),
     )
 }
 
@@ -8367,6 +8420,7 @@ fn submit_shared_block_with_policy(
     policy: SharedBlockPolicy,
     remote_peer: Option<RemoteProofPeerId>,
     remote_request: Option<RemoteProofRequest>,
+    local_preverified: Option<PreverifiedBlockProof>,
 ) -> Result<u64, NodeError> {
     let block_id = block.block_id();
     ensure_remote_request_live(remote_request.as_ref())?;
@@ -8395,13 +8449,20 @@ fn submit_shared_block_with_policy(
     }
     ensure_remote_request_live(remote_request.as_ref())?;
     let block_cache_digest = canonical_block_cache_digest(&block)?;
-    let attempt = begin_proof_attempt(
-        &block_preverifier,
-        production_admission,
-        remote_peer,
-        remote_request.as_ref(),
-        block_cache_digest,
-    )?;
+    let local_evidence = local_preverified.clone();
+    let attempt = match local_preverified {
+        Some(preverified) => ProofAttemptStart {
+            remote_permit: None,
+            cached: Some(preverified),
+        },
+        None => begin_proof_attempt(
+            &block_preverifier,
+            production_admission,
+            remote_peer,
+            remote_request.as_ref(),
+            block_cache_digest,
+        )?,
+    };
     let remote_permit = attempt.remote_permit;
     // The scarce verifier reservation is released immediately after proof verification;
     // side-state replay uses a separate bounded lane so a proof-valid deep fork
@@ -8588,6 +8649,18 @@ fn submit_shared_block_with_policy(
     };
     if externally_admitted && result.as_ref().is_err_and(is_cacheable_block_rejection) {
         node.remember_rejected_body(block_cache_digest);
+    }
+    drop(node);
+    // Locally mined evidence is remembered, like any successful verification,
+    // only after commit accepted it, so a later branch replay can reuse it.
+    if result.is_ok()
+        && let Some(preverified) = local_evidence
+    {
+        let _ = block_preverifier.remember_preverification(
+            block_cache_digest,
+            block_preverifier.backend_generation.load(Ordering::Acquire),
+            preverified,
+        );
     }
     result
 }
@@ -13071,6 +13144,110 @@ mod tests {
         assert!(node.index.contains(competing_tip.block_id()));
         assert!(!node.index.contains(tip_candidate_id));
         drop(node);
+        drop(shared);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn locally_preverified_tip_block_skips_the_busy_queue_and_a_second_dispatch() {
+        let path = test_dir("local-preverified-tip");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        let now = 1_800_000_000;
+        let job = node
+            .build_mining_job(default_miner_destination(), now)
+            .unwrap();
+        let chain_target = job.challenge().target;
+        let chain_valid = |start| match job
+            .search_share_range(start, MAX_MINING_SEARCH_ATTEMPTS, chain_target, || false)
+            .unwrap()
+        {
+            MiningShareSearchResult::Found {
+                proof, next_nonce, ..
+            } => (proof, next_nonce),
+            other => panic!("expected a chain-valid share, received {other:?}"),
+        };
+        let (proof, next_nonce) = chain_valid(0);
+        let (other_proof, _) = chain_valid(next_nonce);
+
+        let mut mutated_nonce = proof.clone();
+        let BlockProof::V2Reference(mutated) = &mut mutated_nonce else {
+            unreachable!();
+        };
+        mutated.nonce = mutated.nonce.wrapping_add(1);
+        let mutated_block = job
+            .chain_block_candidate(&mutated_nonce)
+            .expect("the committed work still claims the chain target");
+        assert!(job.preverify_block(&mutated_block).is_err());
+        let mut above_target = proof.clone();
+        let BlockProof::V2Reference(above) = &mut above_target else {
+            unreachable!();
+        };
+        above.work_digest = [0xff; 32];
+        assert!(job.chain_block_candidate(&above_target).is_none());
+
+        let block = job
+            .chain_block_candidate(&proof)
+            .expect("chain-valid proof must construct a block");
+        let preverified = job.preverify_block(&block).unwrap();
+        let other_block = job
+            .chain_block_candidate(&other_proof)
+            .expect("chain-valid proof must construct a block");
+        let block_id = block.block_id();
+        let digest = canonical_block_cache_digest(&block).unwrap();
+        let other_digest = canonical_block_cache_digest(&other_block).unwrap();
+
+        // Production admission path; a peer verification holds the sole
+        // proof permit for the whole submission.
+        node.profile.proof = ProofProfile::ProductionV4;
+        let preverifier = node.block_preverifier();
+        let held_peer_verification = preverifier.queue.acquire().unwrap();
+        let dispatches = preverifier.worker_dispatches.load(Ordering::Relaxed);
+        let shared = Arc::new(Mutex::new(node));
+
+        // Evidence for one block never admits or caches another.
+        assert!(matches!(
+            submit_shared_tip_block_preverified(&shared, *other_block, now, preverified.clone()),
+            Err(NodeError::Chain(ChainError::PreverifiedProofMismatch))
+        ));
+        assert!(
+            preverifier
+                .cached_preverification(other_digest)
+                .unwrap()
+                .is_none()
+        );
+
+        let (sender, receiver) = mpsc::channel();
+        let submit_node = Arc::clone(&shared);
+        let submitter = thread::spawn(move || {
+            sender
+                .send(submit_shared_tip_block_preverified(
+                    &submit_node,
+                    *block,
+                    now,
+                    preverified,
+                ))
+                .unwrap();
+        });
+        receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a locally preverified block waited behind the proof queue")
+            .unwrap();
+        submitter.join().unwrap();
+        assert_eq!(preverifier.queue.counts().unwrap(), (1, 0));
+        assert_eq!(
+            preverifier.worker_dispatches.load(Ordering::Relaxed),
+            dispatches,
+            "the locally verified proof must not be verified again"
+        );
+        assert!(
+            preverifier
+                .cached_preverification(digest)
+                .unwrap()
+                .is_some()
+        );
+        drop(held_peer_verification);
+        assert_eq!(shared.lock().unwrap().state.tip(), block_id);
         drop(shared);
         clean_test_dir(&path);
     }

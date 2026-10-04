@@ -972,11 +972,11 @@ impl ProofVerificationQueue {
         self: &Arc<Self>,
         request: RemoteProofRequest,
     ) -> Result<ProofVerificationPermit, NodeError> {
-        self.acquire_class(
-            ProofQueueClass::Normal,
-            Some(self.wait_timeout),
-            Some(request),
-        )
+        // A remote request carries its own bounded acceptance deadline, and
+        // remote admission already limits how many can wait. A fully received
+        // block must not be discarded after the short local queue timeout
+        // merely because a local block is being verified.
+        self.acquire_class(ProofQueueClass::Normal, None, Some(request))
     }
 
     fn acquire_priority(self: &Arc<Self>) -> Result<ProofVerificationPermit, NodeError> {
@@ -12186,6 +12186,30 @@ mod tests {
         assert_eq!(state.priority_queued, 0);
         assert!(state.cancelled_normal_tickets.is_empty());
         assert!(state.cancelled_priority_tickets.is_empty());
+    }
+
+    #[test]
+    fn received_remote_block_waits_for_its_own_deadline_not_the_local_queue_timeout() {
+        let queue = Arc::new(ProofVerificationQueue::new(
+            1,
+            8,
+            Duration::from_millis(100),
+        ));
+        let active = queue.acquire().unwrap();
+        let waiting_queue = Arc::clone(&queue);
+        let waiter = thread::spawn(move || {
+            waiting_queue
+                .acquire_cancellable(RemoteProofRequest::new(
+                    Instant::now() + Duration::from_secs(5),
+                ))
+                .map(drop)
+        });
+        thread::sleep(Duration::from_millis(300));
+        drop(active);
+        assert!(waiter.join().unwrap().is_ok());
+        let state = queue.state.lock().unwrap();
+        assert_eq!(state.active, 0);
+        assert_eq!(state.normal_queued, 0);
     }
 
     #[test]

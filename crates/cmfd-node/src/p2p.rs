@@ -716,16 +716,30 @@ impl PeerDiscovery {
     }
 
     fn poll_targets(&self, limit: usize) -> Result<Vec<SocketAddr>, P2pError> {
-        let now = Instant::now();
+        self.poll_targets_at(Instant::now(), limit)
+    }
+
+    /// Due dynamic peers, least recently scheduled first. Address order would
+    /// hand every round to the same lowest addresses once a round outlasts
+    /// `DYNAMIC_PEER_RETRY_INTERVAL`, so a relay with a high address would
+    /// never be polled while lower ones keep answering.
+    fn poll_targets_at(&self, now: Instant, limit: usize) -> Result<Vec<SocketAddr>, P2pError> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| P2pError::PoisonedPeerDiscovery)?;
-        let targets: Vec<_> = state
+        let mut due: Vec<_> = state
             .peers
             .iter()
-            .filter_map(|(address, peer)| (peer.next_sync <= now).then_some(*address))
+            .filter_map(|(address, peer)| {
+                (peer.next_sync <= now).then_some((peer.next_sync, *address))
+            })
+            .collect();
+        due.sort();
+        let targets: Vec<_> = due
+            .into_iter()
             .take(limit)
+            .map(|(_, address)| address)
             .collect();
         for address in &targets {
             if let Some(peer) = state.peers.get_mut(address) {
@@ -4050,6 +4064,54 @@ mod tests {
             outbound_reputation_penalty(&oversized).0,
             RESOURCE_ABUSE_PENALTY
         );
+    }
+
+    #[test]
+    fn peer_discovery_polls_due_peers_least_recently_scheduled_first() {
+        let path = test_dir("discovery-rotation");
+        let node = open_shared(&path);
+        let hello = node.lock().unwrap().peer_hello();
+        let listen_address: SocketAddr = "127.0.0.1:22444".parse().unwrap();
+        let low: SocketAddr = "127.0.0.1:22445".parse().unwrap();
+        let high: SocketAddr = "127.0.0.1:22446".parse().unwrap();
+        let discovery =
+            PeerDiscovery::open(&path, hello, listen_address, PeerAddressPolicy::PrivateOnly);
+        discovery.add_candidate(low).unwrap();
+        discovery.add_candidate(high).unwrap();
+
+        // Both fresh candidates are due; polling reschedules both to the same
+        // retry instant, so the next single pick falls back to address order.
+        let start = Instant::now() + DYNAMIC_PEER_RETRY_INTERVAL;
+        assert_eq!(
+            discovery.poll_targets_at(start, 2).unwrap(),
+            vec![low, high]
+        );
+        let first_round = start + DYNAMIC_PEER_RETRY_INTERVAL;
+        assert_eq!(
+            discovery.poll_targets_at(first_round, 1).unwrap(),
+            vec![low]
+        );
+        // A round later both are due again. The peer polled longest ago goes
+        // first even though its address sorts after the other, and the pair
+        // keeps alternating instead of the low address winning every round.
+        let second_round = first_round + DYNAMIC_PEER_RETRY_INTERVAL;
+        assert_eq!(
+            discovery.poll_targets_at(second_round, 1).unwrap(),
+            vec![high]
+        );
+        assert_eq!(
+            discovery.poll_targets_at(second_round, 1).unwrap(),
+            vec![low]
+        );
+        assert!(
+            discovery
+                .poll_targets_at(second_round, 1)
+                .unwrap()
+                .is_empty()
+        );
+        drop(discovery);
+        drop(node);
+        clean_test_dir(&path);
     }
 
     #[test]

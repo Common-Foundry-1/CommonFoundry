@@ -44,7 +44,7 @@ class MainnetReleaseTests(unittest.TestCase):
             target = self.repo / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes((real_repo / relative).read_bytes().replace(b"\r\n", b"\n"))
-        dashboard_package = {"name": "fixture-pool-dashboard", "version": "1.0.2"}
+        dashboard_package = {"name": "fixture-pool-dashboard", "version": "1.0.3"}
         dashboard_lock = {**dashboard_package, "lockfileVersion": 3,
                           "packages": {"": dashboard_package}}
         for name, blob in {
@@ -58,12 +58,12 @@ class MainnetReleaseTests(unittest.TestCase):
             target.write_bytes(blob)
         self.inventory = self.repo / "packaging/releases/mainnet.inventory"
         self.inventory.parent.mkdir(parents=True, exist_ok=True)
-        inventory_names = release.BASE_EVIDENCE | set(release.archive_names("1.0.2").values()) | {release.REPRODUCTION, release.REPRODUCTION_SIGNATURE}
+        inventory_names = release.BASE_EVIDENCE | set(release.archive_names("1.0.3").values()) | {release.REPRODUCTION, release.REPRODUCTION_SIGNATURE}
         self.inventory.write_bytes(("\n".join(sorted(inventory_names)) + "\n").encode())
         for relative in ("crates/cmfd-node/Cargo.toml", "crates/cmfd-miner/Cargo.toml", "apps/wallet/src-tauri/Cargo.toml"):
             target = self.repo / relative
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(b'[package]\nversion="1.0.2"\n')
+            target.write_bytes(b'[package]\nversion="1.0.3"\n')
         self.git("add", ".")
         self.git("-c", "user.name=Release Test", "-c", "user.email=fixture@example.invalid", "commit", "--no-gpg-sign", "-qm", "Synthetic reviewed release tree")
         self.review_commit = self.git("rev-parse", "HEAD")
@@ -141,7 +141,7 @@ class MainnetReleaseTests(unittest.TestCase):
         return subprocess.run(["git", "-C", str(self.repo), *arguments], env=env, check=True, capture_output=True).stdout.decode().strip()
 
     def common(self):
-        return dict(repo=self.repo, commit=self.commit, version="1.0.2", verifier=self.plan_fixture.verifier,
+        return dict(repo=self.repo, commit=self.commit, version="1.0.3", verifier=self.plan_fixture.verifier,
                     expected_verifier_sha256=self.plan_fixture.trust["ssh_keygen_sha256"])
 
     def prepare(self, output=None):
@@ -167,7 +167,7 @@ class MainnetReleaseTests(unittest.TestCase):
         self.assertEqual(checked["statement"]["review_evidence"][release.DASHBOARD_BUILD_EVIDENCE],
                          package.file_identity(self.first / release.DASHBOARD_BUILD_EVIDENCE))
         # The ordinary finalizer/verification entry point must not skip mainnet.
-        package.integrity.validate_production_rc_artifacts(version="1.0.2", commit=self.commit,
+        package.integrity.validate_production_rc_artifacts(version="1.0.3", commit=self.commit,
             stage_files=files, repo=self.repo, activation_ssh_keygen=self.plan_fixture.verifier,
             activation_ssh_keygen_sha256=self.plan_fixture.trust["ssh_keygen_sha256"])
 
@@ -233,7 +233,7 @@ class MainnetReleaseTests(unittest.TestCase):
         self.sign_reproduction()
         script = Path(__file__).resolve().parents[1] / "release_integrity.py"
         command = [sys.executable, str(script), "finalize", "--repo", str(self.repo), "--expected-commit", self.commit,
-                   "--version", "1.0.2", "--stage", str(self.first), "--inventory", str(self.inventory),
+                   "--version", "1.0.3", "--stage", str(self.first), "--inventory", str(self.inventory),
                    "--activation-ssh-keygen", str(self.plan_fixture.verifier),
                    "--activation-ssh-keygen-sha256", self.plan_fixture.trust["ssh_keygen_sha256"]]
         result = subprocess.run(command, capture_output=True, timeout=60)
@@ -247,21 +247,21 @@ class MainnetReleaseTests(unittest.TestCase):
 
     def test_generic_non_rc_version_cannot_bypass_mainnet_checks(self):
         with self.assertRaisesRegex(package.Error, "mainnet finalization"):
-            package.integrity.validate_production_rc_artifacts(version="1.0.2", commit=self.commit,
+            package.integrity.validate_production_rc_artifacts(version="1.0.3", commit=self.commit,
                 stage_files=package.integrity._stage_files(self.first), repo=self.repo)
 
     def test_same_stage_or_same_archive_is_not_independent_reproduction(self):
         with self.assertRaisesRegex(package.Error, "different directories"):
             release.prepare_reproduction(**self.common(), producer_stage=self.first, reproducer_stage=self.first,
                                          output=self.root / "statement.json")
-        name = next(iter(release.archive_names("1.0.2").values()))
+        name = next(iter(release.archive_names("1.0.3").values()))
         (self.second / name).unlink()
         os.link(self.first / name, self.second / name)
         with self.assertRaisesRegex(package.Error, "same archive"):
             self.prepare()
 
     def test_two_valid_but_different_package_sets_are_rejected(self):
-        name = release.archive_names("1.0.2")["windows-x86_64", "miner"]
+        name = release.archive_names("1.0.3")["windows-x86_64", "miner"]
         archive = self.second / name
         with zipfile.ZipFile(archive) as handle:
             rows = [(row, handle.read(row)) for row in handle.infolist()]
@@ -284,7 +284,7 @@ class MainnetReleaseTests(unittest.TestCase):
         self.prepare()
         self.sign_reproduction()
         original = release.verify_reproduction_signature
-        archive = self.first / next(iter(release.archive_names("1.0.2").values()))
+        archive = self.first / next(iter(release.archive_names("1.0.3").values()))
         def verify_then_change(**kwargs):
             original(**kwargs)
             archive.write_bytes(archive.read_bytes() + b"changed after signature check")

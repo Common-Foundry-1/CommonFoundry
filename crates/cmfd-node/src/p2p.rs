@@ -92,6 +92,14 @@ const MAX_TIP_ANNOUNCE_TARGETS: usize = 16;
 const MAX_KNOWN_PREFIX_HEADER_ROUNDS: usize = 64;
 const MAX_TIP_ANNOUNCE_IN_FLIGHT: usize = 8;
 const MAX_TIP_ANNOUNCE_REPEATS: usize = 3;
+
+/// Configured static peers (relays, the seed, the pool node) are announced
+/// first and never wait behind the in-flight cap, so a slow dynamic peer that
+/// is still receiving the previous block cannot delay the relay fan-out.
+/// Dynamic peers share the remaining bounded slots.
+fn tip_announce_slot_available(static_peer: bool, in_flight: usize) -> bool {
+    static_peer || in_flight < MAX_TIP_ANNOUNCE_IN_FLIGHT
+}
 // A peer that keeps answering Busy for the same offered block (for example a
 // slow node stuck on another branch) is not re-offered that block every round:
 // each re-offer occupies its single verifier and starves its own sync.
@@ -2990,7 +2998,10 @@ fn tip_announce_loop(announcer: TipAnnouncer) {
             continue;
         }
         for peer in announcer.targets() {
-            if workers.len() >= MAX_TIP_ANNOUNCE_IN_FLIGHT {
+            let static_peer = announcer.config.peers.contains(&peer);
+            if !tip_announce_slot_available(static_peer, workers.len()) {
+                // Targets are ordered static peers first, so nothing behind
+                // this dynamic peer is entitled to a slot either.
                 break;
             }
             if !announcer.claim(peer) {
@@ -3573,6 +3584,27 @@ mod tests {
         if path.exists() {
             fs::remove_dir_all(path).expect("remove isolated P2P test directory");
         }
+    }
+
+    #[test]
+    fn static_peers_bypass_the_tip_announce_in_flight_cap() {
+        assert!(tip_announce_slot_available(false, 0));
+        assert!(tip_announce_slot_available(
+            false,
+            MAX_TIP_ANNOUNCE_IN_FLIGHT - 1
+        ));
+        assert!(!tip_announce_slot_available(
+            false,
+            MAX_TIP_ANNOUNCE_IN_FLIGHT
+        ));
+        assert!(tip_announce_slot_available(
+            true,
+            MAX_TIP_ANNOUNCE_IN_FLIGHT
+        ));
+        assert!(tip_announce_slot_available(
+            true,
+            MAX_TIP_ANNOUNCE_IN_FLIGHT * 4
+        ));
     }
 
     fn open_shared(path: &Path) -> Arc<Mutex<Node>> {

@@ -86,6 +86,8 @@ const DYNAMIC_PEER_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 // and skipped while the chain is far behind (catch-up blocks are not news).
 const TIP_ANNOUNCE_CHECK_INTERVAL: Duration = Duration::from_millis(200);
 const MAX_TIP_ANNOUNCE_TARGETS: usize = 16;
+// Bounded header re-requests per session while walking an already-stored prefix.
+const MAX_KNOWN_PREFIX_HEADER_ROUNDS: usize = 64;
 const MAX_TIP_ANNOUNCE_IN_FLIGHT: usize = 8;
 const MAX_TIP_ANNOUNCE_REPEATS: usize = 3;
 const TIP_ANNOUNCE_MAX_MEDIAN_AGE_SECONDS: u64 = 30 * 60;
@@ -1192,6 +1194,22 @@ fn sync_from_peer_once_inner_with_policy(
     result
 }
 
+/// Peers advertise using their own bounded session budget. A larger offer is
+/// not resource abuse: accept the protocol-sized offer, but download only the
+/// prefix that fits our unchanged local session budget.
+fn expect_sync_inventory(message: PeerMessage) -> Result<Vec<[u8; 32]>, P2pError> {
+    let inventory = expect_inventory(message)?;
+    if inventory.len() > MAX_BLOCKS_PER_SYNC {
+        return Err(PeerError::CountLimit {
+            field: "sync inventory",
+            actual: inventory.len(),
+            max: MAX_BLOCKS_PER_SYNC,
+        }
+        .into());
+    }
+    Ok(inventory)
+}
+
 fn perform_sync_from_peer_once_inner_with_policy(
     shared: Arc<Mutex<Node>>,
     address: SocketAddr,
@@ -1227,32 +1245,91 @@ fn perform_sync_from_peer_once_inner_with_policy(
         locator,
         stop: remote_hello.tip,
     })?;
-    let inventory = expect_inventory(connection.receive()?)?;
-    // Peers advertise using their own bounded session budget. A larger offer
-    // is not resource abuse: accept the protocol-sized offer, but download only
-    // the prefix that fits our unchanged local session budget.
-    if inventory.len() > MAX_BLOCKS_PER_SYNC {
-        return Err(PeerError::CountLimit {
-            field: "sync inventory",
-            actual: inventory.len(),
-            max: MAX_BLOCKS_PER_SYNC,
-        }
-        .into());
-    }
+    let mut inventory = expect_sync_inventory(connection.receive()?)?;
+    let mut inventory_items = inventory.len();
+    let mut header_rounds = 1;
 
     let mut requested_blocks = 0;
     let mut accepted_blocks = 0;
     let mut already_known = 0;
     let mut previous_inventory_id = None;
 
-    // Already-stored blocks cost no download budget: walking a known prefix
-    // one id per session made a deep, already-partly-stored branch unreachable.
-    for requested in inventory.iter() {
-        let known = {
-            let node = lock_node(&shared)?;
-            node.contains_block(*requested)
-        };
-        if known {
+    loop {
+        let mut reached_unknown = false;
+        // Already-stored blocks cost no download budget: walking a known prefix
+        // one id per session made a deep, already-partly-stored branch unreachable.
+        for requested in inventory.iter() {
+            let known = {
+                let node = lock_node(&shared)?;
+                node.contains_block(*requested)
+            };
+            if known {
+                if lock_node(&shared)?.advance_peer_sync_cursor(
+                    &observation_address,
+                    sync_cursor,
+                    *requested,
+                ) {
+                    sync_cursor = Some(*requested);
+                }
+                already_known += 1;
+                previous_inventory_id = Some(*requested);
+                continue;
+            }
+            reached_unknown = true;
+            if requested_blocks >= block_batch_limit {
+                break;
+            }
+
+            connection.send(PeerMessage::GetBlock {
+                block_id: *requested,
+            })?;
+            let block = expect_block(connection.receive()?)?;
+            requested_blocks += 1;
+
+            let actual = block.block_id();
+            if actual != *requested {
+                return Err(P2pError::WrongBlock {
+                    requested: *requested,
+                    actual,
+                });
+            }
+
+            let parent_is_ordered = if let Some(previous) = previous_inventory_id {
+                block.challenge.previous_block == previous
+            } else {
+                let node = lock_node(&shared)?;
+                node.contains_block(block.challenge.previous_block)
+            };
+            if !parent_is_ordered {
+                return Err(P2pError::NonContiguousInventory {
+                    block_id: *requested,
+                });
+            }
+
+            let accepted_at = unix_time_seconds()?;
+            let acceptance_deadline =
+                checked_submit_deadline(Instant::now(), SUBMIT_BLOCK_ACCEPTANCE_BUDGET)?;
+            let request = RemoteProofRequest::new(acceptance_deadline);
+            // We requested and received this complete, bounded block. Its source
+            // may close an idle connection while we verify it or reconstruct a
+            // fork. That must not discard local progress and repeat the same work
+            // forever. Local shutdown and the fixed admission deadline still win.
+            let monitor = PeerSubmissionMonitor::local_validation(
+                active_sockets.map(|registry| Arc::clone(&registry.stopping)),
+                request.clone(),
+            )?;
+            let accepted = match submit_shared_peer_block_cancellable(
+                &shared,
+                block,
+                accepted_at,
+                proof_peer,
+                request,
+            ) {
+                Ok(_) => true,
+                Err(NodeError::DuplicateBlock(_)) => false,
+                Err(error) => return Err(error.into()),
+            };
+            drop(monitor);
             if lock_node(&shared)?.advance_peer_sync_cursor(
                 &observation_address,
                 sync_cursor,
@@ -1260,77 +1337,32 @@ fn perform_sync_from_peer_once_inner_with_policy(
             ) {
                 sync_cursor = Some(*requested);
             }
-            already_known += 1;
+            if accepted {
+                accepted_blocks += 1;
+            } else {
+                already_known += 1;
+            }
             previous_inventory_id = Some(*requested);
-            continue;
         }
-        if requested_blocks >= block_batch_limit {
+        // Peers offer only what fits their own budget (one id for stock mainnet
+        // nodes). When the whole offer is already stored, ask again from the
+        // advanced cursor in the same session instead of ending it.
+        if reached_unknown
+            || inventory.is_empty()
+            || header_rounds >= MAX_KNOWN_PREFIX_HEADER_ROUNDS
+        {
             break;
         }
-
-        connection.send(PeerMessage::GetBlock {
-            block_id: *requested,
+        let locator = lock_node(&shared)?
+            .peer_sync_locator(&observation_address, MAX_BLOCKS_PER_SYNC)
+            .0;
+        connection.send(PeerMessage::GetHeaders {
+            locator,
+            stop: remote_hello.tip,
         })?;
-        let block = expect_block(connection.receive()?)?;
-        requested_blocks += 1;
-
-        let actual = block.block_id();
-        if actual != *requested {
-            return Err(P2pError::WrongBlock {
-                requested: *requested,
-                actual,
-            });
-        }
-
-        let parent_is_ordered = if let Some(previous) = previous_inventory_id {
-            block.challenge.previous_block == previous
-        } else {
-            let node = lock_node(&shared)?;
-            node.contains_block(block.challenge.previous_block)
-        };
-        if !parent_is_ordered {
-            return Err(P2pError::NonContiguousInventory {
-                block_id: *requested,
-            });
-        }
-
-        let accepted_at = unix_time_seconds()?;
-        let acceptance_deadline =
-            checked_submit_deadline(Instant::now(), SUBMIT_BLOCK_ACCEPTANCE_BUDGET)?;
-        let request = RemoteProofRequest::new(acceptance_deadline);
-        // We requested and received this complete, bounded block. Its source
-        // may close an idle connection while we verify it or reconstruct a
-        // fork. That must not discard local progress and repeat the same work
-        // forever. Local shutdown and the fixed admission deadline still win.
-        let monitor = PeerSubmissionMonitor::local_validation(
-            active_sockets.map(|registry| Arc::clone(&registry.stopping)),
-            request.clone(),
-        )?;
-        let accepted = match submit_shared_peer_block_cancellable(
-            &shared,
-            block,
-            accepted_at,
-            proof_peer,
-            request,
-        ) {
-            Ok(_) => true,
-            Err(NodeError::DuplicateBlock(_)) => false,
-            Err(error) => return Err(error.into()),
-        };
-        drop(monitor);
-        if lock_node(&shared)?.advance_peer_sync_cursor(
-            &observation_address,
-            sync_cursor,
-            *requested,
-        ) {
-            sync_cursor = Some(*requested);
-        }
-        if accepted {
-            accepted_blocks += 1;
-        } else {
-            already_known += 1;
-        }
-        previous_inventory_id = Some(*requested);
+        inventory = expect_sync_inventory(connection.receive()?)?;
+        inventory_items += inventory.len();
+        header_rounds += 1;
     }
 
     connection.send(PeerMessage::GetMempool)?;
@@ -1380,7 +1412,7 @@ fn perform_sync_from_peer_once_inner_with_policy(
 
     Ok(SyncReport {
         remote_hello,
-        inventory_items: inventory.len(),
+        inventory_items,
         requested_blocks,
         accepted_blocks,
         already_known,
@@ -4299,7 +4331,16 @@ mod tests {
             block_sync_batch_limit(crate::DEVNET_PROFILE.network_id, receiver_limits),
             1
         );
-        let (listener, address) = start_listener(Arc::clone(&source), SOURCE_NONCE);
+        // Like stock mainnet nodes, the source offers one id per request.
+        let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = socket.local_addr().unwrap();
+        let listener = spawn_inbound_listener_inner(
+            Arc::clone(&source),
+            socket,
+            receiver_limits,
+            Some(SOURCE_NONCE),
+        )
+        .unwrap();
         let report = sync_from_peer_once_inner_with_policy(
             Arc::clone(&target),
             address,
@@ -4774,7 +4815,9 @@ mod tests {
             spawn_inbound_listener_inner(Arc::clone(&source), socket, limits, Some(SOURCE_NONCE))
                 .unwrap();
         let observation = observed_address(PeerDirection::Outbound, address);
-        for (session, expected_cursor) in expected_progress.into_iter().enumerate() {
+        // The first session walks the three known active blocks and downloads
+        // the first fork block; every later session downloads one block.
+        for (session, expected_cursor) in expected_progress.into_iter().skip(3).enumerate() {
             let report =
                 sync_from_peer_once_inner(Arc::clone(&target), address, limits, Some(TARGET_NONCE))
                     .unwrap();
@@ -4783,7 +4826,7 @@ mod tests {
                 .unwrap()
                 .peer_sync_locator(&observation, MAX_BLOCKS_PER_SYNC)
                 .1;
-            assert_eq!(report.inventory_items, 1);
+            assert_eq!(report.inventory_items, if session == 0 { 4 } else { 1 });
             assert_eq!(
                 cursor,
                 Some(expected_cursor),
@@ -4792,8 +4835,8 @@ mod tests {
                 report.accepted_blocks,
                 report.already_known
             );
-            assert_eq!(report.already_known, usize::from(session < 3));
-            assert_eq!(report.accepted_blocks, usize::from(session >= 3));
+            assert_eq!(report.already_known, if session == 0 { 3 } else { 0 });
+            assert_eq!(report.accepted_blocks, 1);
         }
         assert!(tips_match(&source, &target));
         assert_eq!(target.lock().unwrap().peer_hello().height, 30);
@@ -5002,7 +5045,10 @@ mod tests {
         let listener =
             spawn_inbound_listener_inner(Arc::clone(&source), socket, limits, Some(SOURCE_NONCE))
                 .unwrap();
-        for session in 0..(4 + usize::from(grow)) {
+        let total_blocks = 4 + usize::from(grow);
+        let mut fetched = 0;
+        let mut session = 0;
+        while fetched < total_blocks {
             let report =
                 sync_from_peer_once_inner(Arc::clone(&target), address, limits, Some(TARGET_NONCE))
                     .unwrap();
@@ -5011,6 +5057,7 @@ mod tests {
                 report.accepted_blocks, 1,
                 "session {session} repeated a known side-chain prefix instead of continuing"
             );
+            fetched += 1;
             if session == 0 {
                 if grow {
                     mine(&source, 1, now + 4);
@@ -5027,10 +5074,14 @@ mod tests {
                         Some(TARGET_NONCE),
                     )
                     .unwrap();
+                    // The restarted receiver walks the stored block and
+                    // continues with the next one in the same session.
                     assert_eq!(recovered.already_known, 1);
-                    assert_eq!(recovered.accepted_blocks, 0);
+                    assert_eq!(recovered.accepted_blocks, 1);
+                    fetched += 1;
                 }
             }
+            session += 1;
         }
         assert!(tips_match(&source, &target));
         listener.stop().unwrap();

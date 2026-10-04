@@ -90,6 +90,12 @@ const MAX_TIP_ANNOUNCE_TARGETS: usize = 16;
 const MAX_KNOWN_PREFIX_HEADER_ROUNDS: usize = 64;
 const MAX_TIP_ANNOUNCE_IN_FLIGHT: usize = 8;
 const MAX_TIP_ANNOUNCE_REPEATS: usize = 3;
+// A peer that keeps answering Busy for the same offered block (for example a
+// slow node stuck on another branch) is not re-offered that block every round:
+// each re-offer occupies its single verifier and starves its own sync.
+const RELAY_BUSY_REPEATS_BEFORE_BACKOFF: u32 = 3;
+const RELAY_BUSY_BACKOFF_BASE: Duration = Duration::from_secs(30);
+const RELAY_BUSY_BACKOFF_MAX: Duration = Duration::from_secs(10 * 60);
 const TIP_ANNOUNCE_MAX_MEDIAN_AGE_SECONDS: u64 = 30 * 60;
 const MAX_DYNAMIC_PEER_BACKOFF: Duration = Duration::from_secs(5 * 60);
 const DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
@@ -2565,6 +2571,69 @@ struct PeerPollOptions {
     nonce_override: Option<[u8; 32]>,
     discovery: Option<Arc<PeerDiscovery>>,
     security: Arc<PeerSecurity>,
+    relay_backoff: Arc<RelayBackoff>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RelayBackoffEntry {
+    block_id: [u8; 32],
+    repeats: u32,
+    until: Option<Instant>,
+}
+
+/// Outbound relay back-off for peers that repeatedly defer the same block.
+/// Pulling from such a peer is unaffected; only re-offering is delayed.
+#[derive(Debug, Default)]
+struct RelayBackoff {
+    entries: Mutex<HashMap<SocketAddr, RelayBackoffEntry>>,
+}
+
+impl RelayBackoff {
+    fn allows(&self, peer: SocketAddr, now: Instant) -> bool {
+        self.entries.lock().map_or(true, |entries| {
+            entries
+                .get(&peer)
+                .and_then(|entry| entry.until)
+                .is_none_or(|until| until <= now)
+        })
+    }
+
+    fn record(&self, peer: SocketAddr, result: &Result<RelayReport, P2pError>, now: Instant) {
+        let Ok(mut entries) = self.entries.lock() else {
+            return;
+        };
+        match result {
+            Ok(_) => {
+                entries.remove(&peer);
+            }
+            Err(P2pError::BusyBlockSubmission(block_id)) => {
+                let entry = entries.entry(peer).or_insert(RelayBackoffEntry {
+                    block_id: *block_id,
+                    repeats: 0,
+                    until: None,
+                });
+                if entry.block_id != *block_id {
+                    *entry = RelayBackoffEntry {
+                        block_id: *block_id,
+                        repeats: 0,
+                        until: None,
+                    };
+                }
+                entry.repeats = entry.repeats.saturating_add(1);
+                if entry.repeats >= RELAY_BUSY_REPEATS_BEFORE_BACKOFF {
+                    let doublings = (entry.repeats - RELAY_BUSY_REPEATS_BEFORE_BACKOFF).min(5);
+                    let backoff = RELAY_BUSY_BACKOFF_BASE
+                        .saturating_mul(1 << doublings)
+                        .min(RELAY_BUSY_BACKOFF_MAX);
+                    entry.until = now.checked_add(backoff);
+                }
+            }
+            Err(_) => {}
+        }
+        if entries.len() > MAX_DISCOVERED_PEERS * 4 {
+            entries.retain(|_, entry| entry.until.is_some_and(|until| until > now));
+        }
+    }
 }
 
 impl StaticPeerPollHandle {
@@ -2647,6 +2716,7 @@ fn spawn_peer_polling_inner(
     let active_sockets = Arc::new(ActiveSocketRegistry::default());
     let thread_stop = Arc::clone(&stop);
     let thread_active_sockets = Arc::clone(&active_sockets);
+    let relay_backoff = Arc::new(RelayBackoff::default());
     let announcer = TipAnnouncer {
         shared: Arc::clone(&shared),
         config: config.clone(),
@@ -2655,6 +2725,7 @@ fn spawn_peer_polling_inner(
         nonce_override,
         discovery: discovery.clone(),
         security: Arc::clone(&security),
+        relay_backoff: Arc::clone(&relay_backoff),
         in_flight: Arc::new(Mutex::new(HashSet::new())),
     };
     let announcer = thread::Builder::new()
@@ -2665,6 +2736,7 @@ fn spawn_peer_polling_inner(
         nonce_override,
         discovery,
         security,
+        relay_backoff,
     };
     let thread = thread::Builder::new()
         .name("cmfd-static-peer-poll".to_owned())
@@ -2704,6 +2776,7 @@ struct TipAnnouncer {
     nonce_override: Option<[u8; 32]>,
     discovery: Option<Arc<PeerDiscovery>>,
     security: Arc<PeerSecurity>,
+    relay_backoff: Arc<RelayBackoff>,
     in_flight: Arc<Mutex<HashSet<SocketAddr>>>,
 }
 
@@ -2757,6 +2830,9 @@ impl TipAnnouncer {
             {
                 break;
             }
+            if !self.relay_backoff.allows(peer, Instant::now()) {
+                break;
+            }
             let Ok(started_tip) = lock_node(&self.shared).map(|node| node.state.tip()) else {
                 break;
             };
@@ -2768,6 +2844,7 @@ impl TipAnnouncer {
                 self.nonce_override,
                 Some(&self.active_sockets),
             );
+            self.relay_backoff.record(peer, &result, Instant::now());
             if let Err(error) = &result {
                 let (penalty, reason) = outbound_reputation_penalty(error);
                 if let Err(reputation_error) =
@@ -3038,16 +3115,25 @@ fn static_peer_poll_loop(
             if poll_stopped(&stop) {
                 return;
             }
-            let relay_result = relay_blocks_to_peer_once_inner_with_policy(
-                Arc::clone(&shared),
-                peer,
-                config.limits,
-                config.address_policy,
-                options.nonce_override,
-                Some(&active_sockets),
-            );
-            round_succeeded &= relay_result.is_ok();
-            let relay_banned = relay_result.as_ref().err().is_some_and(|error| {
+            let relay_result = if options.relay_backoff.allows(peer, Instant::now()) {
+                let result = relay_blocks_to_peer_once_inner_with_policy(
+                    Arc::clone(&shared),
+                    peer,
+                    config.limits,
+                    config.address_policy,
+                    options.nonce_override,
+                    Some(&active_sockets),
+                );
+                options.relay_backoff.record(peer, &result, Instant::now());
+                Some(result)
+            } else {
+                None
+            };
+            round_succeeded &= relay_result.as_ref().is_none_or(Result::is_ok);
+            let relay_banned = relay_result
+                .as_ref()
+                .and_then(|result| result.as_ref().err())
+                .is_some_and(|error| {
                 let (penalty, reason) = outbound_reputation_penalty(error);
                 options
                     .security
@@ -6834,6 +6920,63 @@ mod tests {
         drop(wallet);
         clean_test_dir(&miner_path);
         clean_test_dir(&wallet_path);
+    }
+
+    #[test]
+    fn relay_backs_off_only_after_repeated_busy_for_the_same_block() {
+        let backoff = RelayBackoff::default();
+        let peer: SocketAddr = "127.0.0.1:29444".parse().unwrap();
+        let now = Instant::now();
+        let busy = |id: u8| Err(P2pError::BusyBlockSubmission([id; 32]));
+        backoff.record(peer, &busy(1), now);
+        backoff.record(peer, &busy(1), now);
+        assert!(
+            backoff.allows(peer, now),
+            "two deferrals are ordinary contention"
+        );
+        // A different block restarts the count.
+        backoff.record(peer, &busy(2), now);
+        backoff.record(peer, &busy(2), now);
+        assert!(backoff.allows(peer, now));
+        backoff.record(peer, &busy(2), now);
+        assert!(!backoff.allows(peer, now));
+        assert!(!backoff.allows(peer, now + Duration::from_secs(29)));
+        assert!(backoff.allows(peer, now + RELAY_BUSY_BACKOFF_BASE));
+        // Further deferrals double the wait, up to the cap.
+        backoff.record(peer, &busy(2), now);
+        assert!(!backoff.allows(peer, now + Duration::from_secs(59)));
+        for _ in 0..20 {
+            backoff.record(peer, &busy(2), now);
+        }
+        assert!(!backoff.allows(peer, now + Duration::from_secs(9 * 60)));
+        assert!(backoff.allows(peer, now + RELAY_BUSY_BACKOFF_MAX));
+        // Other failures do not change it; any successful relay clears it.
+        backoff.record(peer, &Err(P2pError::ThreadPanicked), now);
+        assert!(!backoff.allows(peer, now));
+        let other: SocketAddr = "127.0.0.2:29444".parse().unwrap();
+        assert!(backoff.allows(other, now));
+        let hello = PeerHello {
+            network_id: [0; 32],
+            consensus_fingerprint: [0; 32],
+            node_nonce: [1; 32],
+            tip: [0; 32],
+            height: 0,
+            cumulative_work: crate::peer::ChainWork([0; 64]),
+        };
+        backoff.record(
+            peer,
+            &Ok(RelayReport {
+                remote_hello: hello,
+                offered_blocks: 0,
+                accepted_blocks: 0,
+                already_known: 0,
+                offered_transactions: 0,
+                peer_height: 0,
+                peer_tip: [0; 32],
+            }),
+            now,
+        );
+        assert!(backoff.allows(peer, now));
     }
 
     #[test]

@@ -207,7 +207,8 @@ fn main() -> Result<()> {
             "usage: --server EXPECTED_NETWORK_ID MODEL ARTIFACT_DIRECTORY"
         );
         let expected_network_id = parse_expected_network_id(&args[1])?;
-        let prepared = prepare_prover(Path::new(&args[2]), Path::new(&args[3]), true)?;
+        let preload = !preload_disabled(std::env::var("CMFD_V4_PROOF_PRELOAD").ok().as_deref());
+        let prepared = prepare_prover(Path::new(&args[2]), Path::new(&args[3]), preload)?;
         run_sync_in_place(move |scope| {
             run_persistent_server(&prepared, expected_network_id, &scope)
         })??;
@@ -396,6 +397,17 @@ fn prepare_prover(model_path: &Path, artifact_dir: &Path, preload: bool) -> Resu
     })
 }
 
+/// `CMFD_V4_PROOF_PRELOAD=0` in the worker's environment keeps the server on
+/// file mappings, for hosts that cannot spare the pinned banks and trees even
+/// though `host_can_preload` would allow them. The node passes its own
+/// environment through to the worker.
+fn preload_disabled(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|value| value.trim().to_ascii_lowercase()).as_deref(),
+        Some("0" | "false" | "off" | "no")
+    )
+}
+
 fn host_can_preload(bytes: u64) -> bool {
     std::fs::read_to_string("/proc/meminfo")
         .ok()
@@ -425,6 +437,18 @@ mod preload_tests {
         assert_eq!(mem_available_bytes(meminfo), Some(58_000_000 * 1024));
         assert_eq!(mem_available_bytes("MemTotal:       65000000 kB\n"), None);
         assert_eq!(mem_available_bytes("MemAvailable:   lots kB\n"), None);
+    }
+
+    #[test]
+    fn preload_is_disabled_only_by_an_explicit_setting() {
+        assert!(!preload_disabled(None));
+        assert!(!preload_disabled(Some("")));
+        assert!(!preload_disabled(Some("1")));
+        assert!(!preload_disabled(Some("maybe")));
+        assert!(preload_disabled(Some("0")));
+        assert!(preload_disabled(Some(" OFF ")));
+        assert!(preload_disabled(Some("false")));
+        assert!(preload_disabled(Some("no")));
     }
 }
 

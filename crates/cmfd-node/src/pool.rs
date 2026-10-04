@@ -101,6 +101,15 @@ const LEGACY_POOL_LEDGER_CHECKSUM_DOMAIN: &str = "CMFD/POOL/LEDGER/V1";
 const POOL_LEDGER_MAX_BYTES: usize = 64 * 1024 * 1024;
 const POOL_MAX_PAYOUTS_PER_TIP: usize = 16;
 const POOL_LEDGER_GUARD_FILE: &str = "pool-ledger-payout-guard-v1.json";
+/// Settled block and payment records this many blocks deep leave the live
+/// ledger for the append-only archive. Rewards distribute at
+/// `COINBASE_MATURITY`; the extra depth covers any reorganization that could
+/// still change a settled record.
+const POOL_LEDGER_RETIRE_CONFIRMATIONS: u64 = 6 * COINBASE_MATURITY;
+/// The newest non-pending blocks always stay live for the dashboard.
+const POOL_LEDGER_LIVE_BLOCKS: usize = 100;
+const POOL_LEDGER_ARCHIVE_FILE: &str = "pool-ledger-archive-v1.jsonl";
+const POOL_LEDGER_ARCHIVE_SCHEMA: &str = "CMFD/POOL/LEDGER-ARCHIVE/V1";
 
 #[path = "pool_payout_protection.rs"]
 mod payout_protection;
@@ -881,6 +890,12 @@ struct Ledger {
     pplns_shares: VecDeque<PplnsShareRecord>,
     pplns_blocks: BTreeMap<[u8; 32], PplnsBlockRecord>,
     operator_fee_atoms: u64,
+    /// Settled blocks moved to the archive; still counted in `pool_blocks`.
+    archived_canonical_blocks: u64,
+    archived_orphaned_blocks: u64,
+    /// Operator fees of archived distributed blocks; still counted in
+    /// `operator_fee_atoms`.
+    archived_operator_fee_atoms: u64,
     earning_history_started_at_unix_seconds: u64,
     earning_events: VecDeque<EarningRecord>,
     payout_protection: payout_protection::ProtectionState,
@@ -910,6 +925,10 @@ struct PayoutRecord {
     pool_blocks: u64,
     credited_devnet_atoms: u64,
     last_session_id: u64,
+    /// Confirmed payments whose transaction records moved to the archive.
+    /// They stay reserved and confirmed for every credit calculation.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    settled_atoms: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1118,6 +1137,12 @@ struct StoredLedgerPayloadV1 {
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     operator_fee_atoms: u64,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
+    archived_canonical_blocks: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    archived_orphaned_blocks: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    archived_operator_fee_atoms: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
     earning_history_started_at_unix_seconds: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     earning_events: Vec<EarningRecord>,
@@ -1246,6 +1271,45 @@ impl DurableLedger {
             #[cfg(test)]
             persist_delay_millis: AtomicU64::new(0),
         }
+    }
+
+    /// Appends the retired records to the archive file. Memory-only ledgers
+    /// keep no archive.
+    fn archive(&self, retired: &RetiredPoolRecords) -> Result<(), PoolError> {
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        if retired.is_empty() {
+            return Ok(());
+        }
+        let archived_at_unix_seconds = unix_time_seconds()?;
+        let mut lines = Vec::new();
+        for (block_id, record, pplns) in &retired.blocks {
+            serde_json::to_writer(
+                &mut lines,
+                &ArchivedPoolRecordV1::Block {
+                    schema: POOL_LEDGER_ARCHIVE_SCHEMA,
+                    archived_at_unix_seconds,
+                    block_id: hex::encode(block_id),
+                    record,
+                    pplns: pplns.as_ref(),
+                },
+            )?;
+            lines.push(b'\n');
+        }
+        for (txid, record) in &retired.payout_transactions {
+            serde_json::to_writer(
+                &mut lines,
+                &ArchivedPoolRecordV1::PayoutTransaction {
+                    schema: POOL_LEDGER_ARCHIVE_SCHEMA,
+                    archived_at_unix_seconds,
+                    txid: hex::encode(txid),
+                    record,
+                },
+            )?;
+            lines.push(b'\n');
+        }
+        store.append_archive(&lines)
     }
 
     fn next_session_id(&self) -> Result<u64, PoolError> {
@@ -1645,6 +1709,16 @@ impl LedgerStore {
             .join(format!("{POOL_LEDGER_FILE_PREFIX}.{slot}.json"))
     }
 
+    fn append_archive(&self, lines: &[u8]) -> Result<(), PoolError> {
+        let mut file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(self.directory.join(POOL_LEDGER_ARCHIVE_FILE))?;
+        file.write_all(lines)?;
+        file.sync_all()?;
+        sync_ledger_directory(&self.directory)
+    }
+
     fn load_legacy_slot(&self, slot: u8) -> Result<Option<Ledger>, PoolError> {
         let path = self
             .directory
@@ -1697,6 +1771,9 @@ impl LedgerStore {
             pplns_shares: Vec::new(),
             pplns_blocks: Vec::new(),
             operator_fee_atoms: 0,
+            archived_canonical_blocks: 0,
+            archived_orphaned_blocks: 0,
+            archived_operator_fee_atoms: 0,
             earning_history_started_at_unix_seconds: 0,
             earning_events: Vec::new(),
             payout_protection: payout_protection::ProtectionState::default(),
@@ -1759,6 +1836,9 @@ fn ledger_payload(ledger: &Ledger) -> StoredLedgerPayloadV1 {
             })
             .collect(),
         operator_fee_atoms: ledger.operator_fee_atoms,
+        archived_canonical_blocks: ledger.archived_canonical_blocks,
+        archived_orphaned_blocks: ledger.archived_orphaned_blocks,
+        archived_operator_fee_atoms: ledger.archived_operator_fee_atoms,
         earning_history_started_at_unix_seconds: ledger.earning_history_started_at_unix_seconds,
         earning_events: ledger.earning_events.iter().cloned().collect(),
         payout_protection: ledger.payout_protection.clone(),
@@ -1827,6 +1907,9 @@ fn ledger_from_payload(
         pplns_shares: payload.pplns_shares.into(),
         pplns_blocks,
         operator_fee_atoms: payload.operator_fee_atoms,
+        archived_canonical_blocks: payload.archived_canonical_blocks,
+        archived_orphaned_blocks: payload.archived_orphaned_blocks,
+        archived_operator_fee_atoms: payload.archived_operator_fee_atoms,
         earning_history_started_at_unix_seconds: payload.earning_history_started_at_unix_seconds,
         earning_events: payload.earning_events.into(),
         payout_protection: payload.payout_protection,
@@ -1894,10 +1977,16 @@ fn validate_ledger(ledger: &Ledger) -> Result<(), PoolError> {
     {
         return Err(PoolError::LedgerCapacity);
     }
+    // Decompressing a payout key costs microseconds; a full share window
+    // holds tens of thousands of shares over a few dozen keys, so every key is
+    // checked once per pass.
+    let mut verified_payouts = HashSet::new();
     for share in &ledger.pplns_shares {
-        VerifyingKey::from_bytes(&share.payout).map_err(|_| {
-            PoolError::LedgerCorrupt("stored PPLNS share payout is invalid".to_owned())
-        })?;
+        verify_stored_payout(
+            &mut verified_payouts,
+            &share.payout,
+            "stored PPLNS share payout is invalid",
+        )?;
         if !share.worker.is_empty() {
             validate_worker(&share.worker)?;
         }
@@ -1952,7 +2041,6 @@ fn validate_ledger(ledger: &Ledger) -> Result<(), PoolError> {
                 .try_fold(0_u64, |total, allocation| {
                     if allocation.atoms == 0
                         || !keys.insert((allocation.payout, allocation.session_id))
-                        || VerifyingKey::from_bytes(&allocation.payout).is_err()
                         || (!allocation.worker.is_empty()
                             && validate_worker(&allocation.worker).is_err())
                     {
@@ -1960,6 +2048,11 @@ fn validate_ledger(ledger: &Ledger) -> Result<(), PoolError> {
                             "stored PPLNS allocation is invalid".to_owned(),
                         ));
                     }
+                    verify_stored_payout(
+                        &mut verified_payouts,
+                        &allocation.payout,
+                        "stored PPLNS allocation is invalid",
+                    )?;
                     checked_ledger_add(total, allocation.atoms, "PPLNS allocation total")
                 })?;
             if allocated != pplns.distributable_atoms {
@@ -1976,11 +2069,26 @@ fn validate_ledger(ledger: &Ledger) -> Result<(), PoolError> {
             )?;
         }
     }
-    if distributed_operator_fee_atoms != ledger.operator_fee_atoms {
+    if checked_ledger_add(
+        distributed_operator_fee_atoms,
+        ledger.archived_operator_fee_atoms,
+        "operator fee total",
+    )? != ledger.operator_fee_atoms
+    {
         return Err(PoolError::LedgerCorrupt(
             "stored operator-fee total does not match distributed PPLNS blocks".to_owned(),
         ));
     }
+    let live_pool_blocks = ledger
+        .blocks
+        .values()
+        .filter(|record| record.state != PoolBlockState::Pending)
+        .count() as u64;
+    let archived_pool_blocks = checked_ledger_add(
+        ledger.archived_canonical_blocks,
+        ledger.archived_orphaned_blocks,
+        "archived pool blocks",
+    )?;
     let payout_totals = ledger.payouts.values().try_fold(
         (0_u64, 0_u64, 0_u64, 0_u64, 0_u64),
         |totals, record| {
@@ -2018,11 +2126,7 @@ fn validate_ledger(ledger: &Ledger) -> Result<(), PoolError> {
             ledger.credited_devnet_atoms,
             ledger.stale_shares,
         )
-        || ledger
-            .blocks
-            .values()
-            .filter(|record| record.state != PoolBlockState::Pending)
-            .count() as u64
+        || checked_ledger_add(live_pool_blocks, archived_pool_blocks, "pool block total")?
             != ledger.pool_blocks
     {
         return Err(PoolError::LedgerCorrupt(
@@ -2036,13 +2140,18 @@ fn validate_ledger(ledger: &Ledger) -> Result<(), PoolError> {
                 "stored session stale shares exceed rejected shares".to_owned(),
             ));
         }
-        VerifyingKey::from_bytes(&session.payout).map_err(|_| {
-            PoolError::LedgerCorrupt("stored session payout key is invalid".to_owned())
-        })?;
+        verify_stored_payout(
+            &mut verified_payouts,
+            &session.payout,
+            "stored session payout key is invalid",
+        )?;
     }
     for payout in ledger.payouts.keys() {
-        VerifyingKey::from_bytes(payout)
-            .map_err(|_| PoolError::LedgerCorrupt("stored payout key is invalid".to_owned()))?;
+        verify_stored_payout(
+            &mut verified_payouts,
+            payout,
+            "stored payout key is invalid",
+        )?;
     }
     if ledger.stale_shares > ledger.rejected_shares
         || ledger
@@ -2065,9 +2174,11 @@ fn validate_ledger(ledger: &Ledger) -> Result<(), PoolError> {
             ));
         }
         validate_worker(&earning.worker)?;
-        VerifyingKey::from_bytes(&earning.payout).map_err(|_| {
-            PoolError::LedgerCorrupt("stored earning payout key is invalid".to_owned())
-        })?;
+        verify_stored_payout(
+            &mut verified_payouts,
+            &earning.payout,
+            "stored earning payout key is invalid",
+        )?;
     }
     let mut reserved_by_payout = BTreeMap::<[u8; 32], u64>::new();
     for (txid, record) in &ledger.payout_transactions {
@@ -2088,13 +2199,29 @@ fn validate_ledger(ledger: &Ledger) -> Result<(), PoolError> {
             *reserved = checked_ledger_add(*reserved, record.amount_atoms, "reserved payout")?;
         }
     }
-    for (payout, reserved) in reserved_by_payout {
-        if reserved > ledger.payouts[&payout].credited_devnet_atoms {
+    for (payout, record) in &ledger.payouts {
+        let reserved = reserved_by_payout.get(payout).copied().unwrap_or(0);
+        if checked_ledger_add(reserved, record.settled_atoms, "settled payout")?
+            > record.credited_devnet_atoms
+        {
             return Err(PoolError::LedgerCorrupt(
                 "stored payout transaction exceeds earned credit".to_owned(),
             ));
         }
     }
+    Ok(())
+}
+
+fn verify_stored_payout(
+    verified: &mut HashSet<[u8; 32]>,
+    payout: &[u8; 32],
+    label: &str,
+) -> Result<(), PoolError> {
+    if verified.contains(payout) {
+        return Ok(());
+    }
+    VerifyingKey::from_bytes(payout).map_err(|_| PoolError::LedgerCorrupt(label.to_owned()))?;
+    verified.insert(*payout);
     Ok(())
 }
 
@@ -3677,12 +3804,12 @@ fn reconcile_pool_blocks_for_node(
             }
         })
         .collect::<Vec<_>>();
-    let changed = {
+    let (changed, retired) = {
         let ledger = ledger
             .state
             .lock()
             .map_err(|_| PoolError::SharedStatePoisoned)?;
-        updates.iter().any(|(block_id, state, confirmations)| {
+        let changed = updates.iter().any(|(block_id, state, confirmations)| {
             ledger.blocks.get(block_id).is_some_and(|record| {
                 if record.state == PoolBlockState::Pending {
                     *state != PoolBlockState::Unknown || recover_missing_pending
@@ -3703,11 +3830,24 @@ fn reconcile_pool_blocks_for_node(
                                 .is_some_and(|pplns| !pplns.distributed))
                 }
             })
-        })
+        });
+        let retired = if changed {
+            settled_pool_records(
+                &ledger,
+                &updates,
+                node.state.next_height().saturating_sub(1),
+            )
+        } else {
+            RetiredPoolRecords::default()
+        };
+        (changed, retired)
     };
     if !changed {
         return Ok(());
     }
+    // The archive is appended before the live ledger forgets a record, so an
+    // interruption can only leave a record in both places, never in neither.
+    ledger.archive(&retired)?;
     ledger.transaction(|ledger| {
         for (block_id, state, confirmations) in updates {
             let record = *ledger.blocks.get(&block_id).ok_or_else(|| {
@@ -3734,8 +3874,159 @@ fn reconcile_pool_blocks_for_node(
             }
             payout_protection::observe_backing(ledger, node, block_id)?;
         }
-        Ok(())
+        retire_pool_records(ledger, &retired)
     })
+}
+
+#[derive(Default)]
+struct RetiredPoolRecords {
+    blocks: Vec<([u8; 32], BlockRecord, Option<PplnsBlockRecord>)>,
+    payout_transactions: Vec<([u8; 32], PayoutTransactionRecord)>,
+}
+
+impl RetiredPoolRecords {
+    fn is_empty(&self) -> bool {
+        self.blocks.is_empty() && self.payout_transactions.is_empty()
+    }
+}
+
+/// One archive line. Identifiers are hex so the file reads without tooling.
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ArchivedPoolRecordV1<'a> {
+    Block {
+        schema: &'static str,
+        archived_at_unix_seconds: u64,
+        block_id: String,
+        record: &'a BlockRecord,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pplns: Option<&'a PplnsBlockRecord>,
+    },
+    PayoutTransaction {
+        schema: &'static str,
+        archived_at_unix_seconds: u64,
+        txid: String,
+        record: &'a PayoutTransactionRecord,
+    },
+}
+
+/// Settled records that may leave the live ledger: canonical blocks whose
+/// reward is distributed, orphaned blocks that never distributed, and
+/// confirmed payments, each `POOL_LEDGER_RETIRE_CONFIRMATIONS` deep, outside
+/// the newest `POOL_LEDGER_LIVE_BLOCKS` blocks, and not referenced by any
+/// payout incident. `updates` carries the fresh chain state of every block.
+fn settled_pool_records(
+    ledger: &Ledger,
+    updates: &[([u8; 32], PoolBlockState, u64)],
+    chain_height: u64,
+) -> RetiredPoolRecords {
+    let mut live = ledger
+        .blocks
+        .iter()
+        .filter(|(_, record)| record.state != PoolBlockState::Pending)
+        .map(|(block_id, record)| (record.height, *block_id))
+        .collect::<Vec<_>>();
+    live.sort_unstable_by(|left, right| right.cmp(left));
+    live.truncate(POOL_LEDGER_LIVE_BLOCKS);
+    let mut retired = RetiredPoolRecords::default();
+    for (block_id, state, confirmations) in updates {
+        let Some(record) = ledger.blocks.get(block_id) else {
+            continue;
+        };
+        if record.state == PoolBlockState::Pending
+            || live.contains(&(record.height, *block_id))
+            || payout_protection::references_block(ledger, *block_id)
+        {
+            continue;
+        }
+        let pplns = ledger.pplns_blocks.get(block_id);
+        let settled = match state {
+            PoolBlockState::Canonical => {
+                *confirmations >= POOL_LEDGER_RETIRE_CONFIRMATIONS
+                    && pplns.is_none_or(|pplns| pplns.distributed)
+            }
+            PoolBlockState::Orphaned => {
+                chain_height.saturating_sub(record.height) >= POOL_LEDGER_RETIRE_CONFIRMATIONS
+                    && pplns.is_none_or(|pplns| !pplns.distributed)
+            }
+            PoolBlockState::Pending | PoolBlockState::Unknown => false,
+        };
+        if settled {
+            retired.blocks.push((*block_id, *record, pplns.cloned()));
+        }
+    }
+    for (txid, record) in &ledger.payout_transactions {
+        if record.state == PoolPayoutTransactionState::Confirmed
+            && record.confirmations >= POOL_LEDGER_RETIRE_CONFIRMATIONS
+            && !payout_protection::references_payout_transaction(ledger, *txid)
+        {
+            retired.payout_transactions.push((*txid, record.clone()));
+        }
+    }
+    retired
+}
+
+/// Removes the retired records from the live ledger, keeping every total they
+/// contributed to. Each record is re-checked against the ledger being updated;
+/// one that no longer qualifies simply stays live.
+fn retire_pool_records(ledger: &mut Ledger, retired: &RetiredPoolRecords) -> Result<(), PoolError> {
+    for (block_id, _, _) in &retired.blocks {
+        let Some(record) = ledger.blocks.get(block_id).copied() else {
+            continue;
+        };
+        if record.state == PoolBlockState::Pending
+            || payout_protection::references_block(ledger, *block_id)
+        {
+            continue;
+        }
+        let pplns = ledger
+            .pplns_blocks
+            .get(block_id)
+            .map(|pplns| (pplns.distributed, pplns.operator_fee_atoms));
+        match (record.state, pplns) {
+            (PoolBlockState::Canonical, Some((true, operator_fee_atoms))) => {
+                ledger.archived_operator_fee_atoms = checked_ledger_add(
+                    ledger.archived_operator_fee_atoms,
+                    operator_fee_atoms,
+                    "archived operator fees",
+                )?;
+                ledger.archived_canonical_blocks =
+                    checked_ledger_add(ledger.archived_canonical_blocks, 1, "archived blocks")?;
+            }
+            (PoolBlockState::Canonical, None) => {
+                ledger.archived_canonical_blocks =
+                    checked_ledger_add(ledger.archived_canonical_blocks, 1, "archived blocks")?;
+            }
+            (PoolBlockState::Orphaned, None | Some((false, _))) => {
+                ledger.archived_orphaned_blocks =
+                    checked_ledger_add(ledger.archived_orphaned_blocks, 1, "archived blocks")?;
+            }
+            _ => continue,
+        }
+        ledger.blocks.remove(block_id);
+        ledger.pplns_blocks.remove(block_id);
+    }
+    for (txid, _) in &retired.payout_transactions {
+        let Some((payout, amount_atoms)) = ledger
+            .payout_transactions
+            .get(txid)
+            .filter(|record| record.state == PoolPayoutTransactionState::Confirmed)
+            .map(|record| (record.payout, record.amount_atoms))
+        else {
+            continue;
+        };
+        if payout_protection::references_payout_transaction(ledger, *txid) {
+            continue;
+        }
+        let record = ledger
+            .payouts
+            .get_mut(&payout)
+            .ok_or_else(|| PoolError::LedgerCorrupt("payout identity is missing".to_owned()))?;
+        record.settled_atoms =
+            checked_ledger_add(record.settled_atoms, amount_atoms, "settled payout")?;
+        ledger.payout_transactions.remove(txid);
+    }
+    Ok(())
 }
 
 fn reconcile_pool_payouts(shared: &SharedServer, create_new: bool) -> Result<(), PoolError> {
@@ -3948,16 +4239,16 @@ fn payout_available_atoms(ledger: &Ledger, payout: [u8; 32]) -> Result<u64, Pool
     if payout_protection::holds(ledger).blocks(payout) {
         return Ok(0);
     }
-    let credited = ledger
+    let record = ledger
         .payouts
         .get(&payout)
-        .ok_or_else(|| PoolError::LedgerCorrupt("payout identity is missing".to_owned()))?
-        .credited_devnet_atoms;
+        .ok_or_else(|| PoolError::LedgerCorrupt("payout identity is missing".to_owned()))?;
+    let credited = record.credited_devnet_atoms;
     let reserved = ledger
         .payout_transactions
         .values()
         .filter(|record| record.payout == payout && record.state.reserves_credit())
-        .try_fold(0_u64, |total, record| {
+        .try_fold(record.settled_atoms, |total, record| {
             checked_ledger_add(total, record.amount_atoms, "reserved payout")
         })?;
     credited
@@ -3974,6 +4265,13 @@ fn payout_transaction_totals(ledger: &Ledger) -> Result<BTreeMap<[u8; 32], (u64,
         }
         if record.state == PoolPayoutTransactionState::Confirmed {
             entry.1 = checked_ledger_add(entry.1, record.amount_atoms, "confirmed payout")?;
+        }
+    }
+    for (payout, record) in &ledger.payouts {
+        if record.settled_atoms != 0 {
+            let entry = totals.entry(*payout).or_default();
+            entry.0 = checked_ledger_add(entry.0, record.settled_atoms, "settled payout")?;
+            entry.1 = checked_ledger_add(entry.1, record.settled_atoms, "settled payout")?;
         }
     }
     Ok(totals)
@@ -4803,12 +5101,14 @@ fn snapshot_ledger(ledger: &DurableLedger) -> Result<PoolLedgerSnapshot, PoolErr
         .blocks
         .values()
         .filter(|record| record.state == PoolBlockState::Canonical)
-        .count() as u64;
+        .count() as u64
+        + ledger.archived_canonical_blocks;
     let orphaned_pool_blocks = ledger
         .blocks
         .values()
         .filter(|record| record.state == PoolBlockState::Orphaned)
-        .count() as u64;
+        .count() as u64
+        + ledger.archived_orphaned_blocks;
     Ok(PoolLedgerSnapshot {
         accounting_semantics: POOL_ACCOUNTING_SEMANTICS.to_owned(),
         persistence,
@@ -4828,7 +5128,8 @@ fn snapshot_ledger(ledger: &DurableLedger) -> Result<PoolLedgerSnapshot, PoolErr
             .pplns_blocks
             .values()
             .filter(|record| record.distributed)
-            .count() as u64,
+            .count() as u64
+            + ledger.archived_canonical_blocks,
         canonical_pool_blocks,
         orphaned_pool_blocks,
         sessions,
@@ -5595,6 +5896,7 @@ mod tests {
 
     include!("pool_lifecycle_tests.rs");
     include!("pool_payout_protection_tests.rs");
+    include!("pool_ledger_archive_tests.rs");
 
     #[derive(Debug)]
     struct FixedProductionV4ShareVerifier {

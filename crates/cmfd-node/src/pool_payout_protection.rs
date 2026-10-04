@@ -106,6 +106,24 @@ impl Holds {
     }
 }
 
+/// Whether any incident, resolved or not, still refers to this block. Such
+/// blocks stay in the live ledger because `validate` checks the reference.
+pub(super) fn references_block(ledger: &Ledger, block_id: [u8; 32]) -> bool {
+    ledger
+        .payout_protection
+        .incidents
+        .iter()
+        .any(|incident| incident.block_id == Some(block_id))
+}
+
+pub(super) fn references_payout_transaction(ledger: &Ledger, txid: [u8; 32]) -> bool {
+    ledger
+        .payout_protection
+        .incidents
+        .iter()
+        .any(|incident| incident.payout_txid == Some(txid))
+}
+
 pub(super) fn holds(ledger: &Ledger) -> Holds {
     let mut result = Holds::default();
     for incident in ledger

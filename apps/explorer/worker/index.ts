@@ -9,10 +9,15 @@ export function isExplorerApiPath(pathname: string): boolean {
   return pathname === SNAPSHOT_PATH || BLOCK_PATH.test(pathname) || TRANSACTION_PATH.test(pathname) || isAddressApiPath(pathname);
 }
 
-// Static assets bypass the Worker (run_worker_first is /v1/* only), so public/_headers repeats these.
+// Cloudflare Web Analytics loads from static.cloudflareinsights.com and reports to cloudflareinsights.com.
+function contentSecurityPolicy(nonce?: string): string {
+  const scripts = ["'self'", ...(nonce ? [`'nonce-${nonce}'`] : []), "https://static.cloudflareinsights.com"].join(" ");
+  return `default-src 'self'; connect-src 'self' https://cloudflareinsights.com; font-src 'self' data:; img-src 'self' data:; object-src 'none'; script-src ${scripts}; style-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`;
+}
+
+// /assets/* bypasses the Worker (see run_worker_first), so public/_headers repeats these.
 export const SECURITY_HEADERS: Record<string, string> = {
-  "Content-Security-Policy":
-    "default-src 'self'; connect-src 'self'; font-src 'self' data:; img-src 'self' data:; object-src 'none'; script-src 'self'; style-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+  "Content-Security-Policy": contentSecurityPolicy(),
   "Permissions-Policy": "camera=(), geolocation=(), microphone=()",
   "Referrer-Policy": "strict-origin-when-cross-origin",
   "X-Content-Type-Options": "nosniff",
@@ -22,6 +27,11 @@ export const SECURITY_HEADERS: Record<string, string> = {
 function withSecurityHeaders(response: Response): Response {
   const headers = new Headers(response.headers);
   for (const [name, value] of Object.entries(SECURITY_HEADERS)) headers.set(name, value);
+  if (headers.get("Content-Type")?.startsWith("text/html")) {
+    // Cloudflare copies this per-request nonce onto the bot-detection and analytics scripts it injects.
+    headers.set("Content-Security-Policy", contentSecurityPolicy(crypto.randomUUID().replace(/-/g, "")));
+    headers.set("Cache-Control", "no-store");
+  }
 
   return new Response(response.body, {
     status: response.status,
@@ -105,12 +115,20 @@ async function proxyExplorerRequest(request: Request, env: Env): Promise<Respons
   }
 }
 
+// Always fetch the full page: a 304 would pair a cached page with a fresh nonce.
+function fetchAsset(request: Request, env: Env): Promise<Response> {
+  const headers = new Headers(request.headers);
+  headers.delete("If-None-Match");
+  headers.delete("If-Modified-Since");
+  return env.ASSETS.fetch(new Request(request, { headers }));
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const response = url.pathname.startsWith("/v1/")
       ? await proxyExplorerRequest(request, env)
-      : await env.ASSETS.fetch(request);
+      : await fetchAsset(request, env);
     return withSecurityHeaders(response);
   },
 } satisfies ExportedHandler<Env>;

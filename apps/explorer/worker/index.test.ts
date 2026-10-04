@@ -61,10 +61,10 @@ describe("mainnet explorer identity gate", () => {
     expect(config.routes[0].pattern).toBe("explorer.commonfoundry.ai");
   });
 
-  it("invokes the Worker only for API paths and serves static security headers without it", () => {
+  it("serves hashed assets without the Worker, with the same static security headers", () => {
     const config = JSON.parse(readFileSync(new URL("../wrangler.jsonc", import.meta.url), "utf8"));
-    expect(config.assets.run_worker_first).toEqual(["/v1/*"]);
-    expect(config.env.mainnet.assets.run_worker_first).toEqual(["/v1/*"]);
+    expect(config.assets.run_worker_first).toEqual(["/*", "!/assets/*"]);
+    expect(config.env.mainnet.assets.run_worker_first).toEqual(["/*", "!/assets/*"]);
     const rules = readFileSync(new URL("../public/_headers", import.meta.url), "utf8").split(/\r?\n/);
     expect(rules[0]).toBe("/*");
     const declared = Object.fromEntries(rules.slice(1).filter(Boolean).map((line) => {
@@ -170,6 +170,20 @@ describe("mainnet explorer identity gate", () => {
     upstream.mockResolvedValue(Response.json({ network: "RCNet-1" }));
     const response = await worker.fetch(new Request("https://explorer.test/v1/explorer"), environment({ EXPLORER_NETWORK: "rc", EXPLORER_EXPECTED_NETWORK_ID: "" }));
     expect(await response.json()).toEqual({ network: "RCNet-1" });
+  });
+
+  it("gives each page a fresh script nonce and never revalidates it", async () => {
+    const seen: Request[] = [];
+    const page = () => new Response("<!doctype html>", { headers: { "Content-Type": "text/html", ETag: '"page"' } });
+    const env = environment({ ASSETS: { fetch: async (request: Request) => { seen.push(request); return page(); }, connect: () => { throw new Error("unused"); } } as unknown as Fetcher });
+    const request = () => new Request("https://explorer.test/block/42", { headers: { "If-None-Match": '"page"', "If-Modified-Since": "Sat, 03 Oct 2026 00:00:00 GMT" } });
+    const [first, second] = [await worker.fetch(request(), env), await worker.fetch(request(), env)];
+    const nonce = (response: Response) => response.headers.get("Content-Security-Policy")?.match(/script-src 'self' 'nonce-([0-9a-f]{32})' https:\/\/static\.cloudflareinsights\.com;/)?.[1];
+    expect(nonce(first)).toBeDefined();
+    expect(nonce(second)).toBeDefined();
+    expect(nonce(first)).not.toBe(nonce(second));
+    expect(first.headers.get("Cache-Control")).toBe("no-store");
+    expect(seen.every((sent) => !sent.headers.has("If-None-Match") && !sent.headers.has("If-Modified-Since"))).toBe(true);
   });
 
   it("does not proxy static routes to the node", async () => {

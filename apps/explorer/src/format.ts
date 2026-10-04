@@ -14,6 +14,19 @@ export const formatAtoms = (atoms: string) => {
   return `${whole.toLocaleString()}${fraction ? `.${fraction}` : ""} CMFD`;
 };
 
+// Consensus TARGET_SPACING_SECONDS; one Forge Work (FW) is one complete nonce evaluation.
+const TARGET_SPACING_SECONDS = 60;
+const compactNumber = new Intl.NumberFormat("en-US", { notation: "compact", maximumSignificantDigits: 3 });
+
+/** Expected FW per block for a target (`floor(2^256 / (target + 1))`, as in consensus `block_work`). */
+export const blockWork = (target: string) => (1n << 256n) / (BigInt(`0x${target}`) + 1n);
+
+export const formatBlockWork = (target: string) => `${compactNumber.format(Number(blockWork(target)))} FW per block`;
+
+/** Network FW/s implied by the next block's difficulty at the 60-second target spacing. */
+export const formatNetworkWorkRate = (target: string) =>
+  `${compactNumber.format(Number(blockWork(target)) / TARGET_SPACING_SECONDS)} FW/s`;
+
 export const formatAge = (timestamp: number) => {
   const seconds = Math.max(0, Math.floor(Date.now() / 1000) - timestamp);
   if (seconds < 60) return `${seconds}s ago`;

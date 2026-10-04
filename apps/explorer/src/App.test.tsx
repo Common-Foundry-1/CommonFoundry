@@ -35,6 +35,8 @@ test("renders the branded explorer overview", async () => {
   expect(await screen.findByRole("heading", { name: "The chain, as it happens." })).toBeInTheDocument();
   expect(screen.getByRole("heading", { name: "Latest blocks" })).toBeInTheDocument();
   expect(screen.getByRole("button", { name: /pause/i })).toBeInTheDocument();
+  expect(screen.getByText("68.3 FW/s")).toBeInTheDocument();
+  expect(screen.getByText("4.1K FW per block")).toBeInTheDocument();
 });
 
 test("pauses and resumes the forge cycle", async () => {

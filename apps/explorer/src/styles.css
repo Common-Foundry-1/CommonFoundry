@@ -126,7 +126,7 @@ main { width: min(1480px, calc(100% - 8vw)); margin: 0 auto; }
 .chain-line { position: absolute; top: 110px; bottom: 56px; left: 37px; width: 1px; background: #c9a590; }
 .is-paused *, .is-paused *::before, .is-paused *::after { animation-play-state: paused !important; }
 
-.stat-rail { display: grid; grid-template-columns: repeat(5,1fr); margin: 22px 0; background: var(--mineral-50); border: 1px solid var(--mineral-200); box-shadow: var(--shadow-soft); }
+.stat-rail { display: grid; grid-template-columns: repeat(6,1fr); margin: 22px 0; background: var(--mineral-50); border: 1px solid var(--mineral-200); box-shadow: var(--shadow-soft); }
 .stat { display: grid; grid-template-columns: 35px minmax(0,1fr); gap: 11px; padding: 19px 17px; border-right: 1px solid var(--mineral-200); }
 .stat:last-child { border-right: 0; }
 .stat-icon { display: grid; width: 34px; height: 34px; place-items: center; color: var(--copper-600); background: var(--copper-100); border-radius: 50%; }
@@ -249,6 +249,11 @@ footer code { font-size: .6rem; }
 @keyframes forged-transfer { 0%,64% { left: 50%; opacity: 0; transform: translateX(-50%) rotate(45deg) scale(.65); } 68% { opacity: 1; transform: translateX(-50%) rotate(45deg) scale(1); } 84% { left: calc(100% + 24px); opacity: 1; transform: translateX(-50%) rotate(45deg) scale(.88); } 88%,100% { left: calc(100% + 24px); opacity: 0; transform: translateX(-50%) rotate(45deg) scale(.88); } }
 @keyframes chain-accept { 0%,76% { border-left-color: #c7bbb2; transform: translateX(8px); opacity: .66; } 86%,100% { border-left-color: var(--copper-500); transform: translateX(0); opacity: 1; } }
 
+@media (max-width: 1360px) {
+  .stat-rail { grid-template-columns: repeat(3,1fr); }
+  .stat:nth-child(3) { border-right: 0; }.stat:nth-child(n+4) { border-top: 1px solid var(--mineral-200); }
+}
+
 @media (max-width: 1120px) {
   .topbar { grid-template-columns: 210px minmax(280px,1fr) auto; }
   .topbar nav { display: none; }
@@ -256,8 +261,6 @@ footer code { font-size: .6rem; }
   .chain-zone { grid-column: 1 / -1; min-height: 270px; border-top: 1px solid var(--mineral-200); border-left: 0 !important; }
   .block-chain { grid-template-columns: repeat(3,1fr); }
   .chain-line { top: 122px; right: 70px; bottom: auto; left: 70px; width: auto; height: 1px; }
-  .stat-rail { grid-template-columns: repeat(3,1fr); }
-  .stat:nth-child(3) { border-right: 0; }.stat:nth-child(n+4) { border-top: 1px solid var(--mineral-200); }
 }
 
 @media (max-width: 780px) {

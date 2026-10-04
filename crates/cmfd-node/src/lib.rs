@@ -6,7 +6,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::Barrier;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, TryLockError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -165,6 +165,8 @@ const REMOTE_PROOF_CANCELLATION_POLL: Duration = Duration::from_millis(25);
 pub const MAX_REJECTED_BLOCK_IDS: usize = 1_024;
 pub const MAX_SUCCESSFUL_PROOF_CAPABILITIES: usize = 1_024;
 pub const MAX_EXTERNAL_RECONSTRUCTION_BLOCKS_PER_SLICE: usize = 8;
+/// Concurrent proof checks while pre-warming one fork-replay slice.
+const MAX_PARALLEL_REPLAY_PROOF_VERIFICATIONS: usize = 4;
 const MAX_BRANCH_STATE_CHECKPOINTS: usize = 4;
 const MAX_BRANCH_STATE_CHECKPOINT_BYTES: usize = 128 * 1024 * 1024;
 const ACTIVE_BRANCH_CHECKPOINT_INTERVAL: u64 = 16;
@@ -2111,12 +2113,16 @@ impl BlockPreverifier {
         #[cfg(test)]
         self.worker_dispatches.fetch_add(1, Ordering::Relaxed);
         #[cfg(test)]
-        if let Some(delay) = *self
-            .proof_dispatch_delay
-            .lock()
-            .map_err(|_| NodeError::ProofVerificationQueuePoisoned)?
         {
-            std::thread::sleep(delay);
+            // Copy the delay out so concurrent dispatches do not serialize on
+            // this test-only lock while sleeping.
+            let delay = *self
+                .proof_dispatch_delay
+                .lock()
+                .map_err(|_| NodeError::ProofVerificationQueuePoisoned)?;
+            if let Some(delay) = delay {
+                std::thread::sleep(delay);
+            }
         }
         let backend = self
             .backend
@@ -4326,6 +4332,38 @@ impl ExternalBlockAdmissionWork {
     }
 }
 
+/// Proof checks of replayed fork blocks are independent of each other, so a
+/// slice's uncached proofs are verified concurrently into the successful-proof
+/// cache before the ordered replay. The ordered replay still obtains every
+/// proof through `preverify_replay_cached` and handles all failures itself;
+/// errors here are deliberately ignored.
+fn prewarm_replay_proofs(block_preverifier: &BlockPreverifier, replay: &[BranchReplayBlock]) {
+    if replay.len() < 2 {
+        return;
+    }
+    let workers = thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(MAX_PARALLEL_REPLAY_PROOF_VERIFICATIONS)
+        .min(replay.len());
+    if workers < 2 {
+        return;
+    }
+    let next = AtomicUsize::new(0);
+    thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(entry) = replay.get(index) else {
+                        break;
+                    };
+                    let _ = block_preverifier.preverify_replay_cached(&entry.block);
+                }
+            });
+        }
+    });
+}
+
 fn complete_branch_state_plan(
     params: NetworkParams,
     verifier: &ConsensusPowVerifier,
@@ -4337,6 +4375,7 @@ fn complete_branch_state_plan(
         None => ChainState::new(params, verifier.clone())?,
     };
     let mut path = plan.path;
+    prewarm_replay_proofs(block_preverifier, &plan.replay);
     for replay in plan.replay {
         let entry = replay.indexed;
         let block = replay.block;
@@ -13176,6 +13215,45 @@ mod tests {
         }
         node.profile.proof = ProofProfile::ProductionV4;
         (node, path, blocks)
+    }
+
+    #[test]
+    fn fork_replay_slice_verifies_proofs_concurrently_and_once() {
+        let (mut node, path, blocks) = branch_checkpoint_fixture("parallel-replay-proofs", 20);
+        let now = DEVNET_GENESIS_TIMESTAMP + 20 * 60;
+        let candidate = mined_child(&node, blocks[18].block_id(), now, 0xee);
+        let verifier = node.block_preverifier.clone();
+        let delay = Duration::from_millis(200);
+        verifier.set_proof_dispatch_delay(Some(delay));
+        let dispatches_before = verifier.worker_dispatches.load(Ordering::Relaxed);
+        let started = Instant::now();
+        let progress = node
+            .begin_external_block_admission(&candidate, now)
+            .unwrap()
+            .unwrap()
+            .complete(&candidate)
+            .unwrap();
+        let elapsed = started.elapsed();
+        verifier.set_proof_dispatch_delay(None);
+        assert!(matches!(
+            progress,
+            ExternalBlockAdmissionProgress::Checkpoint { .. }
+        ));
+        assert_eq!(verifier.replay_state_blocks.load(Ordering::Relaxed), 8);
+        // Every replayed proof is still checked exactly once.
+        assert_eq!(
+            verifier.worker_dispatches.load(Ordering::Relaxed) - dispatches_before,
+            8
+        );
+        if thread::available_parallelism().map_or(1, usize::from) >= 2 {
+            assert!(
+                elapsed < delay * 6,
+                "eight replay proofs ran serially: {elapsed:?}"
+            );
+        }
+        drop(progress);
+        drop(node);
+        clean_test_dir(&path);
     }
 
     #[test]

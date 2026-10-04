@@ -2824,11 +2824,14 @@ fn effective_operational_peers(
         peers,
         allow_public_peers,
         no_default_seeds,
-        cfg!(any(
+        if cfg!(any(
             feature = "production-rc",
             feature = "production-mainnet"
-        ))
-        .then(|| COMPILED_NETWORK_PROFILE.bootstrap_peer()),
+        )) {
+            COMPILED_NETWORK_PROFILE.bootstrap_peers()
+        } else {
+            Vec::new()
+        },
     )
 }
 
@@ -2836,13 +2839,14 @@ fn effective_operational_peers_for_build(
     mut peers: Vec<SocketAddr>,
     mut allow_public_peers: bool,
     no_default_seeds: bool,
-    default_seed: Option<SocketAddr>,
+    default_seeds: Vec<SocketAddr>,
 ) -> Result<(Vec<SocketAddr>, bool), Box<dyn std::error::Error>> {
-    if peers.is_empty()
-        && !no_default_seeds
-        && let Some(seed) = default_seed
-    {
-        peers = SeedSet::new(vec![seed.to_string().parse()?])?.resolve(&SystemSeedResolver)?;
+    if peers.is_empty() && !no_default_seeds && !default_seeds.is_empty() {
+        let endpoints = default_seeds
+            .iter()
+            .map(|seed| seed.to_string().parse())
+            .collect::<Result<Vec<_>, _>>()?;
+        peers = SeedSet::new(endpoints)?.resolve(&SystemSeedResolver)?;
         allow_public_peers = true;
     }
     Ok((peers, allow_public_peers))
@@ -3202,15 +3206,16 @@ mod tests {
 
     #[test]
     fn production_rc_seed_defaults_are_explicit_replaceable_and_disableable() {
-        let seed = Some(cmfd_node::seed_peers::PRODUCTION_RC_SEED);
+        let seed = vec![cmfd_node::seed_peers::PRODUCTION_RC_SEED];
         let (defaults, public) =
-            effective_operational_peers_for_build(Vec::new(), false, false, seed).unwrap();
+            effective_operational_peers_for_build(Vec::new(), false, false, seed.clone()).unwrap();
         assert_eq!(defaults, vec![cmfd_node::seed_peers::PRODUCTION_RC_SEED]);
         assert!(public);
 
         let explicit = vec!["10.1.2.3:19444".parse().unwrap()];
         assert_eq!(
-            effective_operational_peers_for_build(explicit.clone(), false, false, seed).unwrap(),
+            effective_operational_peers_for_build(explicit.clone(), false, false, seed.clone())
+                .unwrap(),
             (explicit, false)
         );
         assert_eq!(
@@ -3218,21 +3223,31 @@ mod tests {
             (Vec::new(), false)
         );
         assert_eq!(
-            effective_operational_peers_for_build(Vec::new(), false, false, None).unwrap(),
+            effective_operational_peers_for_build(Vec::new(), false, false, Vec::new()).unwrap(),
             (Vec::new(), false)
         );
     }
 
     #[test]
-    fn mainnet_seed_selection_keeps_the_mainnet_port() {
-        let seed = "173.249.35.251:29444".parse().unwrap();
+    fn mainnet_seed_selection_keeps_the_mainnet_port_and_dials_the_relay_too() {
+        let seed: SocketAddr = "173.249.35.251:29444".parse().unwrap();
+        let relay: SocketAddr = "209.145.48.36:29444".parse().unwrap();
         let (peers, public) =
-            effective_operational_peers_for_build(Vec::new(), false, false, Some(seed)).unwrap();
-        assert_eq!(peers, vec![seed]);
+            effective_operational_peers_for_build(Vec::new(), false, false, vec![seed, relay])
+                .unwrap();
+        assert_eq!(peers, vec![seed, relay]);
         assert!(public);
         assert_eq!(
-            effective_operational_peers_for_build(Vec::new(), false, true, Some(seed)).unwrap(),
+            effective_operational_peers_for_build(Vec::new(), false, true, vec![seed, relay])
+                .unwrap(),
             (Vec::new(), false)
+        );
+        // An explicit --peer list replaces every compiled default, relay included.
+        let explicit = vec!["203.0.113.5:29444".parse().unwrap()];
+        assert_eq!(
+            effective_operational_peers_for_build(explicit.clone(), true, false, vec![seed, relay])
+                .unwrap(),
+            (explicit, true)
         );
     }
 

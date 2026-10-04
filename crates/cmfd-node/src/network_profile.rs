@@ -9,6 +9,10 @@ use crate::release_gate::{
 /// consensus reset.
 pub const PRODUCTION_RC_SEED_IPV4: Ipv4Addr = Ipv4Addr::new(173, 249, 35, 251);
 pub const PRODUCTION_RC_SEED_PORT: u16 = 19_444;
+/// Additional mainnet cold-start relays, dialled alongside the bootstrap seed
+/// so a fresh node spreads its initial sync instead of loading the seed alone.
+/// Operational infrastructure like the seed above: not part of any identity.
+pub const MAINNET_BOOTSTRAP_RELAYS_IPV4: [Ipv4Addr; 1] = [Ipv4Addr::new(209, 145, 48, 36)];
 
 /// Compile-time identity and default endpoints for one Common Foundry network.
 ///
@@ -192,6 +196,20 @@ impl NetworkProfile {
 
     pub const fn bootstrap_peer(self) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(self.bootstrap_ipv4), self.p2p_port)
+    }
+
+    /// Every compiled cold-start endpoint: the bootstrap seed first, then the
+    /// mainnet relays on the same P2P port. Other networks have only the seed.
+    pub fn bootstrap_peers(self) -> Vec<SocketAddr> {
+        let mut peers = vec![self.bootstrap_peer()];
+        if matches!(self.kind, NetworkProfileKind::Mainnet) {
+            peers.extend(
+                MAINNET_BOOTSTRAP_RELAYS_IPV4
+                    .iter()
+                    .map(|relay| SocketAddr::new(IpAddr::V4(*relay), self.p2p_port)),
+            );
+        }
+        peers
     }
 }
 
@@ -444,6 +462,34 @@ pub const COMPILED_NETWORK_PROFILE: NetworkProfile = match (
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mainnet_dials_the_seed_and_the_relays_other_networks_only_the_seed() {
+        assert_eq!(
+            RCNET1_PROFILE.bootstrap_peers(),
+            vec![crate::seed_peers::PRODUCTION_RC_SEED]
+        );
+        assert_eq!(
+            DEVNET_PROFILE.bootstrap_peers(),
+            vec![DEVNET_PROFILE.bootstrap_peer()]
+        );
+        let mainnet = NetworkProfile {
+            kind: NetworkProfileKind::Mainnet,
+            p2p_port: 29_444,
+            ..RCNET1_PROFILE
+        };
+        assert_eq!(
+            mainnet
+                .bootstrap_peers()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            vec!["173.249.35.251:29444", "209.145.48.36:29444"]
+        );
+        assert_eq!(mainnet.bootstrap_peers()[0], mainnet.bootstrap_peer());
+        // Relay endpoints are operational only; the identity fields are untouched.
+        assert_eq!(mainnet.network_id, RCNET1_PROFILE.network_id);
+    }
 
     #[test]
     fn rcnet_is_identity_and_storage_isolated_from_devnet() {

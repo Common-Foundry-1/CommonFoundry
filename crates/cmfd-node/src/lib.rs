@@ -3628,6 +3628,16 @@ pub(crate) struct ExchangeCustodyLegacySweepSummary {
     pub legacy_output_count: usize,
 }
 
+/// Where an active-chain transaction lookup last left off for one txid. A
+/// mark is trusted only while its block is still active at that height.
+#[derive(Clone, Copy, Debug)]
+enum TransactionScanMark {
+    Found { height: usize, block_id: [u8; 32] },
+    AbsentThrough { height: usize, block_id: [u8; 32] },
+}
+
+const MAX_TRANSACTION_SCAN_MARKS: usize = 4096;
+
 pub struct Node {
     /// Process-local identity used to bind off-lock admissions to this exact
     /// live node value, even if the value inside a shared mutex is replaced.
@@ -3647,6 +3657,9 @@ pub struct Node {
     branch_checkpoints: BranchCheckpointCache,
     explorer_outputs: explorer_address_index::AddressOutputIndex,
     explorer_history_cache: Option<explorer::ExplorerHistoryCache>,
+    /// Per-txid progress of active-chain transaction lookups, so repeated
+    /// lookups read only blocks added since the last verified scan point.
+    transaction_scan_marks: HashMap<[u8; 32], TransactionScanMark>,
     /// Monotonically changes after every successful block commit. External
     /// proof admissions bind to this value so branch snapshots cannot be
     /// committed after chain state or fork choice changes.
@@ -5317,6 +5330,7 @@ impl Node {
             branch_checkpoints: BranchCheckpointCache::default(),
             explorer_outputs,
             explorer_history_cache: None,
+            transaction_scan_marks: HashMap::new(),
             chain_revision,
             mempool: BTreeMap::new(),
             mempool_bytes: 0,
@@ -6738,7 +6752,41 @@ impl Node {
             if txids.is_empty() {
                 return Ok(confirmations);
             }
-            for position in (1..self.index.active_chain.len()).rev() {
+            let chain_len = self.index.active_chain.len();
+            // Only blocks above each txid's still-active scan mark are read;
+            // a reorganization below a mark discards it and rescans.
+            let mut pending = HashSet::new();
+            let mut lowest = chain_len;
+            for txid in txids {
+                let mark = self.transaction_scan_marks.get(txid).copied();
+                match mark {
+                    Some(TransactionScanMark::Found { height, block_id })
+                        if self.index.active_chain.get(height) == Some(&block_id) =>
+                    {
+                        let depth = u64::try_from(chain_len - height).map_err(|_| {
+                            NodeError::CorruptLog(
+                                "active transaction depth does not fit u64".to_owned(),
+                            )
+                        })?;
+                        confirmations.insert(*txid, depth);
+                    }
+                    Some(TransactionScanMark::AbsentThrough { height, block_id })
+                        if self.index.active_chain.get(height) == Some(&block_id) =>
+                    {
+                        pending.insert(*txid);
+                        lowest = lowest.min(height + 1);
+                    }
+                    _ => {
+                        pending.insert(*txid);
+                        lowest = 1;
+                    }
+                }
+            }
+            if pending.is_empty() {
+                return Ok(confirmations);
+            }
+            let mut found = HashMap::new();
+            for position in (lowest.max(1)..chain_len).rev() {
                 let block_id = self.index.active_chain[position];
                 let indexed = self.index.blocks.get(&block_id).cloned().ok_or_else(|| {
                     NodeError::CorruptLog(
@@ -6753,21 +6801,41 @@ impl Node {
                     self.params.network_id,
                     matches!(self.profile.proof, ProofProfile::ProductionV3),
                 )?;
-                let depth =
-                    u64::try_from(self.index.active_chain.len() - position).map_err(|_| {
-                        NodeError::CorruptLog(
-                            "active transaction depth does not fit u64".to_owned(),
-                        )
-                    })?;
                 for transaction in &block.transactions {
                     let txid = transaction.txid();
-                    if txids.contains(&txid) {
-                        confirmations.insert(txid, depth);
+                    if pending.contains(&txid) {
+                        found.entry(txid).or_insert(position);
                     }
                 }
-                if confirmations.len() == txids.len() {
+                if found.len() == pending.len() {
                     break;
                 }
+            }
+            if self.transaction_scan_marks.len() > MAX_TRANSACTION_SCAN_MARKS {
+                self.transaction_scan_marks.clear();
+            }
+            let tip_height = chain_len - 1;
+            let tip = self.index.active_chain[tip_height];
+            for txid in pending {
+                let mark = match found.get(&txid) {
+                    Some(&height) => {
+                        let depth = u64::try_from(chain_len - height).map_err(|_| {
+                            NodeError::CorruptLog(
+                                "active transaction depth does not fit u64".to_owned(),
+                            )
+                        })?;
+                        confirmations.insert(txid, depth);
+                        TransactionScanMark::Found {
+                            height,
+                            block_id: self.index.active_chain[height],
+                        }
+                    }
+                    None => TransactionScanMark::AbsentThrough {
+                        height: tip_height,
+                        block_id: tip,
+                    },
+                };
+                self.transaction_scan_marks.insert(txid, mark);
             }
             Ok(confirmations)
         })();
@@ -13965,6 +14033,54 @@ mod tests {
         };
         transaction.sign_all(&[&owner]).unwrap();
         transaction
+    }
+
+    #[test]
+    fn transaction_confirmation_lookup_resumes_from_its_scan_mark() {
+        let path = test_dir("transaction-scan-marks");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        let now = DEVNET_GENESIS_TIMESTAMP + 60;
+        let funding = node
+            .mine_once(default_miner_destination(), now, DEFAULT_MINING_ATTEMPTS)
+            .unwrap();
+        let transaction = spend_coinbase_output(&node, &funding, 2, 0x12, 0x31, 10);
+        let txid = transaction.txid();
+        let absent = [0xab; 32];
+        let txids = HashSet::from([txid, absent]);
+        let fresh = |node: &mut Node| {
+            node.transaction_scan_marks.clear();
+            node.active_transaction_confirmations_for(&txids).unwrap()
+        };
+
+        assert!(
+            node.active_transaction_confirmations_for(&txids)
+                .unwrap()
+                .is_empty()
+        );
+        node.submit_transaction(transaction).unwrap();
+        node.mine_once(
+            default_miner_destination(),
+            now + 1,
+            DEFAULT_MINING_ATTEMPTS,
+        )
+        .unwrap();
+        // The absent mark resumes above its scanned height and finds the new block.
+        let resumed = node.active_transaction_confirmations_for(&txids).unwrap();
+        assert_eq!(resumed, HashMap::from([(txid, 1)]));
+        for offset in 2..4 {
+            node.mine_once(
+                default_miner_destination(),
+                now + offset,
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        }
+        let cached = node.active_transaction_confirmations_for(&txids).unwrap();
+        assert_eq!(cached, HashMap::from([(txid, 3)]));
+        assert_eq!(cached, fresh(&mut node));
+        drop(node);
+        clean_test_dir(&path);
     }
 
     #[test]

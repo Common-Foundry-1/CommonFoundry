@@ -2945,22 +2945,30 @@ fn handle_connection(stream: TcpStream, shared: Arc<SharedServer>) -> Result<(),
             persistence: ledger_persistence(&shared.ledger).to_owned(),
         },
     )?;
-    write_frame(
-        &mut stream,
-        &ServerMessage::Job {
-            job: current_job(&shared)?,
-        },
-    )?;
+    let initial_job = current_job(&shared)?;
+    let mut sent_job_id = initial_job.job_id;
+    write_frame(&mut stream, &ServerMessage::Job { job: initial_job })?;
     stream.sock.set_read_timeout(Some(POOL_READ_TIMEOUT))?;
 
     let mut message_count = 0_u64;
     let mut share_rate = ShareRateLimiter::new(Instant::now());
+    let mut frame_reader = FrameReadState::default();
     while !shared.stop.load(Ordering::Acquire) {
-        rotate_if_tip_changed(&shared)?;
-        let message = match read_frame_interruptible::<_, ClientMessage>(&mut stream, &shared.stop)
+        let message = match read_frame_stateful::<_, ClientMessage>(&mut stream, &mut frame_reader)
         {
             Ok(message) => message,
             Err(PoolError::ConnectionClosed) => return Ok(()),
+            Err(PoolError::Io(error)) if is_timeout(&error) => {
+                // The listener rotates the job as soon as the tip changes.
+                // Push the replacement now so miners stop searching a stale
+                // parent instead of learning about it only with their next share.
+                let job = current_job(&shared)?;
+                if job.job_id != sent_job_id {
+                    sent_job_id = job.job_id;
+                    write_frame(&mut stream, &ServerMessage::Job { job })?;
+                }
+                continue;
+            }
             Err(error) => return Err(error),
         };
         message_count = message_count
@@ -3002,7 +3010,8 @@ fn handle_connection(stream: TcpStream, shared: Arc<SharedServer>) -> Result<(),
             retryable_result(&shared, session_id, job_id, nonce, "share_rate_limited")?
         };
         let after = current_job(&shared)?;
-        if before.job_id != after.job_id || job_id != before.job_id {
+        if before.job_id != after.job_id || job_id != before.job_id || after.job_id != sent_job_id {
+            sent_job_id = after.job_id;
             write_frame(&mut stream, &ServerMessage::Job { job: after })?;
         }
         write_frame(&mut stream, &ServerMessage::ShareResult { result })?;
@@ -5268,13 +5277,6 @@ fn read_frame_stateful<R: Read, T: DeserializeOwned>(
     Ok(decoded)
 }
 
-fn read_frame_interruptible<R: Read, T: DeserializeOwned>(
-    reader: &mut R,
-    stop: &AtomicBool,
-) -> Result<T, PoolError> {
-    read_frame_interruptible_inner(reader, stop, None)
-}
-
 fn read_frame_interruptible_until<R: Read, T: DeserializeOwned>(
     reader: &mut R,
     stop: &AtomicBool,
@@ -6876,6 +6878,42 @@ mod tests {
     }
 
     #[test]
+    fn new_tip_job_is_pushed_without_waiting_for_a_share() {
+        let (_root, server, node, pin) = server("push-new-tip-job");
+        let mut client = client(server.local_addr(), pin, "push-worker");
+        let first = client.current_job().clone();
+        let tip = {
+            let mut node = node.lock().unwrap();
+            node.mine_once(
+                default_miner_destination(),
+                unix_time_seconds().unwrap(),
+                10_000,
+            )
+            .unwrap();
+            node.state.tip()
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let pushed = loop {
+            assert!(Instant::now() < deadline, "new-tip job was not pushed");
+            match client.receive() {
+                Ok(PoolClientEvent::Job(job)) => break job,
+                Ok(PoolClientEvent::ShareResult(_)) => panic!("unsolicited share result"),
+                Err(PoolError::Io(error)) if is_timeout(&error) => {}
+                Err(error) => panic!("{error}"),
+            }
+        };
+        assert_ne!(pushed.job_id, first.job_id);
+        assert_eq!(pushed.challenge.previous_block, tip);
+        assert_eq!(client.current_job().job_id, pushed.job_id);
+
+        let work = client.current_work().unwrap();
+        let nonce = find_share(&work, false);
+        let accepted = client.submit_share(pushed.job_id, nonce).unwrap();
+        assert!(accepted.accepted);
+        server.stop().unwrap();
+    }
+
+    #[test]
     fn public_addresses_and_destructive_certificate_overwrite_are_refused() {
         assert!(matches!(
             validate_private_address("8.8.8.8:18445".parse().unwrap()),
@@ -7134,7 +7172,7 @@ mod tests {
             calls: 0,
         };
         let decoded: ClientMessage =
-            read_frame_interruptible(&mut fragmented, &AtomicBool::new(false)).unwrap();
+            read_frame_interruptible_inner(&mut fragmented, &AtomicBool::new(false), None).unwrap();
         assert!(matches!(
             decoded,
             ClientMessage::SubmitShare {

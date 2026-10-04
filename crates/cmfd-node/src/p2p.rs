@@ -1642,6 +1642,7 @@ fn respond_to_peer_inner_with_options(
     let observation_address = observed_address(PeerDirection::Inbound, remote_address);
     record_peer_started(&shared, PeerDirection::Inbound, observation_address.clone());
     let security = Arc::clone(&options.security);
+    let mut handshake_complete = false;
     let result = perform_respond_to_peer_inner_with_policy(
         Arc::clone(&shared),
         stream,
@@ -1649,6 +1650,7 @@ fn respond_to_peer_inner_with_options(
         remote_address,
         observation_address.clone(),
         options,
+        &mut handshake_complete,
     );
     match &result {
         Ok(()) => {
@@ -1657,7 +1659,7 @@ fn respond_to_peer_inner_with_options(
             }
         }
         Err(error) => {
-            let (penalty, reason) = inbound_reputation_penalty(error);
+            let (penalty, reason) = inbound_reputation_penalty(error, handshake_complete);
             if let Err(reputation_error) =
                 security.record_failure(remote_address.ip(), penalty, reason)
             {
@@ -1684,6 +1686,7 @@ fn perform_respond_to_peer_inner_with_policy(
     remote_address: SocketAddr,
     observation_address: String,
     options: InboundPeerOptions,
+    handshake_complete: &mut bool,
 ) -> Result<(), P2pError> {
     let hello = {
         let node = lock_node(&shared)?;
@@ -1699,6 +1702,7 @@ fn perform_respond_to_peer_inner_with_policy(
     }
     connection.send_hello()?;
     let remote_hello = expect_hello(connection.receive()?)?;
+    *handshake_complete = true;
     let proof_peer = next_remote_proof_peer_id()?;
     record_peer_succeeded(
         &shared,
@@ -1926,7 +1930,7 @@ fn transaction_rejection_is_peer_fault(error: &NodeError) -> bool {
     )
 }
 
-fn inbound_reputation_penalty(error: &P2pError) -> (u16, &'static str) {
+fn inbound_reputation_penalty(error: &P2pError, handshake_complete: bool) -> (u16, &'static str) {
     match error {
         P2pError::Peer(
             PeerError::PayloadTooLarge { .. }
@@ -1946,7 +1950,17 @@ fn inbound_reputation_penalty(error: &P2pError) -> (u16, &'static str) {
             | PeerError::SubmitBlockResponseTimeout
             | PeerError::BlockValidationWaitTimeout
             | PeerError::Io(_),
-        ) => (TRANSIENT_FAILURE_PENALTY, "inbound transport churn"),
+        ) => {
+            // Stock clients send their hello immediately after connecting, but
+            // may pause between later requests while their node validates a
+            // block or waits for its node lock. Such slowness is bounded by
+            // the session timeouts and per-IP limits, not evidence of abuse.
+            if handshake_complete {
+                (0, "no peer fault")
+            } else {
+                (TRANSIENT_FAILURE_PENALTY, "inbound transport churn")
+            }
+        }
         P2pError::Peer(_) | P2pError::UnexpectedMessage { .. } => {
             (PROTOCOL_VIOLATION_PENALTY, "peer protocol violation")
         }
@@ -3692,9 +3706,10 @@ mod tests {
 
         assert_eq!(outbound_reputation_penalty(&transport).0, 0);
         assert_eq!(
-            inbound_reputation_penalty(&transport).0,
+            inbound_reputation_penalty(&transport, false).0,
             TRANSIENT_FAILURE_PENALTY
         );
+        assert_eq!(inbound_reputation_penalty(&transport, true).0, 0);
         assert_eq!(
             outbound_reputation_penalty(&malformed).0,
             PROTOCOL_VIOLATION_PENALTY
@@ -4535,10 +4550,75 @@ mod tests {
             },
         ] {
             assert_eq!(
-                inbound_reputation_penalty(&P2pError::Peer(error)).0,
+                inbound_reputation_penalty(&P2pError::Peer(error), true).0,
                 RESOURCE_ABUSE_PENALTY
             );
         }
+    }
+
+    #[test]
+    fn slow_inbound_peer_after_handshake_is_not_banned_for_transport_churn() {
+        let path = test_dir("slow-handshaken-peer");
+        let shared = open_shared(&path);
+        let security = Arc::new(PeerSecurity::default());
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        // Earlier transient failures leave the address one penalty short of a ban.
+        assert!(
+            !security
+                .record_failure(
+                    loopback,
+                    PEER_BAN_SCORE - TRANSIENT_FAILURE_PENALTY,
+                    "earlier transport churn",
+                )
+                .unwrap()
+        );
+        let client_hello = with_nonce(shared.lock().unwrap().peer_hello(), Some(SOURCE_NONCE));
+
+        // A handshaken peer that pauses past the idle timeout, as a stock
+        // client does while its node validates, ends the session unpenalized.
+        // A connection that never sends its hello is still churn.
+        for (sends_hello, banned_after) in [(true, false), (false, true)] {
+            let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = socket.local_addr().unwrap();
+            let client = thread::spawn(move || {
+                let mut stream = Some(TcpStream::connect(address).unwrap());
+                let mut connection = None;
+                if sends_hello {
+                    let mut handshaken = PeerConnection::from_stream(
+                        stream.take().unwrap(),
+                        PeerSession::new(client_hello, test_limits()).unwrap(),
+                    )
+                    .unwrap();
+                    handshaken.send_hello().unwrap();
+                    assert!(matches!(
+                        handshaken.receive().unwrap(),
+                        PeerMessage::Hello(_)
+                    ));
+                    connection = Some(handshaken);
+                }
+                thread::sleep(test_limits().idle_timeout + Duration::from_millis(500));
+                drop((stream, connection));
+            });
+            let (stream, _) = socket.accept().unwrap();
+            let error = respond_to_peer_inner_with_options(
+                Arc::clone(&shared),
+                stream,
+                test_limits(),
+                InboundPeerOptions {
+                    address_policy: PeerAddressPolicy::PrivateOnly,
+                    nonce_override: Some(TARGET_NONCE),
+                    cancellation: None,
+                    discovery: None,
+                    security: Arc::clone(&security),
+                },
+            )
+            .unwrap_err();
+            assert!(matches!(error, P2pError::Peer(PeerError::IdleTimeout)));
+            assert_eq!(security.is_banned(loopback).unwrap(), banned_after);
+            client.join().unwrap();
+        }
+        drop(shared);
+        clean_test_dir(&path);
     }
 
     #[test]
@@ -5164,7 +5244,7 @@ mod tests {
                 actual: 63,
             }));
         assert_eq!(
-            inbound_reputation_penalty(&malformed_frame).0,
+            inbound_reputation_penalty(&malformed_frame, true).0,
             PROTOCOL_VIOLATION_PENALTY
         );
     }

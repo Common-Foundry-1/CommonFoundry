@@ -1,5 +1,38 @@
 # Mainnet block-download timeout recovery
 
+The next branch-state update retains bounded, process-local validated state
+between competing blocks and completed replay slices. A later child can resume
+from its verified ancestor instead of rebuilding state from genesis again.
+Recent active-state anchors are sampled every 16 blocks, and at startup, only
+when eligible for the checked memory budget. Checkout moves checkpoint state;
+it does not clone it. Active-anchor creation is the only bounded state clone.
+
+The cache holds at most four entries and an estimated 128 MiB of retained state.
+This heuristic is not a total-process RSS limit: checked-out reconstruction
+state, the active state, shared verifier allocations and allocator overhead are
+separate. Existing admission bounds and operator memory limits still apply.
+Eviction or lock contention can discard progress and cause safe cold replay.
+Cancellation never grants permission to commit an expired candidate.
+
+Checkpoints are private in-memory values bound to the exact node, network,
+consensus fingerprint and verifier generation. Reuse checks the indexed anchor,
+state/header agreement, path endpoints, retained log identity and extent, and
+the authenticated V2 anchor record. Every replayed suffix record and every new
+candidate still undergoes its normal validation. Skipped prefix bytes are not
+reread on every reuse: this retains already trusted state, like ordinary active
+extension. Startup anchors inherit the existing authenticated startup-snapshot
+trust; no remote snapshot or raw persisted delta becomes a new authority.
+
+Tests cover repeated competing forks with transactions and advancing tips,
+cancellation before/after a replay slice, queue failure after checkout, stale
+contexts, invalid bodies, corrupted anchors, bounded cache eviction, and short
+forks from a recent active anchor. An explicitly opted-in, ignored CPU-only test
+also accepts six preserved real mainnet block frames and authenticated public
+launch inputs, compares cold and warm branch admission, and checks the resulting
+state against a fresh independent replay. Its fixture output is isolated from
+operator wallets and live node data. This is not a claim of live multi-pool load
+qualification or a guarantee that every future fork will recover promptly.
+
 The sync.4 follow-up also preserves continuation through already-known active
 blocks. A sparse locator can skip the actual shared fork point. With a one-block
 batch, the peer then returns a known active ancestor before the competing branch.

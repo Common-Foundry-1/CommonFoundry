@@ -3731,6 +3731,165 @@ mod tests {
         check_single_block_fork_continuation(false, true);
     }
 
+    #[test]
+    fn repeated_competing_forks_reuse_state_while_both_tips_move() {
+        fn mine_active(node: &Arc<Mutex<Node>>, timestamp: u64, payout: u8) -> Block {
+            let block = {
+                let node = node.lock().unwrap();
+                let template = node
+                    .build_template(insecure_dev_destination(payout), timestamp)
+                    .unwrap();
+                let proof = node
+                    .verifier
+                    .mine(&template.challenge, 0, DEFAULT_MINING_ATTEMPTS)
+                    .unwrap();
+                Block {
+                    version: cmfd_consensus::BLOCK_VERSION,
+                    challenge: template.challenge,
+                    proof,
+                    coinbase: template.coinbase,
+                    transactions: template.transactions,
+                }
+            };
+            crate::submit_shared_block(node, block.clone(), timestamp).unwrap();
+            block
+        }
+
+        let source_path = test_dir("repeated-fork-state-source");
+        let target_path = test_dir("repeated-fork-state-target");
+        let source = open_shared(&source_path);
+        let target = open_shared(&target_path);
+        let start = unix_time_seconds().unwrap().saturating_sub(600);
+        for offset in 0..16 {
+            let block = mine_active(&source, start + offset, 0x81);
+            target
+                .lock()
+                .unwrap()
+                .submit_block(block, start + offset)
+                .unwrap();
+        }
+        // Exercise production branch admission with cheap deterministic V2
+        // proofs; this is a state-reuse regression, not a V4 speed benchmark.
+        target.lock().unwrap().profile.proof = crate::ProofProfile::ProductionV4;
+        let replayed = Arc::clone(&target.lock().unwrap().block_preverifier.replay_state_blocks);
+        let limits = PeerLimits {
+            max_bytes_per_peer: (MAX_TRANSACTIONS_PER_SYNC * MAX_TRANSACTION_BYTES) as u64
+                + SYNC_CONTROL_RESERVE_BYTES
+                + max_block_bytes_for_network(crate::DEVNET_PROFILE.network_id) as u64,
+            ..test_limits()
+        };
+        assert_eq!(
+            block_sync_batch_limit(crate::DEVNET_PROFILE.network_id, limits),
+            1
+        );
+        let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = socket.local_addr().unwrap();
+        let listener =
+            spawn_inbound_listener_inner(Arc::clone(&source), socket, limits, Some(SOURCE_NONCE))
+                .unwrap();
+
+        for round in 0..3 {
+            assert!(tips_match(&source, &target));
+            let timestamp = start + 100 + round * 100;
+            let transaction = {
+                let mut node = source.lock().unwrap();
+                let tip = node.peer_hello().tip;
+                let funding = decode_block(
+                    &node.canonical_block(tip).unwrap().unwrap(),
+                    node.peer_hello().network_id,
+                )
+                .unwrap();
+                spend_community_output(&node, &funding, 10)
+            };
+            let source_output = OutPoint {
+                txid: transaction.txid(),
+                index: 0,
+            };
+            let mut competing_transaction = transaction.clone();
+            competing_transaction.outputs[0].lock = OutputLock::Key(insecure_dev_destination(0x92));
+            competing_transaction
+                .sign_all(&[&SigningKey::from_bytes(&[0x12; 32]).unwrap()])
+                .unwrap();
+            let target_output = OutPoint {
+                txid: competing_transaction.txid(),
+                index: 0,
+            };
+            source
+                .lock()
+                .unwrap()
+                .submit_transaction(transaction)
+                .unwrap();
+            target
+                .lock()
+                .unwrap()
+                .submit_transaction(competing_transaction)
+                .unwrap();
+            for offset in 1..=3 {
+                mine_active(&source, timestamp + offset, 0x81);
+            }
+            mine_active(&target, timestamp + 21, 0x91);
+            let mut local_tip = mine_active(&target, timestamp + 22, 0x91).block_id();
+            let mut warmed_replays = None;
+
+            for session in 0..5 {
+                let report = sync_from_peer_once_inner(
+                    Arc::clone(&target),
+                    address,
+                    limits,
+                    Some(TARGET_NONCE),
+                )
+                .unwrap();
+                assert_eq!(report.inventory_items, 1);
+                assert_eq!(report.requested_blocks, 1);
+                assert_eq!(report.accepted_blocks, 1);
+                assert_eq!(report.already_known, 0);
+                let completed_replays = replayed.load(Ordering::Relaxed);
+                if let Some(warmed) = warmed_replays {
+                    assert_eq!(
+                        completed_replays, warmed,
+                        "round {round} session {session} replayed ancestors instead of reusing the validated side tip"
+                    );
+                } else {
+                    warmed_replays = Some(completed_replays);
+                }
+                if session < 3 {
+                    let node = target.lock().unwrap();
+                    assert_eq!(
+                        node.peer_hello().tip,
+                        local_tip,
+                        "equal or lower work must not switch branches"
+                    );
+                    assert!(node.state.utxos().get(&target_output).is_some());
+                    assert!(node.state.utxos().get(&source_output).is_none());
+                }
+                if session == 0 {
+                    // Change both tips while the target retains a validated
+                    // side branch. A new local revision must not lose it.
+                    local_tip = mine_active(&target, timestamp + 23, 0x91).block_id();
+                    mine_active(&source, timestamp + 4, 0x81);
+                } else if session == 1 {
+                    mine_active(&source, timestamp + 5, 0x81);
+                }
+            }
+            assert!(tips_match(&source, &target));
+            let source_node = source.lock().unwrap();
+            let target_node = target.lock().unwrap();
+            assert_eq!(source_node.cumulative_work(), target_node.cumulative_work());
+            assert_eq!(
+                source_node.state.encode_local_snapshot().unwrap(),
+                target_node.state.encode_local_snapshot().unwrap(),
+                "round {round} must converge on the exact transaction and chain state"
+            );
+            assert!(target_node.state.utxos().get(&source_output).is_some());
+            assert!(target_node.state.utxos().get(&target_output).is_none());
+        }
+        listener.stop().unwrap();
+        drop(source);
+        drop(target);
+        clean_test_dir(&source_path);
+        clean_test_dir(&target_path);
+    }
+
     fn check_single_block_fork_continuation(restart: bool, grow: bool) {
         let source_path = test_dir("single-fork-source");
         let target_path = test_dir("single-fork-target");

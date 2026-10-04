@@ -97,6 +97,8 @@ pub mod pool_dashboard;
 pub mod production_v4_pool;
 #[cfg(feature = "production-v4")]
 pub mod rcnet_candidate;
+#[cfg(all(test, feature = "production-v4"))]
+mod real_fork_checkpoint_tests;
 pub mod seed_peers;
 mod startup_snapshot;
 pub mod storage;
@@ -163,6 +165,9 @@ const REMOTE_PROOF_CANCELLATION_POLL: Duration = Duration::from_millis(25);
 pub const MAX_REJECTED_BLOCK_IDS: usize = 1_024;
 pub const MAX_SUCCESSFUL_PROOF_CAPABILITIES: usize = 1_024;
 pub const MAX_EXTERNAL_RECONSTRUCTION_BLOCKS_PER_SLICE: usize = 8;
+const MAX_BRANCH_STATE_CHECKPOINTS: usize = 4;
+const MAX_BRANCH_STATE_CHECKPOINT_BYTES: usize = 128 * 1024 * 1024;
+const ACTIVE_BRANCH_CHECKPOINT_INTERVAL: u64 = 16;
 pub const PRODUCTION_V3_PACKAGE_ARTIFACT_DIRECTORY: &str = "production-v3";
 pub const PRODUCTION_V3_PACKAGE_BANK: &str = "MODEL-V2.bank";
 pub const PRODUCTION_V3_PACKAGE_MANIFEST: &str = "MODEL-V2.manifest.json";
@@ -1896,6 +1901,8 @@ pub struct BlockPreverifier {
     #[cfg(test)]
     worker_dispatches: Arc<AtomicU64>,
     #[cfg(test)]
+    replay_state_blocks: Arc<AtomicU64>,
+    #[cfg(test)]
     proof_dispatch_delay: Arc<Mutex<Option<Duration>>>,
 }
 
@@ -1991,6 +1998,8 @@ impl BlockPreverifier {
             successful_proofs: Arc::new(Mutex::new(SuccessfulProofCache::default())),
             #[cfg(test)]
             worker_dispatches: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            replay_state_blocks: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             proof_dispatch_delay: Arc::new(Mutex::new(None)),
         }
@@ -3635,6 +3644,7 @@ pub struct Node {
     block_preverifier: BlockPreverifier,
     state: ChainState,
     index: BlockIndex,
+    branch_checkpoints: BranchCheckpointCache,
     explorer_outputs: explorer_address_index::AddressOutputIndex,
     explorer_history_cache: Option<explorer::ExplorerHistoryCache>,
     /// Monotonically changes after every successful block commit. External
@@ -3747,9 +3757,78 @@ struct BlockIndex {
 
 #[derive(Debug)]
 struct BranchStateCheckpoint {
+    context: BranchStateContext,
     block_id: [u8; 32],
     state: Box<ChainState>,
     path: Vec<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BranchStateContext {
+    node_instance_id: u64,
+    network_id: [u8; 32],
+    fingerprint: [u8; 32],
+    verifier_generation: u64,
+}
+
+#[derive(Debug)]
+struct CachedBranchCheckpoint {
+    checkpoint: BranchStateCheckpoint,
+    anchor: BlockRecordLocator,
+    charge: usize,
+}
+
+#[derive(Debug, Default)]
+struct BranchCheckpointCache {
+    entries: VecDeque<CachedBranchCheckpoint>,
+    charged_bytes: usize,
+}
+
+impl BranchCheckpointCache {
+    fn remove(&mut self, position: usize) -> CachedBranchCheckpoint {
+        let removed = self
+            .entries
+            .remove(position)
+            .expect("checked checkpoint index");
+        self.charged_bytes -= removed.charge;
+        removed
+    }
+
+    fn insert(&mut self, checkpoint: BranchStateCheckpoint, anchor: BlockRecordLocator) {
+        let Some(charge) = checkpoint_charge(&checkpoint.state, checkpoint.path.capacity()) else {
+            return;
+        };
+        if charge > MAX_BRANCH_STATE_CHECKPOINT_BYTES {
+            return;
+        }
+        if let Some(position) = self
+            .entries
+            .iter()
+            .position(|entry| entry.checkpoint.block_id == checkpoint.block_id)
+        {
+            self.remove(position);
+        }
+        while self.entries.len() >= MAX_BRANCH_STATE_CHECKPOINTS
+            || self.charged_bytes > MAX_BRANCH_STATE_CHECKPOINT_BYTES - charge
+        {
+            self.remove(0);
+        }
+        self.charged_bytes += charge;
+        self.entries.push_back(CachedBranchCheckpoint {
+            checkpoint,
+            anchor,
+            charge,
+        });
+    }
+}
+
+fn checkpoint_charge(state: &ChainState, path_capacity: usize) -> Option<usize> {
+    state
+        .estimated_unique_heap_payload_bytes()
+        .ok()?
+        .checked_add(std::mem::size_of::<CachedBranchCheckpoint>())?
+        .checked_add(path_capacity.checked_mul(std::mem::size_of::<[u8; 32]>())?)?
+        .checked_add(128)
 }
 
 #[derive(Debug)]
@@ -3985,6 +4064,22 @@ struct PreparedBlock {
 }
 
 impl PreparedBlock {
+    fn into_parent_checkpoint(self, context: BranchStateContext) -> Option<BranchStateCheckpoint> {
+        let ValidatedCandidate::Branch { state, .. } = self.candidate else {
+            return None;
+        };
+        let mut path = self.activation_chain?;
+        if path.pop() != Some(self.block_id) || state.tip() != self.parent {
+            return None;
+        }
+        Some(BranchStateCheckpoint {
+            context,
+            block_id: self.parent,
+            state,
+            path,
+        })
+    }
+
     fn validated_block(&self) -> &ValidatedBlock {
         match &self.candidate {
             ValidatedCandidate::Active(validated)
@@ -4019,6 +4114,7 @@ enum AdmissionStateSnapshot {
 /// mutex. Completing this value never touches live node state.
 pub(crate) struct ExternalBlockAdmissionWork {
     node_instance_id: u64,
+    checkpoint_context: BranchStateContext,
     revision: u64,
     block_id: [u8; 32],
     parent: [u8; 32],
@@ -4036,6 +4132,7 @@ pub(crate) struct ExternalBlockAdmissionWork {
 /// node mutex. The external worker capability is still required separately.
 #[derive(Debug)]
 pub(crate) struct ExternalBlockAdmission {
+    checkpoint_context: BranchStateContext,
     revision: u64,
     block_id: [u8; 32],
     parent: [u8; 32],
@@ -4047,6 +4144,75 @@ pub(crate) struct ExternalBlockAdmission {
 enum ExternalBlockAdmissionProgress {
     Ready(ExternalBlockAdmission),
     Checkpoint { checkpoint: BranchStateCheckpoint },
+}
+
+impl ExternalBlockAdmissionProgress {
+    fn into_checkpoint(self) -> Option<BranchStateCheckpoint> {
+        match self {
+            Self::Checkpoint { checkpoint } => Some(checkpoint),
+            Self::Ready(admission) => {
+                let state = admission.branch_state?;
+                let mut path = admission.activation_chain?;
+                if path.pop() != Some(admission.block_id) || state.tip() != admission.parent {
+                    return None;
+                }
+                Some(BranchStateCheckpoint {
+                    context: admission.checkpoint_context,
+                    block_id: admission.parent,
+                    state,
+                    path,
+                })
+            }
+        }
+    }
+}
+
+/// A canceled request may preserve completed ancestor state, never its right
+/// to commit a candidate. Cleanup is best-effort and never waits for Node.
+struct PendingExternalAdmission {
+    shared: Arc<Mutex<Node>>,
+    progress: Option<ExternalBlockAdmissionProgress>,
+}
+
+/// Covers the interval after a cache checkout but before a replay slice can
+/// complete, including reconstruction-queue failure and request cancellation.
+struct PendingExternalWork {
+    shared: Arc<Mutex<Node>>,
+    work: Option<ExternalBlockAdmissionWork>,
+}
+
+impl Drop for PendingExternalWork {
+    fn drop(&mut self) {
+        let Some(work) = self.work.take() else {
+            return;
+        };
+        let AdmissionStateSnapshot::Branch(plan) = work.state_snapshot else {
+            return;
+        };
+        let Some(state) = plan.base else {
+            return;
+        };
+        let checkpoint = BranchStateCheckpoint {
+            context: work.checkpoint_context,
+            block_id: state.tip(),
+            state,
+            path: plan.path,
+        };
+        if let Ok(mut node) = self.shared.try_lock() {
+            node.remember_branch_checkpoint(checkpoint);
+        }
+    }
+}
+
+impl Drop for PendingExternalAdmission {
+    fn drop(&mut self) {
+        let Some(checkpoint) = self.progress.take().and_then(|p| p.into_checkpoint()) else {
+            return;
+        };
+        if let Ok(mut node) = self.shared.try_lock() {
+            node.remember_branch_checkpoint(checkpoint);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4098,6 +4264,7 @@ impl ExternalBlockAdmissionWork {
                     let block_id = state.tip();
                     return Ok(ExternalBlockAdmissionProgress::Checkpoint {
                         checkpoint: BranchStateCheckpoint {
+                            context: self.checkpoint_context,
                             block_id,
                             state: Box::new(state),
                             path,
@@ -4134,6 +4301,7 @@ impl ExternalBlockAdmissionWork {
         });
         Ok(ExternalBlockAdmissionProgress::Ready(
             ExternalBlockAdmission {
+                checkpoint_context: self.checkpoint_context,
                 revision: self.revision,
                 block_id: self.block_id,
                 parent: self.parent,
@@ -4200,6 +4368,10 @@ fn complete_branch_state_plan(
                 "captured production fork block cannot commit during replay: {error}"
             ))
         })?;
+        #[cfg(test)]
+        block_preverifier
+            .replay_state_blocks
+            .fetch_add(1, Ordering::Relaxed);
         let successor_header = state.successor_header_preflight().map_err(|error| {
             NodeError::CorruptLog(format!(
                 "captured production fork successor state is invalid: {error}"
@@ -5142,6 +5314,7 @@ impl Node {
             block_preverifier,
             state,
             index,
+            branch_checkpoints: BranchCheckpointCache::default(),
             explorer_outputs,
             explorer_history_cache: None,
             chain_revision,
@@ -5188,6 +5361,7 @@ impl Node {
         if !startup_snapshot_used {
             let _ = node.persist_startup_snapshot();
         }
+        node.remember_active_branch_checkpoint(true);
         Ok(node)
     }
 
@@ -7040,7 +7214,7 @@ impl Node {
             // ProductionV3 callers must use `submit_shared_block`.
             return Err(NodeError::ProductionV3Unavailable);
         }
-        self.submit_block_with_preverification(block, accepted_at, None, None, None, None)
+        self.submit_block_with_preverification(block, accepted_at, None, None, None, None, None)
     }
 
     /// Rejects cheap duplicate, ancestry, and successor-header failures before
@@ -7118,6 +7292,157 @@ impl Node {
         self.begin_external_block_admission_from_checkpoint(block, accepted_at, None)
     }
 
+    fn branch_state_context(&self) -> BranchStateContext {
+        BranchStateContext {
+            node_instance_id: self.instance_id,
+            network_id: self.params.network_id,
+            fingerprint: self.fingerprint,
+            verifier_generation: self
+                .block_preverifier
+                .backend_generation
+                .load(Ordering::Acquire),
+        }
+    }
+
+    fn checkpoint_matches_index(&self, checkpoint: &BranchStateCheckpoint) -> bool {
+        if self.storage_faulted
+            || checkpoint.context != self.branch_state_context()
+            || checkpoint.state.params() != &self.params
+            || checkpoint.state.tip() != checkpoint.block_id
+        {
+            return false;
+        }
+        let Some(entry) = self.index.blocks.get(&checkpoint.block_id) else {
+            return false;
+        };
+        let Ok(height) = usize::try_from(entry.height()) else {
+            return false;
+        };
+        if height.checked_add(1) != Some(checkpoint.path.len())
+            || checkpoint.path.first() != Some(&self.index.genesis)
+            || checkpoint.path.last() != Some(&checkpoint.block_id)
+            || checkpoint.state.successor_header_preflight().ok() != Some(entry.successor_header)
+        {
+            return false;
+        }
+        // The move-only path was built by local validated replay (or copied
+        // from the active index), never deserialized from a remote cache.
+        // Do not rescan the entire prefix under the Node mutex on every use.
+        checkpoint.path.get(height.saturating_sub(1)) == Some(&entry.parent())
+    }
+
+    fn remember_branch_checkpoint(&mut self, checkpoint: BranchStateCheckpoint) {
+        if !matches!(
+            self.profile.proof,
+            ProofProfile::ProductionV3 | ProofProfile::ProductionV4
+        ) || self.block_preverifier.ensure_reconstruction_open().is_err()
+            || !self.checkpoint_matches_index(&checkpoint)
+        {
+            return;
+        }
+        let anchor = self.index.blocks[&checkpoint.block_id].locator;
+        self.branch_checkpoints.insert(checkpoint, anchor);
+    }
+
+    /// Seed a recent verified active state for shallow forks. Clone only at a
+    /// fixed cadence and only below the checked cache budget; cache checkout is
+    /// move-only. This is state reuse, not a new proof capability or disk trust.
+    fn remember_active_branch_checkpoint(&mut self, force: bool) {
+        let height = self.state.next_height().saturating_sub(1);
+        if self.storage_faulted
+            || height == 0
+            || !matches!(
+                self.profile.proof,
+                ProofProfile::ProductionV3 | ProofProfile::ProductionV4
+            )
+            || (!force && !height.is_multiple_of(ACTIVE_BRANCH_CHECKPOINT_INTERVAL))
+            || self.block_preverifier.ensure_reconstruction_open().is_err()
+        {
+            return;
+        }
+        let Some(charge) = checkpoint_charge(&self.state, self.index.active_chain.len()) else {
+            return;
+        };
+        if charge > MAX_BRANCH_STATE_CHECKPOINT_BYTES {
+            return;
+        }
+        while !self.branch_checkpoints.entries.is_empty()
+            && (self.branch_checkpoints.entries.len() >= MAX_BRANCH_STATE_CHECKPOINTS
+                || self.branch_checkpoints.charged_bytes
+                    > MAX_BRANCH_STATE_CHECKPOINT_BYTES - charge)
+        {
+            self.branch_checkpoints.remove(0);
+        }
+        let checkpoint = BranchStateCheckpoint {
+            context: self.branch_state_context(),
+            block_id: self.state.tip(),
+            state: Box::new(self.state.clone()),
+            path: self.index.active_chain.clone(),
+        };
+        self.remember_branch_checkpoint(checkpoint);
+    }
+
+    fn take_branch_checkpoint(
+        &mut self,
+        parent: [u8; 32],
+    ) -> Result<Option<BranchStateCheckpoint>, NodeError> {
+        self.block_preverifier.ensure_reconstruction_open()?;
+        let mut best = None;
+        for position in (0..self.branch_checkpoints.entries.len()).rev() {
+            let entry = &self.branch_checkpoints.entries[position];
+            if !self.checkpoint_matches_index(&entry.checkpoint)
+                || self
+                    .index
+                    .blocks
+                    .get(&entry.checkpoint.block_id)
+                    .map(|b| b.locator)
+                    != Some(entry.anchor)
+            {
+                self.branch_checkpoints.remove(position);
+            }
+        }
+        for (position, entry) in self.branch_checkpoints.entries.iter().enumerate() {
+            let height = entry.anchor.height;
+            if self.index.ancestor_at_height(parent, height).ok() == Some(entry.checkpoint.block_id)
+                && best.is_none_or(|(_, best_height)| height > best_height)
+            {
+                best = Some((position, height));
+            }
+        }
+        let Some((position, _)) = best else {
+            return Ok(None);
+        };
+        let cached = self.branch_checkpoints.remove(position);
+        let log_path = self.data_dir.join(BLOCK_LOG_FILE);
+        let authenticated = (|| {
+            verify_retained_block_log_path(&self.log, &log_path)?;
+            if self
+                .log
+                .metadata()
+                .map_err(|e| io_error("inspect checkpoint log", &log_path, e))?
+                .len()
+                != self.block_log_length
+            {
+                return Err(NodeError::CorruptLog(
+                    "checkpoint log extent changed".to_owned(),
+                ));
+            }
+            // Authenticate the anchor; all newly replayed suffix records retain
+            // their normal checks. Previously validated prefix state is reused
+            // just as on active extension, not re-read from untrusted snapshots.
+            read_located_record(
+                &self.log,
+                &log_path,
+                &cached.anchor,
+                self.params.network_id,
+                true,
+            )?;
+            Ok(())
+        })();
+        self.latch_authenticated_storage_failure(authenticated)?;
+        Ok(Some(cached.checkpoint))
+    }
+
     fn continue_external_block_admission(
         &mut self,
         block: &Block,
@@ -7146,12 +7471,23 @@ impl Node {
         }
         let block_id = block.block_id();
         let parent = block.challenge.previous_block;
+        let checkpoint_context = self.branch_state_context();
+        if checkpoint
+            .as_ref()
+            .is_some_and(|checkpoint| !self.checkpoint_matches_index(checkpoint))
+        {
+            return Err(NodeError::StaleBlockAdmission);
+        }
         let state_snapshot = if parent == self.state.tip() {
             if checkpoint.is_some() {
                 return Err(NodeError::StaleBlockAdmission);
             }
             AdmissionStateSnapshot::Active
         } else {
+            let checkpoint = match checkpoint {
+                Some(checkpoint) => Some(checkpoint),
+                None => self.take_branch_checkpoint(parent)?,
+            };
             let log_path = self.data_dir.join(BLOCK_LOG_FILE);
             let plan = self.index.branch_state_plan(
                 parent,
@@ -7165,6 +7501,7 @@ impl Node {
         };
         Ok(Some(ExternalBlockAdmissionWork {
             node_instance_id: self.instance_id,
+            checkpoint_context,
             revision: self.chain_revision,
             block_id,
             parent,
@@ -7218,6 +7555,7 @@ impl Node {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -7235,6 +7573,7 @@ impl Node {
             block,
             accepted_at,
             Some(&preverified),
+            None,
             None,
             None,
             request,
@@ -7259,7 +7598,8 @@ impl Node {
         ) {
             return Err(NodeError::ProofVerifierProfileMismatch);
         }
-        if admission.revision != self.chain_revision
+        if admission.checkpoint_context != self.branch_state_context()
+            || admission.revision != self.chain_revision
             || admission.block_id != block.block_id()
             || admission.parent != block.challenge.previous_block
             || admission.accepted_at != accepted_at
@@ -7272,6 +7612,7 @@ impl Node {
             Some(&preverified),
             admission.branch_state,
             admission.activation_chain,
+            Some(admission.checkpoint_context),
             None,
         )
     }
@@ -7290,7 +7631,8 @@ impl Node {
         ) {
             return Err(NodeError::ProofVerifierProfileMismatch);
         }
-        if admission.revision != self.chain_revision
+        if admission.checkpoint_context != self.branch_state_context()
+            || admission.revision != self.chain_revision
             || admission.block_id != block.block_id()
             || admission.parent != block.challenge.previous_block
             || admission.accepted_at != accepted_at
@@ -7303,10 +7645,12 @@ impl Node {
             Some(&preverified),
             admission.branch_state,
             admission.activation_chain,
+            Some(admission.checkpoint_context),
             request,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn submit_block_with_preverification(
         &mut self,
         block: Block,
@@ -7314,9 +7658,24 @@ impl Node {
         preverified: Option<&PreverifiedBlockProof>,
         branch_state: Option<Box<ChainState>>,
         activation_chain: Option<Vec<[u8; 32]>>,
+        checkpoint_context: Option<BranchStateContext>,
         request: Option<&RemoteProofRequest>,
     ) -> Result<u64, NodeError> {
-        ensure_remote_request_live(request)?;
+        if let Err(error) = ensure_remote_request_live(request) {
+            if let (Some(state), Some(mut path), Some(context)) =
+                (branch_state, activation_chain, checkpoint_context)
+                && path.pop() == Some(block.block_id())
+                && state.tip() == block.challenge.previous_block
+            {
+                self.remember_branch_checkpoint(BranchStateCheckpoint {
+                    context,
+                    block_id: state.tip(),
+                    state,
+                    path,
+                });
+            }
+            return Err(error);
+        }
         if self.storage_faulted {
             return Err(NodeError::StorageFaulted);
         }
@@ -7402,14 +7761,25 @@ impl Node {
         // form the request-lifetime linearization point. A cancellation that
         // wins first can never append. Once the recheck succeeds, every later
         // failure is a storage fault rather than an ordinary retryable result.
-        let mut commit_guard = request
+        let commit_guard_result = request
             .map(|request| {
                 request.begin_commit_after_check(|| {
                     #[cfg(test)]
                     self.pause_commit_race(CommitPausePoint::AfterDeadlineCheck);
                 })
             })
-            .transpose()?;
+            .transpose();
+        let mut commit_guard = match commit_guard_result {
+            Ok(guard) => guard,
+            Err(error) => {
+                if let Some(context) = checkpoint_context
+                    && let Some(checkpoint) = prepared.into_parent_checkpoint(context)
+                {
+                    self.remember_branch_checkpoint(checkpoint);
+                }
+                return Err(error);
+            }
+        };
         #[cfg(test)]
         self.pause_commit_race(CommitPausePoint::AfterTransition);
         if let Err(source) = self.log.write_all(&record) {
@@ -7475,6 +7845,19 @@ impl Node {
                 }
                 if let Some(guard) = commit_guard.take() {
                     guard.finish(RemoteProofRequestState::Completed);
+                }
+                if let Some(context) = checkpoint_context
+                    && let Some((state, path)) = outcome.retained_state
+                {
+                    self.remember_branch_checkpoint(BranchStateCheckpoint {
+                        context,
+                        block_id: state.tip(),
+                        state,
+                        path,
+                    });
+                }
+                if canonical_tip_changed {
+                    self.remember_active_branch_checkpoint(false);
                 }
                 // Keep the authenticated fast-start state current while the
                 // node is running, including after nonwinning side-branch
@@ -7954,13 +8337,21 @@ fn submit_shared_block_with_policy(
     };
 
     let admission = match admission_work {
-        Some(mut work) => {
-            let _reconstruction_permit = work
+        Some(work) => {
+            let mut pending_work = PendingExternalWork {
+                shared: Arc::clone(shared),
+                work: Some(work),
+            };
+            let _reconstruction_permit = pending_work
+                .work
+                .as_ref()
+                .expect("pending replay work")
                 .requires_reconstruction()
                 .then(|| block_preverifier.reserve_reconstruction())
                 .transpose()?;
             loop {
                 ensure_remote_request_live(remote_request.as_ref())?;
+                let work = pending_work.work.take().expect("pending replay work");
                 let work_node_instance_id = work.node_instance_id;
                 let work_revision = work.revision;
                 let progress = match catch_unwind(AssertUnwindSafe(|| work.complete(&block))) {
@@ -7978,10 +8369,14 @@ fn submit_shared_block_with_policy(
                     }
                     Err(_) => return Err(NodeError::ProofVerifierPanicked),
                 };
+                let mut pending = PendingExternalAdmission {
+                    shared: Arc::clone(shared),
+                    progress: Some(progress),
+                };
                 ensure_remote_request_live(remote_request.as_ref())?;
-                match progress {
-                    ExternalBlockAdmissionProgress::Ready(admission) => break Some(admission),
-                    ExternalBlockAdmissionProgress::Checkpoint { checkpoint } => {
+                match pending.progress.as_ref().expect("pending admission") {
+                    ExternalBlockAdmissionProgress::Ready(_) => break Some(pending),
+                    ExternalBlockAdmissionProgress::Checkpoint { .. } => {
                         block_preverifier.ensure_reconstruction_open()?;
                         let mut node = lock_shared_node(shared, remote_request.as_ref())?;
                         if matches!(policy, SharedBlockPolicy::ActiveTipOnly)
@@ -7989,11 +8384,16 @@ fn submit_shared_block_with_policy(
                         {
                             return Err(NodeError::StaleBlockAdmission);
                         }
-                        work = node.continue_external_block_admission(
+                        let Some(ExternalBlockAdmissionProgress::Checkpoint { checkpoint }) =
+                            pending.progress.take()
+                        else {
+                            unreachable!("checked pending checkpoint");
+                        };
+                        pending_work.work = Some(node.continue_external_block_admission(
                             &block,
                             accepted_at,
                             checkpoint,
-                        )?;
+                        )?);
                     }
                 }
             }
@@ -8010,7 +8410,12 @@ fn submit_shared_block_with_policy(
     }
     let externally_admitted = admission.is_some();
     let result = match admission {
-        Some(mut admission) => {
+        Some(mut pending) => {
+            let Some(ExternalBlockAdmissionProgress::Ready(mut admission)) =
+                pending.progress.take()
+            else {
+                unreachable!("checked ready admission");
+            };
             if admission.branch_state.is_some() {
                 node.preflight_external_block_admission(&block, accepted_at)?;
                 admission.revision = node.chain_revision;
@@ -8350,6 +8755,7 @@ fn replay_indexed_state_to(
 
 struct CommitOutcome {
     fees: u64,
+    retained_state: Option<(Box<ChainState>, Vec<[u8; 32]>)>,
 }
 
 fn commit_prepared(
@@ -8391,6 +8797,7 @@ fn commit_prepared(
         None
     };
 
+    let mut retained_state = None;
     let (fees, successor_header) = match prepared.candidate {
         ValidatedCandidate::Active(validated) => {
             let fees = active_state.commit_validated(validated)?;
@@ -8404,7 +8811,10 @@ fn commit_prepared(
             let fees = state.commit_validated(validated)?;
             let successor_header = state.successor_header_preflight()?;
             if activates {
-                *active_state = *state;
+                let old_state = std::mem::replace(active_state, *state);
+                retained_state = Some((Box::new(old_state), index.active_chain.clone()));
+            } else if let Some(path) = externally_prepared_chain.take() {
+                retained_state = Some((state, path));
             }
             (fees, successor_header)
         }
@@ -8455,7 +8865,10 @@ fn commit_prepared(
         }
         index.active_work = prepared.cumulative_work;
     }
-    Ok(CommitOutcome { fees })
+    Ok(CommitOutcome {
+        fees,
+        retained_state,
+    })
 }
 
 #[derive(Debug)]
@@ -12650,6 +13063,304 @@ mod tests {
         worker.join().unwrap();
         submit_shared_block(&shared, submitted.clone(), t2).unwrap();
         assert!(shared.lock().unwrap().index.contains(submitted.block_id()));
+        drop(shared);
+        clean_test_dir(&path);
+    }
+
+    fn branch_checkpoint_fixture(label: &str, height: u64) -> (Node, PathBuf, Vec<Block>) {
+        let path = test_dir(label);
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        let mut blocks = Vec::new();
+        let mut parent = node.params.genesis_hash;
+        for height in 1..=height {
+            let now = DEVNET_GENESIS_TIMESTAMP + height * 60;
+            let block = mined_child(&node, parent, now, height as u8);
+            parent = block.block_id();
+            node.submit_block(block.clone(), now).unwrap();
+            blocks.push(block);
+        }
+        node.profile.proof = ProofProfile::ProductionV4;
+        (node, path, blocks)
+    }
+
+    #[test]
+    fn branch_checkpoint_survives_cancelled_progress_and_queue_failure() {
+        let (mut node, path, blocks) = branch_checkpoint_fixture("checkpoint-cancellation", 20);
+        let now = DEVNET_GENESIS_TIMESTAMP + 20 * 60;
+        let candidate = mined_child(&node, blocks[18].block_id(), now, 0xee);
+        let verifier = node.block_preverifier.clone();
+        let first = node
+            .begin_external_block_admission(&candidate, now)
+            .unwrap()
+            .unwrap()
+            .complete(&candidate)
+            .unwrap();
+        assert_eq!(verifier.replay_state_blocks.load(Ordering::Relaxed), 8);
+        let shared = Arc::new(Mutex::new(node));
+        let request = RemoteProofRequest::new(Instant::now() + Duration::from_secs(30));
+        let result = {
+            let _pending = PendingExternalAdmission {
+                shared: shared.clone(),
+                progress: Some(first),
+            };
+            assert!(request.cancel());
+            request.ensure_live()
+        };
+        assert!(result.is_err());
+        assert!(!shared.lock().unwrap().index.contains(candidate.block_id()));
+        assert_eq!(shared.lock().unwrap().branch_checkpoints.entries.len(), 1);
+
+        // A reservation failure after checkout must put its completed base back.
+        let work = shared
+            .lock()
+            .unwrap()
+            .begin_external_block_admission(&candidate, now)
+            .unwrap()
+            .unwrap();
+        assert!(shared.lock().unwrap().branch_checkpoints.entries.is_empty());
+        let blocked = Arc::new(ProofVerificationQueue::new(1, 0, Duration::from_millis(1)));
+        let _held = blocked.acquire().unwrap();
+        {
+            let _pending = PendingExternalWork {
+                shared: shared.clone(),
+                work: Some(work),
+            };
+            assert!(blocked.acquire().is_err());
+        }
+        assert_eq!(shared.lock().unwrap().branch_checkpoints.entries.len(), 1);
+
+        // Exercise the production admission wiring, not just the drop helper.
+        let blocked_queue = Arc::new(ProofVerificationQueue::new(1, 0, Duration::from_millis(1)));
+        shared
+            .lock()
+            .unwrap()
+            .block_preverifier
+            .reconstruction_queue = blocked_queue.clone();
+        let held = blocked_queue.acquire().unwrap();
+        assert!(submit_shared_block(&shared, candidate.clone(), now).is_err());
+        assert_eq!(shared.lock().unwrap().branch_checkpoints.entries.len(), 1);
+        assert!(!shared.lock().unwrap().index.contains(candidate.block_id()));
+        drop(held);
+
+        // Every completed slice can survive a later canceled request, including
+        // Ready's parent state (its path must not retain the candidate ID).
+        loop {
+            let work = shared
+                .lock()
+                .unwrap()
+                .begin_external_block_admission(&candidate, now)
+                .unwrap()
+                .unwrap();
+            let progress = work.complete(&candidate).unwrap();
+            let ready = matches!(progress, ExternalBlockAdmissionProgress::Ready(_));
+            drop(PendingExternalAdmission {
+                shared: shared.clone(),
+                progress: Some(progress),
+            });
+            if ready {
+                break;
+            }
+        }
+        assert_eq!(verifier.replay_state_blocks.load(Ordering::Relaxed), 19);
+        {
+            let node = shared.lock().unwrap();
+            let checkpoint = &node.branch_checkpoints.entries.back().unwrap().checkpoint;
+            assert_eq!(checkpoint.block_id, blocks[18].block_id());
+            assert_eq!(checkpoint.path.last(), Some(&blocks[18].block_id()));
+            assert!(!node.index.contains(candidate.block_id()));
+        }
+        submit_shared_block(&shared, candidate.clone(), now).unwrap();
+        assert_eq!(verifier.replay_state_blocks.load(Ordering::Relaxed), 19);
+        assert!(shared.lock().unwrap().index.contains(candidate.block_id()));
+        assert!(
+            shared
+                .lock()
+                .unwrap()
+                .branch_checkpoints
+                .entries
+                .iter()
+                .any(|entry| entry.checkpoint.block_id == candidate.block_id())
+        );
+        drop(shared);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn branch_checkpoint_identity_generation_and_shutdown_are_fail_closed() {
+        let (mut node, path, blocks) = branch_checkpoint_fixture("checkpoint-identity", 4);
+        node.remember_active_branch_checkpoint(true);
+        let mut checkpoint = node
+            .take_branch_checkpoint(blocks[3].block_id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(node.branch_checkpoints.charged_bytes, 0);
+        checkpoint.context.node_instance_id ^= 1;
+        node.remember_branch_checkpoint(checkpoint);
+        assert!(node.branch_checkpoints.entries.is_empty());
+        node.remember_active_branch_checkpoint(true);
+        let mut checkpoint = node
+            .take_branch_checkpoint(blocks[3].block_id())
+            .unwrap()
+            .unwrap();
+        checkpoint.context.network_id[0] ^= 1;
+        node.remember_branch_checkpoint(checkpoint);
+        assert!(node.branch_checkpoints.entries.is_empty());
+        node.remember_active_branch_checkpoint(true);
+        let mut checkpoint = node
+            .take_branch_checkpoint(blocks[3].block_id())
+            .unwrap()
+            .unwrap();
+        checkpoint.path[0][0] ^= 1;
+        node.remember_branch_checkpoint(checkpoint);
+        assert!(node.branch_checkpoints.entries.is_empty());
+        node.remember_active_branch_checkpoint(true);
+        node.block_preverifier
+            .backend_generation
+            .fetch_add(1, Ordering::AcqRel);
+        assert!(
+            node.take_branch_checkpoint(blocks[3].block_id())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(node.branch_checkpoints.charged_bytes, 0);
+        node.remember_active_branch_checkpoint(true);
+        node.shutdown_proof_verifier();
+        assert!(matches!(
+            node.take_branch_checkpoint(blocks[3].block_id()),
+            Err(NodeError::ProofVerifierShuttingDown)
+        ));
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn branch_checkpoint_anchor_corruption_faults_storage() {
+        let (mut node, path, blocks) = branch_checkpoint_fixture("checkpoint-anchor-corrupt", 4);
+        node.remember_active_branch_checkpoint(true);
+        let mut anchor = node.index.blocks[&blocks[3].block_id()].locator;
+        anchor.complete_digest[0] ^= 1;
+        set_indexed_locator(&mut node, blocks[3].block_id(), anchor);
+        node.branch_checkpoints.entries[0].anchor = anchor;
+        assert!(node.take_branch_checkpoint(blocks[3].block_id()).is_err());
+        assert!(node.storage_faulted);
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn branch_checkpoint_authenticates_same_length_disk_corruption() {
+        let (mut node, path, blocks) = branch_checkpoint_fixture("checkpoint-disk-corrupt", 4);
+        node.remember_active_branch_checkpoint(true);
+        let anchor = node.index.blocks[&blocks[3].block_id()].locator;
+        let mut bytes = fs::read(path.join(BLOCK_LOG_FILE)).unwrap();
+        bytes[usize::try_from(anchor.offset).unwrap() + 64] ^= 1;
+        fs::write(path.join(BLOCK_LOG_FILE), bytes).unwrap();
+        assert!(node.take_branch_checkpoint(blocks[3].block_id()).is_err());
+        assert!(node.storage_faulted);
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn branch_checkpoint_cache_budget_and_eviction_are_bounded() {
+        let (mut node, path, _) = branch_checkpoint_fixture("checkpoint-budget", 4);
+        assert!(checkpoint_charge(&node.state, usize::MAX).is_none());
+        node.remember_active_branch_checkpoint(true);
+        let mut oversized = node
+            .take_branch_checkpoint(node.state.tip())
+            .unwrap()
+            .unwrap();
+        let mut oversized_path = Vec::with_capacity(MAX_BRANCH_STATE_CHECKPOINT_BYTES / 32 + 1);
+        oversized_path.extend_from_slice(&oversized.path);
+        oversized.path = oversized_path;
+        node.remember_branch_checkpoint(oversized);
+        assert!(node.branch_checkpoints.entries.is_empty());
+        for height in 5..=12 {
+            let now = DEVNET_GENESIS_TIMESTAMP + height * 60;
+            let block = mined_child(&node, node.state.tip(), now, height as u8);
+            node.submit_block(block, now).unwrap();
+            node.remember_active_branch_checkpoint(true);
+            assert!(node.branch_checkpoints.entries.len() <= MAX_BRANCH_STATE_CHECKPOINTS);
+            assert!(node.branch_checkpoints.charged_bytes <= MAX_BRANCH_STATE_CHECKPOINT_BYTES);
+            assert_eq!(
+                node.branch_checkpoints.charged_bytes,
+                node.branch_checkpoints
+                    .entries
+                    .iter()
+                    .map(|entry| entry.charge)
+                    .sum::<usize>()
+            );
+        }
+        assert_eq!(
+            node.branch_checkpoints.entries.len(),
+            MAX_BRANCH_STATE_CHECKPOINTS
+        );
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn branch_checkpoint_recent_active_anchor_bounds_short_fork_replay() {
+        let (mut node, path, _) = branch_checkpoint_fixture("checkpoint-recent-active", 0);
+        let mut parent = node.params.genesis_hash;
+        let mut fork_parent = parent;
+        for height in 1..=64 {
+            let now = DEVNET_GENESIS_TIMESTAMP + height * 60;
+            let block = mined_child(&node, parent, now, height as u8);
+            parent = block.block_id();
+            if height == 63 {
+                fork_parent = parent;
+            }
+            node.submit_block(block, now).unwrap();
+        }
+        let now = DEVNET_GENESIS_TIMESTAMP + 64 * 60;
+        let candidate = mined_child(&node, fork_parent, now, 0xf1);
+        let verifier = node.block_preverifier.clone();
+        let shared = Arc::new(Mutex::new(node));
+        submit_shared_block(&shared, candidate.clone(), now).unwrap();
+        assert_eq!(verifier.replay_state_blocks.load(Ordering::Relaxed), 15);
+        assert!(shared.lock().unwrap().index.contains(candidate.block_id()));
+        drop(shared);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn branch_checkpoint_never_authorizes_an_invalid_candidate_body() {
+        let (node, path, _) = branch_checkpoint_fixture("checkpoint-invalid-body", 3);
+        let first_at = DEVNET_GENESIS_TIMESTAMP + 60;
+        let second_at = first_at + 60;
+        let first = mined_child(&node, node.params.genesis_hash, first_at, 0xd1);
+        let shared = Arc::new(Mutex::new(node));
+        submit_shared_block(&shared, first.clone(), first_at).unwrap();
+        let valid = {
+            let node = shared.lock().unwrap();
+            assert!(
+                node.branch_checkpoints
+                    .entries
+                    .iter()
+                    .any(|entry| entry.checkpoint.block_id == first.block_id())
+            );
+            mined_child(&node, first.block_id(), second_at, 0xd2)
+        };
+        let mut invalid = valid.clone();
+        invalid.coinbase.outputs[0].value += 1;
+        let before = shared
+            .lock()
+            .unwrap()
+            .state
+            .encode_local_snapshot()
+            .unwrap();
+        assert!(submit_shared_block(&shared, invalid, second_at).is_err());
+        {
+            let node = shared.lock().unwrap();
+            assert_eq!(node.state.encode_local_snapshot().unwrap(), before);
+            assert!(!node.index.contains(valid.block_id()));
+            assert!(!node.storage_faulted);
+        }
+        submit_shared_block(&shared, valid.clone(), second_at).unwrap();
+        assert!(shared.lock().unwrap().index.contains(valid.block_id()));
         drop(shared);
         clean_test_dir(&path);
     }

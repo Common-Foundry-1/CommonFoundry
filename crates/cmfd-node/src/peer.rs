@@ -1429,6 +1429,12 @@ impl PeerSession {
         if let PeerMessage::Hello(hello) = frame.message {
             self.remote_hello = Some(hello);
             self.remote_version = Some(version);
+            // A peer that greets us with version 5 decodes compressed blocks, so
+            // answer it in kind for the rest of this session. Nothing is kept
+            // about its address: several nodes may share one address (NAT).
+            if version == PEER_PROTOCOL_VERSION_COMPRESSED {
+                self.outbound_version = PEER_PROTOCOL_VERSION_COMPRESSED;
+            }
             Ok(PeerMessage::Hello(hello))
         } else {
             Ok(frame.message)
@@ -3154,7 +3160,7 @@ mod tests {
     }
 
     #[test]
-    fn sessions_learn_the_remote_version_from_its_hello() {
+    fn sessions_mirror_a_version_5_hello_for_the_rest_of_the_session() {
         let compressed = PeerLimits {
             compress_blocks: true,
             ..PeerLimits::default()
@@ -3172,7 +3178,6 @@ mod tests {
         new_node.accept_inbound(&old_hello).unwrap();
         assert!(old_node.remote_compresses_blocks());
         assert!(!new_node.remote_compresses_blocks());
-        // Each side keeps writing its own version; both decode either.
         let block = sample_block();
         let from_new = new_node
             .encode_outbound(PeerMessage::Block(block.clone()))
@@ -3181,7 +3186,12 @@ mod tests {
             .encode_outbound(PeerMessage::Block(block.clone()))
             .unwrap();
         assert_eq!(from_new[6], COMPRESSED_BLOCK_KIND);
-        assert_eq!(from_old[6], BLOCK_KIND);
+        // The old node was greeted with version 5 and now answers in kind.
+        assert_eq!(from_old[6], COMPRESSED_BLOCK_KIND);
+        assert_eq!(
+            &from_old[4..6],
+            &PEER_PROTOCOL_VERSION_COMPRESSED.to_le_bytes()
+        );
         assert!(
             matches!(old_node.accept_inbound(&from_new), Ok(PeerMessage::Block(b)) if b == block)
         );

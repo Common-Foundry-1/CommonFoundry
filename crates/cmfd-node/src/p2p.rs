@@ -73,7 +73,7 @@ const MAX_INBOUND_ATTEMPTS_PER_WINDOW: u16 = 64;
 const INBOUND_ATTEMPT_WINDOW: Duration = Duration::from_secs(10);
 const PEER_BAN_DURATION: Duration = Duration::from_secs(5 * 60);
 const PEER_BAN_SCORE: u16 = 100;
-const COMPRESSED_PEER_STRIKES: u8 = 2;
+const COMPRESSED_PEER_STRIKES: u8 = 1;
 const COMPRESSED_PEER_COOLDOWN: Duration = Duration::from_secs(60 * 60);
 const CLEAN_SESSION_CREDIT: u16 = 10;
 const TRANSIENT_FAILURE_PENALTY: u16 = 5;
@@ -304,7 +304,6 @@ struct PeerReputationEntry {
     connection_attempts: u16,
     last_updated: Instant,
     /// The peer sent us a version-5 frame, so it accepts compressed blocks.
-    compresses_blocks: bool,
     /// Consecutive version-5 sessions that died in transport before any
     /// reply, the signature of a version-4 peer rejecting our hello.
     compressed_strikes: u8,
@@ -320,7 +319,6 @@ impl PeerReputationEntry {
             attempt_window_started: now,
             connection_attempts: 0,
             last_updated: now,
-            compresses_blocks: false,
             compressed_strikes: 0,
             compressed_cooldown_until: None,
         }
@@ -447,9 +445,11 @@ impl PeerSecurity {
         Ok(())
     }
 
-    /// Whether to send this peer version-5 (compressed block) frames: it is a
-    /// configured static peer or has sent us version 5, and recent version-5
-    /// sessions to it did not all die in the handshake.
+    /// Whether to open a session to this peer with version-5 (compressed block)
+    /// frames: it is a configured static peer whose last version-5 session did
+    /// not die in the handshake. Nothing is learned per address, because one
+    /// address may front several nodes (NAT); a session that is greeted with
+    /// version 5 answers in version 5 on its own (see `PeerSession`).
     fn compresses_blocks(&self, ip: IpAddr) -> Result<bool, P2pError> {
         let now = Instant::now();
         let key = PeerReputationKey::from_ip(ip);
@@ -465,27 +465,14 @@ impl PeerSecurity {
         }) {
             return Ok(false);
         }
-        Ok(state.static_peers.contains(&key) || entry.is_some_and(|entry| entry.compresses_blocks))
-    }
-
-    fn record_compressed_peer(&self, ip: IpAddr) -> Result<(), P2pError> {
-        let now = Instant::now();
-        let key = PeerReputationKey::from_ip(ip);
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| P2pError::PoisonedPeerReputation)?;
-        if let Some(entry) = peer_reputation_entry(&mut state, key, now) {
-            entry.compresses_blocks = true;
-            entry.compressed_strikes = 0;
-            entry.compressed_cooldown_until = None;
-        }
-        Ok(())
+        Ok(state.static_peers.contains(&key))
     }
 
     /// Outcome of a session we opened with version 5. A version-4 peer closes
-    /// the connection on our hello, so two such closures in a row pause
-    /// compression toward that peer; any completed session resets the count.
+    /// the connection on our hello and counts it as a protocol violation, so a
+    /// single such closure pauses compression toward that peer for an hour,
+    /// before a second violation would get us banned there; a completed
+    /// session resets the count.
     fn record_compressed_session(
         &self,
         ip: IpAddr,
@@ -1864,11 +1851,6 @@ fn perform_respond_to_peer_inner_with_policy(
     connection.send_hello()?;
     let remote_hello = expect_hello(connection.receive()?)?;
     *handshake_complete = true;
-    if connection.remote_compresses_blocks() {
-        options
-            .security
-            .record_compressed_peer(remote_address.ip())?;
-    }
     let proof_peer = next_remote_proof_peer_id()?;
     record_peer_succeeded(
         &shared,
@@ -3706,42 +3688,37 @@ mod tests {
     }
 
     #[test]
-    fn compressed_block_capability_is_static_or_learned_and_backs_off_on_rejection() {
+    fn compressed_block_capability_is_static_only_and_backs_off_after_one_rejection() {
         let security = PeerSecurity::default();
         let stranger: IpAddr = "203.0.113.9".parse().unwrap();
         let static_peer: SocketAddr = "198.51.100.7:29444".parse().unwrap();
         assert!(!security.compresses_blocks(stranger).unwrap());
         security.register_static_peers(&[static_peer]).unwrap();
         assert!(security.compresses_blocks(static_peer.ip()).unwrap());
-        // A peer that sent us version 5 is remembered.
-        security.record_compressed_peer(stranger).unwrap();
-        assert!(security.compresses_blocks(stranger).unwrap());
-        // One transport failure is tolerated; two in a row pause compression.
-        let closed = P2pError::Peer(PeerError::ConnectionClosed);
-        security
-            .record_compressed_session(static_peer.ip(), Err(&closed))
-            .unwrap();
-        assert!(security.compresses_blocks(static_peer.ip()).unwrap());
+        // A completed session keeps compression on.
         security
             .record_compressed_session(static_peer.ip(), Ok(()))
             .unwrap();
-        security
-            .record_compressed_session(static_peer.ip(), Err(&closed))
-            .unwrap();
         assert!(security.compresses_blocks(static_peer.ip()).unwrap());
+        // One handshake death (an older peer closing on our version-5 hello)
+        // pauses compression toward that peer before it can ban us.
+        let closed = P2pError::Peer(PeerError::ConnectionClosed);
         security
             .record_compressed_session(static_peer.ip(), Err(&closed))
             .unwrap();
         assert!(!security.compresses_blocks(static_peer.ip()).unwrap());
         // Non-transport errors never count as a rejection.
-        let other: IpAddr = "203.0.113.10".parse().unwrap();
-        security.record_compressed_peer(other).unwrap();
+        let other: SocketAddr = "203.0.113.10:29444".parse().unwrap();
+        security.register_static_peers(&[other]).unwrap();
         for _ in 0..3 {
             security
-                .record_compressed_session(other, Err(&P2pError::UnknownRequestedBlock([1; 32])))
+                .record_compressed_session(
+                    other.ip(),
+                    Err(&P2pError::UnknownRequestedBlock([1; 32])),
+                )
                 .unwrap();
         }
-        assert!(security.compresses_blocks(other).unwrap());
+        assert!(security.compresses_blocks(other.ip()).unwrap());
     }
 
     fn test_catchup_candidate(index: u8) -> CatchupCandidate {

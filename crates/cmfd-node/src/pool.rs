@@ -42,7 +42,7 @@ use thiserror::Error;
 
 use crate::{
     COMPILED_NETWORK_PROFILE, MAX_MINING_SEARCH_ATTEMPTS, MiningJob, NetworkProfile, Node,
-    NodeError, ProofProfile, submit_shared_tip_block_preverified, unix_time_seconds,
+    NodeError, ProofProfile, submit_shared_tip_block, unix_time_seconds,
 };
 
 pub const POOL_PROTOCOL_VERSION: u16 = 2;
@@ -3280,22 +3280,11 @@ fn process_share(
     if evaluation.work_digest > active.wire.share_target {
         return rejected_result(shared, session_id, job_id, nonce, "low_difficulty_share");
     }
-    // A chain-winning proof is fully verified exactly once, outside the node
-    // lock and the shared proof queue, concurrently with the durable pending
-    // reservation below. Submission reuses that evidence.
     let block = if let Some(proof) = &evaluation.chain_proof {
-        let Some(block) = active.mining.chain_block_candidate(proof) else {
+        let Some(block) = active.mining.build_block_if_chain_valid(proof)? else {
             return rejected_result(shared, session_id, job_id, nonce, "invalid_chain_proof");
         };
-        let block: Arc<crate::Block> = Arc::from(block);
-        let verification = {
-            let active = Arc::clone(&active);
-            let block = Arc::clone(&block);
-            thread::Builder::new()
-                .name("cmfd-pool-block-verify".to_owned())
-                .spawn(move || active.mining.preverify_block(&block))?
-        };
-        Some((block, verification))
+        Some(block)
     } else {
         None
     };
@@ -3333,7 +3322,7 @@ fn process_share(
         }
     };
 
-    let Some((block, verification)) = block else {
+    let Some(block) = block else {
         // The share was checked against the current tip above. Persisting its
         // credit rewrites the whole ledger, so do it without the node lock:
         // holding the lock here starved block import under many miners and
@@ -3381,27 +3370,9 @@ fn process_share(
     // Release the shared node before the bounded verifier worker runs; the
     // revision-bound helper rechecks the authoritative chain on commit.
     drop(node);
-    let preverified = match verification
-        .join()
-        .unwrap_or(Err(NodeError::ProofVerifierPanicked))
-    {
-        Ok(preverified) => preverified,
-        Err(error) => {
-            if nonce_reserved {
-                release_valid_share(&active, nonce)?;
-            }
-            discard_pending_pool_block(&shared.ledger, block_credit.block_id)?;
-            return Err(error.into());
-        }
-    };
     let node_submission_started = Instant::now();
     loop {
-        match submit_shared_tip_block_preverified(
-            &shared.node,
-            (*block).clone(),
-            unix_time_seconds()?,
-            preverified.clone(),
-        ) {
+        match submit_shared_tip_block(&shared.node, (*block).clone(), unix_time_seconds()?) {
             Ok(_) => break,
             Err(NodeError::StaleBlockAdmission | NodeError::UnknownParent(_)) => {
                 discard_pending_pool_block(&shared.ledger, block_credit.block_id)?;
@@ -7390,71 +7361,6 @@ mod tests {
         assert!(result.accepted);
         assert!(result.block_accepted);
         assert_eq!(result.code, "block_accepted");
-        server.stop().unwrap();
-    }
-
-    #[test]
-    fn pool_block_is_verified_once_and_never_waits_behind_a_peer_proof() {
-        let (_root, server, node, pin) = server("pool-block-single-verification");
-        let mut client = client(server.local_addr(), pin, "block-worker");
-        let work = client.current_work().unwrap();
-        let height = work.job().challenge.height;
-        let nonce = find_share(&work, true);
-        let preverifier = node.lock().unwrap().block_preverifier();
-        // A peer block occupies the node's sole proof verifier throughout.
-        let held_peer_verification = preverifier.queue.acquire().unwrap();
-        let dispatches = preverifier.worker_dispatches.load(Ordering::Relaxed);
-
-        let result = client.submit_share(work.job().job_id, nonce).unwrap();
-        assert!(result.block_accepted);
-        assert_eq!(result.code, "block_accepted");
-        assert_eq!(
-            node.lock().unwrap().status().unwrap().accepted_height,
-            height
-        );
-        assert_eq!(
-            preverifier.worker_dispatches.load(Ordering::Relaxed),
-            dispatches,
-            "the pool block's proof was verified a second time"
-        );
-        drop(held_peer_verification);
-        server.stop().unwrap();
-    }
-
-    #[test]
-    fn invalid_chain_proof_undoes_its_concurrent_pending_reservation() {
-        let root = TestRoot::new("invalid-chain-proof");
-        let mut opened =
-            Node::open_with_profile(root.path().join("node"), crate::DEVNET_PROFILE).unwrap();
-        // The ProductionV4 share path with a devnet consensus verifier: the
-        // fixed worker result claims the chain target, but its proof type can
-        // never pass consensus verification.
-        opened.profile.proof = ProofProfile::ProductionV4;
-        let node = Arc::new(Mutex::new(opened));
-        let (certificate, key, pin) = certificate(&root);
-        let mut config = PoolServerConfig::devnet(
-            "127.0.0.1:0".parse().unwrap(),
-            fs::read(certificate).unwrap(),
-            fs::read(key).unwrap(),
-            default_miner_destination(),
-        );
-        config.production_v4_share_verifier = Some(Arc::new(FixedProductionV4ShareVerifier {
-            evaluation: ProductionV4PoolShareEvaluation {
-                work_digest: [0; 32],
-                chain_proof: Some(test_proof([0; 32])),
-            },
-        }));
-        let server = spawn_pool_server(Arc::clone(&node), config).unwrap();
-        let tip = node.lock().unwrap().state.tip();
-        let mut client = client(server.local_addr(), pin, "invalid-proof-worker");
-        let job_id = client.current_job().job_id;
-        let active = Arc::clone(&server.shared.state.lock().unwrap().current);
-
-        assert!(client.submit_share(job_id, 7).is_err());
-        assert_eq!(node.lock().unwrap().state.tip(), tip);
-        assert!(server.shared.ledger.state.lock().unwrap().blocks.is_empty());
-        assert!(!active.seen_nonces.lock().unwrap().contains(&7));
-        assert_eq!(server.ledger_snapshot().unwrap().pool_blocks, 0);
         server.stop().unwrap();
     }
 

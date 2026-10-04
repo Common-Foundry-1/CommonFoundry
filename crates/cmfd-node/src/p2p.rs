@@ -487,17 +487,31 @@ impl PeerSecurity {
         let Some(entry) = peer_reputation_entry(&mut state, key, now) else {
             return Ok(());
         };
-        match result {
-            Ok(()) => entry.compressed_strikes = 0,
-            Err(P2pError::Peer(PeerError::ConnectionClosed | PeerError::Io(_))) => {
-                entry.compressed_strikes = entry.compressed_strikes.saturating_add(1);
-                if entry.compressed_strikes >= COMPRESSED_PEER_STRIKES {
-                    entry.compressed_strikes = 0;
-                    entry.compressed_cooldown_until = Some(now + COMPRESSED_PEER_COOLDOWN);
-                    tracing::warn!(peer = %ip, "peer rejected compressed-block frames; falling back to version 4 for an hour");
-                }
+        let rejected = match result {
+            Ok(()) => {
+                entry.compressed_strikes = 0;
+                return Ok(());
             }
-            Err(_) => {}
+            Err(P2pError::Peer(PeerError::ConnectionClosed)) => true,
+            // A reset or abort after our hello is the older peer closing on it. A
+            // refused or unreachable connection says nothing about its version,
+            // so an outage of a static peer does not cost an hour uncompressed.
+            Err(P2pError::Peer(PeerError::Io(error))) => matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::UnexpectedEof
+            ),
+            Err(_) => false,
+        };
+        if rejected {
+            entry.compressed_strikes = entry.compressed_strikes.saturating_add(1);
+            if entry.compressed_strikes >= COMPRESSED_PEER_STRIKES {
+                entry.compressed_strikes = 0;
+                entry.compressed_cooldown_until = Some(now + COMPRESSED_PEER_COOLDOWN);
+                tracing::warn!(peer = %ip, "peer rejected compressed-block frames; falling back to version 4 for an hour");
+            }
         }
         Ok(())
     }
@@ -3707,18 +3721,30 @@ mod tests {
             .record_compressed_session(static_peer.ip(), Err(&closed))
             .unwrap();
         assert!(!security.compresses_blocks(static_peer.ip()).unwrap());
-        // Non-transport errors never count as a rejection.
+        // Non-transport errors and an unreachable peer never count as a rejection;
+        // a reset after the hello does.
         let other: SocketAddr = "203.0.113.10:29444".parse().unwrap();
         security.register_static_peers(&[other]).unwrap();
-        for _ in 0..3 {
+        let refused = P2pError::Peer(PeerError::Io(io::Error::from(
+            io::ErrorKind::ConnectionRefused,
+        )));
+        for error in [
+            &P2pError::UnknownRequestedBlock([1; 32]),
+            &refused,
+            &refused,
+        ] {
             security
-                .record_compressed_session(
-                    other.ip(),
-                    Err(&P2pError::UnknownRequestedBlock([1; 32])),
-                )
+                .record_compressed_session(other.ip(), Err(error))
                 .unwrap();
         }
         assert!(security.compresses_blocks(other.ip()).unwrap());
+        let reset = P2pError::Peer(PeerError::Io(io::Error::from(
+            io::ErrorKind::ConnectionReset,
+        )));
+        security
+            .record_compressed_session(other.ip(), Err(&reset))
+            .unwrap();
+        assert!(!security.compresses_blocks(other.ip()).unwrap());
     }
 
     fn test_catchup_candidate(index: u8) -> CatchupCandidate {

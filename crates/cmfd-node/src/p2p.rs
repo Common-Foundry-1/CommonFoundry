@@ -156,7 +156,9 @@ pub enum P2pError {
     },
     #[error("peer rejected submitted block {0:?}")]
     RejectedBlockSubmission([u8; 32]),
-    #[error("peer deferred submitted block {0:?} because admission is busy")]
+    #[error(
+        "peer deferred submitted block {0:?} (retryable: verifier busy, stale tip, missing parent, or fork reconstruction)"
+    )]
     BusyBlockSubmission([u8; 32]),
     #[error("peer inventory is not parent-ordered at block {block_id:?}")]
     NonContiguousInventory { block_id: [u8; 32] },
@@ -1787,6 +1789,7 @@ fn perform_respond_to_peer_inner_with_policy(
             PeerMessage::SubmitBlock(block) => {
                 let started = Instant::now();
                 let block_id = block.block_id();
+                let block_height = block.challenge.height;
                 let accepted_at = unix_time_seconds()?;
                 let acceptance_deadline =
                     checked_submit_deadline(started, SUBMIT_BLOCK_ACCEPTANCE_BUDGET)?;
@@ -1804,9 +1807,27 @@ fn perform_respond_to_peer_inner_with_policy(
                     Ok(_) => BlockSubmissionStatus::Accepted,
                     Err(NodeError::DuplicateBlock(_)) => BlockSubmissionStatus::AlreadyKnown,
                     Err(error) if is_retryable_block_admission(&error) => {
+                        // The wire status cannot carry a reason, and peers
+                        // report every retryable cause with the same deferred status.
+                        tracing::warn!(
+                            block_id = %hex::encode(block_id),
+                            height = block_height,
+                            reason = error.client_error().code,
+                            %error,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "deferred submitted block"
+                        );
                         BlockSubmissionStatus::Busy
                     }
                     Err(error) if error.client_error().status < 500 => {
+                        tracing::warn!(
+                            block_id = %hex::encode(block_id),
+                            height = block_height,
+                            reason = error.client_error().code,
+                            %error,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "rejected submitted block"
+                        );
                         BlockSubmissionStatus::Rejected
                     }
                     Err(error) => return Err(error.into()),

@@ -3,7 +3,8 @@
 The next branch-state update retains bounded, process-local validated state
 between competing blocks and completed replay slices. A later child can resume
 from its verified ancestor instead of rebuilding state from genesis again.
-Recent active-state anchors are sampled every 16 blocks, and at startup, only
+Recent active-state anchors are sampled every 16 blocks, at startup, and after
+an accepted reorganization, only
 when eligible for the checked memory budget. Checkout moves checkpoint state;
 it does not clone it. Active-anchor creation is the only bounded state clone.
 

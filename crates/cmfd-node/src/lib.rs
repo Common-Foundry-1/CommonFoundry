@@ -7857,7 +7857,9 @@ impl Node {
                     });
                 }
                 if canonical_tip_changed {
-                    self.remember_active_branch_checkpoint(false);
+                    self.remember_active_branch_checkpoint(
+                        block.challenge.previous_block != previous_tip,
+                    );
                 }
                 // Keep the authenticated fast-start state current while the
                 // node is running, including after nonwinning side-branch

@@ -3790,6 +3790,7 @@ mod tests {
 
         for round in 0..3 {
             assert!(tips_match(&source, &target));
+            let round_replays = replayed.load(Ordering::Relaxed);
             let timestamp = start + 100 + round * 100;
             let transaction = {
                 let mut node = source.lock().unwrap();
@@ -3850,6 +3851,11 @@ mod tests {
                         "round {round} session {session} replayed ancestors instead of reusing the validated side tip"
                     );
                 } else {
+                    assert!(
+                        completed_replays - round_replays
+                            <= crate::ACTIVE_BRANCH_CHECKPOINT_INTERVAL,
+                        "round {round} lost its recent active anchor before the next fork"
+                    );
                     warmed_replays = Some(completed_replays);
                 }
                 if session < 3 {

@@ -1245,7 +1245,9 @@ fn perform_sync_from_peer_once_inner_with_policy(
     let mut already_known = 0;
     let mut previous_inventory_id = None;
 
-    for requested in inventory.iter().take(block_batch_limit) {
+    // Already-stored blocks cost no download budget: walking a known prefix
+    // one id per session made a deep, already-partly-stored branch unreachable.
+    for requested in inventory.iter() {
         let known = {
             let node = lock_node(&shared)?;
             node.contains_block(*requested)
@@ -1261,6 +1263,9 @@ fn perform_sync_from_peer_once_inner_with_policy(
             already_known += 1;
             previous_inventory_id = Some(*requested);
             continue;
+        }
+        if requested_blocks >= block_batch_limit {
+            break;
         }
 
         connection.send(PeerMessage::GetBlock {
@@ -4231,6 +4236,91 @@ mod tests {
         assert_eq!(second.inventory_items, 1);
         assert_eq!(second.accepted_blocks, 1);
         assert!(tips_match(&source, &target));
+
+        listener.stop().unwrap();
+        drop(source);
+        drop(target);
+        clean_test_dir(&source_path);
+        clean_test_dir(&target_path);
+    }
+
+    #[test]
+    fn known_side_branch_prefix_does_not_consume_the_download_budget() {
+        let source_path = test_dir("known-prefix-source");
+        let target_path = test_dir("known-prefix-target");
+        let source = open_shared(&source_path);
+        let target = open_shared(&target_path);
+        let now = unix_time_seconds().unwrap();
+        let source_blocks: Vec<Block> = (0..5)
+            .map(|offset| {
+                source
+                    .lock()
+                    .unwrap()
+                    .mine_once(
+                        default_miner_destination(),
+                        now + offset,
+                        DEFAULT_MINING_ATTEMPTS,
+                    )
+                    .unwrap()
+            })
+            .collect();
+        {
+            let mut node = target.lock().unwrap();
+            for offset in 0..6 {
+                node.mine_once(
+                    insecure_dev_destination(0x75),
+                    now + 1 + offset,
+                    DEFAULT_MINING_ATTEMPTS,
+                )
+                .unwrap();
+            }
+        }
+        // The target already stores the first three source blocks as a side
+        // branch beneath its own longer chain.
+        for block in &source_blocks[..3] {
+            crate::submit_shared_block(&target, block.clone(), now + 10).unwrap();
+        }
+        let active_tip = target.lock().unwrap().peer_hello().tip;
+        assert!(
+            !target
+                .lock()
+                .unwrap()
+                .contains_block(source_blocks[3].block_id())
+        );
+
+        let reserve =
+            (MAX_TRANSACTIONS_PER_SYNC * MAX_TRANSACTION_BYTES) as u64 + SYNC_CONTROL_RESERVE_BYTES;
+        let block_bytes = max_block_bytes_for_network(crate::DEVNET_PROFILE.network_id) as u64;
+        let receiver_limits = PeerLimits {
+            max_bytes_per_peer: reserve + block_bytes,
+            ..test_limits()
+        };
+        assert_eq!(
+            block_sync_batch_limit(crate::DEVNET_PROFILE.network_id, receiver_limits),
+            1
+        );
+        let (listener, address) = start_listener(Arc::clone(&source), SOURCE_NONCE);
+        let report = sync_from_peer_once_inner_with_policy(
+            Arc::clone(&target),
+            address,
+            receiver_limits,
+            PeerAddressPolicy::PrivateOnly,
+            Some(TARGET_NONCE),
+            None,
+        )
+        .unwrap();
+
+        // One session walks the whole known prefix and still downloads the
+        // first unknown block of the branch.
+        assert_eq!(report.already_known, 3);
+        assert_eq!(report.accepted_blocks, 1);
+        assert!(
+            target
+                .lock()
+                .unwrap()
+                .contains_block(source_blocks[3].block_id())
+        );
+        assert_eq!(target.lock().unwrap().peer_hello().tip, active_tip);
 
         listener.stop().unwrap();
         drop(source);

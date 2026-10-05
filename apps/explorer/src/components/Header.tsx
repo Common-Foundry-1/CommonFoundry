@@ -37,6 +37,7 @@ export function Header({ network, connected, onHome, onSearch }: HeaderProps) {
         <a href="#blocks" onClick={() => setMobileOpen(false)}>Blocks</a>
         <a href="#transactions" onClick={() => setMobileOpen(false)}>Transactions</a>
         <a href="#network" onClick={() => setMobileOpen(false)}>Network</a>
+        <a href="https://wallet.commonfoundry.ai" target="_blank" rel="noopener noreferrer">Wallet</a>
       </nav>
 
       <form className="search-form" role="search" onSubmit={submit}>

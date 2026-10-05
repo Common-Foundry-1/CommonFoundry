@@ -34,7 +34,7 @@ class MainnetPreflightTests(unittest.TestCase):
         with mock.patch.object(package, "source_snapshot", side_effect=self.fixture.sources), \
              mock.patch.object(package, "validate_review_ancestry"), \
              mock.patch.object(package, "native_output", side_effect=AssertionError("preflight executed an archive member")):
-            return preflight.verify_set(self.fixture.repo, self.fixture.commit, "1.0.7", self.fixture.plan_path,
+            return preflight.verify_set(self.fixture.repo, self.fixture.commit, "1.0.8", self.fixture.plan_path,
                                         self.archives if archives is None else archives,
                                         self.fixture.dashboard_manifest_path, self.fixture.cuda_sha256)
 
@@ -90,7 +90,7 @@ class MainnetPreflightTests(unittest.TestCase):
         for relative in ("crates/cmfd-node/Cargo.toml", "crates/cmfd-miner/Cargo.toml", "apps/wallet/src-tauri/Cargo.toml"):
             target = frozen / relative
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(b'[package]\nversion="1.0.7"\n')
+            target.write_bytes(b'[package]\nversion="1.0.8"\n')
         env = dict(os.environ, GIT_AUTHOR_DATE="@1789840000 +0000", GIT_COMMITTER_DATE="@1789840000 +0000")
         def git(*arguments):
             return subprocess.run(["git", "-C", str(frozen), *arguments], env=env, capture_output=True, check=True).stdout.decode().strip()
@@ -113,7 +113,7 @@ class MainnetPreflightTests(unittest.TestCase):
             archives[platform, kind] = self.fixture.assemble(self.fixture.args(platform, kind, "cli-" + platform + kind))
         output = self.fixture.root / "preflight.json"
         command = [sys.executable, str(real_repo / "scripts/verify_mainnet_packages.py"),
-                   "--repo", str(frozen), "--commit", self.fixture.commit, "--version", "1.0.7",
+                   "--repo", str(frozen), "--commit", self.fixture.commit, "--version", "1.0.8",
                    "--plan", str(self.fixture.plan_path), "--output", str(output),
                    "--dashboard-manifest", str(self.fixture.dashboard_manifest_path),
                    "--cuda-sha256", self.fixture.cuda_sha256]
@@ -285,7 +285,7 @@ class MainnetPreflightTests(unittest.TestCase):
             return self.fixture.sources(*args)
         with mock.patch.object(package, "source_snapshot", side_effect=snapshot), mock.patch.object(package, "validate_review_ancestry"):
             with self.assertRaisesRegex(package.Error, "set changed"):
-                preflight.verify_set(self.fixture.repo, self.fixture.commit, "1.0.7", self.fixture.plan_path,
+                preflight.verify_set(self.fixture.repo, self.fixture.commit, "1.0.8", self.fixture.plan_path,
                                      self.archives, self.fixture.dashboard_manifest_path, self.fixture.cuda_sha256)
 
     def test_wrong_archive_epoch_is_rejected(self):

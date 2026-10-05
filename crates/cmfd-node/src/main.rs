@@ -468,6 +468,27 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Create a new exchange deposit or hot-wallet key file (offline; no node
+    /// or data directory). Prints the key's destination (x-only public key).
+    ExchangeKeyNew {
+        /// Output path for the secret key. Existing files are never overwritten.
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Print the destination (x-only public key) of an existing exchange key file.
+    ExchangeKeyShow {
+        #[arg(long)]
+        key: PathBuf,
+    },
+    /// Build and sign a withdrawal from a JSON request (offline; no node or
+    /// data directory). Prints the transaction hex for sendrawtransaction.
+    ExchangeTxSign {
+        /// JSON request: network_id, inputs (txid, vout, value_atoms,
+        /// destination_hex, key_file), outputs (destination_hex, value_atoms),
+        /// optional change_destination_hex and fee_atoms.
+        #[arg(long)]
+        request: PathBuf,
+    },
     /// Qualify an installed v0.5 custody package under the configured service identity.
     ExchangeV3AclQualify {
         /// Absolute path to the live qualification configuration.
@@ -872,6 +893,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .into());
         }
+        return Ok(());
+    }
+    if let Command::ExchangeKeyNew { output } = &cli.command {
+        let destination = cmfd_node::exchange_tx_tool::create_key_file(output)?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "status": "created",
+                "key_file": output,
+                "destination_hex": hex::encode(destination),
+                "warning": "the key file is the only copy of this secret; back it up and keep it private"
+            }))?
+        );
+        return Ok(());
+    }
+    if let Command::ExchangeKeyShow { key } = &cli.command {
+        let key = cmfd_node::exchange_tx_tool::read_key_file(key)?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "destination_hex": hex::encode(cmfd_node::exchange_tx_tool::destination_of(&key)),
+            }))?
+        );
+        return Ok(());
+    }
+    if let Command::ExchangeTxSign { request } = &cli.command {
+        let request: cmfd_node::exchange_tx_tool::SignRequest =
+            serde_json::from_slice(&std::fs::read(request)?)?;
+        let signed = cmfd_node::exchange_tx_tool::sign_request(
+            &request,
+            COMPILED_NETWORK_PROFILE.network_id,
+        )?;
+        println!("{}", serde_json::to_string_pretty(&signed)?);
         return Ok(());
     }
     if let Command::ExchangeWithdrawalKeygen { output } = &cli.command {
@@ -1380,6 +1434,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::ExchangeWithdrawalKeygen { .. } => {
             unreachable!("withdrawal journal key generation exits before node initialization")
+        }
+        Command::ExchangeKeyNew { .. }
+        | Command::ExchangeKeyShow { .. }
+        | Command::ExchangeTxSign { .. } => {
+            unreachable!("exchange key and withdrawal tools exit before node initialization")
         }
         Command::ExchangeV3AclQualify { .. } | Command::ExchangeV3AclFixtureQualify { .. } => {
             unreachable!("ACL qualification exits before node initialization")

@@ -69,6 +69,7 @@ pub(crate) mod exchange_policy;
 pub(crate) mod exchange_queries;
 pub mod exchange_rpc;
 pub(crate) mod exchange_signer;
+pub mod exchange_tx_tool;
 pub(crate) mod exchange_withdrawal;
 pub(crate) mod exchange_withdrawal_v3;
 pub mod explorer;

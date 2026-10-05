@@ -81,6 +81,23 @@ impl AddressHistoryIndex {
             .is_some_and(|locations| locations.contains(&location))
     }
 
+    /// Heights of active-chain blocks that pay or spend this key, ascending.
+    /// A block that touches the key in several transactions repeats its height.
+    pub fn active_heights<'a>(
+        &'a self,
+        address: &[u8; 32],
+        chain: &'a BlockIndex,
+    ) -> impl Iterator<Item = u64> + 'a {
+        self.locations
+            .get(address)
+            .into_iter()
+            .flatten()
+            .filter(|location| {
+                chain.active_position(location.block_id) == usize::try_from(location.height).ok()
+            })
+            .map(|location| location.height)
+    }
+
     pub fn page(
         &self,
         address: &[u8; 32],

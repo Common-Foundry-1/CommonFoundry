@@ -6,12 +6,15 @@ use std::fs::File;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use cmfd_consensus::{Block, OutPoint, OutputLock, Transaction};
+use cmfd_consensus::{Block, OutPoint, OutputLock, Transaction, coinbase_outpoint_id};
 use serde_json::{Value, json};
 
 use crate::{BLOCK_LOG_FILE, BlockRecordLocator, Node, NodeError, ProofProfile};
 
 const MAX_LOOKUP_TRANSACTIONS: usize = 5_000_000;
+/// A block arriving between locating a transaction and rechecking its one
+/// block read is retried here instead of being returned to the client.
+const LOOKUP_ATTEMPTS: usize = 3;
 pub(crate) const MAX_UTXO_PAGE: usize = 1_000;
 
 #[derive(Debug, thiserror::Error)]
@@ -28,12 +31,15 @@ pub(crate) enum QueryError {
     Node(#[from] NodeError),
 }
 
+/// Coinbase identifiers of the active chain, derived from block identities
+/// alone. Regular transactions are located through the node's full-history
+/// transaction index, so a lookup never reads more than the one block that
+/// holds the transaction.
 #[derive(Default)]
 pub(crate) struct TransactionLookupIndex {
     instance: Option<u64>,
     chain: Vec<[u8; 32]>,
-    by_block: HashMap<[u8; 32], Vec<[u8; 32]>>,
-    locations: HashMap<[u8; 32], [u8; 32]>,
+    coinbase_blocks: HashMap<[u8; 32], [u8; 32]>,
 }
 
 struct ReadPlan {
@@ -136,64 +142,37 @@ impl ReadPlan {
 }
 
 impl TransactionLookupIndex {
-    fn synchronize(&mut self, shared: &Arc<Mutex<Node>>) -> Result<(), QueryError> {
-        let (plan, common) = {
-            let node = shared.lock().map_err(|_| NodeError::SharedNodePoisoned)?;
-            if node.storage_faulted {
-                return Err(NodeError::StorageFaulted.into());
-            }
-            if self.instance != Some(node.instance_id) {
-                *self = Self::default();
-            }
-            if self.chain == node.index.active_chain {
-                return Ok(());
-            }
-            let common = self
-                .chain
-                .iter()
-                .zip(&node.index.active_chain)
-                .take_while(|(left, right)| left == right)
-                .count();
-            let mut blocks = Vec::new();
-            for id in node.index.active_chain.iter().skip(common.max(1)) {
-                let indexed = node.index.blocks.get(id).ok_or_else(|| {
-                    NodeError::CorruptLog("transaction lookup active block absent".into())
-                })?;
-                blocks.push((*id, indexed.locator));
-            }
-            (ReadPlan::capture(&node, blocks)?, common)
-        };
-        let mut added = Vec::new();
-        let mut added_count = 0usize;
-        for (id, locator) in &plan.blocks {
-            let block = plan.read_checked(shared, *id, locator)?;
-            let mut ids = vec![block.coinbase_outpoint_id()];
-            ids.extend(block.transactions.iter().map(Transaction::txid));
-            added_count = added_count
-                .checked_add(ids.len())
-                .ok_or(QueryError::Capacity)?;
-            if self.locations.len().saturating_add(added_count) > MAX_LOOKUP_TRANSACTIONS {
-                return Err(QueryError::Capacity);
-            }
-            added.push((*id, ids));
+    /// Follows the active chain under the node lock. Only block identities are
+    /// hashed, so the cost is proportional to the blocks that changed.
+    fn synchronize(&mut self, node: &Node) -> Result<(), QueryError> {
+        if self.instance != Some(node.instance_id) {
+            *self = Self {
+                instance: Some(node.instance_id),
+                ..Self::default()
+            };
         }
-        plan.recheck(shared)?;
-        // Commit only after all records authenticate and the chain is rechecked.
-        for id in self.chain.iter().skip(common) {
-            if let Some(txids) = self.by_block.remove(id) {
-                for txid in txids {
-                    self.locations.remove(&txid);
-                }
-            }
+        let active = &node.index.active_chain;
+        let common = self
+            .chain
+            .iter()
+            .zip(active)
+            .take_while(|(left, right)| left == right)
+            .count();
+        // Position zero is virtual genesis, which has no coinbase.
+        for id in self.chain.iter().skip(common.max(1)) {
+            self.coinbase_blocks
+                .remove(&coinbase_outpoint_id(node.params.network_id, *id));
         }
-        for (id, txids) in added {
-            for txid in &txids {
-                self.locations.insert(*txid, id);
-            }
-            self.by_block.insert(id, txids);
+        if active.len().saturating_sub(1) > MAX_LOOKUP_TRANSACTIONS {
+            *self = Self::default();
+            return Err(QueryError::Capacity);
         }
-        self.instance = Some(plan.instance);
-        self.chain = plan.chain;
+        for id in active.iter().skip(common.max(1)) {
+            self.coinbase_blocks
+                .insert(coinbase_outpoint_id(node.params.network_id, *id), *id);
+        }
+        self.chain.truncate(common);
+        self.chain.extend_from_slice(&active[common..]);
         Ok(())
     }
 
@@ -203,39 +182,51 @@ impl TransactionLookupIndex {
         txid: [u8; 32],
         block_hint: Option<[u8; 32]>,
     ) -> Result<Option<TransactionRead>, QueryError> {
-        if block_hint.is_none() {
-            // Common mempool queries do not need a history scan.
-            let node = shared.lock().map_err(|_| NodeError::SharedNodePoisoned)?;
-            if node.storage_faulted {
-                return Err(NodeError::StorageFaulted.into());
+        for _ in 1..LOOKUP_ATTEMPTS {
+            match self.lookup_once(shared, txid, block_hint) {
+                Err(QueryError::ChainChanged) => {}
+                result => return result,
             }
-            if let Some(entry) = node.mempool.get(&txid) {
-                return Ok(Some(TransactionRead {
-                    body: TransactionBody::Regular(entry.transaction.clone()),
-                    block_id: None,
-                    height: None,
-                    timestamp: None,
-                    confirmations: 0,
-                    tip: node.state.tip(),
-                    tip_height: node.state.next_height().saturating_sub(1),
-                }));
-            }
-            drop(node);
-            self.synchronize(shared)?;
         }
+        self.lookup_once(shared, txid, block_hint)
+    }
+
+    fn lookup_once(
+        &mut self,
+        shared: &Arc<Mutex<Node>>,
+        txid: [u8; 32],
+        block_hint: Option<[u8; 32]>,
+    ) -> Result<Option<TransactionRead>, QueryError> {
         let plan = {
             let node = shared.lock().map_err(|_| NodeError::SharedNodePoisoned)?;
             if node.storage_faulted {
                 return Err(NodeError::StorageFaulted.into());
             }
-            if block_hint.is_none()
-                && (self.instance != Some(node.instance_id)
-                    || self.chain != node.index.active_chain)
-            {
-                return Err(QueryError::ChainChanged);
-            }
-            let Some(id) = block_hint.or_else(|| self.locations.get(&txid).copied()) else {
-                return Ok(None);
+            let id = match block_hint {
+                Some(id) => id,
+                None => {
+                    if let Some(entry) = node.mempool.get(&txid) {
+                        return Ok(Some(TransactionRead {
+                            body: TransactionBody::Regular(entry.transaction.clone()),
+                            block_id: None,
+                            height: None,
+                            timestamp: None,
+                            confirmations: 0,
+                            tip: node.state.tip(),
+                            tip_height: node.state.next_height().saturating_sub(1),
+                        }));
+                    }
+                    match node.index.transactions.active_location(&txid, &node.index) {
+                        Some(location) => location.block_id,
+                        None => {
+                            self.synchronize(&node)?;
+                            let Some(id) = self.coinbase_blocks.get(&txid).copied() else {
+                                return Ok(None);
+                            };
+                            id
+                        }
+                    }
+                }
             };
             let Some(indexed) = node.index.blocks.get(&id) else {
                 return Ok(None);

@@ -17,6 +17,10 @@ export interface LocalTransaction {
   inputs: string[];
   encoded_bytes: number;
   state: "pending" | "confirmed" | "dropped";
+  /** Canonical frame, kept so an unacknowledged broadcast can be re-sent (sendrawtransaction is idempotent). */
+  frame_hex?: string;
+  /** True once the network has returned this txid for the broadcast. */
+  acknowledged?: boolean;
 }
 
 /** Amount paid to other addresses by a confirmed send this browser did not sign. */
@@ -74,7 +78,9 @@ export function createLocalWalletStore(networkId: string, storage: () => Storage
   return {
     loadKey: () => {
       const hex = read(keyName);
-      return hex && /^[0-9a-f]+$/.test(hex) ? hexToBytes(hex) : null;
+      if (hex === null) return null;
+      // Malformed data still counts as a stored wallet: it must be removed explicitly, never overwritten.
+      return /^(?:[0-9a-f]{2})+$/.test(hex) ? hexToBytes(hex) : new Uint8Array(0);
     },
     saveKey: (encrypted) => write(keyName, bytesToHex(encrypted)),
     removeKey: () => {

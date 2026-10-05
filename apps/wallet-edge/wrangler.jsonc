@@ -27,6 +27,11 @@
       "name": "WALLET_RPC_LIMIT",
       "namespace_id": "4101",
       "simple": { "limit": 30, "period": 60 }
+    },
+    {
+      "name": "WALLET_READ_LIMIT",
+      "namespace_id": "4102",
+      "simple": { "limit": 120, "period": 60 }
     }
   ],
   "assets": {
@@ -38,7 +43,7 @@
   "observability": {
     "enabled": true,
     "logs": {
-      "head_sampling_rate": 1
+      "head_sampling_rate": 0.05
     }
   }
 }

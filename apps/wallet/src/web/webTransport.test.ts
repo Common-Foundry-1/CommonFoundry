@@ -254,3 +254,85 @@ describe("web wallet spending", () => {
     expect(publicKeyHex(hexToBytes(vectors.backup.secret))).toBe(ME);
   });
 });
+
+describe("web wallet resilience", () => {
+  it("re-sends an unacknowledged transaction on refresh until the network acknowledges it", async () => {
+    const h = harness([coin("01", 500_000_000)]);
+    await restoredWallet(h);
+    h.api.broadcast.mockRejectedValue(new NodeApiError("gateway timeout", 502, "gateway_unavailable"));
+    await expect(h.transport.sendWalletTransaction({ recipient: OTHER, amount: "1", fee: "0.1" }))
+      .rejects.toMatchObject({ code: "broadcast_unconfirmed", retryable: true });
+    const frame = h.api.broadcast.mock.calls[0][0];
+
+    const pending = await h.transport.getWalletSnapshot();
+    expect(pending.balances.spendable_atoms).toBe("500000000");
+    expect(h.api.broadcast).toHaveBeenCalledTimes(2);
+    expect(h.api.broadcast.mock.calls[1][0]).toBe(frame);
+
+    h.api.broadcast.mockResolvedValue({ txid: pending.history[0].txid });
+    await h.transport.getWalletSnapshot();
+    expect(h.api.broadcast).toHaveBeenCalledTimes(3);
+    await h.transport.getWalletSnapshot();
+    expect(h.api.broadcast).toHaveBeenCalledTimes(3);
+  });
+
+  it("drops a stale send only while the chain still holds its inputs", async () => {
+    const send = async (h: ReturnType<typeof harness>) => {
+      await restoredWallet(h);
+      const expect_ = acceptBroadcasts(h.api, vectors.backup.secret);
+      expect_({
+        networkId: MAINNET_NETWORK_ID,
+        inputs: [{ txid: "02".repeat(32), index: 0 }],
+        outputs: [
+          { value: 100_000_000n, destination: OTHER, spendableHeight: 3_601n },
+          { value: 390_000_000n, destination: ME, spendableHeight: 3_601n },
+        ],
+      });
+      await h.transport.sendWalletTransaction({ recipient: OTHER, amount: "1", fee: "0.1" });
+      h.advance(31 * 60_000);
+    };
+
+    const vanished = harness();
+    await send(vanished);
+    const released = await vanished.transport.getWalletSnapshot();
+    expect(released.balances.spendable_atoms).toBe("1000000000");
+    expect(released.history.some((entry) => entry.status === "pending")).toBe(false);
+
+    const mined = harness();
+    await send(mined);
+    mined.api.utxos.mockResolvedValue({ height: 3_610, utxos: [coin("01", 100_000_000), coin("03", 400_000_000)], has_more: false, next_cursor: null });
+    const kept = await mined.transport.getWalletSnapshot();
+    expect(kept.balances.spendable_atoms).toBe("500000000");
+    expect(kept.history[0]).toMatchObject({ status: "pending", kind: "sent" });
+  });
+
+  it("never lets one backend push the output lock height into the future", async () => {
+    const h = harness([coin("01", 500_000_000)]);
+    await restoredWallet(h);
+    h.api.utxos.mockResolvedValue({ height: 4_000_000_000, utxos: [coin("01", 500_000_000)], has_more: false, next_cursor: null });
+    const expect_ = acceptBroadcasts(h.api, vectors.backup.secret);
+    expect_({
+      networkId: MAINNET_NETWORK_ID,
+      inputs: [{ txid: "01".repeat(32), index: 0 }],
+      outputs: [
+        { value: 100_000_000n, destination: OTHER, spendableHeight: 3_601n },
+        { value: 390_000_000n, destination: ME, spendableHeight: 3_601n },
+      ],
+    });
+    await expect(h.transport.sendWalletTransaction({ recipient: OTHER, amount: "1", fee: "0.1" })).resolves.toMatchObject({ change_atoms: "390000000" });
+  });
+
+  it("removes the stored key only on request, and treats damaged data as a wallet to remove", async () => {
+    const h = harness();
+    await restoredWallet(h);
+    expect(await h.transport.removeWallet()).toMatchObject({ storage: "missing", unlocked: false, destination: null });
+    expect(h.store.loadKey()).toBeNull();
+
+    h.store.saveKey(new Uint8Array([1]));
+    expect(await h.transport.getWalletCustodyStatus()).toMatchObject({ storage: "encrypted" });
+    await expect(h.transport.createWallet("", PASSPHRASE)).rejects.toMatchObject({ code: "wallet_exists" });
+    await expect(h.transport.unlockWallet(PASSPHRASE)).rejects.toMatchObject({ code: "invalid_backup" });
+    await h.transport.removeWallet();
+    expect((await h.transport.createWallet("", PASSPHRASE)).unlocked).toBe(true);
+  });
+});

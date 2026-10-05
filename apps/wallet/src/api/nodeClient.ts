@@ -43,6 +43,7 @@ export interface NodeTransport {
   chooseWalletBackupPath(restore: boolean): Promise<string | null>;
   migrateWalletEncryption(path: string, passphrase: string): Promise<WalletCustodyStatus>;
   restoreWallet(path: string, passphrase: string): Promise<WalletCustodyStatus>;
+  removeWallet(): Promise<WalletCustodyStatus>;
 }
 
 export type NativeInvoke = <T>(
@@ -115,6 +116,7 @@ export const httpNodeTransport: NodeTransport = {
   chooseWalletBackupPath: () => custodyUnavailable(),
   migrateWalletEncryption: () => custodyUnavailable(),
   restoreWallet: () => custodyUnavailable(),
+  removeWallet: () => custodyUnavailable(),
 };
 
 function custodyUnavailable<T>(): Promise<T> {
@@ -262,6 +264,11 @@ export function createTauriNodeTransport(invoke: NativeInvoke): NodeTransport {
       "restore_wallet",
       { request: { path, passphrase } },
     ),
+    removeWallet: () => Promise.reject(new NodeApiError(
+      "Removing a wallet is available in the web wallet.",
+      501,
+      "wallet_custody_unavailable",
+    )),
   };
 }
 
@@ -343,4 +350,8 @@ export function migrateWalletEncryption(
 
 export function restoreWallet(path: string, passphrase: string): Promise<WalletCustodyStatus> {
   return transport.restoreWallet(path, passphrase);
+}
+
+export function removeWallet(): Promise<WalletCustodyStatus> {
+  return transport.removeWallet();
 }

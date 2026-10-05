@@ -16,7 +16,7 @@ import type {
 } from "../types";
 import { decryptWalletKey, encryptWalletKey, WalletBackupError } from "./backup";
 import { isValidDestination, MAX_TRANSACTION_INPUTS, signTransaction, type UnsignedTransaction } from "./codec";
-import { edgeApi, type EdgeApi, type ExplorerAddress, type ExplorerAddressActivity, type ExplorerSnapshot, type UtxoCursor } from "./edgeApi";
+import { edgeApi, type AddressUtxo, type EdgeApi, type ExplorerAddress, type ExplorerAddressActivity, type ExplorerSnapshot, type UtxoCursor } from "./edgeApi";
 import { createLocalWalletStore, StorageUnavailableError, type LocalTransaction, type WalletStore } from "./store";
 
 export const MAINNET_NETWORK_ID = "88296bc39c10e8bc1dd4818d4d42412fe5f08210651110377f495da299812f62";
@@ -109,23 +109,46 @@ export function createWebNodeTransport(options: WebTransportOptions = {}): NodeT
     store.saveTransactions(destination, kept);
   };
 
-  /** Moves pending sends to confirmed once the explorer has them in a block it has indexed. */
+  /** Re-reads the list before writing so a send recorded during an await is never lost. */
+  const applyUpdates = (destination: string, updates: Map<string, Partial<LocalTransaction>>) => {
+    const transactions = localTransactions(destination).map((entry) => {
+      const update = updates.get(entry.txid);
+      return update ? { ...entry, ...update } : entry;
+    });
+    if (updates.size > 0) saveLocal(destination, transactions);
+    return transactions;
+  };
+
+  /** Re-sends unacknowledged frames, confirms mined sends, and drops sends the network never took. */
   const reconcile = async (destination: string, acceptedHeight: number, signal?: AbortSignal) => {
-    const transactions = localTransactions(destination);
-    let changed = false;
-    for (const entry of transactions) {
+    const updates = new Map<string, Partial<LocalTransaction>>();
+    let unspent: Set<string> | null = null;
+    for (const entry of localTransactions(destination)) {
       if (entry.state !== "pending") continue;
       const seen = await api.transaction(entry.txid, signal);
       if (seen?.status === "confirmed" && seen.block_height !== null && seen.block_height <= acceptedHeight) {
-        entry.state = "confirmed";
-        changed = true;
-      } else if (!seen && now() - entry.created_at > PENDING_DROP_AFTER_MS) {
-        entry.state = "dropped";
-        changed = true;
+        updates.set(entry.txid, { state: "confirmed", acknowledged: true });
+        continue;
+      }
+      if (seen) {
+        if (!entry.acknowledged) updates.set(entry.txid, { acknowledged: true });
+        continue;
+      }
+      // Receipt was never confirmed: sendrawtransaction is idempotent, so the same frame is re-sent.
+      if (!entry.acknowledged && entry.frame_hex) {
+        const accepted = await api.broadcast(entry.frame_hex).catch(() => null);
+        if (accepted?.txid === entry.txid) {
+          updates.set(entry.txid, { acknowledged: true });
+          continue;
+        }
+      }
+      if (now() - entry.created_at > PENDING_DROP_AFTER_MS) {
+        // Inputs are released only while the chain still holds them; spent inputs mean a transaction was mined.
+        const chain = (unspent ??= await unspentOutpoints(destination));
+        if (entry.inputs.every((input) => chain.has(input))) updates.set(entry.txid, { state: "dropped" });
       }
     }
-    if (changed) saveLocal(destination, transactions);
-    return transactions;
+    return applyUpdates(destination, updates);
   };
 
   const historyEntries = async (
@@ -200,22 +223,16 @@ export function createWebNodeTransport(options: WebTransportOptions = {}): NodeT
     };
   };
 
-  /** Every mature, unreserved coin for this address, from the gateway's UTXO view. */
-  const spendableCoins = async (wallet: UnlockedWallet) => {
-    const reserved = new Set(
-      localTransactions(wallet.destination)
-        .filter((entry) => entry.state === "pending")
-        .flatMap((entry) => entry.inputs),
-    );
-    const coins: Coin[] = [];
+  /** Every page of the gateway's UTXO view for this address (mature, unspent in its mempool). */
+  const utxoPages = async (destination: string) => {
+    const utxos: AddressUtxo[] = [];
+    let height = 0;
     let cursor: UtxoCursor | null = null;
     for (let page = 0; page < MAX_UTXO_PAGES; page += 1) {
-      const result = await api.utxos(wallet.destination, cursor);
-      for (const utxo of result.utxos) {
-        if (reserved.has(`${utxo.txid}:${utxo.vout}`) || utxo.spendable_height > result.height + 1) continue;
-        coins.push({ txid: utxo.txid, index: utxo.vout, value: BigInt(utxo.value_atoms) });
-      }
-      if (!result.has_more || !result.next_cursor) return { height: result.height, coins };
+      const result = await api.utxos(destination, cursor);
+      height = result.height;
+      utxos.push(...result.utxos);
+      if (!result.has_more || !result.next_cursor) return { height, utxos };
       cursor = result.next_cursor;
     }
     throw new NodeApiError(
@@ -223,6 +240,27 @@ export function createWebNodeTransport(options: WebTransportOptions = {}): NodeT
       413,
       "too_many_outputs",
     );
+  };
+
+  const unspentOutpoints = async (destination: string) =>
+    new Set((await utxoPages(destination)).utxos.map((utxo) => `${utxo.txid}:${utxo.vout}`));
+
+  /** Mature, unreserved coins, plus a lock height for new outputs that trusts neither backend alone. */
+  const spendableCoins = async (wallet: UnlockedWallet) => {
+    const reserved = new Set(
+      localTransactions(wallet.destination)
+        .filter((entry) => entry.state === "pending")
+        .flatMap((entry) => entry.inputs),
+    );
+    const [{ height, utxos }, current] = await Promise.all([utxoPages(wallet.destination), snapshot()]);
+    const coins: Coin[] = [];
+    for (const utxo of utxos) {
+      if (reserved.has(`${utxo.txid}:${utxo.vout}`) || utxo.spendable_height > height + 1) continue;
+      coins.push({ txid: utxo.txid, index: utxo.vout, value: BigInt(utxo.value_atoms) });
+    }
+    // A backend reporting a far-future height would otherwise lock the payment and change for years.
+    const lockHeight = BigInt(Math.min(height, current.accepted_height) + 1);
+    return { lockHeight, coins };
   };
 
   /** Signs, records (reserving the inputs), then broadcasts. */
@@ -237,6 +275,7 @@ export function createWebNodeTransport(options: WebTransportOptions = {}): NodeT
     const minimum = relayFee > MIN_TRANSACTION_FEE_ATOMS ? relayFee : MIN_TRANSACTION_FEE_ATOMS;
     if (fee < minimum) throw new NodeApiError(MINIMUM_FEE_MESSAGE, 422, "fee_too_low");
 
+    const frameHex = bytesToHex(signed.frame);
     const entry: LocalTransaction = {
       ...record,
       txid: signed.txid,
@@ -244,21 +283,29 @@ export function createWebNodeTransport(options: WebTransportOptions = {}): NodeT
       inputs: transaction.inputs.map((input) => `${input.txid}:${input.index}`),
       created_at: now(),
       state: "pending",
+      frame_hex: frameHex,
+      acknowledged: false,
     };
-    const transactions = localTransactions(wallet.destination);
-    saveLocal(wallet.destination, [entry, ...transactions]);
+    saveLocal(wallet.destination, [entry, ...localTransactions(wallet.destination)]);
     try {
-      const accepted = await api.broadcast(bytesToHex(signed.frame));
+      const accepted = await api.broadcast(frameHex);
       if (accepted.txid !== signed.txid) {
         throw new NodeApiError("The network acknowledged a different transaction id.", 502, "txid_mismatch");
       }
     } catch (cause) {
-      // Only release the inputs when the transaction certainly never reached a mempool.
       if (cause instanceof NodeApiError && [400, 413, 422, 429].includes(cause.status)) {
+        // The transaction certainly never reached a mempool, so its inputs are free again.
         saveLocal(wallet.destination, localTransactions(wallet.destination).filter((item) => item.txid !== signed.txid));
+        throw cause;
       }
-      throw cause;
+      throw new NodeApiError(
+        "The network did not confirm receipt. The transaction is saved as pending and will be re-sent automatically; do not send it again.",
+        cause instanceof NodeApiError ? cause.status : 0,
+        "broadcast_unconfirmed",
+        true,
+      );
     }
+    applyUpdates(wallet.destination, new Map([[signed.txid, { acknowledged: true }]]));
     snapshotCache = null;
     return { entry, mempool: await snapshot().catch(() => null) };
   };
@@ -347,7 +394,7 @@ export function createWebNodeTransport(options: WebTransportOptions = {}): NodeT
       if (fee === null || fee < MIN_TRANSACTION_FEE_ATOMS) throw new NodeApiError(MINIMUM_FEE_MESSAGE, 400, "fee_too_low");
 
       const required = amount + fee;
-      const { height, coins } = await spendableCoins(wallet);
+      const { lockHeight, coins } = await spendableCoins(wallet);
       const available = coins.reduce((total, coin) => total + coin.value, 0n);
       coins.sort((left, right) => compareCoins(right, left));
       const selected: Coin[] = [];
@@ -363,9 +410,8 @@ export function createWebNodeTransport(options: WebTransportOptions = {}): NodeT
           : new NodeApiError("Insufficient spendable balance for this amount and fee.", 422, "insufficient_funds");
       }
       const change = selectedValue - required;
-      const spendableHeight = BigInt(height + 1);
-      const outputs = [{ value: amount, destination: recipient, spendableHeight }];
-      if (change > 0n) outputs.push({ value: change, destination: wallet.destination, spendableHeight });
+      const outputs = [{ value: amount, destination: recipient, spendableHeight: lockHeight }];
+      if (change > 0n) outputs.push({ value: change, destination: wallet.destination, spendableHeight: lockHeight });
 
       const { entry, mempool } = await signAndBroadcast(wallet, {
         networkId,
@@ -400,7 +446,7 @@ export function createWebNodeTransport(options: WebTransportOptions = {}): NodeT
       if (!Number.isInteger(payload.max_inputs) || payload.max_inputs < 2 || payload.max_inputs > MAX_TRANSACTION_INPUTS) {
         throw new NodeApiError(`Choose between 2 and ${MAX_TRANSACTION_INPUTS} outputs to consolidate.`, 400, "invalid_max_inputs");
       }
-      const { height, coins } = await spendableCoins(wallet);
+      const { lockHeight, coins } = await spendableCoins(wallet);
       coins.sort(compareCoins);
       const selected = coins.slice(0, payload.max_inputs);
       if (selected.length < 2) {
@@ -413,7 +459,7 @@ export function createWebNodeTransport(options: WebTransportOptions = {}): NodeT
       const { entry, mempool } = await signAndBroadcast(wallet, {
         networkId,
         inputs: selected.map(({ txid, index }) => ({ txid, index })),
-        outputs: [{ value: outputAtoms, destination: wallet.destination, spendableHeight: BigInt(height + 1) }],
+        outputs: [{ value: outputAtoms, destination: wallet.destination, spendableHeight: lockHeight }],
       }, {
         kind: "consolidated",
         recipient: null,
@@ -442,13 +488,22 @@ export function createWebNodeTransport(options: WebTransportOptions = {}): NodeT
     unlockWallet: async (passphrase) => {
       const stored = store.loadKey();
       if (!stored) throw new NodeApiError("No wallet is stored in this browser.", 404, "wallet_missing");
-      unlocked = await custodyCall(() => decryptWalletKey(stored, networkId, passphrase));
+      const opened = await custodyCall(() => decryptWalletKey(stored, networkId, passphrase));
+      unlocked?.secretKey.fill(0);
+      unlocked = opened;
       return custody();
     },
 
     lockWallet: async () => {
       unlocked?.secretKey.fill(0);
       unlocked = null;
+      return custody();
+    },
+
+    removeWallet: async () => {
+      unlocked?.secretKey.fill(0);
+      unlocked = null;
+      await custodyCall(async () => store.removeKey());
       return custody();
     },
 

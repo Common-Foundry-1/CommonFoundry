@@ -1,0 +1,21 @@
+[package]
+name = "cmfd-webwallet-vectors"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+cmfd-consensus = { path = "../../crates/cmfd-consensus" }
+cmfd-node = { path = "../../crates/cmfd-node" }
+k256 = { version = "0.13.4", features = ["schnorr"] }
+hex = "0.4"
+serde_json = "1"
+
+[patch.crates-io]
+glib = { path = "../../third_party/glib-0.18.5-variant-str-iter" }
+p3-util = { path = "../../third_party/p3-util-0.6.3-msrv" }
+p3-merkle-tree = { path = "../../third_party/p3-merkle-tree-0.6.3-gpu-first-layer" }
+p3-fri = { path = "../../third_party/p3-fri-0.6.3-out-of-core" }
+p3-whir = { path = "../../third_party/p3-whir-0.6.3-generic-initial-matrix" }

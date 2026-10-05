@@ -34,6 +34,8 @@ async function proxyExplorer(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   if (request.method !== "GET") return json({ error: "method_not_allowed" }, 405);
   if (url.search || !isExplorerPath(url.pathname)) return json({ error: "not_found" }, 404);
+  const { success } = await env.WALLET_READ_LIMIT.limit({ key: request.headers.get("CF-Connecting-IP") ?? "unknown" });
+  if (!success) return json({ error: "rate_limited", message: "Too many requests from this connection. Wait a minute and try again." }, 429);
   const upstreamUrl = new URL(url.pathname, env.EXPLORER_ORIGIN);
   // Reads are idempotent, so one retry rides out the tunnel's occasional 502.
   for (let attempt = 0; ; attempt += 1) {
@@ -48,7 +50,8 @@ async function proxyExplorer(request: Request, env: Env): Promise<Response> {
       if (attempt === 0) continue;
       return json({ error: "explorer_unavailable", message: "The network explorer is unreachable. Try again shortly." }, 503);
     }
-    if ((upstream.status === 502 || upstream.status === 503) && attempt === 0) {
+    // 503 is the origin shedding load, so only a 502 (tunnel hiccup) is retried.
+    if (upstream.status === 502 && attempt === 0) {
       await upstream.body?.cancel();
       continue;
     }
@@ -68,6 +71,9 @@ async function readJsonBody(request: Request): Promise<Record<string, unknown>> 
   if (request.headers.get("Content-Type")?.split(";", 1)[0].trim().toLowerCase() !== "application/json") {
     throw new EdgeError(415, "json_required", "Send application/json.");
   }
+  // Refuse oversized bodies before buffering them.
+  const declared = Number(request.headers.get("Content-Length") ?? "0");
+  if (!Number.isFinite(declared) || declared > MAX_BODY_BYTES) throw new EdgeError(413, "body_too_large", "The request is too large.");
   const text = await request.text();
   if (text.length > MAX_BODY_BYTES) throw new EdgeError(413, "body_too_large", "The request is too large.");
   try {
@@ -78,6 +84,12 @@ async function readJsonBody(request: Request): Promise<Record<string, unknown>> 
   }
   throw new EdgeError(400, "invalid_json", "The request body must be a JSON object.");
 }
+
+const isHash = (value: unknown): value is string => typeof value === "string" && HASH.test(value);
+const isHeight = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
+const isIndex = (value: unknown): value is number => Number.isInteger(value) && (value as number) >= 0 && (value as number) <= 0xffff_ffff;
+const isAtoms = (value: unknown): value is string => typeof value === "string" && /^(?:0|[1-9][0-9]{0,19})$/.test(value);
+const invalidGatewayResponse = () => new EdgeError(502, "gateway_invalid_response", "The network gateway sent an unexpected response.");
 
 function hash(value: unknown, field: string): string {
   if (typeof value !== "string" || !HASH.test(value)) throw new EdgeError(400, "invalid_params", `${field} must be 64 lowercase hex characters.`);
@@ -146,14 +158,22 @@ async function walletRoute(request: Request, env: Env, route: string): Promise<R
       }
     }
     const result = await gateway(env, "getaddressutxos", [address, 1000, cursor as JsonValue]);
-    if (result.network_id !== env.EXPECTED_NETWORK_ID || result.destination_hex !== address || !Array.isArray(result.utxos)) {
-      throw new EdgeError(502, "gateway_invalid_response", "The network gateway sent an unexpected response.");
+    if (result.network_id !== env.EXPECTED_NETWORK_ID || result.destination_hex !== address
+        || !Array.isArray(result.utxos) || !isHeight(result.height)) {
+      throw invalidGatewayResponse();
+    }
+    const utxos = [];
+    for (const raw of result.utxos as unknown[]) {
+      const utxo = (raw ?? {}) as Record<string, unknown>;
+      if (utxo.lock_type !== "key" || utxo.destination_hex !== address) continue;
+      if (!isHash(utxo.txid) || !isIndex(utxo.vout) || !isAtoms(utxo.value_atoms) || !isHeight(utxo.spendable_height)) {
+        throw invalidGatewayResponse();
+      }
+      utxos.push({ txid: utxo.txid, vout: utxo.vout, value_atoms: utxo.value_atoms, spendable_height: utxo.spendable_height });
     }
     return json({
       height: result.height,
-      utxos: (result.utxos as Record<string, unknown>[])
-        .filter((utxo) => utxo.lock_type === "key" && utxo.destination_hex === address)
-        .map(({ txid, vout, value_atoms, spendable_height }) => ({ txid, vout, value_atoms, spendable_height })),
+      utxos,
       has_more: result.has_more === true,
       next_cursor: result.next_cursor ?? null,
     });
@@ -163,11 +183,16 @@ async function walletRoute(request: Request, env: Env, route: string): Promise<R
     const blockId = hash(body.block_id, "block_id");
     const result = await gateway(env, "getrawtransaction", [txid, true, blockId]);
     if (result.txid !== txid || result.network_id !== env.EXPECTED_NETWORK_ID || !Array.isArray(result.vout)) {
-      throw new EdgeError(502, "gateway_invalid_response", "The network gateway sent an unexpected response.");
+      throw invalidGatewayResponse();
     }
-    return json({
-      vout: (result.vout as Record<string, unknown>[]).map(({ value_atoms, destination_hex }) => ({ value_atoms, destination_hex })),
+    const vout = (result.vout as unknown[]).map((raw) => {
+      const output = (raw ?? {}) as Record<string, unknown>;
+      if (!isAtoms(output.value_atoms) || !(output.destination_hex === null || isHash(output.destination_hex))) {
+        throw invalidGatewayResponse();
+      }
+      return { value_atoms: output.value_atoms, destination_hex: output.destination_hex };
     });
+    return json({ vout });
   }
   if (route === "broadcast") {
     const frame = body.transaction_hex;

@@ -18,7 +18,26 @@ The `/v1/wallet/*` routes have these protections:
 - **Validation:** inputs are checked before anything is forwarded, and broadcast accepts only mainnet transaction frames.
 
 Errors are classified so the browser can tell when a broadcast certainly did not reach a
-mempool (4xx). Anything ambiguous (5xx) keeps the transaction's inputs reserved.
+mempool (4xx). Anything ambiguous (5xx) keeps the transaction's inputs reserved, and the browser
+re-sends the same frame on later refreshes (`sendrawtransaction` is idempotent) until the network
+acknowledges it. Gateway responses are schema-checked at the edge, and the browser caps new
+outputs' lock height at the lower of the gateway's and the explorer's chain height.
+
+## Trust model
+
+Non-custodial: keys never leave the browser, so nobody operating this service can spend funds.
+What the service *can* do if compromised: serve altered JavaScript (as with any hosted wallet;
+the CSP allows no third-party script, and Worker deploys are limited to the Cloudflare account), or
+misreport coin values so a send burns more fee than shown (no profit for the attacker; fees are
+burned). Independent per-input value checks need a node endpoint that returns output values via
+the explorer origin, planned for a later release.
+
+## Verifying the signing code
+
+`tools/webwallet-vectors` builds against the real consensus and node crates:
+`cargo run --release -- vectors` must reproduce `apps/wallet/src/web/fixtures/rust-vectors.json`
+(all but the one-off `backup` blob), `verify <frame-hex>` decodes and checks a browser-signed
+frame, and `backup-verify` restores a browser-made backup with the node's own code.
 
 ## Develop
 

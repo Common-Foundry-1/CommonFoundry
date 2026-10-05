@@ -2976,3 +2976,14 @@
     transition-duration: 0.01ms !important;
   }
 }
+
+.custody-remove-confirm {
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 10px;
+  cursor: pointer;
+}
+
+.custody-remove-confirm input {
+  margin-top: 3px;
+}

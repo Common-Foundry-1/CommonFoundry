@@ -7,13 +7,14 @@ import {
   chooseWalletBackupPath,
   lockWallet,
   migrateWalletEncryption,
+  removeWallet,
   restoreWallet,
   unlockWallet,
 } from "../api/nodeClient";
 import { usesBrowserKeys } from "../api/transportMode";
 import type { WalletCustodyStatus } from "../types";
 
-type CustodyAction = "create" | "unlock" | "backup" | "migrate" | "restore";
+type CustodyAction = "create" | "unlock" | "backup" | "migrate" | "restore" | "remove";
 
 interface WalletSecurityDialogProps {
   open: boolean;
@@ -45,6 +46,7 @@ function browserDescription(action: CustodyAction) {
   }
   if (action === "backup") return "Downloads your encrypted wallet file. It opens in this web wallet or the desktop wallet with the same passphrase.";
   if (action === "restore") return "Restore a .cmfd-backup file made by this web wallet or the desktop wallet.";
+  if (action === "remove") return "Deletes the encrypted key stored in this browser, for example before handing the computer to someone else. The wallet can be restored later from its backup file.";
   return "Your passphrase decrypts the key inside this browser. It is never sent anywhere, and the key is forgotten when you lock or close the tab.";
 }
 
@@ -73,6 +75,7 @@ export function WalletSecurityDialog({
   const [confirmation, setConfirmation] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [removeConfirmed, setRemoveConfirmed] = useState(false);
 
   useEffect(() => {
     if (!open) return;
@@ -80,6 +83,7 @@ export function WalletSecurityDialog({
     setPath("");
     setPassphrase("");
     setConfirmation("");
+    setRemoveConfirmed(false);
     setError(null);
   }, [open, status?.storage, status?.unlocked]);
 
@@ -129,6 +133,23 @@ export function WalletSecurityDialog({
     event.preventDefault();
     if (busy) return;
     setError(null);
+    if (action === "remove") {
+      if (!removeConfirmed) {
+        setError("Confirm that you have your backup file and passphrase first.");
+        return;
+      }
+      setBusy(true);
+      try {
+        onStatusChange(await removeWallet());
+        onCompleted("Wallet removed from this browser.");
+        await Promise.resolve(onRefresh()).catch(() => undefined);
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : "The wallet could not be removed.");
+      } finally {
+        setBusy(false);
+      }
+      return;
+    }
     if (passphraseCharacters(passphrase) < 12) {
       setError("Use a passphrase containing at least 12 characters.");
       return;
@@ -219,7 +240,9 @@ export function WalletSecurityDialog({
         ? "Back up wallet"
         : action === "migrate"
           ? "Encrypt existing wallet"
-          : "Restore wallet";
+          : action === "remove"
+            ? "Remove wallet from this browser"
+            : "Restore wallet";
 
   return (
     <div className="dialog-backdrop">
@@ -269,13 +292,16 @@ export function WalletSecurityDialog({
           </div>
         ) : null}
 
-        {status?.storage === "encrypted" && (status.unlocked || status.launch) ? (
+        {status?.storage === "encrypted" && (status.unlocked || status.launch || usesBrowserKeys) ? (
           <div className="custody-action-switch" role="group" aria-label="Wallet security choice">
-            {!status.unlocked ? <button className={action === "unlock" ? "is-active" : ""} type="button" onClick={() => setAction("unlock")} disabled={busy}>{status.launch?.ready ? "Unlock and connect" : "Show address"}</button> : null}
+            {!status.unlocked ? <button className={action === "unlock" ? "is-active" : ""} type="button" onClick={() => setAction("unlock")} disabled={busy}>{usesBrowserKeys ? "Unlock" : status.launch?.ready ? "Unlock and connect" : "Show address"}</button> : null}
             <button className={action === "backup" ? "is-active" : ""} type="button" onClick={() => setAction("backup")} disabled={busy}>Create backup</button>
-            <button type="button" onClick={() => void lockNow()} disabled={busy}>
-              <LockKeyhole aria-hidden="true" size={14} /> Lock now
-            </button>
+            {status.unlocked || !usesBrowserKeys ? (
+              <button type="button" onClick={() => void lockNow()} disabled={busy}>
+                <LockKeyhole aria-hidden="true" size={14} /> Lock now
+              </button>
+            ) : null}
+            {usesBrowserKeys ? <button className={action === "remove" ? "is-active" : ""} type="button" onClick={() => setAction("remove")} disabled={busy}>Remove…</button> : null}
           </div>
         ) : null}
 
@@ -312,18 +338,30 @@ export function WalletSecurityDialog({
             </div>
           ) : null}
 
-          <div className="form-field">
-            <label htmlFor="custody-passphrase">{passphraseLabel}</label>
-            <input
-              id="custody-passphrase"
-              type="password"
-              value={passphrase}
-              onChange={(event) => setPassphrase(event.target.value)}
-              autoComplete={needsConfirmation ? "new-password" : "current-password"}
-              disabled={busy}
-            />
-            <small>At least 12 characters. Store it separately from the encrypted backup.</small>
-          </div>
+          {action === "remove" ? (
+            <label className="form-field custody-remove-confirm">
+              <input
+                type="checkbox"
+                checked={removeConfirmed}
+                onChange={(event) => setRemoveConfirmed(event.target.checked)}
+                disabled={busy}
+              />
+              <span>I have my backup file and passphrase. Without them, the funds in this wallet are gone for good.</span>
+            </label>
+          ) : (
+            <div className="form-field">
+              <label htmlFor="custody-passphrase">{passphraseLabel}</label>
+              <input
+                id="custody-passphrase"
+                type="password"
+                value={passphrase}
+                onChange={(event) => setPassphrase(event.target.value)}
+                autoComplete={needsConfirmation ? "new-password" : "current-password"}
+                disabled={busy}
+              />
+              <small>At least 12 characters. Store it separately from the encrypted backup.</small>
+            </div>
+          )}
 
           {needsConfirmation ? (
             <div className="form-field">
@@ -343,7 +381,7 @@ export function WalletSecurityDialog({
 
           <div className="dialog-actions">
             {!required ? <button className="button-secondary" type="button" onClick={onClose} disabled={busy}>Cancel</button> : null}
-            <button className="button-primary" type="submit" disabled={busy || !status}>
+            <button className="button-primary" type="submit" disabled={busy || !status || (action === "remove" && !removeConfirmed)}>
               {busy ? <RefreshCw className="spin" aria-hidden="true" size={16} /> : action === "restore" || action === "backup" || action === "migrate" ? <HardDriveDownload aria-hidden="true" size={16} /> : <KeyRound aria-hidden="true" size={16} />}
               {busy ? "Working…" : title}
             </button>

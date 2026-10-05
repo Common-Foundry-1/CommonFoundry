@@ -52,14 +52,18 @@ function passphraseBytes(passphrase: string): Uint8Array {
   return bytes;
 }
 
-function deriveKey(passphrase: Uint8Array, salt: Uint8Array): Promise<Uint8Array> {
-  return argon2idAsync(passphrase, salt, {
-    m: ARGON2_MEMORY_KIB,
-    t: ARGON2_ITERATIONS,
-    p: ARGON2_PARALLELISM,
-    dkLen: 32,
-    asyncTick: 25,
-  });
+async function deriveKey(passphrase: Uint8Array, salt: Uint8Array): Promise<Uint8Array> {
+  try {
+    return await argon2idAsync(passphrase, salt, {
+      m: ARGON2_MEMORY_KIB,
+      t: ARGON2_ITERATIONS,
+      p: ARGON2_PARALLELISM,
+      dkLen: 32,
+      asyncTick: 25,
+    });
+  } finally {
+    passphrase.fill(0);
+  }
 }
 
 function header(networkId: Uint8Array, destination: Uint8Array, salt: Uint8Array, nonce: Uint8Array): Uint8Array {
@@ -134,9 +138,11 @@ export async function decryptWalletKey(
   try {
     destination = schnorr.getPublicKey(secretKey);
   } catch {
+    secretKey.fill(0);
     throw new WalletBackupError("invalid_backup", "This wallet backup does not contain a valid key.");
   }
   if (!equalBytes(destination, encrypted.subarray(96, 128))) {
+    secretKey.fill(0);
     throw new WalletBackupError("destination_mismatch", "The backup key does not match its recorded address.");
   }
   return { secretKey, destination: bytesToHex(destination) };

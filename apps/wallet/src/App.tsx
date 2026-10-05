@@ -1,6 +1,6 @@
 import { RefreshCw, Settings2, ShieldCheck, X } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
-import { getWalletCustodyStatus, usesEmbeddedNode } from "./api/nodeClient";
+import { getWalletCustodyStatus, lockWallet, usesEmbeddedNode } from "./api/nodeClient";
 import { usesBrowserKeys } from "./api/transportMode";
 import { ConsolidationDialog } from "./components/ConsolidationDialog";
 import { MobileNav } from "./components/MobileNav";
@@ -14,6 +14,7 @@ import { Sidebar, type ViewName } from "./components/Sidebar";
 import { StartupScreen } from "./components/StartupScreen";
 import { TransactionsView } from "./components/TransactionsView";
 import { WalletSecurityDialog } from "./components/WalletSecurityDialog";
+import { useInactivityLock } from "./hooks/useInactivityLock";
 import { useWalletData } from "./hooks/useWalletData";
 import type { WalletCustodyStatus } from "./types";
 
@@ -53,6 +54,12 @@ export function App() {
     setNotice(message);
     window.setTimeout(() => setNotice((current) => (current === message ? null : current)), 4_500);
   }, []);
+
+  // Web wallet: forget the decrypted key when nobody has touched the page for a while.
+  useInactivityLock(usesBrowserKeys && Boolean(custody?.unlocked), async () => {
+    setCustody(await lockWallet());
+    showNotice("Wallet locked after 15 minutes without activity.");
+  });
 
   const refreshCustody = useCallback(async () => {
     if (!hasKeyCustody) return;

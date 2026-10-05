@@ -11,9 +11,11 @@ const ORIGIN = "https://wallet.commonfoundry.ai";
 
 function environment(overrides: Partial<Env> = {}) {
   const limit = vi.fn(async () => ({ success: true }));
+  const readLimit = vi.fn(async () => ({ success: true }));
   const env = {
     ASSETS: { fetch: async () => new Response("<!doctype html>", { headers: { "Content-Type": "text/html" } }), connect: () => { throw new Error("unused"); } },
     WALLET_RPC_LIMIT: { limit },
+    WALLET_READ_LIMIT: { limit: readLimit },
     EXPLORER_ORIGIN: "https://mainnet-explorer-origin.commonfoundry.ai",
     EXPECTED_NETWORK_ID: NETWORK_ID,
     GATEWAY_URL: "https://sg-rpc.commonfoundry.ai/mainnet",
@@ -21,7 +23,7 @@ function environment(overrides: Partial<Env> = {}) {
     GATEWAY_PASSWORD: "secret-password",
     ...overrides,
   } as unknown as Env;
-  return { env, limit };
+  return { env, limit, readLimit };
 }
 
 function explorerResponse(body: unknown, network = NETWORK_ID, status = 200) {
@@ -90,6 +92,17 @@ describe("explorer proxy", () => {
     expect(wrong.status).toBe(503);
   });
 
+  it("rate-limits reads and does not retry an origin that is shedding load", async () => {
+    const upstream = vi.fn(async () => new Response("busy", { status: 503 }));
+    vi.stubGlobal("fetch", upstream);
+    const limited = environment();
+    limited.readLimit.mockResolvedValue({ success: false });
+    expect((await worker.fetch(new Request(`${ORIGIN}/v1/explorer`), limited.env)).status).toBe(429);
+    expect(upstream).not.toHaveBeenCalled();
+    expect((await worker.fetch(new Request(`${ORIGIN}/v1/explorer`), environment().env)).status).toBe(503);
+    expect(upstream).toHaveBeenCalledTimes(1);
+  });
+
   it("never forwards query strings or other methods", async () => {
     const upstream = vi.fn();
     vi.stubGlobal("fetch", upstream);
@@ -123,10 +136,33 @@ describe("wallet gateway routes", () => {
     expect((await worker.fetch(post("/v1/wallet/utxos", { address: ADDRESS }, { Origin: "https://evil.example" }), environment().env)).status).toBe(403);
     expect((await worker.fetch(post("/v1/wallet/utxos", { address: ADDRESS }, { "Content-Type": "text/plain" }), environment().env)).status).toBe(415);
     expect((await worker.fetch(new Request(`${ORIGIN}/v1/wallet/utxos`), environment().env)).status).toBe(405);
+    const oversized = new Request(`${ORIGIN}/v1/wallet/utxos`, { method: "POST", headers: { "Content-Type": "application/json", Origin: ORIGIN, "Content-Length": "10000000" }, body: "{}" });
+    expect((await worker.fetch(oversized, environment().env)).status).toBe(413);
     const limited = environment();
     limited.limit.mockResolvedValue({ success: false });
     expect((await worker.fetch(post("/v1/wallet/utxos", { address: ADDRESS }), limited.env)).status).toBe(429);
     expect(upstream).not.toHaveBeenCalled();
+  });
+
+  it("refuses malformed gateway data instead of passing it to the wallet", async () => {
+    const utxo = { txid: "aa".repeat(32), vout: 1, value_atoms: "5", spendable_height: 10, lock_type: "key", destination_hex: ADDRESS };
+    const base = { network_id: NETWORK_ID, destination_hex: ADDRESS, has_more: false, next_cursor: null };
+    for (const result of [
+      { ...base, height: "3600", utxos: [utxo] },
+      { ...base, height: 3600, utxos: [{ ...utxo, value_atoms: 5 }] },
+      { ...base, height: 3600, utxos: [{ ...utxo, spendable_height: 1e300 }] },
+      { ...base, height: 3600, utxos: [{ ...utxo, txid: "nope" }] },
+    ]) {
+      vi.stubGlobal("fetch", vi.fn(async () => rpcResponse({ jsonrpc: "2.0", id: 1, result })));
+      const response = await worker.fetch(post("/v1/wallet/utxos", { address: ADDRESS }), environment().env);
+      expect(response.status).toBe(502);
+      expect(await response.json()).toMatchObject({ error: "gateway_invalid_response" });
+    }
+    vi.stubGlobal("fetch", vi.fn(async () => rpcResponse({ jsonrpc: "2.0", id: 1, result: {
+      txid: "ab".repeat(32), network_id: NETWORK_ID, vout: [{ value_atoms: 7, destination_hex: ADDRESS }],
+    } })));
+    const lookup = await worker.fetch(post("/v1/wallet/transaction", { txid: "ab".repeat(32), block_id: "cd".repeat(32) }), environment().env);
+    expect(lookup.status).toBe(502);
   });
 
   it("only relays mainnet transaction frames", async () => {

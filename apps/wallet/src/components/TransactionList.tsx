@@ -81,7 +81,9 @@ export function TransactionList({ entries, compact = false }: TransactionListPro
               <strong className={value < 0n ? "is-negative" : "is-positive"}>
                 {formatAtoms(value, true)} CMFD
               </strong>
-              {BigInt(entry.fee_burned_atoms) > 0n ? (
+              {entry.fee_unknown ? (
+                <span>Fee not shown</span>
+              ) : BigInt(entry.fee_burned_atoms) > 0n ? (
                 <span>{formatAtoms(entry.fee_burned_atoms)} burned</span>
               ) : (
                 <span>{entry.kind === "mined" ? "Block reward" : "No fee"}</span>

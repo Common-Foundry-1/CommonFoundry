@@ -1,0 +1,96 @@
+{
+  "network_id": "88296bc39c10e8bc1dd4818d4d42412fe5f08210651110377f495da299812f62",
+  "network_magic": "6702973f",
+  "secrets": [
+    {
+      "public_key": "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f",
+      "secret": "0101010101010101010101010101010101010101010101010101010101010101"
+    },
+    {
+      "public_key": "4f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa",
+      "secret": "1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    {
+      "public_key": "142715675faf8da1ecc4d51e0b9e539fa0d52fdd96ed60dbe99adb15d6b05ad9",
+      "secret": "7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f"
+    },
+    {
+      "public_key": "0ce472ae5d8993e7609ee4ef33b344f6b8499a1259374bdf528f82240985bf03",
+      "secret": "fefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefe"
+    }
+  ],
+  "transactions": [
+    {
+      "frame": "434d46446702973f010001001301000088296bc39c10e8bc1dd4818d4d42412fe5f08210651110377f495da299812f620100000001000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01000000004f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aafd735730720476a313cbfeb205cc48ff75ed7fea9e362955e4e328b4336144cb7ed793d6ab8f9d1eccf738512394a73b1aefdf0d3866671c5806ba7c7c398d370200000015cd5b070000000000466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27ef0d000000000000b168de3a00000000004f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aaef0d000000000000",
+      "name": "one_input_two_outputs",
+      "public_key": "4f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa",
+      "secret": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeda99dcbd59e378f2aaec14d7bbf253030",
+      "signature": "fd735730720476a313cbfeb205cc48ff75ed7fea9e362955e4e328b4336144cb7ed793d6ab8f9d1eccf738512394a73b1aefdf0d3866671c5806ba7c7c398d37",
+      "signing_digest": "53a17981cc4367df614aa885de2d5f70abc15e66bb356231f69d1be5fe45f7d0",
+      "transaction": {
+        "inputs": [
+          {
+            "index": 1,
+            "txid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          }
+        ],
+        "network_id": "88296bc39c10e8bc1dd4818d4d42412fe5f08210651110377f495da299812f62",
+        "outputs": [
+          {
+            "destination": "466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27",
+            "spendable_height": 3567,
+            "value": "123456789"
+          },
+          {
+            "destination": "4f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa",
+            "spendable_height": 3567,
+            "value": "987654321"
+          }
+        ],
+        "version": 1
+      },
+      "txid": "c59a9848998071b2ae0df6b9dedcc48f0bb304253e761e4c620d05f32573d56c"
+    },
+    {
+      "frame": "434d46446702973f01000100ec01000088296bc39c10e8bc1dd4818d4d42412fe5f08210651110377f495da299812f62010000000300000001010101010101010101010101010101010101010101010101010101010101010000000000142715675faf8da1ecc4d51e0b9e539fa0d52fdd96ed60dbe99adb15d6b05ad93a8d991de205872a3f7edef82575d0f3e33081b25ab5f2fc23fababadbc494a31bd632a25d7f28a17633f8bdfcb3b1f00b0b171de0cda6bf655b38344e4100ab02020202020202020202020202020202020202020202020202020202020202020700000000142715675faf8da1ecc4d51e0b9e539fa0d52fdd96ed60dbe99adb15d6b05ad93a8d991de205872a3f7edef82575d0f3e33081b25ab5f2fc23fababadbc494a31bd632a25d7f28a17633f8bdfcb3b1f00b0b171de0cda6bf655b38344e4100abfefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefeffff000000142715675faf8da1ecc4d51e0b9e539fa0d52fdd96ed60dbe99adb15d6b05ad93a8d991de205872a3f7edef82575d0f3e33081b25ab5f2fc23fababadbc494a31bd632a25d7f28a17633f8bdfcb3b1f00b0b171de0cda6bf655b38344e4100ab01000000555555555555555500466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f270000000000000000",
+      "name": "three_inputs_one_output",
+      "public_key": "142715675faf8da1ecc4d51e0b9e539fa0d52fdd96ed60dbe99adb15d6b05ad9",
+      "secret": "8080808080808080808080808080807f3b2f5d672fc920bc4052df0d50b6c1c2",
+      "signature": "3a8d991de205872a3f7edef82575d0f3e33081b25ab5f2fc23fababadbc494a31bd632a25d7f28a17633f8bdfcb3b1f00b0b171de0cda6bf655b38344e4100ab",
+      "signing_digest": "5558ef01646bba5238879a38ee809d7929dd29121978883fb1b25f3dbb5f303e",
+      "transaction": {
+        "inputs": [
+          {
+            "index": 0,
+            "txid": "0101010101010101010101010101010101010101010101010101010101010101"
+          },
+          {
+            "index": 7,
+            "txid": "0202020202020202020202020202020202020202020202020202020202020202"
+          },
+          {
+            "index": 65535,
+            "txid": "fefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefe"
+          }
+        ],
+        "network_id": "88296bc39c10e8bc1dd4818d4d42412fe5f08210651110377f495da299812f62",
+        "outputs": [
+          {
+            "destination": "466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27",
+            "spendable_height": 0,
+            "value": "6148914691236517205"
+          }
+        ],
+        "version": 1
+      },
+      "txid": "8b9379777f759c191b509460054f97eb28200ffef188d708ccb3320d180c6122"
+    }
+  ],
+  "backup": {
+    "passphrase": "correct horse battery staple",
+    "secret": "3333333333333333333333333333333333333333333333333333333333333333",
+    "destination": "3c72addb4fdf09af94f0c94d7fe92a386a7e70cf8a1d85916386bb2535c7b1b1",
+    "encrypted": "434d4644574c5431010001010000010003000000010000001c40f06fbb9712a8de1f57f8efda84d536b4b4bee0a926abb3f7dd1087bd3347c0b1c8fb10d6d83888296bc39c10e8bc1dd4818d4d42412fe5f08210651110377f495da299812f623c72addb4fdf09af94f0c94d7fe92a386a7e70cf8a1d85916386bb2535c7b1b11ec64d685955f1c210cf4a9d9fa4fd06244415e893cd1fb104f1320b8c14b0908c36f86480ab05f2a2c888ce9b0c2f1d"
+  },
+  "_source": "Generated by the Rust consensus/node code (Transaction::sign_all, wire::encode_transaction, wallet_backup::migrate_plaintext_wallet_key)."
+}

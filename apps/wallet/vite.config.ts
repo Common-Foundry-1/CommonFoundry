@@ -7,6 +7,11 @@ const nodeProxy = {
     changeOrigin: true,
     rewrite: (path: string) => path.replace(/^\/rpc/, ""),
   },
+  // Web mode: the wallet edge Worker (`npm run dev` in apps/wallet-edge).
+  "/v1": {
+    target: "http://127.0.0.1:8787",
+    changeOrigin: true,
+  },
 };
 
 export default defineConfig({

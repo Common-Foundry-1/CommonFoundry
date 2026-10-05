@@ -1,6 +1,7 @@
 import { RefreshCw, Settings2, ShieldCheck, X } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { getWalletCustodyStatus, usesEmbeddedNode } from "./api/nodeClient";
+import { usesBrowserKeys } from "./api/transportMode";
 import { ConsolidationDialog } from "./components/ConsolidationDialog";
 import { MobileNav } from "./components/MobileNav";
 import { MiningView } from "./components/MiningView";
@@ -15,6 +16,9 @@ import { TransactionsView } from "./components/TransactionsView";
 import { WalletSecurityDialog } from "./components/WalletSecurityDialog";
 import { useWalletData } from "./hooks/useWalletData";
 import type { WalletCustodyStatus } from "./types";
+
+// Browser keys and desktop custody share the security dialog; only the desktop runs a node.
+const hasKeyCustody = usesEmbeddedNode || usesBrowserKeys;
 
 const TITLES: Record<ViewName, { eyebrow: string; title: string }> = {
   overview: { eyebrow: "Common Foundry Wallet", title: "Overview" },
@@ -32,7 +36,7 @@ export function App() {
   const [custody, setCustody] = useState<WalletCustodyStatus | null>(null);
   const [custodyError, setCustodyError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const data = useWalletData();
+  const data = useWalletData(usesBrowserKeys ? 20_000 : undefined);
   const networkShortName = data.status?.network_short_name ?? "Network";
   const heading = view === "network"
     ? { eyebrow: `${networkShortName} operations`, title: "Network" }
@@ -51,7 +55,7 @@ export function App() {
   }, []);
 
   const refreshCustody = useCallback(async () => {
-    if (!usesEmbeddedNode) return;
+    if (!hasKeyCustody) return;
     try {
       const next = await getWalletCustodyStatus();
       setCustody(next);
@@ -78,8 +82,8 @@ export function App() {
     return () => { cancelled = true; clearTimeout(timer); };
   }, [preparingLaunch, refreshCustody]);
 
-  const custodyRequired = usesEmbeddedNode && custody !== null && !custody.unlocked;
-  const custodyNeedsAttention = usesEmbeddedNode && (custody?.requires_migration || custodyRequired);
+  const custodyRequired = hasKeyCustody && custody !== null && !custody.unlocked;
+  const custodyNeedsAttention = hasKeyCustody && (custody?.requires_migration || custodyRequired);
 
   if (preparingLaunch && custody) {
     return <PrelaunchWallet status={custody} statusError={custodyError} onStatusChange={setCustody}
@@ -110,9 +114,9 @@ export function App() {
           <div className="topbar-actions">
             <div className={`connection-pill${data.error ? " is-offline" : ""}`}>
               <span />
-              {data.error ? "Node offline" : `${networkShortName} Connected`}
+              {data.error ? (usesBrowserKeys ? "Offline" : "Node offline") : `${networkShortName} Connected`}
             </div>
-            {usesEmbeddedNode ? (
+            {hasKeyCustody ? (
               <button
                 className={`icon-button topbar-settings${custodyNeedsAttention ? " needs-attention" : ""}`}
                 type="button"
@@ -123,9 +127,11 @@ export function App() {
                 <ShieldCheck aria-hidden="true" size={18} />
               </button>
             ) : null}
-            <button className="icon-button topbar-settings topbar-node-settings" type="button" onClick={() => setView("network")} aria-label="Open node settings">
-              <Settings2 aria-hidden="true" size={18} />
-            </button>
+            {usesBrowserKeys ? null : (
+              <button className="icon-button topbar-settings topbar-node-settings" type="button" onClick={() => setView("network")} aria-label="Open node settings">
+                <Settings2 aria-hidden="true" size={18} />
+              </button>
+            )}
           </div>
         </header>
 
@@ -146,7 +152,7 @@ export function App() {
         {data.error ? (
           <div className="offline-banner" role="alert">
             <div>
-              <strong>Local node unavailable</strong>
+              <strong>{usesBrowserKeys ? "Network service unavailable" : "Local node unavailable"}</strong>
               <span>{data.error}</span>
             </div>
             <button className="button-secondary compact" type="button" onClick={() => void data.refresh()}>
@@ -194,8 +200,8 @@ export function App() {
         <footer className="statusbar">
           <span><i className={data.error ? "offline" : ""} />{
             data.error
-              ? (usesEmbeddedNode ? "Embedded node offline" : "RPC offline")
-              : (usesEmbeddedNode ? "Embedded node connected" : "RPC connected")
+              ? (usesEmbeddedNode ? "Embedded node offline" : usesBrowserKeys ? "Explorer offline" : "RPC offline")
+              : (usesEmbeddedNode ? "Embedded node connected" : usesBrowserKeys ? "Explorer connected" : "RPC connected")
           }</span>
           <span>{data.status?.network ?? "Network unavailable"}</span>
           <span>Height {data.status?.accepted_height ?? "—"}</span>

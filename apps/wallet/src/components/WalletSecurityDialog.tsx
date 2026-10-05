@@ -10,6 +10,7 @@ import {
   restoreWallet,
   unlockWallet,
 } from "../api/nodeClient";
+import { usesBrowserKeys } from "../api/transportMode";
 import type { WalletCustodyStatus } from "../types";
 
 type CustodyAction = "create" | "unlock" | "backup" | "migrate" | "restore";
@@ -29,6 +30,22 @@ function defaultAction(status: WalletCustodyStatus | null): CustodyAction {
   if (!status || status.storage === "missing") return "create";
   if (status.storage === "plaintext") return "migrate";
   return status.unlocked || (status.launch && !status.launch.ready && status.destination) ? "backup" : "unlock";
+}
+
+function browserCompletion(action: CustodyAction) {
+  if (action === "create") return "Wallet created and unlocked. Your encrypted backup file was downloaded.";
+  if (action === "backup") return "Encrypted backup downloaded.";
+  if (action === "restore") return "Wallet restored and unlocked.";
+  return "Wallet unlocked.";
+}
+
+function browserDescription(action: CustodyAction) {
+  if (action === "create") {
+    return "A new key is generated and encrypted in this browser, and an encrypted backup file downloads automatically. Keep that file and your passphrase: nobody, including Common Foundry, can recover them.";
+  }
+  if (action === "backup") return "Downloads your encrypted wallet file. It opens in this web wallet or the desktop wallet with the same passphrase.";
+  if (action === "restore") return "Restore a .cmfd-backup file made by this web wallet or the desktop wallet.";
+  return "Your passphrase decrypts the key inside this browser. It is never sent anywhere, and the key is forgotten when you lock or close the tab.";
 }
 
 function passphraseBytes(value: string) {
@@ -99,7 +116,10 @@ export function WalletSecurityDialog({
 
   if (!open) return null;
 
-  const needsPath = action === "create" || action === "backup" || action === "migrate" || action === "restore";
+  // The browser downloads new backups under a default name; only restore needs a file.
+  const needsPath = usesBrowserKeys
+    ? action === "restore"
+    : action === "create" || action === "backup" || action === "migrate" || action === "restore";
   const needsConfirmation = action === "create" || action === "migrate";
   const passphraseLabel = action === "unlock" || action === "restore" || action === "backup"
     ? "Wallet passphrase"
@@ -141,7 +161,7 @@ export function WalletSecurityDialog({
             ? await migrateWalletEncryption(path, submittedPassphrase)
             : await restoreWallet(path, submittedPassphrase);
       onStatusChange(next);
-      onCompleted(action === "backup"
+      onCompleted(usesBrowserKeys ? browserCompletion(action) : action === "backup"
         ? "Encrypted wallet backup created. The wallet is locked."
         : action === "migrate"
           ? "Wallet encrypted and backup created. Unlock it to resume the node."
@@ -214,7 +234,7 @@ export function WalletSecurityDialog({
       >
         <div className="dialog-header">
           <div>
-            <p className="dialog-eyebrow">Local key custody</p>
+            <p className="dialog-eyebrow">{usesBrowserKeys ? "Browser key custody" : "Local key custody"}</p>
             <h2 className="dialog-title" id="wallet-security-title">{title}</h2>
           </div>
           {!required ? (
@@ -234,7 +254,7 @@ export function WalletSecurityDialog({
               : status?.storage === "plaintext"
                 ? "Encryption upgrade available"
                 : status?.storage === "missing"
-                  ? "No local wallet key"
+                  ? (usesBrowserKeys ? "No wallet in this browser" : "No local wallet key")
                   : "Checking wallet storage"}</strong>
             <span>{status?.network ?? "Common Foundry network"}</span>
           </div>
@@ -261,7 +281,7 @@ export function WalletSecurityDialog({
 
         <form className="form-stack" onSubmit={(event) => void submit(event)} noValidate>
           <p className="dialog-description">
-            {action === "create"
+            {usesBrowserKeys ? browserDescription(action) : action === "create"
               ? "Create an encrypted wallet and a separate encrypted backup before connecting. No signing key is kept unlocked during preparation."
               : action === "migrate"
               ? "This creates a separate authenticated backup first, then atomically replaces the local plaintext key with an encrypted copy."

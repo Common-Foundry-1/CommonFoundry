@@ -8,6 +8,10 @@
 /output/pdf/Common-Foundry-Technical-Whitepaper-v0.2-review.pdf
 /apps/wallet/node_modules/
 /apps/wallet/dist/
+/apps/wallet/dist-web/
+/apps/wallet-edge/node_modules/
+/apps/wallet-edge/.wrangler/
+/apps/wallet-edge/.dev.vars
 /apps/pool-dashboard/node_modules/
 /apps/pool-dashboard/dist/
 /apps/pool-operator-dashboard/node_modules/

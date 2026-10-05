@@ -6,8 +6,10 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "dev:desktop": "vite --host 127.0.0.1 --mode tauri",
+    "dev:web": "vite --host 127.0.0.1 --mode web",
     "build": "tsc -b && vite build",
     "build:desktop": "tsc -b && vite build --mode tauri",
+    "build:web": "tsc -b && vite build --mode web --outDir dist-web",
     "check": "tsc -b --pretty false",
     "test": "vitest run",
     "preview": "vite preview --host 127.0.0.1",
@@ -17,6 +19,9 @@
     "desktop:build:cuda:windows": "npm run cuda:build:windows && tauri build --config src-tauri/tauri.cuda.windows.conf.json"
   },
   "dependencies": {
+    "@noble/ciphers": "2.4.0",
+    "@noble/curves": "2.4.0",
+    "@noble/hashes": "2.4.0",
     "@tauri-apps/api": "2.11.1",
     "lucide-react": "1.32.0",
     "qrcode.react": "4.2.0",

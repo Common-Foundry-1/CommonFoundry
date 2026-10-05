@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 
 import { sendWalletTransaction } from "../api/nodeClient";
+import { usesBrowserKeys } from "../api/transportMode";
 import { formatAtoms, parseCmfd, shortenHash } from "../lib/amount";
 import { DEFAULT_TRANSACTION_FEE, MIN_TRANSACTION_FEE_ATOMS, MINIMUM_FEE_MESSAGE } from "../lib/fees";
 import type { WalletSendResult, WalletSnapshot } from "../types";
@@ -216,7 +217,9 @@ export function SendDialog({
         {phase === "edit" && (
           <form className="form-stack" onSubmit={reviewTransaction} noValidate>
             <p className="dialog-description" id="send-dialog-description">
-              Create a signed transaction using this node's compiled-network wallet.
+              {usesBrowserKeys
+                ? "This browser signs the transaction with your key, then relays it to the network."
+                : "Create a signed transaction using this node's compiled-network wallet."}
             </p>
 
             <div className="form-field">
@@ -384,7 +387,9 @@ export function SendDialog({
         {phase === "complete" && result && (
           <div className="review-stack">
             <p className="dialog-description" id="send-dialog-description">
-              The node accepted this transaction into its local mempool.
+              {usesBrowserKeys
+                ? "The network accepted this transaction into its mempool."
+                : "The node accepted this transaction into its local mempool."}
             </p>
             <div className="review-summary">
               <div className="review-row review-row-block">

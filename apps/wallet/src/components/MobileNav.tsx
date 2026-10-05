@@ -5,6 +5,7 @@ import {
   LayoutDashboard,
   Pickaxe,
 } from "lucide-react";
+import { usesBrowserKeys } from "../api/transportMode";
 import type { ViewName } from "./Sidebar";
 
 interface MobileNavProps {
@@ -33,10 +34,12 @@ export function MobileNav({ active, onNavigate, onSend, onReceive }: MobileNavPr
         <Activity aria-hidden="true" size={20} />
         <span>Activity</span>
       </button>
-      <button className={active === "mining" ? "is-active" : ""} onClick={() => onNavigate("mining")} type="button">
-        <Pickaxe aria-hidden="true" size={20} />
-        <span>Mining</span>
-      </button>
+      {usesBrowserKeys ? null : (
+        <button className={active === "mining" ? "is-active" : ""} onClick={() => onNavigate("mining")} type="button">
+          <Pickaxe aria-hidden="true" size={20} />
+          <span>Mining</span>
+        </button>
+      )}
     </nav>
   );
 }

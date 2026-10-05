@@ -7,6 +7,7 @@ import {
   RefreshCw,
   WalletCards,
 } from "lucide-react";
+import { usesBrowserKeys } from "../api/transportMode";
 import { formatBalanceAtoms, formatBytes, shortenHash, sumAtoms } from "../lib/amount";
 import type { NodeStatus, WalletSnapshot } from "../types";
 import { TransactionList } from "./TransactionList";
@@ -79,13 +80,13 @@ export function Overview({
         <div className="node-rail-heading">
           <div>
             <span className="health-dot" />
-            <strong>Node connected</strong>
+            <strong>{usesBrowserKeys ? "Network connected" : "Node connected"}</strong>
           </div>
           <button className="icon-button" type="button" onClick={onRefresh} aria-label="Refresh wallet data">
             <RefreshCw aria-hidden="true" size={16} className={refreshing ? "spin" : ""} />
           </button>
         </div>
-        <p>Local node responding</p>
+        <p>{usesBrowserKeys ? "Public explorer responding" : "Local node responding"}</p>
         <div className="node-stat-list">
           <div>
             <span>Block height</span>
@@ -110,9 +111,11 @@ export function Overview({
           <Database aria-hidden="true" size={16} />
           <span>{status ? `${formatBytes(status.mempool_bytes)} in mempool` : "Waiting for node"}</span>
         </div>
-        <button className="text-button" type="button" onClick={onViewNetwork}>
-          View node <ArrowRight aria-hidden="true" size={15} />
-        </button>
+        {usesBrowserKeys ? null : (
+          <button className="text-button" type="button" onClick={onViewNetwork}>
+            View node <ArrowRight aria-hidden="true" size={15} />
+          </button>
+        )}
       </aside>
 
       <section className="activity-card">

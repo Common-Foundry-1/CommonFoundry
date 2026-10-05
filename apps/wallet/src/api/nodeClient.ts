@@ -11,6 +11,11 @@ import type {
   WalletSnapshot,
 } from "../types";
 import { invoke } from "@tauri-apps/api/core";
+import { NodeApiError } from "./errors";
+import { usesBrowserKeys } from "./transportMode";
+import { createWebNodeTransport } from "../web/webTransport";
+
+export { NodeApiError };
 
 const RPC_ROOT = "/rpc";
 
@@ -19,25 +24,6 @@ interface NativeErrorEnvelope {
   message?: unknown;
   status?: unknown;
   retryable?: unknown;
-}
-
-export class NodeApiError extends Error {
-  readonly status: number;
-  readonly code: string;
-  readonly retryable: boolean;
-
-  constructor(
-    message: string,
-    status: number,
-    code = "node_request_failed",
-    retryable = false,
-  ) {
-    super(message);
-    this.name = "NodeApiError";
-    this.status = status;
-    this.code = code;
-    this.retryable = retryable;
-  }
 }
 
 export interface NodeTransport {
@@ -285,7 +271,9 @@ export const usesEmbeddedNode = import.meta.env.VITE_CMFD_TRANSPORT === "tauri";
 
 const transport = usesEmbeddedNode
   ? createTauriNodeTransport(nativeInvoke)
-  : httpNodeTransport;
+  : usesBrowserKeys
+    ? createWebNodeTransport()
+    : httpNodeTransport;
 
 export function getNodeStatus(signal?: AbortSignal): Promise<NodeStatus> {
   return transport.getNodeStatus(signal);

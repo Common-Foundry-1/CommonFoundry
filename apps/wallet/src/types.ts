@@ -98,6 +98,8 @@ export interface WalletHistoryEntry {
   net_amount_atoms: string;
   fee_burned_atoms: string;
   counterparty: string | null;
+  /** Web wallet only: a send signed elsewhere, so its fee (and any fee in net_amount_atoms) is unknown. */
+  fee_unknown?: boolean;
 }
 
 export interface WalletSnapshot {

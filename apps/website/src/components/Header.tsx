@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { DISCORD_URL, navItems, type SectionId } from "../content";
+import { DISCORD_URL, WALLET_URL, navItems, type SectionId } from "../content";
 import { ArrowIcon, CloseIcon, MenuIcon } from "./Icons";
 
 function useActiveSection() {
@@ -89,6 +89,7 @@ export function Header() {
             {item.label}
           </a>
         ))}
+        <a href={WALLET_URL} target="_blank" rel="noopener noreferrer">Web wallet</a>
       </nav>
 
       <a
@@ -127,6 +128,10 @@ export function Header() {
               <ArrowIcon />
             </a>
           ))}
+          <a href={WALLET_URL} target="_blank" rel="noopener noreferrer" onClick={closeMenu}>
+            <span>Web wallet</span>
+            <ArrowIcon />
+          </a>
         </nav>
         <a
           className="mobile-menu__cta"

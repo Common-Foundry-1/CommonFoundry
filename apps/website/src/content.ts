@@ -1,5 +1,6 @@
 export const DISCORD_URL = "https://discord.gg/XGuutqWMWP";
 export const GITHUB_URL = "https://github.com/Common-Foundry-1";
+export const WALLET_URL = "https://wallet.commonfoundry.ai";
 export const X_URL = "https://x.com/CommonFoundry1";
 export const RELEASE_VERSION = "v0.1.0-rc.5";
 export const RELEASE_URL = `https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/tag/${RELEASE_VERSION}`;

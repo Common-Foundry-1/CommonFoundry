@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import App from "./App";
-import { DISCORD_URL, EMISSION_URL, MAINNET_LAUNCH_AT, MAINNET_POOL_URL, MAINNET_RELEASE_KEY_FINGERPRINT, MAINNET_RELEASE_KEY_URL, MAINNET_RELEASE_URL, MAINNET_SEED_PEER, MINING_GUIDE_URL, SOURCE_RELEASE_AT, RELEASE_URL, RELEASE_VERSION, SECURITY_URL, WHITEPAPER_URL } from "./content";
+import { DISCORD_URL, EMISSION_URL, EXPLORER_URL, MAINNET_LAUNCH_AT, MAINNET_POOL_URL, MAINNET_RELEASE_KEY_FINGERPRINT, MAINNET_RELEASE_KEY_URL, MAINNET_RELEASE_URL, MAINNET_RELEASE_VERSION, MAINNET_SEED_PEER, MINING_GUIDE_URL, SOURCE_RELEASE_AT, SECURITY_URL, WALLET_URL, WHITEPAPER_URL } from "./content";
 
 describe("Discord-first launch website", () => {
   it("leads with inference and makes Discord the primary first-screen action", () => {
@@ -10,31 +10,34 @@ describe("Discord-first launch website", () => {
     const primary = within(hero).getByRole("link", { name: "Join Discord" });
     expect(primary).toHaveAttribute("href", DISCORD_URL);
     expect(primary).toHaveClass("button-link--primary");
-    expect(within(hero).getByRole("link", { name: "Launch schedule" })).toHaveAttribute("href", "#launch");
+    expect(within(hero).getByRole("link", { name: "Mainnet status" })).toHaveAttribute("href", "#launch");
     expect(within(hero).getByRole("link", { name: "Mainnet pool connection details" })).toHaveAttribute("href", "#pool-setup");
     expect(within(hero).queryByRole("link", { name: /RC5|download/i })).not.toBeInTheDocument();
-    expect(within(hero).getByText("Setup help. Mining guidance. Launch announcements.")).toBeVisible();
+    expect(within(hero).getByText("Setup help. Mining guidance. Release announcements.")).toBeVisible();
+    expect(within(hero).getByText("Mainnet is live")).toBeVisible();
+    expect(within(hero).queryByRole("timer")).not.toBeInTheDocument();
     expect(within(screen.getByRole("banner")).getByRole("link", { name: "Join Discord" })).toHaveAttribute("href", DISCORD_URL);
   });
 
-  it("retains the exact launch schedule without presenting test downloads as mainnet", () => {
+  it("records the launch as completed and points to the live services", () => {
     render(<App />);
-    const launch = screen.getByRole("region", { name: "Two dates. One shared start." });
+    const launch = screen.getByRole("region", { name: "Mainnet is live." });
     expect(within(launch).getByText("October 2, 2026")).toHaveAttribute("datetime", SOURCE_RELEASE_AT);
     expect(within(launch).getByText("October 3, 2026")).toHaveAttribute("datetime", MAINNET_LAUNCH_AT);
     expect(Date.parse(MAINNET_LAUNCH_AT) - Date.parse(SOURCE_RELEASE_AT)).toBe(86_400_000);
     expect(within(launch).getAllByText(/12:00 PM CDT · 17:00 UTC/)).toHaveLength(2);
-    expect(within(launch).getByText(/Mainnet is not live yet/)).toBeVisible();
-    expect(within(launch).getByText(/signed mainnet packages are available/)).toBeVisible();
-    expect(within(launch).getByRole("link", { name: "Get mainnet v1.0.0 packages" })).toHaveAttribute("href", MAINNET_RELEASE_URL);
-    expect(within(launch).getByRole("link", { name: "Get launch-ready in Discord" })).toHaveAttribute("href", DISCORD_URL);
+    expect(within(launch).getByText(/first block was mined at/)).toBeVisible();
+    expect(within(launch).queryByText(/not live yet|coming soon|before activation/)).not.toBeInTheDocument();
+    expect(within(launch).getByRole("link", { name: "Get the latest mainnet packages" })).toHaveAttribute("href", MAINNET_RELEASE_URL);
+    expect(within(launch).getByRole("link", { name: "Open the block explorer" })).toHaveAttribute("href", EXPLORER_URL);
+    expect(within(launch).getByRole("link", { name: "Open the web wallet" })).toHaveAttribute("href", WALLET_URL);
     expect(within(launch).getByText(MAINNET_RELEASE_KEY_FINGERPRINT)).toBeVisible();
     expect(within(launch).getByRole("link", { name: "View the public release key" })).toHaveAttribute("href", MAINNET_RELEASE_KEY_URL);
     const pool = within(launch).getByRole("complementary", { name: "Official pool connection" });
     expect(within(pool).getByText(MAINNET_POOL_URL)).toBeVisible();
     expect(within(pool).getByText(MAINNET_SEED_PEER)).toBeVisible();
-    expect(within(pool).getByText(/not accepting connections before activation/)).toBeVisible();
-    expect(within(pool).getByText(/dashboard shows RCNet/)).toBeVisible();
+    expect(within(pool).getByText(/pool is accepting connections/)).toBeVisible();
+    expect(within(pool).queryByText(/RCNet/)).not.toBeInTheDocument();
   });
 
   it("uses the same official Discord destination across the conversion flow", () => {
@@ -47,7 +50,8 @@ describe("Discord-first launch website", () => {
       expect(link).toHaveAttribute("rel", expect.stringContaining("noreferrer"));
     }
     expect(screen.getByRole("heading", { name: /Start in Discord.*help from there/i })).toBeVisible();
-    expect(screen.getByRole("link", { name: "RCNet test downloads" })).toHaveAttribute("href", RELEASE_URL);
+    expect(screen.getByRole("link", { name: "Mainnet downloads" })).toHaveAttribute("href", MAINNET_RELEASE_URL);
+    expect(screen.queryByText(/RCNet test/)).not.toBeInTheDocument();
   });
 
   it("offers the combined beginner guide with current mainnet downloads", () => {
@@ -60,7 +64,7 @@ describe("Discord-first launch website", () => {
     expect(within(guide).getByRole("link", { name: "Read mining guide (PDF)" })).toHaveAttribute("href", MINING_GUIDE_URL);
     expect(within(guide).getByRole("link", { name: "Download PDF" })).toHaveAttribute("download");
     expect(within(guide).getByRole("link", { name: "Download PDF" })).toHaveAttribute("href", MINING_GUIDE_URL);
-    expect(within(guide).getByText(/released mainnet software now/)).toBeVisible();
+    expect(within(guide).getByText(/start with the current mainnet release/)).toBeVisible();
     expect(within(guide).getByRole("link", { name: "Ask in Discord." })).toHaveAttribute("href", DISCORD_URL);
   });
 
@@ -98,7 +102,7 @@ describe("Discord-first launch website", () => {
     expect(document.getElementById("mining-guide")).toContainElement(notice);
     expect(within(notice).getByRole("link", { name: "Pool setup fix & installation steps" })).toHaveAttribute("href", "https://github.com/Common-Foundry-1/CommonFoundry/blob/366054828601557e7f53becff508db83d6af2a34/packaging/mainnet/linux/POOL-LAUNCHER-UPDATE.md");
     expect(within(notice).getByText(/For pool operators only/)).toBeVisible();
-    expect(within(notice).getByText(/signed v1.0.0 packages and the launch schedule are unchanged/)).toBeVisible();
+    expect(within(notice).getByText(/does not change the signed mainnet packages/)).toBeVisible();
   });
 
   it("keeps the inference vision separate from deployed proof-of-work functionality", () => {
@@ -137,19 +141,19 @@ describe("Discord-first launch website", () => {
     const emission = screen.getByRole("slider", { name: "Block height" });
     fireEvent.change(emission, { target: { value: "2628001" } });
     expect(screen.getByText(/Block 2,628,001 · 5 CMFD per block/)).toBeVisible();
-    const gate = screen.getByRole("button", { name: /October 3 · Mainnet/i });
+    const gate = screen.getByRole("button", { name: /October 3 · Mainnet live/i });
     fireEvent.click(gate);
     expect(gate).toHaveAttribute("aria-expanded", "true");
-    expect(screen.getByText(/24 hours after the source-release window/i)).toBeVisible();
+    expect(screen.getByText(/first block was mined at 17:06 UTC/i)).toBeVisible();
   });
 
   it("preserves economic disclosures and keeps technical resources accessible", () => {
     render(<App />);
     expect(screen.getByText(/permanent 5 CMFD tail goes only to miners/i)).toBeVisible();
-    expect(screen.getByText(/planned mainnet minimum is 0.1 CMFD/i)).toBeVisible();
+    expect(screen.getByText(/mainnet minimum is 0.1 CMFD/i)).toBeVisible();
     expect(screen.getByText(/25% stewardship and 5% community allocations/i)).toBeVisible();
     expect(screen.getByText(/tail is perpetual, not a hard supply cap/i)).toBeVisible();
-    expect(screen.getByText(RELEASE_VERSION)).toBeVisible();
+    expect(screen.getByText(MAINNET_RELEASE_VERSION)).toBeVisible();
     expect(screen.queryByText(/all usage fees burned/i)).not.toBeInTheDocument();
     expect(WHITEPAPER_URL).toBe("/docs/Common-Foundry-Technical-Whitepaper-v0.4.pdf");
     for (const link of screen.getAllByRole("link", { name: /white paper/i })) {

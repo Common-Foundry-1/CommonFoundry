@@ -140,7 +140,7 @@ export function Economics() {
         </div>
 
         <aside className="economics__disclosures" aria-label="Economic disclosures">
-          <p><FlameIcon /><span>Transaction fees are burned, not paid to miners. The planned mainnet minimum is 0.1 CMFD per transaction.</span></p>
+          <p><FlameIcon /><span>Transaction fees are burned, not paid to miners. The mainnet minimum is 0.1 CMFD per transaction.</span></p>
           <p><ShieldIcon /><span>The 25% stewardship and 5% community allocations end with the bootstrap; the permanent 5 CMFD tail goes only to miners.</span></p>
           <p className="economics__plain"><span>The schedule is defined by block height. Years are approximate at the target block spacing.</span></p>
           <p className="economics__plain"><span>The tail is perpetual, not a hard supply cap. Net supply depends on issuance and actual fee burning.</span></p>

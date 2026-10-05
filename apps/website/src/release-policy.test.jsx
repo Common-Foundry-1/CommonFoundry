@@ -20,7 +20,7 @@ it("renders the fingerprint derived from the exact approved public release polic
   const fingerprint = `SHA256:${createHash("sha256").update(keyBlob).digest("base64").replace(/=+$/, "")}`;
   expect(fingerprint).toBe(MAINNET_RELEASE_KEY_FINGERPRINT);
   render(<App />);
-  const launch = screen.getByRole("region", { name: "Two dates. One shared start." });
+  const launch = screen.getByRole("region", { name: "Mainnet is live." });
   expect(within(launch).getByText(fingerprint)).toBeVisible();
   expect(within(launch).getByRole("link", { name: "View the public release key" })).toHaveAttribute("href", "/mainnet-release-key.txt");
 });

@@ -2,7 +2,7 @@ import { useRef, type PointerEvent } from "react";
 import heroApparatus from "../assets/hero-apparatus.png";
 import { ButtonLink } from "../components/ButtonLink";
 import { ShieldIcon } from "../components/Icons";
-import { MainnetCountdown } from "../components/MainnetCountdown";
+import { MainnetLive } from "../components/MainnetLive";
 import { DISCORD_URL, MINING_GUIDE_URL } from "../content";
 
 export function Hero() {
@@ -24,16 +24,16 @@ export function Hero() {
 
   return (
     <section id="top" className="hero section-grid" aria-labelledby="hero-heading">
-      <MainnetCountdown />
+      <MainnetLive />
       <div className="hero__copy">
-        <a className="hero__launch-label" href="#launch">Mainnet coming October 3, 2026 <span aria-hidden="true">↗</span></a>
+        <a className="hero__launch-label" href="#launch">Mainnet live since October 3, 2026 <span aria-hidden="true">↗</span></a>
         <h1 id="hero-heading">
           Inference first.<br />Built to lead.
         </h1>
         <p>
           AI compute should belong to more of us. We’re building Common Foundry
           around GPU operators, verifiable work and a path to customer-paid
-          inference. Mainnet is coming October 3. Join the people building
+          inference. Mainnet launched October 3, 2026. Join the people building
           what comes next.
         </p>
 
@@ -42,11 +42,11 @@ export function Hero() {
             Join Discord
           </ButtonLink>
           <ButtonLink href="#launch" variant="secondary">
-            Launch schedule
+            Mainnet status
           </ButtonLink>
         </div>
 
-        <p className="hero__support">Setup help. Mining guidance. Launch announcements.</p>
+        <p className="hero__support">Setup help. Mining guidance. Release announcements.</p>
         <p className="hero__guide">
           New to mining? <a href={MINING_GUIDE_URL} target="_blank" rel="noopener noreferrer">Windows + Linux mining guide (PDF)</a>
           <br />Official pool miner? <a href="#pool-setup">Mainnet pool connection details</a>

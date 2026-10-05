@@ -4,10 +4,12 @@ import { ButtonLink } from "../components/ButtonLink";
 import { ArrowIcon, DocumentIcon, ShieldIcon, XIcon } from "../components/Icons";
 import {
   DISCORD_URL,
+  EXPLORER_URL,
   GITHUB_URL,
-  RELEASE_URL,
+  MAINNET_RELEASE_URL,
   roadmapGates,
   SECURITY_URL,
+  WALLET_URL,
   WHITEPAPER_URL,
   X_URL,
 } from "../content";
@@ -28,7 +30,7 @@ export function Roadmap() {
       <div className="roadmap__content section-shell">
         <div className="section-heading">
           <h2 id="roadmap-heading">Be part of the next chapter.</h2>
-          <p>A working test network today. Mainnet ahead. A longer-term mission to bring more people into open GPU compute.</p>
+          <p>A live mainnet today. A longer-term mission to bring more people into open GPU compute.</p>
         </div>
 
         <ol className="roadmap__rail">
@@ -58,7 +60,7 @@ export function Roadmap() {
             <p>
               You don’t need a rig or a finished setup to join. Tell us whether
               you want to mine, build or learn. Get guidance from the team and
-              community, and follow the official launch announcements.
+              community, and follow the official release announcements.
             </p>
           </div>
           <div className="conversion-band__actions">
@@ -81,7 +83,7 @@ export function Roadmap() {
             </div>
             <p className="trust-note">
               <ShieldIcon />
-              <span>Setup help · Hardware guidance · Launch updates</span>
+              <span>Setup help · Hardware guidance · Release updates</span>
             </p>
           </div>
         </div>
@@ -93,7 +95,9 @@ export function Roadmap() {
           </div>
           <nav aria-label="Footer navigation">
             <a href={DISCORD_URL} target="_blank" rel="noopener noreferrer"><span>Discord</span><ArrowIcon /></a>
-            <a href={RELEASE_URL} target="_blank" rel="noopener noreferrer"><span>RCNet test downloads</span><ArrowIcon /></a>
+            <a href={MAINNET_RELEASE_URL} target="_blank" rel="noopener noreferrer"><span>Mainnet downloads</span><ArrowIcon /></a>
+            <a href={EXPLORER_URL} target="_blank" rel="noopener noreferrer"><span>Explorer</span><ArrowIcon /></a>
+            <a href={WALLET_URL} target="_blank" rel="noopener noreferrer"><span>Web wallet</span><ArrowIcon /></a>
             <a href={GITHUB_URL} target="_blank" rel="noopener noreferrer"><span>GitHub</span><ArrowIcon /></a>
             <a href={WHITEPAPER_URL} target="_blank" rel="noopener noreferrer"><DocumentIcon /><span>White paper</span></a>
             <a href={SECURITY_URL} target="_blank" rel="noopener noreferrer"><ShieldIcon /><span>Security</span></a>

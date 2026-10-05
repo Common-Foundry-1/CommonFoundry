@@ -4,7 +4,7 @@ import {
   implementedItems,
   nextItems,
   DISCORD_URL,
-  RELEASE_VERSION,
+  MAINNET_RELEASE_VERSION,
   type ProgressItem,
 } from "../content";
 
@@ -39,18 +39,18 @@ export function Progress() {
     <section id="progress" className="progress section-shell" aria-labelledby="progress-heading">
       <div className="section-heading progress__heading">
         <div>
-          <h2 id="progress-heading">Built to run. Getting ready to launch.</h2>
+          <h2 id="progress-heading">Built to run. Running on mainnet.</h2>
           <p>
-            Wallets, transfers, GPU mining and node synchronization are already
-            being exercised on RCNet. We’re bringing that foundation into
-            mainnet. Join Discord for the current status and the right setup
+            Wallets, transfers, GPU mining and node synchronization run on
+            mainnet today, with the public explorer and the web wallet
+            alongside. Join Discord for the current status and the right setup
             for your machine.
           </p>
         </div>
         <p className="release-line">
-          <strong>RCNet test release</strong>
+          <strong>Mainnet release</strong>
           <span>·</span>
-          <code>{RELEASE_VERSION}</code>
+          <code>{MAINNET_RELEASE_VERSION}</code>
         </p>
       </div>
 

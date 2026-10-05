@@ -57,10 +57,24 @@ const MAX_DISCOVERED_PEERS: usize = 64;
 const MAX_PEER_CACHE_BYTES: u64 = 16 * 1024;
 const MAX_DYNAMIC_TARGETS_PER_ROUND: usize = 2;
 const MAX_CATCHUP_EXTRA_SESSIONS_PER_PEER: usize = 3;
-const MAX_CATCHUP_EXTRA_SESSIONS_PER_ROUND: usize = 8;
+/// The peer that delivered blocks fastest when a catch-up round starts may
+/// serve this many extra sessions, so a node far behind spends most of its
+/// time downloading from its best connection instead of waiting on slow ones.
+const MAX_CATCHUP_EXTRA_SESSIONS_FASTEST_PEER: usize = 12;
+const MAX_CATCHUP_EXTRA_SESSIONS_PER_ROUND: usize = 16;
 // This limits starts after the normal fair peer pass, not an in-flight proof.
 // Every started session retains its existing byte/message/deadline bounds.
 const CATCHUP_EXTRA_SESSION_START_BUDGET: Duration = Duration::from_secs(30);
+/// Extra sessions may start for up to this multiple of the ordinary pass's
+/// duration (between the base budget above and the maximum below). Every peer
+/// still gets its ordinary turn each round; the extra time follows the pass.
+const CATCHUP_EXTRA_TIME_PER_ORDINARY_PASS: u32 = 3;
+const CATCHUP_EXTRA_SESSION_MAX_START_BUDGET: Duration = Duration::from_secs(5 * 60);
+/// A block download stops requesting new blocks after this long, once it has
+/// at least one, keeps what arrived and ends the session normally. A slow or
+/// distant peer then costs a bounded slice of a round instead of up to the
+/// five-minute session limit, and the catch-up extras go to faster peers.
+const SYNC_SESSION_FETCH_BUDGET: Duration = Duration::from_secs(30);
 const MAX_UNVERIFIED_PEER_FAILURES: u8 = 3;
 const MAX_DISCOVERED_PEERS_PER_IP: usize = 8;
 // Keep source-tracking memory fixed, prevent one address from consuming the
@@ -1304,6 +1318,7 @@ fn sync_from_peer_once_inner_with_policy(
         address_policy,
         nonce_override,
         active_sockets,
+        SYNC_SESSION_FETCH_BUDGET,
     );
     if let Ok(report) = &result {
         record_peer_succeeded(
@@ -1498,6 +1513,7 @@ fn perform_sync_from_peer_once_inner_with_policy(
     address_policy: PeerAddressPolicy,
     nonce_override: Option<[u8; 32]>,
     active_sockets: Option<&Arc<ActiveSocketRegistry>>,
+    fetch_budget: Duration,
 ) -> Result<SyncReport, P2pError> {
     let observation_address = observed_address(PeerDirection::Outbound, address);
     let (hello, locator, mut sync_cursor) = {
@@ -1537,6 +1553,7 @@ fn perform_sync_from_peer_once_inner_with_policy(
     let preverifier = lock_node(&shared)?.block_preverifier();
     let mut pending: Vec<Block> = Vec::new();
     let mut slots = PrefetchSlots::new(preverifier.prefetched_block_slots());
+    let fetch_started = Instant::now();
 
     loop {
         let mut reached_unknown = false;
@@ -1560,7 +1577,9 @@ fn perform_sync_from_peer_once_inner_with_policy(
                 continue;
             }
             reached_unknown = true;
-            if requested_blocks >= block_batch_limit {
+            if requested_blocks >= block_batch_limit
+                || (requested_blocks > 0 && fetch_started.elapsed() >= fetch_budget)
+            {
                 break;
             }
             // Buffer a small window of fetched blocks so their proofs can be
@@ -3231,31 +3250,83 @@ struct CatchupCandidate {
     address: SocketAddr,
     remote_hello: PeerHello,
     remaining_sessions: usize,
+    /// Blocks accepted per second in this peer's most recent session.
+    rate: f64,
 }
 
 struct CatchupRound {
     pending: VecDeque<CatchupCandidate>,
     started_at: Instant,
+    start_budget: Duration,
     reserved_sessions: usize,
 }
 
+/// Blocks accepted per second by one sync session; zero for a failed one.
+fn sync_session_rate(result: &Result<SyncReport, P2pError>, elapsed: Duration) -> f64 {
+    result.as_ref().map_or(0.0, |report| {
+        report.accepted_blocks as f64 / elapsed.as_secs_f64().max(0.001)
+    })
+}
+
+fn catchup_start_budget(ordinary_pass: Duration) -> Duration {
+    ordinary_pass
+        .saturating_mul(CATCHUP_EXTRA_TIME_PER_ORDINARY_PASS)
+        .clamp(
+            CATCHUP_EXTRA_SESSION_START_BUDGET,
+            CATCHUP_EXTRA_SESSION_MAX_START_BUDGET,
+        )
+}
+
+fn fastest_catchup_index(pending: &VecDeque<CatchupCandidate>) -> Option<usize> {
+    let mut best: Option<(usize, f64)> = None;
+    for (index, candidate) in pending.iter().enumerate() {
+        if best.is_none_or(|(_, rate)| candidate.rate > rate) {
+            best = Some((index, candidate.rate));
+        }
+    }
+    best.map(|(index, _)| index)
+}
+
 impl CatchupRound {
+    #[cfg(test)]
     fn new(pending: VecDeque<CatchupCandidate>, started_at: Instant) -> Self {
+        Self::with_start_budget(pending, started_at, CATCHUP_EXTRA_SESSION_START_BUDGET)
+    }
+
+    /// The fastest candidate (a strictly positive rate; the earliest on a tie)
+    /// receives the larger session allowance.
+    fn with_start_budget(
+        mut pending: VecDeque<CatchupCandidate>,
+        started_at: Instant,
+        start_budget: Duration,
+    ) -> Self {
+        if let Some(fastest) = fastest_catchup_index(&pending)
+            && pending[fastest].rate > 0.0
+        {
+            pending[fastest].remaining_sessions = MAX_CATCHUP_EXTRA_SESSIONS_FASTEST_PEER;
+        }
         Self {
             pending,
             started_at,
+            start_budget,
             reserved_sessions: 0,
         }
+    }
+
+    fn start_budget_expired(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.started_at) >= self.start_budget
     }
 
     fn next(&mut self, now: Instant, stopped: bool) -> Option<CatchupCandidate> {
         if stopped
             || self.reserved_sessions >= MAX_CATCHUP_EXTRA_SESSIONS_PER_ROUND
-            || now.saturating_duration_since(self.started_at) >= CATCHUP_EXTRA_SESSION_START_BUDGET
+            || self.start_budget_expired(now)
         {
             return None;
         }
-        let candidate = self.pending.pop_front()?;
+        // The fastest remaining peer goes next; equal rates keep the fair
+        // round-robin order.
+        let candidate = self.pending.remove(fastest_catchup_index(&self.pending)?)?;
         // A candidate that became banned or up to date may leave this slot
         // unused. It must never increase the round's total allowance.
         self.reserved_sessions += 1;
@@ -3424,6 +3495,7 @@ fn static_peer_poll_loop(
             }
         }
         let mut catchup_candidates = VecDeque::new();
+        let ordinary_pass_started = Instant::now();
         for peer in targets {
             if poll_stopped(&stop) {
                 return;
@@ -3443,6 +3515,7 @@ fn static_peer_poll_loop(
             // a failure with one peer must not stop later peers or rounds.
             let cursor_before = peer_sync_progress_cursor(&shared, peer);
             let limits = compressed_limits(&options.security, peer, config.limits);
+            let session_started = Instant::now();
             let sync_result = sync_from_peer_once_inner_with_policy(
                 Arc::clone(&shared),
                 peer,
@@ -3451,6 +3524,7 @@ fn static_peer_poll_loop(
                 options.nonce_override,
                 Some(&active_sockets),
             );
+            let sync_rate = sync_session_rate(&sync_result, session_started.elapsed());
             record_compressed_outcome(&options.security, peer, limits, &sync_result);
             let mut round_succeeded = sync_result.is_ok();
             let sync_banned = record_poll_sync_result(&options, peer, &sync_result);
@@ -3529,14 +3603,19 @@ fn static_peer_poll_loop(
                     address: peer,
                     remote_hello,
                     remaining_sessions: MAX_CATCHUP_EXTRA_SESSIONS_PER_PEER,
+                    rate: sync_rate,
                 });
             }
         }
 
         // Every selected peer has received its ordinary turn. Only useful,
-        // successful pulls get bounded extra sessions, interleaved fairly.
-        let mut catchup = CatchupRound::new(catchup_candidates, Instant::now());
-        while let Some(candidate) = catchup.next(Instant::now(), poll_stopped(&stop)) {
+        // successful pulls get bounded extra sessions, fastest peer first.
+        let mut catchup = CatchupRound::with_start_budget(
+            catchup_candidates,
+            Instant::now(),
+            catchup_start_budget(ordinary_pass_started.elapsed()),
+        );
+        while let Some(mut candidate) = catchup.next(Instant::now(), poll_stopped(&stop)) {
             let peer = candidate.address;
             match options.security.is_banned(peer.ip()) {
                 Ok(false) => {}
@@ -3554,13 +3633,11 @@ fn static_peer_poll_loop(
                 continue;
             }
             let cursor_before = peer_sync_progress_cursor(&shared, peer);
-            if poll_stopped(&stop)
-                || Instant::now().saturating_duration_since(catchup.started_at)
-                    >= CATCHUP_EXTRA_SESSION_START_BUDGET
-            {
+            if poll_stopped(&stop) || catchup.start_budget_expired(Instant::now()) {
                 break;
             }
             let limits = compressed_limits(&options.security, peer, config.limits);
+            let session_started = Instant::now();
             let result = sync_from_peer_once_inner_with_policy(
                 Arc::clone(&shared),
                 peer,
@@ -3569,6 +3646,7 @@ fn static_peer_poll_loop(
                 options.nonce_override,
                 Some(&active_sockets),
             );
+            candidate.rate = sync_session_rate(&result, session_started.elapsed());
             record_compressed_outcome(&options.security, peer, limits, &result);
             let banned = record_poll_sync_result(&options, peer, &result);
             let continuation = if banned {
@@ -3947,6 +4025,14 @@ mod tests {
             address: SocketAddr::from(([127, 0, 0, 1], 29000 + u16::from(index))),
             remote_hello,
             remaining_sessions: MAX_CATCHUP_EXTRA_SESSIONS_PER_PEER,
+            rate: 0.0,
+        }
+    }
+
+    fn test_catchup_candidate_with_rate(index: u8, rate: f64) -> CatchupCandidate {
+        CatchupCandidate {
+            rate,
+            ..test_catchup_candidate(index)
         }
     }
 
@@ -3968,7 +4054,9 @@ mod tests {
     #[test]
     fn catchup_round_is_round_robin_and_globally_bounded() {
         let now = Instant::now();
-        let peers: Vec<_> = (1..=4).map(test_catchup_candidate).collect();
+        // Equal (unmeasured) rates: fair round-robin, nobody gets the larger
+        // allowance, and the global cap still stops eligible work.
+        let peers: Vec<_> = (1..=6).map(test_catchup_candidate).collect();
         let mut round = CatchupRound::new(peers.iter().copied().collect(), now);
         let mut order = Vec::new();
         for _ in 0..MAX_CATCHUP_EXTRA_SESSIONS_PER_ROUND {
@@ -3981,7 +4069,7 @@ mod tests {
             peers
                 .iter()
                 .cycle()
-                .take(8)
+                .take(MAX_CATCHUP_EXTRA_SESSIONS_PER_ROUND)
                 .map(|p| p.address)
                 .collect::<Vec<_>>()
         );
@@ -4009,6 +4097,68 @@ mod tests {
         assert_ne!(other.address, failed.address);
         round.complete(other, None);
         assert!(round.next(now, false).is_none());
+    }
+
+    #[test]
+    fn catchup_round_gives_the_fastest_peer_the_larger_allowance_and_the_first_turn() {
+        let now = Instant::now();
+        let slow = test_catchup_candidate_with_rate(1, 0.1);
+        let fast = test_catchup_candidate_with_rate(2, 0.5);
+        let medium = test_catchup_candidate_with_rate(3, 0.2);
+        let mut round = CatchupRound::new([slow, fast, medium].into(), now);
+        let mut order = Vec::new();
+        while let Some(peer) = round.next(now, false) {
+            order.push(peer.address);
+            round.complete(peer, Some(peer.remote_hello));
+        }
+        let fast_turns = MAX_CATCHUP_EXTRA_SESSIONS_FASTEST_PEER;
+        assert_eq!(order.len(), MAX_CATCHUP_EXTRA_SESSIONS_PER_ROUND);
+        assert!(
+            order[..fast_turns]
+                .iter()
+                .all(|address| *address == fast.address)
+        );
+        // The others follow by rate and keep the ordinary per-peer cap.
+        assert_eq!(order[fast_turns], medium.address);
+        assert_eq!(
+            order
+                .iter()
+                .filter(|address| **address == medium.address)
+                .count(),
+            MAX_CATCHUP_EXTRA_SESSIONS_PER_PEER
+        );
+
+        // A peer that slows down loses its turn to a faster one.
+        let mut round = CatchupRound::new([fast, medium].into(), now);
+        let mut first = round.next(now, false).unwrap();
+        assert_eq!(first.address, fast.address);
+        first.rate = 0.01;
+        round.complete(first, Some(first.remote_hello));
+        assert_eq!(round.next(now, false).unwrap().address, medium.address);
+    }
+
+    #[test]
+    fn catchup_start_budget_follows_the_ordinary_pass_within_bounds() {
+        assert_eq!(
+            catchup_start_budget(Duration::from_secs(1)),
+            CATCHUP_EXTRA_SESSION_START_BUDGET
+        );
+        assert_eq!(
+            catchup_start_budget(Duration::from_secs(40)),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            catchup_start_budget(Duration::from_secs(600)),
+            CATCHUP_EXTRA_SESSION_MAX_START_BUDGET
+        );
+        let now = Instant::now();
+        let round = CatchupRound::with_start_budget(
+            [test_catchup_candidate(1)].into(),
+            now,
+            Duration::from_secs(120),
+        );
+        assert!(!round.start_budget_expired(now + Duration::from_secs(119)));
+        assert!(round.start_budget_expired(now + Duration::from_secs(120)));
     }
 
     #[test]
@@ -5086,6 +5236,55 @@ mod tests {
             assert!(target.lock().unwrap().peer_hello().height > before);
         }
         assert!(sessions <= 3);
+        listener.stop().unwrap();
+        drop(source);
+        drop(target);
+        clean_test_dir(&source_path);
+        clean_test_dir(&target_path);
+    }
+
+    #[test]
+    fn a_sync_session_stops_requesting_at_its_fetch_budget_and_keeps_what_arrived() {
+        let source_path = test_dir("fetch-budget-source");
+        let target_path = test_dir("fetch-budget-target");
+        let source = open_shared(&source_path);
+        let target = open_shared(&target_path);
+        mine(&source, 6, unix_time_seconds().unwrap());
+        let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = socket.local_addr().unwrap();
+        let listener = spawn_inbound_listener_inner(
+            Arc::clone(&source),
+            socket,
+            test_limits(),
+            Some(SOURCE_NONCE),
+        )
+        .unwrap();
+        // An exhausted budget stops after the first block, and the session is
+        // still a success that keeps the block it downloaded.
+        let report = perform_sync_from_peer_once_inner_with_policy(
+            Arc::clone(&target),
+            address,
+            test_limits(),
+            PeerAddressPolicy::PrivateOnly,
+            Some(TARGET_NONCE),
+            None,
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(report.inventory_items, 6);
+        assert_eq!(report.requested_blocks, 1);
+        assert_eq!(report.accepted_blocks, 1);
+        assert_eq!(target.lock().unwrap().peer_hello().height, 1);
+        // The next ordinary session continues from the advanced cursor.
+        let report = sync_from_peer_once_inner(
+            Arc::clone(&target),
+            address,
+            test_limits(),
+            Some(TARGET_NONCE),
+        )
+        .unwrap();
+        assert_eq!(report.accepted_blocks, 5);
+        assert!(tips_match(&source, &target));
         listener.stop().unwrap();
         drop(source);
         drop(target);
@@ -7814,6 +8013,9 @@ mod tests {
             Some(TARGET_NONCE),
         )
         .unwrap();
+        // One ordinary pull, then extra sessions from the round's fastest (and
+        // only) peer until all six one-block sessions have caught it up.
+        let expected_pulls = 6.min(1 + MAX_CATCHUP_EXTRA_SESSIONS_FASTEST_PEER);
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             let ready = target
@@ -7824,7 +8026,7 @@ mod tests {
                 .any(|peer| {
                     peer.direction == PeerDirection::Outbound
                         && peer.address == address.to_string()
-                        && peer.successful_sessions == 4
+                        && peer.successful_sessions == expected_pulls as u64
                         && peer.active_connections == 0
                 });
             if ready || Instant::now() >= deadline {
@@ -7837,12 +8039,12 @@ mod tests {
         worker.join().unwrap();
         assert_eq!(
             pulls.load(Ordering::Acquire),
-            4,
+            expected_pulls,
             "working downloads must continue despite the failed reverse relay"
         );
         assert_eq!(relay_failures.load(Ordering::Acquire), 1);
         let node = target.lock().unwrap();
-        assert_eq!(node.peer_hello().height, 4);
+        assert_eq!(node.peer_hello().height, expected_pulls as u64);
         let peer = node
             .peer_observations()
             .into_iter()
@@ -7854,7 +8056,7 @@ mod tests {
             peer.failed_sessions, 1,
             "the relay error must remain an error"
         );
-        assert_eq!(peer.successful_sessions, 4);
+        assert_eq!(peer.successful_sessions, expected_pulls as u64);
         drop(node);
         drop(source);
         drop(target);

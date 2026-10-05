@@ -85,13 +85,13 @@ describe("NetworkView", () => {
     cleanup();
     peerApi.get.mockReset().mockResolvedValue({
       peers: [bootstrap],
-      bootstrap_peer: bootstrap,
+      bootstrap_peers: [bootstrap],
       default_peer_port: 18444,
       max_peers: 16,
     });
     peerApi.update.mockReset().mockImplementation(async (peers: string[]) => ({
       peers: peers.map((peer) => peer.includes(":") ? peer : `${peer}:18444`),
-      bootstrap_peer: bootstrap,
+      bootstrap_peers: [bootstrap],
       default_peer_port: 18444,
       max_peers: 16,
     }));

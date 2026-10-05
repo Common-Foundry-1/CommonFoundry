@@ -65,7 +65,10 @@ impl ProductionV3RuntimeOptions {
     }
 }
 
-pub(crate) const DEFAULT_BOOTSTRAP_PEER: SocketAddr = COMPILED_NETWORK_PROFILE.bootstrap_peer();
+/// Every compiled cold-start endpoint: the bootstrap seed and, on mainnet, the relays.
+pub(crate) fn default_bootstrap_peers() -> Vec<SocketAddr> {
+    COMPILED_NETWORK_PROFILE.bootstrap_peers()
+}
 
 impl NodeRuntimeConfig {
     pub(crate) fn webview_data_directory(&self) -> Option<PathBuf> {
@@ -78,7 +81,7 @@ impl NodeRuntimeConfig {
     pub(super) fn default_for_test() -> Self {
         Self {
             p2p_bind: COMPILED_NETWORK_PROFILE.p2p_address(),
-            peers: vec![COMPILED_NETWORK_PROFILE.bootstrap_peer()],
+            peers: default_bootstrap_peers(),
             allow_public_peers: true,
             peers_explicit: false,
             verbose: 0,
@@ -374,7 +377,7 @@ impl NodeRuntimeConfig {
 
     fn with_default_bootstrap(mut self) -> Self {
         if self.peers.is_empty() {
-            self.peers.push(DEFAULT_BOOTSTRAP_PEER);
+            self.peers.extend(default_bootstrap_peers());
             self.allow_public_peers = true;
         }
         self
@@ -614,7 +617,7 @@ mod tests {
         let config = parsed_run_config(Vec::<&str>::new());
 
         assert_eq!(config.p2p_bind, COMPILED_NETWORK_PROFILE.p2p_address());
-        assert_eq!(config.peers, vec![DEFAULT_BOOTSTRAP_PEER]);
+        assert_eq!(config.peers, default_bootstrap_peers());
         assert!(config.allow_public_peers);
         assert!(!config.peers_explicit);
         assert_eq!(config.verbose, 0);
@@ -660,7 +663,7 @@ mod tests {
             Some(PathBuf::from(directory).join("webview-profile"))
         );
         assert_eq!(config.p2p_bind, COMPILED_NETWORK_PROFILE.p2p_address());
-        assert_eq!(config.peers, vec![DEFAULT_BOOTSTRAP_PEER]);
+        assert_eq!(config.peers, default_bootstrap_peers());
         let equals = format!("--data-dir={directory}");
         assert_eq!(
             NodeRuntimeConfig::parse([equals.clone()]).unwrap(),

@@ -14,7 +14,7 @@ use cmfd_node::peer::{
 use cmfd_node::{Node, NodeClientError};
 use serde::{Deserialize, Serialize};
 
-use super::config::{DEFAULT_BOOTSTRAP_PEER, NodeRuntimeConfig};
+use super::config::{NodeRuntimeConfig, default_bootstrap_peers};
 
 const PEER_SETTINGS_VERSION: u8 = 1;
 const DEFAULT_PEER_PORT: u16 = cmfd_node::COMPILED_NETWORK_PROFILE.p2p_port;
@@ -23,7 +23,7 @@ const MAX_PEER_INPUT_BYTES: usize = 128;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PeerSettings {
     pub peers: Vec<String>,
-    pub bootstrap_peer: String,
+    pub bootstrap_peers: Vec<String>,
     pub default_peer_port: u16,
     pub max_peers: usize,
 }
@@ -335,7 +335,10 @@ fn start_poller(
 fn settings_snapshot(peers: &[SocketAddr], limits: PeerLimits) -> PeerSettings {
     PeerSettings {
         peers: peers.iter().map(ToString::to_string).collect(),
-        bootstrap_peer: DEFAULT_BOOTSTRAP_PEER.to_string(),
+        bootstrap_peers: default_bootstrap_peers()
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
         default_peer_port: DEFAULT_PEER_PORT,
         max_peers: limits.max_peers,
     }

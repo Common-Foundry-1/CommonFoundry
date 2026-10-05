@@ -161,8 +161,8 @@ export function NetworkView({ status, wallet, mempool, refreshing, onRefresh, on
                 <button
                   className="button-quiet"
                   type="button"
-                  disabled={!peerSettings || peerSaving || peerSettings.peers.length === 1 && peerSettings.peers[0] === peerSettings.bootstrap_peer}
-                  onClick={() => peerSettings && void savePeers([peerSettings.bootstrap_peer], "Community bootstrap peer restored.")}
+                  disabled={!peerSettings || peerSaving || peerSettings.peers.join(",") === peerSettings.bootstrap_peers.join(",")}
+                  onClick={() => peerSettings && void savePeers(peerSettings.bootstrap_peers, "Community bootstrap peers restored.")}
                 >
                   <RotateCcw aria-hidden="true" size={14} />
                   Reset
@@ -194,7 +194,7 @@ export function NetworkView({ status, wallet, mempool, refreshing, onRefresh, on
                   {peerSettings.peers.map((peer) => (
                     <li key={peer}>
                       <code>{peer}</code>
-                      {peer === peerSettings.bootstrap_peer ? <span>Community bootstrap</span> : <span>Manual peer</span>}
+                      {peerSettings.bootstrap_peers.includes(peer) ? <span>Community bootstrap</span> : <span>Manual peer</span>}
                       <button
                         className="icon-button bordered"
                         type="button"

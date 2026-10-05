@@ -69,6 +69,7 @@ pub(crate) mod exchange_policy;
 pub(crate) mod exchange_queries;
 pub mod exchange_rpc;
 pub(crate) mod exchange_signer;
+pub mod exchange_tx_tool;
 pub(crate) mod exchange_withdrawal;
 pub(crate) mod exchange_withdrawal_v3;
 pub mod explorer;
@@ -570,9 +571,9 @@ pub enum NodeError {
     ForkReconstructionDeferred,
     #[error("transaction is already in the mempool: {0:?}")]
     DuplicateMempoolTransaction([u8; 32]),
-    #[error("transaction input conflicts with the first mempool spend: {0:?}")]
+    #[error("transaction input {}:{} conflicts with the first mempool spend", hex::encode(.0.txid), .0.index)]
     MempoolInputConflict(OutPoint),
-    #[error("transaction input is not confirmed on the active chain: {0:?}")]
+    #[error("transaction input {}:{} is not an unspent output on the active chain", hex::encode(.0.txid), .0.index)]
     MempoolUnconfirmedInput(OutPoint),
     #[error("transaction input is reserved by the exchange withdrawal journal: {0:?}")]
     ExchangeWithdrawalInputReserved(OutPoint),

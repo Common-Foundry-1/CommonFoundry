@@ -32,6 +32,9 @@ pub(crate) const MAX_WATCH_LABEL_BYTES: usize = 128;
 pub(crate) const MAX_WATCH_REGISTRATION_BATCH: usize = 1_000;
 
 const MAX_INDEXED_CHAIN_BLOCKS: usize = 4_000_000;
+/// Registration reads only the blocks the node's address history lists for
+/// the new keys, so a block arriving mid-read is rare and simply retried.
+const REGISTRATION_ATTEMPTS: usize = 3;
 const MAX_EXCHANGE_INDEX_BYTES: usize = 512 * 1024 * 1024;
 const SNAPSHOT_MAGIC: [u8; 8] = *b"CMFDEXI\0";
 const MARKER_MAGIC: [u8; 8] = *b"CMFDEXM\0";
@@ -399,6 +402,37 @@ impl ExchangeDepositIndex {
                 return Err(ExchangeIndexError::DuplicateBatchDestination);
             }
         }
+        // A block arriving during the short indexed read is retried here;
+        // an attempt that already persisted leaves nothing pending.
+        let mut attempt = 1;
+        loop {
+            match self.register_pending(shared, registrations) {
+                Err(ExchangeIndexError::ChainChanged) if attempt < REGISTRATION_ATTEMPTS => {
+                    attempt += 1;
+                }
+                result => break result?,
+            }
+        }
+
+        let watches = registrations
+            .iter()
+            .map(|registration| {
+                let stored = self
+                    .state
+                    .watches
+                    .get(&registration.label)
+                    .expect("validated batch registration must be present");
+                self.watch_view(&registration.label, stored)
+            })
+            .collect();
+        Ok(RegisterWatchDestinationsResult { watches })
+    }
+
+    fn register_pending(
+        &mut self,
+        shared: &Arc<Mutex<Node>>,
+        registrations: &[WatchDestinationRegistration],
+    ) -> Result<(), ExchangeIndexError> {
         self.synchronize(shared)?;
 
         let existing_destinations = self
@@ -425,11 +459,11 @@ impl ExchangeDepositIndex {
         }
 
         if !pending.is_empty() {
-            let plan = self.capture_registration_plan(shared)?;
             let watches = pending
                 .iter()
                 .map(|registration| (registration.destination, registration.label.clone()))
                 .collect::<BTreeMap<_, _>>();
+            let plan = self.capture_registration_plan(shared, watches.keys())?;
             let deposits = execute_deposit_scan(&plan, shared, &watches)?;
             let mut candidate = self.state.clone();
             let tip_height = indexed_tip_height(&plan.active_chain)?;
@@ -455,19 +489,7 @@ impl ExchangeDepositIndex {
             self.persist_candidate(candidate)?;
             self.recheck_shared_plan(shared, &plan)?;
         }
-
-        let watches = registrations
-            .iter()
-            .map(|registration| {
-                let stored = self
-                    .state
-                    .watches
-                    .get(&registration.label)
-                    .expect("validated batch registration must be present");
-                self.watch_view(&registration.label, stored)
-            })
-            .collect();
-        Ok(RegisterWatchDestinationsResult { watches })
+        Ok(())
     }
 
     pub(crate) fn get_watch_destination(
@@ -538,9 +560,14 @@ impl ExchangeDepositIndex {
         capture_chain_plan(&node, active_chain, common, read_blocks)
     }
 
-    fn capture_registration_plan(
+    /// Plans the active-history read for new watches. The node's full-history
+    /// address index lists every retained block with a key output to (or key
+    /// spend by) each destination, so only those blocks are read; a fresh key
+    /// reads none.
+    fn capture_registration_plan<'a>(
         &self,
         shared: &Arc<Mutex<Node>>,
+        destinations: impl Iterator<Item = &'a [u8; 32]>,
     ) -> Result<ChainReadPlan, ExchangeIndexError> {
         let node = lock_node(shared)?;
         self.check_node_binding(&node)?;
@@ -548,7 +575,20 @@ impl ExchangeDepositIndex {
         if active_chain != self.state.indexed_chain {
             return Err(ExchangeIndexError::ChainChanged);
         }
-        capture_chain_plan(&node, active_chain, 1, true)
+        let mut positions = BTreeSet::new();
+        for destination in destinations {
+            for height in node
+                .index
+                .addresses
+                .active_heights(destination, &node.index)
+            {
+                positions.insert(
+                    usize::try_from(height)
+                        .map_err(|_| ExchangeIndexError::Capacity("indexed chain"))?,
+                );
+            }
+        }
+        capture_chain_plan_at(&node, active_chain, positions)
     }
 
     fn check_node_binding(&self, node: &Node) -> Result<(), ExchangeIndexError> {
@@ -732,31 +772,47 @@ fn capture_chain_plan(
             "chain scan starts above the captured tip",
         ));
     }
+    let end = if read_blocks {
+        active_chain.len()
+    } else {
+        start
+    };
+    capture_chain_plan_at(node, active_chain, start..end)
+}
+
+/// Plans authenticated reads of the given active-chain positions, ascending.
+fn capture_chain_plan_at(
+    node: &Node,
+    active_chain: Vec<[u8; 32]>,
+    positions: impl IntoIterator<Item = usize>,
+) -> Result<ChainReadPlan, ExchangeIndexError> {
     let mut blocks = Vec::new();
-    if read_blocks {
-        blocks.reserve(active_chain.len().saturating_sub(start));
-        for (position, block_id) in active_chain.iter().copied().enumerate().skip(start) {
-            if position == 0 {
-                continue;
-            }
-            let indexed = node.index.blocks.get(&block_id).ok_or_else(|| {
-                ExchangeIndexError::Node(NodeError::CorruptLog(
-                    "active exchange scan refers to an absent block".to_owned(),
-                ))
-            })?;
-            let height = u64::try_from(position)
-                .map_err(|_| ExchangeIndexError::Capacity("indexed chain"))?;
-            if indexed.block_id() != block_id || indexed.height() != height {
-                return Err(ExchangeIndexError::Node(NodeError::CorruptLog(
-                    "active exchange scan block metadata is inconsistent".to_owned(),
-                )));
-            }
-            blocks.push(PlannedBlock {
-                height,
-                block_id,
-                locator: indexed.locator,
-            });
+    for position in positions {
+        if position == 0 {
+            continue;
         }
+        let block_id = *active_chain
+            .get(position)
+            .ok_or(ExchangeIndexError::Corrupt(
+                "chain scan position is above the captured tip",
+            ))?;
+        let indexed = node.index.blocks.get(&block_id).ok_or_else(|| {
+            ExchangeIndexError::Node(NodeError::CorruptLog(
+                "active exchange scan refers to an absent block".to_owned(),
+            ))
+        })?;
+        let height =
+            u64::try_from(position).map_err(|_| ExchangeIndexError::Capacity("indexed chain"))?;
+        if indexed.block_id() != block_id || indexed.height() != height {
+            return Err(ExchangeIndexError::Node(NodeError::CorruptLog(
+                "active exchange scan block metadata is inconsistent".to_owned(),
+            )));
+        }
+        blocks.push(PlannedBlock {
+            height,
+            block_id,
+            locator: indexed.locator,
+        });
     }
     let log_path = node.data_dir.join(BLOCK_LOG_FILE);
     let log = if blocks.is_empty() {
@@ -1868,6 +1924,64 @@ mod tests {
             coinbase,
             transactions: Vec::new(),
         }
+    }
+
+    #[test]
+    fn registration_reads_only_blocks_that_touch_the_new_keys() {
+        let path = test_dir("indexed-history");
+        let now = unix_time_seconds().unwrap();
+        let mut node = Node::open_with_profile(&path, DEVNET_PROFILE).unwrap();
+        let paid = random_destination();
+        let other = node.wallet_destination();
+        for (offset, destination) in [other, paid, other, paid].into_iter().enumerate() {
+            node.mine_once(destination, now + offset as u64, DEFAULT_MINING_ATTEMPTS)
+                .unwrap();
+        }
+        let shared = Arc::new(Mutex::new(node));
+        let mut index = ExchangeDepositIndex::open_and_sync(&shared).unwrap();
+
+        let fresh = random_destination();
+        let plan = index
+            .capture_registration_plan(&shared, [fresh].iter())
+            .unwrap();
+        assert!(plan.blocks.is_empty(), "a fresh key must not read history");
+        let plan = index
+            .capture_registration_plan(&shared, [paid, fresh].iter())
+            .unwrap();
+        assert_eq!(
+            plan.blocks
+                .iter()
+                .map(|block| block.height)
+                .collect::<Vec<_>>(),
+            vec![2, 4]
+        );
+
+        index
+            .register_watch_destinations(
+                &shared,
+                &[
+                    WatchDestinationRegistration {
+                        label: "paid".to_owned(),
+                        destination: paid,
+                    },
+                    WatchDestinationRegistration {
+                        label: "fresh".to_owned(),
+                        destination: fresh,
+                    },
+                ],
+            )
+            .unwrap();
+        let page = index.get_deposit_events(0, 100).unwrap();
+        assert_eq!(
+            page.events
+                .iter()
+                .map(|event| (event.deposit.label.as_str(), event.deposit.block_height))
+                .collect::<Vec<_>>(),
+            vec![("paid", 2), ("paid", 4)]
+        );
+        drop(index);
+        drop(shared);
+        let _ = fs::remove_dir_all(path);
     }
 
     #[test]

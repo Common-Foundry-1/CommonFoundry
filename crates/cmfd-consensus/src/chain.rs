@@ -1272,11 +1272,18 @@ impl Block {
     }
 
     pub fn coinbase_outpoint_id(&self) -> [u8; 32] {
-        let mut hasher = Hasher::new_derive_key(COINBASE_OUTPOINT_DOMAIN);
-        hasher.update(&self.challenge.network_id);
-        hasher.update(&self.block_id());
-        *hasher.finalize().as_bytes()
+        coinbase_outpoint_id(self.challenge.network_id, self.block_id())
     }
+}
+
+/// Coinbase outpoint identifier of the block with this network and identity.
+/// It depends only on the block identity, so indexes can derive it without
+/// reading the block body.
+pub fn coinbase_outpoint_id(network_id: [u8; 32], block_id: [u8; 32]) -> [u8; 32] {
+    let mut hasher = Hasher::new_derive_key(COINBASE_OUTPOINT_DOMAIN);
+    hasher.update(&network_id);
+    hasher.update(&block_id);
+    *hasher.finalize().as_bytes()
 }
 
 fn map_pow_error(error: PowError) -> ChainError {

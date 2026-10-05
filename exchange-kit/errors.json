@@ -135,6 +135,14 @@
     {
       "scope": ["sendrawtransaction"],
       "jsonrpc_code": -32005,
+      "retryable": false,
+      "data_codes": ["transaction_already_confirmed"],
+      "meaning": "The exact transaction is already confirmed on the active chain; a rebroadcast is not needed.",
+      "action": "Treat the broadcast as complete and track it with gettransaction."
+    },
+    {
+      "scope": ["sendrawtransaction"],
+      "jsonrpc_code": -32005,
       "retryable": true,
       "data_codes": ["mempool_transaction_limit", "mempool_byte_limit", "chain_temporarily_rejected"],
       "meaning": "A transient admission capacity or chain-time condition rejected the transaction.",

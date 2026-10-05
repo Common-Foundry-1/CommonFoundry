@@ -14,11 +14,11 @@ Parameters are positional and requests use JSON-RPC 2.0 with an explicit id.
 `txid` and `blockhash` are 64 hexadecimal characters. `verbose` accepts a
 boolean or integer 0/1. A lookup without a block hint searches the full retained
 active chain and local mempool, including spent transactions. There is no
-4,096-block lookback cutoff. The rebuildable in-memory index stores locations;
-each result authenticates its durable block record. The first historical
-query after startup builds the index and can take longer. Later queries scan
-new blocks only. Index capacity is 5,000,000 transaction/coinbase identifiers;
-an explicit block hash bypasses the index when this limit is reached.
+4,096-block lookback cutoff. The node's full-history transaction index locates
+the block, and coinbase identifiers are derived from active block identities,
+so a lookup reads only the one block that holds the transaction; each result
+authenticates its durable block record. The coinbase index holds up to
+5,000,000 active blocks; an explicit block hash bypasses it at that limit.
 
 Decoded results include canonical `hex`, inputs (`vin`), outputs (`vout`),
 `blockhash`, `blockheight`, `confirmations`, `active`, `status`, `bestblock`, and
@@ -121,7 +121,8 @@ already signed Common Foundry wire bytes. Bitcoin transaction serialization
 is not supported. Signing, custody, watch registration, wallet controls, and
 native RPC paths are excluded from the remote gateway. Neither the gateway
 nor proxy automatically retries a broadcast. After an ambiguous response,
-look up the txid before deciding to submit again.
+look up the txid before deciding to submit again. Resubmitting a transaction that is
+already mined returns -32005 / `transaction_already_confirmed`.
 
 This endpoint serves RCNet-1 rehearsal coins. Mainnet deployment and exchange
 custody readiness are separate qualifications.

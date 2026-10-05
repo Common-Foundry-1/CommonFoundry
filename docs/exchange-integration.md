@@ -440,14 +440,16 @@ exists.
 ## Durable deposit event workflow
 
 `registerwatchdestinations [[{label, destination_hex}, ...]]` atomically stores
-1-1,000 immutable mappings after one complete active-chain history scan and one
-durable commit. It rejects the entire batch before persistence if any entry is
+1-1,000 immutable mappings after checking their complete active-chain history
+and one durable commit. The node's full-history address index lists the blocks
+that pay or spend each key, so only those blocks are read; a freshly generated
+key reads none. It rejects the entire batch before persistence if any entry is
 invalid, conflicts with an existing mapping, or duplicates another batch label
 or destination. Results preserve input order, and an exact retry returns the
 same mappings. `registerwatchdestination [label, destination_hex]` is the
 one-at-a-time compatibility form and uses the same validation and durable path.
 Each mapping connects an exchange label to one raw 32-byte x-only Schnorr public
-key. A successful response means the node has scanned active-chain history from
+key. A successful response means the node has checked active-chain history from
 height one and durably published all matching events.
 The label must contain 1-128 visible ASCII bytes. The destination must be
 exactly 64 lowercase hexadecimal characters and decode as a valid key.
@@ -727,7 +729,7 @@ Other v0.4 limitations:
   MiB, so capacity and write latency must be monitored;
 - this listener handles at most four bounded requests concurrently and returns
   HTTP 503 when all four worker slots are occupied;
-- each new watch currently performs a synchronous height-one-to-tip scan, and
+- each registration reads the blocks that touch its keys synchronously, and
   updates rewrite a bounded full snapshot under one index lock. The published
   caps are safety ceilings, not production-scale qualification; onboard at a
   controlled rate until a batched, append-only/WAL-backed store replaces this

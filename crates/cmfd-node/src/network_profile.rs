@@ -12,9 +12,10 @@ pub const PRODUCTION_RC_SEED_PORT: u16 = 19_444;
 /// Additional mainnet cold-start relays, dialled alongside the bootstrap seed
 /// so a fresh node spreads its initial sync instead of loading the seed alone.
 /// Operational infrastructure like the seed above: not part of any identity.
-pub const MAINNET_BOOTSTRAP_RELAYS_IPV4: [Ipv4Addr; 2] = [
+pub const MAINNET_BOOTSTRAP_RELAYS_IPV4: [Ipv4Addr; 3] = [
     Ipv4Addr::new(209, 145, 48, 36),
     Ipv4Addr::new(13, 140, 66, 6),
+    Ipv4Addr::new(88, 198, 110, 195),
 ];
 
 /// Compile-time identity and default endpoints for one Common Foundry network.
@@ -490,7 +491,8 @@ mod tests {
             vec![
                 "173.249.35.251:29444",
                 "209.145.48.36:29444",
-                "13.140.66.6:29444"
+                "13.140.66.6:29444",
+                "88.198.110.195:29444"
             ]
         );
         assert_eq!(mainnet.bootstrap_peers()[0], mainnet.bootstrap_peer());

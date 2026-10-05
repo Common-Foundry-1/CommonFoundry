@@ -1885,6 +1885,25 @@ fn route_method(
                 Err(NodeError::DuplicateMempoolTransaction(existing)) => {
                     Ok(json!(hex::encode(existing)))
                 }
+                // A rebroadcast of a mined transaction finds its inputs spent;
+                // report the confirmation instead of a missing input.
+                Err(NodeError::MempoolUnconfirmedInput(_))
+                    if node
+                        .index
+                        .transactions
+                        .active_location(&txid, &node.index)
+                        .is_some() =>
+                {
+                    Err(RpcFault {
+                        code: -32005,
+                        message: format!(
+                            "transaction {} is already confirmed on the active chain",
+                            hex::encode(txid)
+                        ),
+                        data_code: "transaction_already_confirmed",
+                        retryable: false,
+                    })
+                }
                 Err(error) => Err(node_fault(error)),
             }
         }
@@ -3885,7 +3904,7 @@ mod tests {
         );
         assert_eq!(
             retry_after_confirmation["error"]["data"]["code"],
-            "mempool_unconfirmed_input"
+            "transaction_already_confirmed"
         );
         assert_eq!(
             retry_after_confirmation["error"]["data"]["retryable"],

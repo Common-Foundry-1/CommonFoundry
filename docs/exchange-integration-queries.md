@@ -121,7 +121,8 @@ already signed Common Foundry wire bytes. Bitcoin transaction serialization
 is not supported. Signing, custody, watch registration, wallet controls, and
 native RPC paths are excluded from the remote gateway. Neither the gateway
 nor proxy automatically retries a broadcast. After an ambiguous response,
-look up the txid before deciding to submit again.
+look up the txid before deciding to submit again. Resubmitting a transaction that is
+already mined returns -32005 / `transaction_already_confirmed`.
 
 This endpoint serves RCNet-1 rehearsal coins. Mainnet deployment and exchange
 custody readiness are separate qualifications.

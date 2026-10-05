@@ -37,7 +37,7 @@ disagree.
 
 ## Verify the complete downloaded directory
 
-Keep all files from the one `1.0.8` release together in a new directory,
+Keep all files from the one `1.0.9` release together in a new directory,
 including the five archives (Windows/Linux runtime and miner, plus HiveOS),
 `SHA256SUMS.txt`, `SHA256SUMS.txt.sig`, and the
 release metadata. Use Python 3.11 or newer and the pinned dependencies in

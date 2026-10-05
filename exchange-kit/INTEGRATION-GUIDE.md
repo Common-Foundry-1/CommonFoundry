@@ -75,8 +75,8 @@ Register each deposit address once, then follow one event stream:
   `added_cursor`. Reverse any credit you gave for it.
 
 **When to credit.** An event carries `blockheight`. Compute confirmations as
-`getblockcount − blockheight + 1` and credit only after your own threshold; we
-suggest at least 20 confirmations (about 20 minutes). Coinbase deposits
+`getblockcount − blockheight + 1` and credit a deposit only after at least 60
+confirmations (about one hour). Coinbase deposits
 (`"coinbase": true`) can only be spent once `getblockcount + 1 ≥ spendable_height`.
 
 Without watch registration you can instead poll `getaddressbalance` /

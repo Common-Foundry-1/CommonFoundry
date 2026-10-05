@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import App from "./App";
-import { DISCORD_URL, EMISSION_URL, EXPLORER_URL, MAINNET_LAUNCH_AT, MAINNET_POOL_URL, MAINNET_RELEASE_KEY_FINGERPRINT, MAINNET_RELEASE_KEY_URL, MAINNET_RELEASE_URL, MAINNET_RELEASE_VERSION, MAINNET_SEED_PEER, MINING_GUIDE_URL, SOURCE_RELEASE_AT, SECURITY_URL, WALLET_URL, WHITEPAPER_URL } from "./content";
+import { DISCORD_URL, EMISSION_URL, EXPLORER_URL, MAINNET_LAUNCH_AT, MAINNET_RELEASE_KEY_FINGERPRINT, MAINNET_RELEASE_KEY_URL, MAINNET_RELEASE_URL, MAINNET_RELEASE_VERSION, MAINNET_SEED_PEER, MINING_GUIDE_URL, SOURCE_RELEASE_AT, SECURITY_URL, WALLET_URL, WHITEPAPER_URL } from "./content";
 
 describe("Discord-first launch website", () => {
   it("leads with inference and makes Discord the primary first-screen action", () => {
@@ -11,7 +11,6 @@ describe("Discord-first launch website", () => {
     expect(primary).toHaveAttribute("href", DISCORD_URL);
     expect(primary).toHaveClass("button-link--primary");
     expect(within(hero).getByRole("link", { name: "Mainnet status" })).toHaveAttribute("href", "#launch");
-    expect(within(hero).getByRole("link", { name: "Mainnet pool connection details" })).toHaveAttribute("href", "#pool-setup");
     expect(within(hero).queryByRole("link", { name: /RC5|download/i })).not.toBeInTheDocument();
     expect(within(hero).getByText("Setup help. Mining guidance. Release announcements.")).toBeVisible();
     expect(within(hero).getByText("Mainnet is live")).toBeVisible();
@@ -33,11 +32,11 @@ describe("Discord-first launch website", () => {
     expect(within(launch).getByRole("link", { name: "Open the web wallet" })).toHaveAttribute("href", WALLET_URL);
     expect(within(launch).getByText(MAINNET_RELEASE_KEY_FINGERPRINT)).toBeVisible();
     expect(within(launch).getByRole("link", { name: "View the public release key" })).toHaveAttribute("href", MAINNET_RELEASE_KEY_URL);
-    const pool = within(launch).getByRole("complementary", { name: "Official pool connection" });
-    expect(within(pool).getByText(MAINNET_POOL_URL)).toBeVisible();
-    expect(within(pool).getByText(MAINNET_SEED_PEER)).toBeVisible();
-    expect(within(pool).getByText(/pool is accepting connections/)).toBeVisible();
-    expect(within(pool).queryByText(/RCNet/)).not.toBeInTheDocument();
+    const node = within(launch).getByRole("complementary", { name: "Bootstrap peer" });
+    expect(within(node).getByText(MAINNET_SEED_PEER)).toBeVisible();
+    expect(screen.queryByText(/official pool/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/cmfd\+tls:/)).not.toBeInTheDocument();
+    expect(document.getElementById("pool-setup")).toBeNull();
   });
 
   it("uses the same official Discord destination across the conversion flow", () => {
@@ -73,20 +72,6 @@ describe("Discord-first launch website", () => {
     const scroll = vi.fn();
     Element.prototype.scrollIntoView = scroll;
     window.history.replaceState(null, "", "/#mining-guide");
-    try {
-      render(<App />);
-      expect(scroll).toHaveBeenCalledWith({ block: "start" });
-    } finally {
-      window.history.replaceState(null, "", "/");
-      Element.prototype.scrollIntoView = original;
-    }
-  });
-
-  it("opens the shareable pool setup anchor after the app mounts", () => {
-    const original = Element.prototype.scrollIntoView;
-    const scroll = vi.fn();
-    Element.prototype.scrollIntoView = scroll;
-    window.history.replaceState(null, "", "/#pool-setup");
     try {
       render(<App />);
       expect(scroll).toHaveBeenCalledWith({ block: "start" });

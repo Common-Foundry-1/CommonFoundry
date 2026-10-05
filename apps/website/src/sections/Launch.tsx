@@ -1,5 +1,5 @@
 import { ButtonLink } from "../components/ButtonLink";
-import { DISCORD_URL, EXPLORER_URL, MAINNET_FIRST_BLOCK_AT, MAINNET_LAUNCH_AT, MAINNET_POOL_URL, MAINNET_RELEASE_KEY_FINGERPRINT, MAINNET_RELEASE_KEY_URL, MAINNET_RELEASE_URL, MAINNET_SEED_PEER, MINING_GUIDE_URL, SOURCE_RELEASE_AT, WALLET_URL } from "../content";
+import { DISCORD_URL, EXPLORER_URL, MAINNET_FIRST_BLOCK_AT, MAINNET_LAUNCH_AT, MAINNET_RELEASE_KEY_FINGERPRINT, MAINNET_RELEASE_KEY_URL, MAINNET_RELEASE_URL, MAINNET_SEED_PEER, MINING_GUIDE_URL, SOURCE_RELEASE_AT, WALLET_URL } from "../content";
 
 export function Launch() {
   return (
@@ -26,18 +26,15 @@ export function Launch() {
         </article>
       </div>
       <div className="launch__status">
-        <p><strong>Mainnet is live.</strong> Signed releases, the official pool, the public block explorer and the web wallet are all running. New releases and operational updates are announced in Discord.</p>
+        <p><strong>Mainnet is live.</strong> Signed releases, the public block explorer and the web wallet are all running. New releases and operational updates are announced in Discord.</p>
         <ButtonLink href={MAINNET_RELEASE_URL} target="_blank" rel="noopener noreferrer">Get the latest mainnet packages</ButtonLink>
         <ButtonLink href={EXPLORER_URL} target="_blank" rel="noopener noreferrer" variant="secondary">Open the block explorer</ButtonLink>
         <ButtonLink href={WALLET_URL} target="_blank" rel="noopener noreferrer" variant="secondary">Open the web wallet</ButtonLink>
       </div>
-      <aside id="pool-setup" className="launch__pool-setup" aria-labelledby="pool-setup-heading">
-        <p className="launch__eyebrow">Mainnet · Pool mining</p>
-        <h3 id="pool-setup-heading">Official pool connection</h3>
-        <p>Enter the complete certificate-pinned URL in your mainnet pool miner, along with your mainnet wallet address and worker name:</p>
-        <code className="launch__pool-url">{MAINNET_POOL_URL}</code>
-        <p>The pool address and certificate pin match the pool host's configured values. The mainnet pool is accepting connections.</p>
-        <p>Running your own node? The released node has <code>{MAINNET_SEED_PEER}</code> among its default bootstrap peers. This is separate from the mining pool.</p>
+      <aside id="node-setup" className="launch__pool-setup" aria-labelledby="node-setup-heading">
+        <p className="launch__eyebrow">Mainnet · Run a node</p>
+        <h3 id="node-setup-heading">Bootstrap peer</h3>
+        <p>The released node has <code>{MAINNET_SEED_PEER}</code> among its default bootstrap peers, so a fresh install finds the network on its own.</p>
       </aside>
       <article id="mining-guide" className="launch__guide" aria-labelledby="mining-guide-heading">
         <aside className="launch__pool-update" aria-labelledby="pool-update-heading">

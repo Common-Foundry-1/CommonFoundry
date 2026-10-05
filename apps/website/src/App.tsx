@@ -9,7 +9,7 @@ import { Thesis } from "./sections/Thesis";
 
 export default function App() {
   useEffect(() => {
-    if (window.location.hash === "#mining-guide" || window.location.hash === "#pool-setup") {
+    if (window.location.hash === "#mining-guide") {
       document.getElementById(window.location.hash.slice(1))?.scrollIntoView({ block: "start" });
     }
   }, []);

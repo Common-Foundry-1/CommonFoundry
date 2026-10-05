@@ -14,7 +14,6 @@ export const MAINNET_RELEASE_VERSION = "v1.0.8";
 export const MAINNET_RELEASE_KEY_URL = "/mainnet-release-key.txt";
 export const MAINNET_RELEASE_KEY_FINGERPRINT = "SHA256:cA1Tsf8hL/pxDV5WpOE3iPW3b4uDQosu1dOh//4a/fk";
 export const MAINNET_RELEASE_URL = "https://github.com/Common-Foundry-1/CommonFoundry/releases/latest";
-export const MAINNET_POOL_URL = "cmfd+tls://107.214.187.2:29445?pin=0a896a857857354781f06fe5b9ca05e632a35eab915b9cfd68545905bd1300d2";
 export const MAINNET_SEED_PEER = "173.249.35.251:29444";
 
 export type SectionId =
@@ -100,7 +99,7 @@ export const roadmapGates: readonly RoadmapGate[] = [
     number: "04",
     title: "October 3 · Mainnet live",
     detail:
-      "Mainnet mining began on schedule October 3, 2026 at noon CDT / 17:00 UTC; the first block was mined at 17:06 UTC. The chain, the official pool, the public explorer and the web wallet are running. Follow Discord for releases and operational updates.",
+      "Mainnet mining began on schedule October 3, 2026 at noon CDT / 17:00 UTC; the first block was mined at 17:06 UTC. The chain, the public explorer and the web wallet are running. Follow Discord for releases and operational updates.",
     phase: "active",
   },
   {

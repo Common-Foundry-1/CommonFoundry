@@ -49,7 +49,6 @@ export function Hero() {
         <p className="hero__support">Setup help. Mining guidance. Release announcements.</p>
         <p className="hero__guide">
           New to mining? <a href={MINING_GUIDE_URL} target="_blank" rel="noopener noreferrer">Windows + Linux mining guide (PDF)</a>
-          <br />Official pool miner? <a href="#pool-setup">Mainnet pool connection details</a>
         </p>
 
         <div className="trust-note">

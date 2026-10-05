@@ -1,5 +1,9 @@
 # Common Foundry Exchange Integration Kit v1
 
+**New integrators: start with the [integration guide](INTEGRATION-GUIDE.md).** It
+walks through deposit addresses, deposit detection, sweeps, withdrawals, fees
+and errors for both the hosted endpoint and your own node.
+
 The additive [transaction and address query contract](../docs/exchange-integration-queries.md)
 documents `getrawtransaction`, `gettransaction`, `getaddressbalance`, and
 `getbalance`, and `getaddressutxos`, including confirmations, reorganization
@@ -205,10 +209,12 @@ recovery contracts remain normative in
 
 - Bitcoin Core RPC compatibility, JSON-RPC batches, notifications, or named parameters
 - public/non-loopback exposure or built-in TLS
-- checksummed display addresses or node-generated customer deposit addresses
+- checksummed display addresses, or deposit keys generated through the RPC
+  (generate them offline with `cmfd-node exchange-key-new`)
 - watch deletion or reassignment
-- general transaction lookup, UTXO listing, or wallet balance RPC
 - `sendtoaddress`, `sendmany`, fee estimation, or an exchange payout scheduler
+  (sign offline with `cmfd-node exchange-tx-sign` and broadcast with
+  `sendrawtransaction`; the fee is a fixed minimum of 0.1 CMFD)
 - online policy, keyring, journal-key, migration, archive, or compaction RPC
 - a certified vendor HSM driver, remote-signing transport, or threshold-key implementation
 - released-record archive and journal epoch rollover

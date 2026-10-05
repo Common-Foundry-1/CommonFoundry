@@ -18,7 +18,8 @@
   "vars": {
     "EXPLORER_ORIGIN": "https://mainnet-explorer-origin.commonfoundry.ai",
     "EXPECTED_NETWORK_ID": "88296bc39c10e8bc1dd4818d4d42412fe5f08210651110377f495da299812f62",
-    "GATEWAY_URL": "https://13.140.66.6/mainnet",
+    // A hostname, not the bare IP: Cloudflare refuses Worker fetches to IP literals (403).
+    "GATEWAY_URL": "https://sg-rpc.commonfoundry.ai/mainnet",
     "GATEWAY_USERNAME": "webwallet"
   },
   "ratelimits": [

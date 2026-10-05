@@ -33,10 +33,15 @@ work with hot reload, run `npm run dev:web` in `apps/wallet`; it proxies `/v1` t
 
 ## Deploy
 
-1. On the Singapore gateway, add a `webwallet` client: put its SHA-256 password digest in
-   `clients.json`, then restart `commonfoundry-mainnet-gateway`.
-2. `npx wrangler secret put GATEWAY_PASSWORD` (the `webwallet` password).
-3. `npm run deploy`. This builds the app, deploys the Worker and attaches the
+1. DNS: `sg-rpc.commonfoundry.ai` A `13.140.66.6`, **DNS only**. Workers cannot fetch IP
+   literals (Cloudflare answers 403), so the gateway needs a name.
+2. On the Singapore box, expand the certificate to that name, then reload nginx (the default
+   server already answers it):
+   `certbot certonly --cert-name commonfoundry-singapore --expand --webroot -w /var/www/commonfoundry-acme --preferred-profile shortlived --key-type ecdsa --ip-address 13.140.66.6 -d sg-rpc.commonfoundry.ai`
+3. Add a `webwallet` gateway client: put its SHA-256 password digest in `clients.json`, then restart
+   `commonfoundry-mainnet-gateway`.
+4. `npx wrangler secret put GATEWAY_PASSWORD` (the `webwallet` password).
+5. `npm run deploy`. This builds the app, deploys the Worker and attaches the
    `wallet.commonfoundry.ai` custom domain.
-4. Keep Cloudflare Web Analytics and bot-detection script injection off for this hostname.
+6. Keep Cloudflare Web Analytics and bot-detection script injection off for this hostname.
    The CSP blocks every off-origin script, so injected scripts would only produce console errors.

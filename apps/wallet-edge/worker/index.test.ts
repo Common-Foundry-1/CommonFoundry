@@ -16,7 +16,7 @@ function environment(overrides: Partial<Env> = {}) {
     WALLET_RPC_LIMIT: { limit },
     EXPLORER_ORIGIN: "https://mainnet-explorer-origin.commonfoundry.ai",
     EXPECTED_NETWORK_ID: NETWORK_ID,
-    GATEWAY_URL: "https://13.140.66.6/mainnet",
+    GATEWAY_URL: "https://sg-rpc.commonfoundry.ai/mainnet",
     GATEWAY_USERNAME: "webwallet",
     GATEWAY_PASSWORD: "secret-password",
     ...overrides,
@@ -110,7 +110,7 @@ describe("wallet gateway routes", () => {
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ height: 3600, has_more: false, next_cursor: null, utxos: [{ txid: "aa".repeat(32), vout: 1, value_atoms: "5", spendable_height: 10 }] });
     const [url, init] = upstream.mock.calls[0] as unknown as [string, RequestInit];
-    expect(url).toBe("https://13.140.66.6/mainnet");
+    expect(url).toBe("https://sg-rpc.commonfoundry.ai/mainnet");
     expect(new Headers(init.headers).get("Authorization")).toBe(`Basic ${btoa("webwallet:secret-password")}`);
     expect(JSON.parse(init.body as string)).toEqual({ jsonrpc: "2.0", id: 1, method: "getaddressutxos", params: [ADDRESS, 1000, null] });
   });

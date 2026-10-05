@@ -33,13 +33,13 @@ use crate::peer::{
     SUBMIT_BLOCK_RESPONSE_BUDGET, StaticPeerConfig, validate_peer_address,
 };
 use crate::{
-    Node, NodeError, PeerDirection, RemoteProofPeerId, RemoteProofRequest,
+    BlockPreverifier, Node, NodeError, PeerDirection, RemoteProofPeerId, RemoteProofRequest,
     submit_shared_peer_block_cancellable, unix_time_seconds,
 };
 
 /// Absolute item-count cap for one block synchronization request. The active
 /// byte-size cap is derived from the network's maximum block frame below.
-pub const MAX_BLOCKS_PER_SYNC: usize = 16;
+pub const MAX_BLOCKS_PER_SYNC: usize = crate::peer::MAX_BLOCKS_PER_SESSION as usize;
 /// A single poll downloads only a small prefix of an advertised mempool.
 /// Accepted candidates become locally known, allowing later polls to proceed
 /// farther through an honest peer's inventory.
@@ -74,7 +74,10 @@ const INBOUND_ATTEMPT_WINDOW: Duration = Duration::from_secs(10);
 const PEER_BAN_DURATION: Duration = Duration::from_secs(5 * 60);
 const PEER_BAN_SCORE: u16 = 100;
 const COMPRESSED_PEER_STRIKES: u8 = 1;
-const COMPRESSED_PEER_COOLDOWN: Duration = Duration::from_secs(60 * 60);
+// Long enough to stop hammering an older peer with a frame it closes on,
+// short enough that a peer that merely reset once is back on compressed
+// frames within the next few poll rounds.
+const COMPRESSED_PEER_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 const CLEAN_SESSION_CREDIT: u16 = 10;
 const TRANSIENT_FAILURE_PENALTY: u16 = 5;
 const UNKNOWN_REQUEST_PENALTY: u16 = 10;
@@ -123,15 +126,19 @@ const SUBMIT_BLOCK_ACCEPTANCE_BUDGET: Duration = Duration::from_secs(
 );
 static NEXT_REMOTE_PROOF_PEER_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Blocks one sync session may move. Block frames are counted per session by
+/// `PeerLimits::max_blocks_per_session`, not against the byte budget, so the
+/// control budget only has to hold the handshake, inventories and mempool
+/// exchange; the transaction reserve keeps that true for the smallest allowed
+/// `max_bytes_per_peer`.
 fn block_sync_batch_limit(network_id: [u8; 32], limits: PeerLimits) -> usize {
     let transaction_reserve =
         (MAX_TRANSACTIONS_PER_SYNC as u64).saturating_mul(MAX_TRANSACTION_BYTES as u64);
-    let block_budget = limits
-        .max_bytes_per_peer
-        .saturating_sub(transaction_reserve)
-        .saturating_sub(SYNC_CONTROL_RESERVE_BYTES);
-    let maximum_block_bytes = max_block_bytes_for_network(network_id) as u64;
-    usize::try_from(block_budget / maximum_block_bytes)
+    if limits.max_bytes_per_peer <= transaction_reserve.saturating_add(SYNC_CONTROL_RESERVE_BYTES) {
+        return 0;
+    }
+    debug_assert!(max_block_bytes_for_network(network_id) > 0);
+    usize::try_from(limits.max_blocks_per_session)
         .unwrap_or(usize::MAX)
         .min(MAX_BLOCKS_PER_SYNC)
 }
@@ -510,7 +517,7 @@ impl PeerSecurity {
             if entry.compressed_strikes >= COMPRESSED_PEER_STRIKES {
                 entry.compressed_strikes = 0;
                 entry.compressed_cooldown_until = Some(now + COMPRESSED_PEER_COOLDOWN);
-                tracing::warn!(peer = %ip, "peer rejected compressed-block frames; falling back to version 4 for an hour");
+                tracing::warn!(peer = %ip, cooldown_secs = COMPRESSED_PEER_COOLDOWN.as_secs(), "compressed session ended early; opening version-4 sessions to this peer for a while");
             }
         }
         Ok(())
@@ -1318,6 +1325,155 @@ fn sync_from_peer_once_inner_with_policy(
     result
 }
 
+/// A block this session asked for and already holds is worth more than the
+/// verifier queue's patience. Instead of ending the session on a busy verifier
+/// (and downloading the same block again later), re-offer it a bounded number
+/// of times. Local shutdown, the per-attempt acceptance deadline and every
+/// other error still end the session as before.
+const MAX_FETCHED_BLOCK_SUBMIT_ATTEMPTS: usize = 3;
+const FETCHED_BLOCK_QUEUE_FULL_PAUSE: Duration = Duration::from_millis(250);
+
+fn submit_fetched_block(
+    shared: &Arc<Mutex<Node>>,
+    block: Block,
+    proof_peer: RemoteProofPeerId,
+    active_sockets: Option<&Arc<ActiveSocketRegistry>>,
+) -> Result<bool, P2pError> {
+    let stopping = active_sockets.map(|registry| Arc::clone(&registry.stopping));
+    submit_fetched_block_with(block, stopping, |block, accepted_at, request| {
+        submit_shared_peer_block_cancellable(shared, block, accepted_at, proof_peer, request)
+    })
+}
+
+fn submit_fetched_block_with(
+    block: Block,
+    stopping: Option<Arc<AtomicBool>>,
+    mut submit: impl FnMut(Block, u64, RemoteProofRequest) -> Result<u64, NodeError>,
+) -> Result<bool, P2pError> {
+    for attempt in 1..=MAX_FETCHED_BLOCK_SUBMIT_ATTEMPTS {
+        let accepted_at = unix_time_seconds()?;
+        let acceptance_deadline =
+            checked_submit_deadline(Instant::now(), SUBMIT_BLOCK_ACCEPTANCE_BUDGET)?;
+        let request = RemoteProofRequest::new(acceptance_deadline);
+        // We requested and received this complete, bounded block. Its source
+        // may close an idle connection while we verify it or reconstruct a
+        // fork. That must not discard local progress and repeat the same work
+        // forever. Local shutdown and the fixed admission deadline still win.
+        let monitor = PeerSubmissionMonitor::local_validation(stopping.clone(), request.clone())?;
+        let result = submit(block.clone(), accepted_at, request);
+        drop(monitor);
+        let last_attempt = attempt == MAX_FETCHED_BLOCK_SUBMIT_ATTEMPTS
+            || stopping
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Acquire));
+        match result {
+            Ok(_) => return Ok(true),
+            Err(NodeError::DuplicateBlock(_)) => return Ok(false),
+            Err(
+                error @ (NodeError::ProofVerificationQueueTimeout
+                | NodeError::ProofVerificationQueueFull),
+            ) if !last_attempt => {
+                tracing::debug!(%error, attempt, "verifier busy; keeping the fetched block for another attempt");
+                if matches!(error, NodeError::ProofVerificationQueueFull) {
+                    thread::sleep(FETCHED_BLOCK_QUEUE_FULL_PAUSE);
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    unreachable!("the final attempt returns")
+}
+
+/// Blocks one sync session holds between fetching and ordered submission so
+/// their proofs can be checked concurrently, and the node-wide cap on such
+/// buffered blocks across every session (about 240 MB of full mainnet blocks).
+/// A session that cannot reserve a slot simply submits one block at a time.
+const FETCHED_BLOCK_PREFETCH_WINDOW: usize = crate::MAX_PARALLEL_FETCHED_PROOF_VERIFICATIONS;
+const MAX_PREFETCHED_BLOCKS_NODE_WIDE: usize = 20;
+static PREFETCHED_BLOCKS: AtomicUsize = AtomicUsize::new(0);
+
+/// Node-wide reservations for the blocks a session buffers beyond the one it
+/// is about to submit; released when the window is submitted or the session
+/// ends for any reason.
+struct PrefetchSlots {
+    held: usize,
+}
+
+impl PrefetchSlots {
+    fn new() -> Self {
+        Self { held: 0 }
+    }
+
+    fn reserve(&mut self) -> bool {
+        let mut current = PREFETCHED_BLOCKS.load(Ordering::Acquire);
+        loop {
+            if current >= MAX_PREFETCHED_BLOCKS_NODE_WIDE {
+                return false;
+            }
+            match PREFETCHED_BLOCKS.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.held += 1;
+                    return true;
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn release_all(&mut self) {
+        PREFETCHED_BLOCKS.fetch_sub(self.held, Ordering::AcqRel);
+        self.held = 0;
+    }
+}
+
+impl Drop for PrefetchSlots {
+    fn drop(&mut self) {
+        self.release_all();
+    }
+}
+
+/// Submits a window of fetched, contiguous blocks in order after their proofs
+/// were pre-warmed concurrently, advancing the peer cursor and the session
+/// counters exactly as one-at-a-time submission did.
+#[allow(clippy::too_many_arguments)]
+fn submit_fetched_window(
+    shared: &Arc<Mutex<Node>>,
+    preverifier: &BlockPreverifier,
+    pending: &mut Vec<Block>,
+    slots: &mut PrefetchSlots,
+    proof_peer: RemoteProofPeerId,
+    active_sockets: Option<&Arc<ActiveSocketRegistry>>,
+    observation_address: &str,
+    sync_cursor: &mut Option<[u8; 32]>,
+    accepted_blocks: &mut usize,
+    already_known: &mut usize,
+) -> Result<(), P2pError> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    crate::prewarm_fetched_proofs(preverifier, pending);
+    for block in pending.drain(..) {
+        let block_id = block.block_id();
+        let accepted = submit_fetched_block(shared, block, proof_peer, active_sockets)?;
+        if lock_node(shared)?.advance_peer_sync_cursor(observation_address, *sync_cursor, block_id)
+        {
+            *sync_cursor = Some(block_id);
+        }
+        if accepted {
+            *accepted_blocks += 1;
+        } else {
+            *already_known += 1;
+        }
+    }
+    slots.release_all();
+    Ok(())
+}
+
 /// Peers advertise using their own bounded session budget. A larger offer is
 /// not resource abuse: accept the protocol-sized offer, but download only the
 /// prefix that fits our unchanged local session budget.
@@ -1377,6 +1533,9 @@ fn perform_sync_from_peer_once_inner_with_policy(
     let mut accepted_blocks = 0;
     let mut already_known = 0;
     let mut previous_inventory_id = None;
+    let preverifier = lock_node(&shared)?.block_preverifier();
+    let mut pending: Vec<Block> = Vec::new();
+    let mut slots = PrefetchSlots::new();
 
     loop {
         let mut reached_unknown = false;
@@ -1403,72 +1562,103 @@ fn perform_sync_from_peer_once_inner_with_policy(
             if requested_blocks >= block_batch_limit {
                 break;
             }
+            // Buffer a small window of fetched blocks so their proofs can be
+            // checked concurrently; hold only what the node-wide cap allows.
+            if !pending.is_empty()
+                && (pending.len() >= FETCHED_BLOCK_PREFETCH_WINDOW || !slots.reserve())
+            {
+                submit_fetched_window(
+                    &shared,
+                    &preverifier,
+                    &mut pending,
+                    &mut slots,
+                    proof_peer,
+                    active_sockets,
+                    &observation_address,
+                    &mut sync_cursor,
+                    &mut accepted_blocks,
+                    &mut already_known,
+                )?;
+            }
 
-            connection.send(PeerMessage::GetBlock {
-                block_id: *requested,
-            })?;
-            let block = expect_block(connection.receive()?)?;
+            let fetched = connection
+                .send(PeerMessage::GetBlock {
+                    block_id: *requested,
+                })
+                .map_err(P2pError::from)
+                .and_then(|()| connection.receive().map_err(P2pError::from))
+                .and_then(expect_block);
+            let block = match fetched {
+                Ok(block) => block,
+                Err(error) => {
+                    // A peer that ends the session at its own, smaller allowance
+                    // must not cost us the blocks it already delivered.
+                    submit_fetched_window(
+                        &shared,
+                        &preverifier,
+                        &mut pending,
+                        &mut slots,
+                        proof_peer,
+                        active_sockets,
+                        &observation_address,
+                        &mut sync_cursor,
+                        &mut accepted_blocks,
+                        &mut already_known,
+                    )?;
+                    return Err(error);
+                }
+            };
             requested_blocks += 1;
 
             let actual = block.block_id();
-            if actual != *requested {
-                return Err(P2pError::WrongBlock {
-                    requested: *requested,
-                    actual,
-                });
-            }
-
             let parent_is_ordered = if let Some(previous) = previous_inventory_id {
                 block.challenge.previous_block == previous
             } else {
                 let node = lock_node(&shared)?;
                 node.contains_block(block.challenge.previous_block)
             };
-            if !parent_is_ordered {
+            if actual != *requested || !parent_is_ordered {
+                // Blocks fetched before the bad one were checked by id and
+                // ancestry; keep them, then report the peer fault as before.
+                submit_fetched_window(
+                    &shared,
+                    &preverifier,
+                    &mut pending,
+                    &mut slots,
+                    proof_peer,
+                    active_sockets,
+                    &observation_address,
+                    &mut sync_cursor,
+                    &mut accepted_blocks,
+                    &mut already_known,
+                )?;
+                if actual != *requested {
+                    return Err(P2pError::WrongBlock {
+                        requested: *requested,
+                        actual,
+                    });
+                }
                 return Err(P2pError::NonContiguousInventory {
                     block_id: *requested,
                 });
             }
 
-            let accepted_at = unix_time_seconds()?;
-            let acceptance_deadline =
-                checked_submit_deadline(Instant::now(), SUBMIT_BLOCK_ACCEPTANCE_BUDGET)?;
-            let request = RemoteProofRequest::new(acceptance_deadline);
-            // We requested and received this complete, bounded block. Its source
-            // may close an idle connection while we verify it or reconstruct a
-            // fork. That must not discard local progress and repeat the same work
-            // forever. Local shutdown and the fixed admission deadline still win.
-            let monitor = PeerSubmissionMonitor::local_validation(
-                active_sockets.map(|registry| Arc::clone(&registry.stopping)),
-                request.clone(),
-            )?;
-            let accepted = match submit_shared_peer_block_cancellable(
-                &shared,
-                block,
-                accepted_at,
-                proof_peer,
-                request,
-            ) {
-                Ok(_) => true,
-                Err(NodeError::DuplicateBlock(_)) => false,
-                Err(error) => return Err(error.into()),
-            };
-            drop(monitor);
-            if lock_node(&shared)?.advance_peer_sync_cursor(
-                &observation_address,
-                sync_cursor,
-                *requested,
-            ) {
-                sync_cursor = Some(*requested);
-            }
-            if accepted {
-                accepted_blocks += 1;
-            } else {
-                already_known += 1;
-            }
+            pending.push(block);
             previous_inventory_id = Some(*requested);
         }
-        // Peers offer only what fits their own budget (one id for stock mainnet
+        submit_fetched_window(
+            &shared,
+            &preverifier,
+            &mut pending,
+            &mut slots,
+            proof_peer,
+            active_sockets,
+            &observation_address,
+            &mut sync_cursor,
+            &mut accepted_blocks,
+            &mut already_known,
+        )?;
+        // Peers offer only what fits their own budget (one id for pre-1.0.6
         // nodes). When the whole offer is already stored, ask again from the
         // advanced cursor in the same session instead of ending it.
         if reached_unknown
@@ -3697,6 +3887,7 @@ mod tests {
             max_peers: 4,
             max_messages_per_peer: 256,
             max_bytes_per_peer: 32 * 1024 * 1024,
+            max_blocks_per_session: crate::peer::MAX_BLOCKS_PER_SESSION,
             compress_blocks: false,
         }
     }
@@ -3934,24 +4125,48 @@ mod tests {
     }
 
     #[test]
-    fn block_sync_batch_limit_tracks_the_network_frame_size() {
+    fn block_sync_batch_limit_follows_the_session_block_allowance_not_the_frame_size() {
         let limits = test_limits();
         let legacy_network_id = crate::DEVNET_PROFILE.network_id;
         let v4_network_id = cmfd_consensus::PRODUCTION_V4_TESTNET_NETWORK_ID;
 
+        // Full 12 MB ProductionV4 blocks used to fit the 32 MiB byte budget
+        // once per session; block frames are counted separately now, so every
+        // network gets the same per-session allowance.
         assert_eq!(
             block_sync_batch_limit(legacy_network_id, limits),
             MAX_BLOCKS_PER_SYNC
         );
-        assert_eq!(block_sync_batch_limit(v4_network_id, limits), 1);
-
+        assert_eq!(
+            block_sync_batch_limit(v4_network_id, limits),
+            MAX_BLOCKS_PER_SYNC
+        );
         let v4_block_budget = limits
             .max_bytes_per_peer
             .saturating_sub((MAX_TRANSACTIONS_PER_SYNC * MAX_TRANSACTION_BYTES) as u64)
             .saturating_sub(SYNC_CONTROL_RESERVE_BYTES);
         let v4_maximum_block_bytes = max_block_bytes_for_network(v4_network_id) as u64;
-        assert!(v4_maximum_block_bytes <= v4_block_budget);
         assert!(v4_maximum_block_bytes.saturating_mul(2) > v4_block_budget);
+
+        // The allowance is the knob, capped by the protocol offer limit.
+        for (allowance, expected) in [
+            (1, 1),
+            (2, 2),
+            (crate::peer::MAX_BLOCKS_PER_SESSION, MAX_BLOCKS_PER_SYNC),
+        ] {
+            let limits = PeerLimits {
+                max_blocks_per_session: allowance,
+                ..test_limits()
+            };
+            assert_eq!(block_sync_batch_limit(v4_network_id, limits), expected);
+        }
+        // A control budget that cannot even hold the transaction reserve
+        // leaves no room to sync blocks.
+        let starved = PeerLimits {
+            max_bytes_per_peer: (MAX_TRANSACTIONS_PER_SYNC * MAX_TRANSACTION_BYTES) as u64,
+            ..test_limits()
+        };
+        assert_eq!(block_sync_batch_limit(v4_network_id, starved), 0);
     }
 
     #[test]
@@ -4680,19 +4895,15 @@ mod tests {
                 .contains_block(source_blocks[3].block_id())
         );
 
-        let reserve =
-            (MAX_TRANSACTIONS_PER_SYNC * MAX_TRANSACTION_BYTES) as u64 + SYNC_CONTROL_RESERVE_BYTES;
-        let block_bytes = max_block_bytes_for_network(crate::DEVNET_PROFILE.network_id) as u64;
         let receiver_limits = PeerLimits {
-            max_bytes_per_peer: reserve + block_bytes,
-            compress_blocks: false,
+            max_blocks_per_session: 1,
             ..test_limits()
         };
         assert_eq!(
             block_sync_batch_limit(crate::DEVNET_PROFILE.network_id, receiver_limits),
             1
         );
-        // Like stock mainnet nodes, the source offers one id per request.
+        // Like pre-1.0.6 mainnet nodes, the source offers one id per request.
         let socket = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = socket.local_addr().unwrap();
         let listener = spawn_inbound_listener_inner(
@@ -4740,26 +4951,20 @@ mod tests {
         let target = open_shared(&target_path);
         let limited = open_shared(&limited_path);
         mine(&source, 3, unix_time_seconds().unwrap());
-        let reserve =
-            (MAX_TRANSACTIONS_PER_SYNC * MAX_TRANSACTION_BYTES) as u64 + SYNC_CONTROL_RESERVE_BYTES;
-        let block_bytes = max_block_bytes_for_network(crate::DEVNET_PROFILE.network_id) as u64;
         let receiver_limits = PeerLimits {
-            max_bytes_per_peer: reserve + block_bytes,
-            compress_blocks: false,
+            max_blocks_per_session: 1,
             ..test_limits()
         };
-        let sender_limits = PeerLimits {
-            max_bytes_per_peer: reserve + 2 * block_bytes,
-            compress_blocks: false,
-            ..test_limits()
-        };
+        // A 1.0.6 server offers its whole default allowance to a pre-1.0.6
+        // client that can only take one block per session.
+        let sender_limits = test_limits();
         assert_eq!(
             block_sync_batch_limit(crate::DEVNET_PROFILE.network_id, receiver_limits),
             1
         );
         assert_eq!(
             block_sync_batch_limit(crate::DEVNET_PROFILE.network_id, sender_limits),
-            2
+            MAX_BLOCKS_PER_SYNC
         );
         let socket = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = socket.local_addr().unwrap();
@@ -4826,7 +5031,7 @@ mod tests {
             Some(TARGET_NONCE),
         )
         .unwrap();
-        assert_eq!(report.inventory_items, 2);
+        assert_eq!(report.inventory_items, 3);
         assert_eq!(report.requested_blocks, 1);
         assert_eq!(report.accepted_blocks, 1);
         assert_eq!(limited.lock().unwrap().peer_hello().height, 1);
@@ -4837,6 +5042,168 @@ mod tests {
         clean_test_dir(&source_path);
         clean_test_dir(&target_path);
         clean_test_dir(&limited_path);
+    }
+
+    #[test]
+    fn new_client_keeps_progressing_against_a_server_that_serves_fewer_blocks_per_session() {
+        let source_path = test_dir("old-server-source");
+        let target_path = test_dir("old-server-target");
+        let source = open_shared(&source_path);
+        let target = open_shared(&target_path);
+        mine(&source, 5, unix_time_seconds().unwrap());
+        // The server behaves like a pre-1.0.6 node whose session budget
+        // ends after two blocks; the client runs the default allowance.
+        let server_limits = PeerLimits {
+            max_blocks_per_session: 2,
+            ..test_limits()
+        };
+        let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = socket.local_addr().unwrap();
+        let listener = spawn_inbound_listener_inner(
+            Arc::clone(&source),
+            socket,
+            server_limits,
+            Some(SOURCE_NONCE),
+        )
+        .unwrap();
+        let mut sessions = 0;
+        while !tips_match(&source, &target) {
+            sessions += 1;
+            assert!(
+                sessions <= 5,
+                "each session must deliver what the server allows"
+            );
+            let before = target.lock().unwrap().peer_hello().height;
+            // The server ends the session at its own allowance; whatever it
+            // did deliver stays accepted and the next session continues.
+            let _ = sync_from_peer_once_inner(
+                Arc::clone(&target),
+                address,
+                test_limits(),
+                Some(TARGET_NONCE),
+            );
+            assert!(target.lock().unwrap().peer_hello().height > before);
+        }
+        assert!(sessions <= 3);
+        listener.stop().unwrap();
+        drop(source);
+        drop(target);
+        clean_test_dir(&source_path);
+        clean_test_dir(&target_path);
+    }
+
+    #[test]
+    fn fetched_blocks_are_verified_once_through_the_prefetch_lane() {
+        let source_path = test_dir("prefetch-source");
+        let target_path = test_dir("prefetch-target");
+        let source = open_shared(&source_path);
+        let target = open_shared(&target_path);
+        mine(&source, 6, unix_time_seconds().unwrap());
+        let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = socket.local_addr().unwrap();
+        let listener = spawn_inbound_listener_inner(
+            Arc::clone(&source),
+            socket,
+            test_limits(),
+            Some(SOURCE_NONCE),
+        )
+        .unwrap();
+        let preverifier = target.lock().unwrap().block_preverifier();
+        let dispatches_before = preverifier.worker_dispatches.load(Ordering::Relaxed);
+        let prefetched_before = preverifier.prefetched_blocks.load(Ordering::Relaxed);
+        let report = sync_from_peer_once_inner(
+            Arc::clone(&target),
+            address,
+            test_limits(),
+            Some(TARGET_NONCE),
+        )
+        .unwrap();
+        assert_eq!(report.inventory_items, 6);
+        assert_eq!(report.requested_blocks, 6);
+        assert_eq!(report.accepted_blocks, 6);
+        assert!(tips_match(&source, &target));
+        // Every block is verified exactly once: a pre-warmed proof is reused by
+        // the ordered submission instead of being checked a second time.
+        assert_eq!(
+            preverifier.worker_dispatches.load(Ordering::Relaxed) - dispatches_before,
+            6
+        );
+        let parallel = thread::available_parallelism().map_or(1, usize::from) >= 3;
+        assert_eq!(
+            preverifier.prefetched_blocks.load(Ordering::Relaxed) - prefetched_before,
+            if parallel { 6 } else { 0 }
+        );
+        assert_eq!(PREFETCHED_BLOCKS.load(Ordering::Relaxed), 0);
+        listener.stop().unwrap();
+        drop(source);
+        drop(target);
+        clean_test_dir(&source_path);
+        clean_test_dir(&target_path);
+    }
+
+    #[test]
+    fn fetched_blocks_outlive_a_busy_verifier_but_not_other_errors() {
+        let path = test_dir("fetched-retry");
+        let node = open_shared(&path);
+        let block = node
+            .lock()
+            .unwrap()
+            .mine_once(
+                default_miner_destination(),
+                unix_time_seconds().unwrap(),
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        let script = |outcomes: Vec<Result<u64, NodeError>>| {
+            let mut outcomes = outcomes.into_iter();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&calls);
+            let submit = move |_block: Block, _accepted_at: u64, _request: RemoteProofRequest| {
+                counter.fetch_add(1, Ordering::Relaxed);
+                outcomes.next().expect("scripted outcome")
+            };
+            (calls, submit)
+        };
+
+        // Two busy answers, then acceptance: the block is kept and accepted.
+        let (calls, submit) = script(vec![
+            Err(NodeError::ProofVerificationQueueTimeout),
+            Err(NodeError::ProofVerificationQueueFull),
+            Ok(1),
+        ]);
+        assert!(submit_fetched_block_with(block.clone(), None, submit).unwrap());
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+
+        // A verifier that stays busy still ends the session, bounded.
+        let (calls, submit) = script(vec![
+            Err(NodeError::ProofVerificationQueueTimeout),
+            Err(NodeError::ProofVerificationQueueTimeout),
+            Err(NodeError::ProofVerificationQueueTimeout),
+        ]);
+        assert!(matches!(
+            submit_fetched_block_with(block.clone(), None, submit),
+            Err(P2pError::Node(NodeError::ProofVerificationQueueTimeout))
+        ));
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            MAX_FETCHED_BLOCK_SUBMIT_ATTEMPTS
+        );
+
+        // Duplicates and every other error behave exactly as before: no retry.
+        let (calls, submit) = script(vec![Err(NodeError::DuplicateBlock(block.block_id()))]);
+        assert!(!submit_fetched_block_with(block.clone(), None, submit).unwrap());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        let (calls, submit) = script(vec![Err(NodeError::StaleBlockAdmission)]);
+        assert!(submit_fetched_block_with(block.clone(), None, submit).is_err());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        // Local shutdown stops the retries at once.
+        let stopping = Arc::new(AtomicBool::new(true));
+        let (calls, submit) = script(vec![Err(NodeError::ProofVerificationQueueTimeout), Ok(1)]);
+        assert!(submit_fetched_block_with(block, Some(stopping), submit).is_err());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        drop(node);
+        clean_test_dir(&path);
     }
 
     #[test]
@@ -4865,9 +5232,7 @@ mod tests {
             ));
         });
         let limits = PeerLimits {
-            max_bytes_per_peer: (MAX_TRANSACTIONS_PER_SYNC * MAX_TRANSACTION_BYTES) as u64
-                + SYNC_CONTROL_RESERVE_BYTES
-                + max_block_bytes_for_network(crate::DEVNET_PROFILE.network_id) as u64,
+            max_blocks_per_session: 1,
             ..test_limits()
         };
         let error =
@@ -4940,46 +5305,12 @@ mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        let frame_bytes = blocks
-            .iter()
-            .map(|block| {
-                encode_peer_frame(&PeerFrame {
-                    sequence: 1,
-                    message: PeerMessage::SubmitBlock(block.clone()),
-                })
-                .unwrap()
-                .len() as u64
-            })
-            .collect::<Vec<_>>();
-        let largest = *frame_bytes.iter().max().unwrap();
-        let smallest = *frame_bytes.iter().min().unwrap();
-        let hello = source.lock().unwrap().peer_hello();
-        let network_id = hello.network_id;
-        let frame_len = |message: PeerMessage| {
-            encode_peer_frame(&PeerFrame {
-                sequence: 1,
-                message,
-            })
-            .unwrap()
-            .len() as u64
-        };
-        let handshake_bytes = 2 * frame_len(PeerMessage::Hello(hello));
-        let result_bytes = frame_len(PeerMessage::BlockSubmissionResult(BlockSubmissionResult {
-            block_id: [0; 32],
-            status: BlockSubmissionStatus::Accepted,
-            peer_height: 0,
-            peer_tip: [0; 32],
-        }));
-        let mempool_bytes = frame_len(PeerMessage::GetMempool)
-            + frame_len(PeerMessage::TransactionInventory { txids: Vec::new() });
-        // Room for the handshake, one valid block, its acknowledgement, and an
-        // empty mempool exchange, but never for a second block in one session.
+        let network_id = source.lock().unwrap().peer_hello().network_id;
+        // The receiver admits one block frame per session, never a second one.
         let receiver_limits = PeerLimits {
-            max_bytes_per_peer: handshake_bytes + largest + result_bytes + mempool_bytes,
-            compress_blocks: false,
+            max_blocks_per_session: 1,
             ..test_limits()
         };
-        assert!(largest + mempool_bytes < 2 * smallest);
         let sender_limits = test_limits();
         assert!(block_sync_batch_limit(network_id, sender_limits) >= blocks.len());
 
@@ -5164,9 +5495,7 @@ mod tests {
             "the sparse locator must initially return a known active block before the fork"
         );
         let limits = PeerLimits {
-            max_bytes_per_peer: (MAX_TRANSACTIONS_PER_SYNC * MAX_TRANSACTION_BYTES) as u64
-                + SYNC_CONTROL_RESERVE_BYTES
-                + max_block_bytes_for_network(crate::DEVNET_PROFILE.network_id) as u64,
+            max_blocks_per_session: 1,
             ..test_limits()
         };
         assert_eq!(
@@ -5263,9 +5592,7 @@ mod tests {
         target.lock().unwrap().profile.proof = crate::ProofProfile::ProductionV4;
         let replayed = Arc::clone(&target.lock().unwrap().block_preverifier.replay_state_blocks);
         let limits = PeerLimits {
-            max_bytes_per_peer: (MAX_TRANSACTIONS_PER_SYNC * MAX_TRANSACTION_BYTES) as u64
-                + SYNC_CONTROL_RESERVE_BYTES
-                + max_block_bytes_for_network(crate::DEVNET_PROFILE.network_id) as u64,
+            max_blocks_per_session: 1,
             ..test_limits()
         };
         assert_eq!(
@@ -5395,9 +5722,7 @@ mod tests {
         mine(&source, 4, now);
         mine(&target, 2, now + 20);
         let limits = PeerLimits {
-            max_bytes_per_peer: (MAX_TRANSACTIONS_PER_SYNC * MAX_TRANSACTION_BYTES) as u64
-                + SYNC_CONTROL_RESERVE_BYTES
-                + max_block_bytes_for_network(crate::DEVNET_PROFILE.network_id) as u64,
+            max_blocks_per_session: 1,
             ..test_limits()
         };
         assert_eq!(
@@ -5519,9 +5844,7 @@ mod tests {
                 .unwrap();
         }
         let limits = PeerLimits {
-            max_bytes_per_peer: (MAX_TRANSACTIONS_PER_SYNC * MAX_TRANSACTION_BYTES) as u64
-                + SYNC_CONTROL_RESERVE_BYTES
-                + max_block_bytes_for_network(crate::DEVNET_PROFILE.network_id) as u64,
+            max_blocks_per_session: 1,
             ..test_limits()
         };
         let socket = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -7440,9 +7763,7 @@ mod tests {
         let target = open_shared(&target_path);
         mine(&source, 6, unix_time_seconds().unwrap());
         let limits = PeerLimits {
-            max_bytes_per_peer: (MAX_TRANSACTIONS_PER_SYNC * MAX_TRANSACTION_BYTES) as u64
-                + SYNC_CONTROL_RESERVE_BYTES
-                + max_block_bytes_for_network(crate::DEVNET_PROFILE.network_id) as u64,
+            max_blocks_per_session: 1,
             ..test_limits()
         };
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -7547,9 +7868,7 @@ mod tests {
         let limits = PeerLimits {
             connect_timeout: Duration::from_millis(100),
             idle_timeout: Duration::from_millis(100),
-            max_bytes_per_peer: (MAX_TRANSACTIONS_PER_SYNC * MAX_TRANSACTION_BYTES) as u64
-                + SYNC_CONTROL_RESERVE_BYTES
-                + max_block_bytes_for_network(crate::DEVNET_PROFILE.network_id) as u64,
+            max_blocks_per_session: 1,
             ..test_limits()
         };
         assert_eq!(

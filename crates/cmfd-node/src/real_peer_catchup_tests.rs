@@ -379,7 +379,11 @@ fn real_mainnet_peer_backlog_catches_moving_head_without_poll_sleep() {
     drop(a);
     let limits = PeerLimits::default();
     assert_eq!(limits.max_bytes_per_peer, 32 * 1024 * 1024);
-    assert_eq!(block_sync_batch_limit(pin.network_id, limits), 1);
+    assert_eq!(limits.max_blocks_per_session, MAX_BLOCKS_PER_SYNC as u64);
+    assert_eq!(
+        block_sync_batch_limit(pin.network_id, limits),
+        MAX_BLOCKS_PER_SYNC
+    );
     fs::create_dir(&output).unwrap();
 
     println!("REAL_PEER_STAGE three ordinary one-block sessions with full real proofs");
@@ -452,7 +456,8 @@ fn real_mainnet_peer_backlog_catches_moving_head_without_poll_sleep() {
         "network_id": NETWORK, "launch_plan_digest": PLAN, "genesis": GENESIS,
         "fixture_manifest_sha256": manifest_sha256,
         "real_v4_blocks_per_case": 3, "frame_bytes_each": FRAME_BYTES,
-        "session_byte_limit": limits.max_bytes_per_peer, "blocks_per_session": 1,
+        "session_byte_limit": limits.max_bytes_per_peer, "blocks_per_session": limits.max_blocks_per_session,
+        "fixture_blocks_offered_per_session": 1,
         "ordinary_session_ms": ordinary_session_ms, "ordinary_proof_dispatches": ordinary_dispatches,
         "ordinary_peer_stats": ordinary_stats,
         "poll_interval_seconds": 60, "qualification_timeout_seconds": 45,

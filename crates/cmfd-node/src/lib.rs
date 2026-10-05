@@ -167,6 +167,12 @@ pub const MAX_SUCCESSFUL_PROOF_CAPABILITIES: usize = 1_024;
 pub const MAX_EXTERNAL_RECONSTRUCTION_BLOCKS_PER_SLICE: usize = 8;
 /// Concurrent proof checks while pre-warming one fork-replay slice.
 const MAX_PARALLEL_REPLAY_PROOF_VERIFICATIONS: usize = 4;
+/// Node-wide concurrency for pre-warming proofs of blocks a sync session
+/// fetched itself (never for blocks peers push unsolicited): one core is left
+/// to the ordinary verifier and the node's own work.
+pub const MAX_PARALLEL_FETCHED_PROOF_VERIFICATIONS: usize = 4;
+const MAX_QUEUED_FETCHED_PROOF_VERIFICATIONS: usize = 32;
+const FETCHED_PROOF_VERIFICATION_QUEUE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_BRANCH_STATE_CHECKPOINTS: usize = 4;
 const MAX_BRANCH_STATE_CHECKPOINT_BYTES: usize = 128 * 1024 * 1024;
 const ACTIVE_BRANCH_CHECKPOINT_INTERVAL: u64 = 16;
@@ -1904,11 +1910,17 @@ pub struct BlockPreverifier {
     queue: Arc<ProofVerificationQueue>,
     remote_admission: Arc<RemoteProofAdmissionQueue>,
     reconstruction_queue: Arc<ProofVerificationQueue>,
+    /// Lane for proofs of blocks a sync session fetched on request. Bounded
+    /// separately so prefetching never competes with, or widens, the single
+    /// slot that unsolicited peer submissions share.
+    fetched_queue: Arc<ProofVerificationQueue>,
     backend: Arc<RwLock<ProofVerificationBackend>>,
     backend_generation: Arc<AtomicU64>,
     successful_proofs: Arc<Mutex<SuccessfulProofCache>>,
     #[cfg(test)]
     worker_dispatches: Arc<AtomicU64>,
+    #[cfg(test)]
+    prefetched_blocks: Arc<AtomicU64>,
     #[cfg(test)]
     replay_state_blocks: Arc<AtomicU64>,
     #[cfg(test)]
@@ -2002,11 +2014,18 @@ impl BlockPreverifier {
                 INVALID_REMOTE_PROOF_COOLDOWN,
             )),
             reconstruction_queue: Arc::new(ProofVerificationQueue::new(1, 2, wait_timeout)),
+            fetched_queue: Arc::new(ProofVerificationQueue::new(
+                fetched_proof_verification_workers(),
+                MAX_QUEUED_FETCHED_PROOF_VERIFICATIONS,
+                FETCHED_PROOF_VERIFICATION_QUEUE_TIMEOUT,
+            )),
             backend: Arc::new(RwLock::new(backend)),
             backend_generation: Arc::new(AtomicU64::new(0)),
             successful_proofs: Arc::new(Mutex::new(SuccessfulProofCache::default())),
             #[cfg(test)]
             worker_dispatches: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            prefetched_blocks: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             replay_state_blocks: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
@@ -2152,6 +2171,22 @@ impl BlockPreverifier {
         }
     }
 
+    /// Verifies the proof of a block a sync session fetched on request, through
+    /// the bounded fetched-block lane, into the successful-proof cache. The
+    /// ordered submission that follows finds the cached result and skips the
+    /// scarce verifier; on any failure here it simply verifies the block
+    /// itself and applies the usual accounting, so errors are not reported.
+    pub(crate) fn prewarm_fetched_proof(&self, block: &Block) -> Result<(), NodeError> {
+        #[cfg(test)]
+        self.prefetched_blocks.fetch_add(1, Ordering::Relaxed);
+        let cache_key = canonical_block_cache_digest(block)?;
+        if self.cached_preverification(cache_key)?.is_some() {
+            return Ok(());
+        }
+        let _permit = self.fetched_queue.acquire()?;
+        self.preverify_replay_cached(block).map(|_| ())
+    }
+
     /// Reuses only successful process-local proof evidence while reconstructing
     /// authenticated ancestors. Cache misses still execute the configured
     /// verifier; neither a durable locator nor a startup snapshot grants proof
@@ -2282,6 +2317,7 @@ impl BlockPreverifier {
         self.remote_admission.close();
         self.queue.close();
         self.reconstruction_queue.close();
+        self.fetched_queue.close();
         let worker = match self.backend.write() {
             Ok(mut backend) => {
                 match std::mem::replace(&mut *backend, ProofVerificationBackend::Stopped) {
@@ -4359,6 +4395,43 @@ impl ExternalBlockAdmissionWork {
 /// cache before the ordered replay. The ordered replay still obtains every
 /// proof through `preverify_replay_cached` and handles all failures itself;
 /// errors here are deliberately ignored.
+/// Workers for the fetched-block proof lane: all but one core, at most
+/// `MAX_PARALLEL_FETCHED_PROOF_VERIFICATIONS`, never fewer than one.
+fn fetched_proof_verification_workers() -> usize {
+    thread::available_parallelism()
+        .map_or(1, usize::from)
+        .saturating_sub(1)
+        .clamp(1, MAX_PARALLEL_FETCHED_PROOF_VERIFICATIONS)
+}
+
+/// Verifies the proofs of blocks one sync session fetched, concurrently, into
+/// the successful-proof cache before they are submitted in order. Bounded by
+/// the node-wide fetched-block lane; failures are left to the ordered
+/// submission, which verifies and accounts for the block itself.
+pub(crate) fn prewarm_fetched_proofs(block_preverifier: &BlockPreverifier, blocks: &[Block]) {
+    if blocks.len() < 2 {
+        return;
+    }
+    let workers = fetched_proof_verification_workers().min(blocks.len());
+    if workers < 2 {
+        return;
+    }
+    let next = AtomicUsize::new(0);
+    thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(block) = blocks.get(index) else {
+                        break;
+                    };
+                    let _ = block_preverifier.prewarm_fetched_proof(block);
+                }
+            });
+        }
+    });
+}
+
 fn prewarm_replay_proofs(block_preverifier: &BlockPreverifier, replay: &[BranchReplayBlock]) {
     if replay.len() < 2 {
         return;

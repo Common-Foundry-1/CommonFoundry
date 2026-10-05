@@ -38,6 +38,11 @@ pub const MAX_GOSSIP_PEERS: usize = 32;
 pub const MAX_CONFIGURED_PEERS: usize = 64;
 pub const MAX_MESSAGES_PER_PEER: u64 = 4_096;
 pub const MAX_BYTES_PER_PEER: u64 = 64 * 1024 * 1024;
+/// Block frames (`Block`, `SubmitBlock` and their compressed forms) are
+/// counted per session instead of against the byte budget: one block is
+/// already a third of that budget, which held every sync session to a single
+/// block and made initial sync a session-per-block crawl.
+pub const MAX_BLOCKS_PER_SESSION: u64 = 16;
 pub const MAX_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 pub const MAX_TOTAL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -224,7 +229,12 @@ pub struct PeerLimits {
     pub total_timeout: Duration,
     pub max_peers: usize,
     pub max_messages_per_peer: u64,
+    /// Budget for every frame except block frames, which have their own count.
     pub max_bytes_per_peer: u64,
+    /// Block frames (sent or received) allowed in one session, in either
+    /// direction and whether requested or pushed. Bounds a session's transfer
+    /// at `max_blocks_per_session` blocks on top of the byte budget.
+    pub max_blocks_per_session: u64,
     /// Send protocol version 5 (compressed block frames) to this peer. Only
     /// set for peers known to accept it; see `PEER_PROTOCOL_VERSION_COMPRESSED`.
     pub compress_blocks: bool,
@@ -241,6 +251,7 @@ impl Default for PeerLimits {
             max_peers: 64,
             max_messages_per_peer: 512,
             max_bytes_per_peer: 32 * 1024 * 1024,
+            max_blocks_per_session: MAX_BLOCKS_PER_SESSION,
             compress_blocks: false,
         }
     }
@@ -257,6 +268,8 @@ impl PeerLimits {
             || self.max_messages_per_peer > MAX_MESSAGES_PER_PEER
             || self.max_bytes_per_peer < MIN_SESSION_HANDSHAKE_BYTES
             || self.max_bytes_per_peer > MAX_BYTES_PER_PEER
+            || self.max_blocks_per_session == 0
+            || self.max_blocks_per_session > MAX_BLOCKS_PER_SESSION
             || self.connect_timeout > MAX_CONNECT_TIMEOUT
             || self.idle_timeout > MAX_IDLE_TIMEOUT
             || self.total_timeout > MAX_TOTAL_TIMEOUT
@@ -1306,6 +1319,7 @@ pub struct PeerSession {
     next_inbound_sequence: u64,
     messages_used: u64,
     bytes_used: u64,
+    block_frames_used: u64,
     limits: PeerLimits,
     /// Version written on every outbound frame.
     outbound_version: u16,
@@ -1325,6 +1339,7 @@ impl PeerSession {
             next_inbound_sequence: 0,
             messages_used: 0,
             bytes_used: 0,
+            block_frames_used: 0,
             limits,
             outbound_version: if limits.compress_blocks {
                 PEER_PROTOCOL_VERSION_COMPRESSED
@@ -1384,8 +1399,9 @@ impl PeerSession {
             self.local_hello.network_id,
             self.outbound_version,
         )?;
-        self.ensure_budget(encoded.len())?;
-        self.charge(encoded.len());
+        let kind = frame_kind(&encoded);
+        self.ensure_budget(encoded.len(), kind)?;
+        self.charge(encoded.len(), kind);
         self.next_outbound_sequence = next_sequence;
         if sequence == 0 {
             self.hello_sent = true;
@@ -1394,7 +1410,8 @@ impl PeerSession {
     }
 
     pub fn accept_inbound(&mut self, bytes: &[u8]) -> Result<PeerMessage, PeerError> {
-        self.ensure_budget(bytes.len())?;
+        let kind = frame_kind(bytes);
+        self.ensure_budget(bytes.len(), kind)?;
         let (frame, version) = decode_peer_frame_with_version(bytes, self.local_hello.network_id)?;
         if frame.sequence != self.next_inbound_sequence {
             return Err(PeerError::UnexpectedSequence {
@@ -1424,7 +1441,7 @@ impl PeerSession {
             _ => {}
         }
 
-        self.charge(bytes.len());
+        self.charge(bytes.len(), kind);
         self.next_inbound_sequence = next_sequence;
         if let PeerMessage::Hello(hello) = frame.message {
             self.remote_hello = Some(hello);
@@ -1441,28 +1458,65 @@ impl PeerSession {
         }
     }
 
-    fn ensure_budget(&self, frame_bytes: usize) -> Result<(), PeerError> {
+    fn ensure_budget(&self, frame_bytes: usize, kind: u8) -> Result<(), PeerError> {
         let next_messages = self
             .messages_used
             .checked_add(1)
             .ok_or(PeerError::PeerBudgetExceeded)?;
+        if next_messages > self.limits.max_messages_per_peer {
+            return Err(PeerError::PeerBudgetExceeded);
+        }
+        if is_block_frame_kind(kind) {
+            let next_blocks = self
+                .block_frames_used
+                .checked_add(1)
+                .ok_or(PeerError::PeerBudgetExceeded)?;
+            if next_blocks > self.limits.max_blocks_per_session {
+                return Err(PeerError::PeerByteBudgetReached);
+            }
+            return Ok(());
+        }
         let next_bytes = self
             .bytes_used
             .checked_add(frame_bytes as u64)
             .ok_or(PeerError::PeerBudgetExceeded)?;
-        if next_messages > self.limits.max_messages_per_peer {
-            return Err(PeerError::PeerBudgetExceeded);
-        }
         if next_bytes > self.limits.max_bytes_per_peer {
             return Err(PeerError::PeerByteBudgetReached);
         }
         Ok(())
     }
 
-    fn charge(&mut self, frame_bytes: usize) {
+    fn charge(&mut self, frame_bytes: usize, kind: u8) {
         self.messages_used += 1;
-        self.bytes_used += frame_bytes as u64;
+        if is_block_frame_kind(kind) {
+            self.block_frames_used += 1;
+        } else {
+            self.bytes_used += frame_bytes as u64;
+        }
     }
+
+    #[cfg(test)]
+    pub(crate) fn block_frames_used(&self) -> u64 {
+        self.block_frames_used
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bytes_used(&self) -> u64 {
+        self.bytes_used
+    }
+}
+
+/// Message kind byte of an encoded frame; 0 for anything too short to carry one
+/// (such frames fail header validation before they are ever charged).
+fn frame_kind(frame: &[u8]) -> u8 {
+    frame.get(6).copied().unwrap_or(0)
+}
+
+fn is_block_frame_kind(kind: u8) -> bool {
+    matches!(
+        kind,
+        BLOCK_KIND | SUBMIT_BLOCK_KIND | COMPRESSED_BLOCK_KIND | COMPRESSED_SUBMIT_BLOCK_KIND
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1794,7 +1848,7 @@ impl PeerConnection {
             });
         }
         let frame_len = PEER_FRAME_HEADER_BYTES + payload_len;
-        self.session.ensure_budget(frame_len)?;
+        self.session.ensure_budget(frame_len, header[6])?;
         let mut bytes = Vec::with_capacity(frame_len);
         bytes.extend_from_slice(&header);
         bytes.extend_from_slice(&self.read_exact_bounded(payload_len, submit_response_deadline)?);
@@ -3156,6 +3210,92 @@ mod tests {
         assert!(matches!(
             decode_message(COMPRESSED_SUBMIT_BLOCK_KIND, &exact, network_id, PEER_PROTOCOL_VERSION_COMPRESSED),
             Ok(PeerMessage::SubmitBlock(decoded)) if decoded == block
+        ));
+    }
+
+    #[test]
+    fn block_frames_count_per_session_instead_of_against_the_byte_budget() {
+        for invalid in [0, MAX_BLOCKS_PER_SESSION + 1] {
+            let limits = PeerLimits {
+                max_blocks_per_session: invalid,
+                ..PeerLimits::default()
+            };
+            assert!(matches!(limits.validate(), Err(PeerError::InvalidLimits)));
+        }
+        let one_block = PeerLimits {
+            max_blocks_per_session: 1,
+            ..PeerLimits::default()
+        };
+        let mut sender = PeerSession::new(hello(1, 1, 1), one_block).unwrap();
+        let mut receiver = PeerSession::new(hello(2, 2, 2), one_block).unwrap();
+        let sender_hello = sender.encode_hello().unwrap();
+        let receiver_hello = receiver.encode_hello().unwrap();
+        receiver.accept_inbound(&sender_hello).unwrap();
+        sender.accept_inbound(&receiver_hello).unwrap();
+        let bytes_after_handshake = sender.bytes_used();
+        assert!(bytes_after_handshake > 0);
+        assert_eq!(sender.block_frames_used(), 0);
+
+        let block = sample_block();
+        let first = sender
+            .encode_outbound(PeerMessage::Block(block.clone()))
+            .unwrap();
+        assert_eq!(first[6], BLOCK_KIND);
+        // A block frame is counted, not charged against the byte budget.
+        assert_eq!(sender.block_frames_used(), 1);
+        assert_eq!(sender.bytes_used(), bytes_after_handshake);
+        assert!(matches!(
+            receiver.accept_inbound(&first),
+            Ok(PeerMessage::Block(received)) if received == block
+        ));
+        assert_eq!(receiver.block_frames_used(), 1);
+
+        // The second block frame exceeds the per-session allowance on both ends.
+        assert!(matches!(
+            sender.encode_outbound(PeerMessage::Block(block.clone())),
+            Err(PeerError::PeerByteBudgetReached)
+        ));
+        let mut generous = PeerSession::new(hello(3, 3, 3), PeerLimits::default()).unwrap();
+        let generous_hello = generous.encode_hello().unwrap();
+        let mut strict = PeerSession::new(hello(4, 4, 4), one_block).unwrap();
+        let strict_hello = strict.encode_hello().unwrap();
+        generous.accept_inbound(&strict_hello).unwrap();
+        strict.accept_inbound(&generous_hello).unwrap();
+        let frame = generous
+            .encode_outbound(PeerMessage::Block(block.clone()))
+            .unwrap();
+        strict.accept_inbound(&frame).unwrap();
+        let frame = generous
+            .encode_outbound(PeerMessage::Block(block.clone()))
+            .unwrap();
+        assert!(matches!(
+            strict.accept_inbound(&frame),
+            Err(PeerError::PeerByteBudgetReached)
+        ));
+
+        // Control frames still consume the byte budget as before.
+        sender.encode_outbound(PeerMessage::GetMempool).unwrap();
+        assert!(sender.bytes_used() > bytes_after_handshake);
+        assert_eq!(sender.block_frames_used(), 1);
+
+        // The default allowance admits a whole sync batch in one session.
+        let mut bulk = PeerSession::new(hello(5, 5, 5), PeerLimits::default()).unwrap();
+        let mut sink = PeerSession::new(hello(6, 6, 6), PeerLimits::default()).unwrap();
+        let bulk_hello = bulk.encode_hello().unwrap();
+        let sink_hello = sink.encode_hello().unwrap();
+        sink.accept_inbound(&bulk_hello).unwrap();
+        bulk.accept_inbound(&sink_hello).unwrap();
+        for _ in 0..MAX_BLOCKS_PER_SESSION {
+            let frame = bulk
+                .encode_outbound(PeerMessage::Block(block.clone()))
+                .unwrap();
+            sink.accept_inbound(&frame).unwrap();
+        }
+        assert_eq!(sink.block_frames_used(), MAX_BLOCKS_PER_SESSION);
+        assert!(sink.bytes_used() < 64 * 1024);
+        assert!(matches!(
+            bulk.encode_outbound(PeerMessage::Block(block)),
+            Err(PeerError::PeerByteBudgetReached)
         ));
     }
 

@@ -1390,27 +1390,28 @@ fn submit_fetched_block_with(
 /// A session that cannot reserve a slot simply submits one block at a time.
 const FETCHED_BLOCK_PREFETCH_WINDOW: usize = crate::MAX_PARALLEL_FETCHED_PROOF_VERIFICATIONS;
 const MAX_PREFETCHED_BLOCKS_NODE_WIDE: usize = 20;
-static PREFETCHED_BLOCKS: AtomicUsize = AtomicUsize::new(0);
 
 /// Node-wide reservations for the blocks a session buffers beyond the one it
 /// is about to submit; released when the window is submitted or the session
-/// ends for any reason.
+/// ends for any reason. The counter belongs to the node's `BlockPreverifier`,
+/// so every session of one node shares it and nodes stay independent.
 struct PrefetchSlots {
+    counter: Arc<AtomicUsize>,
     held: usize,
 }
 
 impl PrefetchSlots {
-    fn new() -> Self {
-        Self { held: 0 }
+    fn new(counter: Arc<AtomicUsize>) -> Self {
+        Self { counter, held: 0 }
     }
 
     fn reserve(&mut self) -> bool {
-        let mut current = PREFETCHED_BLOCKS.load(Ordering::Acquire);
+        let mut current = self.counter.load(Ordering::Acquire);
         loop {
             if current >= MAX_PREFETCHED_BLOCKS_NODE_WIDE {
                 return false;
             }
-            match PREFETCHED_BLOCKS.compare_exchange_weak(
+            match self.counter.compare_exchange_weak(
                 current,
                 current + 1,
                 Ordering::AcqRel,
@@ -1426,7 +1427,7 @@ impl PrefetchSlots {
     }
 
     fn release_all(&mut self) {
-        PREFETCHED_BLOCKS.fetch_sub(self.held, Ordering::AcqRel);
+        self.counter.fetch_sub(self.held, Ordering::AcqRel);
         self.held = 0;
     }
 }
@@ -1535,7 +1536,7 @@ fn perform_sync_from_peer_once_inner_with_policy(
     let mut previous_inventory_id = None;
     let preverifier = lock_node(&shared)?.block_preverifier();
     let mut pending: Vec<Block> = Vec::new();
-    let mut slots = PrefetchSlots::new();
+    let mut slots = PrefetchSlots::new(preverifier.prefetched_block_slots());
 
     loop {
         let mut reached_unknown = false;
@@ -5133,7 +5134,10 @@ mod tests {
             preverifier.prefetched_blocks.load(Ordering::Relaxed) - prefetched_before,
             if parallel { 6 } else { 0 }
         );
-        assert_eq!(PREFETCHED_BLOCKS.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            preverifier.prefetched_block_slots().load(Ordering::Relaxed),
+            0
+        );
         listener.stop().unwrap();
         drop(source);
         drop(target);

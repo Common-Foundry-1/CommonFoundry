@@ -103,6 +103,7 @@ pub mod seed_peers;
 mod startup_snapshot;
 pub mod storage;
 pub mod wallet_backup;
+mod wallet_history;
 pub mod wallet_keyring;
 pub mod wallet_signing_protocol;
 
@@ -1914,6 +1915,9 @@ pub struct BlockPreverifier {
     /// separately so prefetching never competes with, or widens, the single
     /// slot that unsolicited peer submissions share.
     fetched_queue: Arc<ProofVerificationQueue>,
+    /// Fetched blocks every sync session of this node currently buffers beyond
+    /// the one it is about to submit (see `p2p::PrefetchSlots`).
+    prefetched_block_slots: Arc<AtomicUsize>,
     backend: Arc<RwLock<ProofVerificationBackend>>,
     backend_generation: Arc<AtomicU64>,
     successful_proofs: Arc<Mutex<SuccessfulProofCache>>,
@@ -2019,6 +2023,7 @@ impl BlockPreverifier {
                 MAX_QUEUED_FETCHED_PROOF_VERIFICATIONS,
                 FETCHED_PROOF_VERIFICATION_QUEUE_TIMEOUT,
             )),
+            prefetched_block_slots: Arc::new(AtomicUsize::new(0)),
             backend: Arc::new(RwLock::new(backend)),
             backend_generation: Arc::new(AtomicU64::new(0)),
             successful_proofs: Arc::new(Mutex::new(SuccessfulProofCache::default())),
@@ -2176,6 +2181,11 @@ impl BlockPreverifier {
     /// ordered submission that follows finds the cached result and skips the
     /// scarce verifier; on any failure here it simply verifies the block
     /// itself and applies the usual accounting, so errors are not reported.
+    /// Shared counter of fetched blocks buffered node-wide by sync sessions.
+    pub(crate) fn prefetched_block_slots(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.prefetched_block_slots)
+    }
+
     pub(crate) fn prewarm_fetched_proof(&self, block: &Block) -> Result<(), NodeError> {
         #[cfg(test)]
         self.prefetched_blocks.fetch_add(1, Ordering::Relaxed);
@@ -3503,6 +3513,26 @@ impl DataDirLock {
     }
 }
 
+/// A second, read-only handle to the block log for a reader thread. It leaves
+/// the retained append handle's sharing rules untouched: the reader grants read
+/// and write sharing itself and asks for no write access, so the node keeps its
+/// exclusive write access and can be reopened after this handle closes.
+fn open_block_log_reader(path: &Path) -> Result<File, NodeError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+    }
+    options
+        .open(path)
+        .map_err(|source| io_error("open block log for reading", path, source))
+}
+
 fn open_block_log(path: &Path) -> Result<File, NodeError> {
     let existed = path.exists();
     let mut options = OpenOptions::new();
@@ -3706,6 +3736,13 @@ pub struct Node {
     branch_checkpoints: BranchCheckpointCache,
     explorer_outputs: explorer_address_index::AddressOutputIndex,
     explorer_history_cache: Option<explorer::ExplorerHistoryCache>,
+    /// Confirmed wallet history, scanned once and then extended with only the
+    /// blocks appended since the previous wallet snapshot.
+    wallet_history_cache: Option<wallet_history::WalletHistoryCache>,
+    /// Whole-chain wallet history scan running off the node lock, if any.
+    wallet_history_scan: Option<wallet_history::WalletHistoryScan>,
+    #[cfg(test)]
+    wallet_history_inline_scan_bytes: u64,
     /// Per-txid progress of active-chain transaction lookups, so repeated
     /// lookups read only blocks added since the last verified scan point.
     transaction_scan_marks: HashMap<[u8; 32], TransactionScanMark>,
@@ -5464,6 +5501,10 @@ impl Node {
             branch_checkpoints: BranchCheckpointCache::default(),
             explorer_outputs,
             explorer_history_cache: None,
+            wallet_history_cache: None,
+            wallet_history_scan: None,
+            #[cfg(test)]
+            wallet_history_inline_scan_bytes: wallet_history::INLINE_SCAN_BYTES,
             transaction_scan_marks: HashMap::new(),
             chain_revision,
             mempool: BTreeMap::new(),
@@ -6690,8 +6731,105 @@ impl Node {
         Ok(history)
     }
 
+    /// Confirmed history for `destination`, newest last. The scan over the
+    /// active chain is cached and extended with only the blocks appended since
+    /// the previous snapshot; a reorg at the tip is undone block by block. When
+    /// the unscanned records exceed `wallet_history::INLINE_SCAN_BYTES` (first
+    /// snapshot after start, or a long catch-up), the scan runs on a background
+    /// thread and the snapshot reports what is already cached until it
+    /// completes, so a wallet refresh never holds the node lock for a
+    /// whole-chain read.
     fn confirmed_wallet_history(
         &mut self,
+        destination: [u8; 32],
+        accepted_height: u64,
+        history_limit: usize,
+    ) -> Result<Vec<WalletHistoryEntry>, NodeError> {
+        if let Some(scan) = self.wallet_history_scan.take() {
+            if scan.is_finished() {
+                self.wallet_history_cache = Some(scan.finish()?);
+            } else {
+                self.wallet_history_scan = Some(scan);
+            }
+        }
+        let mut cache = self
+            .wallet_history_cache
+            .take()
+            .filter(|cache| cache.destination() == destination)
+            .and_then(|mut cache| cache.rewind_to(&self.index.active_chain).then_some(cache))
+            .unwrap_or_else(|| {
+                wallet_history::WalletHistoryCache::new(destination, self.index.genesis)
+            });
+        let targets = self.wallet_history_scan_targets(cache.scanned_position() + 1)?;
+        let log_path = self.data_dir.join(BLOCK_LOG_FILE);
+        let require_v2 = matches!(self.profile.proof, ProofProfile::ProductionV3);
+        let next_height = self.state.next_height();
+        let pending_bytes: u64 = targets
+            .iter()
+            .map(|(_, _, indexed)| indexed.locator.length)
+            .sum();
+        if pending_bytes > self.wallet_history_inline_scan_bytes() {
+            if self.wallet_history_scan.is_none() {
+                let log = open_block_log_reader(&log_path)?;
+                self.wallet_history_scan = Some(wallet_history::WalletHistoryScan::start(
+                    cache.clone(),
+                    log,
+                    log_path,
+                    self.params.network_id,
+                    require_v2,
+                    targets,
+                )?);
+            }
+            let history = cache.history(accepted_height, next_height, history_limit);
+            self.wallet_history_cache = Some(cache);
+            return Ok(history);
+        }
+        wallet_history::scan(
+            &mut cache,
+            &self.log,
+            &log_path,
+            self.params.network_id,
+            require_v2,
+            &targets,
+            None,
+        )?;
+        let history = cache.history(accepted_height, next_height, history_limit);
+        self.wallet_history_cache = Some(cache);
+        Ok(history)
+    }
+
+    fn wallet_history_inline_scan_bytes(&self) -> u64 {
+        #[cfg(test)]
+        {
+            self.wallet_history_inline_scan_bytes
+        }
+        #[cfg(not(test))]
+        {
+            wallet_history::INLINE_SCAN_BYTES
+        }
+    }
+
+    /// Active blocks from `from` to the tip, with their authenticated locators.
+    fn wallet_history_scan_targets(
+        &self,
+        from: usize,
+    ) -> Result<Vec<wallet_history::ScanTarget>, NodeError> {
+        let mut targets = Vec::with_capacity(self.index.active_chain.len().saturating_sub(from));
+        for position in from..self.index.active_chain.len() {
+            let block_id = self.index.active_chain[position];
+            let indexed = self.index.blocks.get(&block_id).cloned().ok_or_else(|| {
+                NodeError::CorruptLog("active wallet history refers to an absent block".to_owned())
+            })?;
+            targets.push((position, block_id, indexed));
+        }
+        Ok(targets)
+    }
+
+    /// The pre-cache implementation: a complete scan of the active chain on
+    /// every call. Kept as the reference the cached history is checked against.
+    #[cfg(test)]
+    fn reference_confirmed_wallet_history(
+        &self,
         destination: [u8; 32],
         accepted_height: u64,
         history_limit: usize,
@@ -8762,6 +8900,7 @@ fn signed_wallet_delta(credits: u64, debits: u64) -> String {
     }
 }
 
+#[cfg(test)]
 fn retain_newest_wallet_history(
     history: &mut VecDeque<WalletHistoryEntry>,
     limit: usize,
@@ -19227,6 +19366,232 @@ mod tests {
         assert_eq!(reorged.balances.immature_atoms, "0");
         assert_eq!(reorged.balances.pending_atoms, "0");
         assert!(reorged.history.is_empty());
+
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    /// Cached history must equal the pre-cache full scan, and a snapshot must
+    /// read only the blocks appended since the previous one.
+    fn check_cached_wallet_history(node: &mut Node) -> (Vec<WalletHistoryEntry>, u64) {
+        let destination = node.wallet_destination();
+        let accepted_height = node.state.next_height().saturating_sub(1);
+        let cached = node
+            .confirmed_wallet_history(destination, accepted_height, MAX_WALLET_HISTORY)
+            .unwrap();
+        let reference = node
+            .reference_confirmed_wallet_history(destination, accepted_height, MAX_WALLET_HISTORY)
+            .unwrap();
+        assert_eq!(cached, reference);
+        assert!(node.wallet_history_scan.is_none());
+        let reads = node.wallet_history_cache.as_ref().unwrap().blocks_read();
+        (cached, reads)
+    }
+
+    /// Like `check_cached_wallet_history`, but first lets a background scan of
+    /// a long chain finish; the snapshot must stay empty until it does.
+    fn wait_for_cached_wallet_history(node: &mut Node) -> (Vec<WalletHistoryEntry>, u64) {
+        let destination = node.wallet_destination();
+        let accepted_height = node.state.next_height().saturating_sub(1);
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let cached = node
+                .confirmed_wallet_history(destination, accepted_height, MAX_WALLET_HISTORY)
+                .unwrap();
+            if node.wallet_history_scan.is_none() {
+                break;
+            }
+            assert!(cached.is_empty());
+            assert!(
+                Instant::now() < deadline,
+                "background wallet history scan did not finish"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+        check_cached_wallet_history(node)
+    }
+
+    #[test]
+    fn wallet_history_cache_matches_the_full_scan_and_reads_only_new_blocks() {
+        let path = test_dir("wallet-history-cache");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        let destination = node.wallet_destination();
+        let mine_at = |node: &mut Node| {
+            let height = node.state.next_height();
+            node.mine_once(
+                destination,
+                DEVNET_GENESIS_TIMESTAMP + height * 60,
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap()
+        };
+
+        let blocks = mine_default_chain_to(&mut node, 3);
+        let (history, reads) = check_cached_wallet_history(&mut node);
+        assert_eq!(history.len(), 3);
+        assert!(history.iter().all(|item| item.kind == "mined"));
+        assert_eq!(reads, 3);
+
+        // An external payment to the wallet, confirmed in the next block.
+        let received = spend_coinbase_to(&node, &blocks[0], 1, 0x11, destination, 10);
+        let received_txid = hex::encode(received.txid());
+        node.submit_transaction(received).unwrap();
+        mine_at(&mut node);
+        let (history, reads) = check_cached_wallet_history(&mut node);
+        assert_eq!(reads, 4);
+        let item = history
+            .iter()
+            .find(|item| item.txid == received_txid)
+            .unwrap();
+        assert_eq!(item.kind, "received");
+        assert_eq!(item.height, Some(4));
+
+        // Catch up in batches; every snapshot reads exactly the new blocks.
+        let mut previous_reads = reads;
+        for target in (14..=100).step_by(10) {
+            let before = node.state.next_height();
+            mine_default_chain_to(&mut node, target);
+            let (_, reads) = check_cached_wallet_history(&mut node);
+            assert_eq!(reads - previous_reads, node.state.next_height() - before);
+            previous_reads = reads;
+        }
+
+        // The wallet spends its first, now mature, coinbase output.
+        mine_default_chain_to(&mut node, 102);
+        let (_, reads) = check_cached_wallet_history(&mut node);
+        previous_reads = reads;
+        let first_value = blocks[0].coinbase.outputs[0].value;
+        let mut sent = Transaction {
+            network_id: node.params.network_id,
+            version: TRANSACTION_VERSION,
+            inputs: vec![TxInput {
+                previous: OutPoint {
+                    txid: blocks[0].coinbase_outpoint_id(),
+                    index: 0,
+                },
+                witness: InputWitness::Key {
+                    public_key: [0; 32],
+                    signature: Vec::new(),
+                },
+            }],
+            outputs: vec![TxOutput {
+                value: first_value - 500,
+                lock: OutputLock::Key(insecure_dev_destination(0x22)),
+                spendable_height: node.state.next_height(),
+            }],
+        };
+        sent.sign_all(&[&node.wallet_signing_key]).unwrap();
+        let sent_txid = hex::encode(sent.txid());
+        node.submit_transaction(sent.clone()).unwrap();
+        let spending_block = mine_at(&mut node);
+        let (history, reads) = check_cached_wallet_history(&mut node);
+        assert_eq!(reads - previous_reads, 1);
+        let item = history.iter().find(|item| item.txid == sent_txid).unwrap();
+        assert_eq!(item.kind, "sent");
+        assert_eq!(item.fee_burned_atoms, "500");
+        assert_eq!(
+            item.counterparty,
+            Some(hex::encode(insecure_dev_destination(0x22)))
+        );
+        previous_reads = reads;
+
+        // A tip reorg replaces the spending block: the cache undoes it instead
+        // of rescanning, and the spent output is spendable again afterwards.
+        let spending_height = spending_block.challenge.height;
+        let parent = spending_block.challenge.previous_block;
+        let sibling = mined_child(
+            &node,
+            parent,
+            DEVNET_GENESIS_TIMESTAMP + spending_height * 60 + 1,
+            0x51,
+        );
+        node.submit_block(
+            sibling.clone(),
+            DEVNET_GENESIS_TIMESTAMP + spending_height * 60 + 1,
+        )
+        .unwrap();
+        assert_eq!(node.state.tip(), spending_block.block_id());
+        let sibling_child = mined_child(
+            &node,
+            sibling.block_id(),
+            DEVNET_GENESIS_TIMESTAMP + (spending_height + 1) * 60 + 1,
+            0x52,
+        );
+        node.submit_block(
+            sibling_child.clone(),
+            DEVNET_GENESIS_TIMESTAMP + (spending_height + 1) * 60 + 1,
+        )
+        .unwrap();
+        assert_eq!(node.state.tip(), sibling_child.block_id());
+        let (history, reads) = check_cached_wallet_history(&mut node);
+        assert_eq!(reads - previous_reads, 2);
+        assert!(history.iter().all(|item| item.txid != sent_txid));
+        previous_reads = reads;
+
+        let _ = node.submit_transaction(sent);
+        mine_at(&mut node);
+        let (history, reads) = check_cached_wallet_history(&mut node);
+        assert_eq!(reads - previous_reads, 1);
+        let item = history.iter().find(|item| item.txid == sent_txid).unwrap();
+        assert_eq!(item.height, Some(spending_height + 2));
+
+        // A reorg below the undo window rebuilds the cache from genesis; a long
+        // rebuild runs off the node lock.
+        node.wallet_history_cache
+            .as_mut()
+            .unwrap()
+            .set_undo_depth(2);
+        node.wallet_history_inline_scan_bytes = 0;
+        let fork_height = node.state.next_height() - 4;
+        let mut parent = node.index.active_chain[fork_height as usize];
+        for offset in 0..5_u64 {
+            let timestamp = DEVNET_GENESIS_TIMESTAMP + (fork_height + 1 + offset) * 60 + 2;
+            let block = mined_child(&node, parent, timestamp, 0x61 + offset as u8);
+            node.submit_block(block.clone(), timestamp).unwrap();
+            parent = block.block_id();
+        }
+        assert_eq!(node.state.tip(), parent);
+        let accepted_height = node.state.next_height() - 1;
+        let rebuilt = node
+            .confirmed_wallet_history(destination, accepted_height, MAX_WALLET_HISTORY)
+            .unwrap();
+        assert!(rebuilt.is_empty());
+        assert!(node.wallet_history_scan.is_some());
+        let (_, reads) = wait_for_cached_wallet_history(&mut node);
+        assert_eq!(reads, node.index.active_chain.len() as u64 - 1);
+
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn wallet_history_scans_a_long_chain_off_the_node_lock() {
+        let path = test_dir("wallet-history-background");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        let destination = node.wallet_destination();
+        let height = 70;
+        mine_default_chain_to(&mut node, height);
+        drop(node);
+
+        let mut node = Node::open(&path).unwrap();
+        node.wallet_history_inline_scan_bytes = 0;
+        let accepted_height = node.state.next_height() - 1;
+        let first = node
+            .confirmed_wallet_history(destination, accepted_height, MAX_WALLET_HISTORY)
+            .unwrap();
+        assert!(first.is_empty());
+        assert!(node.wallet_history_scan.is_some());
+        let (history, reads) = wait_for_cached_wallet_history(&mut node);
+        assert_eq!(history.len(), MAX_WALLET_HISTORY.min(height as usize));
+        assert_eq!(reads, height);
+
+        // Later blocks extend the adopted cache inline.
+        node.wallet_history_inline_scan_bytes = wallet_history::INLINE_SCAN_BYTES;
+        mine_default_chain_to(&mut node, height + 2);
+        let (_, reads) = check_cached_wallet_history(&mut node);
+        assert_eq!(reads, height + 2);
 
         drop(node);
         clean_test_dir(&path);

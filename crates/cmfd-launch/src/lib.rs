@@ -17,6 +17,8 @@ pub use schedule::*;
 pub const QUICKNET_GENESIS: u64 = 1_692_803_367;
 pub const QUICKNET_PERIOD_SECONDS: u64 = 3;
 pub const MAINNET_BEACON_ROUND: u64 = 32_747_812;
+/// drand v2 routes by beacon ID; the pinned chain hash remains the verifier identity.
+pub const QUICKNET_BEACON_ID: &str = "quicknet";
 pub const QUICKNET_SCHEME: &str = "bls-unchained-g1-rfc9380";
 pub const QUICKNET_CHAIN_HASH: &str =
     "52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971";

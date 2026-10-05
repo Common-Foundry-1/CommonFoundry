@@ -12,6 +12,10 @@ fn schedule_command_prints_the_operator_agreed_dates_and_no_activation_claim() {
     assert_eq!(value["source_release_utc"], "2026-10-02T17:00:00Z");
     assert_eq!(value["mining_start_utc"], "2026-10-03T17:00:00Z");
     assert_eq!(value["beacon_round"], 32_747_812);
+    assert_eq!(
+        value["beacon_url"],
+        "https://api.drand.sh/v2/beacons/quicknet/rounds/32747812"
+    );
     assert_eq!(value["preparation_seconds"], 86_400);
     assert_eq!(value["mainnet_activation_authorized"], false);
 }

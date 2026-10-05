@@ -11,7 +11,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -1029,16 +1029,49 @@ struct PayoutTransactionRecord {
     confirmations: u64,
 }
 
+/// Ledger updates are applied in memory one at a time, then persisted in
+/// groups: one snapshot write covers every update applied since the previous
+/// write. `transaction` still returns only after its update is durable, and
+/// readers of `state` only ever see durable snapshots, so they never wait for
+/// disk I/O.
 struct DurableLedger {
+    /// Latest durable ledger.
     state: Mutex<Ledger>,
+    /// Updates applied after `state`, not yet durable.
+    working: Mutex<WorkingLedger>,
+    commit: Mutex<CommitProgress>,
+    committed: Condvar,
+    /// Held while a snapshot is persisted; a payout send decision takes it to
+    /// serialize with persistence failures.
+    writer: Mutex<()>,
     store: Option<LedgerStore>,
     faulted: AtomicBool,
+    #[cfg(test)]
+    persist_count: AtomicU64,
+    #[cfg(test)]
+    persist_delay_millis: AtomicU64,
+}
+
+#[derive(Default)]
+struct WorkingLedger {
+    /// `None` when every applied update is already in `state`.
+    pending: Option<Ledger>,
+    applied: u64,
+}
+
+#[derive(Default)]
+struct CommitProgress {
+    persisted: u64,
+    persisting: bool,
 }
 
 struct LedgerStore {
     directory: PathBuf,
     network_id: [u8; 32],
     consensus_fingerprint: [u8; 32],
+    /// Snapshot slot for the next write: never the slot that holds the latest
+    /// durable snapshot.
+    next_slot: AtomicU8,
     _lock: std::fs::File,
 }
 
@@ -1160,11 +1193,7 @@ impl DurableLedger {
         consensus_fingerprint: [u8; 32],
     ) -> Result<Self, PoolError> {
         let Some(directory) = directory else {
-            return Ok(Self {
-                state: Mutex::new(Ledger::default()),
-                store: None,
-                faulted: AtomicBool::new(false),
-            });
+            return Ok(Self::with_store(Ledger::default(), None));
         };
         fs::create_dir_all(&directory)?;
         let lock = OpenOptions::new()
@@ -1188,18 +1217,35 @@ impl DurableLedger {
             directory,
             network_id,
             consensus_fingerprint,
+            next_slot: AtomicU8::new(0),
             _lock: lock,
         };
-        let mut state = store.load()?;
+        let (mut state, loaded_slot) = store.load()?;
+        store.next_slot.store(
+            loaded_slot.map_or((state.generation & 1) as u8, |slot| slot ^ 1),
+            Ordering::Release,
+        );
         if state.guard_version == 0 {
             state.guard_version = 1;
             store.persist(&state)?;
         }
-        Ok(Self {
+        Ok(Self::with_store(state, Some(store)))
+    }
+
+    fn with_store(state: Ledger, store: Option<LedgerStore>) -> Self {
+        Self {
             state: Mutex::new(state),
-            store: Some(store),
+            working: Mutex::new(WorkingLedger::default()),
+            commit: Mutex::new(CommitProgress::default()),
+            committed: Condvar::new(),
+            writer: Mutex::new(()),
+            store,
             faulted: AtomicBool::new(false),
-        })
+            #[cfg(test)]
+            persist_count: AtomicU64::new(0),
+            #[cfg(test)]
+            persist_delay_millis: AtomicU64::new(0),
+        }
     }
 
     fn next_session_id(&self) -> Result<u64, PoolError> {
@@ -1219,33 +1265,156 @@ impl DurableLedger {
         &self,
         update: impl FnOnce(&mut Ledger) -> Result<T, PoolError>,
     ) -> Result<T, PoolError> {
-        let mut current = self
-            .state
+        let (output, sequence) = {
+            let mut working = self
+                .working
+                .lock()
+                .map_err(|_| PoolError::SharedStatePoisoned)?;
+            if self.faulted.load(Ordering::Acquire) {
+                return Err(PoolError::LedgerFaulted);
+            }
+            let mut candidate = match &working.pending {
+                Some(pending) => pending.clone(),
+                None => self
+                    .state
+                    .lock()
+                    .map_err(|_| PoolError::SharedStatePoisoned)?
+                    .clone(),
+            };
+            let output = update(&mut candidate)?;
+            candidate.generation = candidate.generation.checked_add(1).ok_or_else(|| {
+                PoolError::LedgerCorrupt("ledger generation exhausted".to_owned())
+            })?;
+            // Invariants are checked once per persisted snapshot (below), not
+            // per update: validate_ledger walks every PPLNS share record and
+            // cost ~260 ms on a full 65,536-share window, which serialized all
+            // share credits and session handshakes behind one lock.
+            working.pending = Some(candidate);
+            working.applied = working.applied.wrapping_add(1);
+            (output, working.applied)
+        };
+        self.wait_until_durable(sequence)?;
+        Ok(output)
+    }
+
+    /// Returns once update `sequence` is durable. The first waiter that finds
+    /// no write in progress persists everything applied so far for all waiters.
+    fn wait_until_durable(&self, sequence: u64) -> Result<(), PoolError> {
+        let mut progress = self
+            .commit
+            .lock()
+            .map_err(|_| PoolError::SharedStatePoisoned)?;
+        loop {
+            if progress.persisted >= sequence {
+                return Ok(());
+            }
+            if self.faulted.load(Ordering::Acquire) {
+                return Err(PoolError::LedgerFaulted);
+            }
+            if progress.persisting {
+                progress = self
+                    .committed
+                    .wait(progress)
+                    .map_err(|_| PoolError::SharedStatePoisoned)?;
+                continue;
+            }
+            progress.persisting = true;
+            drop(progress);
+            let mut finish = PersistFinish {
+                ledger: self,
+                done: false,
+            };
+            let result = self.persist_working();
+            finish.done = true;
+            progress = self
+                .commit
+                .lock()
+                .map_err(|_| PoolError::SharedStatePoisoned)?;
+            progress.persisting = false;
+            let failure = match result {
+                Ok(persisted) => {
+                    progress.persisted = progress.persisted.max(persisted);
+                    None
+                }
+                Err(error) => {
+                    self.faulted.store(true, Ordering::Release);
+                    Some(error)
+                }
+            };
+            self.committed.notify_all();
+            if let Some(error) = failure {
+                return Err(error);
+            }
+        }
+    }
+
+    fn persist_working(&self) -> Result<u64, PoolError> {
+        let _writer = self
+            .writer
             .lock()
             .map_err(|_| PoolError::SharedStatePoisoned)?;
         if self.faulted.load(Ordering::Acquire) {
             return Err(PoolError::LedgerFaulted);
         }
-        let mut candidate = current.clone();
-        let output = update(&mut candidate)?;
-        candidate.generation = current
-            .generation
-            .checked_add(1)
-            .ok_or_else(|| PoolError::LedgerCorrupt("ledger generation exhausted".to_owned()))?;
-        validate_ledger(&candidate)?;
-        if let Some(store) = &self.store
-            && let Err(error) = store.persist(&candidate)
+        let (snapshot, applied) = {
+            let working = self
+                .working
+                .lock()
+                .map_err(|_| PoolError::SharedStatePoisoned)?;
+            let Some(pending) = &working.pending else {
+                return Ok(working.applied);
+            };
+            (pending.clone(), working.applied)
+        };
+        // Nothing invalid becomes durable or visible to readers: the batch is
+        // validated here, before it is written and before `state` is replaced.
+        validate_ledger(&snapshot)?;
+        #[cfg(test)]
         {
-            self.faulted.store(true, Ordering::Release);
-            return Err(error);
+            self.persist_count.fetch_add(1, Ordering::Relaxed);
+            thread::sleep(Duration::from_millis(
+                self.persist_delay_millis.load(Ordering::Relaxed),
+            ));
         }
-        *current = candidate;
-        Ok(output)
+        if let Some(store) = &self.store {
+            store.persist(&snapshot)?;
+        }
+        *self
+            .state
+            .lock()
+            .map_err(|_| PoolError::SharedStatePoisoned)? = snapshot;
+        let mut working = self
+            .working
+            .lock()
+            .map_err(|_| PoolError::SharedStatePoisoned)?;
+        if working.applied == applied {
+            working.pending = None;
+        }
+        Ok(applied)
+    }
+}
+
+/// Faults the ledger and wakes waiters if a persisting thread unwinds.
+struct PersistFinish<'a> {
+    ledger: &'a DurableLedger,
+    done: bool,
+}
+
+impl Drop for PersistFinish<'_> {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        self.ledger.faulted.store(true, Ordering::Release);
+        if let Ok(mut progress) = self.ledger.commit.lock() {
+            progress.persisting = false;
+        }
+        self.ledger.committed.notify_all();
     }
 }
 
 impl LedgerStore {
-    fn load(&self) -> Result<Ledger, PoolError> {
+    fn load(&self) -> Result<(Ledger, Option<u8>), PoolError> {
         fs::create_dir_all(&self.directory)?;
         if !self.directory.is_dir() {
             return Err(PoolError::LedgerCorrupt(format!(
@@ -1258,13 +1427,13 @@ impl LedgerStore {
         let mut errors = Vec::new();
         for slot in 0..=1 {
             match self.load_slot(slot) {
-                Ok(Some(ledger)) => valid.push(ledger),
+                Ok(Some((ledger, digest))) => valid.push((ledger, digest, slot)),
                 Ok(None) => {}
                 Err(error) => errors.push(error.to_string()),
             }
         }
         if let Some(guard) = guard {
-            if valid.iter().any(|(ledger, digest)| {
+            if valid.iter().any(|(ledger, digest, _)| {
                 ledger.generation > guard.generation
                     || (ledger.generation == guard.generation && *digest != guard.payload_blake3)
             }) {
@@ -1274,11 +1443,11 @@ impl LedgerStore {
             }
             return valid
                 .into_iter()
-                .find_map(|(ledger, digest)| {
+                .find_map(|(ledger, digest, slot)| {
                     (ledger.guard_version == 1
                         && ledger.generation == guard.generation
                         && digest == guard.payload_blake3)
-                        .then_some(ledger)
+                        .then_some((ledger, Some(slot)))
                 })
                 .ok_or_else(|| {
                     PoolError::LedgerCorrupt(
@@ -1290,16 +1459,16 @@ impl LedgerStore {
         if !errors.is_empty() {
             return Err(PoolError::LedgerCorrupt(errors.join("; ")));
         }
-        if valid.iter().any(|(ledger, _)| ledger.guard_version != 0) {
+        if valid.iter().any(|(ledger, _, _)| ledger.guard_version != 0) {
             return Err(PoolError::LedgerCorrupt(
                 "protected ledger is missing its payout guard".into(),
             ));
         }
-        if let Some((ledger, _)) = valid
+        if let Some((ledger, _, slot)) = valid
             .into_iter()
-            .max_by_key(|(ledger, _)| ledger.generation)
+            .max_by_key(|(ledger, _, _)| ledger.generation)
         {
-            return Ok(ledger);
+            return Ok((ledger, Some(slot)));
         }
 
         let mut legacy = Vec::new();
@@ -1313,10 +1482,13 @@ impl LedgerStore {
         if !errors.is_empty() {
             return Err(PoolError::LedgerCorrupt(errors.join("; ")));
         }
-        Ok(legacy
-            .into_iter()
-            .max_by_key(|ledger| ledger.generation)
-            .unwrap_or_default())
+        Ok((
+            legacy
+                .into_iter()
+                .max_by_key(|ledger| ledger.generation)
+                .unwrap_or_default(),
+            None,
+        ))
     }
 
     fn load_slot(&self, slot: u8) -> Result<Option<(Ledger, [u8; 32])>, PoolError> {
@@ -1437,7 +1609,7 @@ impl LedgerStore {
             return Err(PoolError::LedgerCapacity);
         }
         self.write_guard(&stored)?;
-        let slot = (ledger.generation & 1) as u8;
+        let slot = self.next_slot.load(Ordering::Acquire);
         let destination = self.slot_path(slot);
         let mut random = [0_u8; 8];
         getrandom::fill(&mut random).map_err(|error| PoolError::Random(error.to_string()))?;
@@ -1459,6 +1631,7 @@ impl LedgerStore {
             }
             fs::rename(&temporary, &destination)?;
             sync_ledger_directory(&self.directory)?;
+            self.next_slot.store(slot ^ 1, Ordering::Release);
             Ok(())
         })();
         if result.is_err() {
@@ -2945,22 +3118,30 @@ fn handle_connection(stream: TcpStream, shared: Arc<SharedServer>) -> Result<(),
             persistence: ledger_persistence(&shared.ledger).to_owned(),
         },
     )?;
-    write_frame(
-        &mut stream,
-        &ServerMessage::Job {
-            job: current_job(&shared)?,
-        },
-    )?;
+    let initial_job = current_job(&shared)?;
+    let mut sent_job_id = initial_job.job_id;
+    write_frame(&mut stream, &ServerMessage::Job { job: initial_job })?;
     stream.sock.set_read_timeout(Some(POOL_READ_TIMEOUT))?;
 
     let mut message_count = 0_u64;
     let mut share_rate = ShareRateLimiter::new(Instant::now());
+    let mut frame_reader = FrameReadState::default();
     while !shared.stop.load(Ordering::Acquire) {
-        rotate_if_tip_changed(&shared)?;
-        let message = match read_frame_interruptible::<_, ClientMessage>(&mut stream, &shared.stop)
+        let message = match read_frame_stateful::<_, ClientMessage>(&mut stream, &mut frame_reader)
         {
             Ok(message) => message,
             Err(PoolError::ConnectionClosed) => return Ok(()),
+            Err(PoolError::Io(error)) if is_timeout(&error) => {
+                // The listener rotates the job as soon as the tip changes.
+                // Push the replacement now so miners stop searching a stale
+                // parent instead of learning about it only with their next share.
+                let job = current_job(&shared)?;
+                if job.job_id != sent_job_id {
+                    sent_job_id = job.job_id;
+                    write_frame(&mut stream, &ServerMessage::Job { job })?;
+                }
+                continue;
+            }
             Err(error) => return Err(error),
         };
         message_count = message_count
@@ -3002,7 +3183,8 @@ fn handle_connection(stream: TcpStream, shared: Arc<SharedServer>) -> Result<(),
             retryable_result(&shared, session_id, job_id, nonce, "share_rate_limited")?
         };
         let after = current_job(&shared)?;
-        if before.job_id != after.job_id || job_id != before.job_id {
+        if before.job_id != after.job_id || job_id != before.job_id || after.job_id != sent_job_id {
+            sent_job_id = after.job_id;
             write_frame(&mut stream, &ServerMessage::Job { job: after })?;
         }
         write_frame(&mut stream, &ServerMessage::ShareResult { result })?;
@@ -3105,22 +3287,43 @@ fn process_share(
         return rejected_result(shared, session_id, job_id, nonce, "low_difficulty_share");
     }
     let block = if let Some(proof) = &evaluation.chain_proof {
-        let Some(block) = active.mining.build_block_if_chain_valid(proof)? else {
-            return rejected_result(shared, session_id, job_id, nonce, "invalid_chain_proof");
-        };
-        Some(block)
+        match active.mining.build_block_if_chain_valid(proof) {
+            Ok(Some(block)) => Some(block),
+            Ok(None) => {
+                log_pool_block(&active, nonce, "invalid_chain_proof", None);
+                return rejected_result(shared, session_id, job_id, nonce, "invalid_chain_proof");
+            }
+            Err(error) => {
+                log_pool_block(
+                    &active,
+                    nonce,
+                    &format!("verification_error: {error}"),
+                    None,
+                );
+                return Err(error.into());
+            }
+        }
     } else {
         None
     };
 
     // Evaluation is intentionally outside the node lock. Recheck the active
     // parent afterwards, then keep the node lock through duplicate reservation
-    // and ledger credit so P2P cannot advance the tip between those steps.
+    // (and, for a block, its pending ledger reservation) so P2P cannot advance
+    // the tip between those steps.
     let node = shared
         .node
         .lock()
         .map_err(|_| PoolError::SharedStatePoisoned)?;
     if node.state.tip() != active.wire.challenge.previous_block {
+        if block.is_some() {
+            log_pool_block(
+                &active,
+                nonce,
+                "stale_before_reservation",
+                Some(node.state.tip()),
+            );
+        }
         drop(node);
         rotate_if_tip_changed(shared)?;
         return rejected_result(shared, session_id, job_id, nonce, "stale_job");
@@ -3146,6 +3349,11 @@ fn process_share(
     };
 
     let Some(block) = block else {
+        // The share was checked against the current tip above. Persisting its
+        // credit rewrites the whole ledger, so do it without the node lock:
+        // holding the lock here starved block import under many miners and
+        // left the pool mining on stale parents.
+        drop(node);
         let session = record_accepted_share(
             &shared.ledger,
             session_id,
@@ -3153,7 +3361,6 @@ fn process_share(
             shared.pplns_policy,
             active.wire.share_target,
         )?;
-        drop(node);
         return Ok(PoolShareResult {
             job_id,
             nonce,
@@ -3192,13 +3399,18 @@ fn process_share(
     let node_submission_started = Instant::now();
     loop {
         match submit_shared_tip_block(&shared.node, (*block).clone(), unix_time_seconds()?) {
-            Ok(_) => break,
+            Ok(_) => {
+                log_pool_block(&active, nonce, "accepted", None);
+                break;
+            }
             Err(NodeError::StaleBlockAdmission | NodeError::UnknownParent(_)) => {
+                log_pool_block(&active, nonce, "stale_at_submission", None);
                 discard_pending_pool_block(&shared.ledger, block_credit.block_id)?;
                 rotate_if_tip_changed(shared)?;
                 return rejected_result(shared, session_id, job_id, nonce, "stale_job");
             }
             Err(NodeError::DuplicateBlock(_)) => {
+                log_pool_block(&active, nonce, "duplicate", None);
                 reconcile_pool_blocks(shared)?;
                 let session = pool_block_session_snapshot(&shared.ledger, block_credit.block_id)?;
                 rotate_if_tip_changed(shared)?;
@@ -3229,6 +3441,7 @@ fn process_share(
                     .tip()
                     == active.wire.challenge.previous_block;
                 if !parent_is_current {
+                    log_pool_block(&active, nonce, "stale_while_verifier_busy", None);
                     discard_pending_pool_block(&shared.ledger, block_credit.block_id)?;
                     rotate_if_tip_changed(shared)?;
                     return rejected_result(shared, session_id, job_id, nonce, "stale_job");
@@ -3236,6 +3449,7 @@ fn process_share(
                 thread::sleep(Duration::from_millis(10));
             }
             Err(error) if error.client_error().retryable => {
+                log_pool_block(&active, nonce, &format!("verifier_busy: {error}"), None);
                 if nonce_reserved {
                     release_valid_share(&active, nonce)?;
                 }
@@ -3243,6 +3457,7 @@ fn process_share(
                 return retryable_result(shared, session_id, job_id, nonce, "verifier_busy");
             }
             Err(error) => {
+                log_pool_block(&active, nonce, &format!("submit_error: {error}"), None);
                 reconcile_pool_blocks_with_recovery(shared, true)?;
                 return Err(PoolError::Node(error));
             }
@@ -3278,6 +3493,18 @@ fn process_share(
         code: "block_accepted".to_owned(),
         session,
     })
+}
+
+/// Every chain-winning share is rare and valuable; record what happened to it.
+fn log_pool_block(active: &ActiveJob, nonce: u64, outcome: &str, node_tip: Option<[u8; 32]>) {
+    tracing::warn!(
+        height = active.wire.challenge.height,
+        parent = %hex::encode(&active.wire.challenge.previous_block[..8]),
+        node_tip = %node_tip.map(|tip| hex::encode(&tip[..8])).unwrap_or_default(),
+        nonce,
+        outcome,
+        "pool block candidate"
+    );
 }
 
 fn rejected_result(
@@ -3554,7 +3781,7 @@ fn reconcile_pool_payouts(shared: &SharedServer, create_new: bool) -> Result<(),
             // concurrent persistence failure must not be followed by a send.
             let _ledger = shared
                 .ledger
-                .state
+                .writer
                 .lock()
                 .map_err(|_| PoolError::SharedStatePoisoned)?;
             if shared.ledger.faulted.load(Ordering::Acquire) {
@@ -3655,7 +3882,7 @@ fn reconcile_pool_payouts(shared: &SharedServer, create_new: bool) -> Result<(),
         let submitted = {
             let _ledger = shared
                 .ledger
-                .state
+                .writer
                 .lock()
                 .map_err(|_| PoolError::SharedStatePoisoned)?;
             if shared.ledger.faulted.load(Ordering::Acquire) {
@@ -5263,13 +5490,6 @@ fn read_frame_stateful<R: Read, T: DeserializeOwned>(
     Ok(decoded)
 }
 
-fn read_frame_interruptible<R: Read, T: DeserializeOwned>(
-    reader: &mut R,
-    stop: &AtomicBool,
-) -> Result<T, PoolError> {
-    read_frame_interruptible_inner(reader, stop, None)
-}
-
 fn read_frame_interruptible_until<R: Read, T: DeserializeOwned>(
     reader: &mut R,
     stop: &AtomicBool,
@@ -6871,6 +7091,42 @@ mod tests {
     }
 
     #[test]
+    fn new_tip_job_is_pushed_without_waiting_for_a_share() {
+        let (_root, server, node, pin) = server("push-new-tip-job");
+        let mut client = client(server.local_addr(), pin, "push-worker");
+        let first = client.current_job().clone();
+        let tip = {
+            let mut node = node.lock().unwrap();
+            node.mine_once(
+                default_miner_destination(),
+                unix_time_seconds().unwrap(),
+                10_000,
+            )
+            .unwrap();
+            node.state.tip()
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let pushed = loop {
+            assert!(Instant::now() < deadline, "new-tip job was not pushed");
+            match client.receive() {
+                Ok(PoolClientEvent::Job(job)) => break job,
+                Ok(PoolClientEvent::ShareResult(_)) => panic!("unsolicited share result"),
+                Err(PoolError::Io(error)) if is_timeout(&error) => {}
+                Err(error) => panic!("{error}"),
+            }
+        };
+        assert_ne!(pushed.job_id, first.job_id);
+        assert_eq!(pushed.challenge.previous_block, tip);
+        assert_eq!(client.current_job().job_id, pushed.job_id);
+
+        let work = client.current_work().unwrap();
+        let nonce = find_share(&work, false);
+        let accepted = client.submit_share(pushed.job_id, nonce).unwrap();
+        assert!(accepted.accepted);
+        server.stop().unwrap();
+    }
+
+    #[test]
     fn public_addresses_and_destructive_certificate_overwrite_are_refused() {
         assert!(matches!(
             validate_private_address("8.8.8.8:18445".parse().unwrap()),
@@ -6937,11 +7193,7 @@ mod tests {
             make_job_id(startup, job_nonce, 7, &challenge, easier)
         );
 
-        let ledger = DurableLedger {
-            state: Mutex::new(Ledger::default()),
-            store: None,
-            faulted: AtomicBool::new(false),
-        };
+        let ledger = DurableLedger::open(None, [0; 32], [0; 32]).unwrap();
         for session_id in 1..=(POOL_MAX_LEDGER_SESSIONS as u64 + 1) {
             register_session(&ledger, session_id, format!("w{session_id}"), [0x22; 32]).unwrap();
             ledger
@@ -6958,11 +7210,7 @@ mod tests {
             POOL_MAX_LEDGER_SESSIONS
         );
 
-        let payout_ledger = DurableLedger {
-            state: Mutex::new(Ledger::default()),
-            store: None,
-            faulted: AtomicBool::new(false),
-        };
+        let payout_ledger = DurableLedger::open(None, [0; 32], [0; 32]).unwrap();
         {
             let mut ledger = payout_ledger.state.lock().unwrap();
             for index in 0..POOL_MAX_LEDGER_PAYOUTS {
@@ -6991,6 +7239,221 @@ mod tests {
             POOL_MAX_LEDGER_PAYOUTS
         );
         server.stop().unwrap();
+    }
+
+    #[test]
+    fn concurrent_ledger_updates_share_durable_writes_and_reload_exactly() {
+        const SESSIONS: u64 = 8;
+        const CREDITS: u64 = 10;
+        let root = TestRoot::new("ledger-group-commit");
+        let directory = root.path().join("ledger");
+        let ledger =
+            Arc::new(DurableLedger::open(Some(directory.clone()), [1; 32], [2; 32]).unwrap());
+        let payout = test_payout_signer().payout();
+        for session_id in 1..=SESSIONS {
+            register_session(&ledger, session_id, format!("w{session_id}"), payout).unwrap();
+        }
+        let generation_before = ledger.state.lock().unwrap().generation;
+        let writes_before = ledger.persist_count.load(Ordering::Relaxed);
+        ledger.persist_delay_millis.store(100, Ordering::Relaxed);
+        let workers = (1..=SESSIONS)
+            .map(|session_id| {
+                let ledger = Arc::clone(&ledger);
+                thread::spawn(move || {
+                    for credit in 1..=CREDITS {
+                        let stats = credit_accepted_share(&ledger, session_id, 7).unwrap();
+                        // Returned only once durable, so the caller reads its own write.
+                        assert_eq!(stats.accepted_shares, credit);
+                        assert_eq!(
+                            ledger.state.lock().unwrap().sessions[&session_id].accepted_shares,
+                            credit
+                        );
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        // Readers see only durable snapshots and never wait for a write.
+        for _ in 0..20 {
+            let started = Instant::now();
+            snapshot_ledger(&ledger).unwrap();
+            assert!(started.elapsed() < Duration::from_millis(50));
+            thread::sleep(Duration::from_millis(25));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let writes = ledger.persist_count.load(Ordering::Relaxed) - writes_before;
+        assert!(
+            writes < SESSIONS * CREDITS / 2,
+            "{writes} writes for {} updates",
+            SESSIONS * CREDITS
+        );
+        let generation = ledger.state.lock().unwrap().generation;
+        assert_eq!(generation, generation_before + SESSIONS * CREDITS);
+        drop(ledger);
+
+        let reopened = DurableLedger::open(Some(directory.clone()), [1; 32], [2; 32]).unwrap();
+        {
+            let state = reopened.state.lock().unwrap();
+            assert_eq!(state.generation, generation);
+            for session_id in 1..=SESSIONS {
+                assert_eq!(state.sessions[&session_id].accepted_shares, CREDITS);
+            }
+        }
+        // Writes after a grouped run keep alternating slots and reload exactly.
+        credit_accepted_share(&reopened, 1, 7).unwrap();
+        credit_accepted_share(&reopened, 2, 7).unwrap();
+        drop(reopened);
+        let reopened = DurableLedger::open(Some(directory), [1; 32], [2; 32]).unwrap();
+        let state = reopened.state.lock().unwrap();
+        assert_eq!(state.generation, generation + 2);
+        assert_eq!(state.sessions[&1].accepted_shares, CREDITS + 1);
+        assert_eq!(state.sessions[&2].accepted_shares, CREDITS + 1);
+    }
+
+    #[test]
+    #[ignore = "profiles a real pool ledger copy; set CMFD_LEDGER_BENCH_DIR"]
+    fn real_ledger_transaction_cost_breakdown() {
+        let Ok(source) = std::env::var("CMFD_LEDGER_BENCH_DIR") else {
+            return;
+        };
+        let root = TestRoot::new("real-ledger-bench");
+        let directory = root.path().join("ledger");
+        fs::create_dir_all(&directory).unwrap();
+        for name in [
+            "pool-ledger-v2.0.json",
+            "pool-ledger-v2.1.json",
+            POOL_LEDGER_GUARD_FILE,
+        ] {
+            fs::copy(Path::new(&source).join(name), directory.join(name)).unwrap();
+        }
+        let network: [u8; 32] =
+            hex::decode("88296bc39c10e8bc1dd4818d4d42412fe5f08210651110377f495da299812f62")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let fingerprint: [u8; 32] =
+            hex::decode("e9d81f15c580031302656609eb24fa8351efe0a34135ad894c793f3dd9044079")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let started = Instant::now();
+        let ledger = DurableLedger::open(Some(directory), network, fingerprint).unwrap();
+        eprintln!("open {:?}", started.elapsed());
+        let payout = {
+            let state = ledger.state.lock().unwrap();
+            let payout = *state.payouts.keys().next().unwrap();
+            eprintln!(
+                "sessions {} payouts {} pplns_shares {} pplns_blocks {} earning_events {} blocks {} payout_txs {}",
+                state.sessions.len(),
+                state.payouts.len(),
+                state.pplns_shares.len(),
+                state.pplns_blocks.len(),
+                state.earning_events.len(),
+                state.blocks.len(),
+                state.payout_transactions.len()
+            );
+            let t = Instant::now();
+            let cloned = state.clone();
+            eprintln!("clone {:?}", t.elapsed());
+            let t = Instant::now();
+            validate_ledger(&cloned).unwrap();
+            eprintln!("validate {:?}", t.elapsed());
+            let t = Instant::now();
+            let bytes = serde_json::to_vec(&ledger_payload(&cloned)).unwrap();
+            eprintln!("serialize {:?} bytes {}", t.elapsed(), bytes.len());
+            payout
+        };
+        let next_id = ledger.next_session_id().unwrap();
+        for i in 0..5_u64 {
+            let t = Instant::now();
+            register_session(&ledger, next_id + i, format!("bench{i}"), payout).unwrap();
+            eprintln!("register_session {:?}", t.elapsed());
+        }
+        for _ in 0..5 {
+            let t = Instant::now();
+            credit_accepted_share(&ledger, next_id, 7).unwrap();
+            eprintln!("credit_accepted_share {:?}", t.elapsed());
+        }
+        for _ in 0..3 {
+            let t = Instant::now();
+            credit_rejected_share(&ledger, next_id, true).unwrap();
+            eprintln!("credit_rejected_share {:?}", t.elapsed());
+        }
+        let t = Instant::now();
+        ledger
+            .transaction(|state| {
+                if let Some(session) = state.sessions.get_mut(&next_id) {
+                    session.connected = false;
+                }
+                Ok(())
+            })
+            .unwrap();
+        eprintln!("disconnect {:?}", t.elapsed());
+        eprintln!("persists {}", ledger.persist_count.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    #[ignore = "profiles a real pool ledger copy under a handshake burst; set CMFD_LEDGER_BENCH_DIR"]
+    fn real_ledger_handshake_burst_is_batched() {
+        let Ok(source) = std::env::var("CMFD_LEDGER_BENCH_DIR") else {
+            return;
+        };
+        let root = TestRoot::new("real-ledger-burst");
+        let directory = root.path().join("ledger");
+        fs::create_dir_all(&directory).unwrap();
+        for name in [
+            "pool-ledger-v2.0.json",
+            "pool-ledger-v2.1.json",
+            POOL_LEDGER_GUARD_FILE,
+        ] {
+            fs::copy(Path::new(&source).join(name), directory.join(name)).unwrap();
+        }
+        let network: [u8; 32] =
+            hex::decode("88296bc39c10e8bc1dd4818d4d42412fe5f08210651110377f495da299812f62")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let fingerprint: [u8; 32] =
+            hex::decode("e9d81f15c580031302656609eb24fa8351efe0a34135ad894c793f3dd9044079")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let ledger = Arc::new(DurableLedger::open(Some(directory), network, fingerprint).unwrap());
+        let payout = *ledger.state.lock().unwrap().payouts.keys().next().unwrap();
+        let next_id = ledger.next_session_id().unwrap();
+        const BURST: u64 = 48;
+        let persists_before = ledger.persist_count.load(Ordering::Relaxed);
+        let started = Instant::now();
+        let workers = (0..BURST)
+            .map(|i| {
+                let ledger = Arc::clone(&ledger);
+                thread::spawn(move || {
+                    let t = Instant::now();
+                    register_session(&ledger, next_id + i, format!("burst{i}"), payout).unwrap();
+                    credit_accepted_share(&ledger, next_id + i, 7).unwrap();
+                    t.elapsed()
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut latencies = workers
+            .into_iter()
+            .map(|w| w.join().unwrap())
+            .collect::<Vec<_>>();
+        latencies.sort();
+        let wall = started.elapsed();
+        let persists = ledger.persist_count.load(Ordering::Relaxed) - persists_before;
+        eprintln!(
+            "burst of {BURST} register+credit: wall {:?}, persists {persists}, median latency {:?}, max latency {:?}",
+            wall,
+            latencies[latencies.len() / 2],
+            latencies[latencies.len() - 1]
+        );
+        let state = ledger.state.lock().unwrap();
+        for i in 0..BURST {
+            assert_eq!(state.sessions[&(next_id + i)].accepted_shares, 1);
+        }
+        assert!(wall < Duration::from_secs(8), "burst took {wall:?}");
     }
 
     #[test]
@@ -7129,7 +7592,7 @@ mod tests {
             calls: 0,
         };
         let decoded: ClientMessage =
-            read_frame_interruptible(&mut fragmented, &AtomicBool::new(false)).unwrap();
+            read_frame_interruptible_inner(&mut fragmented, &AtomicBool::new(false), None).unwrap();
         assert!(matches!(
             decoded,
             ClientMessage::SubmitShare {

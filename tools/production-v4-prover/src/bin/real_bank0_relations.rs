@@ -50,8 +50,8 @@ use cpu_slop_algebra::AbstractField as CpuAbstractField;
 use memmap2::{Mmap, MmapOptions};
 use rayon::prelude::*;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use slop_algebra::{AbstractExtensionField, AbstractField, PrimeField32};
-use slop_alloc::{Buffer, CpuBackend};
+use slop_algebra::{AbstractField, PrimeField32};
+use slop_alloc::{Buffer, CpuBackend, RawBuffer};
 use slop_basefold::FriConfig;
 use slop_challenger::{CanObserve, FieldChallenger, IopCtx};
 use slop_multilinear::{Mle, Point};
@@ -60,7 +60,7 @@ use sp1_gpu_basefold::FriCudaProver;
 use sp1_gpu_commit::commit_multilinears;
 use sp1_gpu_cudart::{
     args, cuda_memory_info, dot_along_dim_view, run_sync_in_place, DeviceBuffer, DevicePoint,
-    DeviceTensor, TaskScope,
+    DeviceTensor, PinnedAllocator, TaskScope, PINNED_ALLOCATOR,
 };
 use sp1_gpu_jagged_sumcheck::{
     cubic_transition_sumcheck, simple_hadamard_sumcheck, triple_hadamard_sumcheck,
@@ -94,6 +94,10 @@ const SHIFT_PROOF_DOMAIN: &[u8] = b"CommonFoundry/ForgeMatrix/V4/ShiftProof/v1";
 const CUBIC_POINT_DOMAIN: &[u8] = b"CommonFoundry/ForgeMatrix/V4/CubicPoint/v1";
 const CUBIC_PROOF_DOMAIN: &[u8] = b"CommonFoundry/ForgeMatrix/V4/CubicProof/v1";
 const FINAL_POINT_DOMAIN: &[u8] = b"CommonFoundry/ForgeMatrix/V4/FinalPoint/v1";
+/// Memory the host must still have available after the server preloads its
+/// fixed data. Smaller hosts (for example WSL solo miners) keep file mappings.
+const PRELOAD_RESERVE_BYTES: u64 = 16 << 30;
+const PIN_COPY_CHUNK_BYTES: usize = 1 << 24;
 
 type GpuChallenger = <TestGC as IopCtx>::Challenger;
 type GpuDigest = <TestGC as IopCtx>::Digest;
@@ -122,8 +126,61 @@ struct PreparedProver {
     cpu_fixed: [CpuDigest; 3],
     gpu_fixed: [GpuDigest; 3],
     base_input: Vec<u8>,
-    encoded_banks: [Mmap; 3],
+    encoded_banks: [EncodedBank; 3],
     fixed_maps: [real_v4_opening::FixedArtifactMaps; 3],
+}
+
+/// Host bytes of one encoded model bank: the file mapping, or a page-locked
+/// copy so each proof's relation upload is a direct DMA that never waits on
+/// the page cache.
+enum EncodedBank {
+    Mapped(Mmap),
+    Pinned(PinnedBank),
+}
+
+struct PinnedBank {
+    buffer: RawBuffer<u8, PinnedAllocator>,
+    len: usize,
+}
+
+impl EncodedBank {
+    /// Keeps the mapping when the driver cannot pin that much memory.
+    fn pin(map: Mmap) -> Self {
+        let Ok(buffer) =
+            RawBuffer::<u8, PinnedAllocator>::try_with_capacity_in(map.len(), PINNED_ALLOCATOR)
+        else {
+            return Self::Mapped(map);
+        };
+        let destination = buffer.ptr() as usize;
+        map.par_chunks(PIN_COPY_CHUNK_BYTES)
+            .enumerate()
+            .for_each(|(index, chunk)| unsafe {
+                // SAFETY: the chunks are disjoint ranges of the map.len()-byte allocation.
+                std::ptr::copy_nonoverlapping(
+                    chunk.as_ptr(),
+                    (destination as *mut u8).add(index * PIN_COPY_CHUNK_BYTES),
+                    chunk.len(),
+                );
+            });
+        Self::Pinned(PinnedBank {
+            buffer,
+            len: map.len(),
+        })
+    }
+}
+
+impl std::ops::Deref for EncodedBank {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Mapped(map) => &map[..],
+            // SAFETY: `pin` initialized all `len` bytes, which are never written again.
+            Self::Pinned(bank) => unsafe {
+                std::slice::from_raw_parts(bank.buffer.ptr(), bank.len)
+            },
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -150,7 +207,7 @@ fn main() -> Result<()> {
             "usage: --server EXPECTED_NETWORK_ID MODEL ARTIFACT_DIRECTORY"
         );
         let expected_network_id = parse_expected_network_id(&args[1])?;
-        let prepared = prepare_prover(Path::new(&args[2]), Path::new(&args[3]))?;
+        let prepared = prepare_prover(Path::new(&args[2]), Path::new(&args[3]), true)?;
         run_sync_in_place(move |scope| {
             run_persistent_server(&prepared, expected_network_id, &scope)
         })??;
@@ -172,7 +229,7 @@ fn run_one_shot(args: Vec<OsString>) -> Result<()> {
     let dynamic_record_path = PathBuf::from(&args[6]);
     let final_path = PathBuf::from(&args[7]);
     let output_path = PathBuf::from(&args[8]);
-    let prepared = prepare_prover(&model_path, &artifact_dir)?;
+    let prepared = prepare_prover(&model_path, &artifact_dir, false)?;
     let expected = read_dynamic_commitment_record(&dynamic_record_path)?;
     run_sync_in_place(move |scope| {
         prove_job(
@@ -183,6 +240,7 @@ fn run_one_shot(args: Vec<OsString>) -> Result<()> {
             &final_path,
             &output_path,
             Some(expected),
+            true,
             &scope,
         )
     })??;
@@ -255,7 +313,10 @@ mod network_tests {
     }
 }
 
-fn prepare_prover(model_path: &Path, artifact_dir: &Path) -> Result<PreparedProver> {
+/// `preload` (server mode) keeps the fixed data read by every proof in memory:
+/// the encoded banks in pinned host memory and the fixed Merkle trees on the
+/// heap, when the host has room. Proof bytes do not depend on where they live.
+fn prepare_prover(model_path: &Path, artifact_dir: &Path, preload: bool) -> Result<PreparedProver> {
     let fixed_record: ForgeMatrixV4FixedArtifactRecordV1 = serde_json::from_reader(File::open(
         artifact_dir.join("FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json"),
     )?)?;
@@ -266,14 +327,39 @@ fn prepare_prover(model_path: &Path, artifact_dir: &Path) -> Result<PreparedProv
     );
     let fixed_words: [[u32; 8]; 3] =
         std::array::from_fn(|bank| fixed_record.banks()[bank].commitment_words());
+    let preload = preload
+        && host_can_preload(
+            3 * BANK_BYTES as u64
+                + fixed_record
+                    .banks()
+                    .iter()
+                    .map(|bank| bank.tree_bytes())
+                    .sum::<u64>(),
+        );
     let model_bank_prep_started = Instant::now();
     let base_input = read_base_input(model_path)?;
-    let encoded_banks: [Mmap; 3] = (0..3)
+    let encoded_banks: [EncodedBank; 3] = (0..3)
         .into_par_iter()
         .map(|bank| map_encoded_bank(model_path, bank))
         .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .map(|map| {
+            if preload {
+                EncodedBank::pin(map)
+            } else {
+                EncodedBank::Mapped(map)
+            }
+        })
+        .collect::<Vec<_>>()
         .try_into()
         .map_err(|_| anyhow::anyhow!("wrong model-bank count"))?;
+    eprintln!(
+        "fixed_data_preload={preload} pinned_banks={}",
+        encoded_banks
+            .iter()
+            .filter(|bank| matches!(bank, EncodedBank::Pinned(_)))
+            .count()
+    );
     eprintln!(
         "model_bank_prep_total_seconds={:.6}",
         model_bank_prep_started.elapsed().as_secs_f64()
@@ -282,8 +368,11 @@ fn prepare_prover(model_path: &Path, artifact_dir: &Path) -> Result<PreparedProv
     let fixed_maps: [real_v4_opening::FixedArtifactMaps; 3] = (0..3)
         .map(|bank| {
             let started = Instant::now();
-            let maps =
-                real_v4_opening::FixedArtifactMaps::open(artifact_dir, fixed_record.banks()[bank])?;
+            let maps = real_v4_opening::FixedArtifactMaps::open(
+                artifact_dir,
+                fixed_record.banks()[bank],
+                preload,
+            )?;
             eprintln!(
                 "fixed_artifact_prep bank={bank} seconds={:.6}",
                 started.elapsed().as_secs_f64()
@@ -307,6 +396,38 @@ fn prepare_prover(model_path: &Path, artifact_dir: &Path) -> Result<PreparedProv
     })
 }
 
+fn host_can_preload(bytes: u64) -> bool {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|meminfo| mem_available_bytes(&meminfo))
+        .is_some_and(|available| available >= bytes.saturating_add(PRELOAD_RESERVE_BYTES))
+}
+
+fn mem_available_bytes(meminfo: &str) -> Option<u64> {
+    let kib = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemAvailable:"))?
+        .trim()
+        .strip_suffix("kB")?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    kib.checked_mul(1024)
+}
+
+#[cfg(test)]
+mod preload_tests {
+    use super::*;
+
+    #[test]
+    fn reads_mem_available_only() {
+        let meminfo = "MemTotal:       65000000 kB\nMemFree:          100000 kB\nMemAvailable:   58000000 kB\n";
+        assert_eq!(mem_available_bytes(meminfo), Some(58_000_000 * 1024));
+        assert_eq!(mem_available_bytes("MemTotal:       65000000 kB\n"), None);
+        assert_eq!(mem_available_bytes("MemAvailable:   lots kB\n"), None);
+    }
+}
+
 fn run_persistent_server(
     prepared: &PreparedProver,
     expected_network_id: [u8; 32],
@@ -325,6 +446,8 @@ fn run_persistent_server(
             fields.len() == 5 && fields[0] == "RUN" && fields[1..].iter().all(|v| !v.is_empty()),
             "invalid persistent proof command"
         );
+        // No worker self-check here: the node decodes the written proof and runs
+        // the consensus verifier on it before it builds and submits a block.
         prove_job(
             prepared,
             expected_network_id,
@@ -333,6 +456,7 @@ fn run_persistent_server(
             Path::new(fields[3]),
             Path::new(fields[4]),
             None,
+            false,
             scope,
         )?;
         println!("CMFD_V4_PROOF_DONE");
@@ -367,6 +491,7 @@ fn prove_job(
     final_path: &Path,
     output_path: &Path,
     expected_dynamic_words: Option<[[u32; 8]; 3]>,
+    self_check: bool,
     scope: &TaskScope,
 ) -> Result<()> {
     let frozen: FrozenProductionV4Template = serde_json::from_reader(File::open(template_path)?)?;
@@ -440,6 +565,7 @@ fn prove_job(
         &prepared.fixed_maps,
         initial_activation,
         output_path,
+        self_check,
         scope,
     )
 }
@@ -500,12 +626,13 @@ fn prove_complete_proof(
     gpu_dynamic: [GpuDigest; 3],
     base_input: &[u8],
     final_activation: Vec<CpuFelt>,
-    encoded_banks: &[Mmap; 3],
+    encoded_banks: &[EncodedBank; 3],
     dynamic_maps: Vec<Mmap>,
     dynamic_traces: [JaggedTraceMle<Felt, TaskScope>; 3],
     fixed_maps: &[real_v4_opening::FixedArtifactMaps; 3],
     initial_activation: Vec<Felt>,
     output_path: &Path,
+    self_check: bool,
     scope: &TaskScope,
 ) -> Result<()> {
     let (baseline_free, total_device_bytes) = cuda_memory_info()?;
@@ -518,7 +645,8 @@ fn prove_complete_proof(
             if let Ok((free, _)) = cuda_memory_info() {
                 sampler_minimum.fetch_min(free, Ordering::Relaxed);
             }
-            thread::sleep(Duration::from_millis(50));
+            // Parked rather than slept so stopping it does not wait out the interval.
+            thread::park_timeout(Duration::from_millis(50));
         }
     });
     let online_started = Instant::now();
@@ -542,7 +670,6 @@ fn prove_complete_proof(
             statement,
             base_input,
             &encoded_banks[0],
-            dynamic_values[0],
             dynamic_device,
             &initial_activation,
             &mut cpu_challenger,
@@ -563,7 +690,6 @@ fn prove_complete_proof(
             statement,
             base_input,
             &encoded_banks[1],
-            dynamic_values[1],
             next_dynamic_device,
             boundary,
             &mut cpu_challenger,
@@ -593,7 +719,6 @@ fn prove_complete_proof(
             statement,
             base_input,
             &encoded_banks[2],
-            dynamic_values[2],
             final_dynamic_device,
             boundary,
             &mut cpu_challenger,
@@ -668,7 +793,46 @@ fn prove_complete_proof(
         canonical.len() == FORGEMATRIX_V4_TRANSPARENT_PROOF_BYTES,
         "complete proof has the wrong byte length"
     );
-    let decoded = decode_forgematrix_v4_transparent_proof(&canonical)?;
+    let online_seconds = if self_check {
+        self_check_complete_proof(statement, cpu_fixed, base_input, &canonical, online_started)?
+    } else {
+        online_started.elapsed().as_secs_f64()
+    };
+    std::fs::write(output_path, &canonical)?;
+    sampling.store(false, Ordering::Relaxed);
+    sampling_thread.thread().unpark();
+    sampling_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("GPU memory sampler panicked"))?;
+    let peak_process_bytes = baseline_free.saturating_sub(minimum_free.load(Ordering::Relaxed));
+    eprintln!(
+        "gpu_memory total_bytes={} baseline_free_bytes={} peak_process_bytes={} peak_process_gib={:.3}",
+        total_device_bytes,
+        baseline_free,
+        peak_process_bytes,
+        peak_process_bytes as f64 / (1_u64 << 30) as f64,
+    );
+    eprintln!(
+        "real_complete_proof={} bytes={} online_seconds={:.6} output={}",
+        if self_check { "VERIFIED" } else { "WRITTEN" },
+        canonical.len(),
+        online_seconds,
+        output_path.display()
+    );
+    Ok(())
+}
+
+/// Standalone qualification checks on the finished proof: canonical codec,
+/// CPU verification and mutation rejection. Returns the online seconds measured
+/// right after verification. Server mode skips this; its node verifies the proof.
+fn self_check_complete_proof(
+    statement: ForgeMatrixV4TranscriptStatement,
+    cpu_fixed: [CpuDigest; 3],
+    base_input: &[u8],
+    canonical: &[u8],
+    online_started: Instant,
+) -> Result<f64> {
+    let decoded = decode_forgematrix_v4_transparent_proof(canonical)?;
     ensure!(
         encode_forgematrix_v4_transparent_proof(&decoded)? == canonical,
         "complete proof codec is not canonical"
@@ -707,7 +871,7 @@ fn prove_complete_proof(
         decode_forgematrix_v4_transparent_proof(&canonical[..canonical.len() - 1]).is_err(),
         "truncated complete proof was accepted"
     );
-    let mut changed_bytes = canonical.clone();
+    let mut changed_bytes = canonical.to_vec();
     let last = changed_bytes.len() - 1;
     changed_bytes[last] ^= 1;
     ensure!(
@@ -720,26 +884,7 @@ fn prove_complete_proof(
         "mutated complete-proof byte was accepted"
     );
     eprintln!("complete_mutations=REJECTED final,matrix,opening,truncation,byte");
-    std::fs::write(output_path, &canonical)?;
-    sampling.store(false, Ordering::Relaxed);
-    sampling_thread
-        .join()
-        .map_err(|_| anyhow::anyhow!("GPU memory sampler panicked"))?;
-    let peak_process_bytes = baseline_free.saturating_sub(minimum_free.load(Ordering::Relaxed));
-    eprintln!(
-        "gpu_memory total_bytes={} baseline_free_bytes={} peak_process_bytes={} peak_process_gib={:.3}",
-        total_device_bytes,
-        baseline_free,
-        peak_process_bytes,
-        peak_process_bytes as f64 / (1_u64 << 30) as f64,
-    );
-    eprintln!(
-        "real_complete_proof=VERIFIED bytes={} online_seconds={:.6} output={}",
-        canonical.len(),
-        online_seconds,
-        output_path.display()
-    );
-    Ok(())
+    Ok(online_seconds)
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -748,7 +893,6 @@ fn prove_bank_relations(
     statement: ForgeMatrixV4TranscriptStatement,
     base_input: &[u8],
     encoded_bank: &[u8],
-    dynamic_values: &[Felt],
     dynamic: JaggedTraceMle<Felt, TaskScope>,
     boundary_activation: &[Felt],
     cpu_challenger: &mut cmfd_consensus::forgematrix_v4_basefold::ForgeMatrixV4Challenger,
@@ -959,20 +1103,14 @@ fn prove_bank_relations(
         );
         observe_bytes(gpu_challenger, CUBIC_PROOF_DOMAIN);
         let cubic_started = Instant::now();
-        let preactivation = dynamic_values[..BANK_VALUES]
-            .par_iter()
-            .map(|value| Ext::from_base(*value))
-            .collect::<Vec<_>>();
-        let next_activation = dynamic_values[BANK_VALUES..]
-            .par_iter()
-            .map(|value| Ext::from_base(*value))
-            .collect::<Vec<_>>();
+        let preactivation = lift_dynamic_half(&dynamic_tensor, 0, scope)?;
+        let next_activation = lift_dynamic_half(&dynamic_tensor, BANK_VALUES, scope)?;
         let equality: Mle<Ext, TaskScope> = DevicePoint::from_host(&gpu_cubic_point, scope)?
             .partial_lagrange()
             .into();
         let (cubic_sumcheck, cubic_endpoints) = cubic_transition_sumcheck(
-            upload_ext(preactivation, scope),
-            upload_ext(next_activation, scope),
+            preactivation,
+            next_activation,
             equality,
             &mut *gpu_challenger,
             Ext::zero(),
@@ -1134,6 +1272,34 @@ fn reduce_batches(
     }
     scope.synchronize_blocking()?;
     Ok(result.to_host()?)
+}
+
+/// Lifts half of the device-resident base-field dynamic trace (pre-activations at offset 0,
+/// next activations at `BANK_VALUES`) into an extension-field MLE on the GPU.
+///
+/// A width-one dot with `Ext::one()` writes `[x, 0, 0, 0]` for each canonical Montgomery word
+/// `x`, which are the same words the host `Ext::from_base` lift used to upload. The cubic
+/// sumcheck inputs, and therefore the transcript and proof, are unchanged; this only removes
+/// a 2 GiB host conversion and pageable upload per repetition.
+fn lift_dynamic_half(
+    dynamic: &TensorView<'_, Felt, TaskScope>,
+    offset: usize,
+    scope: &TaskScope,
+) -> Result<Mle<Ext, TaskScope>> {
+    ensure!(
+        offset + BANK_VALUES <= dynamic.total_len(),
+        "dynamic trace lift is out of range"
+    );
+    let one = DeviceTensor::from_host(&Tensor::from(vec![Ext::one()]), scope)?;
+    let view = unsafe {
+        TensorView::from_raw_parts(
+            dynamic.as_ptr().add(offset),
+            Dimensions::try_from([1, BANK_VALUES])?,
+            scope.clone(),
+        )
+    };
+    let lifted = dot_along_dim_view(view, one.as_view(), 0);
+    Ok(Mle::new(lifted.reshape([1, BANK_VALUES])))
 }
 
 fn reduce_weights(

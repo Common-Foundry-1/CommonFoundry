@@ -3,7 +3,7 @@ import heroApparatus from "../assets/hero-apparatus.png";
 import { ButtonLink } from "../components/ButtonLink";
 import { ShieldIcon } from "../components/Icons";
 import { MainnetLive } from "../components/MainnetLive";
-import { DISCORD_URL, MINING_GUIDE_URL } from "../content";
+import { DISCORD_URL } from "../content";
 
 export function Hero() {
   const visualRef = useRef<HTMLDivElement>(null);
@@ -47,10 +47,6 @@ export function Hero() {
         </div>
 
         <p className="hero__support">Setup help. Mining guidance. Release announcements.</p>
-        <p className="hero__guide">
-          New to mining? <a href={MINING_GUIDE_URL} target="_blank" rel="noopener noreferrer">Windows + Linux mining guide (PDF)</a>
-        </p>
-
         <div className="trust-note">
           <ShieldIcon />
           <span>No premine · No token sale · GPU proof of work</span>

@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, within } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import App from "./App";
-import { DISCORD_URL, EMISSION_URL, EXPLORER_URL, MAINNET_LAUNCH_AT, MAINNET_RELEASE_KEY_FINGERPRINT, MAINNET_RELEASE_KEY_URL, MAINNET_RELEASE_URL, MAINNET_RELEASE_VERSION, MAINNET_SEED_PEER, MINING_GUIDE_URL, SOURCE_RELEASE_AT, SECURITY_URL, WALLET_URL, WHITEPAPER_URL } from "./content";
+import { DISCORD_URL, EMISSION_URL, EXPLORER_URL, MAINNET_LAUNCH_AT, MAINNET_RELEASE_KEY_FINGERPRINT, MAINNET_RELEASE_KEY_URL, MAINNET_RELEASE_URL, MAINNET_RELEASE_VERSION, MAINNET_SEED_PEER, SOURCE_RELEASE_AT, SECURITY_URL, WALLET_URL, WHITEPAPER_URL } from "./content";
 
 describe("Discord-first launch website", () => {
   it("leads with inference and makes Discord the primary first-screen action", () => {
@@ -42,7 +42,7 @@ describe("Discord-first launch website", () => {
   it("uses the same official Discord destination across the conversion flow", () => {
     render(<App />);
     const discordLinks = screen.getAllByRole("link").filter((link) => link.getAttribute("href") === DISCORD_URL);
-    expect(discordLinks.length).toBeGreaterThanOrEqual(7);
+    expect(discordLinks.length).toBeGreaterThanOrEqual(6);
     for (const link of discordLinks) {
       expect(link).toHaveAttribute("target", "_blank");
       expect(link).toHaveAttribute("rel", expect.stringContaining("noopener"));
@@ -53,38 +53,16 @@ describe("Discord-first launch website", () => {
     expect(screen.queryByText(/RCNet test/)).not.toBeInTheDocument();
   });
 
-  it("offers the combined beginner guide with current mainnet downloads", () => {
+  it("no longer publishes the mining guide", () => {
     render(<App />);
-    const hero = screen.getByRole("region", { name: /Inference first.*Built to lead/i });
-    expect(within(hero).getByRole("link", { name: "Windows + Linux mining guide (PDF)" })).toHaveAttribute("href", MINING_GUIDE_URL);
-    const guide = screen.getByRole("article", { name: "Windows & Linux mining guide" });
-    expect(guide).toHaveAttribute("id", "mining-guide");
-    expect(within(guide).getByText(/terminal-only Linux and rented GPUs/)).toBeVisible();
-    expect(within(guide).getByRole("link", { name: "Read mining guide (PDF)" })).toHaveAttribute("href", MINING_GUIDE_URL);
-    expect(within(guide).getByRole("link", { name: "Download PDF" })).toHaveAttribute("download");
-    expect(within(guide).getByRole("link", { name: "Download PDF" })).toHaveAttribute("href", MINING_GUIDE_URL);
-    expect(within(guide).getByText(/start with the current mainnet release/)).toBeVisible();
-    expect(within(guide).getByRole("link", { name: "Ask in Discord." })).toHaveAttribute("href", DISCORD_URL);
+    expect(screen.queryByText(/mining guide/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: /PDF/ })).not.toBeInTheDocument();
+    expect(document.getElementById("mining-guide")).toBeNull();
   });
 
-  it("opens the shareable guide anchor after the app mounts", () => {
-    const original = Element.prototype.scrollIntoView;
-    const scroll = vi.fn();
-    Element.prototype.scrollIntoView = scroll;
-    window.history.replaceState(null, "", "/#mining-guide");
-    try {
-      render(<App />);
-      expect(scroll).toHaveBeenCalledWith({ block: "start" });
-    } finally {
-      window.history.replaceState(null, "", "/");
-      Element.prototype.scrollIntoView = original;
-    }
-  });
-
-  it("highlights the immutable pool setup fix without changing the mining guide", () => {
+  it("keeps the self-hosted pool setup fix for operators", () => {
     render(<App />);
     const notice = screen.getByRole("complementary", { name: "Running your own pool? Fresh-install setup fix" });
-    expect(document.getElementById("mining-guide")).toContainElement(notice);
     expect(within(notice).getByRole("link", { name: "Pool setup fix & installation steps" })).toHaveAttribute("href", "https://github.com/Common-Foundry-1/CommonFoundry/blob/366054828601557e7f53becff508db83d6af2a34/packaging/mainnet/linux/POOL-LAUNCHER-UPDATE.md");
     expect(within(notice).getByText(/For pool operators only/)).toBeVisible();
     expect(within(notice).getByText(/does not change the signed mainnet packages/)).toBeVisible();

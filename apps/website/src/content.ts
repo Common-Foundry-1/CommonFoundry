@@ -4,7 +4,6 @@ export const WALLET_URL = "https://wallet.commonfoundry.ai";
 export const X_URL = "https://x.com/CommonFoundry1";
 export const EXPLORER_URL = "https://explorer.commonfoundry.ai";
 export const WHITEPAPER_URL = "/docs/Common-Foundry-Technical-Whitepaper-v0.4.pdf";
-export const MINING_GUIDE_URL = "/docs/Common-Foundry-Mainnet-Mining-Guide-Windows-Linux.pdf";
 export const SECURITY_URL = "/docs/SECURITY.md";
 export const EMISSION_URL = "/docs/emission.md";
 export const MAINNET_LAUNCH_AT = "2026-10-03T17:00:00Z";

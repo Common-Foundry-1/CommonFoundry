@@ -42,6 +42,7 @@
               "getbestblockhash",
               "getblockhash",
               "getblock",
+              "gettxoutsetinfo",
               "getrawmempool",
               "sendrawtransaction",
               "registerwatchdestination",

@@ -357,6 +357,31 @@
       ]
     },
     {
+      "name": "gettxoutsetinfo",
+      "summary": "Summarize the active chain's unspent outputs; total_amount_atoms is the total supply",
+      "paramStructure": "by-position",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "type": "object",
+          "required": ["height", "bestblock", "txouts", "total_amount_atoms"],
+          "properties": {
+            "height": { "type": "integer", "minimum": 0 },
+            "bestblock": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "txouts": { "type": "integer", "minimum": 0 },
+            "total_amount_atoms": { "type": "string", "pattern": "^(0|[1-9][0-9]*)$" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/InternalError" }
+      ],
+      "tags": [{ "name": "chain" }]
+    },
+    {
       "name": "getrawmempool",
       "summary": "Return local mempool transaction IDs or verbose entries",
       "paramStructure": "by-position",

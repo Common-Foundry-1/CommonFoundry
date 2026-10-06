@@ -298,6 +298,7 @@ return HTTP 401; authenticated JSON-RPC errors return HTTP 200.
 | `getbestblockhash` | `[]` | Active tip ID |
 | `getblockhash` | `[height]` | Active-chain ID at the height |
 | `getblock` | `[hash, verbosity=1]` | Canonical block-frame hex at `0` (`block_proof_pruned` below `pruneheight` on a pruned node); block with txids at `1`; block with explicit transaction objects at `2` |
+| `gettxoutsetinfo` | `[]` | Active-chain height, best block, unspent-output count and `total_amount_atoms`, the total supply (every minted coin minus burned fees) |
 | `getrawmempool` | `[verbose=false]` | Txid array, or txid-keyed size and `fee_atoms` records |
 | `sendrawtransaction` | `[transaction_hex]` | Accepted txid; an identical transaction already in this mempool returns the same txid |
 | `registerwatchdestination` | `[label, destination_hex]` | Immutable watch registration after the complete active-chain history has been indexed |

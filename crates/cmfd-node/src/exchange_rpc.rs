@@ -1625,6 +1625,7 @@ fn route_get_exchange_info(
                 "getbestblockhash",
                 "getblockhash",
                 "getblock",
+                "gettxoutsetinfo",
                 "getrawtransaction",
                 "gettransaction",
                 "getaddressbalance",
@@ -1834,6 +1835,10 @@ fn route_method(
             Ok(json!(hex::encode(block_id)))
         }
         "getblock" => route_getblock(node, params),
+        "gettxoutsetinfo" => {
+            require_parameter_count(params, 0, 0)?;
+            Ok(txout_set_info(node))
+        }
         "getaddressutxos" => route_get_address_utxos(node, params),
         "getaddressbalance" | "getbalance" => {
             require_parameter_count(params, 1, 1)?;
@@ -2723,6 +2728,17 @@ fn node_fault(error: NodeError) -> RpcFault {
     }
 }
 
+/// Bitcoin Core's `gettxoutsetinfo` for the active chain. `total_amount_atoms`
+/// is the total supply: every minted coin minus burned fees.
+fn txout_set_info(node: &Node) -> Value {
+    json!({
+        "height": node.state.next_height().saturating_sub(1),
+        "bestblock": hex::encode(node.state.tip()),
+        "txouts": node.state.utxos().len(),
+        "total_amount_atoms": node.total_supply_atoms().to_string(),
+    })
+}
+
 fn blockchain_info(node: &Node) -> Result<Value, NodeError> {
     let status = node.status()?;
     let now = crate::unix_time_seconds()?;
@@ -3179,6 +3195,46 @@ mod tests {
             &mut node,
         );
         assert_eq!(raw["error"]["data"]["code"], "block_not_found");
+        drop(node);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn gettxoutsetinfo_reports_the_total_supply() {
+        let directory = test_directory("txoutset");
+        let _ = fs::remove_dir_all(&directory);
+        let mut node = Node::open_with_profile(&directory, DEVNET_PROFILE).unwrap();
+        let destination = node.wallet_destination();
+        let mut minted = 0_u64;
+        for height in 1..=3 {
+            let block = node
+                .mine_once(
+                    destination,
+                    DEVNET_PROFILE.virtual_genesis_timestamp + height * 60,
+                    DEFAULT_MINING_ATTEMPTS,
+                )
+                .unwrap();
+            minted += block
+                .coinbase
+                .outputs
+                .iter()
+                .map(|output| output.value)
+                .sum::<u64>();
+        }
+        let info = call(
+            json!({"jsonrpc":"2.0","id":1,"method":"gettxoutsetinfo","params":[]}),
+            &mut node,
+        )["result"]
+            .clone();
+        assert_eq!(info["height"], 3);
+        assert_eq!(info["bestblock"], hex::encode(node.state.tip()));
+        assert_eq!(info["txouts"], node.state.utxos().len());
+        assert_eq!(info["total_amount_atoms"], minted.to_string());
+        let extra = call(
+            json!({"jsonrpc":"2.0","id":2,"method":"gettxoutsetinfo","params":["muhash"]}),
+            &mut node,
+        );
+        assert!(extra.get("error").is_some());
         drop(node);
         fs::remove_dir_all(directory).unwrap();
     }

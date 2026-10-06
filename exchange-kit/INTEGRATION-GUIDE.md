@@ -94,7 +94,7 @@ locked, -14 wrong passphrase, ...). Amounts are CMFD numbers with eight decimals
 | Balances | `getbalance`, `getbalances`, `getunconfirmedbalance`, `getwalletinfo` |
 | Withdrawals | `sendtoaddress`, `sendmany`, `abandontransaction`, `settxfee`, `estimatesmartfee` |
 | Security | `encryptwallet`, `walletpassphrase`, `walletlock`, `walletpassphrasechange`, `backupwallet` |
-| Chain and status | `getblockchaininfo`, `getblockcount`, `getbestblockhash`, `getblockhash`, `getblock` (verbosity 1 or 2), `getrawtransaction`, `sendrawtransaction`, `getrawmempool`, `getnetworkinfo`, `getconnectioncount`, `getinfo`, `listwallets`, `uptime`, `ping`, `help`, `stop` |
+| Chain and status | `getblockchaininfo`, `getblockcount`, `getbestblockhash`, `getblockhash`, `getblock` (verbosity 1 or 2), `gettxoutsetinfo` (`total_amount` is the total supply), `getrawtransaction`, `sendrawtransaction`, `getrawmempool`, `getnetworkinfo`, `getconnectioncount`, `getinfo`, `listwallets`, `uptime`, `ping`, `help`, `stop` |
 
 Credit deposits after at least 60 confirmations, for example with
 `listsinceblock "<lastblock>" 60` as with bitcoind.
@@ -250,7 +250,8 @@ safe to send again:
 `getblockcount`, `getbestblockhash`, `getblockhash [height]`,
 `getblock [hash, 1|2]`, `getrawtransaction [txid, verbose]`,
 `gettransaction [txid]`, `getaddressbalance [destination_hex]`,
-`getaddressutxos [destination_hex, limit, cursor]`, `getrawmempool`. Transaction
+`getaddressutxos [destination_hex, limit, cursor]`, `getrawmempool`,
+`gettxoutsetinfo` (`total_amount_atoms` is the total supply). Transaction
 lookups do not need a block hash. Parameters are positional; batches and named
 parameters are not supported.
 

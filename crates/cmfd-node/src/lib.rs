@@ -3712,6 +3712,18 @@ impl Node {
     pub(crate) fn log_readers_outstanding(&self) -> bool {
         Arc::strong_count(&self.log_readers) > 1
     }
+
+    /// Value of every unspent output. Fees are burned, so this is every coin
+    /// minted so far minus burned fees: the current total supply.
+    pub fn total_supply_atoms(&self) -> u64 {
+        let total: u128 = self
+            .state
+            .utxos()
+            .iter()
+            .map(|(_, output)| u128::from(output.value))
+            .sum();
+        u64::try_from(total).unwrap_or(u64::MAX)
+    }
 }
 
 fn next_node_instance_id() -> Result<u64, NodeError> {

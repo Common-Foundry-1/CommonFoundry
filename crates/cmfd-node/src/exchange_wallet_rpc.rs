@@ -520,6 +520,7 @@ fn param_names(method: &str) -> Option<&'static [&'static str]> {
         | "getdifficulty"
         | "getinfo"
         | "getnetworkinfo"
+        | "gettxoutsetinfo"
         | "getunconfirmedbalance"
         | "getwalletinfo"
         | "listwallets"
@@ -600,7 +601,8 @@ const HELP: &str = "Common Foundry exchange wallet (Bitcoin Core-compatible JSON
 
 == Blockchain ==
 getbestblockhash, getblock \"blockhash\" ( verbosity 1|2 ), getblockchaininfo,
-getblockcount, getblockhash height, getdifficulty, getrawmempool ( verbose )
+getblockcount, getblockhash height, getdifficulty, getrawmempool ( verbose ),
+gettxoutsetinfo (total_amount is the total supply)
 
 == Network and control ==
 getconnectioncount, getinfo, getnetworkinfo, help ( \"command\" ), ping, stop, uptime
@@ -1254,6 +1256,30 @@ fn call(context: &Context, method: &str, raw: Option<&RawValue>) -> Result<Value
                 json!([hex::encode(hash), verbosity]),
                 "Block not found",
             )
+        }
+        "gettxoutsetinfo" => {
+            let info = forward(
+                context,
+                "gettxoutsetinfo",
+                json!([]),
+                "Chain state is not available",
+            )?;
+            let total = info
+                .get("total_amount_atoms")
+                .and_then(Value::as_str)
+                .and_then(|atoms| atoms.parse::<u64>().ok())
+                .ok_or_else(|| {
+                    RpcError::new(
+                        RPC_CLIENT_NOT_CONNECTED,
+                        "the chain endpoint does not report the UTXO set (it needs v1.0.12 or later)",
+                    )
+                })?;
+            Ok(json!({
+                "height": info["height"],
+                "bestblock": info["bestblock"],
+                "txouts": info["txouts"],
+                "total_amount": amount(total),
+            }))
         }
         "getrawmempool" => {
             let verbose = params.verbosity(0, "verbose", 0)? > 0;

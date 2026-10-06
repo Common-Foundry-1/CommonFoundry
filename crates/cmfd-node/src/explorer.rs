@@ -117,6 +117,9 @@ pub struct ExplorerSnapshot {
     pub expected_target: String,
     pub cumulative_work: String,
     pub utxo_count: usize,
+    /// Total supply in atoms (decimal string): the value of every unspent
+    /// output, since fees are burned.
+    pub total_supply_atoms: String,
     pub mempool_transactions: usize,
     pub mempool_bytes: usize,
     pub connected_peers: usize,
@@ -204,6 +207,7 @@ impl Node {
             expected_target: status.expected_target,
             cumulative_work: status.cumulative_work,
             utxo_count: status.utxo_count,
+            total_supply_atoms: self.total_supply_atoms().to_string(),
             mempool_transactions: status.mempool_transactions,
             mempool_bytes: status.mempool_bytes,
             connected_peers,
@@ -511,6 +515,35 @@ mod tests {
             crate::DEFAULT_MINING_ATTEMPTS,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn total_supply_is_minted_coins_minus_burned_fees() {
+        let path = test_dir("explorer-supply");
+        let mut node = Node::open(&path).unwrap();
+        let minted = |blocks: &[Block]| -> u64 {
+            blocks
+                .iter()
+                .flat_map(|block| &block.coinbase.outputs)
+                .map(|output| output.value)
+                .sum()
+        };
+        let mut blocks: Vec<Block> = (0..3).map(|_| mine(&mut node)).collect();
+        assert_eq!(node.total_supply_atoms(), minted(&blocks));
+        assert_eq!(
+            node.explorer_snapshot().unwrap().total_supply_atoms,
+            minted(&blocks).to_string()
+        );
+
+        // Fees are burned: a transaction's fee leaves the supply.
+        let fee = 1_000;
+        let transaction = spend_coinbase_output(&node, &blocks[0], 1, 0x11, 0x31, fee);
+        node.submit_transaction(transaction).unwrap();
+        blocks.push(mine(&mut node));
+        assert_eq!(blocks[3].transactions.len(), 1);
+        assert_eq!(node.total_supply_atoms(), minted(&blocks) - fee);
+        drop(node);
+        clean_test_dir(&path);
     }
 
     #[test]

@@ -22,15 +22,19 @@ static PROCESS_TEST_SERIAL: Mutex<()> = Mutex::new(());
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(15);
 const PROMPT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Compares chain state across a restart. How the node started (snapshot or
+/// replay, background history check pending or done) may differ.
 fn assert_status_state_equal(mut actual: Value, mut expected: Value) {
-    actual
-        .as_object_mut()
-        .expect("status must be an object")
-        .remove("startup_snapshot_used");
-    expected
-        .as_object_mut()
-        .expect("status must be an object")
-        .remove("startup_snapshot_used");
+    for status in [&mut actual, &mut expected] {
+        let fields = status.as_object_mut().expect("status must be an object");
+        for path_dependent in [
+            "startup_snapshot_used",
+            "history_scrub_complete",
+            "history_scrub_verified_records",
+        ] {
+            fields.remove(path_dependent);
+        }
+    }
     assert_eq!(actual, expected);
 }
 

@@ -1071,6 +1071,11 @@ impl super::Node {
         self.transaction_scan_marks.clear();
         self.remember_active_branch_checkpoint(true);
         let _ = self.persist_startup_snapshot();
+        // The new file was written from authenticated reads, so it counts as
+        // verified history; work planned against the old file restarts.
+        self.log_epoch = self.log_epoch.saturating_add(1);
+        self.history_scrub = super::history_scrub::Progress::verified(self.record_count);
+        let _ = self.persist_index_cache();
         for height in list_anchors(&self.data_dir) {
             if durable && height != anchor_height {
                 let _ = remove_if_present(&anchor_path(&self.data_dir, height));

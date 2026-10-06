@@ -29,9 +29,10 @@ npm run types -- --check
 The node provides bounded read-only endpoints at `/v1/explorer`,
 `/v1/explorer/block/{height-or-id}`, and `/v1/explorer/transaction/{txid}`. Transaction lookup covers
 the full retained canonical history, not only the latest 4,096 blocks. The native node maintains
-compact transaction locations for committed blocks and reconstructs them during the existing
-authenticated block-log startup scan, including when a startup snapshot is used. The snapshot and
-block-log formats are unchanged. No transaction hint from an independent cache is trusted.
+compact transaction locations for committed blocks and keeps them in a startup index cache bound to
+the newest record it covers; a restart indexes only newer records, and without a valid cache it
+rebuilds them during the authenticated block-log startup scan. Locations are hints only: every
+lookup reads and authenticates the block it names before answering.
 
 Overview polling keeps a bounded, process-local cache of at most12 checked block summaries and
 24 confirmed transaction summaries, not block/proof bodies. A tip change or30-second expiry

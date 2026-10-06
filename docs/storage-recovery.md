@@ -67,14 +67,30 @@ cmfd-node --data-dir <node-data> storage-checkpoint
 The checkpoint contains the canonical chain state and compact fork index,
 binds the immutable network fingerprint, exact block-log length, terminal
 record digest, and every cached record locator, and has a domain-separated
-BLAKE3 integrity digest. Startup rechecks the retained log's file identity,
-scans the complete retained record-digest chain, and compares every cached
-record locator against that scan before using the checkpoint. It also reads
-and authenticates the complete terminal record. A fast start therefore still
-reads the retained log; it is not a constant-time startup path. When a
-checkpoint is not eligible, the node reconstructs the same state through full
-deterministic replay. The status field `startup_snapshot_used` reports which
-path opened the node.
+BLAKE3 integrity digest. Beside it the node keeps `startup-index.bin`, the
+explorer's transaction and address location indexes bound to the newest
+record they cover by its complete digest. It is refreshed every 64 records,
+at clean shutdown and by `storage-checkpoint`.
+
+Startup rechecks the retained log's file identity and reads and
+authenticates the complete terminal record. With a valid index cache it then
+reads only the records the cache does not cover, so a restart takes seconds
+however long the history is. The older records are re-checked afterwards by a
+background history scrub at a bounded rate: each record's header, acceptance
+time, complete digest, offset and link to its predecessor must match the
+cached locator. A mismatch faults storage, so the node stops accepting and
+serving blocks, and moves `startup-state.*.bin` and `startup-index.bin` aside
+as `*.invalid-<time>`. The next start then scans or replays the log, which
+stays authoritative, and refuses a damaged record. Every block a node serves
+or uses is still authenticated when it is read, before and after the scrub.
+Without a valid index cache, startup scans the complete retained
+record-digest chain and compares every cached locator first, as before.
+
+When a checkpoint is not eligible, the node reconstructs the same state
+through full deterministic replay. The status field `startup_snapshot_used`
+reports which path opened the node; `history_scrub_complete` and
+`history_scrub_verified_records` report whether every record present at
+startup has been verified, by the startup scan or by the scrub.
 
 Fork-aware loading recomputes cumulative work from retained targets, preserves
 the first accepted winner on equal work, and reconstructs the active ancestry.
@@ -87,9 +103,9 @@ This is a local crash-safe cache, not a consensus state root. It does not
 protect against an attacker able to replace both node storage and the cache,
 and it intentionally does not prune `blocks.log`. Use checkpoints created by
 the matching local node or your own trusted backup, not untrusted third-party
-state downloads. Historical serving policy, pruning, background log scrubbing,
-long-history bounded-startup measurement and signed-package recovery remain
-separate qualification requirements.
+state downloads. Historical serving policy, long-history bounded-startup
+measurement and signed-package recovery remain separate qualification
+requirements.
 
 The [explorer resource qualification](explorer-resource-qualification.md)
 separates synthetic index memory measurements, valid tiny-profile recovery

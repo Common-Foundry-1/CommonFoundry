@@ -31,6 +31,24 @@ impl TransactionIndex {
         )
     }
 
+    /// Every (txid, location) pair, for the startup index cache.
+    pub fn entries(&self) -> impl Iterator<Item = ([u8; 32], TransactionLocation)> + '_ {
+        self.locations
+            .iter()
+            .flat_map(|(txid, locations)| locations.iter().map(move |location| (*txid, *location)))
+    }
+
+    pub fn entry_count(&self) -> usize {
+        self.locations.values().map(Vec::len).sum()
+    }
+
+    pub fn insert_location(&mut self, txid: [u8; 32], location: TransactionLocation) {
+        self.locations
+            .entry(txid)
+            .or_insert_with(|| Vec::with_capacity(1))
+            .push(location);
+    }
+
     pub fn insert_block(&mut self, block_id: [u8; 32], txids: impl IntoIterator<Item = [u8; 32]>) {
         for (transaction_position, txid) in txids.into_iter().enumerate() {
             self.locations

@@ -1713,6 +1713,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     cmfd_node::spawn_pruner(Arc::clone(&shared), cmfd_node::PRUNE_CHECK_INTERVAL)
                 })
                 .transpose()?;
+            let history_scrub = cmfd_node::spawn_history_scrub(Arc::clone(&shared))?;
             let exchange_withdrawals_enabled = exchange_rpc_withdrawal_auth_file.is_some();
             let exchange_custody_v3_active = exchange_custody_v3.is_some();
             let exchange_rpc = match (exchange_rpc_bind, exchange_rpc_auth_file) {
@@ -1812,6 +1813,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Err(error) = node.persist_startup_snapshot() {
                     eprintln!("startup checkpoint not written: {error}");
                 }
+                if let Err(error) = node.persist_index_cache() {
+                    eprintln!("startup index cache not written: {error}");
+                }
                 node.shutdown_proof_verifier();
             }
             let exchange_rpc_result = match exchange_rpc {
@@ -1827,6 +1831,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(pruner) = pruner {
                 pruner.stop();
             }
+            history_scrub.stop();
             drop(shared);
             exchange_rpc_result?;
             rpc_result?;
@@ -1934,6 +1939,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 exchange_withdrawal_security.as_ref(),
             )?;
             node.persist_startup_snapshot()?;
+            node.persist_index_cache()?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
@@ -2171,6 +2177,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Ok(node) = node.lock() {
                 if let Err(error) = node.persist_startup_snapshot() {
                     eprintln!("startup checkpoint not written: {error}");
+                }
+                if let Err(error) = node.persist_index_cache() {
+                    eprintln!("startup index cache not written: {error}");
                 }
                 node.shutdown_proof_verifier();
             }

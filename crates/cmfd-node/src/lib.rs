@@ -87,6 +87,9 @@ mod explorer_index_qualification;
 mod explorer_recovery_qualification;
 #[cfg(all(test, feature = "production-v4"))]
 mod explorer_resource_qualification;
+#[cfg(test)]
+mod fast_startup_tests;
+mod history_scrub;
 pub mod logging;
 #[cfg(feature = "production-v4")]
 pub mod mainnet_custody;
@@ -107,6 +110,7 @@ pub mod rcnet_candidate;
 #[cfg(all(test, feature = "production-v4"))]
 mod real_fork_checkpoint_tests;
 pub mod seed_peers;
+pub use history_scrub::{HistoryScrub, spawn_history_scrub};
 use pruning::StoredBlock;
 pub use pruning::{
     MIN_PRUNE_KEEP_BLOCKS, PRUNE_CHECK_INTERVAL, PruneReport, PrunerHandle, prune_shared_node,
@@ -2438,6 +2442,10 @@ pub struct NodeStatus {
     pub prune_keep_blocks: Option<u64>,
     /// Height of the newest block stored without its proof.
     pub pruned_height: Option<u64>,
+    /// Whether every record present at startup has been verified, either by
+    /// the startup scan or by the background history scrub after a fast start.
+    pub history_scrub_complete: bool,
+    pub history_scrub_verified_records: u64,
     pub peers: Vec<PeerObservation>,
 }
 
@@ -3846,6 +3854,11 @@ pub struct Node {
     /// One reference per [`LogReadHandle`] outstanding; pruning replaces the
     /// log only when none are.
     log_readers: Arc<()>,
+    /// Incremented whenever the block log file is replaced (a prune swap), so
+    /// work planned against the old file restarts.
+    log_epoch: u64,
+    /// Background verification of the history a fast start did not re-read.
+    history_scrub: history_scrub::Progress,
     /// Digest of the exact last complete block-log record. V2 appends bind to
     /// this value; it advances only after the durable record commits in memory.
     last_record_digest: [u8; 32],
@@ -5592,10 +5605,17 @@ impl Node {
 
         let restored =
             startup_snapshot::load_startup_snapshot(&data_dir, &log, &log_path, params, &verifier)?;
-        let (state, index, replay, startup_snapshot_used) = match restored {
+        let (state, index, replay, startup_snapshot_used, history_verified) = match restored {
             Some(mut restored) => {
                 attach_prune_anchor(&data_dir, &mut restored.index, params, &verifier)?;
-                (restored.state, restored.index, restored.replay, true)
+                let verified = restored.history_verified;
+                (
+                    restored.state,
+                    restored.index,
+                    restored.replay,
+                    true,
+                    verified,
+                )
             }
             None => {
                 let mut state = ChainState::new(params, verifier.clone())?;
@@ -5610,7 +5630,7 @@ impl Node {
                     params,
                     external_replay.then_some(&block_preverifier),
                 )?;
-                (state, index, replay, false)
+                (state, index, replay, false, true)
             }
         };
         if metadata != MetadataState::Current {
@@ -5669,6 +5689,12 @@ impl Node {
             exchange_rpc_active: false,
             log,
             log_readers: Arc::new(()),
+            log_epoch: 0,
+            history_scrub: if history_verified || replay.record_count == 0 {
+                history_scrub::Progress::verified(replay.record_count)
+            } else {
+                history_scrub::Progress::default()
+            },
             last_record_digest: replay.last_record_digest,
             block_log_length: replay.log_length,
             storage_faulted: false,
@@ -5705,6 +5731,8 @@ impl Node {
         if !startup_snapshot_used {
             let _ = node.persist_startup_snapshot();
         }
+        // Keep the next start fast; the cache covers every current record.
+        let _ = node.persist_index_cache();
         node.remember_active_branch_checkpoint(true);
         Ok(node)
     }
@@ -5716,10 +5744,17 @@ impl Node {
     /// Writes a two-slot, locally authenticated startup snapshot.
     ///
     /// The canonical state and every retained fork locator are bound to the
-    /// exact log extent. Restart authenticates the complete retained record
-    /// chain before using this cache; an ineligible cache falls back to replay.
+    /// exact log extent. Restart authenticates the terminal record and the
+    /// records the index cache does not cover, and the background history
+    /// scrub re-checks the rest; an ineligible cache falls back to replay.
     pub fn persist_startup_snapshot(&self) -> Result<(), NodeError> {
         startup_snapshot::persist_startup_snapshot(self)
+    }
+
+    /// Saves the transaction and address location indexes bound to the
+    /// newest record, so the next start reads only newer records.
+    pub fn persist_index_cache(&self) -> Result<(), NodeError> {
+        startup_snapshot::persist_index_cache(self)
     }
 
     fn latch_authenticated_storage_failure<T>(
@@ -6013,6 +6048,8 @@ impl Node {
             public_peer_mode: self.public_peer_mode,
             prune_keep_blocks: self.prune_keep_blocks,
             pruned_height: self.prune_height(),
+            history_scrub_complete: self.history_scrub.complete,
+            history_scrub_verified_records: self.history_scrub.verified_records,
             peers: self.peer_observations(),
         })
     }
@@ -8406,6 +8443,12 @@ impl Node {
                 // A snapshot failure is non-authoritative: startup safely
                 // falls back to replaying the block log.
                 let _ = self.persist_startup_snapshot();
+                if self
+                    .record_count
+                    .is_multiple_of(startup_snapshot::INDEX_CACHE_INTERVAL)
+                {
+                    let _ = self.persist_index_cache();
+                }
                 Ok(outcome.fees)
             }
             Err(error) => {

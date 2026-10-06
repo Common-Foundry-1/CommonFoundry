@@ -7,6 +7,10 @@ use std::sync::Arc;
 use blake3::Hasher;
 use primitive_types::U512;
 
+use cmfd_consensus::Transaction;
+
+use super::explorer_address_index::{AddressHistoryIndex, AddressLocation};
+use super::explorer_index::{TransactionIndex, TransactionLocation};
 use super::{
     BlockIndex, BlockRecordLocator, BlockRecordVersion, ChainState, ConsensusPowVerifier,
     EMPTY_RECORD_CHAIN_ROOT, IndexedBlock, MAX_CHAIN_STATE_SNAPSHOT_BYTES, NetworkParams, Node,
@@ -23,11 +27,24 @@ const SNAPSHOT_ENTRY_BYTES: usize =
     8 + 8 + 8 + 1 + 32 + 8 + 32 + 32 + 8 + 32 + SuccessorHeaderPreflight::LOCAL_SNAPSHOT_BYTES;
 const SNAPSHOT_DIGEST_BYTES: usize = 32;
 const MAX_STARTUP_SNAPSHOT_BYTES: usize = MAX_CHAIN_STATE_SNAPSHOT_BYTES + 512 * 1024 * 1024;
+const INDEX_FILE: &str = "startup-index.bin";
+const INDEX_MAGIC: [u8; 8] = *b"CMFDNIX\0";
+const INDEX_VERSION: u32 = 1;
+const INDEX_INTEGRITY_DOMAIN: &str = "CMFD/NODE/STARTUP-INDEX/LOCAL-INTEGRITY/V1";
+const INDEX_HEADER_BYTES: usize = 8 + 4 + 32 + 8 + 8 + 32 + 8 + 8;
+const INDEX_TRANSACTION_BYTES: usize = 32 + 32 + 8;
+const INDEX_ADDRESS_BYTES: usize = 32 + 32 + 8 + 8;
+/// Records appended between index-cache refreshes. A fast start indexes at
+/// most about this many records itself.
+pub(super) const INDEX_CACHE_INTERVAL: u64 = 64;
 
 pub(super) struct LoadedStartupSnapshot {
     pub state: ChainState,
     pub index: BlockIndex,
     pub replay: ReplayLogState,
+    /// True when startup scanned the complete retained log; false for a fast
+    /// start that left older records to the background history scrub.
+    pub history_verified: bool,
 }
 
 pub(super) fn load_startup_snapshot(
@@ -44,8 +61,8 @@ pub(super) fn load_startup_snapshot(
     let mut best = None;
     for slot in 0..=1_u8 {
         let path = snapshot_path(data_dir, slot);
-        let candidate =
-            load_slot(&path, log, log_path, params, verifier, log_length).unwrap_or_default();
+        let candidate = load_slot(&path, data_dir, log, log_path, params, verifier, log_length)
+            .unwrap_or_default();
         if candidate.as_ref().is_some_and(|candidate| {
             best.as_ref().is_none_or(|best: &LoadedStartupSnapshot| {
                 candidate.replay.record_count > best.replay.record_count
@@ -132,6 +149,7 @@ pub(super) fn persist_startup_snapshot(node: &Node) -> Result<(), NodeError> {
 
 fn load_slot(
     path: &Path,
+    data_dir: &Path,
     log: &File,
     log_path: &Path,
     params: NetworkParams,
@@ -318,30 +336,40 @@ fn load_slot(
         ));
     }
     // A local snapshot is a replay accelerator, not an authority over the
-    // append-only block log. Scan the complete retained record chain before
-    // accepting cached state; validating only the terminal record would let a
-    // rewritten middle record bypass its successor's previous-digest link.
-    let mut scan_file = log
-        .try_clone()
-        .map_err(|source| io_error("clone block log for startup validation", log_path, source))?;
-    scan_file
-        .seek(SeekFrom::Start(0))
-        .map_err(|source| io_error("seek block log for startup validation", log_path, source))?;
-    let scanned = scan_replay_log(scan_file, log_path, params, params.network_id)?;
-    if scanned.log_length != snapshot_log_length
-        || scanned.last_record_digest != last_record_digest
-        || scanned.records.len() != record_count
-        || scanned.records.iter().any(|locator| {
-            index
-                .blocks
-                .get(&locator.block_id)
-                .is_none_or(|entry| entry.locator != *locator)
-        })
-    {
-        return Err(NodeError::CorruptLog(
-            "startup snapshot block-log chain binding mismatch".to_owned(),
-        ));
-    }
+    // append-only block log. With a valid index cache, startup reads only the
+    // records the cache does not cover; the background history scrub then
+    // checks every older record against these locators, and a mismatch faults
+    // storage and moves the caches aside so the next start rebuilds from the
+    // log. Without the cache, scan the complete retained record chain now.
+    let cached = load_index_cache(data_dir, params, &index, record_count, log, log_path);
+    let history_verified = cached.is_none();
+    let (transactions, addresses) = match cached {
+        Some(indexes) => indexes,
+        None => {
+            let mut scan_file = log.try_clone().map_err(|source| {
+                io_error("clone block log for startup validation", log_path, source)
+            })?;
+            scan_file.seek(SeekFrom::Start(0)).map_err(|source| {
+                io_error("seek block log for startup validation", log_path, source)
+            })?;
+            let scanned = scan_replay_log(scan_file, log_path, params, params.network_id)?;
+            if scanned.log_length != snapshot_log_length
+                || scanned.last_record_digest != last_record_digest
+                || scanned.records.len() != record_count
+                || scanned.records.iter().any(|locator| {
+                    index
+                        .blocks
+                        .get(&locator.block_id)
+                        .is_none_or(|entry| entry.locator != *locator)
+                })
+            {
+                return Err(NodeError::CorruptLog(
+                    "startup snapshot block-log chain binding mismatch".to_owned(),
+                ));
+            }
+            (scanned.transactions, scanned.addresses)
+        }
+    };
     match last_locator {
         Some(locator) => {
             if locator.complete_digest != last_record_digest {
@@ -367,11 +395,10 @@ fn load_slot(
     index.active_chain.extend(index.path_to(winning_tip)?);
     index.active_work = winning_work;
     validate_active_state(&state, &index)?;
-    // Do not trust transaction locations serialized by a cache. The normal
-    // startup scan already decoded every authenticated record, and all of its
-    // locators were compared above with the restored fork index.
-    index.transactions = scanned.transactions;
-    index.addresses = scanned.addresses;
+    // Cached locations are hints only: every transaction and address lookup
+    // reads and authenticates the block it names before using it.
+    index.transactions = transactions;
+    index.addresses = addresses;
     verify_retained_block_log_path(log, log_path)?;
     Ok(Some(LoadedStartupSnapshot {
         state,
@@ -383,6 +410,7 @@ fn load_slot(
                 NodeError::CorruptLog("startup snapshot record count overflowed".to_owned())
             })?,
         },
+        history_verified,
     }))
 }
 
@@ -470,6 +498,192 @@ fn persist_slot(path: &Path, bytes: &[u8]) -> Result<(), NodeError> {
 
 fn snapshot_path(data_dir: &Path, slot: u8) -> PathBuf {
     data_dir.join(format!("{STARTUP_SNAPSHOT_FILE_PREFIX}.{slot}.bin"))
+}
+
+/// Saves the explorer transaction and address location indexes, bound to the
+/// newest retained record by its complete digest, so a fast start need not
+/// decode the whole log to rebuild them.
+pub(super) fn persist_index_cache(node: &Node) -> Result<(), NodeError> {
+    if node.storage_faulted {
+        return Err(NodeError::StorageFaulted);
+    }
+    let newest = node
+        .index
+        .blocks
+        .values()
+        .map(|entry| entry.locator)
+        .max_by_key(|locator| locator.ordinal);
+    let (covered_records, covered_length, covered_digest) = match newest {
+        Some(locator) => (
+            locator.ordinal.saturating_add(1),
+            locator.offset.saturating_add(locator.length),
+            locator.complete_digest,
+        ),
+        None => (0, 0, EMPTY_RECORD_CHAIN_ROOT),
+    };
+    if covered_records != node.record_count
+        || covered_length != node.block_log_length
+        || covered_digest != node.last_record_digest
+    {
+        return Err(NodeError::CorruptLog(
+            "index cache does not match the retained log".to_owned(),
+        ));
+    }
+    let transactions = node.index.transactions.entry_count();
+    let addresses = node.index.addresses.entry_count();
+    let mut bytes = Vec::with_capacity(
+        INDEX_HEADER_BYTES
+            + transactions * INDEX_TRANSACTION_BYTES
+            + addresses * INDEX_ADDRESS_BYTES
+            + SNAPSHOT_DIGEST_BYTES,
+    );
+    bytes.extend_from_slice(&INDEX_MAGIC);
+    bytes.extend_from_slice(&INDEX_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&node.fingerprint);
+    bytes.extend_from_slice(&covered_records.to_le_bytes());
+    bytes.extend_from_slice(&covered_length.to_le_bytes());
+    bytes.extend_from_slice(&covered_digest);
+    write_count(&mut bytes, transactions)?;
+    write_count(&mut bytes, addresses)?;
+    for (txid, location) in node.index.transactions.entries() {
+        bytes.extend_from_slice(&txid);
+        bytes.extend_from_slice(&location.block_id);
+        bytes.extend_from_slice(&(location.transaction_position as u64).to_le_bytes());
+    }
+    for (address, location) in node.index.addresses.entries() {
+        bytes.extend_from_slice(&address);
+        bytes.extend_from_slice(&location.block_id);
+        bytes.extend_from_slice(&location.height.to_le_bytes());
+        bytes.extend_from_slice(&(location.position as u64).to_le_bytes());
+    }
+    let digest = index_digest(&bytes);
+    bytes.extend_from_slice(&digest);
+    persist_slot(&node.data_dir.join(INDEX_FILE), &bytes)
+}
+
+/// Restores the location indexes for a snapshot-restored fork index, then
+/// indexes the records the cache does not cover by reading them through the
+/// authenticated record path. Any cache that is absent, foreign, damaged or
+/// not bound to this log yields `None`, and startup scans the whole log.
+fn load_index_cache(
+    data_dir: &Path,
+    params: NetworkParams,
+    index: &BlockIndex,
+    record_count: usize,
+    log: &File,
+    log_path: &Path,
+) -> Option<(TransactionIndex, AddressHistoryIndex)> {
+    let bytes = fs::read(data_dir.join(INDEX_FILE)).ok()?;
+    if bytes.len() < INDEX_HEADER_BYTES + SNAPSHOT_DIGEST_BYTES {
+        return None;
+    }
+    let (payload, digest) = bytes.split_at(bytes.len() - SNAPSHOT_DIGEST_BYTES);
+    if index_digest(payload) != digest {
+        return None;
+    }
+    let mut decoder = Decoder::new(payload);
+    if decoder.array::<8>().ok()? != INDEX_MAGIC
+        || decoder.u32().ok()? != INDEX_VERSION
+        || decoder.array::<32>().ok()? != params.fingerprint().ok()?
+    {
+        return None;
+    }
+    let covered = usize::try_from(decoder.u64().ok()?).ok()?;
+    let covered_length = decoder.u64().ok()?;
+    let covered_digest = decoder.array::<32>().ok()?;
+    let transactions = decoder.count().ok()?;
+    let addresses = decoder.count().ok()?;
+    let expected = INDEX_HEADER_BYTES
+        .checked_add(transactions.checked_mul(INDEX_TRANSACTION_BYTES)?)?
+        .checked_add(addresses.checked_mul(INDEX_ADDRESS_BYTES)?)?;
+    if expected != payload.len() || covered > record_count {
+        return None;
+    }
+    let mut locators: Vec<BlockRecordLocator> =
+        index.blocks.values().map(|entry| entry.locator).collect();
+    locators.sort_unstable_by_key(|locator| locator.ordinal);
+    if locators.len() != record_count {
+        return None;
+    }
+    let bound = match covered.checked_sub(1).map(|position| locators[position]) {
+        Some(locator) => {
+            locator.complete_digest == covered_digest
+                && locator.offset.checked_add(locator.length) == Some(covered_length)
+        }
+        None => covered_length == 0 && covered_digest == EMPTY_RECORD_CHAIN_ROOT,
+    };
+    if !bound {
+        return None;
+    }
+    let mut transaction_index = TransactionIndex::default();
+    for _ in 0..transactions {
+        let txid = decoder.array::<32>().ok()?;
+        let block_id = decoder.array::<32>().ok()?;
+        let transaction_position = usize::try_from(decoder.u64().ok()?).ok()?;
+        if !index.blocks.contains_key(&block_id) {
+            return None;
+        }
+        transaction_index.insert_location(
+            txid,
+            TransactionLocation {
+                block_id,
+                transaction_position,
+            },
+        );
+    }
+    let mut address_index = AddressHistoryIndex::default();
+    for _ in 0..addresses {
+        let address = decoder.array::<32>().ok()?;
+        let block_id = decoder.array::<32>().ok()?;
+        let height = decoder.u64().ok()?;
+        let position = usize::try_from(decoder.u64().ok()?).ok()?;
+        if !index.blocks.contains_key(&block_id) {
+            return None;
+        }
+        address_index.insert_entries([(
+            address,
+            AddressLocation {
+                height,
+                position,
+                block_id,
+            },
+        )]);
+    }
+    for locator in &locators[covered..] {
+        let (_, block) =
+            read_located_record(log, log_path, locator, params.network_id, false).ok()?;
+        transaction_index.insert_block(
+            block.block_id(),
+            block.transactions.iter().map(Transaction::txid),
+        );
+        address_index.insert_entries(AddressHistoryIndex::stored_block_entries(&block));
+    }
+    Some((transaction_index, address_index))
+}
+
+/// Moves the startup caches aside after the history scrub found the log and
+/// the caches disagreeing. The next start then scans or replays the log, which
+/// stays authoritative.
+pub(super) fn quarantine_startup_caches(data_dir: &Path) {
+    let stamp = super::unix_time_seconds().unwrap_or_default();
+    let names = [
+        format!("{STARTUP_SNAPSHOT_FILE_PREFIX}.0.bin"),
+        format!("{STARTUP_SNAPSHOT_FILE_PREFIX}.1.bin"),
+        INDEX_FILE.to_owned(),
+    ];
+    for name in names {
+        let path = data_dir.join(&name);
+        if path.exists() {
+            let _ = fs::rename(&path, data_dir.join(format!("{name}.invalid-{stamp}")));
+        }
+    }
+    let _ = sync_parent_directory(&data_dir.join(INDEX_FILE));
+}
+
+fn index_digest(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Hasher::new_derive_key(INDEX_INTEGRITY_DOMAIN);
+    hasher.update(bytes);
+    *hasher.finalize().as_bytes()
 }
 
 #[cfg(test)]

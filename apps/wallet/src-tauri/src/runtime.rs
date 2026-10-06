@@ -57,6 +57,8 @@ enum NodeAvailability {
 struct ServiceHandles {
     inbound: InboundPeerHandle,
     pruner: Option<PrunerHandle>,
+    /// Background check of the block history a fast start did not re-read.
+    history_scrub: Option<cmfd_node::HistoryScrub>,
 }
 
 struct EmbeddedNode {
@@ -666,10 +668,15 @@ fn start_embedded_node(
             return Err(error);
         }
     };
+    let history_scrub = cmfd_node::spawn_history_scrub(Arc::clone(&shared)).ok();
     Ok(EmbeddedNode {
         node: shared,
         peers,
-        services: ServiceHandles { inbound, pruner },
+        services: ServiceHandles {
+            inbound,
+            pruner,
+            history_scrub,
+        },
         #[cfg(feature = "production-v4")]
         production_v4_pool_search,
     })
@@ -686,6 +693,9 @@ fn stop_runtime_parts(runtime: &mut RuntimeParts) {
         let _ = services.inbound.stop();
         if let Some(pruner) = services.pruner {
             pruner.stop();
+        }
+        if let Some(history_scrub) = services.history_scrub {
+            history_scrub.stop();
         }
     }
     if let NodeAvailability::Ready(node) = &runtime.node

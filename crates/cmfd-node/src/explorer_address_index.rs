@@ -87,6 +87,17 @@ impl AddressHistoryIndex {
         entries
     }
 
+    /// Every (address, location) pair, for the startup index cache.
+    pub fn entries(&self) -> impl Iterator<Item = ([u8; 32], AddressLocation)> + '_ {
+        self.locations.iter().flat_map(|(address, locations)| {
+            locations.iter().map(move |location| (*address, *location))
+        })
+    }
+
+    pub fn entry_count(&self) -> usize {
+        self.locations.values().map(BTreeSet::len).sum()
+    }
+
     pub fn insert_entries(
         &mut self,
         entries: impl IntoIterator<Item = ([u8; 32], AddressLocation)>,

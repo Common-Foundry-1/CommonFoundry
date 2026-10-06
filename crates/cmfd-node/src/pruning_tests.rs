@@ -477,3 +477,35 @@ fn the_background_pruner_prunes_and_stops_promptly() {
     assert!(dropping.elapsed() < std::time::Duration::from_secs(2));
     assert_eq!(std::sync::Arc::strong_count(&shared), 1);
 }
+
+#[test]
+fn already_pruned_history_counts_at_its_real_size_for_free_space() {
+    let dir = TestDirectory::new("space-pruned");
+    let mut node = Node::open_with_profile(&dir.0, DEVNET_PROFILE).unwrap();
+    let miner = node.wallet_destination();
+    node.prune_keep_blocks = Some(10);
+    mine_to(&mut node, 140, miner);
+    assert_eq!(node.prune_block_log().unwrap().unwrap().anchor_height, 128);
+    mine_to(&mut node, 210, miner);
+
+    // Enough for the real need: the full blocks twice, the pruned prefix at
+    // its actual size, an allowance per newly pruned block and the margin.
+    // That is far less than an allowance for each of the 128 records pruned
+    // before, which the rule must not charge.
+    let (mut full, mut prefix) = (0_u64, 0_u64);
+    for entry in node.index.blocks.values() {
+        if entry.locator.version == BlockRecordVersion::Pruned {
+            prefix += entry.locator.length;
+        } else {
+            full += entry.locator.length;
+        }
+    }
+    let allowance = pruning::PRUNED_RECORD_ALLOWANCE_BYTES;
+    let margin = pruning::PRUNE_FREE_SPACE_MARGIN_BYTES;
+    let enough = 2 * full + prefix + 64 * allowance + margin;
+    assert!(enough < 2 * full + 192 * allowance + margin);
+    pruning::set_free_space_for_test(Some(enough));
+    let report = node.prune_block_log();
+    pruning::set_free_space_for_test(None);
+    assert_eq!(report.unwrap().unwrap().anchor_height, 192);
+}

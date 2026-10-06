@@ -603,18 +603,19 @@ pub const PRUNE_CHECK_INTERVAL: Duration = Duration::from_secs(600);
 
 /// Free space a prune keeps in reserve beyond its own temporary log, so the
 /// blocks appended while it runs never hit a full disk.
-const PRUNE_FREE_SPACE_MARGIN_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-/// Generous per-block allowance for a pruned record in the temporary log.
-const PRUNED_RECORD_ALLOWANCE_BYTES: u64 = 64 * 1024;
+pub(crate) const PRUNE_FREE_SPACE_MARGIN_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Generous allowance for a block being pruned now; its pruned record does not
+/// exist yet. Records pruned earlier are counted at their actual size.
+pub(crate) const PRUNED_RECORD_ALLOWANCE_BYTES: u64 = 64 * 1024;
 
 /// Free space a prune needs before it starts writing its temporary log: room
-/// for twice the full blocks it keeps, an allowance per pruned record, and a
+/// for twice the full blocks it keeps, the pruned prefix it rewrites, and a
 /// margin. Below that the prune waits for a later check instead of filling
 /// the disk under the node's own block appends.
-fn prune_free_space_required(kept_bytes: u64, pruned_records: u64) -> u64 {
+fn prune_free_space_required(kept_bytes: u64, pruned_prefix_bytes: u64) -> u64 {
     kept_bytes
         .saturating_mul(2)
-        .saturating_add(pruned_records.saturating_mul(PRUNED_RECORD_ALLOWANCE_BYTES))
+        .saturating_add(pruned_prefix_bytes)
         .saturating_add(PRUNE_FREE_SPACE_MARGIN_BYTES)
 }
 
@@ -904,7 +905,17 @@ impl super::Node {
             .iter()
             .map(|entry| entry.locator.length)
             .fold(0_u64, u64::saturating_add);
-        let required = prune_free_space_required(kept_bytes, pruned.len() as u64);
+        let pruned_prefix_bytes = pruned
+            .iter()
+            .map(|entry| {
+                if entry.locator.version == super::BlockRecordVersion::Pruned {
+                    entry.locator.length
+                } else {
+                    PRUNED_RECORD_ALLOWANCE_BYTES
+                }
+            })
+            .fold(0_u64, u64::saturating_add);
+        let required = prune_free_space_required(kept_bytes, pruned_prefix_bytes);
         match available_space(&self.data_dir) {
             Ok(available) if available >= required => {}
             Ok(available) => {
@@ -1338,9 +1349,12 @@ mod tests {
             PRUNE_FREE_SPACE_MARGIN_BYTES
         );
         let kept = 720 * 12_000_000_u64;
+        // A year of history already pruned (~5 KB per record) plus 64 newly
+        // pruned blocks costs megabytes, not 64 KiB per historical record.
+        let prefix = 525_000 * 5_000 + 64 * PRUNED_RECORD_ALLOWANCE_BYTES;
         assert_eq!(
-            prune_free_space_required(kept, 5_000),
-            2 * kept + 5_000 * PRUNED_RECORD_ALLOWANCE_BYTES + PRUNE_FREE_SPACE_MARGIN_BYTES
+            prune_free_space_required(kept, prefix),
+            2 * kept + prefix + PRUNE_FREE_SPACE_MARGIN_BYTES
         );
         assert_eq!(prune_free_space_required(u64::MAX, u64::MAX), u64::MAX);
     }

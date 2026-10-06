@@ -42,7 +42,7 @@ primitive-types.workspace = true
 rcgen = "=0.14.5"
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 sha2 = "0.10"
 thiserror.workspace = true
 # Keep the certificate stack on the versions exercised by this Devnet release.
@@ -50,6 +50,8 @@ time = { version = "=0.3.47", default-features = false }
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
+# Mozilla root certificates for the exchange wallet's HTTPS upstream.
+webpki-roots = "1"
 zeroize.workspace = true
 
 [target.'cfg(unix)'.dependencies]

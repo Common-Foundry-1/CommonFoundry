@@ -480,6 +480,18 @@ enum Command {
         #[arg(long)]
         key: PathBuf,
     },
+    /// Run a Bitcoin Core-compatible wallet daemon for exchanges. It keeps
+    /// the exchange's keys in --wallet-dir and reads the chain from an
+    /// exchange RPC endpoint (the hosted endpoint or your own node), so no
+    /// chain is stored locally. Settings come from cmfd-wallet.conf.
+    ExchangeWallet {
+        /// Directory holding wallet.json (the keys) and the wallet's state.
+        #[arg(long)]
+        wallet_dir: PathBuf,
+        /// Settings file [default: <wallet-dir>/cmfd-wallet.conf].
+        #[arg(long)]
+        conf: Option<PathBuf>,
+    },
     /// Build and sign a withdrawal from a JSON request (offline; no node or
     /// data directory). Prints the transaction hex for sendrawtransaction.
     ExchangeTxSign {
@@ -916,6 +928,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "destination_hex": hex::encode(cmfd_node::exchange_tx_tool::destination_of(&key)),
             }))?
         );
+        return Ok(());
+    }
+    if let Command::ExchangeWallet { wallet_dir, conf } = &cli.command {
+        let _log_guard = cmfd_node::logging::init_tracing(wallet_dir, cli.verbose.max(2));
+        let conf = conf
+            .clone()
+            .unwrap_or_else(|| wallet_dir.join(cmfd_node::exchange_wallet_rpc::CONFIG_FILE));
+        cmfd_node::exchange_wallet_rpc::run(
+            wallet_dir,
+            &conf,
+            COMPILED_NETWORK_PROFILE.network_id,
+            COMPILED_NETWORK_PROFILE.short_name(),
+        )?;
         return Ok(());
     }
     if let Command::ExchangeTxSign { request } = &cli.command {
@@ -1437,6 +1462,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::ExchangeKeyNew { .. }
         | Command::ExchangeKeyShow { .. }
+        | Command::ExchangeWallet { .. }
         | Command::ExchangeTxSign { .. } => {
             unreachable!("exchange key and withdrawal tools exit before node initialization")
         }

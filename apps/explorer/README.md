@@ -203,5 +203,11 @@ npm test -- --run
 npm run deploy
 ```
 
+The same sequence runs automatically from `.github/workflows/deploy-explorer.yml` whenever a
+change under `apps/explorer/` lands on `main` (or on manual dispatch). It deploys only the default
+Worker environment and needs the repository secrets `CLOUDFLARE_API_TOKEN` (an "Edit Cloudflare
+Workers" token) and `CLOUDFLARE_ACCOUNT_ID`. After deploying it fetches an `/address/<hash>` deep
+link from `explorer.commonfoundry.ai` and fails if the explorer page is not served.
+
 Keep the node RPC bound to `127.0.0.1:22443`. Do not open that port on the router or expose the
 unrestricted RPC service directly. The tunnel connector and node must run on the same trusted host.

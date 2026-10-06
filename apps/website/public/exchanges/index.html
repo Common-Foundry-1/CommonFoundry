@@ -1,0 +1,412 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Common Foundry for Exchanges</title>
+<meta name="description" content="How exchanges list CMFD with the Bitcoin Core-compatible exchange wallet: setup, deposits, withdrawals, RPC methods, differences from Bitcoin and the hosted endpoint.">
+<link rel="icon" href="/assets/common-foundry-mark.png">
+<style>
+@font-face { font-family: "Rajdhani"; font-style: normal; font-weight: 600; font-display: swap; src: url("/exchanges/fonts/rajdhani-latin-600-normal.woff2") format("woff2"); }
+@font-face { font-family: "Rajdhani"; font-style: normal; font-weight: 700; font-display: swap; src: url("/exchanges/fonts/rajdhani-latin-700-normal.woff2") format("woff2"); }
+@font-face { font-family: "Inter Variable"; font-style: normal; font-weight: 100 900; font-display: swap; src: url("/exchanges/fonts/inter-latin-wght-normal.woff2") format("woff2-variations"); }
+html { -webkit-text-size-adjust: 100%; }
+body { margin: 0; }
+img { max-width: 100%; }
+[hidden] { display: none !important; }
+/* Layout: sticky contents rail beside one reading column; stacks to a single column on phones. Dark-first, following the Common Foundry site (graphite, mineral, copper). */
+:root {
+  --bg: #090a0a;
+  --surface: #121414;
+  --surface-2: #191b1b;
+  --fg: #f2f0ec;
+  --muted: #a6a39e;
+  --line: rgba(242, 240, 236, 0.12);
+  --accent: #ec7a30;
+  --accent-strong: #f6a05a;
+  --accent-soft: rgba(236, 122, 48, 0.14);
+  --good: #6fbf8a;
+  --bad: #e5695a;
+  --code-bg: #0e0f0f;
+  --display: "Rajdhani", "Arial Narrow", sans-serif;
+  --body: "Inter Variable", "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  color-scheme: dark;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg: #fbfaf7; --surface: #f2f0ec; --surface-2: #e9e6e0; --fg: #171919; --muted: #5d5b57;
+    --line: rgba(23, 25, 25, 0.14); --accent: #bd4210; --accent-strong: #9a360c; --accent-soft: rgba(189, 66, 16, 0.1);
+    --good: #2e7d4f; --bad: #b3362a; --code-bg: #f4f2ee; color-scheme: light;
+  }
+}
+:root[data-theme="light"] {
+  --bg: #fbfaf7; --surface: #f2f0ec; --surface-2: #e9e6e0; --fg: #171919; --muted: #5d5b57;
+  --line: rgba(23, 25, 25, 0.14); --accent: #bd4210; --accent-strong: #9a360c; --accent-soft: rgba(189, 66, 16, 0.1);
+  --good: #2e7d4f; --bad: #b3362a; --code-bg: #f4f2ee; color-scheme: light;
+}
+
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--fg); font-family: var(--body); font-size: 16px; line-height: 1.65; padding-inline: 16px; }
+a { color: var(--accent-strong); text-underline-offset: 3px; }
+a:hover { color: var(--accent); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 3px; }
+code, pre, kbd { font-family: var(--mono); }
+code { font-size: 0.88em; background: var(--surface-2); padding: 0.1em 0.35em; border-radius: 4px; overflow-wrap: anywhere; }
+
+.page { max-width: 1180px; margin-inline: auto; padding-block: 28px 64px; }
+
+/* Masthead */
+.masthead { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px 24px; padding-block: 4px 18px; border-bottom: 1px solid var(--line); }
+.brand { color: var(--fg); text-decoration: none; font-family: var(--display); font-weight: 700; font-size: 1.35rem; letter-spacing: 0.08em; text-transform: uppercase; }
+.brand span { color: var(--accent); }
+.release { font-family: var(--mono); font-size: 0.8rem; color: var(--muted); }
+
+/* Hero */
+.hero { padding-block: 48px 40px; display: grid; gap: 18px; max-width: 860px; }
+.eyebrow { font-family: var(--display); font-weight: 600; text-transform: uppercase; letter-spacing: 0.16em; font-size: 0.9rem; color: var(--accent); }
+h1 { font-family: var(--display); font-weight: 700; font-size: clamp(2.4rem, 6vw, 4.1rem); line-height: 1.02; margin: 0; text-wrap: balance; letter-spacing: 0.01em; }
+.lede { font-size: 1.15rem; color: var(--muted); max-width: 62ch; margin: 0; }
+.lede strong { color: var(--fg); font-weight: 600; }
+.hero-actions { display: flex; flex-wrap: wrap; gap: 10px; padding-top: 6px; }
+.button { display: inline-flex; align-items: center; gap: 8px; padding: 10px 16px; border-radius: 6px; font-weight: 600; font-size: 0.95rem; text-decoration: none; border: 1px solid var(--line); color: var(--fg); background: var(--surface); }
+.button.primary { background: var(--accent); border-color: var(--accent); color: #140802; }
+.button.primary:hover { background: var(--accent-strong); color: #140802; }
+.button:hover { border-color: var(--accent); color: var(--fg); }
+
+/* Spec strip: the chain facts an integrator configures */
+.spec { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; margin-block: 8px 8px; }
+.spec div { padding: 14px 16px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); margin: -1px -1px 0 0; }
+.spec dt { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.12em; color: var(--muted); }
+.spec dd { margin: 2px 0 0; font-family: var(--display); font-weight: 600; font-size: 1.45rem; line-height: 1.15; font-variant-numeric: tabular-nums; }
+.spec dd small { font-family: var(--body); font-weight: 400; font-size: 0.78rem; color: var(--muted); display: block; line-height: 1.35; }
+
+/* Body layout */
+.layout { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 56px; padding-top: 40px; }
+.toc { position: sticky; top: calc(env(safe-area-inset-top, 0px) + 20px); align-self: start; font-size: 0.9rem; }
+.toc p { font-family: var(--display); text-transform: uppercase; letter-spacing: 0.14em; font-size: 0.78rem; color: var(--muted); margin: 0 0 10px; font-weight: 600; }
+.toc ol { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; border-left: 1px solid var(--line); }
+.toc a { display: block; padding: 4px 0 4px 14px; color: var(--muted); text-decoration: none; margin-left: -1px; border-left: 2px solid transparent; }
+.toc a:hover { color: var(--fg); border-left-color: var(--accent); }
+main { min-width: 0; max-width: 760px; }
+section { padding-bottom: 44px; margin-bottom: 44px; border-bottom: 1px solid var(--line); scroll-margin-top: 20px; }
+section:last-of-type { border-bottom: 0; }
+h2 { font-family: var(--display); font-weight: 700; font-size: 2rem; line-height: 1.1; margin: 0 0 14px; text-wrap: balance; letter-spacing: 0.01em; }
+h3 { font-family: var(--display); font-weight: 600; font-size: 1.3rem; margin: 28px 0 8px; letter-spacing: 0.02em; }
+p { margin: 0 0 14px; max-width: 68ch; }
+ul.plain { margin: 0 0 14px; padding-left: 1.2em; display: grid; gap: 6px; }
+ul.plain li::marker { color: var(--accent); }
+
+/* Steps: a real sequence, so they are numbered */
+.steps { list-style: none; margin: 18px 0 0; padding: 0; display: grid; gap: 28px; counter-reset: step; }
+.steps > li { counter-increment: step; display: grid; grid-template-columns: 44px minmax(0, 1fr); gap: 4px 16px; }
+.steps > li::before { content: counter(step); grid-row: span 3; font-family: var(--display); font-weight: 700; font-size: 1.5rem; color: var(--accent); border: 1px solid var(--accent); border-radius: 50%; width: 40px; height: 40px; display: grid; place-items: center; line-height: 1; }
+.steps h3 { margin: 6px 0 4px; }
+.steps > li > * { grid-column: 2; min-width: 0; }
+
+/* Code */
+.code { position: relative; margin: 10px 0 16px; border: 1px solid var(--line); border-radius: 8px; background: var(--code-bg); }
+.code .label { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 6px 8px 6px 14px; border-bottom: 1px solid var(--line); font-size: 0.75rem; color: var(--muted); font-family: var(--mono); }
+.code pre { margin: 0; padding: 14px; overflow-x: auto; font-size: 0.84rem; line-height: 1.6; color: var(--fg); }
+.code pre .c { color: var(--muted); }
+.code pre .k { color: var(--accent-strong); }
+.copy { font: 500 0.75rem var(--body); color: var(--fg); background: var(--surface-2); border: 1px solid var(--line); border-radius: 5px; padding: 3px 10px; cursor: pointer; }
+.copy:hover { border-color: var(--accent); }
+
+/* Tables */
+.table-wrap { overflow-x: auto; margin: 10px 0 16px; border: 1px solid var(--line); border-radius: 8px; }
+table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
+th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
+tr:last-child td { border-bottom: 0; }
+th { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); font-weight: 600; background: var(--surface); }
+td:first-child { font-weight: 600; white-space: nowrap; }
+td code { white-space: nowrap; }
+
+/* Differences: label / explanation pairs */
+.diffs { display: grid; gap: 0; margin: 12px 0 0; border-top: 1px solid var(--line); }
+.diffs div { display: grid; grid-template-columns: 190px minmax(0, 1fr); gap: 4px 20px; padding: 14px 0; border-bottom: 1px solid var(--line); }
+.diffs dt { font-family: var(--display); font-weight: 600; font-size: 1.1rem; color: var(--accent-strong); line-height: 1.4; }
+.diffs dd { margin: 0; }
+
+.note { border-left: 3px solid var(--accent); background: var(--accent-soft); padding: 12px 16px; border-radius: 0 6px 6px 0; margin: 14px 0; }
+.note p:last-child { margin-bottom: 0; }
+
+/* Address checker */
+.checker { border: 1px solid var(--line); background: var(--surface); border-radius: 8px; padding: 16px; display: grid; gap: 10px; margin: 14px 0; }
+.checker label { font-weight: 600; font-size: 0.9rem; }
+.checker input { width: 100%; font: 0.85rem var(--mono); padding: 10px 12px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); }
+.checker input:focus { outline: 2px solid var(--accent); outline-offset: 0; }
+.verdict { font-size: 0.92rem; min-height: 1.5em; display: flex; gap: 8px; align-items: baseline; }
+.verdict .pill { font: 600 0.72rem var(--body); text-transform: uppercase; letter-spacing: 0.08em; padding: 2px 8px; border-radius: 999px; border: 1px solid currentColor; white-space: nowrap; }
+.verdict.ok { color: var(--good); }
+.verdict.no { color: var(--bad); }
+.verdict.idle { color: var(--muted); }
+
+footer { border-top: 1px solid var(--line); padding-top: 22px; margin-top: 12px; color: var(--muted); font-size: 0.88rem; display: flex; flex-wrap: wrap; gap: 8px 28px; justify-content: space-between; }
+footer a { color: var(--muted); }
+footer a:hover { color: var(--accent); }
+.mono-small { font-family: var(--mono); font-size: 0.78rem; overflow-wrap: anywhere; }
+
+@media (max-width: 900px) {
+  .layout { grid-template-columns: minmax(0, 1fr); gap: 24px; }
+  .toc { position: static; }
+  .toc ol { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); border-left: 0; gap: 4px 12px; }
+  .toc a { border-left: 2px solid var(--line); }
+}
+@media (max-width: 560px) {
+  .diffs div { grid-template-columns: minmax(0, 1fr); }
+  .steps > li { grid-template-columns: 34px minmax(0, 1fr); gap: 4px 12px; }
+  .steps > li::before { width: 32px; height: 32px; font-size: 1.15rem; }
+  h2 { font-size: 1.7rem; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+</style>
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <a class="brand" href="/">Common <span>Foundry</span></a>
+    <div class="release">Mainnet · release v1.0.10 · exchange integration</div>
+  </header>
+
+  <div class="hero">
+    <div class="eyebrow">For exchanges</div>
+    <h1>List CMFD the way you list Bitcoin.</h1>
+    <p class="lede">Run <strong>cmfd-node exchange-wallet</strong> on your own server and point your existing Bitcoin integration at it. It answers Bitcoin Core's wallet RPC (<code>getnewaddress</code>, <code>listsinceblock</code>, <code>sendtoaddress</code> and the rest), keeps your keys with you, and reads the chain from our hosted endpoint, so you never download the chain.</p>
+    <div class="hero-actions">
+      <a class="button primary" href="#setup">Set it up in four steps</a>
+      <a class="button" href="https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/tag/v1.0.10">Download v1.0.10</a>
+    </div>
+  </div>
+
+  <dl class="spec" aria-label="Chain facts">
+    <div><dt>Ticker</dt><dd>CMFD<small>8 decimals; 1 CMFD = 100,000,000 atoms</small></dd></div>
+    <div><dt>Block time</dt><dd>60 s<small>target interval</small></dd></div>
+    <div><dt>Credit deposits after</dt><dd>60 conf.<small>about one hour</small></dd></div>
+    <div><dt>Network fee</dt><dd>0.1 CMFD<small>flat per transaction, burned</small></dd></div>
+    <div><dt>Address</dt><dd>64 hex<small>x-only public key, no checksum</small></dd></div>
+    <div><dt>Coinbase maturity</dt><dd>100 blocks<small>mined coins spend after 100 blocks</small></dd></div>
+  </dl>
+
+  <div class="layout">
+    <nav class="toc" aria-label="Contents">
+      <p>Contents</p>
+      <ol>
+        <li><a href="#setup">Setup</a></li>
+        <li><a href="#deposits">Deposits</a></li>
+        <li><a href="#withdrawals">Withdrawals</a></li>
+        <li><a href="#methods">RPC methods</a></li>
+        <li><a href="#differences">Differences from Bitcoin</a></li>
+        <li><a href="#addresses">Checking addresses</a></li>
+        <li><a href="#operations">Security and operations</a></li>
+        <li><a href="#endpoint">Hosted endpoint</a></li>
+        <li><a href="#advanced">Advanced route</a></li>
+      </ol>
+    </nav>
+
+    <main>
+      <section id="setup">
+        <h2>Setup</h2>
+        <p>You need a Linux or Windows server, the hosted-endpoint credential Common Foundry issues to your exchange, and about ten minutes.</p>
+        <ol class="steps">
+          <li>
+            <h3>Download and verify the release</h3>
+            <p>Get the runtime archive for your platform from the <a href="https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/tag/v1.0.10">v1.0.10 release</a>, together with <code>SHA256SUMS.txt</code>, <code>SHA256SUMS.txt.sig</code> and <code>MAINNET-RELEASE.allowed_signers</code>. Check the signature, then the archive.</p>
+            <div class="code"><div class="label"><span>shell</span><button class="copy" type="button">Copy</button></div><pre>ssh-keygen -Y verify -f MAINNET-RELEASE.allowed_signers \
+  -I commonfoundry-mainnet-owner -n commonfoundry-release \
+  -s SHA256SUMS.txt.sig &lt; SHA256SUMS.txt
+sha256sum --ignore-missing -c SHA256SUMS.txt
+tar -xzf commonfoundry-mainnet-runtime-linux-x86_64-v1.0.10.tar.gz</pre></div>
+            <p>The signing key is <span class="mono-small">SHA256:cA1Tsf8hL/pxDV5WpOE3iPW3b4uDQosu1dOh//4a/fk</span>. The wallet is part of <code>cmfd-node</code> in that archive; Windows uses the <code>.zip</code> runtime and <code>cmfd-node.exe</code>.</p>
+          </li>
+          <li>
+            <h3>Write the settings file</h3>
+            <p>Create a directory for the wallet and put <code>cmfd-wallet.conf</code> in it. The format is the familiar <code>bitcoin.conf</code> style.</p>
+            <div class="code"><div class="label"><span>/var/lib/cmfd-wallet/cmfd-wallet.conf</span><button class="copy" type="button">Copy</button></div><pre><span class="c"># Your integration logs in to the wallet with these (HTTP Basic).</span>
+rpcuser=exchange
+rpcpassword=&lt;at least 16 random characters&gt;
+<span class="c"># Default: listen on 127.0.0.1:39120. To accept another host, set
+# rpcbind and list every allowed address or network with rpcallowip.</span>
+<span class="c">#rpcbind=10.0.0.5
+#rpcport=39120
+#rpcallowip=10.0.0.0/8</span>
+<span class="c"># Where the wallet reads the chain.</span>
+upstream=https://sg-rpc.commonfoundry.ai/mainnet
+upstreamuser=&lt;your hosted-endpoint user&gt;
+upstreampassword=&lt;your hosted-endpoint password&gt;</pre></div>
+          </li>
+          <li>
+            <h3>Start the wallet and back it up</h3>
+            <p>On first start the wallet creates <code>wallet.json</code>, which holds your keys. Back it up straight away. Every address the wallet will ever hand out derives from that one file, so you never need a new backup after <code>getnewaddress</code>.</p>
+            <div class="code"><div class="label"><span>shell</span><button class="copy" type="button">Copy</button></div><pre>./cmfd-node exchange-wallet --wallet-dir /var/lib/cmfd-wallet</pre></div>
+            <p>To run it as a service, a systemd unit like this works. The wallet saves its state when it receives the stop signal.</p>
+            <div class="code"><div class="label"><span>/etc/systemd/system/cmfd-wallet.service</span><button class="copy" type="button">Copy</button></div><pre>[Unit]
+Description=Common Foundry exchange wallet
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=cmfd
+ExecStart=/opt/cmfd/cmfd-node exchange-wallet --wallet-dir /var/lib/cmfd-wallet
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target</pre></div>
+          </li>
+          <li>
+            <h3>Point your Bitcoin integration at it</h3>
+            <p>Use host <code>127.0.0.1</code>, port <code>39120</code> and the <code>rpcuser</code> / <code>rpcpassword</code> from step 2 in whatever Bitcoin client library or adapter you already run. <code>bitcoin-cli</code> works too:</p>
+            <div class="code"><div class="label"><span>shell</span><button class="copy" type="button">Copy</button></div><pre>bitcoin-cli -rpcport=39120 -rpcuser=exchange -rpcpassword=… getblockchaininfo
+bitcoin-cli -rpcport=39120 -rpcuser=exchange -rpcpassword=… encryptwallet "&lt;passphrase&gt;"
+bitcoin-cli -rpcport=39120 -rpcuser=exchange -rpcpassword=… backupwallet /secure/cmfd-wallet.json</pre></div>
+            <p>Encrypt before the wallet holds funds, then back up again: a backup taken before encryption still holds the unencrypted key.</p>
+          </li>
+        </ol>
+      </section>
+
+      <section id="deposits">
+        <h2>Deposits</h2>
+        <p>Give each customer an address with <code>getnewaddress "user-123"</code>. The label is yours to use for your own reference. Then follow incoming payments the same way you do with bitcoind:</p>
+        <div class="code"><div class="label"><span>bitcoin-cli … listsinceblock "&lt;lastblock&gt;" 60</span><button class="copy" type="button">Copy</button></div><pre>{
+  "transactions": [
+    {
+      "address": "9f0c5e…e41a",
+      "category": "receive",
+      "amount": 12.34567890,
+      "label": "user-123",
+      "vout": 0,
+      "confirmations": 60,
+      "blockhash": "4b1d0e…77c2",
+      "blockheight": 3912,
+      "txid": "a7e310…0c95",
+      "time": 1791249601
+    }
+  ],
+  "removed": [],
+  "lastblock": "c03f18…9a40"
+}</pre></div>
+        <ul class="plain">
+          <li>Credit a deposit once <code>confirmations</code> reaches <strong>60</strong>. Passing <code>60</code> as the second argument keeps a transaction in every reply until it gets there.</li>
+          <li>Store <code>lastblock</code> and pass it to the next call.</li>
+          <li>Entries in <code>removed</code> were dropped by a chain reorganization. Reverse any credit you gave for them.</li>
+          <li>Deposits appear once they are in a block (1 confirmation), not while they wait in the mempool.</li>
+          <li>Mined coins paid straight to a deposit address show as <code>immature</code> until they are 100 blocks deep, then as <code>generate</code>.</li>
+        </ul>
+        <p><code>gettransaction</code>, <code>getreceivedbyaddress</code>, <code>listreceivedbyaddress</code> and <code>listtransactions</code> work as you expect if your system uses them instead.</p>
+      </section>
+
+      <section id="withdrawals">
+        <h2>Withdrawals</h2>
+        <div class="code"><div class="label"><span>shell</span><button class="copy" type="button">Copy</button></div><pre>bitcoin-cli … walletpassphrase "&lt;passphrase&gt;" 60
+bitcoin-cli … sendtoaddress "&lt;customer address&gt;" 25.5 "withdrawal 8812"
+bitcoin-cli … gettransaction "&lt;txid&gt;"</pre></div>
+        <ul class="plain">
+          <li>Amounts take up to eight decimals. The 0.1 CMFD fee comes out of the wallet, or out of the payment when you set <code>subtractfeefromamount</code>.</li>
+          <li><code>sendmany</code> pays up to 127 recipients in one transaction.</li>
+          <li>The wallet records each payment before broadcasting it. If the endpoint cannot confirm the broadcast, <code>sendtoaddress</code> still returns the txid and the wallet keeps rebroadcasting until the payment is mined.</li>
+        </ul>
+        <div class="note">
+          <p><strong>Never send a withdrawal twice.</strong> If your call times out, look the payment up with <code>gettransaction</code> or <code>listtransactions</code> before trying again, exactly as you would with bitcoind.</p>
+        </div>
+        <p>This chain cannot spend an output until it is mined, so change from a payment returns after the next block, about a minute. The wallet splits change to keep at least 25 coins ready, which lets it make many withdrawals per block. If every coin is waiting, <code>sendtoaddress</code> returns error <code>-6</code> and says to retry after the next block.</p>
+      </section>
+
+      <section id="methods">
+        <h2>RPC methods</h2>
+        <p>JSON-RPC 1.0 and 2.0, batches and named parameters are accepted. Errors use Bitcoin Core's codes: <code>-5</code> invalid address, <code>-6</code> insufficient funds, <code>-13</code> wallet locked, <code>-14</code> wrong passphrase.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Group</th><th>Methods</th></tr></thead>
+            <tbody>
+              <tr><td>Addresses</td><td><code>getnewaddress</code> <code>getrawchangeaddress</code> <code>validateaddress</code> <code>getaddressinfo</code> <code>setlabel</code> <code>getaddressesbylabel</code> <code>listlabels</code></td></tr>
+              <tr><td>Deposits</td><td><code>listsinceblock</code> <code>listtransactions</code> <code>gettransaction</code> <code>getreceivedbyaddress</code> <code>listreceivedbyaddress</code> <code>listunspent</code></td></tr>
+              <tr><td>Balances</td><td><code>getbalance</code> <code>getbalances</code> <code>getunconfirmedbalance</code> <code>getwalletinfo</code></td></tr>
+              <tr><td>Withdrawals</td><td><code>sendtoaddress</code> <code>sendmany</code> <code>abandontransaction</code> <code>settxfee</code> <code>estimatesmartfee</code></td></tr>
+              <tr><td>Security</td><td><code>encryptwallet</code> <code>walletpassphrase</code> <code>walletlock</code> <code>walletpassphrasechange</code> <code>backupwallet</code></td></tr>
+              <tr><td>Chain and status</td><td><code>getblockchaininfo</code> <code>getblockcount</code> <code>getbestblockhash</code> <code>getblockhash</code> <code>getblock</code> <code>getrawtransaction</code> <code>sendrawtransaction</code> <code>getrawmempool</code> <code>getnetworkinfo</code> <code>getconnectioncount</code> <code>getinfo</code> <code>listwallets</code> <code>uptime</code> <code>ping</code> <code>help</code> <code>stop</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="differences">
+        <h2>Differences from Bitcoin Core</h2>
+        <p>These are the only places where your Bitcoin integration needs a setting or a second look.</p>
+        <dl class="diffs">
+          <div><dt>Addresses</dt><dd>64 lowercase hex characters (an x-only public key) with no checksum. Check every customer withdrawal address with <code>validateaddress</code>, and have customers paste rather than type it; see <a href="#addresses">Checking addresses</a>.</dd></div>
+          <div><dt>Fees</dt><dd>Every transaction pays the network minimum of 0.1 CMFD, which is burned. <code>settxfee</code>, <code>fee_rate</code> and <code>conf_target</code> are accepted and ignored; <code>estimatesmartfee</code> returns 0.1.</dd></div>
+          <div><dt>Change</dt><dd>Unconfirmed outputs cannot be spent, so change returns after one block. The wallet keeps 25 coins ready to cover this.</dd></div>
+          <div><dt>Incoming</dt><dd>Deposits appear once mined (1 confirmation), not while in the mempool.</dd></div>
+          <div><dt>Input limit</dt><dd>A transaction takes at most 128 inputs. When the wallet holds more than 200 coins, it merges the 128 smallest into one and pays the 0.1 CMFD fee for it. Merges are not listed by <code>listtransactions</code>; <code>gettransaction</code> shows them. Set <code>consolidatethreshold=0</code> to turn this off.</dd></div>
+          <div><dt>Not available</dt><dd>Raw-transaction building (<code>createrawtransaction</code>, <code>signrawtransactionwithwallet</code>, <code>fundrawtransaction</code>), key import and export, message signing, and multiple wallets.</dd></div>
+        </dl>
+      </section>
+
+      <section id="addresses">
+        <h2>Checking addresses</h2>
+        <p>Addresses carry no checksum. A valid address is 64 lowercase hex characters whose value is the x-coordinate of a point on the secp256k1 curve. That rule rejects malformed input and about half of all mistyped addresses, but the other half still form valid keys. Have customers paste or scan their withdrawal address rather than type it, and show it back to them before you send. Try the rule here; it runs in your browser and sends nothing anywhere.</p>
+        <div class="checker">
+          <label for="address-input">Common Foundry address</label>
+          <input id="address-input" type="text" spellcheck="false" autocomplete="off" placeholder="64 lowercase hex characters" value="79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798">
+          <div class="verdict idle" id="address-verdict" role="status" aria-live="polite"></div>
+        </div>
+        <p>The example is the secp256k1 generator point, a valid key that nobody should pay. Your integration should still call <code>validateaddress</code> on the wallet, which applies the same rule.</p>
+      </section>
+
+      <section id="operations">
+        <h2>Security and operations</h2>
+        <h3>Keys and backups</h3>
+        <ul class="plain">
+          <li><code>wallet.json</code> holds the master key (encrypted once you call <code>encryptwallet</code>), the address counters and labels. Back it up after creating and after encrypting the wallet.</li>
+          <li>Run one wallet process per <code>wallet.json</code>. Two copies spending from the same keys would compete for the same coins.</li>
+          <li>The RPC listens on <code>127.0.0.1</code> by default. Opening it to another host requires <code>rpcbind</code> plus <code>rpcallowip</code>; keep it on a private network.</li>
+        </ul>
+        <h3>Monitoring</h3>
+        <ul class="plain">
+          <li><code>getblockchaininfo</code> reports <code>blocks</code> (the wallet's height) and <code>headers</code> (the endpoint's); they should match within a block.</li>
+          <li><code>getconnectioncount</code> is 1 while the endpoint answers. <code>warnings</code> explains any problem.</li>
+          <li>The wallet keeps answering while the endpoint is unreachable and catches up when it returns. Logs are in <code>&lt;wallet-dir&gt;/logs</code>.</li>
+        </ul>
+        <h3>Restore</h3>
+        <p>Put <code>wallet.json</code> and <code>cmfd-wallet.conf</code> in an empty directory and start the wallet. It rescans from the block at which the wallet was created, about four blocks per second from the hosted endpoint, and finds every address, including ones handed out after the backup was made.</p>
+      </section>
+
+      <section id="endpoint">
+        <h2>Hosted endpoint</h2>
+        <p>Common Foundry runs the mainnet endpoint the wallet reads from, so you do not store the chain. Each exchange gets its own credential, delivered privately.</p>
+        <div class="table-wrap">
+          <table>
+            <tbody>
+              <tr><td>URL</td><td><code>https://sg-rpc.commonfoundry.ai/mainnet</code></td></tr>
+              <tr><td>Transport</td><td>HTTPS, JSON-RPC 2.0, HTTP Basic credentials per exchange</td></tr>
+              <tr><td>Rate limit</td><td>5 requests per second (burst 20) and 8 connections per IP. The wallet stays under it on its own.</td></tr>
+              <tr><td>Privacy</td><td>What one exchange registers or receives is visible only to that exchange's credential.</td></tr>
+              <tr><td>Network ID</td><td><span class="mono-small">88296bc39c10e8bc1dd4818d4d42412fe5f08210651110377f495da299812f62</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Prefer your own infrastructure? Run a full node with <code>cmfd-node run --exchange-rpc-bind 127.0.0.1:&lt;port&gt; --exchange-rpc-auth-file &lt;file&gt;</code> and set <code>upstream=http://127.0.0.1:&lt;port&gt;</code>. Plain <code>http://</code> is accepted only for this machine. A full node stores the chain, which grows by roughly 12 GB a day.</p>
+      </section>
+
+      <section id="advanced">
+        <h2>Advanced route</h2>
+        <p>Some exchanges prefer to hold one key file per address and build every transaction themselves. For that, the release includes offline tools (<code>exchange-key-new</code>, <code>exchange-tx-sign</code>) and the exchange JSON-RPC with deposit event streams. The <a href="https://github.com/Common-Foundry-1/CommonFoundry/blob/v1.0.10/exchange-kit/INTEGRATION-GUIDE.md">full integration guide</a> covers this route in detail, along with error catalogs and the hosted endpoint's method list.</p>
+      </section>
+    </main>
+  </div>
+
+  <footer>
+    <span>Common Foundry mainnet · exchange integration · v1.0.10</span>
+    <span>
+      <a href="https://github.com/Common-Foundry-1/CommonFoundry/blob/v1.0.10/exchange-kit/INTEGRATION-GUIDE.md">Integration guide</a> ·
+      <a href="https://github.com/Common-Foundry-1/CommonFoundry/blob/v1.0.10/docs/mainnet-release-verification.md">Release verification</a> ·
+      <a href="https://explorer.commonfoundry.ai">Explorer</a>
+    </span>
+  </footer>
+</div>
+
+<script src="/exchanges/guide.js" defer></script>
+</body>
+</html>

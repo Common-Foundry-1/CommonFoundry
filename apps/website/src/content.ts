@@ -14,6 +14,9 @@ export const MAINNET_RELEASE_KEY_URL = "/mainnet-release-key.txt";
 export const MAINNET_RELEASE_KEY_FINGERPRINT = "SHA256:cA1Tsf8hL/pxDV5WpOE3iPW3b4uDQosu1dOh//4a/fk";
 export const MAINNET_RELEASE_URL = "https://github.com/Common-Foundry-1/CommonFoundry/releases/latest";
 export const MAINNET_SEED_PEER = "173.249.35.251:29444";
+export const SUPPLY_API_URL = `${EXPLORER_URL}/api/supply`;
+/** Owner-set reference price for the burn counter's dollar value (not a market feed). */
+export const CMFD_USD_PRICE = 0.043;
 
 export type SectionId =
   | "launch"

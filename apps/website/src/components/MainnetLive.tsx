@@ -1,4 +1,5 @@
 import { EXPLORER_URL, MAINNET_FIRST_BLOCK_AT, MAINNET_LAUNCH_AT, WALLET_URL } from "../content";
+import { BurnCounter } from "./BurnCounter";
 
 export function MainnetLive() {
   return (
@@ -15,6 +16,7 @@ export function MainnetLive() {
           <a href={WALLET_URL} target="_blank" rel="noopener noreferrer">Web wallet</a>
         </p>
       </div>
+      <BurnCounter />
     </div>
   );
 }

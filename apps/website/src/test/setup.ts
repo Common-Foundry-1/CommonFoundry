@@ -4,6 +4,9 @@ import { afterEach } from "vitest";
 
 afterEach(cleanup);
 
+// Components that poll public APIs stay idle unless a test stubs fetch.
+globalThis.fetch = () => new Promise<Response>(() => undefined);
+
 Object.defineProperty(window, "matchMedia", {
   writable: true,
   value: (query: string) => ({

@@ -181,6 +181,29 @@
   text-transform: uppercase;
 }
 
+.burn-counter {
+  display: grid;
+  gap: 0.6rem;
+  min-width: 0;
+}
+
+.burn-counter__figures {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: clamp(0.4rem, 1vw, 0.85rem);
+}
+
+.burn-counter .mainnet-countdown__unit strong {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  font-size: clamp(1.9rem, 3.2vw, 3.4rem);
+}
+
+.burn-counter__note {
+  color: var(--mineral-300);
+  font-size: 0.9rem;
+}
+
 .mainnet-countdown__reached {
   max-width: 32rem;
   color: var(--mineral-100);

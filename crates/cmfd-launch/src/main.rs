@@ -10,8 +10,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use clap::{Parser, Subcommand};
 use cmfd_launch::{
     LOCAL_TIME_ZONE, MAINNET_BEACON_ROUND, MAINNET_LAUNCH_UNIX_SECONDS, MAINNET_LAUNCH_UTC,
-    MAX_BEACON_DOCUMENT_BYTES, QUICKNET_CHAIN_HASH, QUICKNET_PUBLIC_KEY, QUICKNET_SCHEME,
-    SOURCE_RELEASE_UNIX_SECONDS, SOURCE_RELEASE_UTC, parse_certificate, verify_mainnet_launch,
+    MAX_BEACON_DOCUMENT_BYTES, QUICKNET_BEACON_ID, QUICKNET_CHAIN_HASH, QUICKNET_PUBLIC_KEY,
+    QUICKNET_SCHEME, SOURCE_RELEASE_UNIX_SECONDS, SOURCE_RELEASE_UTC, parse_certificate,
+    verify_mainnet_launch,
 };
 use serde_json::json;
 
@@ -71,7 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "beacon_public_key": QUICKNET_PUBLIC_KEY,
                 "beacon_scheme": QUICKNET_SCHEME,
                 "beacon_round": MAINNET_BEACON_ROUND,
-                "beacon_url": format!("https://api.drand.sh/v2/beacons/{QUICKNET_CHAIN_HASH}/rounds/{MAINNET_BEACON_ROUND}"),
+                "beacon_url": format!("https://api.drand.sh/v2/beacons/{QUICKNET_BEACON_ID}/rounds/{MAINNET_BEACON_ROUND}"),
                 "mainnet_activation_authorized": false
             }))?
         ),

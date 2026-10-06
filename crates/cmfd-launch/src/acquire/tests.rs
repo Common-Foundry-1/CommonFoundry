@@ -30,9 +30,9 @@ fn retries_bad_relays_and_publishes_only_the_verified_canonical_certificate() {
     )
     .unwrap();
     assert_eq!(seen.len(), 3);
-    assert!(
-        seen.iter()
-            .all(|url| url.ends_with("/rounds/32747812") && !url.contains("latest"))
+    assert_eq!(
+        seen,
+        RELAYS.map(|relay| { format!("{relay}/v2/beacons/quicknet/rounds/32747812") })
     );
     let bytes = std::fs::read(&output).unwrap();
     assert_eq!(parse_certificate(&bytes).unwrap(), historical());

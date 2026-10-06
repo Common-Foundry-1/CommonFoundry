@@ -124,7 +124,7 @@ class MainnetPackageTests(unittest.TestCase):
         for role in ("cmfd-v4-replay", "real_bank0_relations"):
             (binaries / role).write_bytes(elf_x86_64_fixture(role.encode()))
         return argparse.Namespace(repo=self.repo, platform=platform, kind=kind, commit=self.commit,
-                                  version="1.0.0", plan=self.plan_path, approval_manifest=self.approval_path, output=self.root / output,
+                                  version="1.0.2", plan=self.plan_path, approval_manifest=self.approval_path, output=self.root / output,
                                   node=binaries / "cmfd-node" if kind == "runtime" else None,
                                   wallet=binaries / "common-foundry-wallet" if kind == "runtime" else None,
                                   miner=binaries / "cmfd-miner" if kind in ("miner", "hiveos") else None,
@@ -160,7 +160,7 @@ class MainnetPackageTests(unittest.TestCase):
     def output(self, executable, arguments, **_kwargs):
         self.calls.append((executable.name, arguments))
         if arguments == ["--version"]:
-            return b"1.0.0\n"
+            return b"1.0.2\n"
         if arguments == ["network-info"]:
             self.assertEqual(executable.name, "real_bank0_relations")
             return packages.canonical({"schema": "CMFD_PRODUCTION_V4_PROOF_WORKER_NETWORK_V1",
@@ -175,7 +175,7 @@ class MainnetPackageTests(unittest.TestCase):
                                        **{"beacon_" + key: beacon[key] for key in ("chain_hash", "public_key", "scheme")}})
         if arguments == ["runtime-identity"]:
             return packages.canonical({"schema": "CMFD_WALLET_PRELAUNCH_IDENTITY_V1", "role": "common-foundry-wallet",
-                                       "package_version": "1.0.0", "launch_info_base64": base64.b64encode(packages.canonical(self.info)).decode()})
+                                       "package_version": "1.0.2", "launch_info_base64": base64.b64encode(packages.canonical(self.info)).decode()})
         self.assertEqual(arguments, ["mainnet-launch-info"])
         return packages.canonical(self.info)
 
@@ -446,7 +446,7 @@ class MainnetPackageTests(unittest.TestCase):
     def test_dirty_source_never_qualifies_as_frozen_commit(self):
         with mock.patch.object(packages.integrity, "_run_git", side_effect=[self.commit, " M Cargo.toml"]):
             with self.assertRaisesRegex(packages.Error, "clean frozen"):
-                packages.source_snapshot(self.repo, self.commit, {}, "1.0.0")
+                packages.source_snapshot(self.repo, self.commit, {}, "1.0.2")
 
     def test_native_command_output_is_bounded(self):
         self.assertEqual(packages.native_output(Path(sys.executable), ["-c", "print('identity')"]), b"identity\r\n" if sys.platform == "win32" else b"identity\n")

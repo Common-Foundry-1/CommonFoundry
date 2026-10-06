@@ -30,15 +30,36 @@ impl AddressHistoryIndex {
     }
 
     pub fn block_entries(block: &Block) -> Vec<([u8; 32], AddressLocation)> {
+        Self::entries_for(
+            block.block_id(),
+            block.challenge.height,
+            &block.coinbase.outputs,
+            &block.transactions,
+        )
+    }
+
+    pub fn stored_block_entries(block: &crate::StoredBlock) -> Vec<([u8; 32], AddressLocation)> {
+        Self::entries_for(
+            block.block_id(),
+            block.challenge.height,
+            &block.coinbase.outputs,
+            &block.transactions,
+        )
+    }
+
+    fn entries_for(
+        block_id: [u8; 32],
+        height: u64,
+        coinbase_outputs: &[cmfd_consensus::TxOutput],
+        transactions: &[cmfd_consensus::Transaction],
+    ) -> Vec<([u8; 32], AddressLocation)> {
         let mut entries = Vec::new();
-        let block_id = block.block_id();
-        for (position, outputs, inputs) in
-            std::iter::once((0, block.coinbase.outputs.as_slice(), &[][..])).chain(
-                block.transactions.iter().enumerate().map(|(position, tx)| {
-                    (position + 1, tx.outputs.as_slice(), tx.inputs.as_slice())
-                }),
-            )
-        {
+        for (position, outputs, inputs) in std::iter::once((0, coinbase_outputs, &[][..])).chain(
+            transactions
+                .iter()
+                .enumerate()
+                .map(|(position, tx)| (position + 1, tx.outputs.as_slice(), tx.inputs.as_slice())),
+        ) {
             let mut addresses = BTreeSet::new();
             for output in outputs {
                 if let OutputLock::Key(address) = output.lock {
@@ -56,7 +77,7 @@ impl AddressHistoryIndex {
                 (
                     address,
                     AddressLocation {
-                        height: block.challenge.height,
+                        height,
                         position,
                         block_id,
                     },

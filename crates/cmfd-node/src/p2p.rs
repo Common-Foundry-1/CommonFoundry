@@ -211,6 +211,8 @@ pub enum P2pError {
     NonContiguousInventory { block_id: [u8; 32] },
     #[error("peer requested an unknown or body-less block {0:?}")]
     UnknownRequestedBlock([u8; 32]),
+    #[error("peer requested block {} whose proof this pruned node no longer stores", hex::encode(.0))]
+    PrunedRequestedBlock([u8; 32]),
     #[error("peer requested an unknown mempool transaction {0:?}")]
     UnknownRequestedTransaction([u8; 32]),
     #[error("peer returned a mining template that does not extend its advertised tip")]
@@ -2107,6 +2109,11 @@ fn perform_respond_to_peer_inner_with_policy(
             PeerMessage::GetBlock { block_id } => {
                 let canonical = {
                     let mut node = lock_node(&shared)?;
+                    if node.block_is_pruned(block_id) {
+                        // Not the requester's fault: it learned this block
+                        // from another peer. Close without a penalty.
+                        return Err(P2pError::PrunedRequestedBlock(block_id));
+                    }
                     node.canonical_block(block_id)?
                 }
                 .ok_or(P2pError::UnknownRequestedBlock(block_id))?;
@@ -2195,6 +2202,7 @@ fn perform_respond_to_peer_inner_with_policy(
                     checked_submit_deadline(started, SUBMIT_BLOCK_SERVER_RESPONSE_BUDGET)?;
                 let request = RemoteProofRequest::new(acceptance_deadline);
                 let monitor = PeerSubmissionMonitor::start(&connection, request.clone())?;
+                let mut below_prune_point = false;
                 let status = match submit_shared_peer_block_cancellable(
                     &shared,
                     block,
@@ -2204,6 +2212,18 @@ fn perform_respond_to_peer_inner_with_policy(
                 ) {
                     Ok(_) => BlockSubmissionStatus::Accepted,
                     Err(NodeError::DuplicateBlock(_)) => BlockSubmissionStatus::AlreadyKnown,
+                    Err(error @ NodeError::BelowPrunePoint(_)) => {
+                        // A valid block on a fork deeper than this pruned
+                        // node can follow; the sender did nothing wrong.
+                        tracing::info!(
+                            block_id = %hex::encode(block_id),
+                            height = block_height,
+                            %error,
+                            "ignored submitted block below the prune point"
+                        );
+                        below_prune_point = true;
+                        BlockSubmissionStatus::Rejected
+                    }
                     Err(error) if is_retryable_block_admission(&error) => {
                         // The wire status cannot carry a reason, and peers
                         // report every retryable cause with the same deferred status.
@@ -2239,6 +2259,7 @@ fn perform_respond_to_peer_inner_with_policy(
                     response_deadline,
                 )?;
                 if status == BlockSubmissionStatus::Rejected
+                    && !below_prune_point
                     && options.security.record_failure(
                         remote_address.ip(),
                         INVALID_BLOCK_PENALTY,

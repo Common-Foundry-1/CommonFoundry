@@ -99,11 +99,16 @@ pub mod pool;
 pub mod pool_dashboard;
 #[cfg(feature = "production-v4")]
 pub mod production_v4_pool;
+mod pruning;
+#[cfg(test)]
+mod pruning_tests;
 #[cfg(feature = "production-v4")]
 pub mod rcnet_candidate;
 #[cfg(all(test, feature = "production-v4"))]
 mod real_fork_checkpoint_tests;
 pub mod seed_peers;
+use pruning::StoredBlock;
+pub use pruning::{MIN_PRUNE_KEEP_BLOCKS, PruneReport, prune_shared_node};
 mod startup_snapshot;
 pub mod storage;
 pub mod wallet_backup;
@@ -409,6 +414,10 @@ const RECORD_V2_HEADER_BYTES: usize = 56;
 const RECORD_VERSION_V3: u16 = 3;
 const RECORD_V3_HEADER_BYTES: usize = RECORD_V2_HEADER_BYTES + 4;
 const RECORD_V3_CHECKSUM_DOMAIN: &str = "CMFD/NODE/BLOCK-RECORD/V3";
+/// A pruned record: the V3 layout carrying a compressed pruned body (header,
+/// coinbase, transactions and proof summary) instead of the full block.
+const RECORD_VERSION_PRUNED: u16 = 4;
+const RECORD_PRUNED_CHECKSUM_DOMAIN: &str = "CMFD/NODE/BLOCK-RECORD/V4-PRUNED";
 const BLOCK_LOG_COMPRESSION_LEVEL: u32 = 6;
 const RECORD_CHECKSUM_BYTES: usize = 32;
 const RECORD_V1_CHECKSUM_DOMAIN: &str = "CMFD/NODE/BLOCK-RECORD/V1";
@@ -566,6 +575,15 @@ pub enum NodeError {
     DuplicateBlock([u8; 32]),
     #[error("block parent is not indexed: {0:?}")]
     UnknownParent([u8; 32]),
+    #[error("block {} was pruned; this node no longer stores its proof", hex::encode(.0))]
+    BlockProofPruned([u8; 32]),
+    #[error(
+        "block builds on {} below this node's prune point; a pruned node cannot follow a reorganization that deep",
+        hex::encode(.0)
+    )]
+    BelowPrunePoint([u8; 32]),
+    #[error("invalid prune setting: {0}")]
+    InvalidPruneSetting(String),
     #[error("block admission snapshot became stale while proof verification was in progress")]
     StaleBlockAdmission,
     #[error("block was already rejected by deterministic consensus validation: {0:?}")]
@@ -718,6 +736,9 @@ impl NodeError {
             Self::StorageFaulted => ("storage_faulted", 503, false),
             Self::DuplicateBlock(_) => ("duplicate_block", 409, false),
             Self::UnknownParent(_) => ("unknown_parent", 422, true),
+            Self::BlockProofPruned(_) => ("block_proof_pruned", 404, false),
+            Self::BelowPrunePoint(_) => ("below_prune_point", 409, false),
+            Self::InvalidPruneSetting(_) => ("invalid_prune_setting", 400, false),
             Self::StaleBlockAdmission => ("stale_block_admission", 409, true),
             Self::CachedInvalidBlock(_) => ("cached_invalid_block", 422, false),
             Self::ForkReconstructionDeferred => ("fork_reconstruction_deferred", 503, true),
@@ -2410,6 +2431,10 @@ pub struct NodeStatus {
     pub storage_healthy: bool,
     pub startup_snapshot_used: bool,
     pub public_peer_mode: bool,
+    /// Newest active blocks kept with full proofs, when pruning is enabled.
+    pub prune_keep_blocks: Option<u64>,
+    /// Height of the newest block stored without its proof.
+    pub pruned_height: Option<u64>,
     pub peers: Vec<PeerObservation>,
 }
 
@@ -3660,6 +3685,35 @@ fn verify_retained_block_log_path(file: &File, path: &Path) -> Result<(), NodeEr
     Ok(())
 }
 
+/// A clone of the retained block log for reading without the node lock. The
+/// node counts these so pruning never replaces the log under a reader.
+pub(crate) struct LogReadHandle {
+    file: File,
+    // Declared after `file` so the handle closes before the count drops.
+    _reader: Arc<()>,
+}
+
+impl std::ops::Deref for LogReadHandle {
+    type Target = File;
+
+    fn deref(&self) -> &File {
+        &self.file
+    }
+}
+
+impl Node {
+    pub(crate) fn clone_log_for_read(&self) -> io::Result<LogReadHandle> {
+        Ok(LogReadHandle {
+            file: self.log.try_clone()?,
+            _reader: Arc::clone(&self.log_readers),
+        })
+    }
+
+    pub(crate) fn log_readers_outstanding(&self) -> bool {
+        Arc::strong_count(&self.log_readers) > 1
+    }
+}
+
 fn next_node_instance_id() -> Result<u64, NodeError> {
     NEXT_NODE_INSTANCE_ID
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -3754,6 +3808,11 @@ pub struct Node {
     /// proof admissions bind to this value so branch snapshots cannot be
     /// committed after chain state or fork choice changes.
     chain_revision: u64,
+    /// Records in the retained block log; the ordinal of the next append.
+    /// Unlike `chain_revision` it shrinks when pruning drops side branches.
+    record_count: u64,
+    /// Opt-in proof pruning: full blocks kept below the tip, if enabled.
+    prune_keep_blocks: Option<u64>,
     mempool: BTreeMap<[u8; 32], MempoolEntry>,
     mempool_bytes: usize,
     /// Active exchange-withdrawal reservations, bound to the exact unsigned
@@ -3769,6 +3828,9 @@ pub struct Node {
     exchange_custody_v3_wallet_state: ExchangeCustodyV3WalletState,
     exchange_rpc_active: bool,
     log: File,
+    /// One reference per [`LogReadHandle`] outstanding; pruning replaces the
+    /// log only when none are.
+    log_readers: Arc<()>,
     /// Digest of the exact last complete block-log record. V2 appends bind to
     /// this value; it advances only after the durable record commits in memory.
     last_record_digest: [u8; 32],
@@ -3856,6 +3918,26 @@ struct BlockIndex {
     /// index zero.
     active_chain: Vec<[u8; 32]>,
     active_work: U512,
+    /// Chain state at the newest pruned block, when the log is pruned. State
+    /// reconstruction starts here; blocks below it carry no proof.
+    anchor: Option<Arc<PruneAnchor>>,
+}
+
+/// The newest pruned block and the chain state after it.
+struct PruneAnchor {
+    block_id: [u8; 32],
+    height: u64,
+    state: ChainState,
+}
+
+impl std::fmt::Debug for PruneAnchor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PruneAnchor")
+            .field("block_id", &hex::encode(self.block_id))
+            .field("height", &self.height)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
@@ -3958,6 +4040,7 @@ impl BlockIndex {
             transactions: explorer_index::TransactionIndex::default(),
             addresses: explorer_address_index::AddressHistoryIndex::default(),
             active_chain: vec![genesis],
+            anchor: None,
             active_work: U512::zero(),
         }
     }
@@ -3974,6 +4057,44 @@ impl BlockIndex {
                 .get(&block_id)
                 .map(|entry| entry.cumulative_work)
         }
+    }
+
+    /// Where state reconstruction toward `tip` starts: virtual genesis, or the
+    /// prune anchor when the log is pruned. Returns the base height, its state
+    /// (`None` for genesis) and the active path from genesis to the base.
+    #[allow(clippy::type_complexity)]
+    fn reconstruction_base(
+        &self,
+        tip: [u8; 32],
+    ) -> Result<(u64, Option<Box<ChainState>>, Vec<[u8; 32]>), NodeError> {
+        let Some(anchor) = &self.anchor else {
+            return Ok((0, None, vec![self.genesis]));
+        };
+        let reaches_anchor = self
+            .blocks
+            .get(&tip)
+            .is_some_and(|entry| entry.height() >= anchor.height)
+            && self.ancestor_at_height(tip, anchor.height)? == anchor.block_id;
+        if !reaches_anchor {
+            return Err(NodeError::BelowPrunePoint(tip));
+        }
+        let mut path = vec![self.genesis];
+        path.extend(self.path_to(anchor.block_id)?);
+        Ok((anchor.height, Some(Box::new(anchor.state.clone())), path))
+    }
+
+    /// True when `block_id` is a pruned record other than the anchor, so no
+    /// new block may build on it.
+    fn is_below_prune_point(&self, block_id: [u8; 32]) -> bool {
+        let Some(anchor) = &self.anchor else {
+            return false;
+        };
+        if block_id == self.genesis {
+            return true;
+        }
+        self.blocks.get(&block_id).is_some_and(|entry| {
+            entry.locator.version == BlockRecordVersion::Pruned && block_id != anchor.block_id
+        })
     }
 
     fn path_to(&self, tip: [u8; 32]) -> Result<Vec<[u8; 32]>, NodeError> {
@@ -4071,6 +4192,9 @@ impl BlockIndex {
         require_v2: bool,
     ) -> Result<BranchStatePlan, NodeError> {
         if parent == self.genesis {
+            if self.anchor.is_some() {
+                return Err(NodeError::BelowPrunePoint(parent));
+            }
             if checkpoint.is_some() {
                 return Err(NodeError::StaleBlockAdmission);
             }
@@ -4103,15 +4227,18 @@ impl BlockIndex {
                     && self.blocks.get(&checkpoint.block_id).is_some_and(|entry| {
                         self.ancestor_at_height(parent, entry.height())
                             .is_ok_and(|ancestor| ancestor == checkpoint.block_id)
+                    })
+                    && self.anchor.as_ref().is_none_or(|anchor| {
+                        self.blocks[&checkpoint.block_id].height() >= anchor.height
                     });
                 if usable {
                     let height = self.blocks[&checkpoint.block_id].height();
                     (height, Some(checkpoint.state), checkpoint.path)
                 } else {
-                    (0, None, vec![self.genesis])
+                    self.reconstruction_base(parent)?
                 }
             }
-            None => (0, None, vec![self.genesis]),
+            None => self.reconstruction_base(parent)?,
         };
         let end_height = parent_height
             .min(base_height.saturating_add(MAX_EXTERNAL_RECONSTRUCTION_BLOCKS_PER_SLICE as u64));
@@ -4131,7 +4258,9 @@ impl BlockIndex {
                 ));
             }
             let block =
-                read_indexed_block(log, log_path, &indexed, block_id, network_id, require_v2)?;
+                read_indexed_block(log, log_path, &indexed, block_id, network_id, require_v2)?
+                    .into_full()
+                    .ok_or(NodeError::BlockProofPruned(block_id))?;
             replay.push(BranchReplayBlock { indexed, block });
         }
         Ok(BranchStatePlan {
@@ -5449,11 +5578,15 @@ impl Node {
         let restored =
             startup_snapshot::load_startup_snapshot(&data_dir, &log, &log_path, params, &verifier)?;
         let (state, index, replay, startup_snapshot_used) = match restored {
-            Some(restored) => (restored.state, restored.index, restored.replay, true),
+            Some(mut restored) => {
+                attach_prune_anchor(&data_dir, &mut restored.index, params, &verifier)?;
+                (restored.state, restored.index, restored.replay, true)
+            }
             None => {
                 let mut state = ChainState::new(params, verifier.clone())?;
                 let mut index = BlockIndex::new(params.genesis_hash);
                 let replay = replay_log(
+                    &data_dir,
                     &log,
                     &log_path,
                     &mut state,
@@ -5511,6 +5644,8 @@ impl Node {
             wallet_history_inline_scan_bytes: wallet_history::INLINE_SCAN_BYTES,
             transaction_scan_marks: HashMap::new(),
             chain_revision,
+            record_count: replay.record_count,
+            prune_keep_blocks: None,
             mempool: BTreeMap::new(),
             mempool_bytes: 0,
             exchange_withdrawal_reservations: HashMap::new(),
@@ -5518,6 +5653,7 @@ impl Node {
             exchange_custody_v3_wallet_state,
             exchange_rpc_active: false,
             log,
+            log_readers: Arc::new(()),
             last_record_digest: replay.last_record_digest,
             block_log_length: replay.log_length,
             storage_faulted: false,
@@ -5860,6 +5996,8 @@ impl Node {
             storage_healthy: !self.storage_faulted,
             startup_snapshot_used: self.startup_snapshot_used,
             public_peer_mode: self.public_peer_mode,
+            prune_keep_blocks: self.prune_keep_blocks,
+            pruned_height: self.prune_height(),
             peers: self.peer_observations(),
         })
     }
@@ -7125,6 +7263,9 @@ impl Node {
         let Some(indexed) = self.index.blocks.get(&block_id).cloned() else {
             return Ok(None);
         };
+        if indexed.locator.version == BlockRecordVersion::Pruned {
+            return Err(NodeError::BlockProofPruned(block_id));
+        }
         let result = (|| {
             if indexed.block_id() != block_id {
                 return Err(NodeError::CorruptLog(
@@ -7307,7 +7448,17 @@ impl Node {
                 break;
             }
         }
-        inventory
+        self.servable_inventory(inventory)
+    }
+
+    /// Pruned blocks form the oldest part of the active chain. An inventory
+    /// that would start inside it is withheld, since this node cannot serve
+    /// those blocks.
+    fn servable_inventory(&self, inventory: Vec<[u8; 32]>) -> Vec<[u8; 32]> {
+        match inventory.first() {
+            Some(first) if self.block_is_pruned(*first) => Vec::new(),
+            _ => inventory,
+        }
     }
 
     /// Returns active-chain identifiers after the active-chain ancestor of a
@@ -7333,13 +7484,15 @@ impl Node {
         let Some(position) = active_position else {
             return Vec::new();
         };
-        self.index
-            .active_chain
-            .iter()
-            .skip(position + 1)
-            .take(max)
-            .copied()
-            .collect()
+        self.servable_inventory(
+            self.index
+                .active_chain
+                .iter()
+                .skip(position + 1)
+                .take(max)
+                .copied()
+                .collect(),
+        )
     }
 
     pub fn build_template(
@@ -7597,6 +7750,9 @@ impl Node {
         self.index
             .work_at(parent)
             .ok_or(NodeError::UnknownParent(parent))?;
+        if self.index.is_below_prune_point(parent) {
+            return Err(NodeError::BelowPrunePoint(parent));
+        }
         let validation_context = BlockValidationContext {
             now_unix_seconds: accepted_at,
         };
@@ -8112,7 +8268,7 @@ impl Node {
             .checked_add(record_length)
             .ok_or_else(|| NodeError::CorruptLog("block log length overflowed".to_owned()))?;
         let locator = BlockRecordLocator {
-            ordinal: self.chain_revision,
+            ordinal: self.record_count,
             offset: self.block_log_length,
             length: record_length,
             version: BlockRecordVersion::V3,
@@ -8195,6 +8351,7 @@ impl Node {
         match commit_prepared(&mut self.state, &mut self.index, prepared, locator) {
             Ok(outcome) => {
                 self.chain_revision = next_revision;
+                self.record_count = self.record_count.saturating_add(1);
                 self.last_record_digest = record_digest;
                 self.block_log_length = final_length;
                 let canonical_tip_changed = self.state.tip() != previous_tip;
@@ -8226,6 +8383,7 @@ impl Node {
                     self.remember_active_branch_checkpoint(
                         block.challenge.previous_block != previous_tip,
                     );
+                    self.save_prune_candidate(false);
                 }
                 // Keep the authenticated fast-start state current while the
                 // node is running, including after nonwinning side-branch
@@ -9032,7 +9190,10 @@ fn rebuild_state_to(
     tip: [u8; 32],
     external_preverifier: Option<&BlockPreverifier>,
 ) -> Result<ChainState, NodeError> {
-    let mut state = ChainState::new(params, verifier.clone())?;
+    let mut state = match index.reconstruction_base(tip)? {
+        (_, Some(base), _) => *base,
+        (_, None, _) => ChainState::new(params, verifier.clone())?,
+    };
     replay_indexed_state_to(
         block_log,
         block_log_path,
@@ -9054,12 +9215,18 @@ fn replay_indexed_state_to(
     tip: [u8; 32],
     external_preverifier: Option<&BlockPreverifier>,
 ) -> Result<(), NodeError> {
-    if state.tip() != index.genesis {
-        return Err(NodeError::CorruptLog(
-            "indexed replay must begin at virtual genesis".to_owned(),
-        ));
-    }
-    for block_id in index.path_to(tip)? {
+    let path = index.path_to(tip)?;
+    let start = if state.tip() == index.genesis {
+        0
+    } else {
+        path.iter()
+            .position(|block_id| *block_id == state.tip())
+            .map(|position| position + 1)
+            .ok_or_else(|| {
+                NodeError::CorruptLog("indexed replay base is not on the replayed path".to_owned())
+            })?
+    };
+    for block_id in path.into_iter().skip(start) {
         let entry = index.blocks.get(&block_id).ok_or_else(|| {
             NodeError::CorruptLog("fork path refers to an absent block".to_owned())
         })?;
@@ -9070,7 +9237,9 @@ fn replay_indexed_state_to(
             block_id,
             params.network_id,
             requires_external_preverification(&params),
-        )?;
+        )?
+        .into_full()
+        .ok_or(NodeError::BlockProofPruned(block_id))?;
         if block.block_id() != block_id
             || block.challenge.previous_block != entry.parent()
             || block.challenge.height != entry.height()
@@ -10781,6 +10950,79 @@ fn record_checksum_v3(record_without_checksum: &[u8]) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
+fn record_checksum_pruned(record_without_checksum: &[u8]) -> [u8; 32] {
+    let mut hasher = Hasher::new_derive_key(RECORD_PRUNED_CHECKSUM_DOMAIN);
+    hasher.update(record_without_checksum);
+    *hasher.finalize().as_bytes()
+}
+
+/// Encodes a pruned record around an uncompressed pruned body.
+fn encode_record_pruned(
+    accepted_at: u64,
+    body: &[u8],
+    previous_record_digest: [u8; 32],
+) -> Result<Vec<u8>, NodeError> {
+    if body.is_empty() || body.len() > pruning::MAX_PRUNED_BODY_BYTES {
+        return Err(NodeError::CorruptLog(
+            "pruned body exceeds its size limit".to_owned(),
+        ));
+    }
+    let mut encoder = flate2::write::DeflateEncoder::new(
+        Vec::with_capacity(body.len() / 2),
+        flate2::Compression::new(BLOCK_LOG_COMPRESSION_LEVEL),
+    );
+    let compressed = encoder
+        .write_all(body)
+        .and_then(|()| encoder.finish())
+        .map_err(|error| {
+            NodeError::CorruptLog(format!("pruned body compression failed: {error}"))
+        })?;
+    let body_len = u32::try_from(body.len())
+        .map_err(|_| NodeError::CorruptLog("pruned body length exceeds u32".to_owned()))?;
+    let compressed_len = u32::try_from(compressed.len())
+        .map_err(|_| NodeError::CorruptLog("compressed pruned body exceeds u32".to_owned()))?;
+    let capacity = checked_record_len(RECORD_V3_HEADER_BYTES, compressed.len(), 0)?;
+    let mut record = Vec::with_capacity(capacity);
+    record.extend_from_slice(&RECORD_MAGIC);
+    record.extend_from_slice(&RECORD_VERSION_PRUNED.to_le_bytes());
+    record.extend_from_slice(&0_u16.to_le_bytes());
+    record.extend_from_slice(&accepted_at.to_le_bytes());
+    record.extend_from_slice(&compressed_len.to_le_bytes());
+    record.extend_from_slice(&0_u32.to_le_bytes());
+    record.extend_from_slice(&previous_record_digest);
+    record.extend_from_slice(&body_len.to_le_bytes());
+    record.extend_from_slice(&compressed);
+    let checksum = record_checksum_pruned(&record);
+    record.extend_from_slice(&checksum);
+    Ok(record)
+}
+
+/// Rewrites a complete V2, V3 or pruned record to follow a new predecessor
+/// digest. The caller has authenticated `record` at its old position.
+fn rechain_record(record: &[u8], previous_record_digest: [u8; 32]) -> Result<Vec<u8>, NodeError> {
+    if record.len() < RECORD_V2_HEADER_BYTES + RECORD_CHECKSUM_BYTES || record[..4] != RECORD_MAGIC
+    {
+        return Err(NodeError::CorruptLog(
+            "cannot rechain a malformed record".to_owned(),
+        ));
+    }
+    let version = u16::from_le_bytes([record[4], record[5]]);
+    let mut rewritten = record[..record.len() - RECORD_CHECKSUM_BYTES].to_vec();
+    rewritten[24..56].copy_from_slice(&previous_record_digest);
+    let checksum = match version {
+        RECORD_VERSION_V2 => record_checksum_v2(&rewritten),
+        RECORD_VERSION_V3 => record_checksum_v3(&rewritten),
+        RECORD_VERSION_PRUNED => record_checksum_pruned(&rewritten),
+        _ => {
+            return Err(NodeError::CorruptLog(
+                "only V2, V3 and pruned records can be rechained".to_owned(),
+            ));
+        }
+    };
+    rewritten.extend_from_slice(&checksum);
+    Ok(rewritten)
+}
+
 fn complete_record_digest(record: &[u8]) -> [u8; 32] {
     let mut hasher = Hasher::new_derive_key(RECORD_CHAIN_DIGEST_DOMAIN);
     hasher.update(record);
@@ -10810,6 +11052,8 @@ enum BlockRecordVersion {
     V2,
     /// V2 chain semantics with a compressed block body.
     V3,
+    /// V3 layout with a compressed pruned body; the proof is gone.
+    Pruned,
 }
 
 impl BlockRecordVersion {
@@ -10817,7 +11061,7 @@ impl BlockRecordVersion {
         match self {
             Self::LegacyV1 => RECORD_V1_HEADER_BYTES,
             Self::V2 => RECORD_V2_HEADER_BYTES,
-            Self::V3 => RECORD_V3_HEADER_BYTES,
+            Self::V3 | Self::Pruned => RECORD_V3_HEADER_BYTES,
         }
     }
 }
@@ -10827,6 +11071,8 @@ struct ScannedReplayLog {
     children: HashMap<[u8; 32], Vec<usize>>,
     transactions: explorer_index::TransactionIndex,
     addresses: explorer_address_index::AddressHistoryIndex,
+    /// Successor header state stored in each pruned record.
+    pruned_headers: HashMap<[u8; 32], SuccessorHeaderPreflight>,
     last_record_digest: [u8; 32],
     log_length: u64,
 }
@@ -10887,6 +11133,7 @@ fn read_log_record(
         RECORD_VERSION_V1 => BlockRecordVersion::LegacyV1,
         RECORD_VERSION_V2 => BlockRecordVersion::V2,
         RECORD_VERSION_V3 => BlockRecordVersion::V3,
+        RECORD_VERSION_PRUNED => BlockRecordVersion::Pruned,
         _ => {
             return Err(NodeError::CorruptLog(format!(
                 "record {record_index} has unsupported version {version}"
@@ -10917,7 +11164,9 @@ fn read_log_record(
     let (delta_len, previous_record_digest) = if record_version != BlockRecordVersion::LegacyV1 {
         let delta_len =
             u32::from_le_bytes(header[20..24].try_into().expect("fixed slice")) as usize;
-        if delta_len > MAX_REVERSIBLE_STATE_DELTA_BYTES {
+        if delta_len > MAX_REVERSIBLE_STATE_DELTA_BYTES
+            || (record_version == BlockRecordVersion::Pruned && delta_len != 0)
+        {
             return Err(NodeError::CorruptLog(format!(
                 "record {record_index} reversible state delta exceeds the wire limit"
             )));
@@ -10929,10 +11178,18 @@ fn read_log_record(
     } else {
         (0, None)
     };
-    let inflated_len = if record_version == BlockRecordVersion::V3 {
+    let inflated_len = if matches!(
+        record_version,
+        BlockRecordVersion::V3 | BlockRecordVersion::Pruned
+    ) {
         let inflated_len =
             u32::from_le_bytes(header[56..60].try_into().expect("fixed slice")) as usize;
-        if inflated_len == 0 || inflated_len > max_block_bytes_for_network(network_id) {
+        let inflated_limit = if record_version == BlockRecordVersion::Pruned {
+            pruning::MAX_PRUNED_BODY_BYTES
+        } else {
+            max_block_bytes_for_network(network_id)
+        };
+        if inflated_len == 0 || inflated_len > inflated_limit {
             return Err(NodeError::CorruptLog(format!(
                 "record {record_index} inflated block exceeds the wire limit"
             )));
@@ -10976,6 +11233,7 @@ fn read_log_record(
         BlockRecordVersion::LegacyV1 => record_checksum_v1(&complete_record),
         BlockRecordVersion::V2 => record_checksum_v2(&complete_record),
         BlockRecordVersion::V3 => record_checksum_v3(&complete_record),
+        BlockRecordVersion::Pruned => record_checksum_pruned(&complete_record),
     };
     if checksum != expected_checksum {
         return Err(NodeError::CorruptLog(format!(
@@ -11075,7 +11333,7 @@ fn read_located_record(
     locator: &BlockRecordLocator,
     network_id: [u8; 32],
     require_v2: bool,
-) -> Result<(ParsedLogRecord, Block), NodeError> {
+) -> Result<(ParsedLogRecord, StoredBlock), NodeError> {
     let max_block_bytes = max_block_bytes_for_network(network_id);
     let header_bytes = locator.version.header_bytes();
     let (minimum_length, maximum_length) = match locator.version {
@@ -11083,7 +11341,7 @@ fn read_located_record(
             header_bytes + RECORD_CHECKSUM_BYTES,
             checked_record_len(header_bytes, max_block_bytes, 0)?,
         ),
-        BlockRecordVersion::V2 | BlockRecordVersion::V3 => (
+        BlockRecordVersion::V2 | BlockRecordVersion::V3 | BlockRecordVersion::Pruned => (
             header_bytes + RECORD_CHECKSUM_BYTES,
             checked_record_len(
                 header_bytes,
@@ -11174,24 +11432,7 @@ fn read_located_record(
             locator.ordinal
         )));
     }
-    let block = decode_block(&record.block_bytes, network_id).map_err(|error| {
-        NodeError::CorruptLog(format!(
-            "record {} cannot decode at its authenticated locator: {error}",
-            locator.ordinal
-        ))
-    })?;
-    let canonical = encode_block(&block).map_err(|error| {
-        NodeError::CorruptLog(format!(
-            "record {} cannot re-encode at its authenticated locator: {error}",
-            locator.ordinal
-        ))
-    })?;
-    if canonical != record.block_bytes {
-        return Err(NodeError::CorruptLog(format!(
-            "record {} is not canonical at its authenticated locator",
-            locator.ordinal
-        )));
-    }
+    let block = decode_stored_block(&record, locator.ordinal, network_id)?;
     if block.block_id() != locator.block_id
         || block.challenge.previous_block != locator.parent
         || block.challenge.height != locator.height
@@ -11205,6 +11446,46 @@ fn read_located_record(
     Ok((record, block))
 }
 
+/// Decodes an authenticated record. Full records must re-encode to the exact
+/// stored bytes; pruned records keep their stored block identifier.
+fn decode_stored_block(
+    record: &ParsedLogRecord,
+    record_index: u64,
+    network_id: [u8; 32],
+) -> Result<StoredBlock, NodeError> {
+    if record.version == BlockRecordVersion::Pruned {
+        return pruning::decode_pruned_body(&record.block_bytes, network_id).map_err(|error| {
+            match error {
+                NodeError::CorruptLog(message) => {
+                    NodeError::CorruptLog(format!("record {record_index}: {message}"))
+                }
+                other => other,
+            }
+        });
+    }
+    let block = decode_block(&record.block_bytes, network_id).map_err(|error| {
+        NodeError::CorruptLog(format!("record {record_index} cannot decode: {error}"))
+    })?;
+    let canonical = encode_block(&block).map_err(|error| {
+        NodeError::CorruptLog(format!("record {record_index} cannot re-encode: {error}"))
+    })?;
+    if canonical != record.block_bytes {
+        return Err(NodeError::CorruptLog(format!(
+            "record {record_index} is not canonical"
+        )));
+    }
+    Ok(StoredBlock::from_full(block))
+}
+
+/// Size reported for a stored block: the canonical size of the full block,
+/// including for pruned records.
+fn stored_block_size(record: &ParsedLogRecord, block: &StoredBlock) -> usize {
+    match &block.proof {
+        pruning::StoredProof::Pruned { original_bytes, .. } => *original_bytes,
+        pruning::StoredProof::Full(_) => record.block_bytes.len(),
+    }
+}
+
 fn read_indexed_block(
     file: &File,
     path: &Path,
@@ -11212,7 +11493,7 @@ fn read_indexed_block(
     expected_block_id: [u8; 32],
     network_id: [u8; 32],
     require_v2: bool,
-) -> Result<Block, NodeError> {
+) -> Result<StoredBlock, NodeError> {
     read_indexed_block_with_size(
         file,
         path,
@@ -11233,7 +11514,7 @@ fn read_indexed_block_with_size(
     expected_block_id: [u8; 32],
     network_id: [u8; 32],
     require_v2: bool,
-) -> Result<(Block, usize), NodeError> {
+) -> Result<(StoredBlock, usize), NodeError> {
     if indexed.block_id() != expected_block_id {
         return Err(NodeError::CorruptLog(
             "fork index key does not match its durable record locator".to_owned(),
@@ -11241,10 +11522,13 @@ fn read_indexed_block_with_size(
     }
     let (record, block) =
         read_located_record(file, path, &indexed.locator, network_id, require_v2)?;
-    Ok((block, record.block_bytes.len()))
+    let size = stored_block_size(&record, &block);
+    Ok((block, size))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn replay_log(
+    data_dir: &Path,
     log: &File,
     path: &Path,
     state: &mut ChainState,
@@ -11256,10 +11540,12 @@ fn replay_log(
     let mut replayed_state = ChainState::new(params, verifier.clone())?;
     let mut replayed_index = BlockIndex::new(params.genesis_hash);
     let replay = replay_log_into(
+        data_dir,
         log,
         path,
         &mut replayed_state,
         &mut replayed_index,
+        verifier,
         params,
         external_preverifier,
     )?;
@@ -11272,11 +11558,14 @@ fn replay_log(
 /// compact validation capability per V2 ancestry edge. This bounds expensive
 /// full-state retention; record-count/index and process RSS caps are enforced
 /// by later node resource policy, not by this traversal alone.
+#[allow(clippy::too_many_arguments)]
 fn replay_log_into(
+    data_dir: &Path,
     log: &File,
     path: &Path,
     state: &mut ChainState,
     index: &mut BlockIndex,
+    verifier: &ConsensusPowVerifier,
     params: NetworkParams,
     external_preverifier: Option<&BlockPreverifier>,
 ) -> Result<ReplayLogState, NodeError> {
@@ -11320,14 +11609,18 @@ fn replay_log_into(
         });
     }
 
+    // A pruned log starts with its pruned prefix; replay begins at the anchor.
+    let root = install_pruned_prefix(data_dir, &scanned, index, state, verifier, params)?;
+    let (mut winning_tip, mut winning_work, mut winning_record_index) =
+        match index.blocks.get(&root) {
+            Some(entry) => (root, entry.cumulative_work, entry.locator.ordinal),
+            None => (params.genesis_hash, U512::zero(), u64::MAX),
+        };
     let mut stack = vec![ReplayDfsFrame {
-        block_id: params.genesis_hash,
+        block_id: root,
         next_child: 0,
         undo: None,
     }];
-    let mut winning_tip = params.genesis_hash;
-    let mut winning_work = U512::zero();
-    let mut winning_record_index = u64::MAX;
     let mut legacy_undo_stack_bytes = 0_usize;
 
     while let Some(frame) = stack.last_mut() {
@@ -11606,9 +11899,9 @@ fn replay_log_into(
         ));
     }
 
-    if state.tip() != params.genesis_hash || index.blocks.len() != scanned.records.len() {
+    if state.tip() != root || index.blocks.len() != scanned.records.len() {
         return Err(NodeError::CorruptLog(
-            "startup DFS did not return to genesis after visiting every record".to_owned(),
+            "startup DFS did not return to its root after visiting every record".to_owned(),
         ));
     }
     let mut active_chain = Vec::with_capacity(
@@ -11647,6 +11940,120 @@ fn replay_log_into(
     })
 }
 
+/// Indexes the pruned prefix of a scanned log and positions `state` at its
+/// anchor. Returns the block replay starts from: the anchor, or genesis for an
+/// unpruned log.
+fn install_pruned_prefix(
+    data_dir: &Path,
+    scanned: &ScannedReplayLog,
+    index: &mut BlockIndex,
+    state: &mut ChainState,
+    verifier: &ConsensusPowVerifier,
+    params: NetworkParams,
+) -> Result<[u8; 32], NodeError> {
+    let mut last = None;
+    for record in scanned
+        .records
+        .iter()
+        .take_while(|record| record.version == BlockRecordVersion::Pruned)
+    {
+        let parent_work = index.work_at(record.parent).ok_or_else(|| {
+            NodeError::CorruptLog(format!(
+                "pruned record {} parent is absent from the fork index",
+                record.ordinal
+            ))
+        })?;
+        let cumulative_work = add_chain_work(parent_work, record.target).map_err(|error| {
+            NodeError::CorruptLog(format!(
+                "pruned record {} cumulative work is invalid: {error}",
+                record.ordinal
+            ))
+        })?;
+        let successor_header = *scanned
+            .pruned_headers
+            .get(&record.block_id)
+            .ok_or_else(|| {
+                NodeError::CorruptLog(format!(
+                    "pruned record {} lacks its header state",
+                    record.ordinal
+                ))
+            })?;
+        let ancestors = index.ancestor_table(record.parent)?;
+        index.blocks.insert(
+            record.block_id,
+            Arc::new(IndexedBlock {
+                locator: *record,
+                cumulative_work,
+                successor_header,
+                ancestors,
+            }),
+        );
+        last = Some(*record);
+    }
+    let Some(last) = last else {
+        return Ok(params.genesis_hash);
+    };
+    let anchor = load_prune_anchor(data_dir, &last, index, params, verifier)?;
+    *state = anchor.state.clone();
+    index.anchor = Some(Arc::new(anchor));
+    Ok(last.block_id)
+}
+
+/// Loads the anchor saved for the newest pruned record and checks it against
+/// that record's identity and header state.
+fn load_prune_anchor(
+    data_dir: &Path,
+    last_pruned: &BlockRecordLocator,
+    index: &BlockIndex,
+    params: NetworkParams,
+    verifier: &ConsensusPowVerifier,
+) -> Result<PruneAnchor, NodeError> {
+    let path = pruning::anchor_path(data_dir, last_pruned.height);
+    let saved = pruning::read_state_file(&path, params, verifier).map_err(|error| {
+        NodeError::CorruptLog(format!(
+            "the pruned block log needs its anchor state {}: {error}",
+            path.display()
+        ))
+    })?;
+    let expected_header = index
+        .blocks
+        .get(&last_pruned.block_id)
+        .map(|entry| entry.successor_header);
+    if saved.block_id != last_pruned.block_id
+        || saved.height != last_pruned.height
+        || Some(saved.successor) != expected_header
+    {
+        return Err(NodeError::CorruptLog(
+            "prune anchor state does not match the newest pruned record".to_owned(),
+        ));
+    }
+    Ok(PruneAnchor {
+        block_id: saved.block_id,
+        height: saved.height,
+        state: saved.state,
+    })
+}
+
+/// Attaches the anchor to an index restored from a startup snapshot.
+fn attach_prune_anchor(
+    data_dir: &Path,
+    index: &mut BlockIndex,
+    params: NetworkParams,
+    verifier: &ConsensusPowVerifier,
+) -> Result<(), NodeError> {
+    let last = index
+        .blocks
+        .values()
+        .filter(|entry| entry.locator.version == BlockRecordVersion::Pruned)
+        .max_by_key(|entry| entry.height())
+        .map(|entry| entry.locator);
+    if let Some(last) = last {
+        let anchor = load_prune_anchor(data_dir, &last, index, params, verifier)?;
+        index.anchor = Some(Arc::new(anchor));
+    }
+    Ok(())
+}
+
 fn scan_replay_log(
     file: File,
     path: &Path,
@@ -11662,6 +12069,10 @@ fn scan_replay_log(
     let mut transactions = explorer_index::TransactionIndex::default();
     let mut addresses = explorer_address_index::AddressHistoryIndex::default();
     let mut known_blocks = HashSet::from([params.genesis_hash]);
+    let mut pruned_headers = HashMap::new();
+    let mut saw_full_record = false;
+    let mut last_pruned = params.genesis_hash;
+    let mut pruned_height = 0_u64;
     loop {
         let offset = reader
             .stream_position()
@@ -11677,6 +12088,7 @@ fn scan_replay_log(
                 addresses,
                 last_record_digest,
                 log_length,
+                pruned_headers,
             });
         };
         let end = reader
@@ -11707,23 +12119,30 @@ fn scan_replay_log(
                 saw_v2 = true;
             }
         }
+        let block = decode_stored_block(&record, record_index, network_id)?;
         let ParsedLogRecord {
             accepted_at,
-            block_bytes,
-            payload: _,
             complete_digest,
             version,
+            ..
         } = record;
-        let block = decode_block(&block_bytes, network_id).map_err(|error| {
-            NodeError::CorruptLog(format!("record {record_index} cannot decode: {error}"))
-        })?;
-        let reencoded = encode_block(&block).map_err(|error| {
-            NodeError::CorruptLog(format!("record {record_index} cannot re-encode: {error}"))
-        })?;
-        if reencoded != block_bytes {
-            return Err(NodeError::CorruptLog(format!(
-                "record {record_index} is not canonical"
-            )));
+        if version == BlockRecordVersion::Pruned {
+            if saw_full_record
+                || block.challenge.previous_block != last_pruned
+                || block.challenge.height != pruned_height.saturating_add(1)
+            {
+                return Err(NodeError::CorruptLog(format!(
+                    "record {record_index} breaks the pruned prefix chain"
+                )));
+            }
+            last_pruned = block.block_id();
+            pruned_height = block.challenge.height;
+            let successor = block.pruned_successor(params)?.ok_or_else(|| {
+                NodeError::CorruptLog(format!("record {record_index} lacks pruned header state"))
+            })?;
+            pruned_headers.insert(block.block_id(), successor);
+        } else {
+            saw_full_record = true;
         }
         let block_id = block.block_id();
         let parent = block.challenge.previous_block;
@@ -11739,9 +12158,9 @@ fn scan_replay_log(
         }
         let position = records.len();
         transactions.insert_block(block_id, block.transactions.iter().map(Transaction::txid));
-        addresses.insert_entries(explorer_address_index::AddressHistoryIndex::block_entries(
-            &block,
-        ));
+        addresses.insert_entries(
+            explorer_address_index::AddressHistoryIndex::stored_block_entries(&block),
+        );
         children.entry(parent).or_default().push(position);
         records.push(BlockRecordLocator {
             ordinal: record_index,
@@ -16538,6 +16957,7 @@ mod tests {
         let log_path = path.join(BLOCK_LOG_FILE);
         let log = open_block_log(&log_path).unwrap();
         replay_log(
+            &path,
             &log,
             &log_path,
             &mut state,
@@ -17058,7 +17478,7 @@ mod tests {
             let mut state = ChainState::new(params, verifier.clone()).unwrap();
             let mut index = BlockIndex::new(params.genesis_hash);
             let error = replay_log(
-                &retained, &log_path, &mut state, &mut index, &verifier, params, None,
+                &path, &retained, &log_path, &mut state, &mut index, &verifier, params, None,
             )
             .unwrap_err();
             assert!(matches!(
@@ -17104,7 +17524,7 @@ mod tests {
             let mut state = ChainState::new(params, verifier.clone()).unwrap();
             let mut index = BlockIndex::new(params.genesis_hash);
             replay_log(
-                &retained, &log_path, &mut state, &mut index, &verifier, params, None,
+                &path, &retained, &log_path, &mut state, &mut index, &verifier, params, None,
             )
             .unwrap();
             assert_eq!(state.tip(), expected_tip);
@@ -17198,7 +17618,7 @@ mod tests {
         let log_path = path.join(BLOCK_LOG_FILE);
         let log = open_block_log(&log_path).unwrap();
         let error = replay_log(
-            &log, &log_path, &mut state, &mut index, &verifier, params, None,
+            &path, &log, &log_path, &mut state, &mut index, &verifier, params, None,
         )
         .unwrap_err();
         assert!(matches!(

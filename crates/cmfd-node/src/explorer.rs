@@ -1,6 +1,6 @@
 #[cfg(test)]
 use cmfd_consensus::encode_block;
-use cmfd_consensus::{Block, BlockProof, Transaction, encode_transaction};
+use cmfd_consensus::{Transaction, encode_transaction};
 use serde::Serialize;
 use std::time::{Duration, Instant};
 
@@ -17,13 +17,13 @@ const EXPLORER_CACHE_MAX_AGE: Duration = Duration::from_secs(30);
 /// No unchecked constructor, mutation accessor or consensus capability exists.
 /// This avoids rehashing a V4 proof just to obtain the same display identifier.
 pub(super) struct AuthenticatedExplorerBlock {
-    block: Block,
+    block: crate::StoredBlock,
     block_id: [u8; 32],
     encoded_bytes: usize,
 }
 
 impl AuthenticatedExplorerBlock {
-    pub(super) fn block(&self) -> &Block {
+    pub(super) fn block(&self) -> &crate::StoredBlock {
         &self.block
     }
     pub(super) fn block_id(&self) -> [u8; 32] {
@@ -413,7 +413,8 @@ fn block_summary(
                 NodeError::CorruptLog("coinbase output total overflows u64".to_owned())
             })
         })?;
-    let (nonce, work_digest) = proof_identity(&block.proof);
+    let summary = block.proof_summary();
+    let (nonce, work_digest) = (summary.nonce, summary.work_digest);
     Ok(ExplorerBlock {
         height: block.challenge.height,
         block_id: hex::encode(checked.block_id()),
@@ -464,15 +465,6 @@ fn transaction_summary(
     })
 }
 
-fn proof_identity(proof: &BlockProof) -> (u64, [u8; 32]) {
-    match proof {
-        BlockProof::V1Legacy(proof) => (proof.nonce, proof.work_digest),
-        BlockProof::V2Reference(proof) => (proof.nonce, proof.work_digest),
-        BlockProof::V3Candidate(proof) => (proof.nonce, proof.work_digest),
-        BlockProof::V4Candidate(proof) => (proof.nonce, proof.work_digest),
-    }
-}
-
 pub(super) fn parse_identifier(value: &str) -> Option<[u8; 32]> {
     if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
@@ -491,6 +483,7 @@ mod tests {
     use super::*;
     use crate::tests::{clean_test_dir, mined_child, spend_coinbase_output, test_dir};
     use crate::{DEVNET_PROFILE, RpcRequest, route_rpc_request};
+    use cmfd_consensus::Block;
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
 
@@ -644,7 +637,7 @@ mod tests {
         let original = mine(&mut node);
         let block_id = original.block_id();
         let checked = node.read_explorer_block(block_id).unwrap();
-        assert_eq!(checked.block(), &original);
+        assert_eq!(checked.block().full().as_ref(), Some(&original));
         assert_eq!(checked.block_id(), block_id);
         assert_eq!(
             checked.encoded_bytes(),

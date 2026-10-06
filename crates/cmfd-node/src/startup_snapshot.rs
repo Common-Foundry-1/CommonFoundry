@@ -109,6 +109,7 @@ pub(super) fn persist_startup_snapshot(node: &Node) -> Result<(), NodeError> {
             BlockRecordVersion::LegacyV1 => 1,
             BlockRecordVersion::V2 => 2,
             BlockRecordVersion::V3 => 3,
+            BlockRecordVersion::Pruned => 4,
         });
         bytes.extend_from_slice(&locator.complete_digest);
         bytes.extend_from_slice(&locator.accepted_at.to_le_bytes());
@@ -220,6 +221,10 @@ fn load_slot(
                 3 => {
                     saw_v2 = true;
                     BlockRecordVersion::V3
+                }
+                4 => {
+                    saw_v2 = true;
+                    BlockRecordVersion::Pruned
                 }
                 _ => {
                     return Err(NodeError::CorruptLog(

@@ -6,13 +6,13 @@
 //! instance and chain revision.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use blake3::Hasher;
-use cmfd_consensus::{Block, OutputLock};
+use cmfd_consensus::OutputLock;
 use k256::schnorr::VerifyingKey;
 use thiserror::Error;
 
@@ -742,7 +742,7 @@ struct ChainReadPlan {
     chain_revision: u64,
     active_chain: Vec<[u8; 32]>,
     blocks: Vec<PlannedBlock>,
-    log: Option<File>,
+    log: Option<crate::LogReadHandle>,
     log_path: PathBuf,
     network_id: [u8; 32],
     require_v2: bool,
@@ -818,7 +818,7 @@ fn capture_chain_plan_at(
     let log = if blocks.is_empty() {
         None
     } else {
-        Some(node.log.try_clone().map_err(|source| {
+        Some(node.clone_log_for_read().map_err(|source| {
             ExchangeIndexError::Node(super::io_error(
                 "clone retained block log for exchange deposit scan",
                 &log_path,
@@ -918,7 +918,7 @@ fn reconcile_state(
 fn collect_block_deposits(
     deposits: &mut Vec<ActiveDeposit>,
     watches: &BTreeMap<[u8; 32], String>,
-    block: &Block,
+    block: &crate::StoredBlock,
 ) -> Result<(), ExchangeIndexError> {
     let block_hash = block.block_id();
     let block_height = block.challenge.height;
@@ -1843,6 +1843,7 @@ mod tests {
 
     use super::*;
     use crate::{DEFAULT_MINING_ATTEMPTS, DEVNET_PROFILE, unix_time_seconds};
+    use cmfd_consensus::Block;
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
 

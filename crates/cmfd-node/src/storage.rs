@@ -9,7 +9,7 @@ use serde::Serialize;
 
 use super::{
     BLOCK_LOG_FILE, DataDirLock, EMPTY_RECORD_CHAIN_ROOT, NetworkProfile, NodeError,
-    ParsedRecordPayload, decode_block, encode_block, io_error, read_log_record,
+    ParsedRecordPayload, decode_stored_block, io_error, read_log_record,
     verify_retained_block_log_path,
 };
 
@@ -249,17 +249,9 @@ fn scan_block_log(
                 })?;
             }
         }
-        let block = decode_block(&record.block_bytes, profile.network_id).map_err(|error| {
-            NodeError::CorruptLog(format!("record {record_index} cannot decode: {error}"))
-        })?;
-        if encode_block(&block).map_err(|error| {
-            NodeError::CorruptLog(format!("record {record_index} cannot re-encode: {error}"))
-        })? != record.block_bytes
-        {
-            return Err(NodeError::CorruptLog(format!(
-                "record {record_index} is not canonical"
-            )));
-        }
+        // Pruned records keep everything but the proof and are checked
+        // against their stored header instead of re-encoded.
+        let block = decode_stored_block(&record, record_index, profile.network_id)?;
         let block_id = block.block_id();
         if !known_blocks.contains(&block.challenge.previous_block) {
             return Err(NodeError::CorruptLog(format!(

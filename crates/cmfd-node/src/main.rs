@@ -461,6 +461,13 @@ enum Command {
         /// Explicitly allow unauthenticated, unencrypted public P2P addresses.
         #[arg(long)]
         allow_public_peers: bool,
+        /// Opt-in proof pruning: keep full blocks only for this many newest
+        /// blocks (at least 288). Older blocks keep their transactions but
+        /// drop their proofs, cutting storage from about 12 MB to a few KB
+        /// per block. A pruned node cannot serve old blocks to peers or follow
+        /// a reorganization deeper than this window.
+        #[arg(long)]
+        prune_keep_blocks: Option<u64>,
     },
     /// Generate a create-new raw 32-byte withdrawal-journal authentication key.
     ExchangeWithdrawalKeygen {
@@ -1676,6 +1683,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             peers,
             no_default_seeds,
             allow_public_peers,
+            prune_keep_blocks,
         } => {
             let shutdown = install_shutdown_handler()?;
             let (peers, allow_public_peers) =
@@ -1690,8 +1698,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 exchange_withdrawal_security.as_ref(),
             )?;
             node.set_public_peer_mode(allow_public_peers);
+            node.configure_pruning(prune_keep_blocks)?;
+            if prune_keep_blocks.is_some()
+                && let Some(report) = node.prune_block_log()?
+            {
+                eprintln!("{}", serde_json::to_string(&prune_report_json(&report))?);
+            }
             let discovery_hello = node.peer_hello();
             let shared = Arc::new(Mutex::new(node));
+            let pruner = prune_keep_blocks
+                .map(|_| spawn_pruner(Arc::clone(&shared)))
+                .transpose()?;
             let exchange_withdrawals_enabled = exchange_rpc_withdrawal_auth_file.is_some();
             let exchange_custody_v3_active = exchange_custody_v3.is_some();
             let exchange_rpc = match (exchange_rpc_bind, exchange_rpc_auth_file) {
@@ -1803,6 +1820,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None => Ok(()),
             };
             let inbound_result = inbound.stop();
+            if let Some(pruner) = pruner {
+                pruner.stop();
+            }
             drop(shared);
             exchange_rpc_result?;
             rpc_result?;
@@ -2267,6 +2287,57 @@ impl ShutdownSignal {
             }
         }
     }
+}
+
+/// How often a running pruned node checks whether it can prune further.
+const PRUNE_CHECK_INTERVAL: Duration = Duration::from_secs(600);
+
+struct Pruner {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl Pruner {
+    fn stop(self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = self.thread.join();
+    }
+}
+
+/// Prunes a running node in the background. The rewrite runs without the
+/// node lock; a prune that cannot finish (for example while readers keep the
+/// log busy) is retried at the next check. Each prune logs its own report.
+fn spawn_pruner(shared: Arc<Mutex<cmfd_node::Node>>) -> std::io::Result<Pruner> {
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&stop);
+    let thread = std::thread::Builder::new()
+        .name("cmfd-pruner".to_owned())
+        .spawn(move || {
+            let tick = Duration::from_secs(1);
+            let mut waited = Duration::ZERO;
+            while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(tick);
+                waited += tick;
+                if waited < PRUNE_CHECK_INTERVAL {
+                    continue;
+                }
+                waited = Duration::ZERO;
+                if let Err(error) = cmfd_node::prune_shared_node(&shared) {
+                    tracing::warn!(%error, "proof pruning will retry later");
+                }
+            }
+        })?;
+    Ok(Pruner { stop, thread })
+}
+
+fn prune_report_json(report: &cmfd_node::PruneReport) -> serde_json::Value {
+    json!({
+        "pruned_below_height": report.anchor_height,
+        "newly_pruned_blocks": report.newly_pruned_blocks,
+        "dropped_side_blocks": report.dropped_side_blocks,
+        "log_bytes_before": report.log_bytes_before,
+        "log_bytes_after": report.log_bytes_after,
+    })
 }
 
 fn install_shutdown_handler() -> Result<ShutdownSignal, ctrlc::Error> {

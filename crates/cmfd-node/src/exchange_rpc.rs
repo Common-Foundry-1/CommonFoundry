@@ -17,8 +17,8 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 #[cfg(test)]
 use cmfd_consensus::decode_block;
 use cmfd_consensus::{
-    Block, BlockProof, InputWitness, MAX_TRANSACTION_BYTES, OutputLock, Transaction, TxOutput,
-    decode_transaction, encode_transaction,
+    InputWitness, MAX_TRANSACTION_BYTES, OutputLock, Transaction, TxOutput, decode_transaction,
+    encode_transaction,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -649,7 +649,7 @@ enum BlockReadPlan {
 
 struct PersistedBlockReadPlan {
     node_instance_id: u64,
-    log: File,
+    log: crate::LogReadHandle,
     log_path: PathBuf,
     locator: BlockRecordLocator,
     network_id: [u8; 32],
@@ -2185,7 +2185,7 @@ fn plan_block_read(
             .and_then(|height| node.active_block_id_at_height(height))
     });
     let log_path = node.data_dir.join(BLOCK_LOG_FILE);
-    let log = node.log.try_clone().map_err(|source| {
+    let log = node.clone_log_for_read().map_err(|source| {
         crate::io_error(
             "clone retained block log for exchange read",
             &log_path,
@@ -2226,11 +2226,15 @@ fn execute_block_read(plan: BlockReadPlan) -> Result<Value, NodeError> {
         ));
     }
     if plan.verbosity == 0 {
+        if block.is_pruned() {
+            return Err(NodeError::BlockProofPruned(plan.block_id));
+        }
         return Ok(json!(hex::encode(record.block_bytes)));
     }
+    let size = crate::stored_block_size(&record, &block);
     block_document(
         &block,
-        record.block_bytes.len(),
+        size,
         plan.verbosity == 2,
         plan.confirmations,
         plan.next_block,
@@ -2771,7 +2775,7 @@ fn blockchain_info(node: &Node) -> Result<Value, NodeError> {
             .to_owned(),
     );
 
-    Ok(json!({
+    let mut info = json!({
         "api_version": EXCHANGE_RPC_API_VERSION,
         "chain": status.network_short_name,
         "network_id": status.network_id,
@@ -2790,11 +2794,20 @@ fn blockchain_info(node: &Node) -> Result<Value, NodeError> {
         "first_block_height": 1,
         "sync_basis": "external_readiness_policy_required",
         "warnings": warnings,
-    }))
+    });
+    // As in Bitcoin Core, `pruneheight` is the lowest block whose raw bytes
+    // are still stored. Verbose block data stays available for every block.
+    let pruned = status.prune_keep_blocks.is_some() || status.pruned_height.is_some();
+    info["pruned"] = json!(pruned);
+    if pruned {
+        info["pruneheight"] = json!(status.pruned_height.map_or(1, |height| height + 1));
+        info["prune_keep_blocks"] = json!(status.prune_keep_blocks);
+    }
+    Ok(info)
 }
 
 fn block_document(
-    block: &Block,
+    block: &crate::StoredBlock,
     encoded_bytes: usize,
     verbose_transactions: bool,
     active_confirmations: Option<u64>,
@@ -2828,7 +2841,9 @@ fn block_document(
             .map(|transaction| json!(hex::encode(transaction.txid())))
             .collect()
     };
-    let (proof_type, nonce, work_digest) = proof_identity(&block.proof);
+    let summary = block.proof_summary();
+    let (proof_type, nonce, work_digest) =
+        (summary.kind_name(), summary.nonce, summary.work_digest);
 
     Ok(json!({
         "hash": hex::encode(block_id),
@@ -2941,15 +2956,6 @@ fn outputs_document(outputs: &[TxOutput]) -> Vec<Value> {
             })
         })
         .collect()
-}
-
-fn proof_identity(proof: &BlockProof) -> (&'static str, u64, [u8; 32]) {
-    match proof {
-        BlockProof::V1Legacy(proof) => ("v1_legacy", proof.nonce, proof.work_digest),
-        BlockProof::V2Reference(proof) => ("v2_reference", proof.nonce, proof.work_digest),
-        BlockProof::V3Candidate(proof) => ("v3_candidate", proof.nonce, proof.work_digest),
-        BlockProof::V4Candidate(proof) => ("v4_candidate", proof.nonce, proof.work_digest),
-    }
 }
 
 #[cfg(test)]
@@ -3173,6 +3179,70 @@ mod tests {
             &mut node,
         );
         assert_eq!(raw["error"]["data"]["code"], "block_not_found");
+        drop(node);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn pruned_blocks_keep_verbose_documents_but_no_raw_frame() {
+        let directory = test_directory("pruned");
+        let _ = fs::remove_dir_all(&directory);
+        let mut node = Node::open_with_profile(&directory, DEVNET_PROFILE).unwrap();
+        let destination = node.wallet_destination();
+        // The floor is for operators; tests use a short window.
+        node.prune_keep_blocks = Some(10);
+        for height in 1..=80 {
+            node.mine_once(
+                destination,
+                DEVNET_PROFILE.virtual_genesis_timestamp + height * 60,
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        }
+        let info = blockchain_info(&node).unwrap();
+        assert_eq!(info["pruned"], true);
+        assert_eq!(info["pruneheight"], 1);
+        let hash = call(
+            json!({"jsonrpc":"2.0","id":1,"method":"getblockhash","params":[5]}),
+            &mut node,
+        )["result"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let full = call(
+            json!({"jsonrpc":"2.0","id":2,"method":"getblock","params":[hash,2]}),
+            &mut node,
+        )["result"]
+            .clone();
+
+        node.prune_block_log().unwrap().unwrap();
+        let info = blockchain_info(&node).unwrap();
+        assert_eq!(info["pruned"], true);
+        assert_eq!(info["pruneheight"], 65);
+        assert_eq!(info["prune_keep_blocks"], 10);
+        // Everything but the proof bytes survives, including the reported
+        // size of the original block.
+        let pruned = call(
+            json!({"jsonrpc":"2.0","id":3,"method":"getblock","params":[hash,2]}),
+            &mut node,
+        )["result"]
+            .clone();
+        assert_eq!(pruned, full);
+        let raw = call(
+            json!({"jsonrpc":"2.0","id":4,"method":"getblock","params":[hash,0]}),
+            &mut node,
+        );
+        assert_eq!(raw["error"]["data"]["code"], "block_proof_pruned");
+        let tip = call(
+            json!({"jsonrpc":"2.0","id":5,"method":"getbestblockhash","params":[]}),
+            &mut node,
+        )["result"]
+            .clone();
+        let raw = call(
+            json!({"jsonrpc":"2.0","id":6,"method":"getblock","params":[tip,0]}),
+            &mut node,
+        );
+        assert!(raw["result"].is_string());
         drop(node);
         fs::remove_dir_all(directory).unwrap();
     }
@@ -4405,6 +4475,8 @@ mod tests {
         assert_eq!(info["peer_observation_tip_match"], true);
         assert_eq!(info["initialblockdownload"], true);
         assert_eq!(info["verificationprogress"], 1.0);
+        assert_eq!(info["pruned"], false);
+        assert!(info.get("pruneheight").is_none());
 
         drop(node);
         fs::remove_dir_all(directory).unwrap();

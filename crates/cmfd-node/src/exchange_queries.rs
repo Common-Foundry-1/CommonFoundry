@@ -2,11 +2,10 @@
 //! authenticated block log and current chain state remain authoritative.
 
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use cmfd_consensus::{Block, OutPoint, OutputLock, Transaction, coinbase_outpoint_id};
+use cmfd_consensus::{OutPoint, OutputLock, Transaction, coinbase_outpoint_id};
 use serde_json::{Value, json};
 
 use crate::{BLOCK_LOG_FILE, BlockRecordLocator, Node, NodeError, ProofProfile};
@@ -46,7 +45,7 @@ struct ReadPlan {
     instance: u64,
     revision: u64,
     chain: Vec<[u8; 32]>,
-    log: File,
+    log: crate::LogReadHandle,
     path: PathBuf,
     network: [u8; 32],
     require_v2: bool,
@@ -55,7 +54,7 @@ struct ReadPlan {
 
 pub(crate) enum TransactionBody {
     Regular(Transaction),
-    Coinbase(Box<Block>),
+    Coinbase(Box<crate::StoredBlock>),
 }
 
 pub(crate) struct TransactionRead {
@@ -80,7 +79,7 @@ impl ReadPlan {
             instance: node.instance_id,
             revision: node.chain_revision,
             chain: node.index.active_chain.clone(),
-            log: node.log.try_clone().map_err(NodeError::RpcIo)?,
+            log: node.clone_log_for_read().map_err(NodeError::RpcIo)?,
             path: node.data_dir.join(BLOCK_LOG_FILE),
             network: node.params.network_id,
             require_v2: matches!(node.profile.proof, ProofProfile::ProductionV3),
@@ -88,7 +87,11 @@ impl ReadPlan {
         })
     }
 
-    fn read(&self, id: [u8; 32], locator: &BlockRecordLocator) -> Result<Block, NodeError> {
+    fn read(
+        &self,
+        id: [u8; 32],
+        locator: &BlockRecordLocator,
+    ) -> Result<crate::StoredBlock, NodeError> {
         let (_, block) = crate::read_located_record(
             &self.log,
             &self.path,
@@ -123,7 +126,7 @@ impl ReadPlan {
         shared: &Arc<Mutex<Node>>,
         id: [u8; 32],
         locator: &BlockRecordLocator,
-    ) -> Result<Block, QueryError> {
+    ) -> Result<crate::StoredBlock, QueryError> {
         match self.read(id, locator) {
             Ok(block) => Ok(block),
             Err(error) => {

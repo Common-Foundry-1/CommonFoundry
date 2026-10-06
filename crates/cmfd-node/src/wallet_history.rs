@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 
-use cmfd_consensus::{Block, OutPoint, OutputLock, TxOutput};
+use cmfd_consensus::{OutPoint, OutputLock, TxOutput};
 
 use crate::{
     IndexedBlock, MAX_WALLET_HISTORY, NodeError, WalletHistoryEntry, checked_wallet_add, io_error,
@@ -200,7 +200,7 @@ impl WalletHistoryCache {
         &mut self,
         position: usize,
         block_id: [u8; 32],
-        block: &Block,
+        block: &crate::StoredBlock,
     ) -> Result<(), NodeError> {
         if position != self.scanned_position() + 1 {
             return Err(NodeError::CorruptLog(

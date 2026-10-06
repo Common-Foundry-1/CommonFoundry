@@ -95,3 +95,10 @@ The [explorer resource qualification](explorer-resource-qualification.md)
 separates synthetic index memory measurements, valid tiny-profile recovery
 fixtures and real full-size proof checks. None alone closes the production
 startup/recovery gate.
+
+## Proof pruning
+
+Opt-in [proof pruning](proof-pruning.md) rewrites old records without their
+proofs. A pruned log also needs its `prune-anchor-<height>.bin` state file:
+back the two up together. The inspection and tail-repair commands above
+accept pruned logs.

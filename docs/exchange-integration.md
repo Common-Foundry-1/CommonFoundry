@@ -293,11 +293,11 @@ return HTTP 401; authenticated JSON-RPC errors return HTTP 200.
 | Method | Parameters | Result |
 |---|---|---|
 | `getexchangeinfo` | `[]` | Exact API/network pins, enabled custody mode and methods, encodings, index health/capacity, and an explicit non-production status |
-| `getblockchaininfo` | `[]` | Network pins, height/tip/work, storage health, active and recently reachable peers, conservative sync state, warnings |
+| `getblockchaininfo` | `[]` | Network pins, height/tip/work, storage health, active and recently reachable peers, conservative sync state, warnings; `pruned`, plus `pruneheight` and `prune_keep_blocks` on a [pruned node](proof-pruning.md) |
 | `getblockcount` | `[]` | Active tip height |
 | `getbestblockhash` | `[]` | Active tip ID |
 | `getblockhash` | `[height]` | Active-chain ID at the height |
-| `getblock` | `[hash, verbosity=1]` | Canonical block-frame hex at `0`; block with txids at `1`; block with explicit transaction objects at `2` |
+| `getblock` | `[hash, verbosity=1]` | Canonical block-frame hex at `0` (`block_proof_pruned` below `pruneheight` on a pruned node); block with txids at `1`; block with explicit transaction objects at `2` |
 | `getrawmempool` | `[verbose=false]` | Txid array, or txid-keyed size and `fee_atoms` records |
 | `sendrawtransaction` | `[transaction_hex]` | Accepted txid; an identical transaction already in this mempool returns the same txid |
 | `registerwatchdestination` | `[label, destination_hex]` | Immutable watch registration after the complete active-chain history has been indexed |

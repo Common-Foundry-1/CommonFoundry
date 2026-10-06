@@ -149,8 +149,13 @@ The network label remains visible on mobile.
 
 The `mainnet` Wrangler environment is a distinct Worker named
 `commonfoundry-mainnet-explorer`. It owns the public custom domain
-`explorer.commonfoundry.ai` and has no workers.dev access or preview URLs; publish it
-with `npm run build:mainnet` and `npx wrangler deploy --env mainnet`. Validate it locally with:
+`explorer.commonfoundry.ai` and has no workers.dev access or preview URLs. Merges to `main`
+that touch `apps/explorer/` publish it through `.github/workflows/deploy-explorer.yml`: the job
+runs the type check and tests, builds `dist-mainnet`, deploys with
+`npx wrangler deploy --env mainnet`, then checks that the live site serves mainnet data (network
+header, snapshot, supply and an address deep link) and rolls back to the previously live version
+if it does not. It needs the repository secrets `CLOUDFLARE_API_TOKEN` (an "Edit Cloudflare
+Workers" token) and `CLOUDFLARE_ACCOUNT_ID`. Validate it locally with:
 
 ```powershell
 npm run build:mainnet
@@ -182,8 +187,8 @@ configuration. The Worker and node additionally enforce numeric cursor limits.
 
 Validate the complete proposed tunnel configuration with the installed
 `cloudflared tunnel ingress validate` and test both allowed and denied URLs with
-`cloudflared tunnel ingress rule`. Keep the catch-all 404 last. Mainnet publication
-remains owner-controlled; no deployment command is run by the CI dry-run job.
+`cloudflared tunnel ingress rule`. Keep the catch-all 404 last. Merging to `main` is the
+publication decision; the CI dry-run job itself deploys nothing.
 
 ## Devnet deployment
 
@@ -205,12 +210,7 @@ npm test -- --run
 npm run deploy
 ```
 
-The same sequence runs automatically from `.github/workflows/deploy-explorer.yml` whenever a
-change under `apps/explorer/` lands on `main` (or on manual dispatch). It deploys only the default
-Worker environment and needs the repository secrets `CLOUDFLARE_API_TOKEN` (an "Edit Cloudflare
-Workers" token) and `CLOUDFLARE_ACCOUNT_ID`. After deploying it fetches an `/address/<hash>` deep
-link from the Devnet workers.dev address and fails if the explorer page is not served. It never
-publishes the mainnet explorer.
+Nothing deploys the Devnet Worker automatically; run the sequence above by hand when needed.
 
 Keep the node RPC bound to `127.0.0.1:22443`. Do not open that port on the router or expose the
 unrestricted RPC service directly. The tunnel connector and node must run on the same trusted host.

@@ -1,10 +1,11 @@
 name: deploy-explorer
 
-# Deploys the Devnet explorer (apps/explorer, default Worker environment, served only
-# at its workers.dev address) whenever explorer code lands on main.
-# explorer.commonfoundry.ai belongs to the mainnet Worker environment.
-# The mainnet Worker environment is never deployed from here; its publication
-# remains owner-controlled (see apps/explorer/README.md).
+# Publishes the public mainnet explorer (apps/explorer, `mainnet` Worker
+# environment, which owns explorer.commonfoundry.ai) whenever explorer code
+# lands on main: merging to main is the owner's approval. Tests run first.
+# After deploying, the job checks that the live site serves mainnet data and
+# rolls back to the previously live version if it does not. The Devnet Worker
+# is not deployed from here.
 
 on:
   push:
@@ -26,11 +27,15 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     environment:
-      name: devnet-explorer
-      url: https://commonfoundry-devnet-explorer.benefit14snake.workers.dev
+      name: mainnet-explorer
+      url: https://explorer.commonfoundry.ai
     defaults:
       run:
         working-directory: apps/explorer
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      WRANGLER_SEND_METRICS: "false"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -39,9 +44,6 @@ jobs:
           cache: npm
           cache-dependency-path: apps/explorer/package-lock.json
       - name: Check Cloudflare credentials are configured
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           missing=0
           for name in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID; do
@@ -54,23 +56,43 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run check
       - run: npm test -- --run
-      - name: Build and deploy the default (Devnet) Worker
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          WRANGLER_SEND_METRICS: "false"
-        run: npm run deploy
-      - name: Verify a deep link serves the explorer
+      - run: npm run build:mainnet
+      - name: Record the live version for rollback
+        id: previous
         run: |
-          url="https://commonfoundry-devnet-explorer.benefit14snake.workers.dev/address/b5752a5403cee4d4525e5d423cb143e2b02df9aac3d6a9dc652cf6ed7a47eeab"
+          version=$(npx wrangler deployments status --env mainnet --json | jq -r '.versions[0].version_id // empty')
+          if [ -z "$version" ]; then
+            echo "::error::Could not read the live mainnet explorer version."
+            exit 1
+          fi
+          echo "Live version before deploy: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Deploy the mainnet Worker
+        run: |
+          npx wrangler deploy --env mainnet --message "main ${GITHUB_SHA::7}"
+      - name: Verify the live explorer serves mainnet data
+        run: |
+          expected=$(jq -r .network_id ../../packaging/mainnet/MAINNET-PLAN.json)
+          base=https://explorer.commonfoundry.ai
           for attempt in 1 2 3 4 5 6; do
-            status=$(curl -sS -o response.html -w '%{http_code}' "$url" || echo 000)
-            if [ "$status" = "200" ] && grep -q "<title>Common Foundry Explorer</title>" response.html; then
-              echo "Deep link served the explorer page (HTTP 200)."
+            ok=1
+            network=$(curl -sS -D - -o snapshot.json "$base/v1/explorer" | tr -d '\r' | awk 'tolower($1) == "x-cmfd-network-id:" { print $2 }')
+            [ "$network" = "$expected" ] || ok=0
+            jq -e '.accepted_height | numbers' snapshot.json > /dev/null 2>&1 || ok=0
+            total=$(curl -sS "$base/api/supply/total" || true)
+            [[ "$total" =~ ^[0-9]+\.[0-9]{8}$ ]] || ok=0
+            page=$(curl -sS -o page.html -w '%{http_code}' "$base/address/b5752a5403cee4d4525e5d423cb143e2b02df9aac3d6a9dc652cf6ed7a47eeab" || echo 000)
+            { [ "$page" = "200" ] && grep -q "<title>Common Foundry Explorer</title>" page.html; } || ok=0
+            if [ "$ok" = 1 ]; then
+              echo "The live explorer serves mainnet data (supply $total)."
               exit 0
             fi
-            echo "Attempt $attempt: HTTP $status; retrying in 10s"
+            echo "Attempt $attempt: network '$network', supply '$total', page HTTP $page; retrying in 10s"
             sleep 10
           done
-          echo "::error::$url did not return the explorer page after deploy."
+          echo "::error::The live explorer did not serve mainnet data after the deploy."
           exit 1
+      - name: Roll back to the previously live version
+        if: failure() && steps.previous.outputs.version != ''
+        run: |
+          npx wrangler rollback "${{ steps.previous.outputs.version }}" --env mainnet --yes --message "Automatic rollback: main ${GITHUB_SHA::7} failed its post-deploy check"

@@ -17,6 +17,7 @@ beforeEach(() => {
   vi.mocked(loadAddress).mockReset().mockResolvedValue(addressFixture());
   vi.mocked(loadBlock).mockReset(); vi.mocked(loadTransaction).mockReset();
   vi.spyOn(window, "scrollTo").mockImplementation(() => {});
+  window.history.replaceState(null, "", "/");
 });
 afterEach(() => vi.restoreAllMocks());
 
@@ -162,4 +163,99 @@ test("hash search falls back only for not-found, never for an identity failure",
   await user.click(screen.getByRole("button", { name: "Search" }));
   expect(await screen.findByRole("alert")).toHaveTextContent("transaction not found");
   expect(loadTransaction).toHaveBeenCalledWith(fixtureAddress, false);
+});
+
+test("a direct /address link opens the wallet page instead of the overview", async () => {
+  window.history.replaceState(null, "", `/address/${fixtureAddress}`);
+  vi.mocked(loadExplorer).mockResolvedValue({ data: demoSnapshot, preview: false });
+  render(<App />);
+  expect(await screen.findByRole("heading", { name: "Address" })).toBeInTheDocument();
+  expect(screen.queryByRole("heading", { name: "Latest blocks" })).not.toBeInTheDocument();
+  expect(loadAddress).toHaveBeenCalledWith(fixtureAddress, null, false);
+  expect(window.location.pathname).toBe(`/address/${fixtureAddress}`);
+});
+
+test("a direct link survives an outage and opens after Retry", async () => {
+  window.history.replaceState(null, "", `/address/${fixtureAddress}`);
+  vi.mocked(loadExplorer).mockRejectedValueOnce(new Error("offline")).mockResolvedValue({ data: demoSnapshot, preview: false });
+  render(<App />);
+  expect(await screen.findByText("Explorer unavailable")).toBeInTheDocument();
+  expect(window.location.pathname).toBe(`/address/${fixtureAddress}`);
+  await userEvent.setup().click(screen.getByRole("button", { name: "Retry" }));
+  expect(await screen.findByRole("heading", { name: "Address" })).toBeInTheDocument();
+});
+
+test("direct block and transaction links open their pages", async () => {
+  const block = demoSnapshot.latest_blocks[0];
+  const transaction = demoSnapshot.recent_transactions[0];
+  vi.mocked(loadExplorer).mockResolvedValue({ data: demoSnapshot, preview: false });
+  vi.mocked(loadBlock).mockResolvedValue({ ...block, coinbase_outputs: 1, transactions_detail: [] });
+  vi.mocked(loadTransaction).mockResolvedValue(transaction);
+
+  window.history.replaceState(null, "", `/block/${block.height}`);
+  const first = render(<App />);
+  expect(await screen.findByRole("heading", { name: `Block #${block.height.toLocaleString()}` })).toBeInTheDocument();
+  expect(loadBlock).toHaveBeenCalledWith(String(block.height), false);
+  expect(window.location.pathname).toBe(`/block/${block.height}`);
+  first.unmount();
+
+  window.history.replaceState(null, "", `/tx/${transaction.txid}`);
+  render(<App />);
+  expect(await screen.findByRole("heading", { name: "Transaction" })).toBeInTheDocument();
+  expect(loadTransaction).toHaveBeenCalledWith(transaction.txid, false);
+});
+
+test("an unknown path falls back to the overview at /", async () => {
+  window.history.replaceState(null, "", "/wallet/not-a-page");
+  render(<App />);
+  expect(await screen.findByRole("heading", { name: "Latest blocks" })).toBeInTheDocument();
+  expect(window.location.pathname).toBe("/");
+});
+
+test("a failed deep link lands on the overview with the error and a clean URL", async () => {
+  window.history.replaceState(null, "", `/address/${fixtureAddress}`);
+  vi.mocked(loadExplorer).mockResolvedValue({ data: demoSnapshot, preview: false });
+  vi.mocked(loadAddress).mockRejectedValue(new ExplorerRequestError("address not found", 404));
+  render(<App />);
+  expect(await screen.findByRole("alert")).toHaveTextContent("address not found");
+  expect(screen.getByRole("heading", { name: "Latest blocks" })).toBeInTheDocument();
+  expect(window.location.pathname).toBe("/");
+});
+
+test("search updates the URL and browser history restores pages", async () => {
+  vi.mocked(loadExplorer).mockResolvedValue({ data: demoSnapshot, preview: false });
+  render(<App />);
+  await screen.findByRole("heading", { name: "Latest blocks" });
+  const user = userEvent.setup();
+  await user.selectOptions(screen.getByRole("combobox", { name: "Search type" }), "address");
+  await user.type(screen.getByRole("textbox", { name: "Search wallet address" }), fixtureAddress.toUpperCase() + "{Enter}");
+  expect(await screen.findByRole("heading", { name: "Address" })).toBeInTheDocument();
+  expect(window.location.pathname).toBe(`/address/${fixtureAddress}`);
+
+  await user.click(within(screen.getByRole("main")).getByRole("button", { name: "Explorer overview" }));
+  expect(screen.getByRole("heading", { name: "Latest blocks" })).toBeInTheDocument();
+  expect(window.location.pathname).toBe("/");
+
+  await act(async () => { window.history.back(); await new Promise((resolve) => setTimeout(resolve, 0)); });
+  expect(await screen.findByRole("heading", { name: "Address" })).toBeInTheDocument();
+  expect(window.location.pathname).toBe(`/address/${fixtureAddress}`);
+  expect(loadAddress).toHaveBeenCalledTimes(2);
+
+  await act(async () => { window.history.forward(); await new Promise((resolve) => setTimeout(resolve, 0)); });
+  expect(await screen.findByRole("heading", { name: "Latest blocks" })).toBeInTheDocument();
+  expect(window.location.pathname).toBe("/");
+});
+
+test("section links on the overview change only the hash and keep the page", async () => {
+  vi.mocked(loadExplorer).mockResolvedValue({ data: demoSnapshot, preview: false });
+  render(<App />);
+  await screen.findByRole("heading", { name: "Latest blocks" });
+  const user = userEvent.setup();
+  await user.selectOptions(screen.getByRole("combobox", { name: "Search type" }), "address");
+  await user.type(screen.getByRole("textbox", { name: "Search wallet address" }), fixtureAddress + "{Enter}");
+  expect(await screen.findByRole("heading", { name: "Address" })).toBeInTheDocument();
+  await user.click(screen.getByRole("link", { name: "Blocks" }));
+  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+  expect(screen.getByRole("heading", { name: "Address" })).toBeInTheDocument();
+  expect(loadAddress).toHaveBeenCalledTimes(1);
 });

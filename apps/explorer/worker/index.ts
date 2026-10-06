@@ -125,12 +125,49 @@ export function formatCmfd(atoms: string): string {
   return `${value / ATOMS_PER_CMFD}.${(value % ATOMS_PER_CMFD).toString().padStart(8, "0")}`;
 }
 
+// Mainnet monetary policy; tests pin these to packaging/mainnet/MAINNET-PLAN.json.
+const INITIAL_SUBSIDY_ATOMS = 50_000_000_000n;
+const TAIL_HEIGHT = 2_628_001n;
+const TAIL_SUBSIDY_ATOMS = 500_000_000n;
+
+/** Sum of floor((a * i + b) / m) for i in [0, n), exact (the standard floor-sum reduction). */
+function floorSum(n: bigint, m: bigint, a: bigint, b: bigint): bigint {
+  let total = 0n;
+  for (;;) {
+    if (a >= m) {
+      total += (n * (n - 1n) / 2n) * (a / m);
+      a %= m;
+    }
+    if (b >= m) {
+      total += n * (b / m);
+      b %= m;
+    }
+    const yMax = a * n + b;
+    if (yMax < m) return total;
+    [n, b, m, a] = [yMax / m, yMax % m, a, m];
+  }
+}
+
+/**
+ * Atoms the consensus emission schedule has created in blocks 1..height.
+ * Block h pays floor(initial * (E - h + 1) / E) for h <= E, then the tail.
+ */
+export function mintedAtoms(height: bigint): bigint {
+  const emissionBlocks = TAIL_HEIGHT - 1n;
+  const declining = height < emissionBlocks ? height : emissionBlocks;
+  const decliningSum = floorSum(declining, emissionBlocks, INITIAL_SUBSIDY_ATOMS,
+    INITIAL_SUBSIDY_ATOMS * (emissionBlocks - declining + 1n));
+  return decliningSum + (height > emissionBlocks ? (height - emissionBlocks) * TAIL_SUBSIDY_ATOMS : 0n);
+}
+
 /**
  * Public supply endpoints for exchanges and listing sites, read from the
  * node's checked explorer snapshot: `/api/supply` (JSON),
  * `/api/supply/total` and `/api/supply/circulating` (plain numbers).
  * Circulating supply equals total supply: the steward and community fund
- * allocations circulate like any other coins.
+ * allocations circulate like any other coins. Coinbases claim exactly the
+ * scheduled subsidy and every transaction fee is destroyed, so the fees
+ * burned so far are the minted total minus the current supply.
  */
 async function supplyResponse(request: Request, env: Env, pathname: string): Promise<Response> {
   if (request.method !== "GET") {
@@ -149,6 +186,7 @@ async function supplyResponse(request: Request, env: Env, pathname: string): Pro
   if (pathname === SUPPLY_TOTAL_PATH || pathname === SUPPLY_CIRCULATING_PATH) {
     return new Response(formatCmfd(atoms), { headers: { ...headers, "Content-Type": "text/plain; charset=utf-8" } });
   }
+  const burned = mintedAtoms(BigInt(fields.accepted_height as number)) - BigInt(atoms);
   return Response.json({
     network: env.EXPLORER_NETWORK,
     height: fields.accepted_height,
@@ -158,7 +196,9 @@ async function supplyResponse(request: Request, env: Env, pathname: string): Pro
     circulating_supply: formatCmfd(atoms),
     circulating_supply_atoms: atoms,
     max_supply: null,
-    definition: "Value of every unspent output: all CMFD minted so far minus burned fees. Circulating supply equals total supply, including the steward and community fund allocations. Emission ends in a permanent tail, so there is no maximum supply.",
+    burned_fees: burned >= 0n ? formatCmfd(burned.toString()) : null,
+    burned_fees_atoms: burned >= 0n ? burned.toString() : null,
+    definition: "Value of every unspent output: all CMFD minted so far minus burned fees. Circulating supply equals total supply, including the steward and community fund allocations. Emission ends in a permanent tail, so there is no maximum supply. Burned fees are every transaction fee destroyed so far: the CMFD the emission schedule has minted minus the total supply.",
   }, { headers });
 }
 

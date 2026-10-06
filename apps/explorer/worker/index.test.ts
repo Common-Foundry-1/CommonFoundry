@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import worker, { formatCmfd, isExplorerApiPath, SECURITY_HEADERS } from "./index";
+import worker, { formatCmfd, isExplorerApiPath, mintedAtoms, SECURITY_HEADERS } from "./index";
 import { MAINNET_NETWORK_ID, NETWORK_HEADER } from "../shared/network";
 
 function environment(overrides: Partial<Env> = {}): Env {
@@ -208,6 +208,38 @@ describe("mainnet explorer identity gate", () => {
     });
     expect(String(upstream.mock.calls[0][0])).toBe("https://mainnet-explorer-origin.commonfoundry.ai/v1/explorer");
     expect(formatCmfd("5")).toBe("0.00000005");
+  });
+
+  it("counts the fees burned as the scheduled mint minus the supply", async () => {
+    const snapshot = { accepted_height: 5081, tip: "cd".repeat(32), total_supply_atoms: "253628466998978" };
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(async () => Response.json(snapshot, {
+      headers: { [NETWORK_HEADER]: MAINNET_NETWORK_ID },
+    })));
+    const json = await worker.fetch(new Request("https://explorer.test/api/supply"), environment());
+    expect(await json.json()).toMatchObject({ height: 5081, burned_fees: "1759.90000000", burned_fees_atoms: "175990000000" });
+    // A supply above the scheduled mint is inconsistent; report no burn rather than a negative one.
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(async () => Response.json({ ...snapshot, total_supply_atoms: "253804456998979" }, {
+      headers: { [NETWORK_HEADER]: MAINNET_NETWORK_ID },
+    })));
+    const inconsistent = await worker.fetch(new Request("https://explorer.test/api/supply"), environment());
+    expect(await inconsistent.json()).toMatchObject({ total_supply_atoms: "253804456998979", burned_fees: null, burned_fees_atoms: null });
+  });
+
+  it("sums the plan's emission schedule exactly at every height", () => {
+    const plan = JSON.parse(readFileSync(new URL("../../../packaging/mainnet/MAINNET-PLAN.json", import.meta.url), "utf8"));
+    const policy = plan.payload.rules.monetary_policy;
+    const initial = BigInt(policy.initial_subsidy_atoms);
+    const tailHeight = BigInt(policy.tail_height);
+    const emissionBlocks = tailHeight - 1n;
+    const checkpoints = new Set([1n, 2n, 3n, 4880n, 5081n, 1_000_003n, emissionBlocks - 1n, emissionBlocks, tailHeight, tailHeight + 9n]);
+    expect(mintedAtoms(0n)).toBe(0n);
+    let minted = 0n;
+    for (let height = 1n; height <= tailHeight + 9n; height += 1n) {
+      minted += height >= tailHeight ? BigInt(policy.tail_subsidy_atoms) : initial * (emissionBlocks - (height - 1n)) / emissionBlocks;
+      if (checkpoints.has(height)) expect(mintedAtoms(height)).toBe(minted);
+    }
+    expect(mintedAtoms(4880n)).toBe(243_773_501_519_624n);
+    expect(mintedAtoms(5081n)).toBe(253_804_456_998_978n);
   });
 
   it("refuses supply from an unidentified or older node", async () => {

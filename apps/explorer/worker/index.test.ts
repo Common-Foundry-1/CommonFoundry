@@ -197,9 +197,13 @@ describe("mainnet explorer identity gate", () => {
     expect(total.headers.get("Content-Type")).toBe("text/plain; charset=utf-8");
     expect(total.headers.get("Access-Control-Allow-Origin")).toBe("*");
     expect(await total.text()).toBe("2360598.76543210");
+    const circulating = await worker.fetch(new Request("https://explorer.test/api/supply/circulating"), environment());
+    expect(circulating.headers.get("Content-Type")).toBe("text/plain; charset=utf-8");
+    expect(await circulating.text()).toBe("2360598.76543210");
     const json = await worker.fetch(new Request("https://explorer.test/api/supply"), environment());
     expect(await json.json()).toMatchObject({
-      network: "mainnet", height: 4721, total_supply: "2360598.76543210", total_supply_atoms: "236059876543210", max_supply: null,
+      network: "mainnet", height: 4721, total_supply: "2360598.76543210", total_supply_atoms: "236059876543210",
+      circulating_supply: "2360598.76543210", circulating_supply_atoms: "236059876543210", max_supply: null,
     });
     expect(String(upstream.mock.calls[0][0])).toBe("https://mainnet-explorer-origin.commonfoundry.ai/v1/explorer");
     expect(formatCmfd("5")).toBe("0.00000005");

@@ -4,6 +4,7 @@ import { isAddressApiPath } from "../shared/address";
 const SNAPSHOT_PATH = "/v1/explorer";
 const SUPPLY_PATH = "/api/supply";
 const SUPPLY_TOTAL_PATH = "/api/supply/total";
+const SUPPLY_CIRCULATING_PATH = "/api/supply/circulating";
 const ATOMS_PER_CMFD = 100_000_000n;
 const BLOCK_PATH = /^\/v1\/explorer\/block\/(?:[0-9]+|[0-9a-fA-F]{64})$/;
 const TRANSACTION_PATH = /^\/v1\/explorer\/transaction\/[0-9a-fA-F]{64}$/;
@@ -126,8 +127,10 @@ export function formatCmfd(atoms: string): string {
 
 /**
  * Public supply endpoints for exchanges and listing sites, read from the
- * node's checked explorer snapshot: `/api/supply` (JSON) and
- * `/api/supply/total` (plain number).
+ * node's checked explorer snapshot: `/api/supply` (JSON),
+ * `/api/supply/total` and `/api/supply/circulating` (plain numbers).
+ * Circulating supply equals total supply: the steward and community fund
+ * allocations circulate like any other coins.
  */
 async function supplyResponse(request: Request, env: Env, pathname: string): Promise<Response> {
   if (request.method !== "GET") {
@@ -143,7 +146,7 @@ async function supplyResponse(request: Request, env: Env, pathname: string): Pro
     return Response.json({ error: "supply_unavailable" }, { status: 503, headers: { "Cache-Control": "no-store" } });
   }
   const headers = { "Cache-Control": "public, max-age=30", "Access-Control-Allow-Origin": "*" };
-  if (pathname === SUPPLY_TOTAL_PATH) {
+  if (pathname === SUPPLY_TOTAL_PATH || pathname === SUPPLY_CIRCULATING_PATH) {
     return new Response(formatCmfd(atoms), { headers: { ...headers, "Content-Type": "text/plain; charset=utf-8" } });
   }
   return Response.json({
@@ -152,8 +155,10 @@ async function supplyResponse(request: Request, env: Env, pathname: string): Pro
     tip: fields.tip,
     total_supply: formatCmfd(atoms),
     total_supply_atoms: atoms,
+    circulating_supply: formatCmfd(atoms),
+    circulating_supply_atoms: atoms,
     max_supply: null,
-    definition: "Value of every unspent output: all CMFD minted so far minus burned fees. Emission ends in a permanent tail, so there is no maximum supply.",
+    definition: "Value of every unspent output: all CMFD minted so far minus burned fees. Circulating supply equals total supply, including the steward and community fund allocations. Emission ends in a permanent tail, so there is no maximum supply.",
   }, { headers });
 }
 
@@ -170,7 +175,7 @@ export default {
     const url = new URL(request.url);
     const response = url.pathname.startsWith("/v1/")
       ? await proxyExplorerRequest(request, env)
-      : url.pathname === SUPPLY_PATH || url.pathname === SUPPLY_TOTAL_PATH
+      : url.pathname === SUPPLY_PATH || url.pathname === SUPPLY_TOTAL_PATH || url.pathname === SUPPLY_CIRCULATING_PATH
         ? await supplyResponse(request, env, url.pathname)
         : await fetchAsset(request, env);
     return withSecurityHeaders(response);

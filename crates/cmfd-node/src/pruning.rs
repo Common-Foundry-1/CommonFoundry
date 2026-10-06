@@ -19,6 +19,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use blake3::Hasher;
@@ -597,10 +598,63 @@ pub struct BuiltPrune {
 /// quickly even under steady RPC load; the wait only holds the lock briefly.
 const READER_WAIT: Duration = Duration::from_secs(300);
 
+/// How often a background pruner checks whether a prune is due.
+pub const PRUNE_CHECK_INTERVAL: Duration = Duration::from_secs(600);
+
+/// Free space a prune keeps in reserve beyond its own temporary log, so the
+/// blocks appended while it runs never hit a full disk.
+const PRUNE_FREE_SPACE_MARGIN_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Generous per-block allowance for a pruned record in the temporary log.
+const PRUNED_RECORD_ALLOWANCE_BYTES: u64 = 64 * 1024;
+
+/// Free space a prune needs before it starts writing its temporary log: room
+/// for twice the full blocks it keeps, an allowance per pruned record, and a
+/// margin. Below that the prune waits for a later check instead of filling
+/// the disk under the node's own block appends.
+fn prune_free_space_required(kept_bytes: u64, pruned_records: u64) -> u64 {
+    kept_bytes
+        .saturating_mul(2)
+        .saturating_add(pruned_records.saturating_mul(PRUNED_RECORD_ALLOWANCE_BYTES))
+        .saturating_add(PRUNE_FREE_SPACE_MARGIN_BYTES)
+}
+
+#[cfg(test)]
+thread_local! {
+    static FREE_SPACE_FOR_TEST: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Makes `plan_prune` on this test thread see `bytes` of free space.
+#[cfg(test)]
+pub(crate) fn set_free_space_for_test(bytes: Option<u64>) {
+    FREE_SPACE_FOR_TEST.with(|cell| cell.set(bytes));
+}
+
+fn available_space(directory: &Path) -> io::Result<u64> {
+    #[cfg(test)]
+    if let Some(bytes) = FREE_SPACE_FOR_TEST.with(std::cell::Cell::get) {
+        return Ok(bytes);
+    }
+    fs2::available_space(directory)
+}
+
+fn stop_requested(stop: Option<&AtomicBool>) -> bool {
+    stop.is_some_and(|flag| flag.load(Ordering::Acquire))
+}
+
 /// Plans, builds and installs one prune on a shared node. The rewrite runs
 /// without the node lock; only planning and the final swap hold it.
 pub fn prune_shared_node(
     shared: &std::sync::Mutex<super::Node>,
+) -> Result<Option<PruneReport>, NodeError> {
+    prune_shared_node_until_stopped(shared, None)
+}
+
+/// [`prune_shared_node`] that gives up as soon as `stop` is raised: the
+/// temporary log is removed and the current log is left untouched, so a
+/// closing wallet or node never waits for a long first prune.
+pub fn prune_shared_node_until_stopped(
+    shared: &std::sync::Mutex<super::Node>,
+    stop: Option<&AtomicBool>,
 ) -> Result<Option<PruneReport>, NodeError> {
     let plan = {
         let mut node = shared.lock().map_err(|_| NodeError::SharedNodePoisoned)?;
@@ -609,11 +663,17 @@ pub fn prune_shared_node(
     let Some(plan) = plan else {
         return Ok(None);
     };
-    let built = build_pruned_log(plan)?;
+    let Some(built) = build_pruned_log_until_stopped(plan, stop)? else {
+        return Ok(None);
+    };
     // Readers working without the lock hold the current log open. Let them
     // finish rather than replace the file under them.
     let deadline = Instant::now() + READER_WAIT;
     loop {
+        if stop_requested(stop) {
+            built.discard();
+            return Ok(None);
+        }
         let node = shared.lock().map_err(|_| NodeError::SharedNodePoisoned)?;
         if !node.log_readers_outstanding() || Instant::now() >= deadline {
             let mut node = node;
@@ -622,6 +682,67 @@ pub fn prune_shared_node(
         drop(node);
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// A background thread that prunes a shared node: first after `first_check`,
+/// then every [`PRUNE_CHECK_INTERVAL`]. Stopping it (or dropping the handle)
+/// cancels a prune in progress and waits only for the record being written.
+pub struct PrunerHandle {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PrunerHandle {
+    pub fn stop(mut self) {
+        self.stop_and_join();
+    }
+
+    fn stop_and_join(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for PrunerHandle {
+    fn drop(&mut self) {
+        self.stop_and_join();
+    }
+}
+
+/// Starts a [`PrunerHandle`]. Each prune logs its own report; a prune that
+/// cannot finish (readers keep the log busy, too little free space, no saved
+/// state outside the keep window yet) is retried at the next check.
+pub fn spawn_pruner(
+    shared: Arc<std::sync::Mutex<super::Node>>,
+    first_check: Duration,
+) -> io::Result<PrunerHandle> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&stop);
+    let thread = std::thread::Builder::new()
+        .name("cmfd-pruner".to_owned())
+        .spawn(move || {
+            let tick = Duration::from_millis(250);
+            let mut next_check = first_check;
+            let mut waited = Duration::ZERO;
+            while !flag.load(Ordering::Acquire) {
+                std::thread::sleep(tick);
+                waited += tick;
+                if waited < next_check {
+                    continue;
+                }
+                waited = Duration::ZERO;
+                next_check = PRUNE_CHECK_INTERVAL;
+                if let Err(error) = prune_shared_node_until_stopped(&shared, Some(&flag)) {
+                    tracing::warn!(%error, "proof pruning will retry later");
+                }
+            }
+        })?;
+    Ok(PrunerHandle {
+        stop,
+        thread: Some(thread),
+    })
 }
 
 impl super::Node {
@@ -779,6 +900,27 @@ impl super::Node {
             .iter()
             .filter(|entry| entry.locator.version != super::BlockRecordVersion::Pruned)
             .count() as u64;
+        let kept_bytes = kept
+            .iter()
+            .map(|entry| entry.locator.length)
+            .fold(0_u64, u64::saturating_add);
+        let required = prune_free_space_required(kept_bytes, pruned.len() as u64);
+        match available_space(&self.data_dir) {
+            Ok(available) if available >= required => {}
+            Ok(available) => {
+                tracing::warn!(
+                    available_bytes = available,
+                    required_bytes = required,
+                    anchor_height,
+                    "not enough free space to prune safely; pruning waits for the next check"
+                );
+                return Ok(None);
+            }
+            Err(error) => {
+                tracing::warn!(%error, "could not read free space; pruning waits for the next check");
+                return Ok(None);
+            }
+        }
         let log_path = self.data_dir.join(super::BLOCK_LOG_FILE);
         let log = self
             .log
@@ -1003,6 +1145,16 @@ impl super::Node {
 
 /// Writes the pruned prefix and the kept full records without the node lock.
 pub fn build_pruned_log(plan: PrunePlan) -> Result<BuiltPrune, NodeError> {
+    build_pruned_log_until_stopped(plan, None)?
+        .ok_or_else(|| corrupt("a prune without a stop flag reported being stopped"))
+}
+
+/// [`build_pruned_log`] that checks `stop` before each record. When it is
+/// raised the temporary log is removed and `None` is returned.
+fn build_pruned_log_until_stopped(
+    plan: PrunePlan,
+    stop: Option<&AtomicBool>,
+) -> Result<Option<BuiltPrune>, NodeError> {
     let PrunePlan {
         anchor,
         pruned,
@@ -1016,10 +1168,13 @@ pub fn build_pruned_log(plan: PrunePlan) -> Result<BuiltPrune, NodeError> {
         base_log_length,
         base_anchor_height,
     } = plan;
-    let written = (|| -> Result<LogWriter, NodeError> {
+    let written = (|| -> Result<Option<LogWriter>, NodeError> {
         let mut writer = LogWriter::create(&temporary)?;
         let total = pruned.len();
         for (position, entry) in pruned.iter().enumerate() {
+            if stop_requested(stop) {
+                return Ok(None);
+            }
             let record = if entry.locator.version == super::BlockRecordVersion::Pruned {
                 let raw = read_raw_record(&log, &entry.locator, &log_path)?;
                 super::rechain_record(&raw, writer.previous)?
@@ -1040,26 +1195,43 @@ pub fn build_pruned_log(plan: PrunePlan) -> Result<BuiltPrune, NodeError> {
             }
         }
         for entry in &kept {
+            if stop_requested(stop) {
+                return Ok(None);
+            }
             let raw = read_raw_record(&log, &entry.locator, &log_path)?;
             let record = super::rechain_record(&raw, writer.previous)?;
             writer.append(entry, &record, entry.locator.version)?;
         }
-        Ok(writer)
+        Ok(Some(writer))
     })();
     drop(log);
     match written {
-        Ok(writer) => Ok(BuiltPrune {
+        Ok(Some(writer)) => Ok(Some(BuiltPrune {
             anchor,
             newly_pruned,
             instance_id,
             base_log_length,
             base_anchor_height,
             writer,
-        }),
+        })),
+        Ok(None) => {
+            let _ = remove_if_present(&temporary);
+            tracing::info!("proof pruning stopped before it finished; the block log is unchanged");
+            Ok(None)
+        }
         Err(error) => {
             let _ = remove_if_present(&temporary);
             Err(error)
         }
+    }
+}
+
+impl BuiltPrune {
+    /// Drops a finished but uninstalled prune and its temporary log.
+    fn discard(self) {
+        let temporary = self.writer.path.clone();
+        drop(self);
+        let _ = remove_if_present(&temporary);
     }
 }
 
@@ -1153,6 +1325,20 @@ impl LogWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn free_space_rule_reserves_twice_the_kept_blocks_and_a_margin() {
+        assert_eq!(
+            prune_free_space_required(0, 0),
+            PRUNE_FREE_SPACE_MARGIN_BYTES
+        );
+        let kept = 720 * 12_000_000_u64;
+        assert_eq!(
+            prune_free_space_required(kept, 5_000),
+            2 * kept + 5_000 * PRUNED_RECORD_ALLOWANCE_BYTES + PRUNE_FREE_SPACE_MARGIN_BYTES
+        );
+        assert_eq!(prune_free_space_required(u64::MAX, u64::MAX), u64::MAX);
+    }
 
     #[test]
     fn candidates_stay_few_for_any_window() {

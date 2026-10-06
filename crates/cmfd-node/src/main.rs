@@ -1706,8 +1706,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let discovery_hello = node.peer_hello();
             let shared = Arc::new(Mutex::new(node));
+            // The startup prune above already ran; the next check is one
+            // interval later.
             let pruner = prune_keep_blocks
-                .map(|_| spawn_pruner(Arc::clone(&shared)))
+                .map(|_| {
+                    cmfd_node::spawn_pruner(Arc::clone(&shared), cmfd_node::PRUNE_CHECK_INTERVAL)
+                })
                 .transpose()?;
             let exchange_withdrawals_enabled = exchange_rpc_withdrawal_auth_file.is_some();
             let exchange_custody_v3_active = exchange_custody_v3.is_some();
@@ -2287,47 +2291,6 @@ impl ShutdownSignal {
             }
         }
     }
-}
-
-/// How often a running pruned node checks whether it can prune further.
-const PRUNE_CHECK_INTERVAL: Duration = Duration::from_secs(600);
-
-struct Pruner {
-    stop: Arc<std::sync::atomic::AtomicBool>,
-    thread: std::thread::JoinHandle<()>,
-}
-
-impl Pruner {
-    fn stop(self) {
-        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        let _ = self.thread.join();
-    }
-}
-
-/// Prunes a running node in the background. The rewrite runs without the
-/// node lock; a prune that cannot finish (for example while readers keep the
-/// log busy) is retried at the next check. Each prune logs its own report.
-fn spawn_pruner(shared: Arc<Mutex<cmfd_node::Node>>) -> std::io::Result<Pruner> {
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let flag = Arc::clone(&stop);
-    let thread = std::thread::Builder::new()
-        .name("cmfd-pruner".to_owned())
-        .spawn(move || {
-            let tick = Duration::from_secs(1);
-            let mut waited = Duration::ZERO;
-            while !flag.load(std::sync::atomic::Ordering::SeqCst) {
-                std::thread::sleep(tick);
-                waited += tick;
-                if waited < PRUNE_CHECK_INTERVAL {
-                    continue;
-                }
-                waited = Duration::ZERO;
-                if let Err(error) = cmfd_node::prune_shared_node(&shared) {
-                    tracing::warn!(%error, "proof pruning will retry later");
-                }
-            }
-        })?;
-    Ok(Pruner { stop, thread })
 }
 
 fn prune_report_json(report: &cmfd_node::PruneReport) -> serde_json::Value {

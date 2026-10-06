@@ -31,8 +31,15 @@ pub(crate) struct NodeRuntimeConfig {
     /// network-identity override. Normal double-click storage is unchanged.
     pub(super) data_dir: Option<PathBuf>,
     pub(super) wallet_passphrase_file: Option<PathBuf>,
+    /// Newest active blocks that keep their proofs; older blocks keep their
+    /// header and transactions only. `None` (`--no-prune`) keeps every proof.
+    pub(super) prune_keep_blocks: Option<u64>,
     pub(super) production_v3: ProductionV3RuntimeOptions,
 }
+
+/// About twelve hours of blocks. The wallet keeps every transaction, so only
+/// peers syncing old blocks and deep reorganizations need more.
+pub(super) const DEFAULT_PRUNE_KEEP_BLOCKS: u64 = 720;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct ProductionV3RuntimeOptions {
@@ -87,6 +94,7 @@ impl NodeRuntimeConfig {
             verbose: 0,
             data_dir: None,
             wallet_passphrase_file: None,
+            prune_keep_blocks: Some(DEFAULT_PRUNE_KEEP_BLOCKS),
             production_v3: ProductionV3RuntimeOptions::default(),
         }
     }
@@ -121,6 +129,7 @@ impl NodeRuntimeConfig {
         let mut verbose: u8 = 0;
         let mut data_dir = None;
         let mut wallet_passphrase_file = None;
+        let mut prune_keep_blocks = None;
         let mut production_v3 = ProductionV3RuntimeOptions::default();
         let mut arguments = arguments.into_iter().map(Into::into);
 
@@ -195,6 +204,28 @@ impl NodeRuntimeConfig {
                         "--wallet-passphrase-file",
                         arguments.next(),
                     )?;
+                }
+                "--prune-keep-blocks" => {
+                    has_control_arg = true;
+                    if prune_keep_blocks.is_some() {
+                        return Err(ConfigError::ConflictingPruneOptions);
+                    }
+                    let value = arguments
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--prune-keep-blocks"))?;
+                    let keep = value
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|keep| *keep >= cmfd_node::MIN_PRUNE_KEEP_BLOCKS)
+                        .ok_or(ConfigError::InvalidPruneKeepBlocks)?;
+                    prune_keep_blocks = Some(Some(keep));
+                }
+                "--no-prune" => {
+                    has_control_arg = true;
+                    if prune_keep_blocks.is_some() {
+                        return Err(ConfigError::ConflictingPruneOptions);
+                    }
+                    prune_keep_blocks = Some(None);
                 }
                 "--production-v3-bank" => {
                     has_control_arg = true;
@@ -357,6 +388,7 @@ impl NodeRuntimeConfig {
             verbose,
             data_dir,
             wallet_passphrase_file,
+            prune_keep_blocks: prune_keep_blocks.unwrap_or(Some(DEFAULT_PRUNE_KEEP_BLOCKS)),
             production_v3,
         }
         .with_default_bootstrap();
@@ -528,6 +560,8 @@ pub(crate) enum ConfigError {
     InvalidSha256(&'static str),
     InvalidPositiveInteger(&'static str),
     InvalidDataDirectory,
+    InvalidPruneKeepBlocks,
+    ConflictingPruneOptions,
     MalformedProductionV3Argument,
     InvalidPeerConfiguration(String),
     HelpWithArguments,
@@ -572,6 +606,13 @@ impl fmt::Display for ConfigError {
             Self::InvalidDataDirectory => formatter.write_str(
                 "--data-dir requires an absolute local directory, not a root, relative path, parent traversal or Windows network/device path",
             ),
+            Self::InvalidPruneKeepBlocks => write!(
+                formatter,
+                "--prune-keep-blocks requires a whole number of at least {}",
+                cmfd_node::MIN_PRUNE_KEEP_BLOCKS
+            ),
+            Self::ConflictingPruneOptions => formatter
+                .write_str("give --prune-keep-blocks or --no-prune once, not both or twice"),
             Self::MalformedProductionV3Argument => formatter.write_str(
                 "ProductionV3 options require an exact supported name and a separate value",
             ),
@@ -624,7 +665,46 @@ mod tests {
         assert_eq!(config.data_dir, None);
         assert_eq!(config.webview_data_directory(), None);
         assert_eq!(config.wallet_passphrase_file, None);
+        assert_eq!(config.prune_keep_blocks, Some(DEFAULT_PRUNE_KEEP_BLOCKS));
         assert!(!config.production_v3.is_configured());
+    }
+
+    #[test]
+    fn proof_pruning_is_on_by_default_adjustable_and_can_be_turned_off() {
+        assert_eq!(
+            parsed_run_config(["--prune-keep-blocks", "4320"]).prune_keep_blocks,
+            Some(4320)
+        );
+        assert_eq!(
+            parsed_run_config(["--prune-keep-blocks", "288"]).prune_keep_blocks,
+            Some(cmfd_node::MIN_PRUNE_KEEP_BLOCKS)
+        );
+        assert_eq!(parsed_run_config(["--no-prune"]).prune_keep_blocks, None);
+        for value in ["287", "0", "-1", "twelve", ""] {
+            assert!(matches!(
+                NodeRuntimeConfig::parse(["--prune-keep-blocks", value]),
+                Err(ConfigError::InvalidPruneKeepBlocks)
+            ));
+        }
+        assert!(matches!(
+            NodeRuntimeConfig::parse(["--prune-keep-blocks"]),
+            Err(ConfigError::MissingValue("--prune-keep-blocks"))
+        ));
+        for arguments in [
+            vec!["--no-prune", "--no-prune"],
+            vec!["--no-prune", "--prune-keep-blocks", "720"],
+            vec!["--prune-keep-blocks", "720", "--no-prune"],
+            vec!["--prune-keep-blocks", "720", "--prune-keep-blocks", "800"],
+        ] {
+            assert!(matches!(
+                NodeRuntimeConfig::parse(arguments),
+                Err(ConfigError::ConflictingPruneOptions)
+            ));
+        }
+        assert!(matches!(
+            NodeRuntimeConfig::parse(["--help", "--no-prune"]),
+            Err(ConfigError::HelpWithArguments)
+        ));
     }
 
     #[test]

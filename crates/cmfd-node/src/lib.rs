@@ -108,7 +108,10 @@ pub mod rcnet_candidate;
 mod real_fork_checkpoint_tests;
 pub mod seed_peers;
 use pruning::StoredBlock;
-pub use pruning::{MIN_PRUNE_KEEP_BLOCKS, PruneReport, prune_shared_node};
+pub use pruning::{
+    MIN_PRUNE_KEEP_BLOCKS, PRUNE_CHECK_INTERVAL, PruneReport, PrunerHandle, prune_shared_node,
+    prune_shared_node_until_stopped, spawn_pruner,
+};
 mod startup_snapshot;
 pub mod storage;
 pub mod wallet_backup;

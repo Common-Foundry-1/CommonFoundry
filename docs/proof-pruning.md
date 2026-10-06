@@ -3,7 +3,9 @@
 A Common Foundry block is about 12 MB, and almost all of that is its proof of
 work. A node that has validated a block never needs that proof again, except
 to serve the block to another node or to follow a reorganization through it.
-Opt-in proof pruning drops the proofs of old blocks and keeps everything else:
+Proof pruning drops the proofs of old blocks and keeps everything else. It is
+on by default in the desktop wallet (see [Desktop wallet](#desktop-wallet))
+and opt-in for `cmfd-node`:
 
 ```text
 cmfd-node --data-dir <node-data> run --prune-keep-blocks 288 [other options]
@@ -36,6 +38,29 @@ the explorer, wallet history, and verbose `getblock` results stay the same.
 - **Get the proofs back.** Pruning is one-way. To return to a full node,
   restore a full backup or sync a new data directory from a full peer.
 
+## Desktop wallet
+
+The desktop wallet keeps the newest 720 blocks (about 12 hours) in full and
+prunes the proofs of older blocks. Balances, history, sending, receiving, and
+mining work as before. Instead of growing by about 12 GB a day, the wallet's
+block log levels off at roughly 6 to 9 GB of full blocks plus a few KB for
+each older block.
+
+```text
+common-foundry-wallet --prune-keep-blocks 4320   # keep about three days in full
+common-foundry-wallet --no-prune                 # keep every proof
+```
+
+`--prune-keep-blocks` has the same 288-block minimum as the node.
+`--no-prune` stops further pruning; blocks already pruned stay pruned.
+
+The wallet does not prune while it opens. It first checks two minutes after
+it starts and then every 10 minutes. A new wallet that syncs from peers prunes
+shortly after it catches up. A wallet that already holds the full chain saves
+its first chain state when it first starts with pruning on, so its first
+prune comes after it has seen about 720 more blocks; that can be spread over
+several sessions, because saved states are kept on disk.
+
 ## When pruning runs
 
 The node prunes at startup and then checks every 10 minutes while it runs.
@@ -48,10 +73,13 @@ interval and holds between `N` and about `N` plus two intervals of full
 blocks (288 to 416 at the minimum setting).
 
 A prune rewrites the block log into `blocks.log.prune-tmp` and swaps it in
-atomically. Keep enough free space for a second copy of the full blocks
-that stay (around 5 GB at the minimum setting), plus a few KB per pruned
-block. The rewrite runs without blocking the node; only the final swap
-briefly holds it, and the swap waits for in-flight block reads to finish.
+atomically. Before it starts, the node checks for free space of twice the
+full blocks that stay, plus 64 KB per pruned block and a 2 GB margin. With
+less, it logs a warning, skips that prune, and tries again at the next check.
+The rewrite runs without blocking the node; only the final swap briefly holds
+it, and the swap waits for in-flight block reads to finish. Stopping the node
+or wallet during a prune discards the rewrite and leaves the block log as it
+was.
 Each run prints or logs a report with the new prune height, the number of
 blocks pruned, and the log size before and after.
 

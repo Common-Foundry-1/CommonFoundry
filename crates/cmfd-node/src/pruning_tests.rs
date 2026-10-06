@@ -383,3 +383,97 @@ fn shared_prune_appends_blocks_mined_while_it_was_built() {
     assert_eq!(node.state.tip(), tip);
     assert_eq!(node.prune_height(), Some(64));
 }
+
+#[test]
+fn a_prune_waits_for_enough_free_space() {
+    let dir = TestDirectory::new("free-space");
+    let mut node = Node::open_with_profile(&dir.0, DEVNET_PROFILE).unwrap();
+    let miner = node.wallet_destination();
+    node.prune_keep_blocks = Some(10);
+    mine_to(&mut node, 80, miner);
+    let log_path = dir.0.join(BLOCK_LOG_FILE);
+    let log_before = fs::metadata(&log_path).unwrap().len();
+
+    // Too little room for a second copy of the kept blocks: no prune, no
+    // temporary log, nothing changed.
+    pruning::set_free_space_for_test(Some(1024));
+    assert!(node.plan_prune().unwrap().is_none());
+    assert_eq!(node.prune_block_log().unwrap(), None);
+    assert_eq!(node.prune_height(), None);
+    assert!(!node.storage_faulted);
+    assert_eq!(fs::metadata(&log_path).unwrap().len(), log_before);
+    assert!(!dir.0.join("blocks.log.prune-tmp").exists());
+
+    // With room again, the same candidate prunes normally.
+    pruning::set_free_space_for_test(Some(u64::MAX));
+    let report = node.prune_block_log().unwrap().unwrap();
+    pruning::set_free_space_for_test(None);
+    assert_eq!(report.anchor_height, 64);
+    assert_eq!(node.prune_height(), Some(64));
+}
+
+#[test]
+fn a_stopped_prune_leaves_the_log_untouched() {
+    let dir = TestDirectory::new("stopped");
+    let mut node = Node::open_with_profile(&dir.0, DEVNET_PROFILE).unwrap();
+    let miner = node.wallet_destination();
+    node.prune_keep_blocks = Some(10);
+    mine_to(&mut node, 80, miner);
+    let log_path = dir.0.join(BLOCK_LOG_FILE);
+    let log_before = fs::read(&log_path).unwrap();
+
+    let shared = std::sync::Mutex::new(node);
+    let stop = std::sync::atomic::AtomicBool::new(true);
+    assert_eq!(
+        pruning::prune_shared_node_until_stopped(&shared, Some(&stop)).unwrap(),
+        None
+    );
+    {
+        let node = shared.lock().unwrap();
+        assert_eq!(node.prune_height(), None);
+        assert!(!node.storage_faulted);
+    }
+    assert_eq!(fs::read(&log_path).unwrap(), log_before);
+    assert!(!dir.0.join("blocks.log.prune-tmp").exists());
+
+    // Without a stop request the same prune completes.
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let report = pruning::prune_shared_node_until_stopped(&shared, Some(&stop))
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.anchor_height, 64);
+}
+
+#[test]
+fn the_background_pruner_prunes_and_stops_promptly() {
+    let dir = TestDirectory::new("pruner-thread");
+    let mut node = Node::open_with_profile(&dir.0, DEVNET_PROFILE).unwrap();
+    let miner = node.wallet_destination();
+    node.prune_keep_blocks = Some(10);
+    mine_to(&mut node, 80, miner);
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(node));
+    let pruner =
+        pruning::spawn_pruner(std::sync::Arc::clone(&shared), std::time::Duration::ZERO).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while shared.lock().unwrap().prune_height() != Some(64) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background prune did not happen"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let stopping = std::time::Instant::now();
+    pruner.stop();
+    assert!(stopping.elapsed() < std::time::Duration::from_secs(2));
+
+    // A pruner that is dropped instead of stopped also ends its thread.
+    let pruner = pruning::spawn_pruner(
+        std::sync::Arc::clone(&shared),
+        pruning::PRUNE_CHECK_INTERVAL,
+    )
+    .unwrap();
+    let dropping = std::time::Instant::now();
+    drop(pruner);
+    assert!(dropping.elapsed() < std::time::Duration::from_secs(2));
+    assert_eq!(std::sync::Arc::strong_count(&shared), 1);
+}

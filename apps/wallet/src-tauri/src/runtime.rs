@@ -20,7 +20,7 @@ use cmfd_node::wallet_backup::{
 };
 use cmfd_node::{
     COMPILED_NETWORK_PROFILE, NetworkProfile, Node, NodeClientError, NodeError,
-    ProductionV3VerifierRecord, ProductionV4VerifierArtifacts, ProofProfile,
+    ProductionV3VerifierRecord, ProductionV4VerifierArtifacts, ProofProfile, PrunerHandle,
     compiled_production_v3_record_identity, compiled_production_v3_worker_sha256,
     production_v3_package_layout, production_v4_package_artifacts,
 };
@@ -43,6 +43,9 @@ use config::{
 pub(crate) use peers::{PeerManager, PeerSettings, UpdatePeerSettingsRequest};
 
 const STATIC_PEER_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Lets startup and the first sync settle before the first proof-pruning
+/// check; later checks follow `cmfd_node::PRUNE_CHECK_INTERVAL`.
+const FIRST_PRUNE_CHECK_DELAY: Duration = Duration::from_secs(120);
 
 #[derive(Clone)]
 enum NodeAvailability {
@@ -53,6 +56,7 @@ enum NodeAvailability {
 
 struct ServiceHandles {
     inbound: InboundPeerHandle,
+    pruner: Option<PrunerHandle>,
 }
 
 struct EmbeddedNode {
@@ -561,7 +565,7 @@ fn start_embedded_node(
         production_v4_artifacts,
         verifier_worker,
     } = security;
-    let node = Node::open_with_runtime_security_and_wallet_passphrase(
+    let mut node = Node::open_with_runtime_security_and_wallet_passphrase(
         data_dir,
         production_v3_record.as_ref(),
         production_v4_artifacts.as_ref(),
@@ -569,6 +573,8 @@ fn start_embedded_node(
         wallet_passphrase,
     )
     .map_err(|error| sanitize_node_startup_error(COMPILED_NETWORK_PROFILE, error))?;
+    node.configure_pruning(config.prune_keep_blocks)
+        .map_err(|error| startup_error("prune_setting_invalid", error.to_string(), false))?;
     #[cfg(feature = "production-v4")]
     let production_v4_pool_search =
         production_v4_artifacts
@@ -589,6 +595,18 @@ fn start_embedded_node(
             });
     let discovery_hello = node.peer_hello();
     let shared = Arc::new(Mutex::new(node));
+    // Dropping the handle on any later startup error stops the thread.
+    let pruner = config
+        .prune_keep_blocks
+        .map(|_| cmfd_node::spawn_pruner(Arc::clone(&shared), FIRST_PRUNE_CHECK_DELAY))
+        .transpose()
+        .map_err(|_| {
+            startup_error(
+                "prune_start_failed",
+                "The embedded node could not start proof pruning. Reopen the wallet and try again.",
+                true,
+            )
+        })?;
     let listener = TcpListener::bind(config.p2p_bind).map_err(|_| {
         startup_error(
             "p2p_bind_failed",
@@ -651,7 +669,7 @@ fn start_embedded_node(
     Ok(EmbeddedNode {
         node: shared,
         peers,
-        services: ServiceHandles { inbound },
+        services: ServiceHandles { inbound, pruner },
         #[cfg(feature = "production-v4")]
         production_v4_pool_search,
     })
@@ -666,6 +684,9 @@ fn stop_runtime_parts(runtime: &mut RuntimeParts) {
     }
     if let Some(services) = runtime.services.take() {
         let _ = services.inbound.stop();
+        if let Some(pruner) = services.pruner {
+            pruner.stop();
+        }
     }
     if let NodeAvailability::Ready(node) = &runtime.node
         && let Ok(node) = node.lock()
@@ -1154,7 +1175,7 @@ fn command_help_text_for_profile(profile: NetworkProfile) -> String {
         concat!(
             "Common Foundry Wallet\n",
             "Compiled network: {} ({})\n",
-            "Usage: common-foundry-wallet [runtime-identity|--help|--version] [--data-dir <absolute-path>] [--p2p-bind <addr>] [--peer <addr> ...] [--allow-public-peers] [--wallet-passphrase-file <path>] [-v...]\n",
+            "Usage: common-foundry-wallet [runtime-identity|--help|--version] [--data-dir <absolute-path>] [--p2p-bind <addr>] [--peer <addr> ...] [--allow-public-peers] [--wallet-passphrase-file <path>] [--prune-keep-blocks <n>|--no-prune] [-v...]\n",
             "Arguments:\n",
             "  --help (-h)             Show this help\n",
             "  --version (-V)          Print version\n",
@@ -1166,10 +1187,15 @@ fn command_help_text_for_profile(profile: NetworkProfile) -> String {
             "  --allow-public-peers     Allow public peers for explicit --peer entries\n",
             "                          (the default bootstrap peer is always added if no --peer is configured)\n",
             "  --wallet-passphrase-file <path> Unlock or create encrypted wallet.key\n",
+            "  --prune-keep-blocks <n>  Keep proofs for the newest n blocks (default {}, minimum {});\n",
+            "                          older blocks keep their header and transactions\n",
+            "  --no-prune              Keep every block proof\n",
         ),
         profile.name,
         profile.proof.profile_name(),
         profile.p2p_address(),
+        config::DEFAULT_PRUNE_KEEP_BLOCKS,
+        cmfd_node::MIN_PRUNE_KEEP_BLOCKS,
     );
     if profile.proof == ProofProfile::ProductionV3 {
         help.push_str(&format!(
@@ -1257,6 +1283,7 @@ mod tests {
             verbose: 0,
             data_dir: None,
             wallet_passphrase_file: None,
+            prune_keep_blocks: Some(config::DEFAULT_PRUNE_KEEP_BLOCKS),
             production_v3: config::ProductionV3RuntimeOptions::default(),
         }
     }

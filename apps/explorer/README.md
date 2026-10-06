@@ -148,9 +148,9 @@ not overlap a slow request, and manual Retry can supersede a pending request.
 The network label remains visible on mobile.
 
 The `mainnet` Wrangler environment is a distinct Worker named
-`commonfoundry-mainnet-explorer`. It has no routes, workers.dev access or preview
-URLs configured, so preparation does not take over the existing explorer domain.
-Validate it locally with:
+`commonfoundry-mainnet-explorer`. It owns the public custom domain
+`explorer.commonfoundry.ai` and has no workers.dev access or preview URLs; publish it
+with `npm run build:mainnet` and `npx wrangler deploy --env mainnet`. Validate it locally with:
 
 ```powershell
 npm run build:mainnet
@@ -182,14 +182,16 @@ configuration. The Worker and node additionally enforce numeric cursor limits.
 
 Validate the complete proposed tunnel configuration with the installed
 `cloudflared tunnel ingress validate` and test both allowed and denied URLs with
-`cloudflared tunnel ingress rule`. Keep the catch-all 404 last. Do not replace
-the live routing or attach `explorer.commonfoundry.ai` to the mainnet Worker merely
-because the local dry run succeeds. Mainnet publication/start dates remain
-owner-controlled; no deployment command is run by the CI dry-run job.
+`cloudflared tunnel ingress rule`. Keep the catch-all 404 last. Mainnet publication
+remains owner-controlled; no deployment command is run by the CI dry-run job.
 
 ## Devnet deployment
 
-The existing public Devnet explorer is deployed as a Cloudflare Worker with static assets.
+The Devnet explorer is a Cloudflare Worker with static assets served only at its workers.dev
+address (https://commonfoundry-devnet-explorer.benefit14snake.workers.dev). It has no custom domain, so a plain
+`npm run deploy` can never move `explorer.commonfoundry.ai` off the mainnet Worker. (Run
+without a terminal, Wrangler silently re-points any custom domain listed in the deployed
+configuration.)
 This prepared source expands its read-only allowlist to the address routes as well;
 deploy only alongside the corresponding native origin and matching tunnel rule.
 The RC environment points to
@@ -207,7 +209,8 @@ The same sequence runs automatically from `.github/workflows/deploy-explorer.yml
 change under `apps/explorer/` lands on `main` (or on manual dispatch). It deploys only the default
 Worker environment and needs the repository secrets `CLOUDFLARE_API_TOKEN` (an "Edit Cloudflare
 Workers" token) and `CLOUDFLARE_ACCOUNT_ID`. After deploying it fetches an `/address/<hash>` deep
-link from `explorer.commonfoundry.ai` and fails if the explorer page is not served.
+link from the Devnet workers.dev address and fails if the explorer page is not served. It never
+publishes the mainnet explorer.
 
 Keep the node RPC bound to `127.0.0.1:22443`. Do not open that port on the router or expose the
 unrestricted RPC service directly. The tunnel connector and node must run on the same trusted host.

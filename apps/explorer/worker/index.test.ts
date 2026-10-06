@@ -50,15 +50,16 @@ describe("explorer edge API allowlist", () => {
 });
 
 describe("mainnet explorer identity gate", () => {
-  it("pins configuration to the approved plan without taking the live domain", () => {
+  it("pins configuration to the approved plan and gives the public domain only to mainnet", () => {
     const plan = JSON.parse(readFileSync(new URL("../../../packaging/mainnet/MAINNET-PLAN.json", import.meta.url), "utf8"));
     const config = JSON.parse(readFileSync(new URL("../wrangler.jsonc", import.meta.url), "utf8"));
     expect(MAINNET_NETWORK_ID).toBe(plan.network_id);
     expect(config.env.mainnet.vars.EXPLORER_EXPECTED_NETWORK_ID).toBe(MAINNET_NETWORK_ID);
-    expect(config.env.mainnet.routes).toEqual([]);
+    expect(config.env.mainnet.routes).toEqual([{ pattern: "explorer.commonfoundry.ai", custom_domain: true }]);
     expect(config.env.mainnet.workers_dev).toBe(false);
     expect(config.env.mainnet.preview_urls).toBe(false);
-    expect(config.routes[0].pattern).toBe("explorer.commonfoundry.ai");
+    // A plain (Devnet) deploy must never move the public domain off mainnet.
+    expect(config.routes).toBeUndefined();
   });
 
   it("serves hashed assets without the Worker, with the same static security headers", () => {

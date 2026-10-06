@@ -5,12 +5,6 @@
   "compatibility_date": "2026-08-30",
   "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
   "workers_dev": true,
-  "routes": [
-    {
-      "pattern": "explorer.commonfoundry.ai",
-      "custom_domain": true
-    }
-  ],
   "vars": {
     "EXPLORER_ORIGIN": "https://devnet-explorer-origin.commonfoundry.ai",
     "EXPLORER_NETWORK": "rc",
@@ -27,7 +21,12 @@
       "name": "commonfoundry-mainnet-explorer",
       "workers_dev": false,
       "preview_urls": false,
-      "routes": [],
+      "routes": [
+        {
+          "pattern": "explorer.commonfoundry.ai",
+          "custom_domain": true
+        }
+      ],
       "vars": {
         "EXPLORER_ORIGIN": "https://mainnet-explorer-origin.commonfoundry.ai",
         "EXPLORER_NETWORK": "mainnet",

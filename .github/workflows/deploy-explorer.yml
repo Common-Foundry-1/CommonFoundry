@@ -1,7 +1,8 @@
 name: deploy-explorer
 
-# Deploys the public Devnet explorer (apps/explorer, default Worker environment,
-# which owns explorer.commonfoundry.ai) whenever explorer code lands on main.
+# Deploys the Devnet explorer (apps/explorer, default Worker environment, served only
+# at its workers.dev address) whenever explorer code lands on main.
+# explorer.commonfoundry.ai belongs to the mainnet Worker environment.
 # The mainnet Worker environment is never deployed from here; its publication
 # remains owner-controlled (see apps/explorer/README.md).
 
@@ -26,7 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: devnet-explorer
-      url: https://explorer.commonfoundry.ai
+      url: https://commonfoundry-devnet-explorer.benefit14snake.workers.dev
     defaults:
       run:
         working-directory: apps/explorer
@@ -61,7 +62,7 @@ jobs:
         run: npm run deploy
       - name: Verify a deep link serves the explorer
         run: |
-          url="https://explorer.commonfoundry.ai/address/b5752a5403cee4d4525e5d423cb143e2b02df9aac3d6a9dc652cf6ed7a47eeab"
+          url="https://commonfoundry-devnet-explorer.benefit14snake.workers.dev/address/b5752a5403cee4d4525e5d423cb143e2b02df9aac3d6a9dc652cf6ed7a47eeab"
           for attempt in 1 2 3 4 5 6; do
             status=$(curl -sS -o response.html -w '%{http_code}' "$url" || echo 000)
             if [ "$status" = "200" ] && grep -q "<title>Common Foundry Explorer</title>" response.html; then

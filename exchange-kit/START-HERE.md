@@ -1,17 +1,20 @@
 # Common Foundry Exchange Integration Kit v1
 
-**New integrators: start with the [integration guide](INTEGRATION-GUIDE.md).** It
-walks through deposit addresses, deposit detection, sweeps, withdrawals, fees
-and errors for both the hosted endpoint and your own node.
+**New integrators: start with the [integration guide](INTEGRATION-GUIDE.md).** If
+your exchange already lists Bitcoin-style coins, use the exchange wallet it
+describes first: `cmfd-node exchange-wallet` speaks Bitcoin Core's wallet RPC
+(`getnewaddress`, `listsinceblock`, `sendtoaddress`, ...), keeps your keys on
+your server and needs no local chain. The guide also covers building
+transactions yourself against the exchange RPC described below.
 
 The additive [transaction and address query contract](../docs/exchange-integration-queries.md)
 documents `getrawtransaction`, `gettransaction`, `getaddressbalance`, and
 `getbalance`, and `getaddressutxos`, including confirmations, reorganization
 handling, atom units, and spendable-output pagination.
 
-Status: **integration preview**. This kit describes the RPC implemented by the
-current pre-release source. It is not a production-custody certification,
-Bitcoin Core compatibility claim, independent audit opinion, or claim that a
+Status: **integration preview**. The rest of this kit describes the exchange RPC
+implemented by the current pre-release source. It is not a production-custody
+certification, Bitcoin Core compatibility claim, independent audit opinion, or claim that a
 release-gated RCNet binary is available today.
 
 ## Read this first

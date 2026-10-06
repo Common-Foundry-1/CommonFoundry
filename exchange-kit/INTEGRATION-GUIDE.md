@@ -1,8 +1,17 @@
 # Common Foundry exchange integration guide
 
-This guide covers the complete exchange flow: deposit addresses, deposit
-detection, sweeping, withdrawals, fees and error handling. It applies to both
-ways of connecting:
+There are two ways to integrate. Most exchanges should use the first.
+
+1. **The exchange wallet (recommended).** `cmfd-node exchange-wallet` is a
+   wallet daemon that speaks Bitcoin Core's JSON-RPC: `getnewaddress`,
+   `listsinceblock`, `gettransaction`, `sendtoaddress`, `walletpassphrase` and
+   the rest. Point your existing Bitcoin integration at it. It keeps your keys
+   on your server, reads the chain from the hosted endpoint (or your own node)
+   and stores no chain. See [section 1](#1-the-exchange-wallet-recommended).
+2. **Build transactions yourself.** Use the exchange JSON-RPC directly with
+   offline key and signing tools. See [section 2](#2-building-transactions-yourself).
+
+Both connect to the chain through one of:
 
 - **Hosted endpoint:** a private HTTPS JSON-RPC endpoint run by Common Foundry,
   with credentials issued per exchange. No node to operate.
@@ -10,15 +19,14 @@ ways of connecting:
   --exchange-rpc-auth-file <file>`, reachable on loopback only. See
   [START-HERE](START-HERE.md) and the [full integration guide](../docs/exchange-integration.md).
 
-The JSON-RPC methods and result shapes are the same on both. Keys never leave
-your systems in either setup: the endpoint and the node only see public keys and
-signed transactions.
+Keys never leave your systems in either setup: the endpoint and the node only
+see public keys and signed transactions.
 
 ## Chain facts
 
 | Item | Value |
 |---|---|
-| Unit | 1 CMFD = 100,000,000 atoms; all amounts are decimal atom strings |
+| Unit | 1 CMFD = 100,000,000 atoms; the exchange RPC uses decimal atom strings, the exchange wallet CMFD numbers |
 | Address | 64 lowercase hex characters: a BIP340 x-only public key (`destination_hex`); no checksum |
 | Block target | 60 seconds |
 | Coinbase maturity | 100 blocks (`spendable_height` = block height + 100) |
@@ -29,7 +37,108 @@ Because addresses carry no checksum, validate every customer withdrawal address
 before accepting it: it must be 64 lowercase hex characters, and
 `exchange-tx-sign` rejects anything that is not a valid public key.
 
-## 1. Keys and deposit addresses
+## 1. The exchange wallet (recommended)
+
+### Setup
+
+Create a directory for the wallet and a `cmfd-wallet.conf` in it:
+
+```ini
+# Your integration authenticates to the wallet with these (HTTP Basic).
+rpcuser=exchange
+rpcpassword=<at least 16 random characters>
+# Defaults: listen on 127.0.0.1:39120. To accept other hosts, set rpcbind and
+# list every allowed address or network with rpcallowip.
+#rpcbind=10.0.0.5
+#rpcport=39120
+#rpcallowip=10.0.0.0/8
+# Where the wallet reads the chain: the hosted endpoint, or your own node's
+# exchange RPC (http:// is allowed only to this machine).
+upstream=https://sg-rpc.commonfoundry.ai/mainnet
+upstreamuser=<your hosted endpoint user>
+upstreampassword=<your hosted endpoint password>
+```
+
+Start it with the node binary from the signed release:
+
+```sh
+cmfd-node exchange-wallet --wallet-dir /var/lib/cmfd-wallet
+```
+
+On first start it creates `wallet.json` in that directory. **Back it up
+straight away** (`backupwallet`, or copy the file). Every address the wallet
+will ever hand out derives from it, so one backup is enough; you do not need a
+new backup after `getnewaddress`. Encrypt it with `encryptwallet`, then call
+`walletpassphrase` before sending, exactly as with bitcoind. Logs go to
+`<wallet-dir>/logs`. Run one wallet process per `wallet.json`.
+
+Use any Bitcoin Core client library or `bitcoin-cli`:
+
+```sh
+bitcoin-cli -rpcport=39120 -rpcuser=exchange -rpcpassword=… getnewaddress "user-123"
+bitcoin-cli -rpcport=39120 -rpcuser=exchange -rpcpassword=… listsinceblock "<lastblock>" 60
+bitcoin-cli -rpcport=39120 -rpcuser=exchange -rpcpassword=… walletpassphrase "<passphrase>" 60
+bitcoin-cli -rpcport=39120 -rpcuser=exchange -rpcpassword=… sendtoaddress "<address>" 12.5
+```
+
+### Methods
+
+JSON-RPC 1.0 and 2.0, batches and named parameters are supported, with Bitcoin
+Core's error codes (-5 invalid address, -6 insufficient funds, -13 wallet
+locked, -14 wrong passphrase, ...). Amounts are CMFD numbers with eight decimals.
+
+| Group | Methods |
+|---|---|
+| Addresses | `getnewaddress`, `getrawchangeaddress`, `validateaddress`, `getaddressinfo`, `setlabel`, `getaddressesbylabel`, `listlabels` |
+| Deposits | `listsinceblock`, `listtransactions`, `gettransaction`, `getreceivedbyaddress`, `listreceivedbyaddress`, `listunspent` |
+| Balances | `getbalance`, `getbalances`, `getunconfirmedbalance`, `getwalletinfo` |
+| Withdrawals | `sendtoaddress`, `sendmany`, `abandontransaction`, `settxfee`, `estimatesmartfee` |
+| Security | `encryptwallet`, `walletpassphrase`, `walletlock`, `walletpassphrasechange`, `backupwallet` |
+| Chain and status | `getblockchaininfo`, `getblockcount`, `getbestblockhash`, `getblockhash`, `getblock` (verbosity 1 or 2), `getrawtransaction`, `sendrawtransaction`, `getrawmempool`, `getnetworkinfo`, `getconnectioncount`, `getinfo`, `listwallets`, `uptime`, `ping`, `help`, `stop` |
+
+Credit deposits after at least 60 confirmations, for example with
+`listsinceblock "<lastblock>" 60` as with bitcoind.
+
+### What differs from Bitcoin Core
+
+- **Addresses** are 64 lowercase hex characters (an x-only public key) with no
+  checksum. Check every customer withdrawal address with `validateaddress`.
+- **Fees** are the network minimum, 0.1 CMFD per transaction, burned.
+  `settxfee`, `fee_rate` and `conf_target` are accepted and ignored;
+  `estimatesmartfee` returns 0.1.
+- **Unconfirmed outputs cannot be spent**, so change comes back after one block
+  (about a minute). The wallet splits change to keep at least 25 coins ready, so
+  it can make many withdrawals per block. If every coin is waiting,
+  `sendtoaddress` returns -6 and says to retry after the next block.
+- **Incoming deposits appear once mined** (1 confirmation), not while in the
+  mempool.
+- **At most 128 inputs per transaction.** When the wallet holds more than 200
+  coins (`consolidatethreshold` in the config; 0 turns it off), it merges the
+  128 smallest into one, paying the 0.1 CMFD fee. Merges are not listed by
+  `listtransactions`; `gettransaction` shows them.
+- **Not available:** raw-transaction building (`createrawtransaction`,
+  `signrawtransactionwithwallet`, `fundrawtransaction`), key import and export,
+  message signing and multiple wallets.
+
+### Monitoring and restore
+
+`getblockchaininfo` reports `blocks` (the wallet's height) and `headers` (the
+endpoint's); `getconnectioncount` is 1 while the endpoint answers, and
+`warnings` explains any problem. The wallet keeps answering while the endpoint
+is unreachable and catches up when it returns. Payments whose broadcast could
+not be confirmed are kept and rebroadcast until they are mined.
+
+To restore, put `wallet.json` and `cmfd-wallet.conf` into an empty directory
+and start the wallet. It rescans from the block at which the wallet was created
+(about 4 blocks per second from the hosted endpoint) and finds every address,
+including ones handed out after the backup was taken.
+
+## 2. Building transactions yourself
+
+This is the lower-level route: you hold one key file per address, detect
+deposits from an event stream and sign withdrawals with an offline tool.
+
+### Keys and deposit addresses
 
 Generate one key per customer deposit address, plus one or more hot-wallet keys,
 with the node binary from the signed release. This runs offline:
@@ -48,7 +157,7 @@ back it up under your own key-management policy. Show customers the
 Keys can also be produced by any BIP340 implementation. The node accepts any
 valid x-only public key as a destination.
 
-## 2. Detecting deposits
+### Detecting deposits
 
 Register each deposit address once, then follow one event stream:
 
@@ -83,7 +192,7 @@ Without watch registration you can instead poll `getaddressbalance` /
 `getaddressutxos` per address, but the event stream scales better and reports
 reorganizations explicitly.
 
-## 3. Sweeping and withdrawals
+### Sweeping and withdrawals
 
 Spend with `exchange-tx-sign`, then broadcast the hex it prints.
 
@@ -136,7 +245,7 @@ safe to send again:
 | `mempool_input_conflict` | another transaction in the mempool spends the same input |
 | `mempool_fee_too_low` | fee below the minimum |
 
-## 4. Reading the chain
+### Reading the chain
 
 `getblockcount`, `getbestblockhash`, `getblockhash [height]`,
 `getblock [hash, 1|2]`, `getrawtransaction [txid, verbose]`,
@@ -145,7 +254,7 @@ safe to send again:
 lookups do not need a block hash. Parameters are positional; batches and named
 parameters are not supported.
 
-## 5. Errors and retries
+### Errors and retries
 
 Every error carries `error.data.code` and `error.data.retryable`. Retry only
 when `retryable` is true, and never let a timeout trigger a new withdrawal
@@ -153,7 +262,7 @@ transaction: look the txid up first. The machine-readable catalog is
 [errors.json](errors.json). On the hosted endpoint, `upstream_busy` (retryable)
 means the node was momentarily at capacity.
 
-## 6. Hosted endpoint specifics
+## 3. Hosted endpoint specifics
 
 | Item | Value |
 |---|---|

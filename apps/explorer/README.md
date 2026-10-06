@@ -16,6 +16,20 @@ Open `http://127.0.0.1:5175/`. The Vite server proxies `/v1` to
 `http://127.0.0.1:22443`. Development mode displays clearly labelled preview data when that node
 is unavailable; production builds fail closed instead.
 
+## Page links
+
+Every page has a shareable URL that opens it directly, including when pasted into a new tab:
+
+- `/` — overview
+- `/block/{height-or-id}` — block detail
+- `/tx/{txid}` (also `/transaction/{txid}`) — transaction detail
+- `/address/{address}` — wallet balance and activity
+
+Search and the back/forward buttons keep the address bar in step with the open page. The Worker's
+single-page-application fallback serves the app for these paths; the page itself reads the path once the
+live snapshot has loaded, so a link still opens after a transient node outage and a retry. Hashes and
+addresses are case-insensitive; an unknown path falls back to the overview.
+
 ## Verification
 
 ```powershell

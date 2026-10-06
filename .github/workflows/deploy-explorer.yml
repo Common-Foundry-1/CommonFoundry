@@ -1,0 +1,75 @@
+name: deploy-explorer
+
+# Deploys the public Devnet explorer (apps/explorer, default Worker environment,
+# which owns explorer.commonfoundry.ai) whenever explorer code lands on main.
+# The mainnet Worker environment is never deployed from here; its publication
+# remains owner-controlled (see apps/explorer/README.md).
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - apps/explorer/**
+      - .github/workflows/deploy-explorer.yml
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-explorer
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: devnet-explorer
+      url: https://explorer.commonfoundry.ai
+    defaults:
+      run:
+        working-directory: apps/explorer
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: apps/explorer/package-lock.json
+      - name: Check Cloudflare credentials are configured
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          missing=0
+          for name in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Repository secret $name is not set. Add it under Settings > Secrets and variables > Actions."
+              missing=1
+            fi
+          done
+          exit "$missing"
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+      - run: npm test -- --run
+      - name: Build and deploy the default (Devnet) Worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          WRANGLER_SEND_METRICS: "false"
+        run: npm run deploy
+      - name: Verify a deep link serves the explorer
+        run: |
+          url="https://explorer.commonfoundry.ai/address/b5752a5403cee4d4525e5d423cb143e2b02df9aac3d6a9dc652cf6ed7a47eeab"
+          for attempt in 1 2 3 4 5 6; do
+            status=$(curl -sS -o response.html -w '%{http_code}' "$url" || echo 000)
+            if [ "$status" = "200" ] && grep -q "<title>Common Foundry Explorer</title>" response.html; then
+              echo "Deep link served the explorer page (HTTP 200)."
+              exit 0
+            fi
+            echo "Attempt $attempt: HTTP $status; retrying in 10s"
+            sleep 10
+          done
+          echo "::error::$url did not return the explorer page after deploy."
+          exit 1

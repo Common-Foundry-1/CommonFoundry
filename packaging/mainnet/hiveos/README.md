@@ -5,7 +5,7 @@ October 2, 2026 at noon Central; mining starts October 3 at noon Central.
 Starting it early prepares the model and waits for the authenticated launch.
 
 In your flight sheet, choose **Custom** and use the installation URL for
-`commonfoundry-mainnet-hiveos-1.0.10.tar.gz` from the official release.
+`commonfoundry-mainnet-hiveos-1.0.11.tar.gz` from the official release.
 
 - **Wallet template:** `%WAL%` (your 64-character CMFD destination public key)
 - **Pool URL:** the complete `cmfd+tls://IP:PORT?pin=...` URL supplied by the pool
@@ -46,7 +46,7 @@ wallet address and the correct pool certificate pin are required.
 For manual installation, run HiveOS's own installer with the official asset URL:
 
 ```sh
-/hive/miners/custom/custom-get 'https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/download/v1.0.10/commonfoundry-mainnet-hiveos-1.0.10.tar.gz'
+/hive/miners/custom/custom-get 'https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/download/v1.0.11/commonfoundry-mainnet-hiveos-1.0.11.tar.gz'
 ```
 
 That URL becomes usable when the scheduled release is published. Before launch,

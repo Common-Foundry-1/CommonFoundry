@@ -14,6 +14,9 @@ export const formatAtoms = (atoms: string) => {
   return `${whole.toLocaleString()}${fraction ? `.${fraction}` : ""} CMFD`;
 };
 
+/** Whole CMFD, for headline figures. */
+export const formatSupply = (atoms: string) => `${(BigInt(atoms) / 100_000_000n).toLocaleString()} CMFD`;
+
 // Consensus TARGET_SPACING_SECONDS; one Forge Work (FW) is one complete nonce evaluation.
 const TARGET_SPACING_SECONDS = 60;
 const compactNumber = new Intl.NumberFormat("en-US", { notation: "compact", maximumSignificantDigits: 3 });

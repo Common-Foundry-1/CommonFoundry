@@ -1,5 +1,5 @@
-import { Activity, Box, Boxes, Clock3, Database, Gauge, Network, Pickaxe, Users } from "lucide-react";
-import { formatAge, formatAtoms, formatBlockWork, formatBytes, formatNetworkWorkRate, shortHash } from "../format";
+import { Activity, Box, Boxes, Clock3, Coins, Database, Gauge, Network, Pickaxe, Users } from "lucide-react";
+import { formatAge, formatAtoms, formatBlockWork, formatBytes, formatNetworkWorkRate, formatSupply, shortHash } from "../format";
 import type { ExplorerBlock, ExplorerSnapshot, ExplorerTransaction } from "../types";
 import { ForgeFlow } from "./ForgeFlow";
 
@@ -27,7 +27,9 @@ export function Overview({ snapshot, preview, onBlock, onTransaction }: Overview
         <Stat icon={<Activity />} label="Mempool" value={snapshot.mempool_transactions.toLocaleString()} detail={formatBytes(snapshot.mempool_bytes)} />
         <Stat icon={<Gauge />} label="Network work rate" value={formatNetworkWorkRate(snapshot.expected_target)} detail={formatBlockWork(snapshot.expected_target)} />
         <Stat icon={<Users />} label="Connected peers" value={snapshot.connected_peers.toLocaleString()} detail="Live sessions" />
-        <Stat icon={<Database />} label="UTXO set" value={snapshot.utxo_count.toLocaleString()} detail="Spendable records" />
+        {snapshot.total_supply_atoms === undefined
+          ? <Stat icon={<Database />} label="UTXO set" value={snapshot.utxo_count.toLocaleString()} detail="Spendable records" />
+          : <Stat icon={<Coins />} label="Total supply" value={formatSupply(snapshot.total_supply_atoms)} detail={`${snapshot.utxo_count.toLocaleString()} unspent outputs`} />}
         <Stat icon={<Network />} label="Proof profile" value="V4" detail={snapshot.proof_profile} />
       </section>
 

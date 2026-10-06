@@ -38,6 +38,8 @@ export type ExplorerSnapshot = {
   expected_target: string;
   cumulative_work: string;
   utxo_count: number;
+  /** Absent from nodes before v1.0.12. */
+  total_supply_atoms?: string;
   mempool_transactions: number;
   mempool_bytes: number;
   connected_peers: number;

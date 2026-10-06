@@ -39,6 +39,7 @@ export function isExplorerSnapshot(value: unknown): value is ExplorerSnapshot {
     .every((key) => typeof value[key] === "string" && value[key].length > 0 && value[key].length <= 256)
     && ["network_id", "consensus_fingerprint", "tip", "expected_target"].every((key) => hash(value[key]))
     && ["accepted_height", "utxo_count", "mempool_transactions", "mempool_bytes", "connected_peers"].every((key) => natural(value[key]))
+    && (value.total_supply_atoms === undefined || totalAtoms(value.total_supply_atoms))
     && Array.isArray(value.latest_blocks) && value.latest_blocks.length <= 12 && value.latest_blocks.every(isExplorerBlock)
     && Array.isArray(value.recent_transactions) && value.recent_transactions.length <= 24 && value.recent_transactions.every(isExplorerTransaction);
 }

@@ -2,6 +2,9 @@ import { MAINNET_NETWORK_ID, NETWORK_HEADER } from "../shared/network";
 import { isAddressApiPath } from "../shared/address";
 
 const SNAPSHOT_PATH = "/v1/explorer";
+const SUPPLY_PATH = "/api/supply";
+const SUPPLY_TOTAL_PATH = "/api/supply/total";
+const ATOMS_PER_CMFD = 100_000_000n;
 const BLOCK_PATH = /^\/v1\/explorer\/block\/(?:[0-9]+|[0-9a-fA-F]{64})$/;
 const TRANSACTION_PATH = /^\/v1\/explorer\/transaction\/[0-9a-fA-F]{64}$/;
 
@@ -115,6 +118,45 @@ async function proxyExplorerRequest(request: Request, env: Env): Promise<Respons
   }
 }
 
+/** Atoms as a CMFD decimal with exactly eight places. */
+export function formatCmfd(atoms: string): string {
+  const value = BigInt(atoms);
+  return `${value / ATOMS_PER_CMFD}.${(value % ATOMS_PER_CMFD).toString().padStart(8, "0")}`;
+}
+
+/**
+ * Public supply endpoints for exchanges and listing sites, read from the
+ * node's checked explorer snapshot: `/api/supply` (JSON) and
+ * `/api/supply/total` (plain number).
+ */
+async function supplyResponse(request: Request, env: Env, pathname: string): Promise<Response> {
+  if (request.method !== "GET") {
+    return Response.json({ error: "method_not_allowed" }, { status: 405, headers: { Allow: "GET" } });
+  }
+  const upstream = await proxyExplorerRequest(new Request(new URL(SNAPSHOT_PATH, request.url)), env);
+  if (!upstream.ok) return upstream;
+  const snapshot: unknown = await upstream.json().catch(() => null);
+  const fields = typeof snapshot === "object" && snapshot !== null ? snapshot as Record<string, unknown> : {};
+  const atoms = fields.total_supply_atoms;
+  if (typeof atoms !== "string" || !/^(0|[1-9][0-9]{0,30})$/.test(atoms)
+      || !Number.isSafeInteger(fields.accepted_height) || typeof fields.tip !== "string") {
+    return Response.json({ error: "supply_unavailable" }, { status: 503, headers: { "Cache-Control": "no-store" } });
+  }
+  const headers = { "Cache-Control": "public, max-age=30", "Access-Control-Allow-Origin": "*" };
+  if (pathname === SUPPLY_TOTAL_PATH) {
+    return new Response(formatCmfd(atoms), { headers: { ...headers, "Content-Type": "text/plain; charset=utf-8" } });
+  }
+  return Response.json({
+    network: env.EXPLORER_NETWORK,
+    height: fields.accepted_height,
+    tip: fields.tip,
+    total_supply: formatCmfd(atoms),
+    total_supply_atoms: atoms,
+    max_supply: null,
+    definition: "Value of every unspent output: all CMFD minted so far minus burned fees. Emission ends in a permanent tail, so there is no maximum supply.",
+  }, { headers });
+}
+
 // Always fetch the full page: a 304 would pair a cached page with a fresh nonce.
 function fetchAsset(request: Request, env: Env): Promise<Response> {
   const headers = new Headers(request.headers);
@@ -128,7 +170,9 @@ export default {
     const url = new URL(request.url);
     const response = url.pathname.startsWith("/v1/")
       ? await proxyExplorerRequest(request, env)
-      : await fetchAsset(request, env);
+      : url.pathname === SUPPLY_PATH || url.pathname === SUPPLY_TOTAL_PATH
+        ? await supplyResponse(request, env, url.pathname)
+        : await fetchAsset(request, env);
     return withSecurityHeaders(response);
   },
 } satisfies ExportedHandler<Env>;

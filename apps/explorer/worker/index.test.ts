@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import worker, { isExplorerApiPath, SECURITY_HEADERS } from "./index";
+import worker, { formatCmfd, isExplorerApiPath, SECURITY_HEADERS } from "./index";
 import { MAINNET_NETWORK_ID, NETWORK_HEADER } from "../shared/network";
 
 function environment(overrides: Partial<Env> = {}): Env {
@@ -184,6 +184,36 @@ describe("mainnet explorer identity gate", () => {
     expect(nonce(first)).not.toBe(nonce(second));
     expect(first.headers.get("Cache-Control")).toBe("no-store");
     expect(seen.every((sent) => !sent.headers.has("If-None-Match") && !sent.headers.has("If-Modified-Since"))).toBe(true);
+  });
+
+  it("serves the total supply from the checked snapshot", async () => {
+    const snapshot = { accepted_height: 4721, tip: "ab".repeat(32), total_supply_atoms: "236059876543210" };
+    const upstream = vi.fn().mockImplementation(async () => Response.json(snapshot, {
+      headers: { [NETWORK_HEADER]: MAINNET_NETWORK_ID },
+    }));
+    vi.stubGlobal("fetch", upstream);
+    const total = await worker.fetch(new Request("https://explorer.test/api/supply/total"), environment());
+    expect(total.status).toBe(200);
+    expect(total.headers.get("Content-Type")).toBe("text/plain; charset=utf-8");
+    expect(total.headers.get("Access-Control-Allow-Origin")).toBe("*");
+    expect(await total.text()).toBe("2360598.76543210");
+    const json = await worker.fetch(new Request("https://explorer.test/api/supply"), environment());
+    expect(await json.json()).toMatchObject({
+      network: "mainnet", height: 4721, total_supply: "2360598.76543210", total_supply_atoms: "236059876543210", max_supply: null,
+    });
+    expect(String(upstream.mock.calls[0][0])).toBe("https://mainnet-explorer-origin.commonfoundry.ai/v1/explorer");
+    expect(formatCmfd("5")).toBe("0.00000005");
+  });
+
+  it("refuses supply from an unidentified or older node", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ accepted_height: 1, tip: "ab".repeat(32) }, {
+      headers: { [NETWORK_HEADER]: MAINNET_NETWORK_ID },
+    })));
+    const missing = await worker.fetch(new Request("https://explorer.test/api/supply/total"), environment());
+    expect(missing.status).toBe(503);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ total_supply_atoms: "1" })));
+    expect((await worker.fetch(new Request("https://explorer.test/api/supply"), environment())).status).toBe(503);
+    expect((await worker.fetch(new Request("https://explorer.test/api/supply", { method: "POST" }), environment())).status).toBe(405);
   });
 
   it("does not proxy static routes to the node", async () => {

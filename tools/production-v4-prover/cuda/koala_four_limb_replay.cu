@@ -288,7 +288,7 @@ __global__ void initialize_activation_batch(
     uint32_t value = base + mask;
     if (value >= KOALA_BEAR_MODULUS) value -= KOALA_BEAR_MODULUS;
     value = cube_field(value);
-    activations[index] = value;
+    if (activations != nullptr) activations[index] = value;  // fork: only the last layer is stored
     write_centered_limbs(value, limbs + lane * 4 * cells, cells, within_lane);
 }
 
@@ -325,9 +325,9 @@ __global__ void reduce_layer_batch(
         coordinate_mask(lane_coefficients, row, column, row_bits, column_bits);
     uint32_t value = accumulator + mask;
     if (value >= KOALA_BEAR_MODULUS) value -= KOALA_BEAR_MODULUS;
-    preactivations[index] = value;
+    if (preactivations != nullptr) preactivations[index] = value;  // fork: unused in search
     value = cube_field(value);
-    activations[index] = value;
+    if (activations != nullptr) activations[index] = value;  // fork: only the last layer is stored
     write_centered_limbs(value, limbs + lane * 4 * cells, cells, within_lane);
 }
 
@@ -1133,21 +1133,27 @@ void run_production_search_batch(ProductionModel& model, uint32_t batch_size,
     const auto coefficients =
         load_coefficient_batch(coefficient_path, PRODUCTION_LAYERS, batch_size);
 
-    int8_t* limbs = nullptr;
-    int32_t* limb_accumulators = nullptr;
-    uint32_t* preactivations = nullptr;
-    uint32_t* activations = nullptr;
-    uint32_t* device_coefficients = nullptr;
-    cuda_check(cudaMalloc(&limbs, 4 * batch_cells),
-               "allocate production search-batch activation limbs");
-    cuda_check(cudaMalloc(&limb_accumulators, 4 * batch_cells * sizeof(int32_t)),
-               "allocate production search-batch limb accumulators");
-    cuda_check(cudaMalloc(&preactivations, batch_cells * sizeof(uint32_t)),
-               "allocate production search-batch preactivations");
-    cuda_check(cudaMalloc(&activations, batch_cells * sizeof(uint32_t)),
-               "allocate production search-batch activations");
-    cuda_check(cudaMalloc(&device_coefficients, coefficients.size() * sizeof(uint32_t)),
-               "allocate production search-batch coefficients");
+    // fork: buffers persist across batches (allocated for the largest batch seen),
+    // instead of ~200-900 MB cudaMalloc/cudaFree per batch.
+    static uint32_t capacity = 0;
+    static int8_t* limbs = nullptr;
+    static int32_t* limb_accumulators = nullptr;
+    static uint32_t* activations = nullptr;
+    static uint32_t* device_coefficients = nullptr;
+    if (batch_size > capacity) {
+        cudaFree(limbs); cudaFree(limb_accumulators); cudaFree(activations); cudaFree(device_coefficients);
+        const size_t max_cells = size_t(batch_size) * cells;
+        cuda_check(cudaMalloc(&limbs, 4 * max_cells),
+                   "allocate production search-batch activation limbs");
+        cuda_check(cudaMalloc(&limb_accumulators, 4 * max_cells * sizeof(int32_t)),
+                   "allocate production search-batch limb accumulators");
+        cuda_check(cudaMalloc(&activations, max_cells * sizeof(uint32_t)),
+                   "allocate production search-batch activations");
+        cuda_check(cudaMalloc(&device_coefficients,
+                              size_t(batch_size) * (PRODUCTION_LAYERS + 1) * MASK_COEFFICIENTS * sizeof(uint32_t)),
+                   "allocate production search-batch coefficients");
+        capacity = batch_size;
+    }
     cuda_check(cudaMemcpy(device_coefficients, coefficients.data(),
                           coefficients.size() * sizeof(uint32_t), cudaMemcpyHostToDevice),
                "copy production search-batch coefficients");
@@ -1164,14 +1170,15 @@ void run_production_search_batch(ProductionModel& model, uint32_t batch_size,
     const uint32_t blocks =
         static_cast<uint32_t>((batch_cells + THREADS - 1) / THREADS);
     initialize_activation_batch<<<blocks, THREADS>>>(
-        model.base(), limbs, activations, device_coefficients, PRODUCTION_ROWS,
+        model.base(), limbs, nullptr, device_coefficients, PRODUCTION_ROWS,
         PRODUCTION_WIDTH, batch_size);
     for (uint32_t layer = 0; layer < PRODUCTION_LAYERS; ++layer) {
         launch_stacked_limb_gemm(
             limbs, model.weights() + size_t(layer) * layer_cells,
             limb_accumulators, batch_size * PRODUCTION_ROWS, PRODUCTION_WIDTH);
         reduce_layer_batch<<<blocks, THREADS>>>(
-            limb_accumulators, limbs, preactivations, activations,
+            limb_accumulators, limbs, nullptr,
+            layer + 1 == PRODUCTION_LAYERS ? activations : nullptr,
             device_coefficients,
             model.row_sums() + size_t(layer) * PRODUCTION_WIDTH, layer,
             PRODUCTION_ROWS, PRODUCTION_WIDTH, batch_size);
@@ -1247,11 +1254,6 @@ void run_production_search_batch(ProductionModel& model, uint32_t batch_size,
 
     cudaEventDestroy(stop);
     cudaEventDestroy(start);
-    cudaFree(device_coefficients);
-    cudaFree(activations);
-    cudaFree(preactivations);
-    cudaFree(limb_accumulators);
-    cudaFree(limbs);
 }
 
 void run_production_benchmark(const char* model_path, const char* coefficient_path,

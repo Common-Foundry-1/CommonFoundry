@@ -1,0 +1,12 @@
+#!/bin/sh
+# Reject commit messages that credit an AI assistant. GitHub turns a
+# Co-Authored-By trailer with an AI address into a repository contributor.
+# Install with: git config core.hooksPath scripts/git-hooks
+pattern='noreply@anthropic\.com|[Cc]o-[Aa]uthored-[Bb]y:.*(Claude|Codex|Copilot|ChatGPT|Gemini)|^Claude-Session:|Generated with \[?Claude Code'
+if grep -Eq "$pattern" "$1"; then
+    echo "commit-msg: AI attribution lines are not allowed in this repository:" >&2
+    grep -En "$pattern" "$1" >&2
+    echo "Remove the line(s) and commit again. See CLAUDE.md." >&2
+    exit 1
+fi
+exit 0

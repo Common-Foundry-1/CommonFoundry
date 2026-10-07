@@ -21,6 +21,27 @@ env:
   CMFD_BUILD_SOURCE_COMMIT: ${{ github.sha }}
 
 jobs:
+  commit-attribution:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - name: Refuse AI attribution trailers and identities
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [ -n "$BASE_REF" ]; then
+            git fetch --no-tags origin "$BASE_REF"
+            range="origin/$BASE_REF..HEAD"
+          elif [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            range="$BEFORE..HEAD"
+          else
+            range="HEAD~20..HEAD"
+          fi
+          echo "checking $range"
+          scripts/check_commit_attribution.sh "$range"
   msrv:
     runs-on: ubuntu-22.04
     steps:

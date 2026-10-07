@@ -856,6 +856,7 @@ impl ProductionV4PersistentPoolSearcher {
         let search_final_path = files.path("search-final-activation.bin");
         let coefficients_per_nonce = (PRODUCTION_V2_LAYERS as usize + 1) * 20;
         let mut coefficients = Vec::with_capacity(coefficients_per_nonce * batch_size as usize);
+        let mut challenges = Vec::with_capacity(32 * batch_size as usize);
         for lane in 0..batch_size {
             let nonce = start_nonce.wrapping_add(u64::from(lane));
             let challenge_digest = forgematrix_v4_challenge_digest(
@@ -863,9 +864,41 @@ impl ProductionV4PersistentPoolSearcher {
                 nonce,
                 PRODUCTION_V4_MODEL_MANIFEST_DIGEST,
             );
+            challenges.extend_from_slice(&challenge_digest);
             coefficients.extend_from_slice(&production_v4_replay_coefficients(challenge_digest));
         }
         write_new_file(&coefficients_path, &coefficients)?;
+        // fork: the replay worker hashes each lane on the GPU (RUNBATCHDIGEST) and returns
+        // 32 bytes per lane instead of the 2 MiB final activation. CMFD_GPU_DIGEST=0 disables.
+        let gpu_digest = std::env::var("CMFD_GPU_DIGEST").map(|v| v != "0").unwrap_or(true);
+        if gpu_digest {
+            let challenges_path = files.path("challenges.bin");
+            let search_digest_path = files.path("search-final-digest.bin");
+            write_new_file(&challenges_path, &challenges)?;
+            state.replay.invoke(
+                &[
+                    "RUNBATCHDIGEST".to_owned(),
+                    batch_size.to_string(),
+                    self.worker_path(&coefficients_path)?,
+                    self.worker_path(&search_prefix)?,
+                    self.worker_path(&challenges_path)?,
+                ],
+                "CMFD_V4_REPLAY_DONE",
+            )?;
+            let digests = read_exact_file(&search_digest_path, 32 * batch_size as usize)?;
+            if stop.load(std::sync::atomic::Ordering::Acquire) {
+                return Ok(PoolWorkSearchResult::Cancelled {
+                    attempts_completed: u64::from(batch_size),
+                    next_nonce: start_nonce.wrapping_add(u64::from(batch_size)),
+                });
+            }
+            return inspect_search_batch_digests(
+                self.expected_network_id,
+                job,
+                start_nonce,
+                &digests,
+            );
+        }
         state.replay.invoke(
             &[
                 "RUNBATCH".to_owned(),
@@ -1347,6 +1380,52 @@ fn inspect_search_batch(
         );
         let final_activation_digest =
             final_activation_digest_from_bytes(challenge_digest, final_activation)?;
+        let work_digest = forgematrix_v4_work_digest(
+            PRODUCTION_V4_MODEL_MANIFEST_DIGEST,
+            challenge_digest,
+            final_activation_digest,
+        );
+        if work_digest <= job.share_target {
+            return Ok(PoolWorkSearchResult::Found {
+                nonce,
+                work_digest,
+                meets_chain_target: work_digest <= job.challenge.target,
+                attempts_completed: lane as u64 + 1,
+                next_nonce: nonce.wrapping_add(1),
+            });
+        }
+    }
+    Ok(PoolWorkSearchResult::Exhausted {
+        attempts_completed,
+        next_nonce: start_nonce.wrapping_add(attempts_completed),
+    })
+}
+
+fn inspect_search_batch_digests(
+    expected_network_id: [u8; 32],
+    job: &PoolJob,
+    start_nonce: u64,
+    digests: &[u8],
+) -> Result<PoolWorkSearchResult, PoolError> {
+    validate_search_job(expected_network_id, job)?;
+    let chunks = digests.chunks_exact(32);
+    if !chunks.remainder().is_empty()
+        || chunks.len() == 0
+        || chunks.len() > PRODUCTION_V4_POOL_SEARCH_MAX_BATCH_SIZE as usize
+    {
+        return Err(pool_replay_failure(
+            "ProductionV4 search digest batch has the wrong byte length",
+        ));
+    }
+    let attempts_completed = chunks.len() as u64;
+    for (lane, digest) in chunks.enumerate() {
+        let nonce = start_nonce.wrapping_add(lane as u64);
+        let challenge_digest = forgematrix_v4_challenge_digest(
+            &job.challenge,
+            nonce,
+            PRODUCTION_V4_MODEL_MANIFEST_DIGEST,
+        );
+        let final_activation_digest: [u8; 32] = digest.try_into().expect("32-byte chunk");
         let work_digest = forgematrix_v4_work_digest(
             PRODUCTION_V4_MODEL_MANIFEST_DIGEST,
             challenge_digest,

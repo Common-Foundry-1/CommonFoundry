@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -521,6 +522,137 @@ __global__ void canonical_to_montgomery(uint32_t* values, size_t count) {
     }
 }
 
+
+// ===================== fork: BLAKE3 final-activation digest on GPU =====================
+// digest = BLAKE3 derive_key("CommonFoundry/ForgeMatrix/V4/FinalActivation/v1",
+//            challenge(32) || u64_le(cells) || canonical_u32_le(final_activation))
+// Identical to cmfd-node final_activation_digest_from_bytes; only 32 bytes leave the GPU.
+namespace fork_b3 {
+constexpr uint32_t CHUNK_START = 1, CHUNK_END = 2, PARENT = 4, ROOT = 8,
+                   DERIVE_KEY_CONTEXT = 32, DERIVE_KEY_MATERIAL = 64;
+__host__ __device__ constexpr uint32_t iv(int i) {
+    return i == 0 ? 0x6A09E667U : i == 1 ? 0xBB67AE85U : i == 2 ? 0x3C6EF372U :
+           i == 3 ? 0xA54FF53AU : i == 4 ? 0x510E527FU : i == 5 ? 0x9B05688CU :
+           i == 6 ? 0x1F83D9ABU : 0x5BE0CD19U;
+}
+__host__ __device__ inline uint32_t rotr(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
+__host__ __device__ inline void g(uint32_t* v, int a, int b, int c, int d, uint32_t x, uint32_t y) {
+    v[a] = v[a] + v[b] + x; v[d] = rotr(v[d] ^ v[a], 16);
+    v[c] = v[c] + v[d];     v[b] = rotr(v[b] ^ v[c], 12);
+    v[a] = v[a] + v[b] + y; v[d] = rotr(v[d] ^ v[a], 8);
+    v[c] = v[c] + v[d];     v[b] = rotr(v[b] ^ v[c], 7);
+}
+// out[16] = full compression output (first 8 words = chaining value)
+__host__ __device__ inline void compress(const uint32_t cv[8], const uint32_t m_in[16],
+                                         uint64_t counter, uint32_t block_len,
+                                         uint32_t flags, uint32_t out[16]) {
+    const int perm[16] = {2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8};
+    uint32_t m[16], t[16], v[16];
+    for (int i = 0; i < 16; ++i) m[i] = m_in[i];
+    for (int i = 0; i < 8; ++i) v[i] = cv[i];
+    v[8] = iv(0); v[9] = iv(1); v[10] = iv(2); v[11] = iv(3);
+    v[12] = uint32_t(counter); v[13] = uint32_t(counter >> 32); v[14] = block_len; v[15] = flags;
+    for (int r = 0; r < 7; ++r) {
+        g(v, 0, 4, 8, 12, m[0], m[1]);   g(v, 1, 5, 9, 13, m[2], m[3]);
+        g(v, 2, 6, 10, 14, m[4], m[5]);  g(v, 3, 7, 11, 15, m[6], m[7]);
+        g(v, 0, 5, 10, 15, m[8], m[9]);  g(v, 1, 6, 11, 12, m[10], m[11]);
+        g(v, 2, 7, 8, 13, m[12], m[13]); g(v, 3, 4, 9, 14, m[14], m[15]);
+        if (r < 6) { for (int i = 0; i < 16; ++i) t[i] = m[perm[i]]; for (int i = 0; i < 16; ++i) m[i] = t[i]; }
+    }
+    for (int i = 0; i < 8; ++i) { out[i] = v[i] ^ v[i + 8]; out[i + 8] = v[i + 8] ^ cv[i]; }
+}
+// Host: context key for derive_key mode (context string < 64 bytes -> single block).
+inline void context_key(const char* context, uint32_t key[8]) {
+    uint8_t block[64] = {0};
+    const size_t len = std::strlen(context);
+    if (len > 64) throw std::runtime_error("BLAKE3 context too long");
+    std::memcpy(block, context, len);
+    uint32_t m[16], cv[8], out[16];
+    for (int i = 0; i < 16; ++i)
+        m[i] = uint32_t(block[4 * i]) | uint32_t(block[4 * i + 1]) << 8 |
+               uint32_t(block[4 * i + 2]) << 16 | uint32_t(block[4 * i + 3]) << 24;
+    for (int i = 0; i < 8; ++i) cv[i] = iv(i);
+    compress(cv, m, 0, uint32_t(len), CHUNK_START | CHUNK_END | ROOT | DERIVE_KEY_CONTEXT, out);
+    for (int i = 0; i < 8; ++i) key[i] = out[i];
+}
+struct Key { uint32_t w[8]; };
+
+// message word m of one lane: 8 challenge words, u64 length (2 words), then activation words
+__device__ inline uint32_t message_word(const uint32_t* challenge, const uint32_t* act,
+                                        uint32_t cells, uint32_t m) {
+    if (m < 8) return challenge[m];
+    if (m == 8) return cells;
+    if (m == 9) return 0;
+    return act[m - 10];
+}
+
+__global__ void chunk_cvs(const uint32_t* activations, const uint32_t* challenges,
+                          uint32_t cells, uint32_t chunks, Key key, uint32_t* cvs,
+                          unsigned int* noncanonical) {
+    const uint32_t chunk = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t lane = blockIdx.y;
+    if (chunk >= chunks) return;
+    const uint32_t* act = activations + size_t(lane) * cells;
+    const uint32_t* ch = challenges + size_t(lane) * 8;
+    const uint32_t total_words = 10 + cells;           // message length in words
+    const uint32_t first = chunk * 256;                // first word of the chunk
+    const uint32_t words = min(256U, total_words - first);
+    const uint32_t blocks = (words + 15) / 16;
+    uint32_t cv[8], out[16], m[16];
+    for (int i = 0; i < 8; ++i) cv[i] = key.w[i];
+    unsigned int bad = 0;
+    for (uint32_t b = 0; b < blocks; ++b) {
+        const uint32_t base = first + b * 16;
+        const uint32_t in_block = min(16U, total_words - base);
+        for (uint32_t i = 0; i < 16; ++i) {
+            uint32_t value = 0;
+            if (i < in_block) {
+                value = message_word(ch, act, cells, base + i);
+                if (base + i >= 10 && value >= KOALA_BEAR_MODULUS) bad = 1;
+            }
+            m[i] = value;
+        }
+        uint32_t flags = DERIVE_KEY_MATERIAL;
+        if (b == 0) flags |= CHUNK_START;
+        if (b + 1 == blocks) flags |= CHUNK_END;
+        compress(cv, m, chunk, in_block * 4, flags, out);
+        for (int i = 0; i < 8; ++i) cv[i] = out[i];
+    }
+    uint32_t* dst = cvs + (size_t(lane) * chunks + chunk) * 8;
+    for (int i = 0; i < 8; ++i) dst[i] = cv[i];
+    if (bad) atomicOr(noncanonical, 1U);
+}
+
+// One block per lane. Requires chunks == 2^k + 1 (left perfect subtree of 2^k chunks + 1 chunk),
+// which holds for the production size (2049 chunks), and blockDim >= 2^(k-1).
+__global__ void tree_root(uint32_t* cvs, uint32_t chunks, Key key, uint32_t* digests) {
+    const uint32_t lane = blockIdx.x;
+    uint32_t* cv = cvs + size_t(lane) * chunks * 8;
+    uint32_t count = chunks - 1;
+    while (count > 1) {
+        const uint32_t pairs = count / 2;
+        uint32_t result[8];
+        const bool active = threadIdx.x < pairs;
+        if (active) {
+            uint32_t m[16], out[16];
+            for (int i = 0; i < 8; ++i) { m[i] = cv[(2 * threadIdx.x) * 8 + i]; m[8 + i] = cv[(2 * threadIdx.x + 1) * 8 + i]; }
+            compress(key.w, m, 0, 64, PARENT | DERIVE_KEY_MATERIAL, out);
+            for (int i = 0; i < 8; ++i) result[i] = out[i];
+        }
+        __syncthreads();
+        if (active) for (int i = 0; i < 8; ++i) cv[threadIdx.x * 8 + i] = result[i];
+        __syncthreads();
+        count = pairs;
+    }
+    if (threadIdx.x == 0) {
+        uint32_t m[16], out[16];
+        for (int i = 0; i < 8; ++i) { m[i] = cv[i]; m[8 + i] = cv[(chunks - 1) * 8 + i]; }
+        compress(key.w, m, 0, 64, PARENT | ROOT | DERIVE_KEY_MATERIAL, out);
+        for (int i = 0; i < 8; ++i) digests[lane * 8 + i] = out[i];
+    }
+}
+}  // namespace fork_b3
+
 void write_final_activation(const char* prefix, const uint32_t* final_activation,
                             size_t cells) {
     if (prefix == nullptr) return;
@@ -988,7 +1120,8 @@ void run_production_replay(ProductionModel& model, const char* coefficient_path,
 
 void run_production_search_batch(ProductionModel& model, uint32_t batch_size,
                                  const char* coefficient_path,
-                                 const char* output_prefix) {
+                                 const char* output_prefix,
+                                 const char* challenge_path = nullptr) {
     if (output_prefix == nullptr || coefficient_path == nullptr || batch_size == 0 ||
         batch_size > 64) {
         throw std::runtime_error("invalid ProductionV4 search batch");
@@ -1049,7 +1182,62 @@ void run_production_search_batch(ProductionModel& model, uint32_t batch_size,
     cuda_check(cudaEventElapsedTime(&elapsed_ms, start, stop),
                "measure production search batch");
 
-    write_final_activation(output_prefix, activations, batch_cells);
+    if (challenge_path != nullptr) {
+        // fork: hash every lane on the GPU and return 32 bytes per lane.
+        std::ifstream challenge_input(challenge_path, std::ios::binary | std::ios::ate);
+        if (!challenge_input) throw std::runtime_error("open search-batch challenges");
+        if (static_cast<uint64_t>(challenge_input.tellg()) != uint64_t(batch_size) * 32)
+            throw std::runtime_error("search-batch challenges have the wrong byte length");
+        challenge_input.seekg(0, std::ios::beg);
+        std::vector<uint8_t> challenge_bytes(size_t(batch_size) * 32);
+        challenge_input.read(reinterpret_cast<char*>(challenge_bytes.data()), challenge_bytes.size());
+        if (!challenge_input) throw std::runtime_error("read search-batch challenges");
+        std::vector<uint32_t> challenge_words(size_t(batch_size) * 8);
+        for (size_t i = 0; i < challenge_words.size(); ++i)
+            challenge_words[i] = uint32_t(challenge_bytes[4 * i]) | uint32_t(challenge_bytes[4 * i + 1]) << 8 |
+                                 uint32_t(challenge_bytes[4 * i + 2]) << 16 | uint32_t(challenge_bytes[4 * i + 3]) << 24;
+        static fork_b3::Key key = [] {
+            fork_b3::Key k{};
+            fork_b3::context_key("CommonFoundry/ForgeMatrix/V4/FinalActivation/v1", k.w);
+            return k;
+        }();
+        const uint32_t lane_cells = static_cast<uint32_t>(cells);
+        const uint32_t chunks = (uint32_t((10 + uint64_t(lane_cells)) * 4) + 1023) / 1024;
+        if (chunks != 2049) throw std::runtime_error("unexpected BLAKE3 chunk count");
+        uint32_t* device_challenges = nullptr;
+        uint32_t* device_cvs = nullptr;
+        uint32_t* device_digests = nullptr;
+        unsigned int* device_flag = nullptr;
+        cuda_check(cudaMalloc(&device_challenges, challenge_words.size() * 4), "allocate digest challenges");
+        cuda_check(cudaMalloc(&device_cvs, size_t(batch_size) * chunks * 32), "allocate digest chaining values");
+        cuda_check(cudaMalloc(&device_digests, size_t(batch_size) * 32), "allocate digests");
+        cuda_check(cudaMalloc(&device_flag, sizeof(unsigned int)), "allocate digest flag");
+        cuda_check(cudaMemset(device_flag, 0, sizeof(unsigned int)), "clear digest flag");
+        cuda_check(cudaMemcpy(device_challenges, challenge_words.data(), challenge_words.size() * 4,
+                              cudaMemcpyHostToDevice), "copy digest challenges");
+        fork_b3::chunk_cvs<<<dim3((chunks + 127) / 128, batch_size), 128>>>(
+            activations, device_challenges, lane_cells, chunks, key, device_cvs, device_flag);
+        fork_b3::tree_root<<<batch_size, 1024>>>(device_cvs, chunks, key, device_digests);
+        cuda_check(cudaGetLastError(), "launch BLAKE3 digest kernels");
+        std::vector<uint32_t> digest_words(size_t(batch_size) * 8);
+        unsigned int flag = 0;
+        cuda_check(cudaMemcpy(digest_words.data(), device_digests, digest_words.size() * 4,
+                              cudaMemcpyDeviceToHost), "copy digests");
+        cuda_check(cudaMemcpy(&flag, device_flag, sizeof(flag), cudaMemcpyDeviceToHost), "copy digest flag");
+        cudaFree(device_flag); cudaFree(device_digests); cudaFree(device_cvs); cudaFree(device_challenges);
+        if (flag != 0) throw std::runtime_error("final activation contains a noncanonical field value");
+        std::vector<uint8_t> digest_bytes(digest_words.size() * 4);
+        for (size_t i = 0; i < digest_words.size(); ++i)
+            for (int b = 0; b < 4; ++b) digest_bytes[4 * i + b] = uint8_t(digest_words[i] >> (8 * b));
+        const std::string digest_path = std::string(output_prefix) + "-final-digest.bin";
+        std::ofstream digest_output(digest_path, std::ios::binary | std::ios::trunc);
+        if (!digest_output) throw std::runtime_error("create final digest file");
+        digest_output.write(reinterpret_cast<const char*>(digest_bytes.data()), digest_bytes.size());
+        digest_output.close();
+        std::printf("final_digest_path=%s bytes=%zu\n", digest_path.c_str(), digest_bytes.size());
+    } else {
+        write_final_activation(output_prefix, activations, batch_cells);
+    }
     std::printf("device_allocation_gib=%.6f\n",
                 double(model.baseline_free() - free_after) /
                     double(size_t{1} << 30));
@@ -1097,6 +1285,19 @@ void run_persistent_server(const char* model_path) {
         if (fields.size() == 1 && fields[0] == "EVICT") {
             model.evict();
             std::printf("CMFD_V4_REPLAY_EVICTED\n");
+            std::fflush(stdout);
+            continue;
+        }
+        if (fields.size() == 5 && fields[0] == "RUNBATCHDIGEST" &&
+            !fields[1].empty() && !fields[2].empty() && !fields[3].empty() && !fields[4].empty()) {
+            size_t consumed = 0;
+            const unsigned long parsed = std::stoul(fields[1], &consumed);
+            if (consumed != fields[1].size() || parsed == 0 || parsed > 64) {
+                throw std::runtime_error("invalid persistent replay batch size");
+            }
+            run_production_search_batch(model, static_cast<uint32_t>(parsed),
+                                        fields[2].c_str(), fields[3].c_str(), fields[4].c_str());
+            std::printf("CMFD_V4_REPLAY_DONE\n");
             std::fflush(stdout);
             continue;
         }

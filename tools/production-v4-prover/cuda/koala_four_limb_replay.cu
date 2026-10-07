@@ -68,6 +68,22 @@ using LocalityTensorCoreGemm = cutlass::gemm::device::Gemm<
     cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<8>, 3>;
 
 bool use_ada_gemm = false;
+
+// --- fork: extra Sm80 tile variants for Ampere/Ada tuning (select with CMFD_GEMM) ---
+template <int M, int N, int K, int WM, int WN, int WK, int Stages, int Swz>
+using Sm80Gemm = cutlass::gemm::device::Gemm<
+    int8_t, cutlass::layout::RowMajor, int8_t, cutlass::layout::ColumnMajor,
+    int32_t, cutlass::layout::RowMajor, int32_t, cutlass::arch::OpClassTensorOp,
+    cutlass::arch::Sm80, cutlass::gemm::GemmShape<M, N, K>,
+    cutlass::gemm::GemmShape<WM, WN, WK>, cutlass::gemm::GemmShape<16, 8, 32>,
+    cutlass::epilogue::thread::LinearCombinationClamp<int32_t, 4, int32_t, int32_t>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<Swz>, Stages>;
+using ForkGemm128x128s4 = Sm80Gemm<128, 128, 64, 64, 64, 64, 4, 8>;
+using ForkGemm256x128s3 = Sm80Gemm<256, 128, 64, 64, 64, 64, 3, 8>;
+using ForkGemm128x256s4 = Sm80Gemm<128, 256, 64, 64, 64, 64, 4, 8>;
+using ForkGemm128x128k128 = Sm80Gemm<128, 128, 128, 64, 64, 128, 3, 8>;
+using ForkGemm64x256s4 = Sm80Gemm<64, 256, 64, 64, 64, 64, 4, 8>;
+int fork_gemm_variant = 0;  // 0 = upstream selection
 bool use_dp4a_gemm = false;
 
 void cuda_check(cudaError_t result, const char* operation) {
@@ -405,6 +421,16 @@ void launch_stacked_limb_gemm(const int8_t* limbs, const int8_t* weights,
                               int32_t* limb_accumulators, uint32_t rows,
                               uint32_t width) {
     // Preserve the low-latency SM120 tile below the miner's 32-forward batch.
+    switch (fork_gemm_variant) {
+        case 1: launch_gemm<TensorCoreGemm>(limbs, weights, limb_accumulators, 4 * rows, width); return;
+        case 2: launch_gemm<LocalityTensorCoreGemm>(limbs, weights, limb_accumulators, 4 * rows, width); return;
+        case 3: launch_gemm<ForkGemm128x128s4>(limbs, weights, limb_accumulators, 4 * rows, width); return;
+        case 4: launch_gemm<ForkGemm256x128s3>(limbs, weights, limb_accumulators, 4 * rows, width); return;
+        case 5: launch_gemm<ForkGemm128x256s4>(limbs, weights, limb_accumulators, 4 * rows, width); return;
+        case 6: launch_gemm<ForkGemm128x128k128>(limbs, weights, limb_accumulators, 4 * rows, width); return;
+        case 7: launch_gemm<ForkGemm64x256s4>(limbs, weights, limb_accumulators, 4 * rows, width); return;
+        default: break;
+    }
     if (use_dp4a_gemm) {
         launch_dp4a_gemm(limbs, weights, limb_accumulators, 4 * rows, width);
     } else if (use_blackwell_gemm && rows < 32 * PRODUCTION_ROWS) {
@@ -1141,6 +1167,20 @@ int main(int argc, char** argv) {
                            cutlass::Kernel<LocalityTensorCoreGemm::GemmKernel>),
                        "read Ada Tensor Core kernel target");
             use_ada_gemm = attributes.ptxVersion >= 80;
+        }
+        // fork: Ampere (8.0/8.6/8.7) supports the same Sm80 integer MMA + cp.async pipeline as Ada.
+        if (!use_dp4a_gemm && properties.major == 8 && properties.minor != 9 && !use_ada_gemm) {
+            cudaFuncAttributes attributes{};
+            cuda_check(cudaFuncGetAttributes(
+                           &attributes,
+                           cutlass::Kernel<LocalityTensorCoreGemm::GemmKernel>),
+                       "read Ampere Tensor Core kernel target");
+            use_ada_gemm = attributes.ptxVersion >= 80;
+        }
+        if (const char* v = std::getenv("CMFD_GEMM")) {
+            fork_gemm_variant = std::atoi(v);
+            if (fork_gemm_variant < 0 || fork_gemm_variant > 7 || (use_dp4a_gemm && fork_gemm_variant)) fork_gemm_variant = 0;
+            std::printf("fork_gemm_variant=%d\n", fork_gemm_variant);
         }
         std::printf("gemm_backend=%s\n",
                     use_dp4a_gemm ? "sm70_dp4a_int8" :

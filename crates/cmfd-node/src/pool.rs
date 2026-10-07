@@ -3697,6 +3697,16 @@ fn rejected_result(
 ) -> Result<PoolShareResult, PoolError> {
     let session = credit_rejected_share(&shared.ledger, session_id, code == "stale_job")?;
     record_rejected_share_reason(shared, session_id, code)?;
+    // One line per rejected share so operators can see why a miner's shares fail.
+    tracing::info!(
+        session = session_id,
+        worker = %session.worker,
+        payout = %session.payout,
+        job = %hex::encode(&job_id[..8]),
+        nonce,
+        reason = code,
+        "pool share rejected"
+    );
     Ok(PoolShareResult {
         job_id,
         nonce,

@@ -9,9 +9,10 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Mutex;
-use std::time::Instant;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::time::{Duration, Instant};
 
 use cmfd_consensus::forgematrix_v4_proof::{
     forgematrix_v4_final_activation_digest, forgematrix_v4_mask_coefficients,
@@ -35,6 +36,14 @@ use crate::{BlockTemplate, COMPILED_NETWORK_PROFILE};
 
 const WORKER_OUTPUT_MAX_LINES: usize = 4_096;
 const WORKER_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
+/// Longest wait for a worker to load its model and report ready.
+const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(600);
+/// Longest wait for one command (a 64-nonce batch on a slow GPU, or a proof).
+/// A worker that says nothing for this long is killed and restarted, so a
+/// wedged GPU process cannot hold the worker lock forever.
+const WORKER_COMMAND_TIMEOUT: Duration = Duration::from_secs(600);
+/// After a worker fails to start, wait this long before trying again.
+const WORKER_RESTART_BACKOFF: Duration = Duration::from_secs(10);
 const FROZEN_TEMPLATE_FORMAT_VERSION: u16 = 1;
 pub const PRODUCTION_V4_POOL_SEARCH_MAX_BATCH_SIZE: u32 = 64;
 
@@ -262,12 +271,26 @@ struct SearchWorkerState {
     next_attempt: u64,
 }
 
+/// A long-lived worker process that is restarted when it dies or stops
+/// answering: a failed command kills the process, and the next command starts
+/// a fresh one, so one crash cannot silently stop the pool.
 #[derive(Debug)]
 struct PersistentWorker {
+    command: ProductionV4PoolWorkerCommand,
+    ready_marker: &'static str,
+    label: &'static str,
+    process: Option<WorkerProcess>,
+    retry_after: Option<Instant>,
+    restarts: u64,
+}
+
+#[derive(Debug)]
+struct WorkerProcess {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
-    label: &'static str,
+    /// Lines from the worker's stdout, read on their own thread so every wait
+    /// has a deadline. The channel closes when stdout does.
+    lines: Receiver<std::io::Result<String>>,
 }
 
 #[derive(Serialize)]
@@ -654,9 +677,10 @@ impl ProductionV4PoolShareVerifier for ProductionV4PersistentPoolVerifier {
 }
 
 impl PersistentWorker {
+    /// Starts the worker now, so a bad command or model fails at startup.
     fn start(
         command: &ProductionV4PoolWorkerCommand,
-        ready_marker: &str,
+        ready_marker: &'static str,
         label: &'static str,
     ) -> Result<Self, PoolError> {
         if !command.program.is_absolute() || !command.program.is_file() {
@@ -665,6 +689,100 @@ impl PersistentWorker {
                 command.program.display()
             )));
         }
+        let process = WorkerProcess::spawn(command, ready_marker, label, WORKER_READY_TIMEOUT)?;
+        Ok(Self {
+            command: command.clone(),
+            ready_marker,
+            label,
+            process: Some(process),
+            retry_after: None,
+            restarts: 0,
+        })
+    }
+
+    fn invoke(&mut self, fields: &[String], done_marker: &str) -> Result<(), PoolError> {
+        self.invoke_with_timeout(fields, done_marker, WORKER_COMMAND_TIMEOUT)
+    }
+
+    fn invoke_with_timeout(
+        &mut self,
+        fields: &[String],
+        done_marker: &str,
+        timeout: Duration,
+    ) -> Result<(), PoolError> {
+        if fields.is_empty()
+            || fields.iter().any(|field| {
+                field.is_empty()
+                    || field
+                        .bytes()
+                        .any(|byte| matches!(byte, b'\t' | b'\r' | b'\n'))
+            })
+        {
+            return Err(pool_replay_failure(format!(
+                "{} command contains an invalid field",
+                self.label
+            )));
+        }
+        let label = self.label;
+        let process = self.running_process()?;
+        let result = process.invoke(fields, done_marker, label, timeout);
+        if let Err(error) = &result {
+            // Never reuse a worker whose last command failed: its stream
+            // position and GPU state are unknown. The next command restarts it.
+            self.process = None;
+            tracing::warn!(
+                worker = self.label,
+                %error,
+                "pool worker failed; it will be restarted for the next request"
+            );
+        }
+        result
+    }
+
+    fn running_process(&mut self) -> Result<&mut WorkerProcess, PoolError> {
+        if self.process.is_none() {
+            if matches!(self.retry_after, Some(retry_after) if Instant::now() < retry_after) {
+                return Err(pool_replay_failure(format!(
+                    "{} is restarting after a failure",
+                    self.label
+                )));
+            }
+            match WorkerProcess::spawn(
+                &self.command,
+                self.ready_marker,
+                self.label,
+                WORKER_READY_TIMEOUT,
+            ) {
+                Ok(process) => {
+                    self.restarts = self.restarts.saturating_add(1);
+                    self.retry_after = None;
+                    tracing::info!(
+                        worker = self.label,
+                        restarts = self.restarts,
+                        "pool worker restarted"
+                    );
+                    self.process = Some(process);
+                }
+                Err(error) => {
+                    self.retry_after = Some(Instant::now() + WORKER_RESTART_BACKOFF);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(self
+            .process
+            .as_mut()
+            .expect("worker process was just started"))
+    }
+}
+
+impl WorkerProcess {
+    fn spawn(
+        command: &ProductionV4PoolWorkerCommand,
+        ready_marker: &str,
+        label: &'static str,
+        ready_timeout: Duration,
+    ) -> Result<Self, PoolError> {
         let mut child = Command::new(&command.program)
             .args(&command.arguments)
             .envs(command.environment.iter().cloned())
@@ -681,57 +799,90 @@ impl PersistentWorker {
             .stdout
             .take()
             .ok_or_else(|| pool_replay_failure(format!("{label} stdout is unavailable")))?;
-        let mut worker = Self {
+        let (sender, lines) = mpsc::sync_channel(256);
+        std::thread::Builder::new()
+            .name("cmfd-pool-worker-stdout".to_owned())
+            .spawn(move || {
+                let mut reader = BufReader::new(stdout);
+                loop {
+                    let mut line = String::new();
+                    // A line longer than the output limit is passed on truncated
+                    // and then rejected by the byte limit below.
+                    let read = (&mut reader)
+                        .take(WORKER_OUTPUT_MAX_BYTES as u64 + 1)
+                        .read_line(&mut line);
+                    match read {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            if sender.send(Ok(line)).is_err() {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = sender.send(Err(error));
+                            break;
+                        }
+                    }
+                }
+            })
+            .map_err(replay_error)?;
+        let mut process = Self {
             child,
             stdin,
-            stdout: BufReader::new(stdout),
-            label,
+            lines,
         };
-        worker.read_until(ready_marker)?;
-        Ok(worker)
+        process.read_until(ready_marker, label, ready_timeout)?;
+        Ok(process)
     }
 
-    fn invoke(&mut self, fields: &[String], done_marker: &str) -> Result<(), PoolError> {
-        if fields.is_empty()
-            || fields.iter().any(|field| {
-                field.is_empty()
-                    || field
-                        .bytes()
-                        .any(|byte| matches!(byte, b'\t' | b'\r' | b'\n'))
-            })
-        {
-            return Err(pool_replay_failure(format!(
-                "{} command contains an invalid field",
-                self.label
-            )));
-        }
+    fn invoke(
+        &mut self,
+        fields: &[String],
+        done_marker: &str,
+        label: &'static str,
+        timeout: Duration,
+    ) -> Result<(), PoolError> {
         self.stdin
             .write_all(fields.join("\t").as_bytes())
             .and_then(|()| self.stdin.write_all(b"\n"))
             .and_then(|()| self.stdin.flush())
             .map_err(replay_error)?;
-        self.read_until(done_marker)
+        self.read_until(done_marker, label, timeout)
     }
 
-    fn read_until(&mut self, marker: &str) -> Result<(), PoolError> {
+    fn read_until(
+        &mut self,
+        marker: &str,
+        label: &'static str,
+        timeout: Duration,
+    ) -> Result<(), PoolError> {
+        let deadline = Instant::now() + timeout;
         let mut total_bytes = 0_usize;
         for _ in 0..WORKER_OUTPUT_MAX_LINES {
-            let mut line = String::new();
-            let bytes = self.stdout.read_line(&mut line).map_err(replay_error)?;
-            if bytes == 0 {
-                let status = self.child.try_wait().map_err(replay_error)?;
-                return Err(pool_replay_failure(format!(
-                    "{} closed stdout before {marker}; status={status:?}",
-                    self.label
-                )));
-            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let line = match self.lines.recv_timeout(remaining) {
+                Ok(line) => line.map_err(replay_error)?,
+                Err(RecvTimeoutError::Timeout) => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    return Err(pool_replay_failure(format!(
+                        "{label} did not emit {marker} within {} s and was stopped",
+                        timeout.as_secs()
+                    )));
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    let status = self.child.try_wait().map_err(replay_error)?;
+                    return Err(pool_replay_failure(format!(
+                        "{label} closed stdout before {marker}; status={status:?}"
+                    )));
+                }
+            };
             total_bytes = total_bytes
-                .checked_add(bytes)
+                .checked_add(line.len())
                 .ok_or_else(|| pool_replay_failure("worker output byte count overflow"))?;
             if total_bytes > WORKER_OUTPUT_MAX_BYTES {
                 return Err(pool_replay_failure(format!(
-                    "{} exceeded its output limit",
-                    self.label
+                    "{label} exceeded its output limit"
                 )));
             }
             if line.trim_end_matches(['\r', '\n']) == marker {
@@ -739,13 +890,12 @@ impl PersistentWorker {
             }
         }
         Err(pool_replay_failure(format!(
-            "{} did not emit {marker} within its line limit",
-            self.label
+            "{label} did not emit {marker} within its line limit"
         )))
     }
 }
 
-impl Drop for PersistentWorker {
+impl Drop for WorkerProcess {
     fn drop(&mut self) {
         let _ = self.stdin.write_all(b"QUIT\n");
         let _ = self.stdin.flush();
@@ -1153,5 +1303,99 @@ mod tests {
         assert_eq!(bounded_batch_size(0, 32), 32);
         assert_eq!(bounded_batch_size(u64::MAX - 2, 32), 3);
         assert_eq!(bounded_batch_size(u64::MAX, 32), 1);
+    }
+
+    /// A fake worker: says READY, answers DONE per command, exits on CRASH,
+    /// stops answering on HANG, and refuses to start while `$1` exists.
+    #[cfg(unix)]
+    fn fake_worker(block_start: &Path) -> ProductionV4PoolWorkerCommand {
+        let script = r#"[ -e "$1" ] && exit 4
+echo READY
+while read -r line; do
+  case "$line" in
+    CRASH) exit 3 ;;
+    HANG) exec sleep 30 ;;
+  esac
+  echo DONE
+done"#;
+        ProductionV4PoolWorkerCommand {
+            program: PathBuf::from("/bin/sh"),
+            arguments: vec![
+                "-c".into(),
+                script.into(),
+                "fake-worker".into(),
+                block_start.as_os_str().to_owned(),
+            ],
+            environment: Vec::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn worker_test_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("cmfd-pool-worker-{label}-{}", std::process::id()))
+    }
+
+    #[cfg(unix)]
+    fn fields(value: &str) -> Vec<String> {
+        vec![value.to_owned()]
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn crashed_worker_is_restarted_for_the_next_command() {
+        let command = fake_worker(&worker_test_path("crash-unused"));
+        let mut worker = PersistentWorker::start(&command, "READY", "test worker").unwrap();
+        worker.invoke(&fields("job"), "DONE").unwrap();
+        let error = worker.invoke(&fields("CRASH"), "DONE").unwrap_err();
+        assert!(
+            error.to_string().contains("closed stdout before DONE"),
+            "{error}"
+        );
+        assert!(worker.process.is_none());
+        worker.invoke(&fields("job"), "DONE").unwrap();
+        assert_eq!(worker.restarts, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wedged_worker_is_stopped_at_the_deadline_and_restarted() {
+        let command = fake_worker(&worker_test_path("hang-unused"));
+        let mut worker = PersistentWorker::start(&command, "READY", "test worker").unwrap();
+        let started = Instant::now();
+        let error = worker
+            .invoke_with_timeout(&fields("HANG"), "DONE", Duration::from_millis(300))
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(error.to_string().contains("was stopped"), "{error}");
+        assert!(worker.process.is_none());
+        worker.invoke(&fields("job"), "DONE").unwrap();
+        assert_eq!(worker.restarts, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_restart_backs_off_then_recovers() {
+        let block_start = worker_test_path("backoff");
+        let _ = std::fs::remove_file(&block_start);
+        let command = fake_worker(&block_start);
+        let mut worker = PersistentWorker::start(&command, "READY", "test worker").unwrap();
+        std::fs::write(&block_start, b"").unwrap();
+        worker.invoke(&fields("CRASH"), "DONE").unwrap_err();
+
+        let error = worker.invoke(&fields("job"), "DONE").unwrap_err();
+        assert!(
+            error.to_string().contains("closed stdout before READY"),
+            "{error}"
+        );
+        assert!(worker.retry_after.is_some());
+        let error = worker.invoke(&fields("job"), "DONE").unwrap_err();
+        assert!(error.to_string().contains("is restarting"), "{error}");
+        assert_eq!(worker.restarts, 0);
+
+        std::fs::remove_file(&block_start).unwrap();
+        worker.retry_after = Some(Instant::now());
+        worker.invoke(&fields("job"), "DONE").unwrap();
+        assert_eq!(worker.restarts, 1);
+        assert!(worker.retry_after.is_none());
     }
 }

@@ -35,18 +35,19 @@ for argument in "$@"; do
 done
 
 # The default is the already-qualified RC SM120 build. The opt-in mainnet
-# candidate gives the full prover native SM89 and SM120 code images.
+# candidate gives the full prover native SM86, SM89 and SM120 code images.
 # The replay/search worker uses its own cross-generation builder in both modes.
 # Keep its Cargo build directory separate: cached single-arch CUDA objects must
 # never be mistaken for dual-arch worker bytes submitted for signing.
 if "$dual_arch"; then
-    CUDA_ARCHS='89;120'
-    BUILD_ROOT=${CMFD_PROVER_DUAL_TARGET_DIR:-$SCRIPT_DIR/target/dual-sm89-sm120}
+    CUDA_ARCHS='86;89;120'
+    BUILD_ROOT=${CMFD_PROVER_DUAL_TARGET_DIR:-$SCRIPT_DIR/target/dual-sm86-sm89-sm120}
     if [[ $BUILD_ROOT != /* || $BUILD_ROOT == "$SCRIPT_DIR/target" ]]; then
         echo "CMFD_PROVER_DUAL_TARGET_DIR must be a separate absolute directory" >&2
         exit 2
     fi
     NVCC_ARCH_FLAGS=(
+        '-gencode=arch=compute_86,code=sm_86'
         '-gencode=arch=compute_89,code=sm_89'
         '-gencode=arch=compute_120,code=sm_120'
     )

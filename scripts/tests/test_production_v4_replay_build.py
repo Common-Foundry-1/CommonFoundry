@@ -168,7 +168,7 @@ esac
         source = (BUILD.parent / 'build.sh').read_text()
         self.assertIn('bash "$SCRIPT_DIR/build-replay.sh"', source)
         self.assertNotIn('koala_four_limb_replay.cu', source)
-        self.assertIn("CUDA_ARCHS='89;120'", source)
+        self.assertIn("CUDA_ARCHS='86;89;120'", source)
 
     def test_replay_kernel_namespace_does_not_embed_checkout_path(self):
         source = (BUILD.parent / 'cuda/koala_four_limb_replay.cu').read_text()

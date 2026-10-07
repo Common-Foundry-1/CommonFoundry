@@ -16,11 +16,11 @@ Run `prepare-dependencies.sh` once in a clean Ubuntu-22.04 WSL environment, then
 Both scripts fail closed if their pinned checkout identities do not match. The build emits the
 three Rust tools plus `cmfd-v4-replay` and `cmfd-v4-fixed-row-cache` under `target/release`.
 
-For a prospective **single worker set with native SM89 and SM120 code images**, run
+For a prospective **single worker set with native SM86, SM89 and SM120 code images**, run
 `build.sh --dual-arch` from the same pinned dependency checkouts. This opt-in mode passes
-`CUDA_ARCHS=89;120` to the Rust/SP1 build, gives the fixed-row-cache tool explicit
-`compute_89 -> sm_89` and `compute_120 -> sm_120` `nvcc -gencode` targets, and writes to
-`target/dual-sm89-sm120/release`. Its separate Cargo target directory prevents a cached
+`CUDA_ARCHS=86;89;120` to the Rust/SP1 build, gives the fixed-row-cache tool explicit
+`compute_86 -> sm_86`, `compute_89 -> sm_89` and `compute_120 -> sm_120` `nvcc -gencode`
+targets, and writes to `target/dual-sm86-sm89-sm120/release`. Its separate Cargo target directory prevents a cached
 SM120-only dependency from being packaged as a dual-architecture worker. The ordinary
 `build.sh` command keeps its full proof tools SM120-only. Both modes print
 SHA-256 digests of their actual worker bytes after successful compilation; this output is

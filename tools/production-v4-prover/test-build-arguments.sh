@@ -70,7 +70,8 @@ single_plan=$("$BUILD_SCRIPT" --print-build-plan)
 check_plan single "$single_plan" 120 "$SCRIPT_DIR/target" '-arch=sm_120'
 
 dual_plan=$("$BUILD_SCRIPT" --dual-arch --print-build-plan)
-check_plan dual "$dual_plan" '89;120' "$SCRIPT_DIR/target/dual-sm89-sm120" \
+check_plan dual "$dual_plan" '86;89;120' "$SCRIPT_DIR/target/dual-sm86-sm89-sm120" \
+    '-gencode=arch=compute_86,code=sm_86' \
     '-gencode=arch=compute_89,code=sm_89' \
     '-gencode=arch=compute_120,code=sm_120'
 

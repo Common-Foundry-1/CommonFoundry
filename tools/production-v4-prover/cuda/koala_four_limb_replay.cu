@@ -1134,7 +1134,7 @@ int main(int argc, char** argv) {
                            "read batched Tensor Core kernel target");
                 use_blackwell_gemm = attributes.ptxVersion >= 80;
             }
-        } else if (!use_dp4a_gemm && properties.major == 8 && properties.minor == 9) {
+        } else if (!use_dp4a_gemm && properties.major == 8 && properties.minor >= 6) {
             cudaFuncAttributes attributes{};
             cuda_check(cudaFuncGetAttributes(
                            &attributes,

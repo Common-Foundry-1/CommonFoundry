@@ -450,6 +450,11 @@ void launch_stacked_limb_gemm(const int8_t* limbs, const int8_t* weights,
     }
 }
 
+#include "fused_limb_layer.cuh"
+
+// fork: -1 = classic CUTLASS GEMM + reduce kernel, otherwise fused configuration id.
+int fused_config = -1;
+
 std::vector<uint32_t> make_coefficients(uint32_t layers) {
     std::vector<uint32_t> coefficients(size_t(layers + 1) * MASK_COEFFICIENTS);
     for (size_t index = 0; index < coefficients.size(); ++index) {
@@ -1141,16 +1146,25 @@ void run_production_search_batch(ProductionModel& model, uint32_t batch_size,
     // instead of ~200-900 MB cudaMalloc/cudaFree per batch.
     static uint32_t capacity = 0;
     static int8_t* limbs = nullptr;
+    static int8_t* limbs_next = nullptr;  // fused: double-buffered limbs
     static int32_t* limb_accumulators = nullptr;
     static uint32_t* activations = nullptr;
     static uint32_t* device_coefficients = nullptr;
     if (batch_size > capacity) {
-        cudaFree(limbs); cudaFree(limb_accumulators); cudaFree(activations); cudaFree(device_coefficients);
+        cudaFree(limbs); cudaFree(limbs_next); cudaFree(limb_accumulators);
+        cudaFree(activations); cudaFree(device_coefficients);
+        limbs_next = nullptr; limb_accumulators = nullptr;
         const size_t max_cells = size_t(batch_size) * cells;
         cuda_check(cudaMalloc(&limbs, 4 * max_cells),
                    "allocate production search-batch activation limbs");
-        cuda_check(cudaMalloc(&limb_accumulators, 4 * max_cells * sizeof(int32_t)),
-                   "allocate production search-batch limb accumulators");
+        if (fused_config >= 0) {
+            // the fused kernel keeps accumulators in registers: 4x less memory
+            cuda_check(cudaMalloc(&limbs_next, 4 * max_cells),
+                       "allocate production search-batch next-layer limbs");
+        } else {
+            cuda_check(cudaMalloc(&limb_accumulators, 4 * max_cells * sizeof(int32_t)),
+                       "allocate production search-batch limb accumulators");
+        }
         cuda_check(cudaMalloc(&activations, max_cells * sizeof(uint32_t)),
                    "allocate production search-batch activations");
         cuda_check(cudaMalloc(&device_coefficients,
@@ -1176,7 +1190,19 @@ void run_production_search_batch(ProductionModel& model, uint32_t batch_size,
     initialize_activation_batch<<<blocks, THREADS>>>(
         model.base(), limbs, nullptr, device_coefficients, PRODUCTION_ROWS,
         PRODUCTION_WIDTH, batch_size);
-    for (uint32_t layer = 0; layer < PRODUCTION_LAYERS; ++layer) {
+    for (uint32_t layer = 0; layer < PRODUCTION_LAYERS && fused_config >= 0; ++layer) {
+        fused::LayerArgs args;
+        args.limbs_in = (layer & 1) ? limbs_next : limbs;
+        args.limbs_out = (layer & 1) ? limbs : limbs_next;
+        args.weights = model.weights() + size_t(layer) * layer_cells;
+        args.activations_out = layer + 1 == PRODUCTION_LAYERS ? activations : nullptr;
+        args.row_sums = model.row_sums() + size_t(layer) * PRODUCTION_WIDTH;
+        args.coefficients = device_coefficients;
+        args.layer = layer;
+        args.m_rows = batch_size * PRODUCTION_ROWS * 4;
+        fused::launch_fused_layer(fused_config, args);
+    }
+    for (uint32_t layer = 0; layer < PRODUCTION_LAYERS && fused_config < 0; ++layer) {
         launch_stacked_limb_gemm(
             limbs, model.weights() + size_t(layer) * layer_cells,
             limb_accumulators, batch_size * PRODUCTION_ROWS, PRODUCTION_WIDTH);
@@ -1389,6 +1415,16 @@ int main(int argc, char** argv) {
             if (fork_gemm_variant < 0 || fork_gemm_variant > 7 || (use_dp4a_gemm && fork_gemm_variant)) fork_gemm_variant = 0;
             std::printf("fork_gemm_variant=%d\n", fork_gemm_variant);
         }
+        // fork: fused GEMM+reduce on sm_80+ (Ampere, Ada, Hopper, Blackwell); CMFD_FUSED=-1
+        // restores the classic path, CMFD_FUSED=<n> picks a tile configuration.
+        if (!use_dp4a_gemm && fork_gemm_variant == 0 && fused::fused_available(properties))
+            fused_config = fused::default_config(properties);
+        if (const char* v = std::getenv("CMFD_FUSED")) {
+            const int requested = std::atoi(v);
+            if (requested < 0 || !fused::fused_available(properties)) fused_config = -1;
+            else if (requested < fused::CONFIG_COUNT) fused_config = requested;
+        }
+        std::printf("fused_config=%d\n", fused_config);
         std::printf("gemm_backend=%s\n",
                     use_dp4a_gemm ? "sm70_dp4a_int8" :
                     use_blackwell_gemm ? "sm80_m16n8k32_blackwell_sw8_batch" :

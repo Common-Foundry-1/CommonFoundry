@@ -556,17 +556,23 @@ pub fn require_existing_pool_ledger(data_dir: &Path) -> Result<(), PoolError> {
     Ok(())
 }
 
-fn open_operator_ledger(node: &Node, fee_atoms: u64) -> Result<DurableLedger, PoolError> {
+fn open_operator_ledger(
+    node: &Node,
+    fee_atoms: u64,
+    ledger_max_bytes: usize,
+) -> Result<DurableLedger, PoolError> {
     if fee_atoms == 0
         || fee_atoms < cmfd_consensus::economics::minimum_transaction_fee(node.params.network_id)
     {
         return Err(PoolError::InvalidPayoutPolicy);
     }
+    super::validate_ledger_size_limit(ledger_max_bytes)?;
     require_existing_pool_ledger(&node.data_dir)?;
-    DurableLedger::open(
+    DurableLedger::open_with_limit(
         Some(node.data_dir.join("pool-ledger")),
         node.params.network_id,
         node.fingerprint,
+        ledger_max_bytes,
     )
 }
 
@@ -576,7 +582,16 @@ pub fn inspect_pool_payout_protection(
     node: &mut Node,
     fee_atoms: u64,
 ) -> Result<PoolPayoutProtectionReport, PoolError> {
-    let ledger = open_operator_ledger(node, fee_atoms)?;
+    inspect_pool_payout_protection_with_limit(node, fee_atoms, DEFAULT_POOL_LEDGER_MAX_BYTES)
+}
+
+/// `inspect_pool_payout_protection` for a pool run with `--pool-ledger-max-bytes`.
+pub fn inspect_pool_payout_protection_with_limit(
+    node: &mut Node,
+    fee_atoms: u64,
+    ledger_max_bytes: usize,
+) -> Result<PoolPayoutProtectionReport, PoolError> {
+    let ledger = open_operator_ledger(node, fee_atoms, ledger_max_bytes)?;
     reconcile_pool_blocks_for_node(&ledger, node, true)?;
     refresh_payment_states(&ledger, node)?;
     check_funding(&ledger, node, fee_atoms)?;
@@ -590,6 +605,15 @@ pub fn reconcile_pool_payout_protection(
     node: &mut Node,
     request: PoolPayoutReconciliationRequest,
 ) -> Result<PoolPayoutProtectionReport, PoolError> {
+    reconcile_pool_payout_protection_with_limit(node, request, DEFAULT_POOL_LEDGER_MAX_BYTES)
+}
+
+/// `reconcile_pool_payout_protection` for a pool run with `--pool-ledger-max-bytes`.
+pub fn reconcile_pool_payout_protection_with_limit(
+    node: &mut Node,
+    request: PoolPayoutReconciliationRequest,
+    ledger_max_bytes: usize,
+) -> Result<PoolPayoutProtectionReport, PoolError> {
     if request.operator_note.trim().is_empty()
         || request.operator_note.len() > 256
         || request.operator_note.chars().any(char::is_control)
@@ -599,7 +623,7 @@ pub fn reconcile_pool_payout_protection(
                 .into(),
         ));
     }
-    let ledger = open_operator_ledger(node, request.fee_atoms)?;
+    let ledger = open_operator_ledger(node, request.fee_atoms, ledger_max_bytes)?;
     if node.state.tip() != request.expected_tip
         || ledger
             .state

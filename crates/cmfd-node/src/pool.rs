@@ -58,6 +58,15 @@ pub const DEFAULT_POOL_CONNECTIONS_PER_SOURCE: usize = 8;
 pub const POOL_MAX_CONCURRENT_SHARE_VERIFICATIONS: usize = 8;
 pub const DEFAULT_POOL_CONCURRENT_SHARE_VERIFICATIONS: usize = 1;
 pub const POOL_MAX_QUEUED_SHARE_VERIFICATIONS: usize = 64;
+/// Default cap on one serialized pool ledger snapshot. A pool with thousands
+/// of sessions and cards outgrows it; operators raise it with
+/// `--pool-ledger-max-bytes` on `pool-serve` and the offline payout tools.
+pub const DEFAULT_POOL_LEDGER_MAX_BYTES: usize = 64 * 1024 * 1024;
+/// Smallest accepted `--pool-ledger-max-bytes`.
+pub const POOL_MIN_LEDGER_MAX_BYTES: usize = 1024 * 1024;
+/// Largest accepted `--pool-ledger-max-bytes`: a snapshot is held in memory
+/// both as the ledger and as its serialized bytes while it persists.
+pub const POOL_MAX_LEDGER_MAX_BYTES: usize = 1024 * 1024 * 1024;
 pub const DEFAULT_POOL_QUEUED_SHARE_VERIFICATIONS: usize = 8;
 pub const POOL_MAX_MESSAGES_PER_SESSION: u64 = 1_000_000;
 pub const POOL_MAX_SHARES_PER_JOB: usize = 65_536;
@@ -98,7 +107,6 @@ const POOL_LEDGER_CHECKSUM_DOMAIN: &str = "CMFD/POOL/LEDGER/V2";
 const LEGACY_POOL_LEDGER_FORMAT_VERSION: u16 = 1;
 const LEGACY_POOL_LEDGER_FILE_PREFIX: &str = "pool-ledger-v1";
 const LEGACY_POOL_LEDGER_CHECKSUM_DOMAIN: &str = "CMFD/POOL/LEDGER/V1";
-const POOL_LEDGER_MAX_BYTES: usize = 64 * 1024 * 1024;
 const POOL_MAX_PAYOUTS_PER_TIP: usize = 16;
 const POOL_LEDGER_GUARD_FILE: &str = "pool-ledger-payout-guard-v1.json";
 /// Settled block and payment records this many blocks deep leave the live
@@ -115,7 +123,9 @@ const POOL_LEDGER_ARCHIVE_SCHEMA: &str = "CMFD/POOL/LEDGER-ARCHIVE/V1";
 mod payout_protection;
 pub use payout_protection::{
     PoolPayoutProtectionReport, PoolPayoutProtectionSnapshot, PoolPayoutReconciliationRequest,
-    inspect_pool_payout_protection, reconcile_pool_payout_protection, require_existing_pool_ledger,
+    inspect_pool_payout_protection, inspect_pool_payout_protection_with_limit,
+    reconcile_pool_payout_protection, reconcile_pool_payout_protection_with_limit,
+    require_existing_pool_ledger,
 };
 
 #[derive(Debug, Error)]
@@ -198,6 +208,16 @@ pub enum PoolError {
     DeadlineOverflow,
     #[error("pool bounded session ledger has no inactive record available to prune")]
     LedgerCapacity,
+    #[error(
+        "pool ledger size limit must be between {min} and {max} bytes",
+        min = POOL_MIN_LEDGER_MAX_BYTES,
+        max = POOL_MAX_LEDGER_MAX_BYTES
+    )]
+    InvalidLedgerSizeLimit,
+    #[error(
+        "pool ledger snapshot is {bytes} bytes, above the pool-ledger-max-bytes limit of {limit}; raise --pool-ledger-max-bytes"
+    )]
+    LedgerSizeLimit { bytes: usize, limit: usize },
     #[error("pool ledger storage is corrupt: {0}")]
     LedgerCorrupt(String),
     #[error("pool ledger is already in use; stop the pool before running offline payout controls")]
@@ -242,6 +262,8 @@ pub struct PoolServerConfig {
     pub max_concurrent_share_verifications: usize,
     pub max_queued_share_verifications: usize,
     pub ledger_directory: Option<PathBuf>,
+    /// Largest ledger snapshot the pool loads or writes, in bytes.
+    pub ledger_max_bytes: usize,
     pub payout_policy: Option<PoolPayoutPolicy>,
     pub pplns_policy: Option<PoolPplnsPolicy>,
     pub allow_public_clients: bool,
@@ -268,6 +290,7 @@ impl PoolServerConfig {
             max_concurrent_share_verifications: DEFAULT_POOL_CONCURRENT_SHARE_VERIFICATIONS,
             max_queued_share_verifications: DEFAULT_POOL_QUEUED_SHARE_VERIFICATIONS,
             ledger_directory: None,
+            ledger_max_bytes: DEFAULT_POOL_LEDGER_MAX_BYTES,
             payout_policy: None,
             pplns_policy: None,
             allow_public_clients: false,
@@ -1096,6 +1119,8 @@ struct LedgerStore {
     directory: PathBuf,
     network_id: [u8; 32],
     consensus_fingerprint: [u8; 32],
+    /// Largest snapshot this store loads or writes.
+    max_bytes: usize,
     /// Snapshot slot for the next write: never the slot that holds the latest
     /// durable snapshot.
     next_slot: AtomicU8,
@@ -1220,10 +1245,28 @@ struct LegacyStoredLedgerPayloadV1 {
 }
 
 impl DurableLedger {
+    /// Open with the default snapshot size limit.
+    #[cfg(test)]
     fn open(
         directory: Option<PathBuf>,
         network_id: [u8; 32],
         consensus_fingerprint: [u8; 32],
+    ) -> Result<Self, PoolError> {
+        Self::open_with_limit(
+            directory,
+            network_id,
+            consensus_fingerprint,
+            DEFAULT_POOL_LEDGER_MAX_BYTES,
+        )
+    }
+
+    /// Open the ledger with an explicit snapshot size limit. The limit must
+    /// already be validated (`POOL_MIN_LEDGER_MAX_BYTES..=POOL_MAX_LEDGER_MAX_BYTES`).
+    fn open_with_limit(
+        directory: Option<PathBuf>,
+        network_id: [u8; 32],
+        consensus_fingerprint: [u8; 32],
+        max_bytes: usize,
     ) -> Result<Self, PoolError> {
         let Some(directory) = directory else {
             return Ok(Self::with_store(Ledger::default(), None));
@@ -1250,6 +1293,7 @@ impl DurableLedger {
             directory,
             network_id,
             consensus_fingerprint,
+            max_bytes,
             next_slot: AtomicU8::new(0),
             _lock: lock,
         };
@@ -1522,10 +1566,16 @@ impl LedgerStore {
                         .then_some((ledger, Some(slot)))
                 })
                 .ok_or_else(|| {
-                    PoolError::LedgerCorrupt(
+                    // Name the slot errors too: a snapshot refused for its
+                    // size is otherwise reported only as a guard mismatch.
+                    let mut message =
                         "no snapshot matches the durable payout guard; refusing older payout state"
-                            .into(),
-                    )
+                            .to_owned();
+                    if !errors.is_empty() {
+                        message.push_str("; ");
+                        message.push_str(&errors.join("; "));
+                    }
+                    PoolError::LedgerCorrupt(message)
                 });
         }
         if !errors.is_empty() {
@@ -1570,12 +1620,7 @@ impl LedgerStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        if bytes.is_empty() || bytes.len() > POOL_LEDGER_MAX_BYTES {
-            return Err(PoolError::LedgerCorrupt(format!(
-                "{} has an invalid byte length",
-                path.display()
-            )));
-        }
+        self.check_snapshot_size(&path, bytes.len())?;
         let stored: StoredLedgerV1 = serde_json::from_slice(&bytes)
             .map_err(|error| PoolError::LedgerCorrupt(format!("{}: {error}", path.display())))?;
         if stored.format_version != POOL_LEDGER_FORMAT_VERSION
@@ -1677,8 +1722,11 @@ impl LedgerStore {
             payload,
         };
         let bytes = serde_json::to_vec(&stored)?;
-        if bytes.len() > POOL_LEDGER_MAX_BYTES {
-            return Err(PoolError::LedgerCapacity);
+        if bytes.len() > self.max_bytes {
+            return Err(PoolError::LedgerSizeLimit {
+                bytes: bytes.len(),
+                limit: self.max_bytes,
+            });
         }
         self.write_guard(&stored)?;
         let slot = self.next_slot.load(Ordering::Acquire);
@@ -1712,6 +1760,23 @@ impl LedgerStore {
         result
     }
 
+    fn check_snapshot_size(&self, path: &Path, bytes: usize) -> Result<(), PoolError> {
+        if bytes == 0 {
+            return Err(PoolError::LedgerCorrupt(format!(
+                "{} is empty",
+                path.display()
+            )));
+        }
+        if bytes > self.max_bytes {
+            return Err(PoolError::LedgerCorrupt(format!(
+                "{} is {bytes} bytes, above the pool-ledger-max-bytes limit of {}; raise --pool-ledger-max-bytes to load it",
+                path.display(),
+                self.max_bytes
+            )));
+        }
+        Ok(())
+    }
+
     fn slot_path(&self, slot: u8) -> PathBuf {
         self.directory
             .join(format!("{POOL_LEDGER_FILE_PREFIX}.{slot}.json"))
@@ -1736,12 +1801,7 @@ impl LedgerStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        if bytes.is_empty() || bytes.len() > POOL_LEDGER_MAX_BYTES {
-            return Err(PoolError::LedgerCorrupt(format!(
-                "{} has an invalid byte length",
-                path.display()
-            )));
-        }
+        self.check_snapshot_size(&path, bytes.len())?;
         let stored: LegacyStoredLedgerV1 = serde_json::from_slice(&bytes)
             .map_err(|error| PoolError::LedgerCorrupt(format!("{}: {error}", path.display())))?;
         if stored.format_version != LEGACY_POOL_LEDGER_FORMAT_VERSION
@@ -2861,6 +2921,14 @@ impl Drop for PoolServerHandle {
     }
 }
 
+/// Reject a `--pool-ledger-max-bytes` value outside the supported range.
+pub fn validate_ledger_size_limit(max_bytes: usize) -> Result<(), PoolError> {
+    if !(POOL_MIN_LEDGER_MAX_BYTES..=POOL_MAX_LEDGER_MAX_BYTES).contains(&max_bytes) {
+        return Err(PoolError::InvalidLedgerSizeLimit);
+    }
+    Ok(())
+}
+
 pub fn spawn_pool_server(
     node: Arc<Mutex<Node>>,
     config: PoolServerConfig,
@@ -2887,6 +2955,7 @@ pub fn spawn_pool_server(
     if config.max_queued_share_verifications > POOL_MAX_QUEUED_SHARE_VERIFICATIONS {
         return Err(PoolError::InvalidShareVerificationQueueLimit);
     }
+    validate_ledger_size_limit(config.ledger_max_bytes)?;
     if let Some(policy) = config.payout_policy {
         if policy.minimum_payout_atoms == 0
             || policy.fee_atoms == 0
@@ -2952,7 +3021,12 @@ pub fn spawn_pool_server(
         mining,
         seen_nonces: Mutex::new(HashSet::new()),
     });
-    let ledger = DurableLedger::open(config.ledger_directory, network_id, consensus_fingerprint)?;
+    let ledger = DurableLedger::open_with_limit(
+        config.ledger_directory,
+        network_id,
+        consensus_fingerprint,
+        config.ledger_max_bytes,
+    )?;
     let next_session_id = ledger.next_session_id()?;
     let shared = Arc::new(SharedServer {
         node,
@@ -6766,6 +6840,94 @@ mod tests {
         );
         assert!(dashboard.workers[0].estimated_24h_earnings_atoms.is_some());
         server.stop().unwrap();
+    }
+
+    #[test]
+    fn durable_ledger_size_limit_is_configurable() {
+        let root = TestRoot::new("durable-ledger-size-limit");
+        let directory = root.path().join("ledger");
+        let network_id = [0x33; 32];
+        let fingerprint = [0x34; 32];
+        let payout = default_miner_destination();
+        {
+            let ledger =
+                DurableLedger::open(Some(directory.clone()), network_id, fingerprint).unwrap();
+            register_session(&ledger, 1, "worker".to_owned(), payout).unwrap();
+            credit_accepted_share(&ledger, 1, 7).unwrap();
+        }
+        let snapshot_bytes = (0..=1)
+            .filter_map(|slot| {
+                fs::metadata(directory.join(format!("{POOL_LEDGER_FILE_PREFIX}.{slot}.json"))).ok()
+            })
+            .map(|metadata| metadata.len() as usize)
+            .max()
+            .unwrap();
+        assert!(snapshot_bytes > 0);
+
+        // A durable snapshot above the limit is refused, and the message names
+        // the flag that raises it rather than only the guard mismatch.
+        match DurableLedger::open_with_limit(
+            Some(directory.clone()),
+            network_id,
+            fingerprint,
+            snapshot_bytes - 1,
+        ) {
+            Err(PoolError::LedgerCorrupt(message)) => {
+                assert!(message.contains("pool-ledger-max-bytes"), "{message}");
+            }
+            other => panic!("unexpected result: {:?}", other.map(|_| ())),
+        }
+
+        // The same snapshot loads once the limit covers it. The first write
+        // that would exceed the limit is refused and faults the ledger instead
+        // of persisting a truncated snapshot.
+        let ledger = DurableLedger::open_with_limit(
+            Some(directory.clone()),
+            network_id,
+            fingerprint,
+            snapshot_bytes + 64,
+        )
+        .unwrap();
+        assert_eq!(ledger.next_session_id().unwrap(), 2);
+        let mut refused = None;
+        for session in 2_u64..64 {
+            if let Err(error) =
+                register_session(&ledger, session, format!("worker-{session}"), payout)
+            {
+                refused = Some(error);
+                break;
+            }
+        }
+        match refused {
+            Some(PoolError::LedgerSizeLimit { bytes, limit }) => {
+                assert!(bytes > limit, "{bytes} <= {limit}");
+                assert_eq!(limit, snapshot_bytes + 64);
+            }
+            other => panic!("expected a ledger size limit error, got {other:?}"),
+        }
+        assert!(matches!(
+            register_session(&ledger, 99, "late".to_owned(), payout),
+            Err(PoolError::LedgerFaulted)
+        ));
+        drop(ledger);
+
+        // Reopening with the default limit recovers the last durable snapshot.
+        let recovered = DurableLedger::open(Some(directory), network_id, fingerprint).unwrap();
+        assert_eq!(recovered.next_session_id().unwrap(), 2);
+        let snapshot = snapshot_ledger(&recovered).unwrap();
+        assert_eq!(snapshot.accepted_shares, 1);
+    }
+
+    #[test]
+    fn pool_server_rejects_ledger_size_limit_outside_range() {
+        assert!(validate_ledger_size_limit(POOL_MIN_LEDGER_MAX_BYTES - 1).is_err());
+        assert!(validate_ledger_size_limit(POOL_MIN_LEDGER_MAX_BYTES).is_ok());
+        assert!(validate_ledger_size_limit(DEFAULT_POOL_LEDGER_MAX_BYTES).is_ok());
+        assert!(validate_ledger_size_limit(POOL_MAX_LEDGER_MAX_BYTES).is_ok());
+        assert!(matches!(
+            validate_ledger_size_limit(POOL_MAX_LEDGER_MAX_BYTES + 1),
+            Err(PoolError::InvalidLedgerSizeLimit)
+        ));
     }
 
     #[test]

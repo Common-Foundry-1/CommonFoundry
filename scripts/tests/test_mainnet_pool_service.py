@@ -174,6 +174,23 @@ class MainnetPoolServiceTests(unittest.TestCase):
             with self.assertRaisesRegex(pool.PreflightError, "prune_keep_blocks"):
                 self.preflight()
 
+    def test_optional_pool_ledger_limit_becomes_pool_ledger_max_bytes(self):
+        config, _, _ = self.preflight()
+        with mock.patch.object(pool, "CONFIG_BASE", self.config_base):
+            command = pool.build_command(self.root, self.state, self.credential_base, config)
+        self.assertNotIn("--pool-ledger-max-bytes", command)
+        self.config["pool_ledger_max_bytes"] = 256 * 1024 * 1024
+        self.save_config()
+        config, _, _ = self.preflight()
+        with mock.patch.object(pool, "CONFIG_BASE", self.config_base):
+            command = pool.build_command(self.root, self.state, self.credential_base, config)
+        self.assertEqual(command[command.index("--pool-ledger-max-bytes") + 1], str(256 * 1024 * 1024))
+        for bad in (1024 * 1024 - 1, 0, -1, "268435456", 268435456.0, True, None, 1024 * 1024 * 1024 + 1):
+            self.config["pool_ledger_max_bytes"] = bad
+            self.save_config()
+            with self.assertRaisesRegex(pool.PreflightError, "pool_ledger_max_bytes"):
+                self.preflight()
+
     def test_placeholder_or_legacy_payout_config_fails_closed(self):
         self.config["operator_fee_bps"] = "SET_APPROVED_MAINNET_VALUE"
         self.save_config()

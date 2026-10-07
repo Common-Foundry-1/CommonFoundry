@@ -51,8 +51,12 @@ CONFIG_FIELDS = {"schema", "public_numeric_ip", "private_bind_ip", "mainnet_seed
 # Optional: relay nodes the pool also treats as static peers (announced to first,
 # compressed block frames). Same numeric IP:29444 form as mainnet_seed.
 # Optional: proof pruning window (newest full blocks kept), as `--prune-keep-blocks`.
-OPTIONAL_FIELDS = {"mainnet_relays", "prune_keep_blocks"}
+# Optional: largest pool ledger snapshot in bytes, as `--pool-ledger-max-bytes`
+# (node default 64 MiB; large pools outgrow it).
+OPTIONAL_FIELDS = {"mainnet_relays", "prune_keep_blocks", "pool_ledger_max_bytes"}
 MIN_PRUNE_KEEP_BLOCKS = 288
+MIN_POOL_LEDGER_MAX_BYTES = 1024 * 1024
+MAX_POOL_LEDGER_MAX_BYTES = 1024 * 1024 * 1024
 MAX_RELAYS = 8
 COMPETING_UNITS = (
     "commonfoundry-pool-public.service", "commonfoundry-pool-ai01.service",
@@ -185,6 +189,11 @@ def validate_config(config: dict) -> dict:
             type(config["prune_keep_blocks"]) is not int
             or not MIN_PRUNE_KEEP_BLOCKS <= config["prune_keep_blocks"] <= 2**32):
         raise PreflightError(f"prune_keep_blocks must be an integer of at least {MIN_PRUNE_KEEP_BLOCKS}")
+    if "pool_ledger_max_bytes" in config and (
+            type(config["pool_ledger_max_bytes"]) is not int
+            or not MIN_POOL_LEDGER_MAX_BYTES <= config["pool_ledger_max_bytes"] <= MAX_POOL_LEDGER_MAX_BYTES):
+        raise PreflightError(f"pool_ledger_max_bytes must be an integer from {MIN_POOL_LEDGER_MAX_BYTES} "
+                             f"to {MAX_POOL_LEDGER_MAX_BYTES}")
     for fresh, old in (("expected_tls_certificate_sha256", "forbidden_rc_certificate_sha256"),
                        ("expected_tls_private_key_sha256", "forbidden_rc_private_key_sha256")):
         if config[fresh] == config[old]:
@@ -398,6 +407,8 @@ def build_command(root: Path, state: Path, credential_base: Path, config: dict) 
         "--pool-public-url", f"cmfd+tls://{socket(config['public_numeric_ip'], 29445)}?pin={pin}",
         "--shutdown-request-file", str(state / "shutdown.request"),
         *(("--prune-keep-blocks", str(config["prune_keep_blocks"])) if "prune_keep_blocks" in config else ()),
+        *(("--pool-ledger-max-bytes", str(config["pool_ledger_max_bytes"]))
+          if "pool_ledger_max_bytes" in config else ()),
     ]
 
 

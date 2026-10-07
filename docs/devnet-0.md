@@ -313,6 +313,14 @@ Operators can tune the verifier admission bounds with
 `--pool-max-concurrent-share-verifications` and
 `--pool-max-queued-share-verifications` without changing consensus.
 
+The pool ledger is written as one JSON snapshot, and the node refuses to load
+or write a snapshot above `--pool-ledger-max-bytes` (default 64 MiB) so a
+corrupt or runaway file cannot exhaust memory. A pool with thousands of
+sessions and payout cards outgrows the default; raise the limit (1 MiB to
+1 GiB) on `pool-serve`, and pass the same value to `pool-payout-status` and
+`pool-payout-reconcile`, which open the same ledger offline. A snapshot above
+the limit fails startup with a message naming the file size and the flag.
+
 ## Run two or three local nodes
 
 Build once, then run each command in a separate PowerShell window. The fully

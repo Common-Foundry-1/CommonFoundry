@@ -36,12 +36,13 @@ use cmfd_node::p2p::{
 use cmfd_node::peer::{PeerAddressPolicy, PeerLimits, StaticPeerConfig};
 use cmfd_node::pool::{
     DEFAULT_POOL_CONCURRENT_SHARE_VERIFICATIONS, DEFAULT_POOL_CONNECTIONS_PER_SOURCE,
-    DEFAULT_POOL_MINIMUM_PAYOUT_ATOMS, DEFAULT_POOL_OPERATOR_FEE_BPS,
-    DEFAULT_POOL_PAYOUT_FEE_ATOMS, DEFAULT_POOL_QUEUED_SHARE_VERIFICATIONS,
-    DEFAULT_POOL_SOCKET_ADDRESS, DEFAULT_PPLNS_WINDOW_SHARES, DEFAULT_SHARE_LEADING_ZERO_BITS,
-    PoolPayoutPolicy, PoolPayoutReconciliationRequest, PoolPplnsPolicy, PoolServerConfig,
-    certificate_sha256, generate_pool_certificate, inspect_pool_payout_protection,
-    reconcile_pool_payout_protection, require_existing_pool_ledger, spawn_pool_server,
+    DEFAULT_POOL_LEDGER_MAX_BYTES, DEFAULT_POOL_MINIMUM_PAYOUT_ATOMS,
+    DEFAULT_POOL_OPERATOR_FEE_BPS, DEFAULT_POOL_PAYOUT_FEE_ATOMS,
+    DEFAULT_POOL_QUEUED_SHARE_VERIFICATIONS, DEFAULT_POOL_SOCKET_ADDRESS,
+    DEFAULT_PPLNS_WINDOW_SHARES, DEFAULT_SHARE_LEADING_ZERO_BITS, PoolPayoutPolicy,
+    PoolPayoutReconciliationRequest, PoolPplnsPolicy, PoolServerConfig, certificate_sha256,
+    generate_pool_certificate, inspect_pool_payout_protection_with_limit,
+    reconcile_pool_payout_protection_with_limit, require_existing_pool_ledger, spawn_pool_server,
 };
 use cmfd_node::pool_dashboard::{
     DEFAULT_POOL_DASHBOARD_ADDRESS, PoolDashboardConfig, spawn_pool_dashboard,
@@ -744,11 +745,17 @@ enum Command {
         /// Use the same fee as pool-serve. Amount is in atomic units.
         #[arg(long)]
         pool_payout_fee_atoms: u64,
+        /// Use the same ledger size limit as pool-serve.
+        #[arg(long, default_value_t = DEFAULT_POOL_LEDGER_MAX_BYTES)]
+        pool_ledger_max_bytes: usize,
     },
     /// Resolve funded payout holds offline without sending or replacing payments.
     PoolPayoutReconcile {
         #[arg(long)]
         pool_payout_fee_atoms: u64,
+        /// Use the same ledger size limit as pool-serve.
+        #[arg(long, default_value_t = DEFAULT_POOL_LEDGER_MAX_BYTES)]
+        pool_ledger_max_bytes: usize,
         #[arg(long, value_parser = parse_hex32)]
         expected_tip: [u8; 32],
         #[arg(long)]
@@ -841,6 +848,11 @@ enum Command {
         /// Maximum authenticated shares waiting for a pool verifier slot.
         #[arg(long, default_value_t = DEFAULT_POOL_QUEUED_SHARE_VERIFICATIONS)]
         pool_max_queued_share_verifications: usize,
+        /// Largest pool ledger snapshot loaded or written, in bytes (1 MiB to
+        /// 1 GiB). Raise it when a large pool's ledger outgrows the default;
+        /// pass the same value to pool-payout-status and pool-payout-reconcile.
+        #[arg(long, default_value_t = DEFAULT_POOL_LEDGER_MAX_BYTES)]
+        pool_ledger_max_bytes: usize,
         /// Built dashboard directory containing index.html and its static assets.
         #[arg(long)]
         pool_dashboard_assets: Option<PathBuf>,
@@ -1892,6 +1904,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::PoolPayoutStatus {
             pool_payout_fee_atoms,
+            pool_ledger_max_bytes,
         } => {
             let mut node = open_node(
                 &cli.data_dir,
@@ -1901,12 +1914,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 wallet_passphrase.as_ref().map(|value| value.as_slice()),
                 exchange_withdrawal_security.as_ref(),
             )?;
-            let report = inspect_pool_payout_protection(&mut node, pool_payout_fee_atoms)?;
+            let report = inspect_pool_payout_protection_with_limit(
+                &mut node,
+                pool_payout_fee_atoms,
+                pool_ledger_max_bytes,
+            )?;
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }
         Command::PoolPayoutReconcile {
             pool_payout_fee_atoms,
+            pool_ledger_max_bytes,
             expected_tip,
             expected_ledger_generation,
             note,
@@ -1923,7 +1941,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 wallet_passphrase.as_ref().map(|value| value.as_slice()),
                 exchange_withdrawal_security.as_ref(),
             )?;
-            let report = reconcile_pool_payout_protection(
+            let report = reconcile_pool_payout_protection_with_limit(
                 &mut node,
                 PoolPayoutReconciliationRequest {
                     expected_tip,
@@ -1931,6 +1949,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     fee_atoms: pool_payout_fee_atoms,
                     operator_note: note,
                 },
+                pool_ledger_max_bytes,
             )?;
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
@@ -2007,6 +2026,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             pool_max_connections_per_source,
             pool_max_concurrent_share_verifications,
             pool_max_queued_share_verifications,
+            pool_ledger_max_bytes,
             pool_dashboard_assets,
             pool_public_url,
             pool_dashboard_bind,
@@ -2110,6 +2130,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             config.max_connections_per_source = pool_max_connections_per_source;
             config.max_concurrent_share_verifications = pool_max_concurrent_share_verifications;
             config.max_queued_share_verifications = pool_max_queued_share_verifications;
+            config.ledger_max_bytes = pool_ledger_max_bytes;
             config.allow_public_clients = allow_public_pool_clients;
             config.allow_address_only_payouts = allow_address_only_payouts;
             config.pplns_policy = Some(PoolPplnsPolicy {
@@ -2167,6 +2188,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "max_connections_per_source": pool_max_connections_per_source,
                     "max_concurrent_share_verifications": pool_max_concurrent_share_verifications,
                     "max_queued_share_verifications": pool_max_queued_share_verifications,
+                    "ledger_max_bytes": pool_ledger_max_bytes,
                     "dashboard": dashboard.as_ref().map(|dashboard| format!("http://{}", dashboard.local_addr())),
                     "used_insecure_default_miner": used_insecure_default_miner,
                     "public_peer_mode": allow_public_peers,

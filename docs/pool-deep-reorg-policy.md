@@ -87,6 +87,8 @@ On Windows invoke the verified `cmfd-node.exe` using PowerShell's `&` when the
 path is quoted. Amounts in the report are decimal **atomic-unit strings**, not
 floating-point CMFD. The tool requires an existing `pool-ledger` below the
 selected node data directory; a typo does not create a new wallet/empty ledger.
+A pool started with `--pool-ledger-max-bytes` needs the same value on both
+commands, or they refuse the oversized snapshot exactly as `pool-serve` would.
 Library integrations with custom ledger locations must retain that layout or
 provide an equally locked operator workflow.
 

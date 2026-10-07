@@ -3758,6 +3758,28 @@ fn retryable_result(
             .get(&session_id)
             .ok_or_else(|| PoolError::InvalidMessage("unknown session".to_owned()))?,
     )?;
+    // Miners count these as rejected too. Rate-limited shares are not bounded
+    // by the share rate, so they are logged only at debug level.
+    if code == "share_rate_limited" {
+        tracing::debug!(
+            session = session_id,
+            worker = %session.worker,
+            reason = code,
+            retryable = true,
+            "pool share rejected"
+        );
+    } else {
+        tracing::info!(
+            session = session_id,
+            worker = %session.worker,
+            payout = %session.payout,
+            job = %hex::encode(&job_id[..8]),
+            nonce,
+            reason = code,
+            retryable = true,
+            "pool share rejected"
+        );
+    }
     Ok(PoolShareResult {
         job_id,
         nonce,

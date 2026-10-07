@@ -91,7 +91,11 @@ approved pool GPU still has a compute process. It never stops that process.
    becomes the miner URL pin. The optional `mainnet_relays` list names up to
    eight relay nodes (`numeric-ip:29444`) that the pool node also treats as
    static peers: a found block is announced to them first and block frames to
-   them are compressed. `automatic_payouts` must be explicitly true; the
+   them are compressed. The optional `prune_keep_blocks` (at least `288`)
+   turns on proof pruning: the pool node keeps full blocks only for that many
+   newest blocks and drops the proofs of older ones, keeping their
+   transactions (see `docs/proof-pruning.md`). `720` keeps about 12 hours.
+   Leave it out to keep every proof. `automatic_payouts` must be explicitly true; the
    launcher uses the **mainnet-specific** `--enable-mainnet-payouts` flag, never
    `--enable-testnet-payouts`. A runtime without that flag fails closed.
    The burned payout fee must meet the exact minimum in the pinned launch

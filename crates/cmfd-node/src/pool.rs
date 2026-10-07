@@ -3858,23 +3858,28 @@ fn reconcile_pool_blocks_for_node(
     node: &Node,
     recover_missing_pending: bool,
 ) -> Result<(), PoolError> {
-    let block_ids = ledger
+    let blocks = ledger
         .state
         .lock()
         .map_err(|_| PoolError::SharedStatePoisoned)?
         .blocks
-        .keys()
-        .copied()
+        .iter()
+        .map(|(block_id, record)| (*block_id, record.height))
         .collect::<Vec<_>>();
-    if block_ids.is_empty() {
+    if blocks.is_empty() {
         return Ok(());
     }
-    let updates = block_ids
+    let pruned_height = node.prune_height();
+    let updates = blocks
         .into_iter()
-        .map(|block_id| {
+        .map(|(block_id, height)| {
             if let Some(confirmations) = node.active_chain_confirmations(block_id) {
                 (block_id, PoolBlockState::Canonical, confirmations)
-            } else if node.contains_block(block_id) {
+            } else if node.contains_block(block_id)
+                // A prune drops side blocks at or below the prune height, and
+                // the active chain there can no longer change.
+                || pruned_height.is_some_and(|pruned| height <= pruned)
+            {
                 (block_id, PoolBlockState::Orphaned, 0)
             } else {
                 (block_id, PoolBlockState::Unknown, 0)

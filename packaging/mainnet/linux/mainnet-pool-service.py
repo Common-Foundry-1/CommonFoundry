@@ -50,7 +50,9 @@ CONFIG_FIELDS = {"schema", "public_numeric_ip", "private_bind_ip", "mainnet_seed
                  "gpu_uuid", "automatic_payouts", *HASH_FIELDS, *NUMBER_FIELDS}
 # Optional: relay nodes the pool also treats as static peers (announced to first,
 # compressed block frames). Same numeric IP:29444 form as mainnet_seed.
-OPTIONAL_FIELDS = {"mainnet_relays"}
+# Optional: proof pruning window (newest full blocks kept), as `--prune-keep-blocks`.
+OPTIONAL_FIELDS = {"mainnet_relays", "prune_keep_blocks"}
+MIN_PRUNE_KEEP_BLOCKS = 288
 MAX_RELAYS = 8
 COMPETING_UNITS = (
     "commonfoundry-pool-public.service", "commonfoundry-pool-ai01.service",
@@ -179,6 +181,10 @@ def validate_config(config: dict) -> dict:
     config["mainnet_seed"] = parse_seed(config["mainnet_seed"])
     if "mainnet_relays" in config:
         config["mainnet_relays"] = parse_relays(config["mainnet_relays"], config["mainnet_seed"])
+    if "prune_keep_blocks" in config and (
+            type(config["prune_keep_blocks"]) is not int
+            or not MIN_PRUNE_KEEP_BLOCKS <= config["prune_keep_blocks"] <= 2**32):
+        raise PreflightError(f"prune_keep_blocks must be an integer of at least {MIN_PRUNE_KEEP_BLOCKS}")
     for fresh, old in (("expected_tls_certificate_sha256", "forbidden_rc_certificate_sha256"),
                        ("expected_tls_private_key_sha256", "forbidden_rc_private_key_sha256")):
         if config[fresh] == config[old]:
@@ -391,6 +397,7 @@ def build_command(root: Path, state: Path, credential_base: Path, config: dict) 
         "--pool-dashboard-bind", "127.0.0.1:29446",
         "--pool-public-url", f"cmfd+tls://{socket(config['public_numeric_ip'], 29445)}?pin={pin}",
         "--shutdown-request-file", str(state / "shutdown.request"),
+        *(("--prune-keep-blocks", str(config["prune_keep_blocks"])) if "prune_keep_blocks" in config else ()),
     ]
 
 

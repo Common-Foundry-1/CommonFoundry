@@ -351,3 +351,90 @@ fn retired_records_are_appended_to_the_archive_and_survive_restart() {
     assert_eq!(state.blocks.len(), 100);
     assert!(state.payout_transactions.is_empty());
 }
+
+#[test]
+fn orphans_a_prune_drops_stay_orphaned() {
+    let root = TestRoot::new("pruned-orphan");
+    let mut node = Node::open_with_profile(root.path().join("node"), crate::DEVNET_PROFILE).unwrap();
+    let miner = node.wallet_destination();
+    let timestamp = |height: u64| crate::DEVNET_GENESIS_TIMESTAMP + height * 60;
+    node.prune_keep_blocks = Some(10);
+    for height in 1..=25 {
+        node.mine_once(miner, timestamp(height), crate::DEFAULT_MINING_ATTEMPTS)
+            .unwrap();
+    }
+
+    // A pool block at height 20 that lost to the active chain.
+    let parent = node.active_block_id_at_height(19).unwrap();
+    let state = crate::rebuild_state_to(
+        &node.log,
+        &node.data_dir.join(crate::BLOCK_LOG_FILE),
+        &node.index,
+        node.params,
+        &node.verifier,
+        parent,
+        None,
+    )
+    .unwrap();
+    let allocation = node.params.monetary_policy.allocation(20, 0).unwrap();
+    let coinbase = cmfd_consensus::Coinbase::new(20, allocation, [9; 32], node.params.rewards);
+    let challenge = BlockChallenge {
+        network_id: node.params.network_id,
+        previous_block: parent,
+        transaction_root: cmfd_consensus::merkle_root(&[coinbase.commitment(node.params.network_id)]),
+        height: 20,
+        timestamp: timestamp(20) + 7,
+        target: state.expected_target().unwrap(),
+    };
+    let proof = node
+        .verifier
+        .mine(&challenge, 0, crate::DEFAULT_MINING_ATTEMPTS)
+        .unwrap();
+    let orphan = cmfd_consensus::Block {
+        version: crate::BLOCK_VERSION,
+        challenge,
+        proof,
+        coinbase,
+        transactions: Vec::new(),
+    };
+    let orphan_id = orphan.block_id();
+    node.submit_block(orphan, timestamp(20) + 7).unwrap();
+    assert!(node.contains_block(orphan_id));
+    assert_eq!(node.active_chain_confirmations(orphan_id), None);
+
+    let ledger = DurableLedger::open(None, [0x41; 32], [0x42; 32]).unwrap();
+    register_session(&ledger, 1, "miner".to_owned(), test_payout_signer().payout()).unwrap();
+    let policy = PoolPplnsPolicy {
+        operator_fee_bps: 300,
+        window_shares: 4,
+    };
+    // A second orphan above the prune point that the node never saw.
+    let unseen = [0xe2; 32];
+    for (block_id, height) in [(orphan_id, 20), (unseen, 70)] {
+        record_accepted_share(&ledger, 1, 1, Some(policy), [0xff; 32]).unwrap();
+        let credit = PoolBlockCredit {
+            block_id,
+            parent,
+            height,
+            miner_reward_atoms: 1_000,
+            share_target: [0xff; 32],
+            block_target: [0x3f; 32],
+        };
+        reserve_pending_pool_block(&ledger, 1, credit, 1, Some(policy)).unwrap();
+        finalize_pending_pool_block(&ledger, block_id, PoolBlockState::Orphaned, 0).unwrap();
+    }
+
+    for height in 26..=80 {
+        node.mine_once(miner, timestamp(height), crate::DEFAULT_MINING_ATTEMPTS)
+            .unwrap();
+    }
+    let report = node.prune_block_log().unwrap().unwrap();
+    assert_eq!(report.anchor_height, 64);
+    assert_eq!(report.dropped_side_blocks, 1);
+    assert!(!node.contains_block(orphan_id));
+
+    reconcile_pool_blocks_for_node(&ledger, &node, false).unwrap();
+    let state = ledger.state.lock().unwrap();
+    assert_eq!(state.blocks[&orphan_id].state, PoolBlockState::Orphaned);
+    assert_eq!(state.blocks[&unseen].state, PoolBlockState::Unknown);
+}

@@ -853,6 +853,12 @@ enum Command {
         /// Absolute create-new request file used by local operator controls for graceful shutdown.
         #[arg(long)]
         shutdown_request_file: Option<PathBuf>,
+        /// Opt-in proof pruning, as for `run`: keep full blocks only for this
+        /// many newest blocks (at least 288). Mining jobs, block maturity and
+        /// payouts only need recent blocks and transactions, which pruned
+        /// blocks keep.
+        #[arg(long)]
+        prune_keep_blocks: Option<u64>,
     },
 }
 
@@ -2005,6 +2011,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             pool_public_url,
             pool_dashboard_bind,
             shutdown_request_file,
+            prune_keep_blocks,
         } => {
             require_pool_mining_profile()?;
             let automatic_payouts = pool_payouts_enabled(
@@ -2045,6 +2052,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 exchange_withdrawal_security.as_ref(),
             )?;
             node_instance.set_public_peer_mode(allow_public_peers);
+            node_instance.configure_pruning(prune_keep_blocks)?;
+            if prune_keep_blocks.is_some()
+                && let Some(report) = node_instance.prune_block_log()?
+            {
+                eprintln!("{}", serde_json::to_string(&prune_report_json(&report))?);
+            }
             let discovery_hello = node_instance.peer_hello();
             let miner_destination = match miner.as_deref() {
                 Some(value) => parse_miner_destination(value)?,
@@ -2056,6 +2069,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let private_key_der = std::fs::read(&private_key)?;
             let pin = certificate_sha256(&certificate_der);
             let node = Arc::new(Mutex::new(node_instance));
+            // The startup prune above already ran; the next check is one
+            // interval later.
+            let pruner = prune_keep_blocks
+                .map(|_| {
+                    cmfd_node::spawn_pruner(Arc::clone(&node), cmfd_node::PRUNE_CHECK_INTERVAL)
+                })
+                .transpose()?;
             let limits = PeerLimits::default();
             let p2p_socket = TcpListener::bind(p2p_bind)?;
             let p2p_address = p2p_socket.local_addr()?;
@@ -2151,6 +2171,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "used_insecure_default_miner": used_insecure_default_miner,
                     "public_peer_mode": allow_public_peers,
                     "p2p_warning": peer_warning(allow_public_peers),
+                    "prune_keep_blocks": prune_keep_blocks,
                     "accounting": cmfd_node::pool::POOL_ACCOUNTING_SEMANTICS
                 }))?
             );
@@ -2189,6 +2210,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None => Ok(()),
             };
             let inbound_result = inbound.stop();
+            if let Some(pruner) = pruner {
+                pruner.stop();
+            }
             dashboard_result?;
             pool_result?;
             poll_result?;
@@ -3284,6 +3308,7 @@ mod tests {
             pool_dashboard_bind,
             pool_operator_fee_bps,
             pool_pplns_window_shares,
+            prune_keep_blocks,
             ..
         } = cli.command
         else {
@@ -3294,6 +3319,26 @@ mod tests {
         assert_eq!(pool_dashboard_bind, DEFAULT_POOL_DASHBOARD_ADDRESS);
         assert_eq!(pool_operator_fee_bps, 300);
         assert_eq!(pool_pplns_window_shares, 0);
+        assert_eq!(prune_keep_blocks, None);
+
+        let cli = Cli::try_parse_from([
+            "cmfd-node",
+            "pool-serve",
+            "--certificate",
+            "certificate.der",
+            "--private-key",
+            "private-key.der",
+            "--prune-keep-blocks",
+            "720",
+        ])
+        .unwrap();
+        let Command::PoolServe {
+            prune_keep_blocks, ..
+        } = cli.command
+        else {
+            unreachable!()
+        };
+        assert_eq!(prune_keep_blocks, Some(720));
     }
 
     #[test]

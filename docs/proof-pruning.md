@@ -61,6 +61,15 @@ its first chain state when it first starts with pruning on, so its first
 prune comes after it has seen about 720 more blocks; that can be spread over
 several sessions, because saved states are kept on disk.
 
+## Pools
+
+`pool-serve` takes the same `--prune-keep-blocks` option; the Linux pool
+service sets it from the optional `prune_keep_blocks` field in `pool.json`.
+Mining jobs build on the tip, block rewards mature after 100 blocks and
+payouts only check transactions, so all of them work on a pruned node. A pool
+block that lost to another block and sits at or below the prune height stays
+`orphaned` in the pool ledger after the prune drops it.
+
 ## When pruning runs
 
 The node prunes at startup and then checks every 10 minutes while it runs.

@@ -157,6 +157,23 @@ class MainnetPoolServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(pool.PreflightError, "unexpected fields"):
             self.preflight()
 
+    def test_optional_prune_window_becomes_prune_keep_blocks(self):
+        config, _, _ = self.preflight()
+        with mock.patch.object(pool, "CONFIG_BASE", self.config_base):
+            command = pool.build_command(self.root, self.state, self.credential_base, config)
+        self.assertNotIn("--prune-keep-blocks", command)
+        self.config["prune_keep_blocks"] = 720
+        self.save_config()
+        config, _, _ = self.preflight()
+        with mock.patch.object(pool, "CONFIG_BASE", self.config_base):
+            command = pool.build_command(self.root, self.state, self.credential_base, config)
+        self.assertEqual(command[command.index("--prune-keep-blocks") + 1], "720")
+        for bad in (287, 0, -1, "720", 720.0, True, None, 2**32 + 1):
+            self.config["prune_keep_blocks"] = bad
+            self.save_config()
+            with self.assertRaisesRegex(pool.PreflightError, "prune_keep_blocks"):
+                self.preflight()
+
     def test_placeholder_or_legacy_payout_config_fails_closed(self):
         self.config["operator_fee_bps"] = "SET_APPROVED_MAINNET_VALUE"
         self.save_config()

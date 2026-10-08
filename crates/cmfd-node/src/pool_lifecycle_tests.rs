@@ -274,3 +274,61 @@ fn pplns_reference_chain_maturity_payout_and_restart_are_exactly_once() {
     assert_eq!(recovered.payouts[0].available_payout_atoms, 0);
     server.stop().unwrap();
 }
+
+#[test]
+fn payouts_wait_for_a_node_behind_the_ledger() {
+    let root = TestRoot::new("payouts-behind-ledger");
+    let node = Arc::new(Mutex::new(
+        Node::open_with_profile(root.path().join("node"), crate::DEVNET_PROFILE).unwrap(),
+    ));
+    let pool_wallet = node.lock().unwrap().wallet_destination();
+    let now = unix_time_seconds().unwrap();
+    for offset in 0..=COINBASE_MATURITY {
+        node.lock()
+            .unwrap()
+            .mine_once(pool_wallet, now + offset, 10_000)
+            .unwrap();
+    }
+    let tip = node.lock().unwrap().state.next_height() - 1;
+    let (certificate, key, _) = certificate(&root);
+    let mut config = PoolServerConfig::devnet(
+        "127.0.0.1:0".parse().unwrap(),
+        fs::read(certificate).unwrap(),
+        fs::read(key).unwrap(),
+        pool_wallet,
+    );
+    config.ledger_directory = Some(root.path().join("ledger"));
+    config.payout_policy = Some(PoolPayoutPolicy {
+        minimum_payout_atoms: 100,
+        fee_atoms: 1,
+    });
+    let server = spawn_pool_server(Arc::clone(&node), config).unwrap();
+    // A ledger that last reconciled against a longer chain than this node has.
+    server
+        .shared
+        .ledger
+        .transaction(|ledger| {
+            ledger.observed_chain_height = tip + 50;
+            Ok(())
+        })
+        .unwrap();
+    let generation = server.shared.ledger.state.lock().unwrap().generation;
+    reconcile_pool_payouts(&server.shared, true).unwrap();
+    {
+        let state = server.shared.ledger.state.lock().unwrap();
+        assert_eq!(state.generation, generation, "no payout work while the node is behind");
+        assert!(state.payout_protection.is_empty());
+    }
+    // At or past the ledger's height, payouts reconcile normally again.
+    server
+        .shared
+        .ledger
+        .transaction(|ledger| {
+            ledger.observed_chain_height = tip;
+            Ok(())
+        })
+        .unwrap();
+    reconcile_pool_payouts(&server.shared, true).unwrap();
+    assert!(server.shared.ledger.state.lock().unwrap().payout_protection.is_empty());
+    server.stop().unwrap();
+}

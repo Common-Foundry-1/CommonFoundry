@@ -447,6 +447,9 @@ pub(super) fn refresh_payment_states(
     };
     if !updates.is_empty() || !hazards.is_empty() {
         ledger.transaction(|state| {
+            state.observed_chain_height = state
+                .observed_chain_height
+                .max(node.state.next_height().saturating_sub(1));
             for (id, status, confirmations) in updates {
                 let record = state.payout_transactions.get_mut(&id).unwrap();
                 record.state = status;

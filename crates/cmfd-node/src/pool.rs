@@ -988,6 +988,9 @@ struct Ledger {
     earning_history_started_at_unix_seconds: u64,
     earning_events: VecDeque<EarningRecord>,
     payout_protection: payout_protection::ProtectionState,
+    /// Chain height the ledger last reconciled against. A node below it is
+    /// still catching up, not reporting a reorganization.
+    observed_chain_height: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1237,6 +1240,8 @@ struct StoredLedgerPayloadV1 {
     earning_history_started_at_unix_seconds: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     earning_events: Vec<EarningRecord>,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    observed_chain_height: u64,
     #[serde(
         default,
         skip_serializing_if = "payout_protection::ProtectionState::is_empty"
@@ -1885,6 +1890,7 @@ impl LedgerStore {
         }
         let payload = StoredLedgerPayloadV1 {
             guard_version: 0,
+            observed_chain_height: 0,
             accepted_shares: stored.payload.accepted_shares,
             rejected_shares: stored.payload.rejected_shares,
             stale_shares: 0,
@@ -1966,6 +1972,7 @@ fn ledger_payload(ledger: &Ledger) -> StoredLedgerPayloadV1 {
         archived_orphaned_blocks: ledger.archived_orphaned_blocks,
         archived_operator_fee_atoms: ledger.archived_operator_fee_atoms,
         earning_history_started_at_unix_seconds: ledger.earning_history_started_at_unix_seconds,
+        observed_chain_height: ledger.observed_chain_height,
         earning_events: ledger.earning_events.iter().cloned().collect(),
         payout_protection: ledger.payout_protection.clone(),
     }
@@ -2039,6 +2046,7 @@ fn ledger_from_payload(
         earning_history_started_at_unix_seconds: payload.earning_history_started_at_unix_seconds,
         earning_events: payload.earning_events.into(),
         payout_protection: payload.payout_protection,
+        observed_chain_height: payload.observed_chain_height,
     };
     validate_ledger(&ledger)?;
     Ok(ledger)
@@ -4288,19 +4296,39 @@ fn reconcile_pool_blocks_with_recovery(
     reconcile_pool_blocks_for_node(&shared.ledger, &node, recover_missing_pending)
 }
 
+/// The node's tip and the chain height the ledger last reconciled against,
+/// when the node is still below it: after a restart or a fresh sync the node
+/// reports fewer confirmations than the ledger has already seen, which is not
+/// a reorganization. Reconciliation and payouts wait until it has caught up.
+fn node_behind_ledger(ledger: &Ledger, node: &Node) -> Option<(u64, u64)> {
+    let tip = node.state.next_height().saturating_sub(1);
+    (tip < ledger.observed_chain_height).then_some((tip, ledger.observed_chain_height))
+}
+
 fn reconcile_pool_blocks_for_node(
     ledger: &DurableLedger,
     node: &Node,
     recover_missing_pending: bool,
 ) -> Result<(), PoolError> {
-    let blocks = ledger
-        .state
-        .lock()
-        .map_err(|_| PoolError::SharedStatePoisoned)?
-        .blocks
-        .iter()
-        .map(|(block_id, record)| (*block_id, record.height))
-        .collect::<Vec<_>>();
+    let blocks = {
+        let state = ledger
+            .state
+            .lock()
+            .map_err(|_| PoolError::SharedStatePoisoned)?;
+        if let Some((tip, seen)) = node_behind_ledger(&state, node) {
+            tracing::warn!(
+                node_height = tip,
+                ledger_height = seen,
+                "pool reconciliation deferred until the node catches up with the chain the ledger last saw"
+            );
+            return Ok(());
+        }
+        state
+            .blocks
+            .iter()
+            .map(|(block_id, record)| (*block_id, record.height))
+            .collect::<Vec<_>>()
+    };
     if blocks.is_empty() {
         return Ok(());
     }
@@ -4364,6 +4392,7 @@ fn reconcile_pool_blocks_for_node(
     // interruption can only leave a record in both places, never in neither.
     ledger.archive(&retired)?;
     ledger.transaction(|ledger| {
+        ledger.observed_chain_height = ledger.observed_chain_height.max(chain_height);
         for (block_id, state, confirmations) in updates {
             let record = *ledger.blocks.get(&block_id).ok_or_else(|| {
                 PoolError::LedgerCorrupt("pool block disappeared during reconciliation".to_owned())
@@ -4558,6 +4587,21 @@ fn reconcile_pool_payouts(shared: &SharedServer, create_new: bool) -> Result<(),
         .node
         .lock()
         .map_err(|_| PoolError::SharedStatePoisoned)?;
+    {
+        let state = shared
+            .ledger
+            .state
+            .lock()
+            .map_err(|_| PoolError::SharedStatePoisoned)?;
+        if let Some((tip, seen)) = node_behind_ledger(&state, &node) {
+            tracing::warn!(
+                node_height = tip,
+                ledger_height = seen,
+                "pool payouts deferred until the node catches up with the chain the ledger last saw"
+            );
+            return Ok(());
+        }
+    }
     reconcile_pool_blocks_for_node(&shared.ledger, &node, true)?;
     payout_protection::refresh_payment_states(&shared.ledger, &mut node)?;
     payout_protection::check_funding(&shared.ledger, &node, policy.fee_atoms)?;
@@ -7320,6 +7364,84 @@ mod tests {
             classify_pool_block(None, false, None, 1_000, 1_001),
             (PoolBlockState::Unknown, 0)
         );
+    }
+
+    #[test]
+    fn reconciliation_waits_for_a_node_behind_the_ledger() {
+        let root = TestRoot::new("behind-ledger");
+        let mut node =
+            Node::open_with_profile(root.path().join("node"), crate::DEVNET_PROFILE).unwrap();
+        let miner = node.wallet_destination();
+        let timestamp = |height: u64| crate::DEVNET_GENESIS_TIMESTAMP + height * 60;
+        for height in 1..=10 {
+            node.mine_once(miner, timestamp(height), crate::DEFAULT_MINING_ATTEMPTS)
+                .unwrap();
+        }
+        let block_id = node.active_block_id_at_height(5).unwrap();
+        let parent = node.active_block_id_at_height(4).unwrap();
+        let ledger = DurableLedger::open(None, [0x41; 32], [0x42; 32]).unwrap();
+        register_session(
+            &ledger,
+            1,
+            "miner".to_owned(),
+            test_payout_signer().payout(),
+        )
+        .unwrap();
+        let policy = PoolPplnsPolicy {
+            operator_fee_bps: 300,
+            window_shares: 4,
+        };
+        record_accepted_share(&ledger, 1, 1, Some(policy), [0xff; 32]).unwrap();
+        reserve_pending_pool_block(
+            &ledger,
+            1,
+            PoolBlockCredit {
+                block_id,
+                parent,
+                height: 5,
+                miner_reward_atoms: 1_000,
+                share_target: [0xff; 32],
+                block_target: [0x3f; 32],
+            },
+            1,
+            Some(policy),
+        )
+        .unwrap();
+        // The ledger last saw this block with 15 confirmations from a node at
+        // height 20; this node has only reached height 10 so far.
+        finalize_pending_pool_block(&ledger, block_id, PoolBlockState::Canonical, 15).unwrap();
+        ledger
+            .transaction(|ledger| {
+                ledger.observed_chain_height = 20;
+                Ok(())
+            })
+            .unwrap();
+        let generation = ledger.state.lock().unwrap().generation;
+        reconcile_pool_blocks_for_node(&ledger, &node, true).unwrap();
+        {
+            let state = ledger.state.lock().unwrap();
+            assert_eq!(
+                state.generation, generation,
+                "nothing is written while behind"
+            );
+            assert_eq!(state.blocks[&block_id].confirmations, 15);
+            assert!(state.payout_protection.is_empty());
+            assert_eq!(state.observed_chain_height, 20);
+        }
+        // Once the node passes the ledger's height, reconciliation resumes and
+        // records how far it has now seen.
+        for height in 11..=21 {
+            node.mine_once(miner, timestamp(height), crate::DEFAULT_MINING_ATTEMPTS)
+                .unwrap();
+        }
+        reconcile_pool_blocks_for_node(&ledger, &node, true).unwrap();
+        let state = ledger.state.lock().unwrap();
+        assert_eq!(
+            state.blocks[&block_id].confirmations,
+            node.active_chain_confirmations(block_id).unwrap()
+        );
+        assert_eq!(state.observed_chain_height, 21);
+        assert!(state.payout_protection.is_empty());
     }
 
     #[test]

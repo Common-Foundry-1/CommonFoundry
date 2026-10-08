@@ -33,6 +33,11 @@ wallet. It does not approve an actual ledger adjustment or money movement.
 
 - A distributed PPLNS reward that becomes orphaned, unknown, or falls below
   coinbase maturity creates a durable incident for its frozen recipients.
+- Reconciliation, incidents and automatic payouts wait while the node is below
+  the chain height the ledger last reconciled against, as after a restart on a
+  node that is still catching up. Fewer confirmations from a node that is
+  merely behind are not treated as a reorganization; the pool logs the two
+  heights and resumes once the node reaches the ledger's height.
 - A pool block the node no longer holds is `unknown` while the chain could
   still change at its height. Once it is at or below the prune point, or six
   coinbase maturities deep, it is treated as orphaned and retires to the

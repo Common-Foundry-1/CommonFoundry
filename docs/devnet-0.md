@@ -313,6 +313,20 @@ Operators can tune the verifier admission bounds with
 `--pool-max-concurrent-share-verifications` and
 `--pool-max-queued-share-verifications` without changing consensus.
 
+A ProductionV4 pool can also check shares in GPU batches. By default each
+share is replayed on its own. With `--pool-share-batch-size N` (2 to 64), a
+batch thread collects shares and replays up to N of them in one call to the
+persistent replay worker. A batch runs once N shares are waiting, or once its
+oldest share has waited `--pool-share-batch-wait-ms` (default 100, at most
+1000). Each share still gets its own exact work digest, and a share that meets
+the chain target is replayed in full and proved exactly as before. While
+batching is on, up to N plus `--pool-max-queued-share-verifications` shares
+may wait; beyond that the pool answers `share_verifier_busy`. Batching is
+local to the pool: miners, the protocol and consensus are unchanged. Measure
+on your verifier GPU before relying on it: with the current replay worker a
+batch of 2 checked shares about 1.9 times as fast on an RTX 4090 but gave no
+gain on an RTX 5070 Ti, and larger batches were slower on both.
+
 The pool ledger is written as one JSON snapshot, and the node refuses to load
 or write a snapshot above `--pool-ledger-max-bytes` (default 64 MiB) so a
 corrupt or runaway file cannot exhaust memory. A pool with thousands of

@@ -53,10 +53,16 @@ CONFIG_FIELDS = {"schema", "public_numeric_ip", "private_bind_ip", "mainnet_seed
 # Optional: proof pruning window (newest full blocks kept), as `--prune-keep-blocks`.
 # Optional: largest pool ledger snapshot in bytes, as `--pool-ledger-max-bytes`
 # (node default 64 MiB; large pools outgrow it).
-OPTIONAL_FIELDS = {"mainnet_relays", "prune_keep_blocks", "pool_ledger_max_bytes"}
+# Optional: shares replayed together in one GPU batch, as `--pool-share-batch-size`
+# (node default 1 = no batching), and the longest a share waits for its batch,
+# as `--pool-share-batch-wait-ms` (node default 100).
+OPTIONAL_FIELDS = {"mainnet_relays", "prune_keep_blocks", "pool_ledger_max_bytes",
+                   "share_batch_size", "share_batch_wait_ms"}
 MIN_PRUNE_KEEP_BLOCKS = 288
 MIN_POOL_LEDGER_MAX_BYTES = 1024 * 1024
 MAX_POOL_LEDGER_MAX_BYTES = 1024 * 1024 * 1024
+MAX_SHARE_BATCH_SIZE = 64
+MAX_SHARE_BATCH_WAIT_MS = 1000
 MAX_RELAYS = 8
 COMPETING_UNITS = (
     "commonfoundry-pool-public.service", "commonfoundry-pool-ai01.service",
@@ -194,6 +200,10 @@ def validate_config(config: dict) -> dict:
             or not MIN_POOL_LEDGER_MAX_BYTES <= config["pool_ledger_max_bytes"] <= MAX_POOL_LEDGER_MAX_BYTES):
         raise PreflightError(f"pool_ledger_max_bytes must be an integer from {MIN_POOL_LEDGER_MAX_BYTES} "
                              f"to {MAX_POOL_LEDGER_MAX_BYTES}")
+    for field, maximum in (("share_batch_size", MAX_SHARE_BATCH_SIZE),
+                           ("share_batch_wait_ms", MAX_SHARE_BATCH_WAIT_MS)):
+        if field in config and (type(config[field]) is not int or not 1 <= config[field] <= maximum):
+            raise PreflightError(f"{field} must be an integer from 1 to {maximum}")
     for fresh, old in (("expected_tls_certificate_sha256", "forbidden_rc_certificate_sha256"),
                        ("expected_tls_private_key_sha256", "forbidden_rc_private_key_sha256")):
         if config[fresh] == config[old]:
@@ -409,6 +419,10 @@ def build_command(root: Path, state: Path, credential_base: Path, config: dict) 
         *(("--prune-keep-blocks", str(config["prune_keep_blocks"])) if "prune_keep_blocks" in config else ()),
         *(("--pool-ledger-max-bytes", str(config["pool_ledger_max_bytes"]))
           if "pool_ledger_max_bytes" in config else ()),
+        *(("--pool-share-batch-size", str(config["share_batch_size"]))
+          if "share_batch_size" in config else ()),
+        *(("--pool-share-batch-wait-ms", str(config["share_batch_wait_ms"]))
+          if "share_batch_wait_ms" in config else ()),
     ]
 
 

@@ -68,6 +68,14 @@ pub const POOL_MIN_LEDGER_MAX_BYTES: usize = 1024 * 1024;
 /// both as the ledger and as its serialized bytes while it persists.
 pub const POOL_MAX_LEDGER_MAX_BYTES: usize = 1024 * 1024 * 1024;
 pub const DEFAULT_POOL_QUEUED_SHARE_VERIFICATIONS: usize = 8;
+/// Shares checked per replay-worker call (`--pool-share-batch-size`). One keeps
+/// the original path: each share is replayed on its own, with no batch queue.
+pub const DEFAULT_POOL_SHARE_BATCH_SIZE: usize = 1;
+/// Largest batch the persistent replay worker accepts (`RUNBATCH`).
+pub const POOL_MAX_SHARE_BATCH_SIZE: usize = 64;
+/// Longest a queued share waits for others to join its batch.
+pub const DEFAULT_POOL_SHARE_BATCH_WAIT_MS: u64 = 100;
+pub const POOL_MAX_SHARE_BATCH_WAIT_MS: u64 = 1_000;
 pub const POOL_MAX_MESSAGES_PER_SESSION: u64 = 1_000_000;
 pub const POOL_MAX_SHARES_PER_JOB: usize = 65_536;
 pub const POOL_MAX_LEDGER_SESSIONS: usize = 1_024;
@@ -92,6 +100,8 @@ const POOL_SHARE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
 const POOL_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const POOL_ACCEPT_POLL: Duration = Duration::from_millis(25);
 const POOL_SHARE_VERIFICATION_WAIT: Duration = Duration::from_secs(5);
+/// How often batch waits re-check the stop flag.
+const POOL_SHARE_BATCH_POLL: Duration = Duration::from_millis(200);
 const POOL_SHARE_RATE_BURST: u32 = 8;
 const POOL_SHARE_RATE_INTERVAL: Duration = Duration::from_millis(250);
 const POOL_SOURCE_FAILURE_LIMIT: u32 = 4;
@@ -162,6 +172,12 @@ pub enum PoolError {
     InvalidShareVerificationLimit,
     #[error("pool queued share-verification limit exceeds {POOL_MAX_QUEUED_SHARE_VERIFICATIONS}")]
     InvalidShareVerificationQueueLimit,
+    #[error("pool share batch size must be between 1 and {POOL_MAX_SHARE_BATCH_SIZE}")]
+    InvalidShareBatchSize,
+    #[error("pool share batch wait must be between 1 and {POOL_MAX_SHARE_BATCH_WAIT_MS} ms")]
+    InvalidShareBatchWait,
+    #[error("pool share batching requires the ProductionV4 share verifier")]
+    ShareBatchingUnsupported,
     #[error("pool payout policy requires nonzero minimum and fee amounts")]
     InvalidPayoutPolicy,
     #[error("automatic pool payouts require a durable ledger directory")]
@@ -261,6 +277,10 @@ pub struct PoolServerConfig {
     pub max_connections_per_source: usize,
     pub max_concurrent_share_verifications: usize,
     pub max_queued_share_verifications: usize,
+    /// Shares replayed together; one disables batching.
+    pub share_batch_size: usize,
+    /// Longest a share waits for its batch to fill.
+    pub share_batch_wait: Duration,
     pub ledger_directory: Option<PathBuf>,
     /// Largest ledger snapshot the pool loads or writes, in bytes.
     pub ledger_max_bytes: usize,
@@ -289,6 +309,8 @@ impl PoolServerConfig {
             max_connections_per_source: DEFAULT_POOL_CONNECTIONS_PER_SOURCE,
             max_concurrent_share_verifications: DEFAULT_POOL_CONCURRENT_SHARE_VERIFICATIONS,
             max_queued_share_verifications: DEFAULT_POOL_QUEUED_SHARE_VERIFICATIONS,
+            share_batch_size: DEFAULT_POOL_SHARE_BATCH_SIZE,
+            share_batch_wait: Duration::from_millis(DEFAULT_POOL_SHARE_BATCH_WAIT_MS),
             ledger_directory: None,
             ledger_max_bytes: DEFAULT_POOL_LEDGER_MAX_BYTES,
             payout_policy: None,
@@ -356,6 +378,27 @@ pub trait ProductionV4PoolShareVerifier: fmt::Debug + Send + Sync {
         nonce: u64,
         share_target: [u8; 32],
     ) -> Result<ProductionV4PoolShareEvaluation, PoolError>;
+
+    /// Evaluates several shares and returns one result per share, in order.
+    /// Implementations may replay them together; the default checks them one
+    /// at a time with [`Self::evaluate`].
+    fn evaluate_batch(
+        &self,
+        shares: &[ProductionV4PoolShareRequest<'_>],
+    ) -> Vec<Result<ProductionV4PoolShareEvaluation, PoolError>> {
+        shares
+            .iter()
+            .map(|share| self.evaluate(share.template, share.nonce, share.share_target))
+            .collect()
+    }
+}
+
+/// One share handed to [`ProductionV4PoolShareVerifier::evaluate_batch`].
+#[derive(Debug, Clone, Copy)]
+pub struct ProductionV4PoolShareRequest<'a> {
+    pub template: &'a crate::BlockTemplate,
+    pub nonce: u64,
+    pub share_target: [u8; 32],
 }
 
 #[derive(Debug, Clone)]
@@ -2464,6 +2507,147 @@ impl Drop for ShareVerificationPermit<'_> {
     }
 }
 
+/// Collects shares from session threads so one replay-worker call can check
+/// several (`--pool-share-batch-size`). A batch runs as soon as it is full or
+/// its oldest share has waited `max_wait`. Only built when batching is on.
+struct ShareBatcher<P> {
+    queue: Mutex<VecDeque<BatchedShare<P>>>,
+    ready: Condvar,
+    batch_size: usize,
+    max_wait: Duration,
+    capacity: usize,
+}
+
+struct BatchedShare<P> {
+    payload: P,
+    nonce: u64,
+    queued_at: Instant,
+    reply: std::sync::mpsc::SyncSender<Result<ProductionV4PoolShareEvaluation, PoolError>>,
+}
+
+impl<P> ShareBatcher<P> {
+    /// `max_queued` shares may wait beyond the batch being collected.
+    fn new(batch_size: usize, max_wait: Duration, max_queued: usize) -> Self {
+        Self {
+            queue: Mutex::new(VecDeque::new()),
+            ready: Condvar::new(),
+            batch_size,
+            max_wait,
+            capacity: batch_size.saturating_add(max_queued),
+        }
+    }
+
+    /// Queues one share and waits for its result. `None` means the queue is
+    /// full or the pool is stopping, which the caller reports as busy.
+    fn submit(
+        &self,
+        stop: &AtomicBool,
+        payload: P,
+        nonce: u64,
+    ) -> Result<Option<ProductionV4PoolShareEvaluation>, PoolError> {
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
+        {
+            let mut queue = self
+                .queue
+                .lock()
+                .map_err(|_| PoolError::SharedStatePoisoned)?;
+            if stop.load(Ordering::Acquire) || queue.len() >= self.capacity {
+                return Ok(None);
+            }
+            queue.push_back(BatchedShare {
+                payload,
+                nonce,
+                queued_at: Instant::now(),
+                reply,
+            });
+        }
+        self.ready.notify_all();
+        loop {
+            match result.recv_timeout(POOL_SHARE_BATCH_POLL) {
+                Ok(evaluation) => return evaluation.map(Some),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if stop.load(Ordering::Acquire) {
+                        return Ok(None);
+                    }
+                }
+                // The batch thread dropped the share because the pool is stopping.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(None),
+            }
+        }
+    }
+
+    /// Waits for the next batch. `None` once the pool stops; queued shares
+    /// are then dropped and their submitters see busy.
+    fn next_batch(&self, stop: &AtomicBool) -> Result<Option<Vec<BatchedShare<P>>>, PoolError> {
+        let mut queue = self
+            .queue
+            .lock()
+            .map_err(|_| PoolError::SharedStatePoisoned)?;
+        loop {
+            if stop.load(Ordering::Acquire) {
+                queue.clear();
+                return Ok(None);
+            }
+            let wait = match queue.front() {
+                None => POOL_SHARE_BATCH_POLL,
+                Some(oldest) => {
+                    let deadline = checked_pool_deadline(oldest.queued_at, self.max_wait)?;
+                    let now = Instant::now();
+                    if queue.len() >= self.batch_size || now >= deadline {
+                        let count = queue.len().min(self.batch_size);
+                        return Ok(Some(queue.drain(..count).collect()));
+                    }
+                    deadline
+                        .saturating_duration_since(now)
+                        .min(POOL_SHARE_BATCH_POLL)
+                }
+            };
+            queue = self
+                .ready
+                .wait_timeout(queue, wait)
+                .map_err(|_| PoolError::SharedStatePoisoned)?
+                .0;
+        }
+    }
+
+    /// Checks batches until the pool stops. A panic or a wrong result count
+    /// fails only that batch's shares, never the batch thread.
+    fn run(
+        &self,
+        stop: &AtomicBool,
+        evaluate: impl Fn(&[BatchedShare<P>]) -> Vec<Result<ProductionV4PoolShareEvaluation, PoolError>>,
+    ) -> Result<(), PoolError> {
+        while let Some(batch) = self.next_batch(stop)? {
+            let results =
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| evaluate(&batch))) {
+                    Ok(results) if results.len() == batch.len() => results,
+                    Ok(_) => batch_failure(
+                        batch.len(),
+                        "share batch returned the wrong number of results",
+                    ),
+                    Err(_) => batch_failure(batch.len(), "share batch evaluation panicked"),
+                };
+            for (share, result) in batch.into_iter().zip(results) {
+                let _ = share.reply.send(result);
+            }
+        }
+        Ok(())
+    }
+
+    fn wake(&self) {
+        self.ready.notify_all();
+    }
+}
+
+fn batch_failure(
+    count: usize,
+    message: &str,
+) -> Vec<Result<ProductionV4PoolShareEvaluation, PoolError>> {
+    (0..count)
+        .map(|_| Err(PoolError::ProductionV4Replay(message.to_owned())))
+        .collect()
+}
+
 struct ShareRateLimiter {
     available: u32,
     last_refill: Instant,
@@ -2507,6 +2691,8 @@ struct SharedServer {
     rejected_share_reasons: Mutex<HashMap<u64, RejectedShareReasons>>,
     source_admission: PoolSourceAdmission,
     share_verification: ShareVerificationGate,
+    /// Present only with `--pool-share-batch-size` above one.
+    share_batcher: Option<ShareBatcher<Arc<ActiveJob>>>,
     next_connection_id: AtomicU64,
     next_session_id: AtomicU64,
     network_id: [u8; 32],
@@ -2550,6 +2736,7 @@ pub struct PoolServerHandle {
     address: SocketAddr,
     shared: Arc<SharedServer>,
     thread: Option<JoinHandle<Result<(), PoolError>>>,
+    share_batch_thread: Option<JoinHandle<Result<(), PoolError>>>,
 }
 
 #[derive(Clone)]
@@ -2905,13 +3092,21 @@ impl PoolServerHandle {
 
     fn stop_inner(&mut self) -> Result<(), PoolError> {
         self.shared.stop.store(true, Ordering::Release);
+        if let Some(batcher) = &self.shared.share_batcher {
+            batcher.wake();
+        }
         let socket_result = shutdown_active_connections(&self.shared);
         let thread_result = match self.thread.take() {
             Some(thread) => thread.join().map_err(|_| PoolError::ThreadPanicked)?,
             None => Ok(()),
         };
+        let batch_result = match self.share_batch_thread.take() {
+            Some(thread) => thread.join().map_err(|_| PoolError::ThreadPanicked)?,
+            None => Ok(()),
+        };
         socket_result?;
-        thread_result
+        thread_result?;
+        batch_result
     }
 }
 
@@ -2919,6 +3114,19 @@ impl Drop for PoolServerHandle {
     fn drop(&mut self) {
         let _ = self.stop_inner();
     }
+}
+
+/// Reject `--pool-share-batch-size` / `--pool-share-batch-wait-ms` values
+/// outside the supported range.
+pub fn validate_share_batching(batch_size: usize, wait: Duration) -> Result<(), PoolError> {
+    if !(1..=POOL_MAX_SHARE_BATCH_SIZE).contains(&batch_size) {
+        return Err(PoolError::InvalidShareBatchSize);
+    }
+    if wait < Duration::from_millis(1) || wait > Duration::from_millis(POOL_MAX_SHARE_BATCH_WAIT_MS)
+    {
+        return Err(PoolError::InvalidShareBatchWait);
+    }
+    Ok(())
 }
 
 /// Reject a `--pool-ledger-max-bytes` value outside the supported range.
@@ -2954,6 +3162,10 @@ pub fn spawn_pool_server(
     }
     if config.max_queued_share_verifications > POOL_MAX_QUEUED_SHARE_VERIFICATIONS {
         return Err(PoolError::InvalidShareVerificationQueueLimit);
+    }
+    validate_share_batching(config.share_batch_size, config.share_batch_wait)?;
+    if config.share_batch_size > 1 && config.production_v4_share_verifier.is_none() {
+        return Err(PoolError::ShareBatchingUnsupported);
     }
     validate_ledger_size_limit(config.ledger_max_bytes)?;
     if let Some(policy) = config.payout_policy {
@@ -3045,6 +3257,13 @@ pub fn spawn_pool_server(
             config.max_concurrent_share_verifications,
             config.max_queued_share_verifications,
         ),
+        share_batcher: (config.share_batch_size > 1).then(|| {
+            ShareBatcher::new(
+                config.share_batch_size,
+                config.share_batch_wait,
+                config.max_queued_share_verifications,
+            )
+        }),
         next_connection_id: AtomicU64::new(0),
         next_session_id: AtomicU64::new(next_session_id),
         network_id,
@@ -3064,6 +3283,17 @@ pub fn spawn_pool_server(
     });
     reconcile_pool_blocks_with_recovery(&shared, true)?;
     reconcile_pool_payouts(&shared, true)?;
+    let share_batch_thread = match &shared.share_batcher {
+        Some(_) => {
+            let runtime = Arc::clone(&shared);
+            Some(
+                thread::Builder::new()
+                    .name("cmfd-pool-share-batch".to_owned())
+                    .spawn(move || run_share_batches(&runtime))?,
+            )
+        }
+        None => None,
+    };
     let runtime = Arc::clone(&shared);
     let thread = thread::Builder::new()
         .name("cmfd-pool-listener".to_owned())
@@ -3072,6 +3302,35 @@ pub fn spawn_pool_server(
         address,
         shared,
         thread: Some(thread),
+        share_batch_thread,
+    })
+}
+
+/// The batch thread: replays queued shares together on the pool's verifier.
+fn run_share_batches(shared: &SharedServer) -> Result<(), PoolError> {
+    let (Some(batcher), Some(verifier)) = (
+        &shared.share_batcher,
+        shared.production_v4_share_verifier.as_deref(),
+    ) else {
+        return Ok(());
+    };
+    batcher.run(&shared.stop, |batch| {
+        let requests = batch
+            .iter()
+            .map(|share| ProductionV4PoolShareRequest {
+                template: &share.payload.mining.template,
+                nonce: share.nonce,
+                share_target: share.payload.wire.share_target,
+            })
+            .collect::<Vec<_>>();
+        let started = Instant::now();
+        let results = verifier.evaluate_batch(&requests);
+        tracing::debug!(
+            shares = batch.len(),
+            seconds = started.elapsed().as_secs_f64(),
+            "pool share batch checked"
+        );
+        results
     })
 }
 
@@ -3533,11 +3792,21 @@ fn process_share(
     if job_id != active.wire.job_id {
         return rejected_result(shared, session_id, job_id, nonce, "stale_job");
     }
-    let Some(_verification_permit) = shared.share_verification.acquire(&shared.stop)? else {
-        return retryable_result(shared, session_id, job_id, nonce, "share_verifier_busy");
+    let evaluation = match &shared.share_batcher {
+        Some(batcher) => {
+            let Some(evaluation) = batcher.submit(&shared.stop, Arc::clone(&active), nonce)? else {
+                return retryable_result(shared, session_id, job_id, nonce, "share_verifier_busy");
+            };
+            verified_production_v4_share(&active.mining.template, evaluation)?
+        }
+        None => {
+            let Some(_verification_permit) = shared.share_verification.acquire(&shared.stop)?
+            else {
+                return retryable_result(shared, session_id, job_id, nonce, "share_verifier_busy");
+            };
+            evaluate_pool_share(shared, &active, nonce)?
+        }
     };
-    let evaluation = evaluate_pool_share(shared, &active, nonce)?;
-    drop(_verification_permit);
     if evaluation.work_digest > active.wire.share_target {
         return rejected_result(shared, session_id, job_id, nonce, "low_difficulty_share");
     }
@@ -5395,6 +5664,15 @@ fn evaluate_production_v4_pool_share(
 ) -> Result<VerifiedPoolShare, PoolError> {
     let verifier = verifier.ok_or(PoolError::ProductionV4Unsupported)?;
     let evaluation = verifier.evaluate(template, nonce, share_target)?;
+    verified_production_v4_share(template, evaluation)
+}
+
+/// Accepts a verifier's result only when its proof matches whether the share
+/// meets the chain target.
+fn verified_production_v4_share(
+    template: &crate::BlockTemplate,
+    evaluation: ProductionV4PoolShareEvaluation,
+) -> Result<VerifiedPoolShare, PoolError> {
     let meets_chain_target = evaluation.work_digest <= template.challenge.target;
     match (meets_chain_target, evaluation.chain_proof) {
         (true, Some(proof)) if proof.work_digest() == evaluation.work_digest => {
@@ -7123,12 +7401,220 @@ mod tests {
             Err(PoolError::InvalidPplnsWindow)
         ));
 
+        for (size, wait) in [
+            (0, DEFAULT_POOL_SHARE_BATCH_WAIT_MS),
+            (
+                POOL_MAX_SHARE_BATCH_SIZE + 1,
+                DEFAULT_POOL_SHARE_BATCH_WAIT_MS,
+            ),
+        ] {
+            let mut batch = config();
+            batch.share_batch_size = size;
+            batch.share_batch_wait = Duration::from_millis(wait);
+            assert!(matches!(
+                spawn_pool_server(Arc::clone(&node), batch),
+                Err(PoolError::InvalidShareBatchSize)
+            ));
+        }
+        for wait in [0, POOL_MAX_SHARE_BATCH_WAIT_MS + 1] {
+            let mut batch = config();
+            batch.share_batch_size = 8;
+            batch.share_batch_wait = Duration::from_millis(wait);
+            assert!(matches!(
+                spawn_pool_server(Arc::clone(&node), batch),
+                Err(PoolError::InvalidShareBatchWait)
+            ));
+        }
+        // The devnet reference profile replays shares without a ProductionV4
+        // verifier, so there is nothing to batch.
+        let mut batch = config();
+        batch.share_batch_size = 8;
+        assert!(matches!(
+            spawn_pool_server(Arc::clone(&node), batch),
+            Err(PoolError::ShareBatchingUnsupported)
+        ));
+
+        // Batching is off by default: no queue and no batch thread.
+        let server = spawn_pool_server(Arc::clone(&node), config()).unwrap();
+        assert!(server.shared.share_batcher.is_none());
+        assert!(server.share_batch_thread.is_none());
+        server.stop().unwrap();
+
         let mut queued = config();
         queued.max_queued_share_verifications = POOL_MAX_QUEUED_SHARE_VERIFICATIONS + 1;
         assert!(matches!(
             spawn_pool_server(node, queued),
             Err(PoolError::InvalidShareVerificationQueueLimit)
         ));
+    }
+
+    fn batch_result(nonce: u64) -> Result<ProductionV4PoolShareEvaluation, PoolError> {
+        Ok(ProductionV4PoolShareEvaluation {
+            work_digest: [nonce as u8; 32],
+            chain_proof: None,
+        })
+    }
+
+    #[test]
+    fn share_batcher_checks_concurrent_shares_together() {
+        let batcher = Arc::new(ShareBatcher::<u64>::new(4, Duration::from_secs(1), 8));
+        let stop = Arc::new(AtomicBool::new(false));
+        let sizes = Arc::new(Mutex::new(Vec::new()));
+        let runner = {
+            let (batcher, stop, sizes) =
+                (Arc::clone(&batcher), Arc::clone(&stop), Arc::clone(&sizes));
+            thread::spawn(move || {
+                batcher.run(&stop, |batch| {
+                    sizes.lock().unwrap().push(batch.len());
+                    batch
+                        .iter()
+                        .map(|share| batch_result(share.nonce + share.payload))
+                        .collect()
+                })
+            })
+        };
+        let submitters = (1..=4_u64)
+            .map(|nonce| {
+                let (batcher, stop) = (Arc::clone(&batcher), Arc::clone(&stop));
+                thread::spawn(move || batcher.submit(&stop, 100, nonce).unwrap())
+            })
+            .collect::<Vec<_>>();
+        for (nonce, submitter) in (1..=4_u64).zip(submitters) {
+            let evaluation = submitter.join().unwrap().expect("share was checked");
+            assert_eq!(evaluation.work_digest, [(nonce + 100) as u8; 32]);
+        }
+        assert_eq!(*sizes.lock().unwrap(), vec![4]);
+        stop.store(true, Ordering::Release);
+        batcher.wake();
+        runner.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn share_batcher_runs_a_partial_batch_after_the_wait() {
+        let batcher = Arc::new(ShareBatcher::<u64>::new(8, Duration::from_millis(50), 8));
+        let stop = Arc::new(AtomicBool::new(false));
+        let sizes = Arc::new(Mutex::new(Vec::new()));
+        let runner = {
+            let (batcher, stop, sizes) =
+                (Arc::clone(&batcher), Arc::clone(&stop), Arc::clone(&sizes));
+            thread::spawn(move || {
+                batcher.run(&stop, |batch| {
+                    sizes.lock().unwrap().push(batch.len());
+                    batch
+                        .iter()
+                        .map(|share| batch_result(share.nonce))
+                        .collect()
+                })
+            })
+        };
+        let started = Instant::now();
+        let evaluation = batcher
+            .submit(&stop, 0, 7)
+            .unwrap()
+            .expect("share was checked");
+        assert_eq!(evaluation.work_digest, [7; 32]);
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(*sizes.lock().unwrap(), vec![1]);
+        stop.store(true, Ordering::Release);
+        batcher.wake();
+        runner.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn share_batcher_reports_busy_when_full_or_stopping() {
+        // Room for one batch of two and no extra queue; nothing is running it.
+        let batcher = Arc::new(ShareBatcher::<u64>::new(2, Duration::from_secs(1), 0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let waiting = (1..=2_u64)
+            .map(|nonce| {
+                let (batcher, stop) = (Arc::clone(&batcher), Arc::clone(&stop));
+                thread::spawn(move || batcher.submit(&stop, 0, nonce).unwrap())
+            })
+            .collect::<Vec<_>>();
+        while batcher.queue.lock().unwrap().len() < 2 {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(batcher.submit(&stop, 0, 3).unwrap().is_none());
+        stop.store(true, Ordering::Release);
+        for submitter in waiting {
+            assert!(submitter.join().unwrap().is_none());
+        }
+        assert!(batcher.next_batch(&stop).unwrap().is_none());
+        assert!(batcher.queue.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn share_batcher_fails_only_the_batch_that_panicked() {
+        let batcher = Arc::new(ShareBatcher::<u64>::new(1, Duration::from_millis(1), 4));
+        let stop = Arc::new(AtomicBool::new(false));
+        let runner = {
+            let (batcher, stop) = (Arc::clone(&batcher), Arc::clone(&stop));
+            thread::spawn(move || {
+                batcher.run(&stop, |batch| {
+                    if batch[0].nonce == 1 {
+                        panic!("broken batch");
+                    }
+                    batch
+                        .iter()
+                        .map(|share| batch_result(share.nonce))
+                        .collect()
+                })
+            })
+        };
+        let error = batcher.submit(&stop, 0, 1).unwrap_err();
+        assert!(error.to_string().contains("panicked"), "{error}");
+        let evaluation = batcher
+            .submit(&stop, 0, 2)
+            .unwrap()
+            .expect("share was checked");
+        assert_eq!(evaluation.work_digest, [2; 32]);
+        stop.store(true, Ordering::Release);
+        batcher.wake();
+        runner.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn share_batcher_rejects_a_wrong_result_count() {
+        let batcher = Arc::new(ShareBatcher::<u64>::new(1, Duration::from_millis(1), 4));
+        let stop = Arc::new(AtomicBool::new(false));
+        let runner = {
+            let (batcher, stop) = (Arc::clone(&batcher), Arc::clone(&stop));
+            thread::spawn(move || batcher.run(&stop, |_| Vec::new()))
+        };
+        let error = batcher.submit(&stop, 0, 1).unwrap_err();
+        assert!(error.to_string().contains("wrong number"), "{error}");
+        stop.store(true, Ordering::Release);
+        batcher.wake();
+        runner.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn default_batch_evaluation_checks_each_share_in_order() {
+        #[derive(Debug)]
+        struct NonceVerifier;
+        impl ProductionV4PoolShareVerifier for NonceVerifier {
+            fn evaluate(
+                &self,
+                _template: &crate::BlockTemplate,
+                nonce: u64,
+                _share_target: [u8; 32],
+            ) -> Result<ProductionV4PoolShareEvaluation, PoolError> {
+                batch_result(nonce)
+            }
+        }
+        let template = production_v4_share_template();
+        let requests = [5_u64, 6, 7].map(|nonce| ProductionV4PoolShareRequest {
+            template: &template,
+            nonce,
+            share_target: [0xff; 32],
+        });
+        let digests = NonceVerifier
+            .evaluate_batch(&requests)
+            .into_iter()
+            .map(|result| result.unwrap().work_digest)
+            .collect::<Vec<_>>();
+        assert_eq!(digests, vec![[5; 32], [6; 32], [7; 32]]);
     }
 
     #[test]

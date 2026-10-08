@@ -95,7 +95,12 @@ approved pool GPU still has a compute process. It never stops that process.
    turns on proof pruning: the pool node keeps full blocks only for that many
    newest blocks and drops the proofs of older ones, keeping their
    transactions (see `docs/proof-pruning.md`). `720` keeps about 12 hours.
-   Leave it out to keep every proof. `automatic_payouts` must be explicitly true; the
+   Leave it out to keep every proof. The optional `share_batch_size` (1 to
+   `64`) lets the pool check that many shares in one GPU replay instead of one
+   at a time, and `share_batch_wait_ms` (1 to `1000`, default `100`) caps how
+   long a share waits for its batch. Leave both out to keep one-at-a-time
+   checks; measure before turning batching on (see `docs/devnet-0.md`).
+   `automatic_payouts` must be explicitly true; the
    launcher uses the **mainnet-specific** `--enable-mainnet-payouts` flag, never
    `--enable-testnet-payouts`. A runtime without that flag fails closed.
    The burned payout fee must meet the exact minimum in the pinned launch

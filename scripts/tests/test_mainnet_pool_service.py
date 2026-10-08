@@ -191,6 +191,28 @@ class MainnetPoolServiceTests(unittest.TestCase):
             with self.assertRaisesRegex(pool.PreflightError, "pool_ledger_max_bytes"):
                 self.preflight()
 
+    def test_optional_share_batching_becomes_pool_share_batch_flags(self):
+        config, _, _ = self.preflight()
+        with mock.patch.object(pool, "CONFIG_BASE", self.config_base):
+            command = pool.build_command(self.root, self.state, self.credential_base, config)
+        self.assertNotIn("--pool-share-batch-size", command)
+        self.assertNotIn("--pool-share-batch-wait-ms", command)
+        self.config["share_batch_size"] = 8
+        self.config["share_batch_wait_ms"] = 50
+        self.save_config()
+        config, _, _ = self.preflight()
+        with mock.patch.object(pool, "CONFIG_BASE", self.config_base):
+            command = pool.build_command(self.root, self.state, self.credential_base, config)
+        self.assertEqual(command[command.index("--pool-share-batch-size") + 1], "8")
+        self.assertEqual(command[command.index("--pool-share-batch-wait-ms") + 1], "50")
+        for field, maximum in (("share_batch_size", 64), ("share_batch_wait_ms", 1000)):
+            for bad in (0, -1, maximum + 1, "8", 8.0, True, None):
+                self.config[field] = bad
+                self.save_config()
+                with self.assertRaisesRegex(pool.PreflightError, field):
+                    self.preflight()
+            self.config[field] = 8
+
     def test_placeholder_or_legacy_payout_config_fails_closed(self):
         self.config["operator_fee_bps"] = "SET_APPROVED_MAINNET_VALUE"
         self.save_config()

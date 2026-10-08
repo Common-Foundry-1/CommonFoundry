@@ -38,11 +38,12 @@ use cmfd_node::pool::{
     DEFAULT_POOL_CONCURRENT_SHARE_VERIFICATIONS, DEFAULT_POOL_CONNECTIONS_PER_SOURCE,
     DEFAULT_POOL_LEDGER_MAX_BYTES, DEFAULT_POOL_MINIMUM_PAYOUT_ATOMS,
     DEFAULT_POOL_OPERATOR_FEE_BPS, DEFAULT_POOL_PAYOUT_FEE_ATOMS,
-    DEFAULT_POOL_QUEUED_SHARE_VERIFICATIONS, DEFAULT_POOL_SOCKET_ADDRESS,
-    DEFAULT_PPLNS_WINDOW_SHARES, DEFAULT_SHARE_LEADING_ZERO_BITS, PoolPayoutPolicy,
-    PoolPayoutReconciliationRequest, PoolPplnsPolicy, PoolServerConfig, certificate_sha256,
-    generate_pool_certificate, inspect_pool_payout_protection_with_limit,
-    reconcile_pool_payout_protection_with_limit, require_existing_pool_ledger, spawn_pool_server,
+    DEFAULT_POOL_QUEUED_SHARE_VERIFICATIONS, DEFAULT_POOL_SHARE_BATCH_SIZE,
+    DEFAULT_POOL_SHARE_BATCH_WAIT_MS, DEFAULT_POOL_SOCKET_ADDRESS, DEFAULT_PPLNS_WINDOW_SHARES,
+    DEFAULT_SHARE_LEADING_ZERO_BITS, PoolPayoutPolicy, PoolPayoutReconciliationRequest,
+    PoolPplnsPolicy, PoolServerConfig, certificate_sha256, generate_pool_certificate,
+    inspect_pool_payout_protection_with_limit, reconcile_pool_payout_protection_with_limit,
+    require_existing_pool_ledger, spawn_pool_server,
 };
 use cmfd_node::pool_dashboard::{
     DEFAULT_POOL_DASHBOARD_ADDRESS, PoolDashboardConfig, spawn_pool_dashboard,
@@ -848,6 +849,13 @@ enum Command {
         /// Maximum authenticated shares waiting for a pool verifier slot.
         #[arg(long, default_value_t = DEFAULT_POOL_QUEUED_SHARE_VERIFICATIONS)]
         pool_max_queued_share_verifications: usize,
+        /// Shares replayed together in one GPU batch (1 to 64). The default 1
+        /// keeps the original one-share-at-a-time verification.
+        #[arg(long, default_value_t = DEFAULT_POOL_SHARE_BATCH_SIZE)]
+        pool_share_batch_size: usize,
+        /// Longest a share waits for its batch to fill, in milliseconds (1 to 1000).
+        #[arg(long, default_value_t = DEFAULT_POOL_SHARE_BATCH_WAIT_MS)]
+        pool_share_batch_wait_ms: u64,
         /// Largest pool ledger snapshot loaded or written, in bytes (1 MiB to
         /// 1 GiB). Raise it when a large pool's ledger outgrows the default;
         /// pass the same value to pool-payout-status and pool-payout-reconcile.
@@ -2026,6 +2034,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             pool_max_connections_per_source,
             pool_max_concurrent_share_verifications,
             pool_max_queued_share_verifications,
+            pool_share_batch_size,
+            pool_share_batch_wait_ms,
             pool_ledger_max_bytes,
             pool_dashboard_assets,
             pool_public_url,
@@ -2130,6 +2140,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             config.max_connections_per_source = pool_max_connections_per_source;
             config.max_concurrent_share_verifications = pool_max_concurrent_share_verifications;
             config.max_queued_share_verifications = pool_max_queued_share_verifications;
+            config.share_batch_size = pool_share_batch_size;
+            config.share_batch_wait = Duration::from_millis(pool_share_batch_wait_ms);
             config.ledger_max_bytes = pool_ledger_max_bytes;
             config.allow_public_clients = allow_public_pool_clients;
             config.allow_address_only_payouts = allow_address_only_payouts;
@@ -2188,6 +2200,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "max_connections_per_source": pool_max_connections_per_source,
                     "max_concurrent_share_verifications": pool_max_concurrent_share_verifications,
                     "max_queued_share_verifications": pool_max_queued_share_verifications,
+                    "share_batch_size": pool_share_batch_size,
+                    "share_batch_wait_ms": pool_share_batch_wait_ms,
                     "ledger_max_bytes": pool_ledger_max_bytes,
                     "dashboard": dashboard.as_ref().map(|dashboard| format!("http://{}", dashboard.local_addr())),
                     "used_insecure_default_miner": used_insecure_default_miner,

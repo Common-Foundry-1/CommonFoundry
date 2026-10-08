@@ -30,7 +30,7 @@ use serde::Serialize;
 
 use crate::pool::{
     PoolError, PoolJob, PoolWorkSearchResult, ProductionV4PoolShareEvaluation,
-    ProductionV4PoolShareVerifier,
+    ProductionV4PoolShareRequest, ProductionV4PoolShareVerifier,
 };
 use crate::{BlockTemplate, COMPILED_NETWORK_PROFILE};
 
@@ -307,6 +307,19 @@ struct AttemptFiles {
     token: String,
 }
 
+/// A replayed share that meets the chain target, ready to be proved.
+struct ChainShare<'a> {
+    files: &'a AttemptFiles,
+    template: &'a BlockTemplate,
+    nonce: u64,
+    challenge_digest: [u8; 32],
+    search_final: &'a [u8],
+    final_activation_digest: [u8; 32],
+    work_digest: [u8; 32],
+    evaluation_started: Instant,
+    search_replay_seconds: f64,
+}
+
 impl ProductionV4PersistentPoolVerifier {
     pub fn start(config: ProductionV4PoolVerifierConfig) -> Result<Self, PoolError> {
         Self::start_for_network(COMPILED_NETWORK_PROFILE.network_id, config)
@@ -361,16 +374,7 @@ impl ProductionV4PersistentPoolVerifier {
             .state
             .lock()
             .map_err(|_| pool_replay_failure("persistent search worker lock is poisoned"))?;
-        if template.challenge.network_id != self.expected_network_id {
-            return Err(pool_replay_failure(
-                "pool replay received a template for another network",
-            ));
-        }
-        if share_target < template.challenge.target {
-            return Err(pool_replay_failure(
-                "pool share target is harder than the chain target",
-            ));
-        }
+        self.validate_share(template, share_target)?;
 
         let attempt_number = state.next_attempt;
         state.next_attempt = state.next_attempt.wrapping_add(1);
@@ -436,7 +440,247 @@ impl ProductionV4PersistentPoolVerifier {
                 chain_proof: None,
             });
         }
+        self.prove_chain_share(
+            state,
+            &mut search_state,
+            ChainShare {
+                files: &files,
+                template,
+                nonce,
+                challenge_digest,
+                search_final: &search_final,
+                final_activation_digest,
+                work_digest,
+                evaluation_started,
+                search_replay_seconds,
+            },
+        )
+    }
 
+    fn validate_share(
+        &self,
+        template: &BlockTemplate,
+        share_target: [u8; 32],
+    ) -> Result<(), PoolError> {
+        if template.challenge.network_id != self.expected_network_id {
+            return Err(pool_replay_failure(
+                "pool replay received a template for another network",
+            ));
+        }
+        if share_target < template.challenge.target {
+            return Err(pool_replay_failure(
+                "pool share target is harder than the chain target",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Checks several shares with one `RUNBATCH` replay per 64 shares. A share
+    /// that fails validation, or a lane that meets the chain target, is
+    /// handled exactly as the single-share path would.
+    fn evaluate_batch_locked(
+        &self,
+        state: &mut WorkerState,
+        shares: &[ProductionV4PoolShareRequest<'_>],
+    ) -> Vec<Result<ProductionV4PoolShareEvaluation, PoolError>> {
+        let evaluation_started = Instant::now();
+        let mut search_state = match self.searcher.state.lock() {
+            Ok(search_state) => search_state,
+            Err(_) => {
+                return shares
+                    .iter()
+                    .map(|_| {
+                        Err(pool_replay_failure(
+                            "persistent search worker lock is poisoned",
+                        ))
+                    })
+                    .collect();
+            }
+        };
+        let mut results = shares.iter().map(|_| None).collect::<Vec<_>>();
+        let mut lanes = Vec::with_capacity(shares.len());
+        for (index, share) in shares.iter().enumerate() {
+            match self.validate_share(share.template, share.share_target) {
+                Ok(()) => lanes.push((
+                    index,
+                    forgematrix_v4_challenge_digest(
+                        &share.template.challenge,
+                        share.nonce,
+                        PRODUCTION_V4_MODEL_MANIFEST_DIGEST,
+                    ),
+                )),
+                Err(error) => results[index] = Some(Err(error)),
+            }
+        }
+        for chunk in lanes.chunks(PRODUCTION_V4_POOL_SEARCH_MAX_BATCH_SIZE as usize) {
+            let search_replay_started = Instant::now();
+            match self.replay_search_batch(state, &mut search_state, chunk) {
+                Ok(final_activations) => {
+                    let search_replay_seconds = search_replay_started.elapsed().as_secs_f64();
+                    let lane_activations = final_activations
+                        .chunks_exact(FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES);
+                    for (&(index, challenge_digest), search_final) in
+                        chunk.iter().zip(lane_activations)
+                    {
+                        results[index] = Some(self.finish_batched_share(
+                            state,
+                            &mut search_state,
+                            &shares[index],
+                            challenge_digest,
+                            search_final,
+                            evaluation_started,
+                            search_replay_seconds,
+                        ));
+                    }
+                }
+                Err(error) => {
+                    let message = match error {
+                        PoolError::ProductionV4Replay(message) => message,
+                        other => other.to_string(),
+                    };
+                    for &(index, _) in chunk {
+                        results[index] = Some(Err(pool_replay_failure(message.clone())));
+                    }
+                }
+            }
+        }
+        results
+            .into_iter()
+            .map(|result| {
+                result.unwrap_or_else(|| Err(pool_replay_failure("share was not evaluated")))
+            })
+            .collect()
+    }
+
+    /// Replays several shares in one `RUNBATCH` call and returns their final
+    /// activations, one lane per share, in order.
+    fn replay_search_batch(
+        &self,
+        state: &mut WorkerState,
+        search_state: &mut SearchWorkerState,
+        lanes: &[(usize, [u8; 32])],
+    ) -> Result<Vec<u8>, PoolError> {
+        let attempt_number = state.next_attempt;
+        state.next_attempt = state.next_attempt.wrapping_add(1);
+        let files = AttemptFiles {
+            scratch_directory: self.scratch_directory.clone(),
+            token: format!(
+                "cmfd-v4-pool-batch-{}-{attempt_number:016x}",
+                hex::encode(self.startup_id)
+            ),
+        };
+        let coefficients_path = files.path("coefficients.bin");
+        let search_prefix = files.path("search");
+        let search_final_path = files.path("search-final-activation.bin");
+        let coefficients = lanes
+            .iter()
+            .flat_map(|&(_, challenge_digest)| production_v4_replay_coefficients(challenge_digest))
+            .collect::<Vec<_>>();
+        write_new_file(&coefficients_path, &coefficients)?;
+        search_state.replay.invoke(
+            &[
+                "RUNBATCH".to_owned(),
+                lanes.len().to_string(),
+                self.worker_path(&coefficients_path)?,
+                self.worker_path(&search_prefix)?,
+            ],
+            "CMFD_V4_REPLAY_DONE",
+        )?;
+        let expected_bytes = FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES
+            .checked_mul(lanes.len())
+            .ok_or_else(|| pool_replay_failure("share-batch byte length overflow"))?;
+        read_exact_file(&search_final_path, expected_bytes)
+    }
+
+    /// Derives one batched lane's work digest; a chain-winning lane is then
+    /// written out and proved exactly like a single share.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_batched_share(
+        &self,
+        state: &mut WorkerState,
+        search_state: &mut SearchWorkerState,
+        share: &ProductionV4PoolShareRequest<'_>,
+        challenge_digest: [u8; 32],
+        search_final: &[u8],
+        evaluation_started: Instant,
+        search_replay_seconds: f64,
+    ) -> Result<ProductionV4PoolShareEvaluation, PoolError> {
+        let final_activation_digest =
+            final_activation_digest_from_bytes(challenge_digest, search_final)?;
+        let work_digest = forgematrix_v4_work_digest(
+            PRODUCTION_V4_MODEL_MANIFEST_DIGEST,
+            challenge_digest,
+            final_activation_digest,
+        );
+        if work_digest > share.template.challenge.target {
+            return Ok(ProductionV4PoolShareEvaluation {
+                work_digest,
+                chain_proof: None,
+            });
+        }
+        let attempt_number = state.next_attempt;
+        state.next_attempt = state.next_attempt.wrapping_add(1);
+        let files = AttemptFiles {
+            scratch_directory: self.scratch_directory.clone(),
+            token: format!(
+                "cmfd-v4-pool-{}-{attempt_number:016x}",
+                hex::encode(self.startup_id)
+            ),
+        };
+        write_new_file(
+            &files.path("coefficients.bin"),
+            &production_v4_replay_coefficients(challenge_digest),
+        )?;
+        let frozen = FrozenProductionV4Template {
+            format_version: FROZEN_TEMPLATE_FORMAT_VERSION,
+            challenge: share.template.challenge,
+            coinbase: &share.template.coinbase,
+            transactions: &share.template.transactions,
+            nonce: share.nonce,
+        };
+        write_new_file(
+            &files.path("template.json"),
+            &serde_json::to_vec(&frozen).map_err(replay_error)?,
+        )?;
+        self.prove_chain_share(
+            state,
+            search_state,
+            ChainShare {
+                files: &files,
+                template: share.template,
+                nonce: share.nonce,
+                challenge_digest,
+                search_final,
+                final_activation_digest,
+                work_digest,
+                evaluation_started,
+                search_replay_seconds,
+            },
+        )
+    }
+
+    /// Repeats a chain-winning replay in full mode, proves it, and checks the
+    /// proof against the replay. `share.files` must already hold the share's
+    /// single-nonce coefficients and frozen template.
+    fn prove_chain_share(
+        &self,
+        state: &mut WorkerState,
+        search_state: &mut SearchWorkerState,
+        share: ChainShare<'_>,
+    ) -> Result<ProductionV4PoolShareEvaluation, PoolError> {
+        let ChainShare {
+            files,
+            template,
+            nonce,
+            challenge_digest,
+            search_final,
+            final_activation_digest,
+            work_digest,
+            evaluation_started,
+            search_replay_seconds,
+        } = share;
+        let coefficients_path = files.path("coefficients.bin");
+        let template_path = files.path("template.json");
         let full_prefix = files.path("full");
         let full_final_path = files.path("full-final-activation.bin");
         let proof_path = files.path("transparent-proof.bin");
@@ -455,7 +699,7 @@ impl ProductionV4PersistentPoolVerifier {
             &full_final_path,
             FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES,
         )?;
-        if search_final != full_final {
+        if search_final != full_final.as_slice() {
             return Err(pool_replay_failure(
                 "search replay and full replay final activations differ",
             ));
@@ -673,6 +917,26 @@ impl ProductionV4PoolShareVerifier for ProductionV4PersistentPoolVerifier {
             .lock()
             .map_err(|_| pool_replay_failure("persistent worker lock is poisoned"))?;
         self.evaluate_locked(&mut state, template, nonce, share_target)
+    }
+
+    fn evaluate_batch(
+        &self,
+        shares: &[ProductionV4PoolShareRequest<'_>],
+    ) -> Vec<Result<ProductionV4PoolShareEvaluation, PoolError>> {
+        // A lone share takes the original single-share replay.
+        if shares.len() <= 1 {
+            return shares
+                .iter()
+                .map(|share| self.evaluate(share.template, share.nonce, share.share_target))
+                .collect();
+        }
+        match self.state.lock() {
+            Ok(mut state) => self.evaluate_batch_locked(&mut state, shares),
+            Err(_) => shares
+                .iter()
+                .map(|_| Err(pool_replay_failure("persistent worker lock is poisoned")))
+                .collect(),
+        }
     }
 }
 
@@ -1397,5 +1661,362 @@ done"#;
         worker.invoke(&fields("job"), "DONE").unwrap();
         assert_eq!(worker.restarts, 1);
         assert!(worker.retry_after.is_none());
+    }
+
+    #[cfg(unix)]
+    const BATCH_TEST_NETWORK_ID: [u8; 32] = [0xa5; 32];
+
+    /// A fake replay worker for `RUN search` and `RUNBATCH`. Lane `i` (from 1)
+    /// of every answer is filled with the field value `i`, the coefficient file
+    /// must hold exactly one coefficient set per lane, each command is logged
+    /// to `$1`, and `RUNBATCH` crashes while `$1.crash` exists.
+    #[cfg(unix)]
+    fn fake_replay_worker(log: &Path) -> ProductionV4PoolWorkerCommand {
+        let script = r#"log="$1"; per="$2"
+lane() {
+  printf "\\$(printf '%03o' "$1")\\000\\000\\000" > "$2.lane"
+  i=0
+  while [ "$i" -lt 19 ]; do cat "$2.lane" "$2.lane" > "$2.lane2"; mv "$2.lane2" "$2.lane"; i=$((i+1)); done
+  cat "$2.lane" >> "$2"; rm -f "$2.lane"
+}
+echo CMFD_V4_REPLAY_READY
+while read -r command first second third; do
+  case "$command" in
+    QUIT) exit 0 ;;
+    RUNBATCH) count="$first" ;;
+    RUN) count=1 ;;
+    *) exit 5 ;;
+  esac
+  [ "$command" = RUNBATCH ] && [ -e "$log.crash" ] && exit 3
+  [ "$(wc -c < "$second")" -eq $((count * per)) ] || exit 6
+  out="$third-final-activation.bin"
+  : > "$out"
+  lane_index=1
+  while [ "$lane_index" -le "$count" ]; do lane "$lane_index" "$out"; lane_index=$((lane_index+1)); done
+  echo "$command $count" >> "$log"
+  echo CMFD_V4_REPLAY_DONE
+done"#;
+        ProductionV4PoolWorkerCommand {
+            program: PathBuf::from("/bin/sh"),
+            arguments: vec![
+                "-c".into(),
+                script.into(),
+                "fake-replay".into(),
+                log.as_os_str().to_owned(),
+                ((PRODUCTION_V2_LAYERS as usize + 1) * 20)
+                    .to_string()
+                    .into(),
+            ],
+            environment: Vec::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn fake_proof_worker() -> ProductionV4PoolWorkerCommand {
+        let script = r#"echo CMFD_V4_PROOF_READY
+while read -r line; do [ "$line" = QUIT ] && exit 0; echo CMFD_V4_PROOF_DONE; done"#;
+        ProductionV4PoolWorkerCommand {
+            program: PathBuf::from("/bin/sh"),
+            arguments: vec!["-c".into(), script.into(), "fake-proof".into()],
+            environment: Vec::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn batch_test_verifier(label: &str) -> (ProductionV4PersistentPoolVerifier, PathBuf, PathBuf) {
+        let scratch = worker_test_path(label);
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+        let log = scratch.join("worker.log");
+        let verifier = ProductionV4PersistentPoolVerifier::start_for_network(
+            BATCH_TEST_NETWORK_ID,
+            ProductionV4PoolVerifierConfig {
+                replay: fake_replay_worker(&log),
+                proof: fake_proof_worker(),
+                scratch_directory: scratch.clone(),
+                worker_scratch_directory: scratch.to_str().unwrap().to_owned(),
+            },
+        )
+        .unwrap();
+        (verifier, scratch, log)
+    }
+
+    /// A template whose chain target nothing meets, so no lane needs a proof.
+    #[cfg(unix)]
+    fn batch_test_template(network_id: [u8; 32]) -> BlockTemplate {
+        BlockTemplate {
+            challenge: cmfd_consensus::BlockChallenge {
+                network_id,
+                previous_block: [2; 32],
+                transaction_root: [3; 32],
+                height: 4,
+                timestamp: 5,
+                target: [0; 32],
+            },
+            coinbase: cmfd_consensus::Coinbase {
+                height: 4,
+                outputs: Vec::new(),
+            },
+            transactions: Vec::new(),
+            total_fees_burned: 0,
+        }
+    }
+
+    /// The work digest of a lane the fake worker filled with `value`.
+    #[cfg(unix)]
+    fn fake_lane_work_digest(template: &BlockTemplate, nonce: u64, value: u32) -> [u8; 32] {
+        let challenge_digest = forgematrix_v4_challenge_digest(
+            &template.challenge,
+            nonce,
+            PRODUCTION_V4_MODEL_MANIFEST_DIGEST,
+        );
+        let activation = value
+            .to_le_bytes()
+            .repeat(FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES / size_of::<u32>());
+        forgematrix_v4_work_digest(
+            PRODUCTION_V4_MODEL_MANIFEST_DIGEST,
+            challenge_digest,
+            final_activation_digest_from_bytes(challenge_digest, &activation).unwrap(),
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn batched_shares_are_replayed_together_and_mapped_to_their_lanes() {
+        let (verifier, scratch, log) = batch_test_verifier("batch-lanes");
+        let template = batch_test_template(BATCH_TEST_NETWORK_ID);
+        let requests = [10_u64, 11, 12].map(|nonce| ProductionV4PoolShareRequest {
+            template: &template,
+            nonce,
+            share_target: [0xff; 32],
+        });
+        let results = verifier.evaluate_batch(&requests);
+        for (lane, (request, result)) in requests.iter().zip(results).enumerate() {
+            let evaluation = result.unwrap();
+            assert_eq!(
+                evaluation.work_digest,
+                fake_lane_work_digest(&template, request.nonce, lane as u32 + 1)
+            );
+            assert!(evaluation.chain_proof.is_none());
+        }
+        // A batch of one keeps the original single-share replay.
+        let single = verifier
+            .evaluate_batch(&requests[..1])
+            .pop()
+            .unwrap()
+            .unwrap();
+        assert_eq!(single.work_digest, fake_lane_work_digest(&template, 10, 1));
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "RUNBATCH 3\nRUN 1\n"
+        );
+        let leftovers = std::fs::read_dir(&scratch)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("cmfd-v4-pool-")
+            })
+            .count();
+        assert_eq!(leftovers, 0, "batch scratch files must be removed");
+        drop(verifier);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_invalid_share_fails_alone_in_its_batch() {
+        let (verifier, scratch, log) = batch_test_verifier("batch-invalid");
+        let template = batch_test_template(BATCH_TEST_NETWORK_ID);
+        let foreign = batch_test_template([0x5a; 32]);
+        let requests = [
+            ProductionV4PoolShareRequest {
+                template: &template,
+                nonce: 20,
+                share_target: [0xff; 32],
+            },
+            ProductionV4PoolShareRequest {
+                template: &foreign,
+                nonce: 21,
+                share_target: [0xff; 32],
+            },
+            ProductionV4PoolShareRequest {
+                template: &template,
+                nonce: 22,
+                share_target: [0xff; 32],
+            },
+        ];
+        let results = verifier.evaluate_batch(&requests);
+        assert_eq!(
+            results[0].as_ref().unwrap().work_digest,
+            fake_lane_work_digest(&template, 20, 1)
+        );
+        let error = results[1].as_ref().unwrap_err();
+        assert!(error.to_string().contains("another network"), "{error}");
+        assert_eq!(
+            results[2].as_ref().unwrap().work_digest,
+            fake_lane_work_digest(&template, 22, 2)
+        );
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "RUNBATCH 2\n");
+        drop(verifier);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    /// Real-GPU check, run by hand on a pool host with the production workers:
+    ///
+    /// ```text
+    /// CMFD_HW_REPLAY_WORKER=…/cmfd-v4-replay CMFD_HW_PROOF_WORKER=…/real_bank0_relations \
+    /// CMFD_HW_MODEL_BANK=…/MODEL-V2.bank CMFD_HW_FIXED_DIR=…/production-v4/fixed \
+    /// CMFD_HW_SCRATCH=/abs/scratch [CMFD_HW_PROVE=1] \
+    ///   <test binary> --ignored real_gpu_batched_replay --nocapture
+    /// ```
+    ///
+    /// Every batched lane must give exactly the work digest of a one-share
+    /// replay of the same nonce. With `CMFD_HW_PROVE=1` two chain-winning
+    /// lanes are also proved from one batch.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "needs a CUDA GPU, the model bank and the production workers"]
+    fn real_gpu_batched_replay_matches_single_replays() {
+        let path = |name: &str| {
+            PathBuf::from(std::env::var_os(name).unwrap_or_else(|| panic!("{name} is required")))
+        };
+        let prove = std::env::var("CMFD_HW_PROVE").as_deref() == Ok("1");
+        let config = if prove {
+            production_v4_solo_config(
+                &path("CMFD_HW_REPLAY_WORKER"),
+                &path("CMFD_HW_PROOF_WORKER"),
+                &path("CMFD_HW_MODEL_BANK"),
+                &path("CMFD_HW_FIXED_DIR"),
+                &path("CMFD_HW_SCRATCH"),
+                None,
+            )
+            .unwrap()
+        } else {
+            // Replay only: the proof worker is never asked for anything.
+            let search = production_v4_pool_searcher_config(
+                &path("CMFD_HW_REPLAY_WORKER"),
+                &path("CMFD_HW_MODEL_BANK"),
+                &path("CMFD_HW_SCRATCH"),
+                32,
+                None,
+                None,
+            )
+            .unwrap();
+            ProductionV4PoolVerifierConfig {
+                replay: search.replay,
+                proof: fake_proof_worker(),
+                scratch_directory: search.scratch_directory,
+                worker_scratch_directory: search.worker_scratch_directory,
+            }
+        };
+        let verifier = ProductionV4PersistentPoolVerifier::start(config).unwrap();
+        let mut template = batch_test_template(COMPILED_NETWORK_PROFILE.network_id);
+        let nonces = (0..32_u64)
+            .map(|index| 0x5eed_0000 + index * 7_919)
+            .collect::<Vec<_>>();
+        verifier.evaluate(&template, 1, [0xff; 32]).unwrap();
+
+        let started = Instant::now();
+        let single = nonces
+            .iter()
+            .map(|&nonce| {
+                verifier
+                    .evaluate(&template, nonce, [0xff; 32])
+                    .unwrap()
+                    .work_digest
+            })
+            .collect::<Vec<_>>();
+        let single_seconds = started.elapsed().as_secs_f64();
+        eprintln!(
+            "batch 1: {:.2} shares/s ({single_seconds:.2} s for {})",
+            nonces.len() as f64 / single_seconds,
+            nonces.len()
+        );
+        for size in [2, 4, 8, 16, 32] {
+            let started = Instant::now();
+            let mut batched = Vec::with_capacity(nonces.len());
+            for chunk in nonces.chunks(size) {
+                let requests = chunk
+                    .iter()
+                    .map(|&nonce| ProductionV4PoolShareRequest {
+                        template: &template,
+                        nonce,
+                        share_target: [0xff; 32],
+                    })
+                    .collect::<Vec<_>>();
+                for result in verifier.evaluate_batch(&requests) {
+                    batched.push(result.unwrap().work_digest);
+                }
+            }
+            let seconds = started.elapsed().as_secs_f64();
+            assert_eq!(
+                batched, single,
+                "batch {size} differs from one-share replays"
+            );
+            eprintln!(
+                "batch {size}: {:.2} shares/s ({:.1}x), lanes identical",
+                nonces.len() as f64 / seconds,
+                single_seconds / seconds
+            );
+        }
+
+        if prove {
+            // The target is part of the challenge, so these digests differ
+            // from the ones above; compare against a one-share replay instead.
+            template.challenge.target = [0xff; 32];
+            let requests = nonces[..2]
+                .iter()
+                .map(|&nonce| ProductionV4PoolShareRequest {
+                    template: &template,
+                    nonce,
+                    share_target: [0xff; 32],
+                })
+                .collect::<Vec<_>>();
+            let batched = verifier.evaluate_batch(&requests);
+            for result in &batched {
+                let evaluation = result.as_ref().unwrap();
+                let proof = evaluation
+                    .chain_proof
+                    .as_ref()
+                    .expect("a chain-winning lane is proved");
+                assert_eq!(proof.work_digest(), evaluation.work_digest);
+            }
+            let single = verifier.evaluate(&template, nonces[0], [0xff; 32]).unwrap();
+            assert!(single.chain_proof.is_some());
+            assert_eq!(batched[0].as_ref().unwrap().work_digest, single.work_digest);
+            eprintln!(
+                "two chain-winning lanes proved from one batch; lane 0 matches a one-share proof"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_batch_fails_its_shares_and_the_worker_recovers() {
+        let (verifier, scratch, log) = batch_test_verifier("batch-crash");
+        let template = batch_test_template(BATCH_TEST_NETWORK_ID);
+        let requests = [30_u64, 31].map(|nonce| ProductionV4PoolShareRequest {
+            template: &template,
+            nonce,
+            share_target: [0xff; 32],
+        });
+        let crash = PathBuf::from(format!("{}.crash", log.display()));
+        std::fs::write(&crash, b"").unwrap();
+        for result in verifier.evaluate_batch(&requests) {
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("closed stdout"), "{error}");
+        }
+        std::fs::remove_file(&crash).unwrap();
+        for (lane, result) in verifier.evaluate_batch(&requests).into_iter().enumerate() {
+            assert_eq!(
+                result.unwrap().work_digest,
+                fake_lane_work_digest(&template, requests[lane].nonce, lane as u32 + 1)
+            );
+        }
+        drop(verifier);
+        let _ = std::fs::remove_dir_all(scratch);
     }
 }

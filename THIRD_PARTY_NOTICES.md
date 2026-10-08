@@ -34,6 +34,19 @@ Reference: https://github.com/bitcoin-cash-node/bitcoin-cash-node/blob/master/sr
 This comparison does not change the deployed matrix proof-of-work or select
 ASERT as an active consensus rule.
 
+## FreeForgeMiner replay kernels
+
+The ProductionV4 replay worker's batched search includes changes from
+FreeForgeMiner (https://github.com/pepsykolya/freeforgeminer, commit
+`e696540d40c2ccbf5534def1dd8327b8d7430990`): the fused int8 GEMM and layer
+reduce kernel in `tools/production-v4-prover/cuda/fused_limb_layer.cuh`, and in
+`koala_four_limb_replay.cu` the persistent batch buffers, interleaved limb
+rows, GPU final-activation digest and extra SM80 GEMM tile choices.
+
+Copyright (c) 2026 FreeForgeMiner contributors.
+SPDX-License-Identifier: MIT. The MIT permission and disclaimer are reproduced
+in this repository's `LICENSE`.
+
 ## NVIDIA CUTLASS v3.9.2
 
 The optional production CUDA tensor-core backend is compiled from CUTLASS

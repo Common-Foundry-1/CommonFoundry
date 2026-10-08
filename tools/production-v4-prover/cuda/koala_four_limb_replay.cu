@@ -1,13 +1,16 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -1150,11 +1153,17 @@ void run_production_search_batch(ProductionModel& model, uint32_t batch_size,
     static int32_t* limb_accumulators = nullptr;
     static uint32_t* activations = nullptr;
     static uint32_t* device_coefficients = nullptr;
-    if (batch_size > capacity) {
+    // The two paths need different buffers, so a path change (the fused
+    // self-check falling back to the classic path) reallocates them.
+    static bool allocated_for_fused = false;
+    const bool wants_fused = fused_config >= 0;
+    if (batch_size > capacity || wants_fused != allocated_for_fused) {
         cudaFree(limbs); cudaFree(limbs_next); cudaFree(limb_accumulators);
         cudaFree(activations); cudaFree(device_coefficients);
         limbs_next = nullptr; limb_accumulators = nullptr;
-        const size_t max_cells = size_t(batch_size) * cells;
+        const uint32_t allocation = std::max(batch_size, capacity);
+        allocated_for_fused = wants_fused;
+        const size_t max_cells = size_t(allocation) * cells;
         cuda_check(cudaMalloc(&limbs, 4 * max_cells),
                    "allocate production search-batch activation limbs");
         if (fused_config >= 0) {
@@ -1168,9 +1177,9 @@ void run_production_search_batch(ProductionModel& model, uint32_t batch_size,
         cuda_check(cudaMalloc(&activations, max_cells * sizeof(uint32_t)),
                    "allocate production search-batch activations");
         cuda_check(cudaMalloc(&device_coefficients,
-                              size_t(batch_size) * (PRODUCTION_LAYERS + 1) * MASK_COEFFICIENTS * sizeof(uint32_t)),
+                              size_t(allocation) * (PRODUCTION_LAYERS + 1) * MASK_COEFFICIENTS * sizeof(uint32_t)),
                    "allocate production search-batch coefficients");
-        capacity = batch_size;
+        capacity = allocation;
     }
     cuda_check(cudaMemcpy(device_coefficients, coefficients.data(),
                           coefficients.size() * sizeof(uint32_t), cudaMemcpyHostToDevice),
@@ -1304,9 +1313,65 @@ std::vector<std::string> split_command(const std::string& line) {
     return fields;
 }
 
+std::vector<char> read_whole_file(const std::string& path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) throw std::runtime_error("open fused self-check output");
+    return std::vector<char>(std::istreambuf_iterator<char>(input), {});
+}
+
+// The fused kernel serves only batched search. Before a server reports ready,
+// two fixed lanes are replayed through it and through the classic per-nonce
+// path on this very GPU; their final activations must be identical. Any
+// difference or failure disables the fused kernel for this process, and the
+// classic path then serves every request.
+void run_fused_self_check(ProductionModel& model) {
+    namespace fs = std::filesystem;
+    const fs::path directory =
+        fs::temp_directory_path() /
+        ("cmfd-v4-fused-check-" +
+         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    const char* outcome = "EXACT";
+    try {
+        fs::create_directory(directory);
+        const size_t lane_bytes = size_t(PRODUCTION_LAYERS + 1) * MASK_COEFFICIENTS;
+        std::vector<char> both;
+        for (uint32_t lane = 0; lane < 2; ++lane) {
+            std::vector<char> coefficients(lane_bytes);
+            for (size_t index = 0; index < lane_bytes; ++index) {
+                coefficients[index] = static_cast<char>((index * 131 + lane * 977 + 7) & 0xff);
+            }
+            both.insert(both.end(), coefficients.begin(), coefficients.end());
+            const std::string path = (directory / ("lane" + std::to_string(lane))).string();
+            std::ofstream(path + ".bin", std::ios::binary)
+                .write(coefficients.data(), coefficients.size());
+            run_production_replay(model, (path + ".bin").c_str(), path.c_str(), false);
+        }
+        const std::string batch = (directory / "batch").string();
+        std::ofstream(batch + ".bin", std::ios::binary).write(both.data(), both.size());
+        run_production_search_batch(model, 2, (batch + ".bin").c_str(), batch.c_str());
+        const auto fused = read_whole_file(batch + "-final-activation.bin");
+        std::vector<char> classic;
+        for (uint32_t lane = 0; lane < 2; ++lane) {
+            const auto single = read_whole_file(
+                (directory / ("lane" + std::to_string(lane) + "-final-activation.bin")).string());
+            classic.insert(classic.end(), single.begin(), single.end());
+        }
+        if (fused != classic) outcome = "MISMATCH";
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "fused self-check failed: %s\n", error.what());
+        outcome = "FAILED";
+    }
+    std::error_code ignored;
+    fs::remove_all(directory, ignored);
+    if (std::strcmp(outcome, "EXACT") != 0) fused_config = -1;
+    std::printf("fused_self_check=%s fused_config=%d\n", outcome, fused_config);
+    std::fflush(stdout);
+}
+
 void run_persistent_server(const char* model_path) {
     if (model_path == nullptr) throw std::runtime_error("server requires a model bank");
     ProductionModel model(model_path);
+    if (fused_config >= 0) run_fused_self_check(model);
     std::printf("CMFD_V4_REPLAY_READY\n");
     std::fflush(stdout);
     std::string line;

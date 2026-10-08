@@ -1,3 +1,6 @@
+// From FreeForgeMiner (https://github.com/pepsykolya/freeforgeminer), MIT License,
+// Copyright (c) 2026 FreeForgeMiner contributors. See THIRD_PARTY_NOTICES.md.
+//
 // FreeForgeMiner: one kernel per ForgeMatrix layer = int8 tensor-core GEMM + layer reduce.
 //
 // A = interleaved limb rows (row 4*cell + limb, K = 4096 contiguous), B = layer weights

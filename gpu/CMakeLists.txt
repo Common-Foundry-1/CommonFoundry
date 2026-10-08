@@ -17,7 +17,7 @@ if(CMFD_ENABLE_CUDA)
   set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
   set(CMFD_PROOF_CUDA_ARCHITECTURES
-    "86-real;89-real"
+    "70-real;75-real;86-real;89-real;120-real;70-virtual"
     CACHE STRING
     "CUDA architectures for the optional Goldilocks proof-acceleration targets"
   )
@@ -73,7 +73,7 @@ if(CMFD_ENABLE_CUDA)
       $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>>:-Xcompiler=/Zc:__cplusplus>
     )
     set_target_properties(cmfd-forgematrix-v2-tensor-core PROPERTIES
-      CUDA_ARCHITECTURES "86-real;89-real"
+      CUDA_ARCHITECTURES "75-real;75-virtual;86-real;89-real;120-real"
       CUDA_RUNTIME_LIBRARY Static
       MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
       POSITION_INDEPENDENT_CODE ON
@@ -116,13 +116,13 @@ if(CMFD_ENABLE_CUDA)
     CMFD_POSEIDON2_BACKEND_LIBRARY=1
   )
   set_target_properties(cmfd-forgematrix-cuda PROPERTIES
-    CUDA_ARCHITECTURES "89"
+    CUDA_ARCHITECTURES "89;120"
   )
   set_target_properties(cmfd-forgematrix-v2-cuda PROPERTIES
-    CUDA_ARCHITECTURES "89"
+    CUDA_ARCHITECTURES "89;120"
   )
   set_target_properties(cmfd-forgematrix-v2-miner PROPERTIES
-    CUDA_ARCHITECTURES "86-real;89-real"
+    CUDA_ARCHITECTURES "70-real;75-real;86-real;89-real;120-real;70-virtual"
     CUDA_RUNTIME_LIBRARY Static
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
     OUTPUT_NAME "cmfd-forgematrix-v2-miner"

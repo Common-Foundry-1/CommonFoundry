@@ -87,6 +87,20 @@ reference, and verify a complete resulting proof separately. These checks are
 not substitutes for physical older-card or accepted-share qualification.
 Broader replay support does not widen the full proof worker's supported targets.
 
+Batched search (`RUNBATCH`) uses a fused kernel on SM80 and newer: one int8
+Tensor Core GEMM per layer with the layer reduce done in registers, so the
+int32 accumulators never reach memory. Per-nonce `RUN search` and `RUN full`
+keep the classic path, so proving is unchanged. Before a `--server` worker
+reports ready, it replays two fixed lanes through both paths on its GPU and
+requires identical final activations (`fused_self_check=EXACT`); any
+difference or failure disables the fused kernel for that process.
+`CMFD_FUSED=-1` forces the classic path and `CMFD_FUSED=<n>` picks a fused tile
+configuration; `CMFD_GEMM=<1..7>` overrides the classic GEMM tile for tuning.
+`RUNBATCHDIGEST` returns 32-byte GPU final-activation digests per lane; the
+miner and pool do not use it until its BLAKE3 is separately qualified. The
+fused kernel and these batch changes come from FreeForgeMiner (MIT, see
+`THIRD_PARTY_NOTICES.md`).
+
 The online proving path is:
 
 1. freeze a canonical template with `cmfd-miner snapshot-v4-template`;

@@ -322,10 +322,11 @@ oldest share has waited `--pool-share-batch-wait-ms` (default 100, at most
 the chain target is replayed in full and proved exactly as before. While
 batching is on, up to N plus `--pool-max-queued-share-verifications` shares
 may wait; beyond that the pool answers `share_verifier_busy`. Batching is
-local to the pool: miners, the protocol and consensus are unchanged. Measure
-on your verifier GPU before relying on it: with the current replay worker a
-batch of 2 checked shares about 1.9 times as fast on an RTX 4090 but gave no
-gain on an RTX 5070 Ti, and larger batches were slower on both.
+local to the pool: miners, the protocol and consensus are unchanged. With the
+fused replay worker a batch of 8 checked about 35 shares per second on an
+RTX 4090 against about 8 one at a time, and about 15 on an RTX 5070 Ti against
+about 6; larger batches gained less. With older replay workers, batches above
+2 are slower, so measure on your verifier GPU.
 
 The pool ledger is written as one JSON snapshot, and the node refuses to load
 or write a snapshot above `--pool-ledger-max-bytes` (default 64 MiB) so a

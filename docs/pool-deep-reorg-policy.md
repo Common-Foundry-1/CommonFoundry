@@ -89,6 +89,9 @@ floating-point CMFD. The tool requires an existing `pool-ledger` below the
 selected node data directory; a typo does not create a new wallet/empty ledger.
 A pool started with `--pool-ledger-max-bytes` needs the same value on both
 commands, or they refuse the oversized snapshot exactly as `pool-serve` would.
+To inspect a copy of a running pool's ledger, copy the two snapshot files
+before the payout guard file, or stop the pool first: a guard copied before a
+newer snapshot is refused as older than or conflicting with that snapshot.
 Library integrations with custom ledger locations must retain that layout or
 provide an equally locked operator workflow.
 

@@ -3642,8 +3642,14 @@ fn handle_connection(stream: TcpStream, shared: Arc<SharedServer>) -> Result<(),
         }
     };
 
-    let session_id = shared.next_session_id.fetch_add(1, Ordering::AcqRel);
-    register_session(&shared.ledger, session_id, worker, payout)?;
+    // A fresh ID is only used when no disconnected session of this worker
+    // and payout can be reconnected; an unused ID leaves a harmless gap.
+    let session_id = register_session(
+        &shared.ledger,
+        shared.next_session_id.fetch_add(1, Ordering::AcqRel),
+        worker,
+        payout,
+    )?;
     let _session_guard = SessionGuard {
         ledger: &shared.ledger,
         worker_telemetry: &shared.worker_telemetry,
@@ -4241,6 +4247,32 @@ fn rotate_if_tip_changed(shared: &Arc<SharedServer>) -> Result<bool, PoolError> 
     Ok(changed)
 }
 
+/// How the chain currently sees a pool block. A block the node no longer
+/// holds is `Unknown` while the chain could still change at its height, and
+/// `Orphaned` once it is at or below the prune point or
+/// `POOL_LEDGER_RETIRE_CONFIRMATIONS` deep, so a block lost with a dropped
+/// branch is retired instead of staying unknown forever.
+fn classify_pool_block(
+    canonical_confirmations: Option<u64>,
+    held_by_node: bool,
+    pruned_height: Option<u64>,
+    chain_height: u64,
+    height: u64,
+) -> (PoolBlockState, u64) {
+    if let Some(confirmations) = canonical_confirmations {
+        (PoolBlockState::Canonical, confirmations)
+    } else if held_by_node
+        // A prune drops side blocks at or below the prune height, and the
+        // active chain there can no longer change.
+        || pruned_height.is_some_and(|pruned| height <= pruned)
+        || chain_height.saturating_sub(height) >= POOL_LEDGER_RETIRE_CONFIRMATIONS
+    {
+        (PoolBlockState::Orphaned, 0)
+    } else {
+        (PoolBlockState::Unknown, 0)
+    }
+}
+
 fn reconcile_pool_blocks(shared: &SharedServer) -> Result<(), PoolError> {
     reconcile_pool_blocks_with_recovery(shared, false)
 }
@@ -4273,20 +4305,18 @@ fn reconcile_pool_blocks_for_node(
         return Ok(());
     }
     let pruned_height = node.prune_height();
+    let chain_height = node.state.next_height().saturating_sub(1);
     let updates = blocks
         .into_iter()
         .map(|(block_id, height)| {
-            if let Some(confirmations) = node.active_chain_confirmations(block_id) {
-                (block_id, PoolBlockState::Canonical, confirmations)
-            } else if node.contains_block(block_id)
-                // A prune drops side blocks at or below the prune height, and
-                // the active chain there can no longer change.
-                || pruned_height.is_some_and(|pruned| height <= pruned)
-            {
-                (block_id, PoolBlockState::Orphaned, 0)
-            } else {
-                (block_id, PoolBlockState::Unknown, 0)
-            }
+            let (state, confirmations) = classify_pool_block(
+                node.active_chain_confirmations(block_id),
+                node.contains_block(block_id),
+                pruned_height,
+                chain_height,
+                height,
+            );
+            (block_id, state, confirmations)
         })
         .collect::<Vec<_>>();
     let (changed, retired) = {
@@ -4772,13 +4802,31 @@ fn current_job(shared: &SharedServer) -> Result<PoolJob, PoolError> {
         .clone())
 }
 
+/// Registers a connection's session and returns its session ID.
+///
+/// A disconnected session with the same worker and payout is reconnected and
+/// keeps its counters, so a miner that reconnects, or opens a short separate
+/// session per card for a developer fee as some miners do, does not add a
+/// session record each time. Only when no such session exists is `session_id`
+/// inserted as a new record.
 fn register_session(
     ledger: &DurableLedger,
     session_id: u64,
     worker: String,
     payout: [u8; 32],
-) -> Result<(), PoolError> {
+) -> Result<u64, PoolError> {
     ledger.transaction(|ledger| {
+        let reusable = ledger.sessions.iter().rev().find_map(|(id, session)| {
+            (!session.connected && session.worker == worker && session.payout == payout)
+                .then_some(*id)
+        });
+        if let Some(existing) = reusable {
+            if let Some(session) = ledger.sessions.get_mut(&existing) {
+                session.connected = true;
+            }
+            ledger.payouts.entry(payout).or_default().last_session_id = existing;
+            return Ok(existing);
+        }
         while ledger.sessions.len() >= POOL_MAX_LEDGER_SESSIONS {
             let inactive = ledger
                 .sessions
@@ -4805,7 +4853,7 @@ fn register_session(
             },
         );
         ledger.payouts.entry(payout).or_default().last_session_id = session_id;
-        Ok(())
+        Ok(session_id)
     })
 }
 
@@ -7146,6 +7194,132 @@ mod tests {
         );
         assert!(dashboard.workers[0].estimated_24h_earnings_atoms.is_some());
         server.stop().unwrap();
+    }
+
+    #[test]
+    fn reconnecting_worker_reuses_its_disconnected_session() {
+        let ledger = DurableLedger::open(None, [0x41; 32], [0x42; 32]).unwrap();
+        let payout = test_payout_signer().payout();
+        let other = PoolPayoutSigner::new(SigningKey::from_bytes(&[0x52; 32]).unwrap()).payout();
+        assert_eq!(
+            register_session(&ledger, 1, "rig".to_owned(), payout).unwrap(),
+            1
+        );
+        credit_accepted_share(&ledger, 1, 5).unwrap();
+        // Still connected: a second connection of the same worker is a new session.
+        assert_eq!(
+            register_session(&ledger, 2, "rig".to_owned(), payout).unwrap(),
+            2
+        );
+        for session in [1, 2] {
+            ledger
+                .transaction(|ledger| {
+                    ledger.sessions.get_mut(&session).unwrap().connected = false;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        // Reconnecting reuses the newest disconnected session of that worker
+        // and payout, with its counters, instead of adding a record.
+        assert_eq!(
+            register_session(&ledger, 3, "rig".to_owned(), payout).unwrap(),
+            2
+        );
+        assert_eq!(
+            register_session(&ledger, 4, "rig".to_owned(), payout).unwrap(),
+            1
+        );
+        // A different worker name or payout never shares a session.
+        assert_eq!(
+            register_session(&ledger, 5, "rig2".to_owned(), payout).unwrap(),
+            5
+        );
+        ledger
+            .transaction(|ledger| {
+                ledger.sessions.get_mut(&1).unwrap().connected = false;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            register_session(&ledger, 6, "rig".to_owned(), other).unwrap(),
+            6
+        );
+        let state = ledger.state.lock().unwrap();
+        assert_eq!(state.sessions.len(), 4);
+        let reused = &state.sessions[&1];
+        assert_eq!((reused.connected, reused.accepted_shares), (false, 1));
+        assert!(state.sessions[&2].connected);
+        // The payout's newest session is the "rig2" one registered last.
+        assert_eq!(state.payouts[&payout].last_session_id, 5);
+    }
+
+    #[test]
+    fn reconnecting_client_gets_its_previous_session_id() {
+        let (_root, server, _node, pin) = server("session-reuse");
+        let first = client(server.local_addr(), pin, "rig");
+        let session = first.session_id();
+        // Two connections of one worker at the same time stay separate.
+        let second = client(server.local_addr(), pin, "rig");
+        let newest = second.session_id();
+        assert_ne!(newest, session);
+        drop(second);
+        drop(first);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let disconnected = server
+                .shared
+                .ledger
+                .state
+                .lock()
+                .unwrap()
+                .sessions
+                .values()
+                .all(|session| !session.connected);
+            if disconnected {
+                break;
+            }
+            assert!(Instant::now() < deadline, "sessions never disconnected");
+            thread::sleep(Duration::from_millis(20));
+        }
+        // The newest disconnected session of that worker comes back.
+        let again = client(server.local_addr(), pin, "rig");
+        assert_eq!(again.session_id(), newest);
+        assert_eq!(server.shared.ledger.state.lock().unwrap().sessions.len(), 2);
+        drop(again);
+        server.stop().unwrap();
+    }
+
+    #[test]
+    fn pool_blocks_the_node_dropped_are_orphaned_once_deep_enough() {
+        let deep = POOL_LEDGER_RETIRE_CONFIRMATIONS;
+        assert_eq!(
+            classify_pool_block(Some(3), false, None, 1_000, 997),
+            (PoolBlockState::Canonical, 3)
+        );
+        assert_eq!(
+            classify_pool_block(None, true, None, 1_000, 999),
+            (PoolBlockState::Orphaned, 0)
+        );
+        assert_eq!(
+            classify_pool_block(None, false, Some(900), 1_000, 900),
+            (PoolBlockState::Orphaned, 0)
+        );
+        // Not held, above the prune point, but deeper than any settled record
+        // could be reorganized: orphaned, so it retires instead of staying
+        // unknown forever.
+        assert_eq!(
+            classify_pool_block(None, false, None, 1_000, 1_000 - deep),
+            (PoolBlockState::Orphaned, 0)
+        );
+        assert_eq!(
+            classify_pool_block(None, false, Some(300), 1_000, 1_000 - deep + 1),
+            (PoolBlockState::Unknown, 0)
+        );
+        // A block above the tip (just submitted) is never deep.
+        assert_eq!(
+            classify_pool_block(None, false, None, 1_000, 1_001),
+            (PoolBlockState::Unknown, 0)
+        );
     }
 
     #[test]

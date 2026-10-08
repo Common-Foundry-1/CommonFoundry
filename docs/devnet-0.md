@@ -262,7 +262,10 @@ unencrypted, unauthenticated protocol.
 The authenticated client hello commits to pool protocol v2, network ID,
 consensus fingerprint, worker label, payout key, and the challenge signature.
 The server then returns a session ID and a job containing an immutable
-`BlockChallenge`, a distinct easier share target, and a server-issued job ID. A
+`BlockChallenge`, a distinct easier share target, and a server-issued job ID.
+A worker that reconnects with the same worker label and payout key gets its
+previous session back, counters included, while no connection of that session
+is open; only a new worker and payout pair adds a session record. A
 share submission contains only that job ID and a nonce. It does not contain a
 trusted work digest or proof.
 

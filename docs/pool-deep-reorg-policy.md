@@ -33,6 +33,11 @@ wallet. It does not approve an actual ledger adjustment or money movement.
 
 - A distributed PPLNS reward that becomes orphaned, unknown, or falls below
   coinbase maturity creates a durable incident for its frozen recipients.
+- A pool block the node no longer holds is `unknown` while the chain could
+  still change at its height. Once it is at or below the prune point, or six
+  coinbase maturities deep, it is treated as orphaned and retires to the
+  archive like any other orphan, so blocks lost with a dropped branch do not
+  stay unknown forever.
 - Holds stop new payments and automatic retries to those recipients. Chain and
   mempool observations still update; already-broadcast payments cannot be recalled.
 - Signed payments retain their exact bytes and credit reservations if their

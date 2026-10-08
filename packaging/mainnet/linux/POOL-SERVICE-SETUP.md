@@ -100,6 +100,10 @@ approved pool GPU still has a compute process. It never stops that process.
    at a time, and `share_batch_wait_ms` (1 to `1000`, default `100`) caps how
    long a share waits for its batch. Leave both out to keep one-at-a-time
    checks; measure before turning batching on (see `docs/devnet-0.md`).
+   The optional `replay_gpus` list (1 to 16 distinct GPU UUIDs, which may
+   include `gpu_uuid`) runs one replay worker per listed GPU so shares are
+   checked on all of them; every listed GPU must be present and idle at
+   start. Leave it out to check shares on `gpu_uuid` alone.
    `automatic_payouts` must be explicitly true; the
    launcher uses the **mainnet-specific** `--enable-mainnet-payouts` flag, never
    `--enable-testnet-payouts`. A runtime without that flag fails closed.

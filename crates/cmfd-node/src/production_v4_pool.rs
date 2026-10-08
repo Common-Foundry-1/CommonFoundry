@@ -11,6 +11,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
@@ -66,6 +67,9 @@ pub struct ProductionV4PoolWorkerCommand {
 #[derive(Debug, Clone)]
 pub struct ProductionV4PoolVerifierConfig {
     pub replay: ProductionV4PoolWorkerCommand,
+    /// More replay workers, usually one per extra GPU. Batches run on all of
+    /// them at once; the first `replay` worker also serves single shares.
+    pub extra_replays: Vec<ProductionV4PoolWorkerCommand>,
     pub proof: ProductionV4PoolWorkerCommand,
     pub scratch_directory: PathBuf,
     pub worker_scratch_directory: String,
@@ -168,10 +172,14 @@ pub fn production_v4_pool_searcher_config(
 #[derive(Debug)]
 pub struct ProductionV4PersistentPoolVerifier {
     searcher: ProductionV4PersistentPoolSearcher,
+    /// Replay workers 1.. (worker 0 is `searcher`), each with its own lock.
+    extra_searchers: Vec<ProductionV4PersistentPoolSearcher>,
     expected_network_id: [u8; 32],
     scratch_directory: PathBuf,
     worker_scratch_directory: String,
     startup_id: [u8; 8],
+    /// Batch scratch-file names, unique across concurrent replay workers.
+    next_batch_attempt: AtomicU64,
     state: Mutex<WorkerState>,
 }
 
@@ -243,6 +251,7 @@ pub fn production_v4_solo_config(
     };
     Ok(ProductionV4PoolVerifierConfig {
         replay: search.replay,
+        extra_replays: Vec::new(),
         proof,
         scratch_directory: search.scratch_directory,
         worker_scratch_directory: search.worker_scratch_directory,
@@ -332,15 +341,37 @@ impl ProductionV4PersistentPoolVerifier {
         validate_expected_network_id(expected_network_id)?;
         validate_scratch_paths(&config.scratch_directory, &config.worker_scratch_directory)?;
         fs::create_dir_all(&config.scratch_directory).map_err(replay_error)?;
-        let searcher = ProductionV4PersistentPoolSearcher::start_for_network(
-            expected_network_id,
-            ProductionV4PoolSearcherConfig {
-                replay: config.replay,
-                scratch_directory: config.scratch_directory.clone(),
-                worker_scratch_directory: config.worker_scratch_directory.clone(),
-                batch_size: 32,
-            },
-        )?;
+        // Every replay worker loads the model on its own GPU; start them together.
+        let start_searcher = |replay: ProductionV4PoolWorkerCommand| {
+            ProductionV4PersistentPoolSearcher::start_for_network(
+                expected_network_id,
+                ProductionV4PoolSearcherConfig {
+                    replay,
+                    scratch_directory: config.scratch_directory.clone(),
+                    worker_scratch_directory: config.worker_scratch_directory.clone(),
+                    batch_size: 32,
+                },
+            )
+        };
+        let (searcher, extra_searchers) = std::thread::scope(|scope| {
+            let extra = config
+                .extra_replays
+                .clone()
+                .into_iter()
+                .map(|replay| scope.spawn(move || start_searcher(replay)))
+                .collect::<Vec<_>>();
+            let first = start_searcher(config.replay.clone());
+            let extra = extra
+                .into_iter()
+                .map(|started| {
+                    started.join().unwrap_or_else(|_| {
+                        Err(pool_replay_failure("replay worker start panicked"))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>();
+            (first, extra)
+        });
+        let (searcher, extra_searchers) = (searcher?, extra_searchers?);
         let proof = PersistentWorker::start(
             &config.proof,
             "CMFD_V4_PROOF_READY",
@@ -350,10 +381,12 @@ impl ProductionV4PersistentPoolVerifier {
         getrandom::fill(&mut startup_id).map_err(replay_error)?;
         Ok(Self {
             searcher,
+            extra_searchers,
             expected_network_id,
             scratch_directory: config.scratch_directory,
             worker_scratch_directory: config.worker_scratch_directory,
             startup_id,
+            next_batch_attempt: AtomicU64::new(0),
             state: Mutex::new(WorkerState {
                 proof,
                 next_attempt: 0,
@@ -475,27 +508,29 @@ impl ProductionV4PersistentPoolVerifier {
         Ok(())
     }
 
-    /// Checks several shares with one `RUNBATCH` replay per 64 shares. A share
-    /// that fails validation, or a lane that meets the chain target, is
-    /// handled exactly as the single-share path would.
-    fn evaluate_batch_locked(
+    fn searcher_for(&self, worker: usize) -> Option<&ProductionV4PersistentPoolSearcher> {
+        match worker {
+            0 => Some(&self.searcher),
+            _ => self.extra_searchers.get(worker - 1),
+        }
+    }
+
+    /// Checks several shares on replay worker `worker`, one `RUNBATCH` per 64
+    /// shares. Only that worker's lock is held while it replays, so batches on
+    /// different GPUs run at the same time. A share that fails validation, or
+    /// a lane that meets the chain target, is handled exactly as the
+    /// single-share path would.
+    fn evaluate_batch_on_worker(
         &self,
-        state: &mut WorkerState,
+        worker: usize,
         shares: &[ProductionV4PoolShareRequest<'_>],
     ) -> Vec<Result<ProductionV4PoolShareEvaluation, PoolError>> {
         let evaluation_started = Instant::now();
-        let mut search_state = match self.searcher.state.lock() {
-            Ok(search_state) => search_state,
-            Err(_) => {
-                return shares
-                    .iter()
-                    .map(|_| {
-                        Err(pool_replay_failure(
-                            "persistent search worker lock is poisoned",
-                        ))
-                    })
-                    .collect();
-            }
+        let Some(searcher) = self.searcher_for(worker) else {
+            return shares
+                .iter()
+                .map(|_| Err(pool_replay_failure("no such pool replay worker")))
+                .collect();
         };
         let mut results = shares.iter().map(|_| None).collect::<Vec<_>>();
         let mut lanes = Vec::with_capacity(shares.len());
@@ -514,7 +549,13 @@ impl ProductionV4PersistentPoolVerifier {
         }
         for chunk in lanes.chunks(PRODUCTION_V4_POOL_SEARCH_MAX_BATCH_SIZE as usize) {
             let search_replay_started = Instant::now();
-            match self.replay_search_batch(state, &mut search_state, chunk) {
+            let replayed = match searcher.state.lock() {
+                Ok(mut search_state) => self.replay_search_batch(&mut search_state, chunk),
+                Err(_) => Err(pool_replay_failure(
+                    "persistent search worker lock is poisoned",
+                )),
+            };
+            match replayed {
                 Ok(final_activations) => {
                     let search_replay_seconds = search_replay_started.elapsed().as_secs_f64();
                     let lane_activations = final_activations
@@ -523,8 +564,7 @@ impl ProductionV4PersistentPoolVerifier {
                         chunk.iter().zip(lane_activations)
                     {
                         results[index] = Some(self.finish_batched_share(
-                            state,
-                            &mut search_state,
+                            searcher,
                             &shares[index],
                             challenge_digest,
                             search_final,
@@ -556,12 +596,10 @@ impl ProductionV4PersistentPoolVerifier {
     /// activations, one lane per share, in order.
     fn replay_search_batch(
         &self,
-        state: &mut WorkerState,
         search_state: &mut SearchWorkerState,
         lanes: &[(usize, [u8; 32])],
     ) -> Result<Vec<u8>, PoolError> {
-        let attempt_number = state.next_attempt;
-        state.next_attempt = state.next_attempt.wrapping_add(1);
+        let attempt_number = self.next_batch_attempt.fetch_add(1, Ordering::Relaxed);
         let files = AttemptFiles {
             scratch_directory: self.scratch_directory.clone(),
             token: format!(
@@ -592,13 +630,13 @@ impl ProductionV4PersistentPoolVerifier {
         read_exact_file(&search_final_path, expected_bytes)
     }
 
-    /// Derives one batched lane's work digest; a chain-winning lane is then
-    /// written out and proved exactly like a single share.
-    #[allow(clippy::too_many_arguments)]
+    /// Derives one batched lane's work digest. A chain-winning lane then takes
+    /// the proof lock and its replay worker's lock, in the same order as the
+    /// single-share path, and is written out and proved exactly like a single
+    /// share.
     fn finish_batched_share(
         &self,
-        state: &mut WorkerState,
-        search_state: &mut SearchWorkerState,
+        searcher: &ProductionV4PersistentPoolSearcher,
         share: &ProductionV4PoolShareRequest<'_>,
         challenge_digest: [u8; 32],
         search_final: &[u8],
@@ -618,6 +656,14 @@ impl ProductionV4PersistentPoolVerifier {
                 chain_proof: None,
             });
         }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| pool_replay_failure("persistent worker lock is poisoned"))?;
+        let mut search_state = searcher
+            .state
+            .lock()
+            .map_err(|_| pool_replay_failure("persistent search worker lock is poisoned"))?;
         let attempt_number = state.next_attempt;
         state.next_attempt = state.next_attempt.wrapping_add(1);
         let files = AttemptFiles {
@@ -643,8 +689,8 @@ impl ProductionV4PersistentPoolVerifier {
             &serde_json::to_vec(&frozen).map_err(replay_error)?,
         )?;
         self.prove_chain_share(
-            state,
-            search_state,
+            &mut state,
+            &mut search_state,
             ChainShare {
                 files: &files,
                 template: share.template,
@@ -923,20 +969,26 @@ impl ProductionV4PoolShareVerifier for ProductionV4PersistentPoolVerifier {
         &self,
         shares: &[ProductionV4PoolShareRequest<'_>],
     ) -> Vec<Result<ProductionV4PoolShareEvaluation, PoolError>> {
-        // A lone share takes the original single-share replay.
-        if shares.len() <= 1 {
+        self.evaluate_batch_on(0, shares)
+    }
+
+    fn replay_workers(&self) -> usize {
+        1 + self.extra_searchers.len()
+    }
+
+    fn evaluate_batch_on(
+        &self,
+        worker: usize,
+        shares: &[ProductionV4PoolShareRequest<'_>],
+    ) -> Vec<Result<ProductionV4PoolShareEvaluation, PoolError>> {
+        // A lone share on the first worker takes the original single-share replay.
+        if worker == 0 && shares.len() <= 1 {
             return shares
                 .iter()
                 .map(|share| self.evaluate(share.template, share.nonce, share.share_target))
                 .collect();
         }
-        match self.state.lock() {
-            Ok(mut state) => self.evaluate_batch_locked(&mut state, shares),
-            Err(_) => shares
-                .iter()
-                .map(|_| Err(pool_replay_failure("persistent worker lock is poisoned")))
-                .collect(),
-        }
+        self.evaluate_batch_on_worker(worker, shares)
     }
 }
 
@@ -1724,21 +1776,142 @@ while read -r line; do [ "$line" = QUIT ] && exit 0; echo CMFD_V4_PROOF_DONE; do
 
     #[cfg(unix)]
     fn batch_test_verifier(label: &str) -> (ProductionV4PersistentPoolVerifier, PathBuf, PathBuf) {
+        let (verifier, scratch, mut logs) = batch_test_verifier_with_workers(label, 1);
+        (verifier, scratch, logs.remove(0))
+    }
+
+    /// A verifier with `workers` fake replay workers, each logging to its own file.
+    #[cfg(unix)]
+    fn batch_test_verifier_with_workers(
+        label: &str,
+        workers: usize,
+    ) -> (ProductionV4PersistentPoolVerifier, PathBuf, Vec<PathBuf>) {
         let scratch = worker_test_path(label);
         let _ = std::fs::remove_dir_all(&scratch);
         std::fs::create_dir_all(&scratch).unwrap();
-        let log = scratch.join("worker.log");
+        let logs = (0..workers)
+            .map(|worker| scratch.join(format!("worker{worker}.log")))
+            .collect::<Vec<_>>();
         let verifier = ProductionV4PersistentPoolVerifier::start_for_network(
             BATCH_TEST_NETWORK_ID,
             ProductionV4PoolVerifierConfig {
-                replay: fake_replay_worker(&log),
+                replay: fake_replay_worker(&logs[0]),
+                extra_replays: logs[1..]
+                    .iter()
+                    .map(|log| fake_replay_worker(log))
+                    .collect(),
                 proof: fake_proof_worker(),
                 scratch_directory: scratch.clone(),
                 worker_scratch_directory: scratch.to_str().unwrap().to_owned(),
             },
         )
         .unwrap();
-        (verifier, scratch, log)
+        (verifier, scratch, logs)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extra_replay_workers_check_batches_at_the_same_time() {
+        let (verifier, scratch, logs) = batch_test_verifier_with_workers("batch-multi", 3);
+        assert_eq!(verifier.replay_workers(), 3);
+        let template = batch_test_template(BATCH_TEST_NETWORK_ID);
+        let nonces = [40_u64, 41, 42, 43, 44, 45];
+        let requests = nonces.map(|nonce| ProductionV4PoolShareRequest {
+            template: &template,
+            nonce,
+            share_target: [0xff; 32],
+        });
+        // Three batches of two, one per worker, all at once.
+        let results = std::thread::scope(|scope| {
+            let handles = (0..3)
+                .map(|worker| {
+                    let chunk = &requests[2 * worker..2 * worker + 2];
+                    let verifier = &verifier;
+                    scope.spawn(move || verifier.evaluate_batch_on(worker, chunk))
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        for (worker, batch) in results.iter().enumerate() {
+            for (lane, result) in batch.iter().enumerate() {
+                let evaluation = result.as_ref().unwrap();
+                assert_eq!(
+                    evaluation.work_digest,
+                    fake_lane_work_digest(&template, nonces[2 * worker + lane], lane as u32 + 1)
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(&logs[worker]).unwrap(),
+                "RUNBATCH 2\n",
+                "worker {worker} ran exactly its own batch"
+            );
+        }
+        // A worker that does not exist fails its shares without touching any worker.
+        for result in verifier.evaluate_batch_on(3, &requests[..2]) {
+            let error = result.unwrap_err();
+            assert!(
+                error.to_string().contains("no such pool replay worker"),
+                "{error}"
+            );
+        }
+        // A lone share on an extra worker still uses that worker's batch path.
+        let lone = verifier
+            .evaluate_batch_on(2, &requests[..1])
+            .pop()
+            .unwrap()
+            .unwrap();
+        assert_eq!(lone.work_digest, fake_lane_work_digest(&template, 40, 1));
+        assert_eq!(
+            std::fs::read_to_string(&logs[2]).unwrap(),
+            "RUNBATCH 2\nRUNBATCH 1\n"
+        );
+        drop(verifier);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_crashed_extra_replay_worker_fails_only_its_own_batch() {
+        let (verifier, scratch, logs) = batch_test_verifier_with_workers("batch-multi-crash", 2);
+        let template = batch_test_template(BATCH_TEST_NETWORK_ID);
+        let requests = [50_u64, 51].map(|nonce| ProductionV4PoolShareRequest {
+            template: &template,
+            nonce,
+            share_target: [0xff; 32],
+        });
+        let crash = PathBuf::from(format!("{}.crash", logs[1].display()));
+        std::fs::write(&crash, b"").unwrap();
+        for result in verifier.evaluate_batch_on(1, &requests) {
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("closed stdout"), "{error}");
+        }
+        // Worker 0 is unaffected, and worker 1 restarts for its next batch.
+        for (lane, result) in verifier
+            .evaluate_batch_on(0, &requests)
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(
+                result.unwrap().work_digest,
+                fake_lane_work_digest(&template, requests[lane].nonce, lane as u32 + 1)
+            );
+        }
+        std::fs::remove_file(&crash).unwrap();
+        for (lane, result) in verifier
+            .evaluate_batch_on(1, &requests)
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(
+                result.unwrap().work_digest,
+                fake_lane_work_digest(&template, requests[lane].nonce, lane as u32 + 1)
+            );
+        }
+        drop(verifier);
+        let _ = std::fs::remove_dir_all(scratch);
     }
 
     /// A template whose chain target nothing meets, so no lane needs a proof.
@@ -1869,7 +2042,7 @@ while read -r line; do [ "$line" = QUIT ] && exit 0; echo CMFD_V4_PROOF_DONE; do
     /// ```text
     /// CMFD_HW_REPLAY_WORKER=…/cmfd-v4-replay CMFD_HW_PROOF_WORKER=…/real_bank0_relations \
     /// CMFD_HW_MODEL_BANK=…/MODEL-V2.bank CMFD_HW_FIXED_DIR=…/production-v4/fixed \
-    /// CMFD_HW_SCRATCH=/abs/scratch [CMFD_HW_PROVE=1] \
+    /// CMFD_HW_SCRATCH=/abs/scratch [CMFD_HW_PROVE=1] [CMFD_HW_EXTRA_GPUS=1,2] \
     ///   <test binary> --ignored real_gpu_batched_replay --nocapture
     /// ```
     ///
@@ -1884,7 +2057,18 @@ while read -r line; do [ "$line" = QUIT ] && exit 0; echo CMFD_V4_PROOF_DONE; do
             PathBuf::from(std::env::var_os(name).unwrap_or_else(|| panic!("{name} is required")))
         };
         let prove = std::env::var("CMFD_HW_PROVE").as_deref() == Ok("1");
-        let config = if prove {
+        // CMFD_HW_EXTRA_GPUS: comma-separated CUDA devices that each run one
+        // more replay worker; batches then run on every worker at once.
+        let extra_gpus = std::env::var("CMFD_HW_EXTRA_GPUS")
+            .ok()
+            .map(|list| {
+                list.split(',')
+                    .filter(|device| !device.is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut config = if prove {
             production_v4_solo_config(
                 &path("CMFD_HW_REPLAY_WORKER"),
                 &path("CMFD_HW_PROOF_WORKER"),
@@ -1907,12 +2091,29 @@ while read -r line; do [ "$line" = QUIT ] && exit 0; echo CMFD_V4_PROOF_DONE; do
             .unwrap();
             ProductionV4PoolVerifierConfig {
                 replay: search.replay,
+                extra_replays: Vec::new(),
                 proof: fake_proof_worker(),
                 scratch_directory: search.scratch_directory,
                 worker_scratch_directory: search.worker_scratch_directory,
             }
         };
+        for gpu in &extra_gpus {
+            let mut replay = config.replay.clone();
+            replay.environment = vec![(
+                "CUDA_VISIBLE_DEVICES".into(),
+                production_v4_worker_cuda_visible_device(Some(gpu))
+                    .unwrap()
+                    .into(),
+            )];
+            config.extra_replays.push(replay);
+        }
+        let started = Instant::now();
         let verifier = ProductionV4PersistentPoolVerifier::start(config).unwrap();
+        eprintln!(
+            "{} replay worker(s) ready in {:.1} s",
+            verifier.replay_workers(),
+            started.elapsed().as_secs_f64()
+        );
         let mut template = batch_test_template(COMPILED_NETWORK_PROFILE.network_id);
         let nonces = (0..32_u64)
             .map(|index| 0x5eed_0000 + index * 7_919)
@@ -1960,6 +2161,56 @@ while read -r line; do [ "$line" = QUIT ] && exit 0; echo CMFD_V4_PROOF_DONE; do
                 "batch {size}: {:.2} shares/s ({:.1}x), lanes identical",
                 nonces.len() as f64 / seconds,
                 single_seconds / seconds
+            );
+        }
+
+        let workers = verifier.replay_workers();
+        if workers > 1 {
+            // Every worker checks the same 32 nonces in batches of 8, all at
+            // the same time; each must match the one-share replays exactly.
+            let requests = nonces
+                .iter()
+                .map(|&nonce| ProductionV4PoolShareRequest {
+                    template: &template,
+                    nonce,
+                    share_target: [0xff; 32],
+                })
+                .collect::<Vec<_>>();
+            let started = Instant::now();
+            let per_worker = std::thread::scope(|scope| {
+                (0..workers)
+                    .map(|worker| {
+                        let (verifier, requests) = (&verifier, &requests);
+                        scope.spawn(move || {
+                            let worker_started = Instant::now();
+                            let digests = requests
+                                .chunks(8)
+                                .flat_map(|chunk| verifier.evaluate_batch_on(worker, chunk))
+                                .map(|result| result.unwrap().work_digest)
+                                .collect::<Vec<_>>();
+                            (digests, worker_started.elapsed().as_secs_f64())
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            let seconds = started.elapsed().as_secs_f64();
+            for (worker, (digests, worker_seconds)) in per_worker.iter().enumerate() {
+                assert_eq!(
+                    digests, &single,
+                    "worker {worker} differs from one-share replays"
+                );
+                eprintln!(
+                    "worker {worker}: {:.2} shares/s alone, lanes identical",
+                    nonces.len() as f64 / worker_seconds
+                );
+            }
+            eprintln!(
+                "{workers} workers together: {:.2} shares/s ({:.1}x one worker at batch 8)",
+                (workers * nonces.len()) as f64 / seconds,
+                (workers * nonces.len()) as f64 / seconds / (nonces.len() as f64 / per_worker[0].1)
             );
         }
 

@@ -97,6 +97,7 @@ fn real_5x_proofs_two_nodes_and_restart() {
                 arguments: vec!["--server".into(), model.as_os_str().to_owned()],
                 environment: vec![],
             },
+            extra_replays: Vec::new(),
             proof: ProductionV4PoolWorkerCommand {
                 program: proof_worker,
                 arguments: vec![

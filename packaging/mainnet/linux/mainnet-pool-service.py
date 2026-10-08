@@ -56,13 +56,16 @@ CONFIG_FIELDS = {"schema", "public_numeric_ip", "private_bind_ip", "mainnet_seed
 # Optional: shares replayed together in one GPU batch, as `--pool-share-batch-size`
 # (node default 1 = no batching), and the longest a share waits for its batch,
 # as `--pool-share-batch-wait-ms` (node default 100).
+# Optional: GPU UUIDs that each run one replay (share check) worker, as
+# `--production-v4-pool-replay-gpu`; left out, one replay worker uses gpu_uuid.
 OPTIONAL_FIELDS = {"mainnet_relays", "prune_keep_blocks", "pool_ledger_max_bytes",
-                   "share_batch_size", "share_batch_wait_ms"}
+                   "share_batch_size", "share_batch_wait_ms", "replay_gpus"}
 MIN_PRUNE_KEEP_BLOCKS = 288
 MIN_POOL_LEDGER_MAX_BYTES = 1024 * 1024
 MAX_POOL_LEDGER_MAX_BYTES = 1024 * 1024 * 1024
 MAX_SHARE_BATCH_SIZE = 64
 MAX_SHARE_BATCH_WAIT_MS = 1000
+MAX_REPLAY_GPUS = 16
 MAX_RELAYS = 8
 COMPETING_UNITS = (
     "commonfoundry-pool-public.service", "commonfoundry-pool-ai01.service",
@@ -204,6 +207,12 @@ def validate_config(config: dict) -> dict:
                            ("share_batch_wait_ms", MAX_SHARE_BATCH_WAIT_MS)):
         if field in config and (type(config[field]) is not int or not 1 <= config[field] <= maximum):
             raise PreflightError(f"{field} must be an integer from 1 to {maximum}")
+    if "replay_gpus" in config:
+        gpus = config["replay_gpus"]
+        if (type(gpus) is not list or not 1 <= len(gpus) <= MAX_REPLAY_GPUS
+                or any(not isinstance(gpu, str) or not GPU_UUID.fullmatch(gpu) for gpu in gpus)
+                or len(set(gpus)) != len(gpus)):
+            raise PreflightError(f"replay_gpus must list 1 to {MAX_REPLAY_GPUS} distinct NVIDIA GPU UUIDs")
     for fresh, old in (("expected_tls_certificate_sha256", "forbidden_rc_certificate_sha256"),
                        ("expected_tls_private_key_sha256", "forbidden_rc_private_key_sha256")):
         if config[fresh] == config[old]:
@@ -423,6 +432,8 @@ def build_command(root: Path, state: Path, credential_base: Path, config: dict) 
           if "share_batch_size" in config else ()),
         *(("--pool-share-batch-wait-ms", str(config["share_batch_wait_ms"]))
           if "share_batch_wait_ms" in config else ()),
+        *(argument for gpu in config.get("replay_gpus", ())
+          for argument in ("--production-v4-pool-replay-gpu", gpu)),
     ]
 
 
@@ -444,7 +455,8 @@ def preflight(config_path: Path, root: Path, state: Path, config_base: Path, ins
         raise PreflightError("on-disk mainnet launch plan differs from native pinned launch info")
     check_artifacts(root, config, bank, record)
     data, scratch = check_state(state, config)
-    check_gpu(config["gpu_uuid"])
+    for gpu in (config["gpu_uuid"], *config.get("replay_gpus", ())):
+        check_gpu(gpu)
     return config, data, scratch
 
 
@@ -488,7 +500,8 @@ def main() -> int:
     regular(ROOT / "production-mainnet/LAUNCH-BEACON.json", "verified launch-beacon sidecar")
     # The node independently revalidates this beacon and compiled plan before opening state.
     check_competing_services()
-    check_gpu_idle(config["gpu_uuid"])
+    for gpu in {config["gpu_uuid"], *config.get("replay_gpus", ())}:
+        check_gpu_idle(gpu)
     write_marker(STATE, config)
     environment = dict(os.environ, CUDA_VISIBLE_DEVICES=config["gpu_uuid"],
                        RAYON_NUM_THREADS=str(config["worker_threads"]),

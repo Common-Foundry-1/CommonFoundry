@@ -328,6 +328,15 @@ RTX 4090 against about 8 one at a time, and about 15 on an RTX 5070 Ti against
 about 6; larger batches gained less. With older replay workers, batches above
 2 are slower, so measure on your verifier GPU.
 
+A pool with several GPUs can check shares on all of them. Each
+`--production-v4-pool-replay-gpu <device>` (a CUDA device index or GPU UUID,
+repeatable) starts one replay worker pinned to that GPU, and the batch threads
+take batches from one queue, so the workers run side by side. The proof worker
+and single-share replays stay on the pool's own GPU. Omitting the flag keeps
+one replay worker on the pool's GPU; it is not available under WSL. Every
+replay worker loads the model bank on its GPU, so each listed GPU needs the
+replay worker's memory, and startup takes about as long as one model load.
+
 The pool ledger is written as one JSON snapshot, and the node refuses to load
 or write a snapshot above `--pool-ledger-max-bytes` (default 64 MiB) so a
 corrupt or runaway file cannot exhaust memory. A pool with thousands of

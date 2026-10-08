@@ -391,6 +391,21 @@ pub trait ProductionV4PoolShareVerifier: fmt::Debug + Send + Sync {
             .map(|share| self.evaluate(share.template, share.nonce, share.share_target))
             .collect()
     }
+
+    /// Replay workers that can check batches at the same time, one per GPU.
+    fn replay_workers(&self) -> usize {
+        1
+    }
+
+    /// [`Self::evaluate_batch`] on replay worker `worker` (`0..replay_workers()`).
+    fn evaluate_batch_on(
+        &self,
+        worker: usize,
+        shares: &[ProductionV4PoolShareRequest<'_>],
+    ) -> Vec<Result<ProductionV4PoolShareEvaluation, PoolError>> {
+        let _ = worker;
+        self.evaluate_batch(shares)
+    }
 }
 
 /// One share handed to [`ProductionV4PoolShareVerifier::evaluate_batch`].
@@ -2526,14 +2541,17 @@ struct BatchedShare<P> {
 }
 
 impl<P> ShareBatcher<P> {
-    /// `max_queued` shares may wait beyond the batch being collected.
-    fn new(batch_size: usize, max_wait: Duration, max_queued: usize) -> Self {
+    /// Each of `workers` batch threads collects up to `batch_size` shares;
+    /// `max_queued` more may wait beyond those.
+    fn new(batch_size: usize, max_wait: Duration, max_queued: usize, workers: usize) -> Self {
         Self {
             queue: Mutex::new(VecDeque::new()),
             ready: Condvar::new(),
             batch_size,
             max_wait,
-            capacity: batch_size.saturating_add(max_queued),
+            capacity: batch_size
+                .saturating_mul(workers.max(1))
+                .saturating_add(max_queued),
         }
     }
 
@@ -2736,7 +2754,7 @@ pub struct PoolServerHandle {
     address: SocketAddr,
     shared: Arc<SharedServer>,
     thread: Option<JoinHandle<Result<(), PoolError>>>,
-    share_batch_thread: Option<JoinHandle<Result<(), PoolError>>>,
+    share_batch_threads: Vec<JoinHandle<Result<(), PoolError>>>,
 }
 
 #[derive(Clone)]
@@ -3100,10 +3118,13 @@ impl PoolServerHandle {
             Some(thread) => thread.join().map_err(|_| PoolError::ThreadPanicked)?,
             None => Ok(()),
         };
-        let batch_result = match self.share_batch_thread.take() {
-            Some(thread) => thread.join().map_err(|_| PoolError::ThreadPanicked)?,
-            None => Ok(()),
-        };
+        let mut batch_result = Ok(());
+        for thread in self.share_batch_threads.drain(..) {
+            let result = thread.join().map_err(|_| PoolError::ThreadPanicked)?;
+            if batch_result.is_ok() {
+                batch_result = result;
+            }
+        }
         socket_result?;
         thread_result?;
         batch_result
@@ -3167,6 +3188,10 @@ pub fn spawn_pool_server(
     if config.share_batch_size > 1 && config.production_v4_share_verifier.is_none() {
         return Err(PoolError::ShareBatchingUnsupported);
     }
+    let replay_workers = config
+        .production_v4_share_verifier
+        .as_ref()
+        .map_or(1, |verifier| verifier.replay_workers().max(1));
     validate_ledger_size_limit(config.ledger_max_bytes)?;
     if let Some(policy) = config.payout_policy {
         if policy.minimum_payout_atoms == 0
@@ -3257,11 +3282,12 @@ pub fn spawn_pool_server(
             config.max_concurrent_share_verifications,
             config.max_queued_share_verifications,
         ),
-        share_batcher: (config.share_batch_size > 1).then(|| {
+        share_batcher: (config.share_batch_size > 1 || replay_workers > 1).then(|| {
             ShareBatcher::new(
                 config.share_batch_size,
                 config.share_batch_wait,
                 config.max_queued_share_verifications,
+                replay_workers,
             )
         }),
         next_connection_id: AtomicU64::new(0),
@@ -3283,17 +3309,18 @@ pub fn spawn_pool_server(
     });
     reconcile_pool_blocks_with_recovery(&shared, true)?;
     reconcile_pool_payouts(&shared, true)?;
-    let share_batch_thread = match &shared.share_batcher {
-        Some(_) => {
+    // One batch thread per replay worker, all taking batches from one queue.
+    let mut share_batch_threads = Vec::new();
+    if shared.share_batcher.is_some() {
+        for worker in 0..replay_workers {
             let runtime = Arc::clone(&shared);
-            Some(
+            share_batch_threads.push(
                 thread::Builder::new()
-                    .name("cmfd-pool-share-batch".to_owned())
-                    .spawn(move || run_share_batches(&runtime))?,
-            )
+                    .name(format!("cmfd-pool-share-batch-{worker}"))
+                    .spawn(move || run_share_batches(&runtime, worker))?,
+            );
         }
-        None => None,
-    };
+    }
     let runtime = Arc::clone(&shared);
     let thread = thread::Builder::new()
         .name("cmfd-pool-listener".to_owned())
@@ -3302,12 +3329,12 @@ pub fn spawn_pool_server(
         address,
         shared,
         thread: Some(thread),
-        share_batch_thread,
+        share_batch_threads,
     })
 }
 
-/// The batch thread: replays queued shares together on the pool's verifier.
-fn run_share_batches(shared: &SharedServer) -> Result<(), PoolError> {
+/// A batch thread: replays queued shares together on replay worker `worker`.
+fn run_share_batches(shared: &SharedServer, worker: usize) -> Result<(), PoolError> {
     let (Some(batcher), Some(verifier)) = (
         &shared.share_batcher,
         shared.production_v4_share_verifier.as_deref(),
@@ -3324,8 +3351,9 @@ fn run_share_batches(shared: &SharedServer) -> Result<(), PoolError> {
             })
             .collect::<Vec<_>>();
         let started = Instant::now();
-        let results = verifier.evaluate_batch(&requests);
+        let results = verifier.evaluate_batch_on(worker, &requests);
         tracing::debug!(
+            worker,
             shares = batch.len(),
             seconds = started.elapsed().as_secs_f64(),
             "pool share batch checked"
@@ -7437,7 +7465,7 @@ mod tests {
         // Batching is off by default: no queue and no batch thread.
         let server = spawn_pool_server(Arc::clone(&node), config()).unwrap();
         assert!(server.shared.share_batcher.is_none());
-        assert!(server.share_batch_thread.is_none());
+        assert!(server.share_batch_threads.is_empty());
         server.stop().unwrap();
 
         let mut queued = config();
@@ -7456,8 +7484,63 @@ mod tests {
     }
 
     #[test]
+    fn share_batcher_spreads_batches_over_several_runners() {
+        // Two runners; each batch takes long enough that both must work at once.
+        let batcher = Arc::new(ShareBatcher::<u64>::new(2, Duration::from_millis(20), 0, 2));
+        let stop = Arc::new(AtomicBool::new(false));
+        assert_eq!(batcher.capacity, 4, "room for one batch per runner");
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let runners = (0..2)
+            .map(|_| {
+                let (batcher, stop, active, peak) = (
+                    Arc::clone(&batcher),
+                    Arc::clone(&stop),
+                    Arc::clone(&active),
+                    Arc::clone(&peak),
+                );
+                thread::spawn(move || {
+                    batcher.run(&stop, |batch| {
+                        let now = active.fetch_add(1, Ordering::AcqRel) + 1;
+                        peak.fetch_max(now, Ordering::AcqRel);
+                        thread::sleep(Duration::from_millis(300));
+                        active.fetch_sub(1, Ordering::AcqRel);
+                        batch
+                            .iter()
+                            .map(|share| batch_result(share.nonce))
+                            .collect()
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        let started = Instant::now();
+        let submitters = (1..=4_u64)
+            .map(|nonce| {
+                let (batcher, stop) = (Arc::clone(&batcher), Arc::clone(&stop));
+                thread::spawn(move || batcher.submit(&stop, 0, nonce).unwrap())
+            })
+            .collect::<Vec<_>>();
+        for (nonce, submitter) in (1..=4_u64).zip(submitters) {
+            let evaluation = submitter.join().unwrap().expect("share was checked");
+            assert_eq!(evaluation.work_digest, [nonce as u8; 32]);
+        }
+        // Two batches of two, checked side by side: well under two batch times.
+        assert!(
+            started.elapsed() < Duration::from_millis(550),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(peak.load(Ordering::Acquire), 2);
+        stop.store(true, Ordering::Release);
+        batcher.wake();
+        for runner in runners {
+            runner.join().unwrap().unwrap();
+        }
+    }
+
+    #[test]
     fn share_batcher_checks_concurrent_shares_together() {
-        let batcher = Arc::new(ShareBatcher::<u64>::new(4, Duration::from_secs(1), 8));
+        let batcher = Arc::new(ShareBatcher::<u64>::new(4, Duration::from_secs(1), 8, 1));
         let stop = Arc::new(AtomicBool::new(false));
         let sizes = Arc::new(Mutex::new(Vec::new()));
         let runner = {
@@ -7491,7 +7574,7 @@ mod tests {
 
     #[test]
     fn share_batcher_runs_a_partial_batch_after_the_wait() {
-        let batcher = Arc::new(ShareBatcher::<u64>::new(8, Duration::from_millis(50), 8));
+        let batcher = Arc::new(ShareBatcher::<u64>::new(8, Duration::from_millis(50), 8, 1));
         let stop = Arc::new(AtomicBool::new(false));
         let sizes = Arc::new(Mutex::new(Vec::new()));
         let runner = {
@@ -7524,7 +7607,7 @@ mod tests {
     #[test]
     fn share_batcher_reports_busy_when_full_or_stopping() {
         // Room for one batch of two and no extra queue; nothing is running it.
-        let batcher = Arc::new(ShareBatcher::<u64>::new(2, Duration::from_secs(1), 0));
+        let batcher = Arc::new(ShareBatcher::<u64>::new(2, Duration::from_secs(1), 0, 1));
         let stop = Arc::new(AtomicBool::new(false));
         let waiting = (1..=2_u64)
             .map(|nonce| {
@@ -7546,7 +7629,7 @@ mod tests {
 
     #[test]
     fn share_batcher_fails_only_the_batch_that_panicked() {
-        let batcher = Arc::new(ShareBatcher::<u64>::new(1, Duration::from_millis(1), 4));
+        let batcher = Arc::new(ShareBatcher::<u64>::new(1, Duration::from_millis(1), 4, 1));
         let stop = Arc::new(AtomicBool::new(false));
         let runner = {
             let (batcher, stop) = (Arc::clone(&batcher), Arc::clone(&stop));
@@ -7576,7 +7659,7 @@ mod tests {
 
     #[test]
     fn share_batcher_rejects_a_wrong_result_count() {
-        let batcher = Arc::new(ShareBatcher::<u64>::new(1, Duration::from_millis(1), 4));
+        let batcher = Arc::new(ShareBatcher::<u64>::new(1, Duration::from_millis(1), 4, 1));
         let stop = Arc::new(AtomicBool::new(false));
         let runner = {
             let (batcher, stop) = (Arc::clone(&batcher), Arc::clone(&stop));

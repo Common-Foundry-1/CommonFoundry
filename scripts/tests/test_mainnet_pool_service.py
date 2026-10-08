@@ -213,6 +213,38 @@ class MainnetPoolServiceTests(unittest.TestCase):
                     self.preflight()
             self.config[field] = 8
 
+    def test_optional_replay_gpus_become_replay_gpu_flags_and_are_checked(self):
+        config, _, _ = self.preflight()
+        with mock.patch.object(pool, "CONFIG_BASE", self.config_base):
+            command = pool.build_command(self.root, self.state, self.credential_base, config)
+        self.assertNotIn("--production-v4-pool-replay-gpu", command)
+        gpus = ["GPU-11111111-2222-3333-4444-555555555555",
+                "GPU-66666666-7777-8888-9999-aaaaaaaaaaaa"]
+        self.config["replay_gpus"] = gpus
+        self.save_config()
+        actual_regular = pool.regular
+        def no_owner_check(path, label, *, static=False):
+            return actual_regular(path, label, static=False)
+        with mock.patch.object(pool, "CONFIG_BASE", self.config_base), \
+             mock.patch.object(pool, "regular", side_effect=no_owner_check), \
+             mock.patch.object(pool, "native_launch_info", return_value=self.info), \
+             mock.patch.object(pool, "check_gpu") as check_gpu:
+            config, _, _ = pool.preflight(self.config_path, self.root, self.state, self.config_base,
+                                          self.install, self.credential_base)
+        self.assertEqual([call.args[0] for call in check_gpu.call_args_list],
+                         [self.config["gpu_uuid"], *gpus])
+        with mock.patch.object(pool, "CONFIG_BASE", self.config_base):
+            command = pool.build_command(self.root, self.state, self.credential_base, config)
+        flagged = [command[index + 1] for index, value in enumerate(command)
+                   if value == "--production-v4-pool-replay-gpu"]
+        self.assertEqual(flagged, gpus)
+        for bad in ([], gpus[:1] * 2, ["0"], ["GPU-short"], "GPU-11111111-2222-3333-4444-555555555555",
+                    [gpus[0]] * 17, [1], None):
+            self.config["replay_gpus"] = bad
+            self.save_config()
+            with self.assertRaisesRegex(pool.PreflightError, "replay_gpus"):
+                self.preflight()
+
     def test_placeholder_or_legacy_payout_config_fails_closed(self):
         self.config["operator_fee_bps"] = "SET_APPROVED_MAINNET_VALUE"
         self.save_config()

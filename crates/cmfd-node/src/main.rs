@@ -813,6 +813,11 @@ enum Command {
         /// Absolute native path to the persistent ProductionV4 CUDA replay worker.
         #[arg(long)]
         production_v4_pool_replay_worker: Option<PathBuf>,
+        /// Run one replay (share check) worker on this GPU, a CUDA device index
+        /// or GPU UUID. Repeat to check shares on several GPUs at once. Omit to
+        /// run one replay worker on the pool's own GPU.
+        #[arg(long = "production-v4-pool-replay-gpu")]
+        production_v4_pool_replay_gpus: Vec<String>,
         /// Absolute native path to the persistent ProductionV4 proof worker.
         #[arg(long)]
         production_v4_pool_proof_worker: Option<PathBuf>,
@@ -2022,6 +2027,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             miner,
             share_leading_zero_bits,
             production_v4_pool_replay_worker,
+            production_v4_pool_replay_gpus,
             production_v4_pool_proof_worker,
             production_v4_pool_scratch,
             production_v4_pool_wsl_distribution,
@@ -2159,6 +2165,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &mut config,
                 production_v4_artifacts.as_ref(),
                 production_v4_pool_replay_worker.as_ref(),
+                &production_v4_pool_replay_gpus,
                 production_v4_pool_proof_worker.as_ref(),
                 production_v4_pool_scratch.as_ref(),
                 production_v4_pool_wsl_distribution.as_deref(),
@@ -2202,6 +2209,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "max_queued_share_verifications": pool_max_queued_share_verifications,
                     "share_batch_size": pool_share_batch_size,
                     "share_batch_wait_ms": pool_share_batch_wait_ms,
+                    "replay_gpus": production_v4_pool_replay_gpus,
                     "ledger_max_bytes": pool_ledger_max_bytes,
                     "dashboard": dashboard.as_ref().map(|dashboard| format!("http://{}", dashboard.local_addr())),
                     "used_insecure_default_miner": used_insecure_default_miner,
@@ -2511,11 +2519,13 @@ fn configure_production_v4_pool_verifier(
     config: &mut PoolServerConfig,
     artifacts: Option<&ProductionV4VerifierArtifacts>,
     replay_worker: Option<&PathBuf>,
+    replay_gpus: &[String],
     proof_worker: Option<&PathBuf>,
     scratch_directory: Option<&PathBuf>,
     wsl_distribution: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let supplied = replay_worker.is_some()
+        || !replay_gpus.is_empty()
         || proof_worker.is_some()
         || scratch_directory.is_some()
         || wsl_distribution.is_some();
@@ -2547,7 +2557,23 @@ fn configure_production_v4_pool_verifier(
             .fixed_record
             .parent()
             .ok_or("ProductionV4 fixed artifact record has no parent directory")?;
+        // One replay worker per listed GPU, each pinned with its own
+        // CUDA_VISIBLE_DEVICES; none listed keeps one worker on the pool's GPU.
+        let replay_command = |device: Option<String>| ProductionV4PoolWorkerCommand {
+            program: replay_worker.clone(),
+            arguments: vec!["--server".into(), artifacts.bank.as_os_str().to_owned()],
+            environment: device
+                .map(|device| ("CUDA_VISIBLE_DEVICES".into(), device.into()))
+                .into_iter()
+                .collect(),
+        };
+        let mut extra_replays = Vec::new();
         let (replay, proof, worker_scratch_directory) = match wsl_distribution {
+            Some(_) if !replay_gpus.is_empty() => {
+                return Err(
+                    "--production-v4-pool-replay-gpu needs a native Linux pool, not WSL".into(),
+                );
+            }
             Some(distribution) => production_v4_wsl_pool_workers(
                 distribution,
                 &replay_worker,
@@ -2557,10 +2583,22 @@ fn configure_production_v4_pool_verifier(
                 &scratch_directory,
             )?,
             None => (
-                ProductionV4PoolWorkerCommand {
-                    program: replay_worker,
-                    arguments: vec!["--server".into(), artifacts.bank.as_os_str().to_owned()],
-                    environment: vec![],
+                match replay_gpus.split_first() {
+                    None => replay_command(None),
+                    Some((first, rest)) => {
+                        for gpu in rest {
+                            extra_replays.push(replay_command(Some(
+                                cmfd_node::production_v4_pool::production_v4_worker_cuda_visible_device(
+                                    Some(gpu),
+                                )?,
+                            )));
+                        }
+                        replay_command(Some(
+                            cmfd_node::production_v4_pool::production_v4_worker_cuda_visible_device(
+                                Some(first),
+                            )?,
+                        ))
+                    }
                 },
                 ProductionV4PoolWorkerCommand {
                     program: proof_worker,
@@ -2578,6 +2616,7 @@ fn configure_production_v4_pool_verifier(
         };
         let verifier = ProductionV4PersistentPoolVerifier::start(ProductionV4PoolVerifierConfig {
             replay,
+            extra_replays,
             proof,
             scratch_directory,
             worker_scratch_directory,

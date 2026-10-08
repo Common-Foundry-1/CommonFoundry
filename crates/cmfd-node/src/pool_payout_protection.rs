@@ -347,6 +347,100 @@ fn coverage(node: &Node, ledger: &Ledger, fee_atoms: u64) -> Result<Coverage, Po
     })
 }
 
+/// Lifts holds the chain has since contradicted, without an operator: a
+/// reward block that is canonical and mature again, a payout confirmed
+/// `COINBASE_MATURITY` deep, or a funding shortfall once mature funds cover
+/// every outstanding credit again. Like a manual reconcile it first requires
+/// full coverage, and it records the same receipt with an automatic note.
+/// Legacy-payment incidents always wait for an operator.
+pub(super) fn auto_resolve(
+    ledger: &DurableLedger,
+    node: &Node,
+    fee_atoms: u64,
+) -> Result<(), PoolError> {
+    let has_candidates = ledger
+        .state
+        .lock()
+        .map_err(|_| PoolError::SharedStatePoisoned)?
+        .payout_protection
+        .incidents
+        .iter()
+        .any(|i| i.resolution.is_none() && i.reason != Reason::LegacyPaymentUncertain);
+    if !has_candidates {
+        return Ok(());
+    }
+    ledger.transaction(|state| {
+        let funds = coverage(node, state, fee_atoms)?;
+        if funds.assets < funds.required {
+            return Ok(());
+        }
+        let cleared = state
+            .payout_protection
+            .incidents
+            .iter()
+            .filter(|incident| incident.resolution.is_none())
+            .filter_map(|incident| {
+                let note = match incident.reason {
+                    Reason::RewardBackingLost => {
+                        let block = state.blocks.get(&incident.block_id?)?;
+                        (block.state == PoolBlockState::Canonical
+                            && block.confirmations >= COINBASE_MATURITY)
+                            .then(|| {
+                                format!(
+                                    "automatic: reward block canonical again with {} confirmations",
+                                    block.confirmations
+                                )
+                            })?
+                    }
+                    Reason::MissingPayoutFunding => {
+                        let record = state.payout_transactions.get(&incident.payout_txid?)?;
+                        (record.state == PoolPayoutTransactionState::Confirmed
+                            && record.confirmations >= COINBASE_MATURITY)
+                            .then(|| {
+                                format!(
+                                    "automatic: payout confirmed with {} confirmations",
+                                    record.confirmations
+                                )
+                            })?
+                    }
+                    Reason::FundingShortfall => {
+                        "automatic: mature funds cover every outstanding credit again".to_owned()
+                    }
+                    Reason::LegacyPaymentUncertain => return None,
+                };
+                Some((incident.id, note))
+            })
+            .collect::<Vec<_>>();
+        if cleared.is_empty() {
+            return Ok(());
+        }
+        let receipt = Resolution {
+            tip: node.state.tip(),
+            height: node.state.next_height().saturating_sub(1),
+            at: unix_time_seconds()?,
+            prior_generation: state.generation,
+            mature_assets: funds.assets,
+            required_assets: funds.required,
+            operator_note: String::new(),
+        };
+        for (id, note) in cleared {
+            if let Some(incident) = state
+                .payout_protection
+                .incidents
+                .iter_mut()
+                .find(|incident| incident.id == id)
+            {
+                tracing::info!(incident = id, reason = ?incident.reason, %note, "pool payout hold lifted");
+                incident.resolution = Some(Resolution {
+                    operator_note: note,
+                    ..receipt.clone()
+                });
+            }
+        }
+        Ok(())
+    })
+}
+
 pub(super) fn check_funding(
     ledger: &DurableLedger,
     node: &Node,

@@ -4605,6 +4605,7 @@ fn reconcile_pool_payouts(shared: &SharedServer, create_new: bool) -> Result<(),
     reconcile_pool_blocks_for_node(&shared.ledger, &node, true)?;
     payout_protection::refresh_payment_states(&shared.ledger, &mut node)?;
     payout_protection::check_funding(&shared.ledger, &node, policy.fee_atoms)?;
+    payout_protection::auto_resolve(&shared.ledger, &node, policy.fee_atoms)?;
     let records = shared
         .ledger
         .state

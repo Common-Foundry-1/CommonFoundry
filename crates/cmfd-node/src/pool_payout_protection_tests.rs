@@ -520,3 +520,70 @@ fn legacy_abandoned_signatures_are_held_and_never_automatically_replaced() {
         120
     );
 }
+
+#[test]
+fn payout_hold_lifts_itself_once_the_payout_is_confirmed_deep_enough() {
+    let root = TestRoot::new("payout-hold-auto-clear");
+    let mut node =
+        Node::open_with_profile(root.path().join("node"), crate::DEVNET_PROFILE).unwrap();
+    let owner = node.wallet_destination();
+    let now = unix_time_seconds().unwrap();
+    for offset in 0..COINBASE_MATURITY + 2 {
+        node.mine_once(owner, now + offset, 10_000).unwrap();
+    }
+    let recipient = test_payout_signer().payout();
+    let ledger = protection_ledger(&node);
+    register_session(&ledger, 1, "affected".into(), recipient).unwrap();
+    credit_accepted_share(&ledger, 1, 120).unwrap();
+    let (signed, _) = node.prepare_dev_wallet_payment(recipient, 120, 1).unwrap();
+    let txid = signed.txid();
+    let set_payment = |state: PoolPayoutTransactionState, confirmations: u64| {
+        ledger
+            .transaction(|ledger| {
+                ledger.payout_transactions.insert(
+                    txid,
+                    PayoutTransactionRecord {
+                        payout: recipient,
+                        amount_atoms: 120,
+                        fee_atoms: 1,
+                        transaction: signed.clone(),
+                        state,
+                        confirmations,
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+    };
+    set_payment(PoolPayoutTransactionState::Prepared, 0);
+    payout_protection::missing_funding(&ledger, &node, txid).unwrap();
+    let held = |ledger: &DurableLedger| {
+        let state = ledger.state.lock().unwrap();
+        payout_protection::snapshot(&state)
+            .affected_payouts
+            .contains(&hex::encode(recipient))
+    };
+    assert!(held(&ledger));
+
+    // Confirmed, but not yet COINBASE_MATURITY deep: the hold stays.
+    set_payment(PoolPayoutTransactionState::Confirmed, COINBASE_MATURITY - 1);
+    payout_protection::auto_resolve(&ledger, &node, 1).unwrap();
+    assert!(held(&ledger));
+
+    // Deep enough: the hold lifts with an automatic receipt that passes the
+    // same validation as an operator's reconcile.
+    set_payment(PoolPayoutTransactionState::Confirmed, COINBASE_MATURITY);
+    payout_protection::auto_resolve(&ledger, &node, 1).unwrap();
+    assert!(!held(&ledger));
+    let snapshot = {
+        let state = ledger.state.lock().unwrap();
+        validate_ledger(&state).unwrap();
+        payout_protection::snapshot(&state)
+    };
+    assert!(!snapshot.requires_reconciliation);
+    assert_eq!(snapshot.resolved_incidents, 1);
+    // Nothing left to do on the next pass.
+    let generation = ledger.state.lock().unwrap().generation;
+    payout_protection::auto_resolve(&ledger, &node, 1).unwrap();
+    assert_eq!(ledger.state.lock().unwrap().generation, generation);
+}

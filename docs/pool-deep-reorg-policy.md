@@ -33,6 +33,12 @@ wallet. It does not approve an actual ledger adjustment or money movement.
 
 - A distributed PPLNS reward that becomes orphaned, unknown, or falls below
   coinbase maturity creates a durable incident for its frozen recipients.
+- A hold lifts itself once the chain contradicts it: a reward block that is
+  canonical and mature again, a payout confirmed `COINBASE_MATURITY` deep, or
+  a funding shortfall once mature funds cover every outstanding credit. The
+  pool first requires full funding coverage, exactly as a manual reconcile
+  does, and records the same receipt with an "automatic:" note. Legacy
+  abandoned-payment incidents still wait for an operator.
 - Reconciliation, incidents and automatic payouts wait while the node is below
   the chain height the ledger last reconciled against, as after a restart on a
   node that is still catching up. Fewer confirmations from a node that is

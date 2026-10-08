@@ -85,6 +85,19 @@ pub struct PoolPayoutProtectionReport {
     pub automatic_payout_fee_atoms: String,
     pub blocking_signed_transactions: Vec<String>,
     pub legacy_abandoned_transactions_require_review: bool,
+    /// Dry run of the next automatic payout run at this minimum: every
+    /// payment it would make, in order, without signing or sending anything.
+    /// Absent when no minimum was given.
+    pub planned_payout_minimum_atoms: Option<String>,
+    pub planned_payouts: Vec<PlannedPayoutView>,
+    pub planned_payout_atoms: String,
+    pub planned_payout_fees_atoms: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PlannedPayoutView {
+    pub payout: String,
+    pub amount_atoms: String,
 }
 
 pub struct PoolPayoutReconciliationRequest {
@@ -608,13 +621,34 @@ fn report(
     node: &Node,
     ledger: &DurableLedger,
     fee_atoms: u64,
+    minimum_payout_atoms: Option<u64>,
 ) -> Result<PoolPayoutProtectionReport, PoolError> {
     let state = ledger
         .state
         .lock()
         .map_err(|_| PoolError::SharedStatePoisoned)?;
     let funds = coverage(node, &state, fee_atoms)?;
+    let planned = match minimum_payout_atoms {
+        Some(minimum) => super::payout_candidates(&state, minimum)?,
+        None => Vec::new(),
+    };
+    let planned_atoms = planned.iter().try_fold(0_u64, |total, (_, amount)| {
+        checked_ledger_add(total, *amount, "planned payouts")
+    })?;
+    let planned_fees = (planned.len() as u64)
+        .checked_mul(fee_atoms)
+        .ok_or_else(|| PoolError::LedgerCorrupt("planned payout fees overflow".into()))?;
     Ok(PoolPayoutProtectionReport {
+        planned_payout_minimum_atoms: minimum_payout_atoms.map(|value| value.to_string()),
+        planned_payouts: planned
+            .iter()
+            .map(|(payout, amount)| PlannedPayoutView {
+                payout: hex::encode(payout),
+                amount_atoms: amount.to_string(),
+            })
+            .collect(),
+        planned_payout_atoms: planned_atoms.to_string(),
+        planned_payout_fees_atoms: planned_fees.to_string(),
         schema: "CommonFoundry/PoolPayoutProtection/v1",
         network_id: hex::encode(node.params.network_id),
         chain_tip: hex::encode(node.state.tip()),
@@ -679,20 +713,27 @@ pub fn inspect_pool_payout_protection(
     node: &mut Node,
     fee_atoms: u64,
 ) -> Result<PoolPayoutProtectionReport, PoolError> {
-    inspect_pool_payout_protection_with_limit(node, fee_atoms, DEFAULT_POOL_LEDGER_MAX_BYTES)
+    inspect_pool_payout_protection_with_limit(
+        node,
+        fee_atoms,
+        DEFAULT_POOL_LEDGER_MAX_BYTES,
+        DEFAULT_POOL_MINIMUM_PAYOUT_ATOMS,
+    )
 }
 
-/// `inspect_pool_payout_protection` for a pool run with `--pool-ledger-max-bytes`.
+/// `inspect_pool_payout_protection` for a pool run with `--pool-ledger-max-bytes`
+/// and `--pool-minimum-payout-atoms`; the minimum selects the dry-run payouts.
 pub fn inspect_pool_payout_protection_with_limit(
     node: &mut Node,
     fee_atoms: u64,
     ledger_max_bytes: usize,
+    minimum_payout_atoms: u64,
 ) -> Result<PoolPayoutProtectionReport, PoolError> {
     let ledger = open_operator_ledger(node, fee_atoms, ledger_max_bytes)?;
     reconcile_pool_blocks_for_node(&ledger, node, true)?;
     refresh_payment_states(&ledger, node)?;
     check_funding(&ledger, node, fee_atoms)?;
-    report(node, &ledger, fee_atoms)
+    report(node, &ledger, fee_atoms, Some(minimum_payout_atoms))
 }
 
 /// Resolve the currently reported holds only when all credits/fees are backed
@@ -736,7 +777,7 @@ pub fn reconcile_pool_payout_protection_with_limit(
     reconcile_pool_blocks_for_node(&ledger, node, true)?;
     refresh_payment_states(&ledger, node)?;
     check_funding(&ledger, node, request.fee_atoms)?;
-    let before = report(node, &ledger, request.fee_atoms)?;
+    let before = report(node, &ledger, request.fee_atoms, None)?;
     if before.ledger_generation != request.expected_ledger_generation {
         return Err(PoolError::Reconciliation(
             "new accounting changes were detected; inspect again".into(),
@@ -775,7 +816,7 @@ pub fn reconcile_pool_payout_protection_with_limit(
         }
         Ok(())
     })?;
-    report(node, &ledger, request.fee_atoms)
+    report(node, &ledger, request.fee_atoms, None)
 }
 
 pub(super) fn validate(ledger: &Ledger) -> Result<(), PoolError> {

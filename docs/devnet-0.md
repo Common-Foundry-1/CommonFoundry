@@ -334,7 +334,10 @@ about 6; larger batches gained less. With older replay workers, batches above
 A pool with several GPUs can check shares on all of them. Each
 `--production-v4-pool-replay-gpu <device>` (a CUDA device index or GPU UUID,
 repeatable) starts one replay worker pinned to that GPU, and the batch threads
-take batches from one queue, so the workers run side by side. The proof worker
+take batches from one queue, so the workers run side by side. A batch whose
+replay worker fails outright is handed to the next worker once before its
+shares are rejected (with one worker, to the same worker after its restart);
+a batch that ran into the worker deadline is not retried. The proof worker
 and single-share replays stay on the pool's own GPU. Omitting the flag keeps
 one replay worker on the pool's GPU; it is not available under WSL. Every
 replay worker loads the model bank on its GPU, so each listed GPU needs the

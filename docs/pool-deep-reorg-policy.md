@@ -60,9 +60,10 @@ wallet. It does not approve an actual ledger adjustment or money movement.
   Only mature, pool-owned chain UTXOs count. Inputs committed to unrelated
   mempool transactions or exchange withdrawal reservations do not count.
   Insufficient shared funding creates a pool-wide automatic payout hold.
-- Unaffected recipients can continue when the pool is fully backed. Restored
-  funding or a restart alone never clears an existing hold. No credit is debited,
-  no future miner levy is applied, and no fee setting is changed.
+- Unaffected recipients can continue when the pool is fully backed. A hold
+  clears only when the chain contradicts it (above) or through a manual
+  reconcile; a restart alone never clears one. No credit is debited, no future
+  miner levy is applied, and no fee setting is changed.
 - The public dashboard shows holds, unreserved held credit and reserved pending
   payments. It does not expose operator notes or offer a resume button.
 
@@ -78,7 +79,11 @@ wallet. It does not approve an actual ledger adjustment or money movement.
 3. Inspect the reported network, chain tip, ledger generation, affected recipients,
    shortfall and `blocking_signed_transactions`. A local node may be behind its
    peers: synchronize normally before stopping for final inspection, and check
-   the expected network tip independently.
+   the expected network tip independently. `planned_payouts` is a dry run of
+   the next automatic payout run at `--pool-minimum-payout-atoms` (pass the
+   service's value): each recipient and amount in the order the pool would pay
+   them, with the totals in `planned_payout_atoms` and
+   `planned_payout_fees_atoms`. Nothing is signed or sent.
 4. Reconcile funding and signed-payment history. A separate, explicitly authorized
    operator top-up may be needed. This command does **not** fund the wallet or
    authorize an external transfer. Sync any newly confirmed funding, stop, and
@@ -94,7 +99,7 @@ Command skeletons (replace angle-bracket placeholders; include the service's
 normal global model/verifier/wallet options before the subcommand):
 
 ```text
-cmfd-node --data-dir <existing-pool-data> <runtime-options> pool-payout-status --pool-payout-fee-atoms <configured-fee-atoms>
+cmfd-node --data-dir <existing-pool-data> <runtime-options> pool-payout-status --pool-payout-fee-atoms <configured-fee-atoms> --pool-minimum-payout-atoms <configured-minimum-atoms>
 
 cmfd-node --data-dir <existing-pool-data> <runtime-options> pool-payout-reconcile --pool-payout-fee-atoms <configured-fee-atoms> --expected-tip <64-hex-inspected-tip> --expected-ledger-generation <inspected-generation> --note "Reviewed funding and outstanding signed payments" --acknowledge-reconciliation
 ```

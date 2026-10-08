@@ -102,6 +102,9 @@ const POOL_ACCEPT_POLL: Duration = Duration::from_millis(25);
 const POOL_SHARE_VERIFICATION_WAIT: Duration = Duration::from_secs(5);
 /// How often batch waits re-check the stop flag.
 const POOL_SHARE_BATCH_POLL: Duration = Duration::from_millis(200);
+/// A batch whose replay worker failed this quickly (a crash, not a hang) is
+/// handed to another worker once before its shares are failed.
+const POOL_SHARE_BATCH_RETRY_WINDOW: Duration = Duration::from_secs(60);
 const POOL_SHARE_RATE_BURST: u32 = 8;
 const POOL_SHARE_RATE_INTERVAL: Duration = Duration::from_millis(250);
 const POOL_SOURCE_FAILURE_LIMIT: u32 = 4;
@@ -3359,7 +3362,7 @@ fn run_share_batches(shared: &SharedServer, worker: usize) -> Result<(), PoolErr
             })
             .collect::<Vec<_>>();
         let started = Instant::now();
-        let results = verifier.evaluate_batch_on(worker, &requests);
+        let results = evaluate_batch_with_retry(verifier, worker, &requests);
         tracing::debug!(
             worker,
             shares = batch.len(),
@@ -3368,6 +3371,46 @@ fn run_share_batches(shared: &SharedServer, worker: usize) -> Result<(), PoolErr
         );
         results
     })
+}
+
+/// Checks a batch on `worker`; shares that failed because the replay worker
+/// failed are retried once on the next worker (or the same one, restarted,
+/// when there is only one) if the failure came quickly. A hang that ran into
+/// the worker deadline is not retried: its miners have already moved on.
+fn evaluate_batch_with_retry(
+    verifier: &dyn ProductionV4PoolShareVerifier,
+    worker: usize,
+    requests: &[ProductionV4PoolShareRequest<'_>],
+) -> Vec<Result<ProductionV4PoolShareEvaluation, PoolError>> {
+    let started = Instant::now();
+    let mut results = verifier.evaluate_batch_on(worker, requests);
+    let failed = results
+        .iter()
+        .enumerate()
+        .filter(|(_, result)| matches!(result, Err(PoolError::ProductionV4Replay(_))))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if failed.is_empty() || started.elapsed() >= POOL_SHARE_BATCH_RETRY_WINDOW {
+        return results;
+    }
+    let retry_worker = (worker + 1) % verifier.replay_workers().max(1);
+    tracing::warn!(
+        worker,
+        retry_worker,
+        shares = failed.len(),
+        "pool share batch failed on its replay worker; retrying once"
+    );
+    let retry = failed
+        .iter()
+        .map(|&index| requests[index])
+        .collect::<Vec<_>>();
+    for (index, result) in failed
+        .into_iter()
+        .zip(verifier.evaluate_batch_on(retry_worker, &retry))
+    {
+        results[index] = result;
+    }
+    results
 }
 
 fn ensure_pool_profile_supported(
@@ -4777,8 +4820,22 @@ fn next_payout_candidate(
         .state
         .lock()
         .map_err(|_| PoolError::SharedStatePoisoned)?;
-    let totals = payout_transaction_totals(&ledger)?;
-    let held = payout_protection::holds(&ledger);
+    Ok(payout_candidates(&ledger, policy.minimum_payout_atoms)?
+        .into_iter()
+        .next())
+}
+
+/// Every payout the automatic run would make next, in the order it makes
+/// them: unheld identities whose unreserved credit reaches the minimum, each
+/// paid its whole available amount. The offline status report lists these as
+/// a dry run.
+fn payout_candidates(
+    ledger: &Ledger,
+    minimum_payout_atoms: u64,
+) -> Result<Vec<([u8; 32], u64)>, PoolError> {
+    let totals = payout_transaction_totals(ledger)?;
+    let held = payout_protection::holds(ledger);
+    let mut candidates = Vec::new();
     for payout in ledger.payouts.keys().copied() {
         if held.blocks(payout) {
             continue;
@@ -4788,11 +4845,11 @@ fn next_payout_candidate(
         let available = credited.checked_sub(reserved).ok_or_else(|| {
             PoolError::LedgerCorrupt("reserved payout exceeds earned credit".to_owned())
         })?;
-        if available >= policy.minimum_payout_atoms {
-            return Ok(Some((payout, available)));
+        if available >= minimum_payout_atoms {
+            candidates.push((payout, available));
         }
     }
-    Ok(None)
+    Ok(candidates)
 }
 
 fn payout_available_atoms(ledger: &Ledger, payout: [u8; 32]) -> Result<u64, PoolError> {
@@ -7778,6 +7835,89 @@ mod tests {
             work_digest: [nonce as u8; 32],
             chain_proof: None,
         })
+    }
+
+    /// A verifier with two replay workers; worker 1 always fails with the
+    /// replay-worker error, worker 0 answers.
+    #[derive(Debug)]
+    struct FlakyWorkerVerifier {
+        calls: Mutex<Vec<(usize, usize)>>,
+        failure: fn() -> PoolError,
+    }
+
+    impl ProductionV4PoolShareVerifier for FlakyWorkerVerifier {
+        fn evaluate(
+            &self,
+            _template: &crate::BlockTemplate,
+            nonce: u64,
+            _share_target: [u8; 32],
+        ) -> Result<ProductionV4PoolShareEvaluation, PoolError> {
+            batch_result(nonce)
+        }
+
+        fn replay_workers(&self) -> usize {
+            2
+        }
+
+        fn evaluate_batch_on(
+            &self,
+            worker: usize,
+            shares: &[ProductionV4PoolShareRequest<'_>],
+        ) -> Vec<Result<ProductionV4PoolShareEvaluation, PoolError>> {
+            self.calls.lock().unwrap().push((worker, shares.len()));
+            shares
+                .iter()
+                .map(|share| {
+                    if worker == 1 {
+                        Err((self.failure)())
+                    } else {
+                        batch_result(share.nonce)
+                    }
+                })
+                .collect()
+        }
+    }
+
+    #[test]
+    fn a_batch_whose_worker_failed_is_retried_once_on_the_next_worker() {
+        let template = production_v4_share_template();
+        let requests = [1_u64, 2, 3].map(|nonce| ProductionV4PoolShareRequest {
+            template: &template,
+            nonce,
+            share_target: [0xff; 32],
+        });
+        let verifier = FlakyWorkerVerifier {
+            calls: Mutex::new(Vec::new()),
+            failure: || PoolError::ProductionV4Replay("worker crashed".to_owned()),
+        };
+        let results = evaluate_batch_with_retry(&verifier, 1, &requests);
+        let digests = results
+            .into_iter()
+            .map(|result| result.unwrap().work_digest)
+            .collect::<Vec<_>>();
+        assert_eq!(digests, vec![[1; 32], [2; 32], [3; 32]]);
+        // The failed batch went to worker 1, then once to worker 0.
+        assert_eq!(*verifier.calls.lock().unwrap(), vec![(1, 3), (0, 3)]);
+
+        // A healthy worker is not retried, and a failure that is not the
+        // replay worker's (here: no verifier for the profile) is final.
+        verifier.calls.lock().unwrap().clear();
+        assert!(
+            evaluate_batch_with_retry(&verifier, 0, &requests)
+                .into_iter()
+                .all(|result| result.is_ok())
+        );
+        assert_eq!(*verifier.calls.lock().unwrap(), vec![(0, 3)]);
+        let final_failure = FlakyWorkerVerifier {
+            calls: Mutex::new(Vec::new()),
+            failure: || PoolError::ProductionV4Unsupported,
+        };
+        assert!(
+            evaluate_batch_with_retry(&final_failure, 1, &requests)
+                .into_iter()
+                .all(|result| matches!(result, Err(PoolError::ProductionV4Unsupported)))
+        );
+        assert_eq!(*final_failure.calls.lock().unwrap(), vec![(1, 3)]);
     }
 
     #[test]

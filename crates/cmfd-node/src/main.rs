@@ -749,6 +749,10 @@ enum Command {
         /// Use the same ledger size limit as pool-serve.
         #[arg(long, default_value_t = DEFAULT_POOL_LEDGER_MAX_BYTES)]
         pool_ledger_max_bytes: usize,
+        /// Use the same minimum as pool-serve; the report lists the payouts the
+        /// next automatic run would make at it, without sending anything.
+        #[arg(long, default_value_t = DEFAULT_POOL_MINIMUM_PAYOUT_ATOMS)]
+        pool_minimum_payout_atoms: u64,
     },
     /// Resolve funded payout holds offline without sending or replacing payments.
     PoolPayoutReconcile {
@@ -1918,6 +1922,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::PoolPayoutStatus {
             pool_payout_fee_atoms,
             pool_ledger_max_bytes,
+            pool_minimum_payout_atoms,
         } => {
             let mut node = open_node(
                 &cli.data_dir,
@@ -1931,6 +1936,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &mut node,
                 pool_payout_fee_atoms,
                 pool_ledger_max_bytes,
+                pool_minimum_payout_atoms,
             )?;
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
@@ -3428,6 +3434,25 @@ mod tests {
             ])
             .is_ok()
         );
+        let Ok(Cli {
+            command:
+                Command::PoolPayoutStatus {
+                    pool_minimum_payout_atoms,
+                    ..
+                },
+            ..
+        }) = Cli::try_parse_from([
+            "cmfd-node",
+            "pool-payout-status",
+            "--pool-payout-fee-atoms",
+            "1",
+            "--pool-minimum-payout-atoms",
+            "250",
+        ])
+        else {
+            unreachable!()
+        };
+        assert_eq!(pool_minimum_payout_atoms, 250);
         let tip = "11".repeat(32);
         let arguments = [
             "cmfd-node",

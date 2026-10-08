@@ -365,6 +365,14 @@ fn payout_hold_is_scoped_and_wallet_planner_keeps_signed_inputs_reserved() {
     );
     assert!(!report.protection.all_payouts_paused);
     assert!(report.blocking_signed_transactions.is_empty());
+    // The dry run lists only the unheld, unreserved credit the next automatic
+    // run would pay, at the configured minimum.
+    assert_eq!(report.planned_payout_minimum_atoms.as_deref(), Some("100"));
+    assert_eq!(report.planned_payouts.len(), 1);
+    assert_eq!(report.planned_payouts[0].payout, hex::encode(other));
+    assert_eq!(report.planned_payouts[0].amount_atoms, "130");
+    assert_eq!(report.planned_payout_atoms, "130");
+    assert_eq!(report.planned_payout_fees_atoms, "1");
     // Funds committed to another custody flow do not back pool liabilities.
     let unavailable = node
         .state
@@ -407,6 +415,9 @@ fn payout_hold_is_scoped_and_wallet_planner_keeps_signed_inputs_reserved() {
     let resumed = reconcile_pool_payout_protection(&mut node, protection_request(&report)).unwrap();
     assert!(!resumed.protection.requires_reconciliation);
     assert!(node.mempool.is_empty());
+    // Reconciliation reports no dry run: it has no payout minimum.
+    assert!(resumed.planned_payout_minimum_atoms.is_none());
+    assert!(resumed.planned_payouts.is_empty());
 }
 
 #[test]

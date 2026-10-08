@@ -200,7 +200,8 @@ reservations are preserved; affected new payments/retries pause, and a shared
 funding shortfall pauses all automatic payouts. Restart or restored backing does
 not clear a hold. Offline `pool-payout-status` and `pool-payout-reconcile` commands
 provide exact-tip/generation and funding-checked operator recovery without
-sending payments. See [the operator procedure and storage restrictions](pool-deep-reorg-policy.md).
+sending payments; the status report also lists the next automatic payout run
+as a dry run. See [the operator procedure and storage restrictions](pool-deep-reorg-policy.md).
 This source change still requires packaging/rehearsal and an authorized upgrade;
 it has not changed the running RC pool.
 

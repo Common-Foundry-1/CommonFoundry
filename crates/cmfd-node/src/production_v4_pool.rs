@@ -751,7 +751,9 @@ impl ProductionV4PersistentPoolVerifier {
             ));
         }
         let proof_started = Instant::now();
-        state.proof.invoke(
+        // A chain-winning share is rare and valuable: one proof-worker crash
+        // (for example a GPU allocation failure) gets one restart and retry.
+        state.proof.invoke_retrying_once(
             &[
                 "RUN".to_owned(),
                 self.worker_path(&template_path)?,
@@ -1018,6 +1020,27 @@ impl PersistentWorker {
 
     fn invoke(&mut self, fields: &[String], done_marker: &str) -> Result<(), PoolError> {
         self.invoke_with_timeout(fields, done_marker, WORKER_COMMAND_TIMEOUT)
+    }
+
+    /// Runs a command and, if the worker fails, restarts it and runs the same
+    /// command once more. For rare, valuable requests such as the proof of a
+    /// chain-winning share, where one worker crash must not cost the block.
+    fn invoke_retrying_once(
+        &mut self,
+        fields: &[String],
+        done_marker: &str,
+    ) -> Result<(), PoolError> {
+        match self.invoke(fields, done_marker) {
+            Ok(()) => Ok(()),
+            Err(first) => {
+                tracing::warn!(
+                    worker = self.label,
+                    error = %first,
+                    "pool worker failed on a request that is retried once after a restart"
+                );
+                self.invoke(fields, done_marker)
+            }
+        }
     }
 
     fn invoke_with_timeout(
@@ -1670,6 +1693,41 @@ done"#;
         assert!(worker.process.is_none());
         worker.invoke(&fields("job"), "DONE").unwrap();
         assert_eq!(worker.restarts, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn request_is_retried_once_after_a_worker_crash() {
+        let marker = worker_test_path("retry-once");
+        let _ = std::fs::remove_file(&marker);
+        let script = r#"echo READY
+while read -r line; do
+  [ "$line" = QUIT ] && exit 0
+  if [ ! -e "$1" ]; then touch "$1"; exit 3; fi
+  echo DONE
+done"#;
+        let command = ProductionV4PoolWorkerCommand {
+            program: PathBuf::from("/bin/sh"),
+            arguments: vec![
+                "-c".into(),
+                script.into(),
+                "fake-retry".into(),
+                marker.as_os_str().to_owned(),
+            ],
+            environment: Vec::new(),
+        };
+        let mut worker = PersistentWorker::start(&command, "READY", "test worker").unwrap();
+        worker.invoke_retrying_once(&fields("job"), "DONE").unwrap();
+        assert_eq!(worker.restarts, 1);
+        assert!(worker.process.is_some());
+        let _ = std::fs::remove_file(&marker);
+
+        // A worker that keeps failing still fails the request after one retry.
+        let command = fake_worker(&worker_test_path("retry-crash-unused"));
+        let mut worker = PersistentWorker::start(&command, "READY", "test worker").unwrap();
+        worker.invoke_retrying_once(&fields("CRASH"), "DONE").unwrap_err();
+        assert_eq!(worker.restarts, 1);
+        assert!(worker.process.is_none());
     }
 
     #[cfg(unix)]

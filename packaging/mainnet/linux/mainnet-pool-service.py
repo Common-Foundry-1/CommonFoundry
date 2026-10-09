@@ -58,11 +58,14 @@ CONFIG_FIELDS = {"schema", "public_numeric_ip", "private_bind_ip", "mainnet_seed
 # as `--pool-share-batch-wait-ms` (node default 100).
 # Optional: GPU UUIDs that each run one replay (share check) worker, as
 # `--production-v4-pool-replay-gpu`; left out, one replay worker uses gpu_uuid.
+# Optional: `proof_gpu`, the GPU UUID the proof worker runs on, as
+# `--production-v4-pool-proof-gpu`; left out, the proof worker uses gpu_uuid. On
+# 16 GB cards it must be a GPU that is not in replay_gpus.
 # Optional: miner connection limits, as `--pool-max-connections` (node default 256,
 # up to 4096) and `--pool-max-connections-per-source` (node default 64, up to 256).
 OPTIONAL_FIELDS = {"mainnet_relays", "prune_keep_blocks", "pool_ledger_max_bytes",
                    "share_batch_size", "share_batch_wait_ms", "replay_gpus",
-                   "max_connections", "max_connections_per_source"}
+                   "max_connections", "max_connections_per_source", "proof_gpu"}
 MIN_PRUNE_KEEP_BLOCKS = 288
 MIN_POOL_LEDGER_MAX_BYTES = 1024 * 1024
 MAX_POOL_LEDGER_MAX_BYTES = 1024 * 1024 * 1024
@@ -214,6 +217,9 @@ def validate_config(config: dict) -> dict:
                            ("max_connections_per_source", MAX_POOL_CONNECTIONS_PER_SOURCE)):
         if field in config and (type(config[field]) is not int or not 1 <= config[field] <= maximum):
             raise PreflightError(f"{field} must be an integer from 1 to {maximum}")
+    if "proof_gpu" in config and (not isinstance(config["proof_gpu"], str)
+                                 or not GPU_UUID.fullmatch(config["proof_gpu"])):
+        raise PreflightError("proof_gpu must be one exact NVIDIA GPU UUID")
     if "replay_gpus" in config:
         gpus = config["replay_gpus"]
         if (type(gpus) is not list or not 1 <= len(gpus) <= MAX_REPLAY_GPUS
@@ -441,6 +447,7 @@ def build_command(root: Path, state: Path, credential_base: Path, config: dict) 
           if "share_batch_wait_ms" in config else ()),
         *(argument for gpu in config.get("replay_gpus", ())
           for argument in ("--production-v4-pool-replay-gpu", gpu)),
+        *(("--production-v4-pool-proof-gpu", config["proof_gpu"]) if "proof_gpu" in config else ()),
         *(("--pool-max-connections", str(config["max_connections"]))
           if "max_connections" in config else ()),
         *(("--pool-max-connections-per-source", str(config["max_connections_per_source"]))
@@ -466,7 +473,8 @@ def preflight(config_path: Path, root: Path, state: Path, config_base: Path, ins
         raise PreflightError("on-disk mainnet launch plan differs from native pinned launch info")
     check_artifacts(root, config, bank, record)
     data, scratch = check_state(state, config)
-    for gpu in (config["gpu_uuid"], *config.get("replay_gpus", ())):
+    for gpu in (config["gpu_uuid"], *config.get("replay_gpus", ()),
+                *([config["proof_gpu"]] if "proof_gpu" in config else [])):
         check_gpu(gpu)
     return config, data, scratch
 
@@ -511,7 +519,8 @@ def main() -> int:
     regular(ROOT / "production-mainnet/LAUNCH-BEACON.json", "verified launch-beacon sidecar")
     # The node independently revalidates this beacon and compiled plan before opening state.
     check_competing_services()
-    for gpu in {config["gpu_uuid"], *config.get("replay_gpus", ())}:
+    for gpu in {config["gpu_uuid"], *config.get("replay_gpus", ()),
+                *([config["proof_gpu"]] if "proof_gpu" in config else [])}:
         check_gpu_idle(gpu)
     write_marker(STATE, config)
     environment = dict(os.environ, CUDA_VISIBLE_DEVICES=config["gpu_uuid"],

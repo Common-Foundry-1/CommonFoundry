@@ -140,6 +140,13 @@ credit, and payout status. The dashboard is deliberately loopback-only. Publish
 it through an authenticated reverse proxy or tunnel if remote viewing is
 needed.
 
+The proof worker runs on the pool process's default CUDA device unless
+`--production-v4-pool-proof-gpu` names a GPU (`proof_gpu` in `pool.json`). A
+proof needs about 7 GiB of free VRAM while a replay worker keeps about 6.5 GiB
+resident, so on 16 GB cards the proof GPU must not also run a replay worker;
+the pool logs a warning when it does. A proof-worker failure on a chain-winning
+share is retried once after the worker restarts.
+
 `pool-serve` accepts 256 simultaneous miner connections by default and at most
 64 from one source address. Change them with `--pool-max-connections` (1 to
 4096) and `--pool-max-connections-per-source` (1 to 256); the service

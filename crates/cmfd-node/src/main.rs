@@ -823,6 +823,12 @@ enum Command {
         /// run one replay worker on the pool's own GPU.
         #[arg(long = "production-v4-pool-replay-gpu")]
         production_v4_pool_replay_gpus: Vec<String>,
+        /// Run the proof worker on this GPU, a CUDA device index or GPU UUID.
+        /// Omit to use the pool process's default CUDA device. A proof needs
+        /// about 7 GiB of free VRAM, so on 16 GB cards give it a GPU that runs
+        /// no replay worker.
+        #[arg(long)]
+        production_v4_pool_proof_gpu: Option<String>,
         /// Absolute native path to the persistent ProductionV4 proof worker.
         #[arg(long)]
         production_v4_pool_proof_worker: Option<PathBuf>,
@@ -2038,6 +2044,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             share_leading_zero_bits,
             production_v4_pool_replay_worker,
             production_v4_pool_replay_gpus,
+            production_v4_pool_proof_gpu,
             production_v4_pool_proof_worker,
             production_v4_pool_scratch,
             production_v4_pool_wsl_distribution,
@@ -2178,6 +2185,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 production_v4_artifacts.as_ref(),
                 production_v4_pool_replay_worker.as_ref(),
                 &production_v4_pool_replay_gpus,
+                production_v4_pool_proof_gpu.as_deref(),
                 production_v4_pool_proof_worker.as_ref(),
                 production_v4_pool_scratch.as_ref(),
                 production_v4_pool_wsl_distribution.as_deref(),
@@ -2223,6 +2231,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "share_batch_size": pool_share_batch_size,
                     "share_batch_wait_ms": pool_share_batch_wait_ms,
                     "replay_gpus": production_v4_pool_replay_gpus,
+                    "proof_gpu": production_v4_pool_proof_gpu,
                     "ledger_max_bytes": pool_ledger_max_bytes,
                     "dashboard": dashboard.as_ref().map(|dashboard| format!("http://{}", dashboard.local_addr())),
                     "used_insecure_default_miner": used_insecure_default_miner,
@@ -2533,12 +2542,14 @@ fn configure_production_v4_pool_verifier(
     artifacts: Option<&ProductionV4VerifierArtifacts>,
     replay_worker: Option<&PathBuf>,
     replay_gpus: &[String],
+    proof_gpu: Option<&str>,
     proof_worker: Option<&PathBuf>,
     scratch_directory: Option<&PathBuf>,
     wsl_distribution: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let supplied = replay_worker.is_some()
         || !replay_gpus.is_empty()
+        || proof_gpu.is_some()
         || proof_worker.is_some()
         || scratch_directory.is_some()
         || wsl_distribution.is_some();
@@ -2582,9 +2593,9 @@ fn configure_production_v4_pool_verifier(
         };
         let mut extra_replays = Vec::new();
         let (replay, proof, worker_scratch_directory) = match wsl_distribution {
-            Some(_) if !replay_gpus.is_empty() => {
+            Some(_) if !replay_gpus.is_empty() || proof_gpu.is_some() => {
                 return Err(
-                    "--production-v4-pool-replay-gpu needs a native Linux pool, not WSL".into(),
+                    "--production-v4-pool-replay-gpu and --production-v4-pool-proof-gpu need a native Linux pool, not WSL".into(),
                 );
             }
             Some(distribution) => production_v4_wsl_pool_workers(
@@ -2619,7 +2630,26 @@ fn configure_production_v4_pool_verifier(
                         artifacts.bank.as_os_str(),
                         fixed_artifact_directory.as_os_str(),
                     ),
-                    environment: vec![],
+                    environment: match proof_gpu {
+                        Some(gpu) => {
+                            let device = cmfd_node::production_v4_pool::production_v4_worker_cuda_visible_device(Some(gpu))?;
+                            if replay_gpus.iter().any(|replay| replay == gpu) {
+                                tracing::warn!(
+                                    gpu = %device,
+                                    "the proof worker shares its GPU with a replay worker; a proof needs about 7 GiB of free VRAM beside the replay worker's working set, which does not fit on 16 GB cards"
+                                );
+                            }
+                            vec![("CUDA_VISIBLE_DEVICES".into(), device.into())]
+                        }
+                        None => {
+                            if !replay_gpus.is_empty() {
+                                tracing::warn!(
+                                    "no --production-v4-pool-proof-gpu: the proof worker runs on the pool process's default CUDA device, which may also host a replay worker"
+                                );
+                            }
+                            vec![]
+                        }
+                    },
                 },
                 scratch_directory
                     .to_str()

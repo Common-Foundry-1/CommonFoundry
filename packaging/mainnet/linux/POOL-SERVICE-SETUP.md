@@ -104,6 +104,9 @@ approved pool GPU still has a compute process. It never stops that process.
    include `gpu_uuid`) runs one replay worker per listed GPU so shares are
    checked on all of them; every listed GPU must be present and idle at
    start. Leave it out to check shares on `gpu_uuid` alone.
+   The optional `proof_gpu` (one GPU UUID) runs the proof worker on that GPU
+   instead of `gpu_uuid`; a proof needs about 7 GiB of free VRAM, so on 16 GB
+   cards it must not also be in `replay_gpus`.
    The optional `max_connections` (1 to `4096`, node default `256`) and
    `max_connections_per_source` (1 to `256`, node default `64`) change the
    miner connection limits; the official miner uses one connection per GPU,

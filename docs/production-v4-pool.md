@@ -140,8 +140,8 @@ credit, and payout status. The dashboard is deliberately loopback-only. Publish
 it through an authenticated reverse proxy or tunnel if remote viewing is
 needed.
 
-`pool-serve` accepts 64 simultaneous miner connections by default and at most
-8 from one source address. Raise them with `--pool-max-connections` (1 to
+`pool-serve` accepts 256 simultaneous miner connections by default and at most
+64 from one source address. Change them with `--pool-max-connections` (1 to
 1024) and `--pool-max-connections-per-source` (1 to 256); the service
 launcher reads the same values from `max_connections` and
 `max_connections_per_source` in `pool.json`. The official miner opens one

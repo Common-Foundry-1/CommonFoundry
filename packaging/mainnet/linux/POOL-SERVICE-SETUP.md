@@ -104,8 +104,8 @@ approved pool GPU still has a compute process. It never stops that process.
    include `gpu_uuid`) runs one replay worker per listed GPU so shares are
    checked on all of them; every listed GPU must be present and idle at
    start. Leave it out to check shares on `gpu_uuid` alone.
-   The optional `max_connections` (1 to `1024`, node default `64`) and
-   `max_connections_per_source` (1 to `256`, node default `8`) raise the
+   The optional `max_connections` (1 to `1024`, node default `256`) and
+   `max_connections_per_source` (1 to `256`, node default `64`) change the
    miner connection limits; the official miner uses one connection per GPU,
    and the per-source limit caps the GPUs behind one public address.
    `automatic_payouts` must be explicitly true; the

@@ -310,6 +310,7 @@ export function App() {
           <Stat icon={<WalletCards />} label="Earned · 24h" value={formatAtoms(pool.credited_atoms_last_24h)} detail="actual PPLNS credit" />
           <Stat icon={<Pickaxe />} label="Estimated · 24h" value={pool.estimated_24h_credited_atoms === null ? "Collecting data" : formatAtoms(pool.estimated_24h_credited_atoms)} detail={pool.estimated_24h_credited_atoms === null ? `${formatCount(pool.earnings_observation_seconds)}s observed · 15m minimum` : "paced from observed earnings and average work rate"} />
           <Stat icon={<Blocks />} label="Pool blocks" value={formatCount(ledger.canonical_pool_blocks)} detail={`${formatCount(ledger.orphaned_pool_blocks)} orphaned`} />
+          <Stat icon={<Pickaxe />} label="Round effort" value={pool.expected_shares_per_block ? `${Math.round(((pool.round_accepted_shares ?? 0) / pool.expected_shares_per_block) * 100)}%` : "N/A"} detail={`${formatCount(pool.round_accepted_shares ?? 0)} of ${formatCount(pool.expected_shares_per_block ?? 0)} expected shares since the last pool block`} />
           <Stat
             icon={<Percent />}
             label="Operator fee"

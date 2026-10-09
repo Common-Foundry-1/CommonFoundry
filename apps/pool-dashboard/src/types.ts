@@ -97,6 +97,8 @@ export interface PoolSnapshot {
   active_connections: number;
   connection_capacity: number;
   max_connections_per_source: number;
+  round_accepted_shares?: number;
+  expected_shares_per_block?: number;
   active_share_verifications: number;
   queued_share_verifications: number;
   share_verification_capacity: number;

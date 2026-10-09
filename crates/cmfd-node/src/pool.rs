@@ -678,6 +678,10 @@ pub struct PoolDashboardSnapshot {
     pub active_connections: usize,
     pub connection_capacity: usize,
     pub max_connections_per_source: usize,
+    /// Accepted shares since the pool's last accepted block (the current round); resets when the pool restarts.
+    pub round_accepted_shares: u64,
+    /// Shares at the current share target expected per block at the current network target.
+    pub expected_shares_per_block: u64,
     pub active_share_verifications: usize,
     pub queued_share_verifications: usize,
     pub share_verification_capacity: usize,
@@ -2716,6 +2720,8 @@ struct SharedServer {
     ledger: DurableLedger,
     stop: AtomicBool,
     active_connections: AtomicUsize,
+    /// Accepted shares since the last accepted pool block.
+    round_accepted_shares: AtomicU64,
     active_sockets: Mutex<HashMap<u64, TcpStream>>,
     worker_telemetry: Mutex<HashMap<u64, WorkerTelemetry>>,
     rejected_share_reasons: Mutex<HashMap<u64, RejectedShareReasons>>,
@@ -3062,6 +3068,11 @@ impl PoolDashboardSource {
             active_connections: self.shared.active_connections.load(Ordering::Acquire),
             connection_capacity: self.shared.max_connections,
             max_connections_per_source: self.shared.source_admission.max_connections_per_source,
+            round_accepted_shares: self.shared.round_accepted_shares.load(Ordering::Acquire),
+            expected_shares_per_block: expected_shares_per_block(
+                current.challenge.target,
+                current.share_target,
+            )?,
             active_share_verifications: verification.active,
             queued_share_verifications: verification.waiting,
             share_verification_capacity: self.shared.share_verification.max_active,
@@ -3279,6 +3290,7 @@ pub fn spawn_pool_server(
         ledger,
         stop: AtomicBool::new(false),
         active_connections: AtomicUsize::new(0),
+        round_accepted_shares: AtomicU64::new(0),
         active_sockets: Mutex::new(HashMap::new()),
         worker_telemetry: Mutex::new(HashMap::new()),
         rejected_share_reasons: Mutex::new(HashMap::new()),
@@ -3999,6 +4011,7 @@ fn process_share(
             shared.pplns_policy,
             active.wire.share_target,
         )?;
+        shared.round_accepted_shares.fetch_add(1, Ordering::AcqRel);
         return Ok(PoolShareResult {
             job_id,
             nonce,
@@ -4039,6 +4052,7 @@ fn process_share(
         match submit_shared_tip_block(&shared.node, (*block).clone(), unix_time_seconds()?) {
             Ok(_) => {
                 log_pool_block(&active, nonce, "accepted", None);
+                shared.round_accepted_shares.store(0, Ordering::Release);
                 break;
             }
             Err(NodeError::StaleBlockAdmission | NodeError::UnknownParent(_)) => {
@@ -4049,6 +4063,7 @@ fn process_share(
             }
             Err(NodeError::DuplicateBlock(_)) => {
                 log_pool_block(&active, nonce, "duplicate", None);
+                shared.round_accepted_shares.store(0, Ordering::Release);
                 reconcile_pool_blocks(shared)?;
                 let session = pool_block_session_snapshot(&shared.ledger, block_credit.block_id)?;
                 rotate_if_tip_changed(shared)?;
@@ -5233,6 +5248,22 @@ fn effective_pplns_window_shares(
         return Err(PoolError::InvalidPplnsWindow);
     }
     Ok(expected.low_u64() as usize)
+}
+
+/// Shares at `share_target` expected per block at `block_target`, rounded up;
+/// the dashboard's round-effort denominator.
+fn expected_shares_per_block(
+    block_target: [u8; 32],
+    share_target: [u8; 32],
+) -> Result<u64, PoolError> {
+    let block_work = target_work(block_target)?;
+    let share_work = target_work(share_target)?;
+    let expected = (block_work + share_work - U512::one()) / share_work;
+    Ok(if expected > U512::from(u64::MAX) {
+        u64::MAX
+    } else {
+        expected.low_u64()
+    })
 }
 
 fn operator_fee_atoms(reward_atoms: u64, operator_fee_bps: u16) -> u64 {
@@ -6581,6 +6612,15 @@ fn decode_hex_32(value: &str) -> Result<[u8; 32], PoolError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn expected_shares_per_block_is_the_work_ratio_of_the_targets() {
+        use super::{expected_shares_per_block, target_with_leading_zero_bits};
+        let block = target_with_leading_zero_bits(20);
+        let share = target_with_leading_zero_bits(7);
+        assert_eq!(expected_shares_per_block(block, share).unwrap(), 1 << 13);
+        assert_eq!(expected_shares_per_block(share, share).unwrap(), 1);
+    }
+
     #[test]
     fn connection_limits_accept_the_full_range_and_reject_outside_it() {
         use super::{

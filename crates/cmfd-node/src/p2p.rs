@@ -82,7 +82,7 @@ const MAX_DISCOVERED_PEERS_PER_IP: usize = 8;
 // honest nodes behind one NAT. Bans are deliberately temporary so operator
 // mistakes and rolling-upgrade incompatibilities recover without intervention.
 const MAX_PEER_REPUTATIONS: usize = 1_024;
-const MAX_INBOUND_CONNECTIONS_PER_IP: usize = 4;
+const MAX_INBOUND_CONNECTIONS_PER_IP: usize = 8;
 const MAX_INBOUND_ATTEMPTS_PER_WINDOW: u16 = 64;
 const INBOUND_ATTEMPT_WINDOW: Duration = Duration::from_secs(10);
 const PEER_BAN_DURATION: Duration = Duration::from_secs(5 * 60);

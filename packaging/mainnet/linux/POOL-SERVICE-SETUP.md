@@ -106,7 +106,8 @@ approved pool GPU still has a compute process. It never stops that process.
    start. Leave it out to check shares on `gpu_uuid` alone.
    The optional `max_connections` (1 to `1024`, node default `64`) and
    `max_connections_per_source` (1 to `256`, node default `8`) raise the
-   miner connection limits; one connection is one miner process.
+   miner connection limits; the official miner uses one connection per GPU,
+   and the per-source limit caps the GPUs behind one public address.
    `automatic_payouts` must be explicitly true; the
    launcher uses the **mainnet-specific** `--enable-mainnet-payouts` flag, never
    `--enable-testnet-payouts`. A runtime without that flag fails closed.

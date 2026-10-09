@@ -144,9 +144,11 @@ needed.
 8 from one source address. Raise them with `--pool-max-connections` (1 to
 1024) and `--pool-max-connections-per-source` (1 to 256); the service
 launcher reads the same values from `max_connections` and
-`max_connections_per_source` in `pool.json`. Each connection is one miner
-process, which may drive several GPUs, so size the total to the number of
-rigs, not cards. The dashboard shows the configured capacity next to the
+`max_connections_per_source` in `pool.json`. The official miner opens one
+connection per GPU (one `cmfd-miner pool` process per card), so with it the
+total is a GPU count and the per-source limit caps the GPUs behind one
+public address; a miner that drives a whole rig from one process uses one
+connection per rig. The dashboard shows the configured capacity next to the
 active connection count.
 
 The operator console is separately available at <http://127.0.0.1:19448> after

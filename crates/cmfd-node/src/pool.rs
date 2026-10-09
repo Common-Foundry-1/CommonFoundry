@@ -3474,13 +3474,22 @@ fn pool_listener(listener: TcpListener, shared: Arc<SharedServer>) -> Result<(),
                         .name("cmfd-pool-session".to_owned())
                         .spawn(move || {
                             let _guard = connection_guard;
-                            if let Err(error) =
-                                handle_connection(stream, Arc::clone(&connection_shared))
-                                && is_pool_source_failure(&error)
-                            {
-                                connection_shared
-                                    .source_admission
-                                    .record_failure(source, Instant::now());
+                            match handle_connection(stream, peer, Arc::clone(&connection_shared)) {
+                                Ok(()) => tracing::debug!(peer = %peer, "miner disconnected"),
+                                Err(error) if is_pool_source_failure(&error) => {
+                                    tracing::debug!(peer = %peer, error = %error, "miner session rejected");
+                                    connection_shared
+                                        .source_admission
+                                        .record_failure(source, Instant::now());
+                                }
+                                // A pool-side failure (verifier, proof worker, ledger, node)
+                                // closes the miner's session; say so, or operators only see
+                                // unexplained reconnects.
+                                Err(error) => tracing::warn!(
+                                    peer = %peer,
+                                    error = %error,
+                                    "miner session closed by a pool-side error"
+                                ),
                             }
                         })?,
                 );
@@ -3602,7 +3611,11 @@ fn is_pool_source_failure(error: &PoolError) -> bool {
     )
 }
 
-fn handle_connection(stream: TcpStream, shared: Arc<SharedServer>) -> Result<(), PoolError> {
+fn handle_connection(
+    stream: TcpStream,
+    peer: SocketAddr,
+    shared: Arc<SharedServer>,
+) -> Result<(), PoolError> {
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(POOL_READ_TIMEOUT))?;
     stream.set_write_timeout(Some(POOL_WRITE_TIMEOUT))?;
@@ -3698,9 +3711,16 @@ fn handle_connection(stream: TcpStream, shared: Arc<SharedServer>) -> Result<(),
     let session_id = register_session(
         &shared.ledger,
         shared.next_session_id.fetch_add(1, Ordering::AcqRel),
-        worker,
+        worker.clone(),
         payout,
     )?;
+    tracing::debug!(
+        session = session_id,
+        worker = %worker,
+        payout = %hex::encode(payout),
+        peer = %peer,
+        "miner connected"
+    );
     let _session_guard = SessionGuard {
         ledger: &shared.ledger,
         worker_telemetry: &shared.worker_telemetry,
@@ -3777,7 +3797,22 @@ fn handle_connection(stream: TcpStream, shared: Arc<SharedServer>) -> Result<(),
         rotate_if_tip_changed(&shared)?;
         let before = current_job(&shared)?;
         let result = if share_rate.allow(Instant::now()) {
-            process_share(&shared, session_id, job_id, nonce)?
+            match process_share(&shared, session_id, job_id, nonce) {
+                Ok(result) => result,
+                Err(error) => {
+                    // A chain-winning share whose proof worker fails ends up here;
+                    // without this line it vanished as a silent disconnect.
+                    tracing::warn!(
+                        session = session_id,
+                        peer = %peer,
+                        height = before.challenge.height,
+                        nonce,
+                        error = %error,
+                        "share evaluation failed; closing the miner session"
+                    );
+                    return Err(error);
+                }
+            }
         } else {
             retryable_result(&shared, session_id, job_id, nonce, "share_rate_limited")?
         };

@@ -2537,6 +2537,8 @@ fn production_v4_artifacts(
     }
 }
 
+// One option per worker knob; grouping them would only move the list.
+#[allow(clippy::too_many_arguments)]
 fn configure_production_v4_pool_verifier(
     config: &mut PoolServerConfig,
     artifacts: Option<&ProductionV4VerifierArtifacts>,

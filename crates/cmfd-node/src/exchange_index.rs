@@ -35,6 +35,11 @@ const MAX_INDEXED_CHAIN_BLOCKS: usize = 4_000_000;
 /// Registration reads only the blocks the node's address history lists for
 /// the new keys, so a block arriving mid-read is rare and simply retried.
 const REGISTRATION_ATTEMPTS: usize = 3;
+/// Blocks read per incremental synchronize pass. Each pass persists before
+/// the next starts, so an index that fell far behind (a slow restart, a client
+/// that stopped polling) catches up across calls instead of re-reading the
+/// whole gap on every call and losing it to the next block.
+const MAX_BLOCKS_PER_SYNCHRONIZE: usize = 64;
 const MAX_EXCHANGE_INDEX_BYTES: usize = 512 * 1024 * 1024;
 const SNAPSHOT_MAGIC: [u8; 8] = *b"CMFDEXI\0";
 const MARKER_MAGIC: [u8; 8] = *b"CMFDEXM\0";
@@ -554,9 +559,12 @@ impl ExchangeDepositIndex {
     ) -> Result<ChainReadPlan, ExchangeIndexError> {
         let node = lock_node(shared)?;
         self.check_node_binding(&node)?;
-        let active_chain = checked_active_chain(&node)?;
+        let mut active_chain = checked_active_chain(&node)?;
         let common = common_prefix_len(&self.state.indexed_chain, &active_chain);
         let read_blocks = !self.state.watches.is_empty();
+        if read_blocks && active_chain.len() - common > MAX_BLOCKS_PER_SYNCHRONIZE {
+            active_chain.truncate(common + MAX_BLOCKS_PER_SYNCHRONIZE);
+        }
         capture_chain_plan(&node, active_chain, common, read_blocks)
     }
 
@@ -605,11 +613,13 @@ impl ExchangeDepositIndex {
         Ok(())
     }
 
+    /// The planned chain must still be a prefix of the active chain: blocks
+    /// appended behind it while the plan was read do not change what was
+    /// read, a reorganization of any planned block does.
     fn recheck_plan(&self, node: &Node, plan: &ChainReadPlan) -> Result<(), ExchangeIndexError> {
         self.check_node_binding(node)?;
         if node.instance_id != plan.node_instance_id
-            || node.chain_revision != plan.chain_revision
-            || node.index.active_chain != plan.active_chain
+            || !node.index.active_chain.starts_with(&plan.active_chain)
         {
             return Err(ExchangeIndexError::ChainChanged);
         }
@@ -739,7 +749,6 @@ struct PlannedBlock {
 
 struct ChainReadPlan {
     node_instance_id: u64,
-    chain_revision: u64,
     active_chain: Vec<[u8; 32]>,
     blocks: Vec<PlannedBlock>,
     log: Option<crate::LogReadHandle>,
@@ -828,7 +837,6 @@ fn capture_chain_plan_at(
     };
     Ok(ChainReadPlan {
         node_instance_id: node.instance_id,
-        chain_revision: node.chain_revision,
         active_chain,
         blocks,
         log,
@@ -2464,6 +2472,115 @@ mod tests {
 
         drop(reopened_index);
         drop(reopened_shared);
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn synchronize_catches_up_in_bounded_persisted_passes() {
+        let path = test_dir("bounded-catch-up");
+        let watched = random_destination();
+        let node = Node::open_with_profile(&path, DEVNET_PROFILE).unwrap();
+        let shared = Arc::new(Mutex::new(node));
+        let mut index = ExchangeDepositIndex::open_and_sync(&shared).unwrap();
+        index
+            .register_watch_destination(&shared, "account-001", watched)
+            .unwrap();
+        let generation = index.state.generation;
+        // Nobody polls while the chain grows well past one pass.
+        let behind = 2 * MAX_BLOCKS_PER_SYNCHRONIZE + 5;
+        let now = unix_time_seconds().unwrap();
+        {
+            let mut node = shared.lock().unwrap();
+            for offset in 0..behind as u64 {
+                node.mine_once(watched, now + offset, DEFAULT_MINING_ATTEMPTS)
+                    .unwrap();
+            }
+        }
+        let pass = MAX_BLOCKS_PER_SYNCHRONIZE as u64;
+
+        // Each call indexes at most one pass and persists it before returning.
+        let first = index.synchronize(&shared).unwrap();
+        assert_eq!(first.indexed_tip_height, pass);
+        assert_eq!(first.high_watermark, pass);
+        assert_eq!(index.state.generation, generation + 1);
+        let second = index.synchronize(&shared).unwrap();
+        assert_eq!(second.indexed_tip_height, 2 * pass);
+        assert_eq!(index.state.generation, generation + 2);
+        let third = index.synchronize(&shared).unwrap();
+        assert_eq!(third.indexed_tip_height, behind as u64);
+        assert_eq!(third.high_watermark, behind as u64);
+        assert_eq!(index.state.generation, generation + 3);
+        // Caught up: a further call reads nothing and persists nothing.
+        assert_eq!(
+            index.synchronize(&shared).unwrap().indexed_tip_height,
+            behind as u64
+        );
+        assert_eq!(index.state.generation, generation + 3);
+        let page = index.get_deposit_events(0, MAX_DEPOSIT_EVENT_PAGE).unwrap();
+        assert_eq!(
+            page.events
+                .iter()
+                .map(|event| event.deposit.block_height)
+                .collect::<Vec<_>>(),
+            (1..=behind as u64).collect::<Vec<_>>()
+        );
+
+        drop(index);
+        drop(shared);
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn recheck_accepts_blocks_appended_behind_the_plan_but_not_a_reorganization() {
+        let path = test_dir("recheck-prefix");
+        let watched = random_destination();
+        let other = random_destination();
+        let node = Node::open_with_profile(&path, DEVNET_PROFILE).unwrap();
+        let genesis = node.params.genesis_hash;
+        let t1 = DEVNET_PROFILE.virtual_genesis_timestamp + 60;
+        let t2 = t1 + 60;
+        let t3 = t2 + 60;
+        let shared = Arc::new(Mutex::new(node));
+        let mut index = ExchangeDepositIndex::open_and_sync(&shared).unwrap();
+        index
+            .register_watch_destination(&shared, "account-001", watched)
+            .unwrap();
+        let a1 = {
+            let mut node = shared.lock().unwrap();
+            let a1 = mined_child_to(&node, genesis, t1, watched);
+            node.submit_block(a1.clone(), t1).unwrap();
+            a1
+        };
+
+        // Plan the read of a1, then let the chain grow behind it.
+        let plan = index.capture_incremental_plan(&shared).unwrap();
+        assert_eq!(plan.active_chain, vec![genesis, a1.block_id()]);
+        {
+            let mut node = shared.lock().unwrap();
+            let a2 = mined_child_to(&node, a1.block_id(), t2, other);
+            node.submit_block(a2, t2).unwrap();
+        }
+        index.recheck_shared_plan(&shared, &plan).unwrap();
+
+        // A reorganization that replaces a planned block invalidates the plan.
+        {
+            let mut node = shared.lock().unwrap();
+            let b1 = mined_child_to(&node, genesis, t1, other);
+            node.submit_block(b1.clone(), t1).unwrap();
+            let b2 = mined_child_to(&node, b1.block_id(), t2, other);
+            node.submit_block(b2.clone(), t2).unwrap();
+            let b3 = mined_child_to(&node, b2.block_id(), t3, other);
+            node.submit_block(b3, t3).unwrap();
+        }
+        assert!(matches!(
+            index.recheck_shared_plan(&shared, &plan),
+            Err(ExchangeIndexError::ChainChanged)
+        ));
+        // The next synchronize follows the reorganization normally.
+        assert_eq!(index.synchronize(&shared).unwrap().indexed_tip_height, 3);
+
+        drop(index);
+        drop(shared);
         let _ = fs::remove_dir_all(path);
     }
 

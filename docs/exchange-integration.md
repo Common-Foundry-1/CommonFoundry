@@ -537,6 +537,15 @@ or storage error therefore blocks even historical reads by design. Treat every
 such error as a hard deposit-credit stop, preserve the last committed exchange
 cursor, alert the operator, and resume only after the same request succeeds.
 
+Each synchronize indexes at most 64 new blocks and commits them before the
+call returns, so an index that fell behind (a node that restarted slowly, a
+client that stopped polling) catches up across successive calls rather than
+re-reading the whole gap on each one. While it catches up, `getexchangeinfo`
+reports the `deposit_index.indexed_tip` below the chain tip and a page's
+`high_watermark` may rise on the next call; keep polling. Blocks appended
+behind an in-progress read do not fail it; only a reorganization of a block
+being read returns `exchange_index_chain_changed`, which is retryable.
+
 ## Durable withdrawal workflow
 
 Version 0.4 deliberately separates transaction preparation from broadcast. A

@@ -142,7 +142,7 @@ needed.
 
 `pool-serve` accepts 256 simultaneous miner connections by default and at most
 64 from one source address. Change them with `--pool-max-connections` (1 to
-1024) and `--pool-max-connections-per-source` (1 to 256); the service
+4096) and `--pool-max-connections-per-source` (1 to 256); the service
 launcher reads the same values from `max_connections` and
 `max_connections_per_source` in `pool.json`. The official miner opens one
 connection per GPU (one `cmfd-miner pool` process per card), so with it the

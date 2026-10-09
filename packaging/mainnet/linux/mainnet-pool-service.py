@@ -59,7 +59,7 @@ CONFIG_FIELDS = {"schema", "public_numeric_ip", "private_bind_ip", "mainnet_seed
 # Optional: GPU UUIDs that each run one replay (share check) worker, as
 # `--production-v4-pool-replay-gpu`; left out, one replay worker uses gpu_uuid.
 # Optional: miner connection limits, as `--pool-max-connections` (node default 256,
-# up to 1024) and `--pool-max-connections-per-source` (node default 64, up to 256).
+# up to 4096) and `--pool-max-connections-per-source` (node default 64, up to 256).
 OPTIONAL_FIELDS = {"mainnet_relays", "prune_keep_blocks", "pool_ledger_max_bytes",
                    "share_batch_size", "share_batch_wait_ms", "replay_gpus",
                    "max_connections", "max_connections_per_source"}
@@ -68,7 +68,7 @@ MIN_POOL_LEDGER_MAX_BYTES = 1024 * 1024
 MAX_POOL_LEDGER_MAX_BYTES = 1024 * 1024 * 1024
 MAX_SHARE_BATCH_SIZE = 64
 MAX_SHARE_BATCH_WAIT_MS = 1000
-MAX_POOL_CONNECTIONS = 1024
+MAX_POOL_CONNECTIONS = 4096
 MAX_POOL_CONNECTIONS_PER_SOURCE = 256
 MAX_REPLAY_GPUS = 16
 MAX_RELAYS = 8

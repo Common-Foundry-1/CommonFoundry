@@ -850,7 +850,7 @@ enum Command {
         /// Fixed PPLNS share count; zero automatically uses one block of expected share work.
         #[arg(long, default_value_t = DEFAULT_PPLNS_WINDOW_SHARES)]
         pool_pplns_window_shares: usize,
-        /// Maximum simultaneous pool connections in total (1 to 1024).
+        /// Maximum simultaneous pool connections in total (1 to 4096).
         #[arg(long, default_value_t = DEFAULT_POOL_CONNECTIONS)]
         pool_max_connections: usize,
         /// Maximum simultaneous pool connections accepted from one source IP (1 to 256).

@@ -58,13 +58,18 @@ CONFIG_FIELDS = {"schema", "public_numeric_ip", "private_bind_ip", "mainnet_seed
 # as `--pool-share-batch-wait-ms` (node default 100).
 # Optional: GPU UUIDs that each run one replay (share check) worker, as
 # `--production-v4-pool-replay-gpu`; left out, one replay worker uses gpu_uuid.
+# Optional: miner connection limits, as `--pool-max-connections` (node default 64,
+# up to 1024) and `--pool-max-connections-per-source` (node default 8, up to 256).
 OPTIONAL_FIELDS = {"mainnet_relays", "prune_keep_blocks", "pool_ledger_max_bytes",
-                   "share_batch_size", "share_batch_wait_ms", "replay_gpus"}
+                   "share_batch_size", "share_batch_wait_ms", "replay_gpus",
+                   "max_connections", "max_connections_per_source"}
 MIN_PRUNE_KEEP_BLOCKS = 288
 MIN_POOL_LEDGER_MAX_BYTES = 1024 * 1024
 MAX_POOL_LEDGER_MAX_BYTES = 1024 * 1024 * 1024
 MAX_SHARE_BATCH_SIZE = 64
 MAX_SHARE_BATCH_WAIT_MS = 1000
+MAX_POOL_CONNECTIONS = 1024
+MAX_POOL_CONNECTIONS_PER_SOURCE = 256
 MAX_REPLAY_GPUS = 16
 MAX_RELAYS = 8
 COMPETING_UNITS = (
@@ -204,7 +209,9 @@ def validate_config(config: dict) -> dict:
         raise PreflightError(f"pool_ledger_max_bytes must be an integer from {MIN_POOL_LEDGER_MAX_BYTES} "
                              f"to {MAX_POOL_LEDGER_MAX_BYTES}")
     for field, maximum in (("share_batch_size", MAX_SHARE_BATCH_SIZE),
-                           ("share_batch_wait_ms", MAX_SHARE_BATCH_WAIT_MS)):
+                           ("share_batch_wait_ms", MAX_SHARE_BATCH_WAIT_MS),
+                           ("max_connections", MAX_POOL_CONNECTIONS),
+                           ("max_connections_per_source", MAX_POOL_CONNECTIONS_PER_SOURCE)):
         if field in config and (type(config[field]) is not int or not 1 <= config[field] <= maximum):
             raise PreflightError(f"{field} must be an integer from 1 to {maximum}")
     if "replay_gpus" in config:
@@ -434,6 +441,10 @@ def build_command(root: Path, state: Path, credential_base: Path, config: dict) 
           if "share_batch_wait_ms" in config else ()),
         *(argument for gpu in config.get("replay_gpus", ())
           for argument in ("--production-v4-pool-replay-gpu", gpu)),
+        *(("--pool-max-connections", str(config["max_connections"]))
+          if "max_connections" in config else ()),
+        *(("--pool-max-connections-per-source", str(config["max_connections_per_source"]))
+          if "max_connections_per_source" in config else ()),
     ]
 
 

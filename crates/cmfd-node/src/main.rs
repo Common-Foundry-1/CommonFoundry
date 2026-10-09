@@ -35,7 +35,8 @@ use cmfd_node::p2p::{
 };
 use cmfd_node::peer::{PeerAddressPolicy, PeerLimits, StaticPeerConfig};
 use cmfd_node::pool::{
-    DEFAULT_POOL_CONCURRENT_SHARE_VERIFICATIONS, DEFAULT_POOL_CONNECTIONS_PER_SOURCE,
+    DEFAULT_POOL_CONCURRENT_SHARE_VERIFICATIONS, DEFAULT_POOL_CONNECTIONS,
+    DEFAULT_POOL_CONNECTIONS_PER_SOURCE,
     DEFAULT_POOL_LEDGER_MAX_BYTES, DEFAULT_POOL_MINIMUM_PAYOUT_ATOMS,
     DEFAULT_POOL_OPERATOR_FEE_BPS, DEFAULT_POOL_PAYOUT_FEE_ATOMS,
     DEFAULT_POOL_QUEUED_SHARE_VERIFICATIONS, DEFAULT_POOL_SHARE_BATCH_SIZE,
@@ -849,7 +850,10 @@ enum Command {
         /// Fixed PPLNS share count; zero automatically uses one block of expected share work.
         #[arg(long, default_value_t = DEFAULT_PPLNS_WINDOW_SHARES)]
         pool_pplns_window_shares: usize,
-        /// Maximum simultaneous pool connections accepted from one source IP.
+        /// Maximum simultaneous pool connections in total (1 to 1024).
+        #[arg(long, default_value_t = DEFAULT_POOL_CONNECTIONS)]
+        pool_max_connections: usize,
+        /// Maximum simultaneous pool connections accepted from one source IP (1 to 256).
         #[arg(long, default_value_t = DEFAULT_POOL_CONNECTIONS_PER_SOURCE)]
         pool_max_connections_per_source: usize,
         /// Maximum share replays evaluated concurrently by the pool verifier.
@@ -2043,6 +2047,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             pool_payout_fee_atoms,
             pool_operator_fee_bps,
             pool_pplns_window_shares,
+            pool_max_connections,
             pool_max_connections_per_source,
             pool_max_concurrent_share_verifications,
             pool_max_queued_share_verifications,
@@ -2149,6 +2154,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 PoolServerConfig::devnet(bind, certificate_der, private_key_der, miner_destination);
             config.share_target = target_with_leading_zero_bits(share_leading_zero_bits);
             config.ledger_directory = Some(cli.data_dir.join("pool-ledger"));
+            config.max_connections = pool_max_connections;
             config.max_connections_per_source = pool_max_connections_per_source;
             config.max_concurrent_share_verifications = pool_max_concurrent_share_verifications;
             config.max_queued_share_verifications = pool_max_queued_share_verifications;
@@ -2210,6 +2216,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "payout_fee_atoms": pool_payout_fee_atoms,
                     "operator_fee_bps": pool_operator_fee_bps,
                     "pplns_window_shares": if pool_pplns_window_shares == 0 { json!("automatic") } else { json!(pool_pplns_window_shares) },
+                    "max_connections": pool_max_connections,
                     "max_connections_per_source": pool_max_connections_per_source,
                     "max_concurrent_share_verifications": pool_max_concurrent_share_verifications,
                     "max_queued_share_verifications": pool_max_queued_share_verifications,

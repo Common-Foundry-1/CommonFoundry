@@ -52,8 +52,9 @@ pub const DEFAULT_SHARE_LEADING_ZERO_BITS: u16 = 7;
 pub const DEFAULT_TEST_CREDIT_ATOMS_PER_SHARE: u64 = 1;
 pub const POOL_MAX_FRAME_BYTES: usize = 16 * 1024;
 pub const POOL_MAX_WORKER_BYTES: usize = 32;
-pub const POOL_MAX_CONNECTIONS: usize = 64;
-pub const POOL_MAX_CONNECTIONS_PER_SOURCE: usize = 16;
+pub const POOL_MAX_CONNECTIONS: usize = 1024;
+pub const DEFAULT_POOL_CONNECTIONS: usize = 64;
+pub const POOL_MAX_CONNECTIONS_PER_SOURCE: usize = 256;
 pub const DEFAULT_POOL_CONNECTIONS_PER_SOURCE: usize = 8;
 pub const POOL_MAX_CONCURRENT_SHARE_VERIFICATIONS: usize = 8;
 pub const DEFAULT_POOL_CONCURRENT_SHARE_VERIFICATIONS: usize = 1;
@@ -308,7 +309,7 @@ impl PoolServerConfig {
             block_destination,
             share_target: target_with_leading_zero_bits(DEFAULT_SHARE_LEADING_ZERO_BITS),
             test_credit_atoms_per_share: DEFAULT_TEST_CREDIT_ATOMS_PER_SHARE,
-            max_connections: POOL_MAX_CONNECTIONS,
+            max_connections: DEFAULT_POOL_CONNECTIONS,
             max_connections_per_source: DEFAULT_POOL_CONNECTIONS_PER_SOURCE,
             max_concurrent_share_verifications: DEFAULT_POOL_CONCURRENT_SHARE_VERIFICATIONS,
             max_queued_share_verifications: DEFAULT_POOL_QUEUED_SHARE_VERIFICATIONS,
@@ -3179,14 +3180,7 @@ pub fn spawn_pool_server(
     };
     ensure_pool_profile_supported(profile, config.production_v4_share_verifier.is_some())?;
     validate_private_address(config.bind)?;
-    if config.max_connections == 0 || config.max_connections > POOL_MAX_CONNECTIONS {
-        return Err(PoolError::InvalidConnectionLimit);
-    }
-    if config.max_connections_per_source == 0
-        || config.max_connections_per_source > POOL_MAX_CONNECTIONS_PER_SOURCE
-    {
-        return Err(PoolError::InvalidSourceConnectionLimit);
-    }
+    validate_connection_limits(config.max_connections, config.max_connections_per_source)?;
     if config.max_concurrent_share_verifications == 0
         || config.max_concurrent_share_verifications > POOL_MAX_CONCURRENT_SHARE_VERIFICATIONS
     {
@@ -6360,6 +6354,22 @@ fn easier_target(configured: [u8; 32], chain: [u8; 32]) -> [u8; 32] {
     configured.max(chain)
 }
 
+/// Checks the total and per-source connection limits against the compiled ceilings.
+fn validate_connection_limits(
+    max_connections: usize,
+    max_connections_per_source: usize,
+) -> Result<(), PoolError> {
+    if max_connections == 0 || max_connections > POOL_MAX_CONNECTIONS {
+        return Err(PoolError::InvalidConnectionLimit);
+    }
+    if max_connections_per_source == 0
+        || max_connections_per_source > POOL_MAX_CONNECTIONS_PER_SOURCE
+    {
+        return Err(PoolError::InvalidSourceConnectionLimit);
+    }
+    Ok(())
+}
+
 fn validate_private_address(address: SocketAddr) -> Result<(), PoolError> {
     let allowed = match address.ip() {
         IpAddr::V4(ip) => ip.is_loopback() || ip.is_private(),
@@ -6571,6 +6581,34 @@ fn decode_hex_32(value: &str) -> Result<[u8; 32], PoolError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn connection_limits_accept_the_full_range_and_reject_outside_it() {
+        use super::{
+            validate_connection_limits, PoolError, DEFAULT_POOL_CONNECTIONS,
+            DEFAULT_POOL_CONNECTIONS_PER_SOURCE, POOL_MAX_CONNECTIONS,
+            POOL_MAX_CONNECTIONS_PER_SOURCE,
+        };
+        assert!(validate_connection_limits(DEFAULT_POOL_CONNECTIONS, DEFAULT_POOL_CONNECTIONS_PER_SOURCE).is_ok());
+        assert!(validate_connection_limits(128, 32).is_ok());
+        assert!(validate_connection_limits(POOL_MAX_CONNECTIONS, POOL_MAX_CONNECTIONS_PER_SOURCE).is_ok());
+        assert!(matches!(
+            validate_connection_limits(0, 8),
+            Err(PoolError::InvalidConnectionLimit)
+        ));
+        assert!(matches!(
+            validate_connection_limits(POOL_MAX_CONNECTIONS + 1, 8),
+            Err(PoolError::InvalidConnectionLimit)
+        ));
+        assert!(matches!(
+            validate_connection_limits(64, 0),
+            Err(PoolError::InvalidSourceConnectionLimit)
+        ));
+        assert!(matches!(
+            validate_connection_limits(64, POOL_MAX_CONNECTIONS_PER_SOURCE + 1),
+            Err(PoolError::InvalidSourceConnectionLimit)
+        ));
+    }
+
     use super::*;
 
     include!("pool_lifecycle_tests.rs");

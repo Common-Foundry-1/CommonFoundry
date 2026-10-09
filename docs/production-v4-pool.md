@@ -140,6 +140,15 @@ credit, and payout status. The dashboard is deliberately loopback-only. Publish
 it through an authenticated reverse proxy or tunnel if remote viewing is
 needed.
 
+`pool-serve` accepts 64 simultaneous miner connections by default and at most
+8 from one source address. Raise them with `--pool-max-connections` (1 to
+1024) and `--pool-max-connections-per-source` (1 to 256); the service
+launcher reads the same values from `max_connections` and
+`max_connections_per_source` in `pool.json`. Each connection is one miner
+process, which may drive several GPUs, so size the total to the number of
+rigs, not cards. The dashboard shows the configured capacity next to the
+active connection count.
+
 The operator console is separately available at <http://127.0.0.1:19448> after
 running the supplied operator-dashboard launcher. It binds exclusively to
 `127.0.0.1`, validates the browser host and origin, and requires an in-memory

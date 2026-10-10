@@ -5,7 +5,10 @@ const SNAPSHOT_PATH = "/v1/explorer";
 const SUPPLY_PATH = "/api/supply";
 const SUPPLY_TOTAL_PATH = "/api/supply/total";
 const SUPPLY_CIRCULATING_PATH = "/api/supply/circulating";
+const PRICE_PATH = "/api/price";
+const PRICE_FEED_URL = "https://tidoex.com/api/v2/markets?market_id=CMFD_USDT";
 const ATOMS_PER_CMFD = 100_000_000n;
+const ATOMS_PATTERN = /^(0|[1-9][0-9]{0,30})$/;
 const BLOCK_PATH = /^\/v1\/explorer\/block\/(?:[0-9]+|[0-9a-fA-F]{64})$/;
 const TRANSACTION_PATH = /^\/v1\/explorer\/transaction\/[0-9a-fA-F]{64}$/;
 
@@ -160,46 +163,114 @@ export function mintedAtoms(height: bigint): bigint {
   return decliningSum + (height > emissionBlocks ? (height - emissionBlocks) * TAIL_SUBSIDY_ATOMS : 0n);
 }
 
+// Mainnet reward destinations (25% and 5% of every block); tests pin these to packaging/mainnet/MAINNET-PLAN.json.
+export const FUND_ADDRESSES = [
+  { label: "steward", address: "5321229f3d3e3fccb900f95c7baee2b27a929afe70f95a0bde0394dba79c9684" },
+  { label: "community", address: "fbe36f76cad922c1c911d8cecc2eed21c853d10fb99e450fc14ac7e54bf59a3f" },
+] as const;
+
+async function explorerView(path: string, request: Request, env: Env): Promise<Record<string, unknown> | Response> {
+  const upstream = await proxyExplorerRequest(new Request(new URL(path, request.url)), env);
+  if (!upstream.ok) return upstream;
+  const body: unknown = await upstream.json().catch(() => null);
+  return typeof body === "object" && body !== null ? body as Record<string, unknown> : {};
+}
+
 /**
  * Public supply endpoints for exchanges and listing sites, read from the
  * node's checked explorer snapshot: `/api/supply` (JSON),
  * `/api/supply/total` and `/api/supply/circulating` (plain numbers).
- * Circulating supply equals total supply: the steward and community fund
- * allocations circulate like any other coins. Coinbases claim exactly the
- * scheduled subsidy and every transaction fee is destroyed, so the fees
- * burned so far are the minted total minus the current supply.
+ * Circulating supply is the total minus what the steward and community fund
+ * addresses hold, read at the same tip as the snapshot. Coinbases claim
+ * exactly the scheduled subsidy and every transaction fee is destroyed, so
+ * the fees burned so far are the minted total minus the current supply.
  */
 async function supplyResponse(request: Request, env: Env, pathname: string): Promise<Response> {
   if (request.method !== "GET") {
     return Response.json({ error: "method_not_allowed" }, { status: 405, headers: { Allow: "GET" } });
   }
-  const upstream = await proxyExplorerRequest(new Request(new URL(SNAPSHOT_PATH, request.url)), env);
-  if (!upstream.ok) return upstream;
-  const snapshot: unknown = await upstream.json().catch(() => null);
-  const fields = typeof snapshot === "object" && snapshot !== null ? snapshot as Record<string, unknown> : {};
-  const atoms = fields.total_supply_atoms;
-  if (typeof atoms !== "string" || !/^(0|[1-9][0-9]{0,30})$/.test(atoms)
-      || !Number.isSafeInteger(fields.accepted_height) || typeof fields.tip !== "string") {
-    return Response.json({ error: "supply_unavailable" }, { status: 503, headers: { "Cache-Control": "no-store" } });
+  const unavailable = () => Response.json({ error: "supply_unavailable" }, { status: 503, headers: { "Cache-Control": "no-store" } });
+  const withFunds = pathname !== SUPPLY_TOTAL_PATH;
+  const paths = [SNAPSHOT_PATH, ...(withFunds ? FUND_ADDRESSES.map((fund) => `/v1/explorer/address/${fund.address}`) : [])];
+  // A block can land between the reads; retry until every view shares one tip.
+  for (let attempt = 1; ; attempt += 1) {
+    const views = await Promise.all(paths.map((path) => explorerView(path, request, env)));
+    const failed = views.find((view) => view instanceof Response);
+    if (failed) return failed;
+    const [fields, ...funds] = views as Record<string, unknown>[];
+    const atoms = fields.total_supply_atoms;
+    if (typeof atoms !== "string" || !ATOMS_PATTERN.test(atoms)
+        || !Number.isSafeInteger(fields.accepted_height) || typeof fields.tip !== "string"
+        || funds.some((fund) => typeof fund.confirmed_atoms !== "string" || !ATOMS_PATTERN.test(fund.confirmed_atoms))) {
+      return unavailable();
+    }
+    if (funds.some((fund) => fund.tip !== fields.tip)) {
+      if (attempt === 3) return unavailable();
+      continue;
+    }
+    const fundAtoms = funds.map((fund) => fund.confirmed_atoms as string);
+    const circulating = (BigInt(atoms) - fundAtoms.reduce((sum, value) => sum + BigInt(value), 0n)).toString();
+    const headers = { "Cache-Control": "public, max-age=30", "Access-Control-Allow-Origin": "*" };
+    if (pathname === SUPPLY_TOTAL_PATH || pathname === SUPPLY_CIRCULATING_PATH) {
+      const value = pathname === SUPPLY_TOTAL_PATH ? atoms : circulating;
+      return new Response(formatCmfd(value), { headers: { ...headers, "Content-Type": "text/plain; charset=utf-8" } });
+    }
+    const burned = mintedAtoms(BigInt(fields.accepted_height as number)) - BigInt(atoms);
+    return Response.json({
+      network: env.EXPLORER_NETWORK,
+      height: fields.accepted_height,
+      tip: fields.tip,
+      total_supply: formatCmfd(atoms),
+      total_supply_atoms: atoms,
+      circulating_supply: formatCmfd(circulating),
+      circulating_supply_atoms: circulating,
+      excluded_from_circulating: FUND_ADDRESSES.map((fund, index) => ({
+        label: fund.label,
+        address: fund.address,
+        balance: formatCmfd(fundAtoms[index]),
+        balance_atoms: fundAtoms[index],
+      })),
+      max_supply: null,
+      burned_fees: burned >= 0n ? formatCmfd(burned.toString()) : null,
+      burned_fees_atoms: burned >= 0n ? burned.toString() : null,
+      definition: "Total supply is the value of every unspent output: all CMFD minted so far minus burned fees. Circulating supply is the total supply minus the current balances of the steward and community fund addresses, which receive 25% and 5% of every block reward; both are listed in excluded_from_circulating. Emission ends in a permanent tail, so there is no maximum supply. Burned fees are every transaction fee destroyed so far: the CMFD the emission schedule has minted minus the total supply.",
+    }, { headers });
   }
-  const headers = { "Cache-Control": "public, max-age=30", "Access-Control-Allow-Origin": "*" };
-  if (pathname === SUPPLY_TOTAL_PATH || pathname === SUPPLY_CIRCULATING_PATH) {
-    return new Response(formatCmfd(atoms), { headers: { ...headers, "Content-Type": "text/plain; charset=utf-8" } });
+}
+
+/** The last CMFD/USDT trade on TidoEx, the only market so far. */
+async function priceResponse(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "GET") {
+    return Response.json({ error: "method_not_allowed" }, { status: 405, headers: { Allow: "GET" } });
   }
-  const burned = mintedAtoms(BigInt(fields.accepted_height as number)) - BigInt(atoms);
-  return Response.json({
-    network: env.EXPLORER_NETWORK,
-    height: fields.accepted_height,
-    tip: fields.tip,
-    total_supply: formatCmfd(atoms),
-    total_supply_atoms: atoms,
-    circulating_supply: formatCmfd(atoms),
-    circulating_supply_atoms: atoms,
-    max_supply: null,
-    burned_fees: burned >= 0n ? formatCmfd(burned.toString()) : null,
-    burned_fees_atoms: burned >= 0n ? burned.toString() : null,
-    definition: "Value of every unspent output: all CMFD minted so far minus burned fees. Circulating supply equals total supply, including the steward and community fund allocations. Emission ends in a permanent tail, so there is no maximum supply. Burned fees are every transaction fee destroyed so far: the CMFD the emission schedule has minted minus the total supply.",
-  }, { headers });
+  if (env.EXPLORER_NETWORK !== "mainnet") return Response.json({ error: "not_found" }, { status: 404 });
+  const unavailable = () => Response.json({ error: "price_unavailable" }, { status: 503, headers: { "Cache-Control": "no-store" } });
+  try {
+    const upstream = await fetch(PRICE_FEED_URL, {
+      headers: { Accept: "application/json" },
+      redirect: "manual",
+      signal: AbortSignal.timeout(10_000),
+      cf: { cacheTtl: 60, cacheEverything: true },
+    });
+    if (!upstream.ok) {
+      await upstream.body?.cancel();
+      return unavailable();
+    }
+    const markets: unknown = await upstream.json();
+    const market = Array.isArray(markets)
+      ? markets.find((entry): entry is Record<string, unknown> =>
+        typeof entry === "object" && entry !== null && (entry as Record<string, unknown>).market_id === "CMFD_USDT")
+      : undefined;
+    const price = market?.last_price;
+    if (typeof price !== "string" || !/^(0|[1-9][0-9]{0,15})(\.[0-9]{1,18})?$/.test(price) || !(Number(price) > 0)) {
+      return unavailable();
+    }
+    return Response.json({ market: "CMFD_USDT", exchange: "TidoEx", last_price: price, quote_currency: "USDT" }, {
+      headers: { "Cache-Control": "public, max-age=60", "Access-Control-Allow-Origin": "*" },
+    });
+  } catch {
+    return unavailable();
+  }
 }
 
 // Always fetch the full page: a 304 would pair a cached page with a fresh nonce.
@@ -217,7 +288,9 @@ export default {
       ? await proxyExplorerRequest(request, env)
       : url.pathname === SUPPLY_PATH || url.pathname === SUPPLY_TOTAL_PATH || url.pathname === SUPPLY_CIRCULATING_PATH
         ? await supplyResponse(request, env, url.pathname)
-        : await fetchAsset(request, env);
+        : url.pathname === PRICE_PATH
+          ? await priceResponse(request, env)
+          : await fetchAsset(request, env);
     return withSecurityHeaders(response);
   },
 } satisfies ExportedHandler<Env>;

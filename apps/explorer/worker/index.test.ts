@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import worker, { formatCmfd, isExplorerApiPath, mintedAtoms, SECURITY_HEADERS } from "./index";
+import worker, { formatCmfd, FUND_ADDRESSES, isExplorerApiPath, mintedAtoms, SECURITY_HEADERS } from "./index";
 import { MAINNET_NETWORK_ID, NETWORK_HEADER } from "../shared/network";
 
 function environment(overrides: Partial<Env> = {}): Env {
@@ -15,6 +15,14 @@ function environment(overrides: Partial<Env> = {}): Env {
 }
 
 afterEach(() => vi.unstubAllGlobals());
+
+/** An origin answering the snapshot, and each fund address at the snapshot's tip. */
+function origin(snapshot: Record<string, unknown>, fundAtoms = "0") {
+  return vi.fn().mockImplementation(async (url: URL) => Response.json(
+    String(url).includes("/v1/explorer/address/") ? { tip: snapshot.tip, confirmed_atoms: fundAtoms } : snapshot,
+    { headers: { [NETWORK_HEADER]: MAINNET_NETWORK_ID } },
+  ));
+}
 
 describe("explorer edge API allowlist", () => {
   it("keeps the prepared origin rule anchored to only public explorer paths", () => {
@@ -198,29 +206,117 @@ describe("mainnet explorer identity gate", () => {
     expect(total.headers.get("Content-Type")).toBe("text/plain; charset=utf-8");
     expect(total.headers.get("Access-Control-Allow-Origin")).toBe("*");
     expect(await total.text()).toBe("2360598.76543210");
+    // The total needs only the snapshot.
+    expect(upstream.mock.calls.map(([url]) => String(url))).toEqual(["https://mainnet-explorer-origin.commonfoundry.ai/v1/explorer"]);
+    expect(formatCmfd("5")).toBe("0.00000005");
+  });
+
+  it("pins the fund addresses to the plan's reward destinations", () => {
+    const plan = JSON.parse(readFileSync(new URL("../../../packaging/mainnet/MAINNET-PLAN.json", import.meta.url), "utf8"));
+    const destinations = plan.payload.rules.reward_destinations;
+    expect(FUND_ADDRESSES).toEqual([
+      { label: "steward", address: destinations.steward_xonly_public_key },
+      { label: "community", address: destinations.community_xonly_public_key },
+    ]);
+  });
+
+  it("leaves the steward and community fund balances out of the circulating supply", async () => {
+    const tip = "ab".repeat(32);
+    const balances: Record<string, string> = { [FUND_ADDRESSES[0].address]: "50000000000000", [FUND_ADDRESSES[1].address]: "9876543210" };
+    const upstream = vi.fn().mockImplementation(async (url: URL) => {
+      const address = /\/v1\/explorer\/address\/([0-9a-f]{64})$/.exec(String(url))?.[1];
+      const body = address
+        ? { address, tip, accepted_height: 4721, confirmed_atoms: balances[address] }
+        : { accepted_height: 4721, tip, total_supply_atoms: "236059876543210" };
+      return Response.json(body, { headers: { [NETWORK_HEADER]: MAINNET_NETWORK_ID } });
+    });
+    vi.stubGlobal("fetch", upstream);
     const circulating = await worker.fetch(new Request("https://explorer.test/api/supply/circulating"), environment());
     expect(circulating.headers.get("Content-Type")).toBe("text/plain; charset=utf-8");
-    expect(await circulating.text()).toBe("2360598.76543210");
+    expect(await circulating.text()).toBe("1860500.00000000");
     const json = await worker.fetch(new Request("https://explorer.test/api/supply"), environment());
     expect(await json.json()).toMatchObject({
       network: "mainnet", height: 4721, total_supply: "2360598.76543210", total_supply_atoms: "236059876543210",
-      circulating_supply: "2360598.76543210", circulating_supply_atoms: "236059876543210", max_supply: null,
+      circulating_supply: "1860500.00000000", circulating_supply_atoms: "186050000000000", max_supply: null,
+      excluded_from_circulating: [
+        { label: "steward", address: FUND_ADDRESSES[0].address, balance: "500000.00000000", balance_atoms: "50000000000000" },
+        { label: "community", address: FUND_ADDRESSES[1].address, balance: "98.76543210", balance_atoms: "9876543210" },
+      ],
     });
-    expect(String(upstream.mock.calls[0][0])).toBe("https://mainnet-explorer-origin.commonfoundry.ai/v1/explorer");
-    expect(formatCmfd("5")).toBe("0.00000005");
+    expect(upstream.mock.calls.slice(0, 3).map(([url]) => String(url))).toEqual([
+      "https://mainnet-explorer-origin.commonfoundry.ai/v1/explorer",
+      `https://mainnet-explorer-origin.commonfoundry.ai/v1/explorer/address/${FUND_ADDRESSES[0].address}`,
+      `https://mainnet-explorer-origin.commonfoundry.ai/v1/explorer/address/${FUND_ADDRESSES[1].address}`,
+    ]);
+  });
+
+  it("reads the fund balances at the snapshot's tip", async () => {
+    let round = 0;
+    const upstream = vi.fn().mockImplementation(async (url: URL) => {
+      const isSnapshot = String(url).endsWith("/v1/explorer");
+      if (isSnapshot) round += 1;
+      // The first round's fund views come from the next block.
+      const tip = !isSnapshot && round === 1 ? "cd".repeat(32) : "ab".repeat(32);
+      const body = isSnapshot
+        ? { accepted_height: 4721, tip, total_supply_atoms: "300" }
+        : { tip, confirmed_atoms: round === 1 ? "999" : "100" };
+      return Response.json(body, { headers: { [NETWORK_HEADER]: MAINNET_NETWORK_ID } });
+    });
+    vi.stubGlobal("fetch", upstream);
+    const circulating = await worker.fetch(new Request("https://explorer.test/api/supply/circulating"), environment());
+    expect(await circulating.text()).toBe("0.00000100");
+    expect(upstream).toHaveBeenCalledTimes(6);
+    // Views that never agree on a tip are not published.
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(async (url: URL) => Response.json(
+      String(url).endsWith("/v1/explorer")
+        ? { accepted_height: 4721, tip: "ab".repeat(32), total_supply_atoms: "300" }
+        : { tip: "cd".repeat(32), confirmed_atoms: "100" },
+      { headers: { [NETWORK_HEADER]: MAINNET_NETWORK_ID } },
+    )));
+    expect((await worker.fetch(new Request("https://explorer.test/api/supply"), environment())).status).toBe(503);
+  });
+
+  it("serves the last TidoEx CMFD/USDT trade", async () => {
+    const markets = [{ market_id: "BTC_USDT", last_price: "82160.04" }, { market_id: "CMFD_USDT", last_price: "0.010524", base_volume: "102718.658" }];
+    const upstream = vi.fn().mockImplementation(async () => Response.json(markets));
+    vi.stubGlobal("fetch", upstream);
+    const response = await worker.fetch(new Request("https://explorer.test/api/price"), environment());
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBe("*");
+    expect(response.headers.get("Cache-Control")).toBe("public, max-age=60");
+    expect(await response.json()).toEqual({ market: "CMFD_USDT", exchange: "TidoEx", last_price: "0.010524", quote_currency: "USDT" });
+    const [url, options] = upstream.mock.calls[0];
+    expect(String(url)).toBe("https://tidoex.com/api/v2/markets?market_id=CMFD_USDT");
+    expect(options.redirect).toBe("manual");
+  });
+
+  it.each([
+    ["no CMFD market", () => Response.json([{ market_id: "BTC_USDT", last_price: "82160.04" }])],
+    ["a zero price", () => Response.json([{ market_id: "CMFD_USDT", last_price: "0" }])],
+    ["a non-decimal price", () => Response.json([{ market_id: "CMFD_USDT", last_price: "1e-2" }])],
+    ["an error status", () => new Response("down", { status: 502 })],
+    ["a non-JSON body", () => new Response("<html>")],
+  ])("reports no price for %s", async (_, reply) => {
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(async () => reply()));
+    const response = await worker.fetch(new Request("https://explorer.test/api/price"), environment());
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ error: "price_unavailable" });
+  });
+
+  it("serves no market price off mainnet", async () => {
+    const upstream = vi.fn(); vi.stubGlobal("fetch", upstream);
+    expect((await worker.fetch(new Request("https://explorer.test/api/price"), environment({ EXPLORER_NETWORK: "rc" }))).status).toBe(404);
+    expect((await worker.fetch(new Request("https://explorer.test/api/price", { method: "POST" }), environment())).status).toBe(405);
+    expect(upstream).not.toHaveBeenCalled();
   });
 
   it("counts the fees burned as the scheduled mint minus the supply", async () => {
     const snapshot = { accepted_height: 5081, tip: "cd".repeat(32), total_supply_atoms: "253628466998978" };
-    vi.stubGlobal("fetch", vi.fn().mockImplementation(async () => Response.json(snapshot, {
-      headers: { [NETWORK_HEADER]: MAINNET_NETWORK_ID },
-    })));
+    vi.stubGlobal("fetch", origin(snapshot));
     const json = await worker.fetch(new Request("https://explorer.test/api/supply"), environment());
     expect(await json.json()).toMatchObject({ height: 5081, burned_fees: "1759.90000000", burned_fees_atoms: "175990000000" });
     // A supply above the scheduled mint is inconsistent; report no burn rather than a negative one.
-    vi.stubGlobal("fetch", vi.fn().mockImplementation(async () => Response.json({ ...snapshot, total_supply_atoms: "253804456998979" }, {
-      headers: { [NETWORK_HEADER]: MAINNET_NETWORK_ID },
-    })));
+    vi.stubGlobal("fetch", origin({ ...snapshot, total_supply_atoms: "253804456998979" }));
     const inconsistent = await worker.fetch(new Request("https://explorer.test/api/supply"), environment());
     expect(await inconsistent.json()).toMatchObject({ total_supply_atoms: "253804456998979", burned_fees: null, burned_fees_atoms: null });
   });

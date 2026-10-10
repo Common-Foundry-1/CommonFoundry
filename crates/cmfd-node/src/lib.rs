@@ -5291,6 +5291,41 @@ pub struct SponsorTransfer {
     pub amount_atoms: u64,
 }
 
+/// Where an active-chain transaction can be: `height` on the active chain and
+/// the block identifier there, so a stored location is verified against the
+/// chain in one lookup instead of a block scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransactionLocation {
+    pub height: u64,
+    pub block_id: [u8; 32],
+}
+
+/// Bounds for one transaction lookup: the transaction was created at
+/// `floor_height`, so no block below it is read on its behalf, and `hint` is
+/// where the caller last saw it (verified first; a stale hint falls back to
+/// the bounded scan).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransactionLookup {
+    pub floor_height: u64,
+    pub hint: Option<TransactionLocation>,
+}
+
+/// A transaction found on the active chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransactionLookupResult {
+    pub confirmations: u64,
+    pub location: TransactionLocation,
+}
+
+/// The outcome of [`Node::active_transaction_lookups`]: every transaction
+/// found, and the active tip the scan ran against so a caller can record an
+/// absent transaction as "absent through this tip" and bound its next lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransactionLookupOutcome {
+    pub found: HashMap<[u8; 32], TransactionLookupResult>,
+    pub scanned_tip: TransactionLocation,
+}
+
 impl Node {
     /// Open mainnet only with the opaque result of plan/beacon authentication.
     /// The same immutable parameters govern startup replay and live admission.
@@ -7302,6 +7337,25 @@ impl Node {
 
     pub(crate) fn mempool_contains_transaction(&self, txid: [u8; 32]) -> bool {
         self.mempool.contains_key(&txid)
+    }
+
+    /// Confirmations of active-chain transactions, each bounded by its own
+    /// floor and hint, never reading a block below a request's floor for that
+    /// request. See [`TransactionLookup`].
+    pub(crate) fn active_transaction_lookups(
+        &mut self,
+        requests: &HashMap<[u8; 32], TransactionLookup>,
+    ) -> Result<TransactionLookupOutcome, NodeError> {
+        // TODO(payout-scan-floors): implemented in the bounded-lookup change.
+        let _ = requests;
+        let height = self.index.active_chain.len().saturating_sub(1);
+        Ok(TransactionLookupOutcome {
+            found: HashMap::new(),
+            scanned_tip: TransactionLocation {
+                height: height as u64,
+                block_id: self.index.active_chain[height],
+            },
+        })
     }
 
     pub(crate) fn active_transaction_confirmations_for(

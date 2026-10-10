@@ -87,6 +87,12 @@ pub const POOL_MAX_EARNING_EVENTS: usize = 65_536;
 pub const DEFAULT_POOL_MINIMUM_PAYOUT_ATOMS: u64 = 100;
 pub const DEFAULT_POOL_PAYOUT_FEE_ATOMS: u64 = cmfd_consensus::economics::MIN_TRANSACTION_FEE_ATOMS;
 pub const DEFAULT_POOL_OPERATOR_FEE_BPS: u16 = 300;
+/// Bonus credited on top of each miner's net PPLNS allocation, in basis
+/// points; zero disables the bonus reserve.
+pub const DEFAULT_POOL_BONUS_RATE_BPS: u16 = 0;
+pub const MAX_POOL_BONUS_RATE_BPS: u16 = 10_000;
+/// Confirmations a sponsor transfer needs before it funds the bonus reserve.
+pub const POOL_BONUS_FUNDING_CONFIRMATIONS: u64 = 6;
 pub const DEFAULT_PPLNS_WINDOW_SHARES: usize = 0;
 pub const POOL_MAX_PPLNS_WINDOW_SHARES: usize = 65_536;
 pub const POOL_ACCOUNTING_SEMANTICS: &str = "durable PPLNS accounting; each mature pool block is distributed over its discovery-time rolling share window after the disclosed operator fee";
@@ -290,6 +296,7 @@ pub struct PoolServerConfig {
     pub ledger_max_bytes: usize,
     pub payout_policy: Option<PoolPayoutPolicy>,
     pub pplns_policy: Option<PoolPplnsPolicy>,
+    pub bonus_policy: Option<PoolBonusPolicy>,
     pub allow_public_clients: bool,
     pub allow_address_only_payouts: bool,
     pub production_v4_share_verifier: Option<Arc<dyn ProductionV4PoolShareVerifier>>,
@@ -319,6 +326,7 @@ impl PoolServerConfig {
             ledger_max_bytes: DEFAULT_POOL_LEDGER_MAX_BYTES,
             payout_policy: None,
             pplns_policy: None,
+            bonus_policy: None,
             allow_public_clients: false,
             allow_address_only_payouts: false,
             production_v4_share_verifier: None,
@@ -340,6 +348,20 @@ impl Default for PoolPplnsPolicy {
             window_shares: DEFAULT_PPLNS_WINDOW_SHARES,
         }
     }
+}
+
+/// Sponsor-funded bonus on top of PPLNS credits. The sponsor key's confirmed
+/// transfers to the pool wallet fund a reserve; each mature block's net
+/// allocations earn `rate_bps` more from that reserve until it is empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolBonusPolicy {
+    pub rate_bps: u16,
+    /// Key whose confirmed transfers to the pool wallet fund the reserve.
+    pub sponsor: [u8; 32],
+    /// First chain height scanned for sponsor transfers when the ledger has
+    /// no scan mark yet, or a lower height to rescan from. `None` starts at
+    /// the current tip.
+    pub scan_from_height: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

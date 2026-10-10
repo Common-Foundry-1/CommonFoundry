@@ -5281,6 +5281,16 @@ fn build_template_from_state(
     })
 }
 
+/// A canonical transaction that moved coins from a sponsor key into the pool
+/// wallet: an input witnessed by `sponsor`, no input witnessed by the wallet
+/// key, and `amount_atoms` across its outputs locked to the wallet key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SponsorTransfer {
+    pub txid: [u8; 32],
+    pub height: u64,
+    pub amount_atoms: u64,
+}
+
 impl Node {
     /// Open mainnet only with the opaque result of plan/beacon authentication.
     /// The same immutable parameters govern startup replay and live admission.
@@ -5850,6 +5860,26 @@ impl Node {
             });
         }
         install_external_proof_verifier(self.profile, &self.block_preverifier, config)
+    }
+
+    /// Block identifier of the active chain at `height`, if that height exists.
+    pub(crate) fn active_block_id_at(&self, height: u64) -> Option<[u8; 32]> {
+        usize::try_from(height)
+            .ok()
+            .and_then(|height| self.index.active_chain.get(height).copied())
+    }
+
+    /// Sponsor transfers into the pool wallet in canonical blocks at heights
+    /// `from_height..=to_height`, clamped to the active chain, in chain order.
+    pub(crate) fn sponsor_transfers_to_wallet(
+        &mut self,
+        sponsor: [u8; 32],
+        from_height: u64,
+        to_height: u64,
+    ) -> Result<Vec<SponsorTransfer>, NodeError> {
+        // TODO(bonus-reserve): implemented in the bonus-reserve change.
+        let _ = (sponsor, from_height, to_height);
+        Ok(Vec::new())
     }
 
     pub fn wallet_destination(&self) -> [u8; 32] {

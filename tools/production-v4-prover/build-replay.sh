@@ -44,8 +44,13 @@ if "$REPRODUCIBLE"; then
     REPRO_FLAGS=(--objdir-as-tempdir --keep --keep-dir "$INTERMEDIATES"
                  --frandom-seed=1129137732)
 fi
+CUDA_SOURCES=(
+    "$SCRIPT_DIR/cuda/koala_four_limb_replay.cu"
+    "$SCRIPT_DIR/cuda/layer_fused_impl.cu"
+    "$SCRIPT_DIR/cuda/layer_fused_mma_impl.cu"
+)
 BUILD=("$NVCC" -O3 -std=c++17 "${REPRO_FLAGS[@]}" "${CODE_FLAGS[@]}" -I"$CUTLASS_ROOT/include"
-       "$SCRIPT_DIR/cuda/koala_four_limb_replay.cu" -o "$WORKER")
+       "${CUDA_SOURCES[@]}" -o "$WORKER")
 if "$PRINT_PLAN"; then
     printf 'REPLAY_NATIVE_ARCHS=%s\n' "${ARCHITECTURES[*]}"
     printf 'REPLAY_PTX_ARCH=70\nREPLAY_COMPILE='

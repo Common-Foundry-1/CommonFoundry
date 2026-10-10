@@ -224,7 +224,7 @@ describe("mainnet explorer identity gate", () => {
     const tip = "ab".repeat(32);
     const balances: Record<string, string> = { [FUND_ADDRESSES[0].address]: "50000000000000", [FUND_ADDRESSES[1].address]: "9876543210" };
     const upstream = vi.fn().mockImplementation(async (url: URL) => {
-      const address = /\/v1\/explorer\/address\/([0-9a-f]{64})$/.exec(String(url))?.[1];
+      const address = /\/v1\/explorer\/address\/([0-9a-f]{64})\//.exec(String(url))?.[1];
       const body = address
         ? { address, tip, accepted_height: 4721, confirmed_atoms: balances[address] }
         : { accepted_height: 4721, tip, total_supply_atoms: "236059876543210" };
@@ -245,32 +245,41 @@ describe("mainnet explorer identity gate", () => {
     });
     expect(upstream.mock.calls.slice(0, 3).map(([url]) => String(url))).toEqual([
       "https://mainnet-explorer-origin.commonfoundry.ai/v1/explorer",
-      `https://mainnet-explorer-origin.commonfoundry.ai/v1/explorer/address/${FUND_ADDRESSES[0].address}`,
-      `https://mainnet-explorer-origin.commonfoundry.ai/v1/explorer/address/${FUND_ADDRESSES[1].address}`,
+      // Cursors at block 1's coinbase: no history page, so the node reads no blocks.
+      `https://mainnet-explorer-origin.commonfoundry.ai/v1/explorer/address/${FUND_ADDRESSES[0].address}/${tip}.1.0`,
+      `https://mainnet-explorer-origin.commonfoundry.ai/v1/explorer/address/${FUND_ADDRESSES[1].address}/${tip}.1.0`,
     ]);
   });
 
-  it("reads the fund balances at the snapshot's tip", async () => {
+  it("restarts from the snapshot when a block lands before the fund reads", async () => {
+    const stale = { code: "explorer_cursor_stale", error: "the chain tip changed", retryable: true };
+    const tips = ["ab".repeat(32), "cd".repeat(32)];
     let round = 0;
     const upstream = vi.fn().mockImplementation(async (url: URL) => {
-      const isSnapshot = String(url).endsWith("/v1/explorer");
-      if (isSnapshot) round += 1;
-      // The first round's fund views come from the next block.
-      const tip = !isSnapshot && round === 1 ? "cd".repeat(32) : "ab".repeat(32);
-      const body = isSnapshot
-        ? { accepted_height: 4721, tip, total_supply_atoms: "300" }
-        : { tip, confirmed_atoms: round === 1 ? "999" : "100" };
-      return Response.json(body, { headers: { [NETWORK_HEADER]: MAINNET_NETWORK_ID } });
+      const headers = { [NETWORK_HEADER]: MAINNET_NETWORK_ID };
+      if (String(url).endsWith("/v1/explorer")) {
+        round += 1;
+        return Response.json({ accepted_height: 4720 + round, tip: tips[round - 1], total_supply_atoms: "300" }, { headers });
+      }
+      // The first snapshot's tip is already stale when the fund views arrive.
+      return round === 1 ? Response.json(stale, { status: 409, headers }) : Response.json({ tip: tips[1], confirmed_atoms: "100" }, { headers });
     });
     vi.stubGlobal("fetch", upstream);
     const circulating = await worker.fetch(new Request("https://explorer.test/api/supply/circulating"), environment());
     expect(await circulating.text()).toBe("0.00000100");
     expect(upstream).toHaveBeenCalledTimes(6);
-    // Views that never agree on a tip are not published.
+    expect(String(upstream.mock.calls[5][0])).toBe(`https://mainnet-explorer-origin.commonfoundry.ai/v1/explorer/address/${FUND_ADDRESSES[1].address}/${tips[1]}.1.0`);
+    // A tip that keeps moving, or a fund view at another tip, is not published.
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(async (url: URL) => String(url).endsWith("/v1/explorer")
+      ? Response.json({ accepted_height: 4721, tip: tips[0], total_supply_atoms: "300" }, { headers: { [NETWORK_HEADER]: MAINNET_NETWORK_ID } })
+      : Response.json(stale, { status: 409, headers: { [NETWORK_HEADER]: MAINNET_NETWORK_ID } })));
+    const moving = await worker.fetch(new Request("https://explorer.test/api/supply"), environment());
+    expect(moving.status).toBe(503);
+    expect(await moving.json()).toEqual({ error: "supply_unavailable" });
     vi.stubGlobal("fetch", vi.fn().mockImplementation(async (url: URL) => Response.json(
       String(url).endsWith("/v1/explorer")
-        ? { accepted_height: 4721, tip: "ab".repeat(32), total_supply_atoms: "300" }
-        : { tip: "cd".repeat(32), confirmed_atoms: "100" },
+        ? { accepted_height: 4721, tip: tips[0], total_supply_atoms: "300" }
+        : { tip: tips[1], confirmed_atoms: "100" },
       { headers: { [NETWORK_HEADER]: MAINNET_NETWORK_ID } },
     )));
     expect((await worker.fetch(new Request("https://explorer.test/api/supply"), environment())).status).toBe(503);

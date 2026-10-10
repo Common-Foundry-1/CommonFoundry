@@ -190,23 +190,29 @@ async function supplyResponse(request: Request, env: Env, pathname: string): Pro
     return Response.json({ error: "method_not_allowed" }, { status: 405, headers: { Allow: "GET" } });
   }
   const unavailable = () => Response.json({ error: "supply_unavailable" }, { status: 503, headers: { "Cache-Control": "no-store" } });
-  const withFunds = pathname !== SUPPLY_TOTAL_PATH;
-  const paths = [SNAPSHOT_PATH, ...(withFunds ? FUND_ADDRESSES.map((fund) => `/v1/explorer/address/${fund.address}`) : [])];
-  // A block can land between the reads; retry until every view shares one tip.
   for (let attempt = 1; ; attempt += 1) {
-    const views = await Promise.all(paths.map((path) => explorerView(path, request, env)));
-    const failed = views.find((view) => view instanceof Response);
-    if (failed) return failed;
-    const [fields, ...funds] = views as Record<string, unknown>[];
+    const fields = await explorerView(SNAPSHOT_PATH, request, env);
+    if (fields instanceof Response) return fields;
     const atoms = fields.total_supply_atoms;
     if (typeof atoms !== "string" || !ATOMS_PATTERN.test(atoms)
-        || !Number.isSafeInteger(fields.accepted_height) || typeof fields.tip !== "string"
-        || funds.some((fund) => typeof fund.confirmed_atoms !== "string" || !ATOMS_PATTERN.test(fund.confirmed_atoms))) {
+        || !Number.isSafeInteger(fields.accepted_height) || typeof fields.tip !== "string" || !/^[0-9a-f]{64}$/.test(fields.tip)) {
       return unavailable();
     }
-    if (funds.some((fund) => fund.tip !== fields.tip)) {
-      if (attempt === 3) return unavailable();
-      continue;
+    // The funds are paid in every block, so a first history page would read 20 full blocks.
+    // A cursor at their first payment (block 1's coinbase) leaves the page empty, and its
+    // tip makes the node answer at the snapshot's tip or reject the cursor as stale.
+    const views = pathname === SUPPLY_TOTAL_PATH ? [] : await Promise.all(FUND_ADDRESSES.map((fund) =>
+      explorerView(`/v1/explorer/address/${fund.address}/${fields.tip}.1.0`, request, env)));
+    const failed = views.find((view) => view instanceof Response);
+    if (failed?.status === 409) {
+      if (attempt < 3) continue;
+      return unavailable();
+    }
+    if (failed) return failed;
+    const funds = views as Record<string, unknown>[];
+    if (funds.some((fund) => fund.tip !== fields.tip
+        || typeof fund.confirmed_atoms !== "string" || !ATOMS_PATTERN.test(fund.confirmed_atoms))) {
+      return unavailable();
     }
     const fundAtoms = funds.map((fund) => fund.confirmed_atoms as string);
     const circulating = (BigInt(atoms) - fundAtoms.reduce((sum, value) => sum + BigInt(value), 0n)).toString();

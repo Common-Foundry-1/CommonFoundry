@@ -42,7 +42,8 @@ use thiserror::Error;
 
 use crate::{
     COMPILED_NETWORK_PROFILE, MAX_MINING_SEARCH_ATTEMPTS, MiningJob, NetworkProfile, Node,
-    NodeError, ProofProfile, submit_shared_tip_block, unix_time_seconds,
+    NodeError, ProofProfile, TransactionLocation, TransactionLookup, submit_shared_tip_block,
+    unix_time_seconds,
 };
 
 pub const POOL_PROTOCOL_VERSION: u16 = 2;
@@ -1254,6 +1255,53 @@ struct PayoutTransactionRecord {
     transaction: Transaction,
     state: PoolPayoutTransactionState,
     confirmations: u64,
+    /// The chain tip the payout was created at. Its transaction did not exist
+    /// before, so no block of that chain holds it: a lookup starts above the
+    /// tip while it is active, and above the fork point below it after a
+    /// reorganization. `None` for a record from before this field existed,
+    /// which costs one unbounded sweep before `absent_through` bounds it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    created_at: Option<PayoutTransactionLocation>,
+    /// Where the transaction was last found on the active chain. While that
+    /// block is still active at that height the record is confirmed without
+    /// reading any block; after a reorganization below it the lookup starts
+    /// above the fork point, as the transaction was not below its block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    confirmed_at: Option<PayoutTransactionLocation>,
+    /// The active tip the transaction was last known absent through, so the
+    /// next lookup starts above it, or above the fork point below it once a
+    /// reorganization has replaced it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    absent_through: Option<PayoutTransactionLocation>,
+}
+
+/// A position on the chain the pool saw at the time, verified by block
+/// identifier before it is trusted: a block's content is fixed by its
+/// identifier, and a chain that no longer holds the block still agrees with
+/// the chain it was on up to their fork point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PayoutTransactionLocation {
+    height: u64,
+    block_id: [u8; 32],
+}
+
+impl From<TransactionLocation> for PayoutTransactionLocation {
+    fn from(location: TransactionLocation) -> Self {
+        Self {
+            height: location.height,
+            block_id: location.block_id,
+        }
+    }
+}
+
+impl From<PayoutTransactionLocation> for TransactionLocation {
+    fn from(location: PayoutTransactionLocation) -> Self {
+        Self {
+            height: location.height,
+            block_id: location.block_id,
+        }
+    }
 }
 
 /// Ledger updates are applied in memory one at a time, then persisted in
@@ -2907,11 +2955,98 @@ impl ShareRateLimiter {
     }
 }
 
+/// Tip-change reconciliation requests for the reconcile thread. A request made
+/// while one is pending is covered by the same run; `requests` counts every
+/// request and `completed` the requests the finished runs covered, so a waiter
+/// can tell when the work requested so far has run.
+#[derive(Default)]
+struct ReconcileSignal {
+    state: Mutex<ReconcileState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct ReconcileState {
+    requested: bool,
+    requests: u64,
+    completed: u64,
+}
+
+impl ReconcileSignal {
+    fn request(&self) -> Result<(), PoolError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| PoolError::SharedStatePoisoned)?;
+        state.requested = true;
+        state.requests = state.requests.wrapping_add(1);
+        self.changed.notify_all();
+        Ok(())
+    }
+
+    /// Waits at most `timeout` for a request, or for `stop`, and takes the
+    /// request, returning the request count the run covers; `None` when none
+    /// arrived in time or the server is stopping.
+    fn take_request(&self, stop: &AtomicBool, timeout: Duration) -> Result<Option<u64>, PoolError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| PoolError::SharedStatePoisoned)?;
+        let (mut state, _) = self
+            .changed
+            .wait_timeout_while(state, timeout, |state| {
+                !state.requested && !stop.load(Ordering::Acquire)
+            })
+            .map_err(|_| PoolError::SharedStatePoisoned)?;
+        if !state.requested || stop.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        state.requested = false;
+        Ok(Some(state.requests))
+    }
+
+    fn complete(&self, covered: u64) -> Result<(), PoolError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| PoolError::SharedStatePoisoned)?;
+        state.completed = covered;
+        self.changed.notify_all();
+        Ok(())
+    }
+
+    /// Waits until every request made before this call has been run, or
+    /// until `deadline`; returns whether they have.
+    #[cfg(test)]
+    fn wait_idle(&self, deadline: Instant) -> Result<bool, PoolError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| PoolError::SharedStatePoisoned)?;
+        let target = state.requests;
+        while state.completed < target {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+            state = self
+                .changed
+                .wait_timeout(state, remaining)
+                .map_err(|_| PoolError::SharedStatePoisoned)?
+                .0;
+        }
+        Ok(true)
+    }
+}
+
 struct SharedServer {
     node: Arc<Mutex<Node>>,
     state: Mutex<ServerState>,
     ledger: DurableLedger,
     stop: AtomicBool,
+    /// Set on a tip change; the reconcile thread runs block and payout
+    /// reconciliation so no listener or share thread does.
+    reconcile: ReconcileSignal,
     active_connections: AtomicUsize,
     /// Accepted shares since the last accepted pool block.
     round_accepted_shares: AtomicU64,
@@ -2974,6 +3109,7 @@ pub struct PoolServerHandle {
     shared: Arc<SharedServer>,
     thread: Option<JoinHandle<Result<(), PoolError>>>,
     share_batch_threads: Vec<JoinHandle<Result<(), PoolError>>>,
+    reconcile_thread: Option<JoinHandle<Result<(), PoolError>>>,
 }
 
 #[derive(Clone)]
@@ -3309,8 +3445,15 @@ impl PoolServerHandle {
         self.address
     }
 
+    /// Whether the listener or the reconcile thread has exited; either ends
+    /// the pool service, as reconciliation ending would otherwise leave pool
+    /// blocks and payouts unreconciled while miners keep submitting.
     pub fn is_finished(&self) -> bool {
         self.thread.as_ref().is_some_and(JoinHandle::is_finished)
+            || self
+                .reconcile_thread
+                .as_ref()
+                .is_some_and(JoinHandle::is_finished)
     }
 
     pub fn ledger_snapshot(&self) -> Result<PoolLedgerSnapshot, PoolError> {
@@ -3340,11 +3483,19 @@ impl PoolServerHandle {
         self.stop_inner()
     }
 
+    /// Waits until every tip-change reconciliation requested so far has run
+    /// on the reconcile thread, for at most `timeout`; returns whether it has.
+    #[cfg(test)]
+    fn wait_for_reconcile(&self, timeout: Duration) -> Result<bool, PoolError> {
+        self.shared.reconcile.wait_idle(Instant::now() + timeout)
+    }
+
     fn stop_inner(&mut self) -> Result<(), PoolError> {
         self.shared.stop.store(true, Ordering::Release);
         if let Some(batcher) = &self.shared.share_batcher {
             batcher.wake();
         }
+        self.shared.reconcile.changed.notify_all();
         let socket_result = shutdown_active_connections(&self.shared);
         let thread_result = match self.thread.take() {
             Some(thread) => thread.join().map_err(|_| PoolError::ThreadPanicked)?,
@@ -3357,9 +3508,14 @@ impl PoolServerHandle {
                 batch_result = result;
             }
         }
+        let reconcile_result = match self.reconcile_thread.take() {
+            Some(thread) => thread.join().map_err(|_| PoolError::ThreadPanicked)?,
+            None => Ok(()),
+        };
         socket_result?;
         thread_result?;
-        batch_result
+        batch_result?;
+        reconcile_result
     }
 }
 
@@ -3525,6 +3681,7 @@ pub fn spawn_pool_server(
         }),
         ledger,
         stop: AtomicBool::new(false),
+        reconcile: ReconcileSignal::default(),
         active_connections: AtomicUsize::new(0),
         round_accepted_shares: AtomicU64::new(0),
         active_sockets: Mutex::new(HashMap::new()),
@@ -3579,12 +3736,40 @@ pub fn spawn_pool_server(
     let thread = thread::Builder::new()
         .name("cmfd-pool-listener".to_owned())
         .spawn(move || pool_listener(listener, runtime))?;
+    // Later tip changes reconcile on this thread, never on the listener or a
+    // share thread: a payout lookup or ledger write must not stall accepts.
+    let runtime = Arc::clone(&shared);
+    let reconcile_thread = thread::Builder::new()
+        .name("cmfd-pool-reconcile".to_owned())
+        .spawn(move || run_reconciliations(&runtime))?;
     Ok(PoolServerHandle {
         address,
         shared,
         thread: Some(thread),
         share_batch_threads,
+        reconcile_thread: Some(reconcile_thread),
     })
+}
+
+/// The reconcile thread: after each tip change it reconciles pool blocks and
+/// payouts once, logging a failure and serving the next request, until `stop`.
+fn run_reconciliations(shared: &SharedServer) -> Result<(), PoolError> {
+    while !shared.stop.load(Ordering::Acquire) {
+        let Some(covered) = shared
+            .reconcile
+            .take_request(&shared.stop, POOL_ACCEPT_POLL)?
+        else {
+            continue;
+        };
+        if let Err(error) = reconcile_pool_blocks(shared) {
+            tracing::warn!(%error, "pool block reconciliation failed; retrying on the next tip change");
+        }
+        if let Err(error) = reconcile_pool_payouts(shared, true) {
+            tracing::warn!(%error, "pool payout reconciliation failed; retrying on the next tip change");
+        }
+        shared.reconcile.complete(covered)?;
+    }
+    Ok(())
 }
 
 /// A batch thread: replays queued shares together on replay worker `worker`.
@@ -4301,7 +4486,7 @@ fn process_share(
             Err(NodeError::DuplicateBlock(_)) => {
                 log_pool_block(&active, nonce, "duplicate", None);
                 shared.round_accepted_shares.store(0, Ordering::Release);
-                reconcile_pool_blocks(shared)?;
+                reconcile_pool_blocks_without_funding(shared, false)?;
                 let session = pool_block_session_snapshot(&shared.ledger, block_credit.block_id)?;
                 rotate_if_tip_changed(shared)?;
                 return Ok(PoolShareResult {
@@ -4348,7 +4533,7 @@ fn process_share(
             }
             Err(error) => {
                 log_pool_block(&active, nonce, &format!("submit_error: {error}"), None);
-                reconcile_pool_blocks_with_recovery(shared, true)?;
+                reconcile_pool_blocks_without_funding(shared, true)?;
                 return Err(PoolError::Node(error));
             }
         }
@@ -4574,8 +4759,10 @@ fn rotate_if_tip_changed(shared: &Arc<SharedServer>) -> Result<bool, PoolError> 
         }
     };
     if changed {
-        reconcile_pool_blocks(shared)?;
-        reconcile_pool_payouts(shared, true)?;
+        // Reconciliation reads blocks and writes the ledger; it runs on the
+        // reconcile thread so this caller (listener or share thread) returns
+        // to its miners at once.
+        shared.reconcile.request()?;
     }
     Ok(changed)
 }
@@ -4619,13 +4806,34 @@ fn reconcile_pool_blocks_with_recovery(
         .lock()
         .map_err(|_| PoolError::SharedStatePoisoned)?;
     // Funding registered this tick is available to a block maturing this
-    // tick. This path also runs for pools without automatic payouts. A failed
-    // scan is retried next tick and never stops block reconciliation.
+    // tick. This path also runs for pools without automatic payouts, and
+    // `reconcile_pool_payouts` always follows it, so the scan runs once per
+    // tick. A failed scan is retried next tick and never stops block
+    // reconciliation.
     if let Some(policy) = shared.bonus_policy
         && let Err(error) = credit_bonus_funding(&shared.ledger, &mut node, policy)
     {
         tracing::warn!(%error, "bonus funding scan failed; retrying on the next tick");
     }
+    reconcile_pool_blocks_for_node(
+        &shared.ledger,
+        &node,
+        recover_missing_pending,
+        shared.bonus_rate_bps(),
+    )
+}
+
+/// Block reconciliation without the bonus funding scan, for a share thread
+/// answering a miner: it reads no block. The tip change it follows queues a
+/// full run, scan included, on the reconcile thread.
+fn reconcile_pool_blocks_without_funding(
+    shared: &SharedServer,
+    recover_missing_pending: bool,
+) -> Result<(), PoolError> {
+    let node = shared
+        .node
+        .lock()
+        .map_err(|_| PoolError::SharedStatePoisoned)?;
     reconcile_pool_blocks_for_node(
         &shared.ledger,
         &node,
@@ -5053,14 +5261,9 @@ fn reconcile_pool_payouts(shared: &SharedServer, create_new: bool) -> Result<(),
             return Ok(());
         }
     }
+    // Sponsor funding was scanned by the block reconciliation every caller
+    // runs first, so it already counts as an asset in the funding check.
     reconcile_pool_blocks_for_node(&shared.ledger, &node, true, shared.bonus_rate_bps())?;
-    // New sponsor funding counts as an asset before the funding check below;
-    // a failed scan is retried next tick and never stops payouts.
-    if let Some(bonus_policy) = shared.bonus_policy
-        && let Err(error) = credit_bonus_funding(&shared.ledger, &mut node, bonus_policy)
-    {
-        tracing::warn!(%error, "bonus funding scan failed; retrying on the next tick");
-    }
     payout_protection::refresh_payment_states(&shared.ledger, &mut node)?;
     payout_protection::check_funding(&shared.ledger, &node, policy.fee_atoms)?;
     payout_protection::auto_resolve(&shared.ledger, &node, policy.fee_atoms)?;
@@ -5157,6 +5360,12 @@ fn reconcile_pool_payouts(shared: &SharedServer, create_new: bool) -> Result<(),
             Err(error) => return Err(PoolError::Node(error)),
         };
         let txid = transaction.txid();
+        // The chain tip the transaction is created at: it is in no block of
+        // that chain.
+        let created_at = Some(PayoutTransactionLocation {
+            height: node.state.next_height().saturating_sub(1),
+            block_id: node.state.tip(),
+        });
         let journaled = shared.ledger.transaction(|ledger| {
             if payout_available_atoms(ledger, payout)? < amount {
                 return Ok(false);
@@ -5175,6 +5384,9 @@ fn reconcile_pool_payouts(shared: &SharedServer, create_new: bool) -> Result<(),
                         transaction: transaction.clone(),
                         state: PoolPayoutTransactionState::Prepared,
                         confirmations: 0,
+                        created_at,
+                        confirmed_at: None,
+                        absent_through: None,
                     },
                 )
                 .is_some()

@@ -276,6 +276,27 @@ input conflict. Reconciliation retries that exact signed transaction after the
 conflict clears; it must not release the credit and generate a replacement merely
 because another unconfirmed transaction is using the same input.
 
+The ledger keeps, for each payout, the chain tip it was created at and either
+where it was found (block height and identifier) or the tip it was last
+absent through, so creating a payout or restarting the pool no longer sweeps
+the chain: a confirmed payout whose block is still on the active chain is
+verified without reading a block, and an unconfirmed one is looked for only
+in the blocks added since the last check. A reorganization does not reopen
+the chain either: a kept position whose block was replaced still bounds the
+lookup at the fork point, so only the blocks of the new branch are read. A
+pool upgraded from an older build should expect one sweep for each payout
+recorded before this build that is still unconfirmed at its first check, or
+whose block is replaced before that check; it runs during the startup
+reconciliation, or on the reconcile thread afterwards when the node was still
+catching up with the ledger at startup. After it, those records are bounded
+too.
+
+Reconciliation after a chain tip change (pool block states, bonus funding,
+payout states and new payouts) runs on its own `cmfd-pool-reconcile` thread.
+The listener and share threads only note the new tip and hand out the new
+job, so miner connections and share results are never blocked by a block
+read or a ledger write.
+
 The shared source now persists payout holds when an already-distributed PPLNS
 reward loses mature canonical backing. Earned credits and signed-payment
 reservations are preserved; affected new payments/retries pause, and a shared

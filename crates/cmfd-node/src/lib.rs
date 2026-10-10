@@ -3798,6 +3798,25 @@ enum TransactionScanMark {
 
 const MAX_TRANSACTION_SCAN_MARKS: usize = 4096;
 
+/// The lookup result for a transaction at active-chain position `height`.
+fn active_transaction_result(
+    active_chain: &[[u8; 32]],
+    height: usize,
+) -> Result<TransactionLookupResult, NodeError> {
+    let confirmations = u64::try_from(active_chain.len() - height).map_err(|_| {
+        NodeError::CorruptLog("active transaction depth does not fit u64".to_owned())
+    })?;
+    Ok(TransactionLookupResult {
+        confirmations,
+        location: TransactionLocation {
+            height: u64::try_from(height).map_err(|_| {
+                NodeError::CorruptLog("active transaction height does not fit u64".to_owned())
+            })?,
+            block_id: active_chain[height],
+        },
+    })
+}
+
 pub struct Node {
     /// Process-local identity used to bind off-lock admissions to this exact
     /// live node value, even if the value inside a shared mutex is replaced.
@@ -3827,6 +3846,10 @@ pub struct Node {
     /// Per-txid progress of active-chain transaction lookups, so repeated
     /// lookups read only blocks added since the last verified scan point.
     transaction_scan_marks: HashMap<[u8; 32], TransactionScanMark>,
+    /// Blocks read by active-chain transaction lookups, so tests can assert
+    /// that floors, hints and scan marks bound the scan.
+    #[cfg(test)]
+    transaction_lookup_blocks_read: u64,
     /// Monotonically changes after every successful block commit. External
     /// proof admissions bind to this value so branch snapshots cannot be
     /// committed after chain state or fork choice changes.
@@ -4154,6 +4177,20 @@ impl BlockIndex {
 
         let position = usize::try_from(self.blocks.get(&block_id)?.height()).ok()?;
         (self.active_chain.get(position).copied() == Some(block_id)).then_some(position)
+    }
+
+    /// Position of the newest block in `block_id`'s ancestry that is on the
+    /// active chain: its own position while it is active, otherwise the fork
+    /// point below it, where the chain it was on and the active chain still
+    /// agree. `None` for an identifier the index does not hold.
+    fn active_ancestor_position(&self, block_id: [u8; 32]) -> Option<usize> {
+        let mut cursor = block_id;
+        loop {
+            if let Some(position) = self.active_position(cursor) {
+                return Some(position);
+            }
+            cursor = self.blocks.get(&cursor)?.parent();
+        }
     }
 
     fn ancestor_at_height(&self, tip: [u8; 32], target_height: u64) -> Result<[u8; 32], NodeError> {
@@ -5723,6 +5760,8 @@ impl Node {
             #[cfg(test)]
             wallet_history_inline_scan_bytes: wallet_history::INLINE_SCAN_BYTES,
             transaction_scan_marks: HashMap::new(),
+            #[cfg(test)]
+            transaction_lookup_blocks_read: 0,
             chain_revision,
             record_count: replay.record_count,
             prune_keep_blocks: None,
@@ -7335,6 +7374,16 @@ impl Node {
         self.index.active_chain.get(position).copied()
     }
 
+    /// Height of the newest block in `block_id`'s ancestry that is on the
+    /// active chain: the block's own height while it is active, otherwise the
+    /// fork point below it. A bound recorded against the chain `block_id` was
+    /// on stays valid up to that height, since the two chains agree there.
+    /// `None` for an identifier the node no longer holds.
+    pub(crate) fn active_ancestor_height(&self, block_id: [u8; 32]) -> Option<u64> {
+        let position = self.index.active_ancestor_position(block_id)?;
+        u64::try_from(position).ok()
+    }
+
     pub(crate) fn mempool_contains_transaction(&self, txid: [u8; 32]) -> bool {
         self.mempool.contains_key(&txid)
     }
@@ -7342,66 +7391,87 @@ impl Node {
     /// Confirmations of active-chain transactions, each bounded by its own
     /// floor and hint, never reading a block below a request's floor for that
     /// request. See [`TransactionLookup`].
+    ///
+    /// A hint whose block identifier still sits at its height on the active
+    /// chain is trusted without reading anything, since a block's content is
+    /// fixed by its identifier. Otherwise the in-process scan marks apply: a
+    /// still-active `Found` mark answers the request and an `AbsentThrough`
+    /// mark raises its bound above the mark, or above the fork point below it
+    /// once its block has left the active chain. The remaining
+    /// requests share one scan from the tip down to the lowest bound still
+    /// pending; each block is read once, a request leaves the scan as soon as
+    /// the position falls below its bound (it is then absent), and the scan
+    /// stops when nothing is pending. Marks are updated as before: `Found`
+    /// where a transaction was seen, `AbsentThrough` the scanned tip
+    /// otherwise. Confirmations are `chain_len - height` for the active-chain
+    /// position `height`; height 0 is the virtual genesis anchor.
     pub(crate) fn active_transaction_lookups(
         &mut self,
         requests: &HashMap<[u8; 32], TransactionLookup>,
     ) -> Result<TransactionLookupOutcome, NodeError> {
-        // TODO(payout-scan-floors): implemented in the bounded-lookup change.
-        let _ = requests;
-        let height = self.index.active_chain.len().saturating_sub(1);
-        Ok(TransactionLookupOutcome {
-            found: HashMap::new(),
-            scanned_tip: TransactionLocation {
-                height: height as u64,
-                block_id: self.index.active_chain[height],
-            },
-        })
-    }
-
-    pub(crate) fn active_transaction_confirmations_for(
-        &mut self,
-        txids: &HashSet<[u8; 32]>,
-    ) -> Result<HashMap<[u8; 32], u64>, NodeError> {
         let result = (|| {
-            let mut confirmations = HashMap::new();
-            if txids.is_empty() {
-                return Ok(confirmations);
-            }
             let chain_len = self.index.active_chain.len();
-            // Only blocks above each txid's still-active scan mark are read;
-            // a reorganization below a mark discards it and rescans.
-            let mut pending = HashSet::new();
+            let tip_height = chain_len - 1;
+            let scanned_tip =
+                active_transaction_result(&self.index.active_chain, tip_height)?.location;
+            let mut found = HashMap::new();
+            // Requests the scan still has to answer, each with the lowest
+            // position it may occupy: its floor, raised above its absent
+            // mark. Position 0 is the virtual genesis and holds no
+            // transactions.
+            let mut pending = HashMap::new();
             let mut lowest = chain_len;
-            for txid in txids {
-                let mark = self.transaction_scan_marks.get(txid).copied();
-                match mark {
+            for (txid, request) in requests {
+                if let Some(hint) = request.hint {
+                    let active = usize::try_from(hint.height).ok().filter(|height| {
+                        self.index.active_chain.get(*height) == Some(&hint.block_id)
+                    });
+                    if let Some(height) = active {
+                        found.insert(
+                            *txid,
+                            active_transaction_result(&self.index.active_chain, height)?,
+                        );
+                        continue;
+                    }
+                }
+                let mut bound = usize::try_from(request.floor_height)
+                    .unwrap_or(usize::MAX)
+                    .max(1);
+                match self.transaction_scan_marks.get(txid).copied() {
                     Some(TransactionScanMark::Found { height, block_id })
                         if self.index.active_chain.get(height) == Some(&block_id) =>
                     {
-                        let depth = u64::try_from(chain_len - height).map_err(|_| {
-                            NodeError::CorruptLog(
-                                "active transaction depth does not fit u64".to_owned(),
-                            )
-                        })?;
-                        confirmations.insert(*txid, depth);
+                        found.insert(
+                            *txid,
+                            active_transaction_result(&self.index.active_chain, height)?,
+                        );
+                        continue;
                     }
                     Some(TransactionScanMark::AbsentThrough { height, block_id })
                         if self.index.active_chain.get(height) == Some(&block_id) =>
                     {
-                        pending.insert(*txid);
-                        lowest = lowest.min(height + 1);
+                        bound = bound.max(height + 1);
                     }
-                    _ => {
-                        pending.insert(*txid);
-                        lowest = 1;
+                    // A mark whose block left the active chain still bounds
+                    // the scan above the fork point below it: the scan that
+                    // wrote the mark covered the blocks the two chains share.
+                    Some(TransactionScanMark::AbsentThrough { block_id, .. }) => {
+                        if let Some(agreed) = self.index.active_ancestor_position(block_id) {
+                            bound = bound.max(agreed + 1);
+                        }
                     }
+                    _ => {}
                 }
+                pending.insert(*txid, bound);
+                lowest = lowest.min(bound);
             }
-            if pending.is_empty() {
-                return Ok(confirmations);
-            }
-            let mut found = HashMap::new();
-            for position in (lowest.max(1)..chain_len).rev() {
+            let scanned: Vec<[u8; 32]> = pending.keys().copied().collect();
+            let mut positions = HashMap::new();
+            for position in (lowest..chain_len).rev() {
+                pending.retain(|_, bound| *bound <= position);
+                if pending.is_empty() {
+                    break;
+                }
                 let block_id = self.index.active_chain[position];
                 let indexed = self.index.blocks.get(&block_id).cloned().ok_or_else(|| {
                     NodeError::CorruptLog(
@@ -7416,45 +7486,73 @@ impl Node {
                     self.params.network_id,
                     matches!(self.profile.proof, ProofProfile::ProductionV3),
                 )?;
+                #[cfg(test)]
+                {
+                    self.transaction_lookup_blocks_read += 1;
+                }
                 for transaction in &block.transactions {
                     let txid = transaction.txid();
-                    if pending.contains(&txid) {
-                        found.entry(txid).or_insert(position);
+                    if pending.remove(&txid).is_some() {
+                        positions.insert(txid, position);
                     }
                 }
-                if found.len() == pending.len() {
-                    break;
-                }
             }
-            if self.transaction_scan_marks.len() > MAX_TRANSACTION_SCAN_MARKS {
+            if !scanned.is_empty() && self.transaction_scan_marks.len() > MAX_TRANSACTION_SCAN_MARKS
+            {
                 self.transaction_scan_marks.clear();
             }
-            let tip_height = chain_len - 1;
-            let tip = self.index.active_chain[tip_height];
-            for txid in pending {
-                let mark = match found.get(&txid) {
+            for txid in scanned {
+                let mark = match positions.get(&txid) {
                     Some(&height) => {
-                        let depth = u64::try_from(chain_len - height).map_err(|_| {
-                            NodeError::CorruptLog(
-                                "active transaction depth does not fit u64".to_owned(),
-                            )
-                        })?;
-                        confirmations.insert(txid, depth);
+                        let result = active_transaction_result(&self.index.active_chain, height)?;
+                        found.insert(txid, result);
                         TransactionScanMark::Found {
                             height,
-                            block_id: self.index.active_chain[height],
+                            block_id: result.location.block_id,
                         }
                     }
                     None => TransactionScanMark::AbsentThrough {
                         height: tip_height,
-                        block_id: tip,
+                        block_id: scanned_tip.block_id,
                     },
                 };
                 self.transaction_scan_marks.insert(txid, mark);
             }
-            Ok(confirmations)
+            Ok(TransactionLookupOutcome { found, scanned_tip })
         })();
         self.latch_authenticated_storage_failure(result)
+    }
+
+    /// Confirmations of active-chain transactions with no floor and no hint:
+    /// [`Self::active_transaction_lookups`] bounded by the scan marks alone.
+    pub(crate) fn active_transaction_confirmations_for(
+        &mut self,
+        txids: &HashSet<[u8; 32]>,
+    ) -> Result<HashMap<[u8; 32], u64>, NodeError> {
+        let requests = txids
+            .iter()
+            .map(|txid| {
+                (
+                    *txid,
+                    TransactionLookup {
+                        floor_height: 0,
+                        hint: None,
+                    },
+                )
+            })
+            .collect();
+        Ok(self
+            .active_transaction_lookups(&requests)?
+            .found
+            .into_iter()
+            .map(|(txid, result)| (txid, result.confirmations))
+            .collect())
+    }
+
+    /// Blocks read by active-chain transaction lookups since the node opened.
+    #[cfg(test)]
+    pub(crate) fn transaction_lookup_blocks_read(&self) -> u64 {
+        self.transaction_lookup_blocks_read
     }
 
     /// Reads and authenticates the exact canonical frame for a validated block.
@@ -15211,6 +15309,346 @@ mod tests {
         let cached = node.active_transaction_confirmations_for(&txids).unwrap();
         assert_eq!(cached, HashMap::from([(txid, 3)]));
         assert_eq!(cached, fresh(&mut node));
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    /// A node with `height` blocks mined on the active chain, and those
+    /// blocks in height order, for the bounded transaction lookup tests.
+    fn transaction_lookup_fixture(label: &str, height: u64) -> (Node, PathBuf, Vec<Block>) {
+        let path = test_dir(label);
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        let blocks = (1..=height)
+            .map(|height| {
+                node.mine_once(
+                    default_miner_destination(),
+                    DEVNET_GENESIS_TIMESTAMP + height * 60,
+                    DEFAULT_MINING_ATTEMPTS,
+                )
+                .unwrap()
+            })
+            .collect();
+        (node, path, blocks)
+    }
+
+    fn active_location(node: &Node, height: u64) -> TransactionLocation {
+        TransactionLocation {
+            height,
+            block_id: node.active_block_id_at_height(height).unwrap(),
+        }
+    }
+
+    #[test]
+    fn transaction_lookup_reads_no_block_below_its_floor() {
+        let (mut node, path, blocks) = transaction_lookup_fixture("transaction-lookup-floor", 3);
+        let transaction = spend_coinbase_output(&node, &blocks[0], 2, 0x12, 0x31, 10);
+        let txid = transaction.txid();
+        // Created while block 3 is the tip: it cannot be mined below height 4.
+        let floor_height = node.state.next_height();
+        assert_eq!(floor_height, 4);
+        node.submit_transaction(transaction).unwrap();
+        for height in 4..=6 {
+            node.mine_once(
+                default_miner_destination(),
+                DEVNET_GENESIS_TIMESTAMP + height * 60,
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        }
+        let requests = HashMap::from([(
+            txid,
+            TransactionLookup {
+                floor_height,
+                hint: None,
+            },
+        )]);
+        let read_before = node.transaction_lookup_blocks_read();
+        let outcome = node.active_transaction_lookups(&requests).unwrap();
+        assert_eq!(
+            outcome.found,
+            HashMap::from([(
+                txid,
+                TransactionLookupResult {
+                    confirmations: 3,
+                    location: active_location(&node, 4),
+                }
+            )])
+        );
+        assert_eq!(outcome.scanned_tip, active_location(&node, 6));
+        // Blocks 6, 5 and 4; the three below the floor are never read.
+        assert_eq!(node.transaction_lookup_blocks_read() - read_before, 3);
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn unmined_transaction_lookup_at_the_tip_reads_nothing() {
+        let (mut node, path, blocks) = transaction_lookup_fixture("transaction-lookup-tip", 3);
+        let transaction = spend_coinbase_output(&node, &blocks[0], 2, 0x12, 0x31, 10);
+        let txid = transaction.txid();
+        let tip = active_location(&node, 3);
+        let lookup = |floor_height| {
+            HashMap::from([(
+                txid,
+                TransactionLookup {
+                    floor_height,
+                    hint: None,
+                },
+            )])
+        };
+        let read_before = node.transaction_lookup_blocks_read();
+        let outcome = node
+            .active_transaction_lookups(&lookup(node.state.next_height()))
+            .unwrap();
+        assert!(outcome.found.is_empty());
+        assert_eq!(outcome.scanned_tip, tip);
+        assert_eq!(node.transaction_lookup_blocks_read(), read_before);
+        assert!(matches!(
+            node.transaction_scan_marks.get(&txid),
+            Some(TransactionScanMark::AbsentThrough { height: 3, .. })
+        ));
+        // The floor is inclusive: a transaction may sit in the block at its
+        // floor, so that block is read when no mark excludes it.
+        node.transaction_scan_marks.clear();
+        let outcome = node.active_transaction_lookups(&lookup(3)).unwrap();
+        assert!(outcome.found.is_empty());
+        assert_eq!(outcome.scanned_tip, tip);
+        assert_eq!(node.transaction_lookup_blocks_read(), read_before + 1);
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn transaction_lookup_trusts_a_hint_still_on_the_active_chain() {
+        let (mut node, path, blocks) = transaction_lookup_fixture("transaction-lookup-hint", 3);
+        let transaction = spend_coinbase_output(&node, &blocks[0], 2, 0x12, 0x31, 10);
+        let txid = transaction.txid();
+        node.submit_transaction(transaction).unwrap();
+        for height in 4..=6 {
+            node.mine_once(
+                default_miner_destination(),
+                DEVNET_GENESIS_TIMESTAMP + height * 60,
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        }
+        let hint = active_location(&node, 4);
+        // No mark may answer for the hint.
+        node.transaction_scan_marks.clear();
+        let requests = HashMap::from([(
+            txid,
+            TransactionLookup {
+                floor_height: 4,
+                hint: Some(hint),
+            },
+        )]);
+        let read_before = node.transaction_lookup_blocks_read();
+        let outcome = node.active_transaction_lookups(&requests).unwrap();
+        assert_eq!(
+            outcome.found,
+            HashMap::from([(
+                txid,
+                TransactionLookupResult {
+                    confirmations: 3,
+                    location: hint,
+                }
+            )])
+        );
+        assert_eq!(outcome.scanned_tip, active_location(&node, 6));
+        assert_eq!(node.transaction_lookup_blocks_read(), read_before);
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn stale_transaction_hint_falls_back_to_the_bounded_scan_after_a_reorg() {
+        let (mut node, path, blocks) =
+            transaction_lookup_fixture("transaction-lookup-stale-hint", 3);
+        let transaction = spend_coinbase_output(&node, &blocks[0], 2, 0x12, 0x31, 10);
+        let txid = transaction.txid();
+        let floor_height = node.state.next_height();
+        node.submit_transaction(transaction.clone()).unwrap();
+        let t4 = DEVNET_GENESIS_TIMESTAMP + 4 * 60;
+        let t5 = t4 + 60;
+        let t6 = t5 + 60;
+        node.mine_once(default_miner_destination(), t4, DEFAULT_MINING_ATTEMPTS)
+            .unwrap();
+        let hint = active_location(&node, 4);
+        let requests = HashMap::from([(
+            txid,
+            TransactionLookup {
+                floor_height,
+                hint: Some(hint),
+            },
+        )]);
+        assert_eq!(
+            node.active_transaction_lookups(&requests).unwrap().found[&txid].location,
+            hint
+        );
+
+        // A heavier branch from block 3 replaces block 4 with one that does
+        // not hold the transaction.
+        let side = mined_child(&node, blocks[2].block_id(), t4, 0x41);
+        node.submit_block(side.clone(), t4).unwrap();
+        let heavier = mined_child(&node, side.block_id(), t5, 0x42);
+        node.submit_block(heavier.clone(), t5).unwrap();
+        assert_eq!(node.state.tip(), heavier.block_id());
+        assert_ne!(node.active_block_id_at_height(4), Some(hint.block_id));
+
+        let read_before = node.transaction_lookup_blocks_read();
+        let outcome = node.active_transaction_lookups(&requests).unwrap();
+        assert!(outcome.found.is_empty());
+        assert_eq!(
+            outcome.scanned_tip,
+            TransactionLocation {
+                height: 5,
+                block_id: heavier.block_id(),
+            }
+        );
+        // Blocks 5 and 4: the stale hint is ignored and the floor still holds.
+        assert_eq!(node.transaction_lookup_blocks_read() - read_before, 2);
+
+        // Mined again on the new branch: the hint is still stale, and the
+        // scan resumes above the absent mark it left at block 5.
+        let remined =
+            mined_child_with_transactions(&node, heavier.block_id(), t6, 0x43, vec![transaction]);
+        node.submit_block(remined.clone(), t6).unwrap();
+        let read_before = node.transaction_lookup_blocks_read();
+        let outcome = node.active_transaction_lookups(&requests).unwrap();
+        assert_eq!(
+            outcome.found,
+            HashMap::from([(
+                txid,
+                TransactionLookupResult {
+                    confirmations: 1,
+                    location: TransactionLocation {
+                        height: 6,
+                        block_id: remined.block_id(),
+                    },
+                }
+            )])
+        );
+        assert_eq!(node.transaction_lookup_blocks_read() - read_before, 1);
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn stale_absent_mark_bounds_the_scan_above_the_fork_point() {
+        let (mut node, path, blocks) =
+            transaction_lookup_fixture("transaction-lookup-stale-absent", 3);
+        let txid = [0xab; 32];
+        let requests = HashMap::from([(
+            txid,
+            TransactionLookup {
+                floor_height: 0,
+                hint: None,
+            },
+        )]);
+        // No floor and no mark: blocks 3, 2 and 1 are read, and the absent
+        // mark is left at block 3.
+        let read_before = node.transaction_lookup_blocks_read();
+        assert!(
+            node.active_transaction_lookups(&requests)
+                .unwrap()
+                .found
+                .is_empty()
+        );
+        assert_eq!(node.transaction_lookup_blocks_read() - read_before, 3);
+
+        // A heavier branch from block 2 replaces block 3, so the mark's block
+        // leaves the active chain; the chains still agree through block 2.
+        let t3 = DEVNET_GENESIS_TIMESTAMP + 3 * 60;
+        let t4 = t3 + 60;
+        let side = mined_child(&node, blocks[1].block_id(), t3, 0x41);
+        node.submit_block(side.clone(), t3).unwrap();
+        let heavier = mined_child(&node, side.block_id(), t4, 0x42);
+        node.submit_block(heavier.clone(), t4).unwrap();
+        assert_eq!(node.state.tip(), heavier.block_id());
+        assert_eq!(node.active_ancestor_height(blocks[2].block_id()), Some(2));
+        assert_eq!(node.active_ancestor_height(heavier.block_id()), Some(4));
+        assert_eq!(node.active_ancestor_height([0xee; 32]), None);
+
+        // Only blocks 4 and 3 are read: the stale mark still bounds the scan
+        // above the fork point.
+        let read_before = node.transaction_lookup_blocks_read();
+        let outcome = node.active_transaction_lookups(&requests).unwrap();
+        assert!(outcome.found.is_empty());
+        assert_eq!(
+            outcome.scanned_tip,
+            TransactionLocation {
+                height: 4,
+                block_id: heavier.block_id(),
+            }
+        );
+        assert_eq!(node.transaction_lookup_blocks_read() - read_before, 2);
+        assert!(matches!(
+            node.transaction_scan_marks.get(&txid),
+            Some(TransactionScanMark::AbsentThrough { height: 4, .. })
+        ));
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn mixed_transaction_lookups_share_one_scan_bounded_by_the_lowest_floor() {
+        let (mut node, path, blocks) = transaction_lookup_fixture("transaction-lookup-mixed", 3);
+        let found_tx = spend_coinbase_output(&node, &blocks[0], 2, 0x12, 0x31, 10);
+        let below_floor_tx = spend_coinbase_output(&node, &blocks[1], 2, 0x12, 0x32, 10);
+        let (found_id, below_floor_id, absent_id) =
+            (found_tx.txid(), below_floor_tx.txid(), [0xcd; 32]);
+        let t4 = DEVNET_GENESIS_TIMESTAMP + 4 * 60;
+        let mined = mined_child_with_transactions(
+            &node,
+            blocks[2].block_id(),
+            t4,
+            0x44,
+            vec![found_tx, below_floor_tx],
+        );
+        node.submit_block(mined, t4).unwrap();
+        for height in 5..=7 {
+            node.mine_once(
+                default_miner_destination(),
+                DEVNET_GENESIS_TIMESTAMP + height * 60,
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        }
+        let lookup = |floor_height| TransactionLookup {
+            floor_height,
+            hint: None,
+        };
+        // Both transactions sit in block 4, but the second is asked for with
+        // a floor above it and must not be seen there.
+        let requests = HashMap::from([
+            (found_id, lookup(4)),
+            (below_floor_id, lookup(5)),
+            (absent_id, lookup(6)),
+        ]);
+        let read_before = node.transaction_lookup_blocks_read();
+        let outcome = node.active_transaction_lookups(&requests).unwrap();
+        assert_eq!(
+            outcome.found,
+            HashMap::from([(
+                found_id,
+                TransactionLookupResult {
+                    confirmations: 4,
+                    location: active_location(&node, 4),
+                }
+            )])
+        );
+        assert_eq!(outcome.scanned_tip, active_location(&node, 7));
+        // Blocks 7 down to the lowest floor, 4: one read each, none below.
+        assert_eq!(node.transaction_lookup_blocks_read() - read_before, 4);
+        assert!(matches!(
+            node.transaction_scan_marks.get(&below_floor_id),
+            Some(TransactionScanMark::AbsentThrough { height: 7, .. })
+        ));
+        assert!(matches!(
+            node.transaction_scan_marks.get(&absent_id),
+            Some(TransactionScanMark::AbsentThrough { height: 7, .. })
+        ));
         drop(node);
         clean_test_dir(&path);
     }

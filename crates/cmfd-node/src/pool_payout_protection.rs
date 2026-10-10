@@ -483,6 +483,39 @@ pub(super) fn check_funding(
     Ok(())
 }
 
+/// What `refresh_payment_states` found for one payment: its state and the
+/// chain positions that bound its next lookup.
+struct PaymentRefresh {
+    state: PoolPayoutTransactionState,
+    confirmations: u64,
+    confirmed_at: Option<PayoutTransactionLocation>,
+    absent_through: Option<PayoutTransactionLocation>,
+}
+
+/// Whether `location` is still on the active chain, by block identifier.
+fn on_active_chain(node: &Node, location: PayoutTransactionLocation) -> bool {
+    node.active_block_id_at_height(location.height) == Some(location.block_id)
+}
+
+/// The lowest height a lookup has to read, given a block at or below which
+/// the transaction was not on the chain the location was recorded on: the
+/// height above the block while it is active, and otherwise above the fork
+/// point below it, since the active chain holds the same blocks up to there.
+/// Zero, no bound, without a location or for a block the node no longer
+/// holds.
+fn lookup_floor(node: &Node, location: Option<PayoutTransactionLocation>) -> u64 {
+    location
+        .and_then(|at| node.active_ancestor_height(at.block_id))
+        .map_or(0, |height| height.saturating_add(1))
+}
+
+/// Refreshes every payment's chain state. A payment whose `confirmed_at`
+/// block is still active is confirmed without reading a block; the rest are
+/// looked up once, each above the tip it was created at or last absent
+/// through (or above the fork point below either, once a reorganization has
+/// replaced it), and the result is kept in the ledger so the next refresh, or
+/// a restart, reads only blocks added since. A record from before these
+/// fields existed costs one unbounded sweep, after which it is bounded.
 pub(super) fn refresh_payment_states(
     ledger: &DurableLedger,
     node: &mut Node,
@@ -495,25 +528,67 @@ pub(super) fn refresh_payment_states(
         .iter()
         .map(|(id, r)| (*id, r.clone()))
         .collect();
-    let ids = records.iter().map(|(id, _)| *id).collect();
-    let confirmed = node.active_transaction_confirmations_for(&ids)?;
+    let next_height = node.state.next_height();
+    let mut located = HashMap::new();
+    let mut requests = HashMap::new();
+    for (id, record) in &records {
+        if let Some(location) = record.confirmed_at.filter(|at| on_active_chain(node, *at)) {
+            located.insert(*id, (next_height.saturating_sub(location.height), location));
+            continue;
+        }
+        // The transaction was not on the chain through the tip it was
+        // created at or last absent through, nor below the block it was
+        // found in, so each bounds the lookup.
+        let floor_height = lookup_floor(node, record.created_at)
+            .max(lookup_floor(node, record.absent_through))
+            .max(lookup_floor(node, record.confirmed_at));
+        requests.insert(
+            *id,
+            TransactionLookup {
+                floor_height,
+                hint: record.confirmed_at.map(TransactionLocation::from),
+            },
+        );
+    }
+    let scanned_tip = if requests.is_empty() {
+        None
+    } else {
+        let outcome = node.active_transaction_lookups(&requests)?;
+        for (id, result) in outcome.found {
+            located.insert(id, (result.confirmations, result.location.into()));
+        }
+        Some(PayoutTransactionLocation::from(outcome.scanned_tip))
+    };
     let updates: Vec<_> = records
         .into_iter()
         .filter_map(|(id, record)| {
-            let (state, confirmations) = if let Some(count) = confirmed.get(&id) {
-                (PoolPayoutTransactionState::Confirmed, *count)
-            } else if node.mempool_contains_transaction(id) {
-                (PoolPayoutTransactionState::Broadcast, 0)
-            } else if record.state == PoolPayoutTransactionState::Abandoned {
-                (PoolPayoutTransactionState::Abandoned, 0)
+            let refresh = if let Some((confirmations, location)) = located.get(&id) {
+                PaymentRefresh {
+                    state: PoolPayoutTransactionState::Confirmed,
+                    confirmations: *confirmations,
+                    confirmed_at: Some(*location),
+                    absent_through: None,
+                }
             } else {
-                (PoolPayoutTransactionState::Prepared, 0)
+                let state = if node.mempool_contains_transaction(id) {
+                    PoolPayoutTransactionState::Broadcast
+                } else if record.state == PoolPayoutTransactionState::Abandoned {
+                    PoolPayoutTransactionState::Abandoned
+                } else {
+                    PoolPayoutTransactionState::Prepared
+                };
+                PaymentRefresh {
+                    state,
+                    confirmations: 0,
+                    confirmed_at: record.confirmed_at,
+                    absent_through: scanned_tip,
+                }
             };
-            (state != record.state || confirmations != record.confirmations).then_some((
-                id,
-                state,
-                confirmations,
-            ))
+            (refresh.state != record.state
+                || refresh.confirmations != record.confirmations
+                || refresh.confirmed_at != record.confirmed_at
+                || refresh.absent_through != record.absent_through)
+                .then_some((id, refresh))
         })
         .collect();
     let hazards = {
@@ -527,8 +602,8 @@ pub(super) fn refresh_payment_states(
             .filter_map(|(id, record)| {
                 let status = updates
                     .iter()
-                    .find(|(updated, _, _)| updated == id)
-                    .map_or(record.state, |(_, status, _)| *status);
+                    .find(|(updated, _)| updated == id)
+                    .map_or(record.state, |(_, refresh)| refresh.state);
                 let reason = if status == PoolPayoutTransactionState::Abandoned {
                     Reason::LegacyPaymentUncertain
                 } else if matches!(
@@ -557,10 +632,12 @@ pub(super) fn refresh_payment_states(
             state.observed_chain_height = state
                 .observed_chain_height
                 .max(node.state.next_height().saturating_sub(1));
-            for (id, status, confirmations) in updates {
+            for (id, refresh) in updates {
                 let record = state.payout_transactions.get_mut(&id).unwrap();
-                record.state = status;
-                record.confirmations = confirmations;
+                record.state = refresh.state;
+                record.confirmations = refresh.confirmations;
+                record.confirmed_at = refresh.confirmed_at;
+                record.absent_through = refresh.absent_through;
             }
             for (id, reason) in hazards {
                 add_incident(state, node, reason, None, Some(id))?;

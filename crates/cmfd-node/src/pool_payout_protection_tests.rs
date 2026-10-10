@@ -332,6 +332,9 @@ fn payout_hold_is_scoped_and_wallet_planner_keeps_signed_inputs_reserved() {
                     transaction: signed.clone(),
                     state: PoolPayoutTransactionState::Prepared,
                     confirmations: 0,
+                    created_at: None,
+                    confirmed_at: None,
+                    absent_through: None,
                 },
             );
             Ok(())
@@ -506,6 +509,9 @@ fn legacy_abandoned_signatures_are_held_and_never_automatically_replaced() {
                     transaction,
                     state: PoolPayoutTransactionState::Abandoned,
                     confirmations: 0,
+                    created_at: None,
+                    confirmed_at: None,
+                    absent_through: None,
                 },
             );
             Ok(())
@@ -562,6 +568,9 @@ fn payout_hold_lifts_itself_once_the_payout_is_confirmed_deep_enough() {
                         transaction: signed.clone(),
                         state,
                         confirmations,
+                        created_at: None,
+                        confirmed_at: None,
+                        absent_through: None,
                     },
                 );
                 Ok(())
@@ -700,4 +709,302 @@ fn offline_status_distributes_a_block_maturing_at_the_configured_bonus_rate() {
     assert_eq!(snapshot.bonus_credited_atoms, bonus);
     assert_eq!(snapshot.bonus_reserve_atoms, reserve - bonus);
     assert_eq!(snapshot.payouts[0].bonus_atoms, bonus);
+}
+
+#[test]
+fn payout_transaction_locations_round_trip_and_stay_absent_from_legacy_bytes() {
+    #[derive(Serialize)]
+    struct PreviousPayoutTransactionRecord<'a> {
+        payout: [u8; 32],
+        amount_atoms: u64,
+        fee_atoms: u64,
+        transaction: &'a Transaction,
+        state: PoolPayoutTransactionState,
+        confirmations: u64,
+    }
+    #[derive(Serialize)]
+    struct PreviousStoredPayoutTransactionRecordV1<'a> {
+        txid: [u8; 32],
+        record: PreviousPayoutTransactionRecord<'a>,
+    }
+
+    let payout = test_payout_signer().payout();
+    let transaction = Transaction {
+        network_id: [0x7e; 32],
+        version: 1,
+        inputs: Vec::new(),
+        outputs: vec![cmfd_consensus::TxOutput {
+            value: 120,
+            lock: OutputLock::Key(payout),
+            spendable_height: 0,
+        }],
+    };
+    let txid = transaction.txid();
+    let located = PayoutTransactionRecord {
+        payout,
+        amount_atoms: 120,
+        fee_atoms: 1,
+        transaction: transaction.clone(),
+        state: PoolPayoutTransactionState::Confirmed,
+        confirmations: 3,
+        created_at: Some(PayoutTransactionLocation {
+            height: 41,
+            block_id: [0x41; 32],
+        }),
+        confirmed_at: Some(PayoutTransactionLocation {
+            height: 42,
+            block_id: [0x42; 32],
+        }),
+        absent_through: Some(PayoutTransactionLocation {
+            height: 40,
+            block_id: [0x40; 32],
+        }),
+    };
+    let restored: PayoutTransactionRecord =
+        serde_json::from_slice(&serde_json::to_vec(&located).unwrap()).unwrap();
+    assert_eq!(restored.created_at, located.created_at);
+    assert_eq!(restored.confirmed_at, located.confirmed_at);
+    assert_eq!(restored.absent_through, located.absent_through);
+    assert_eq!(restored.confirmations, 3);
+
+    // A record written before these fields existed loads with none of them.
+    let previous = PreviousPayoutTransactionRecord {
+        payout,
+        amount_atoms: 120,
+        fee_atoms: 1,
+        transaction: &transaction,
+        state: PoolPayoutTransactionState::Broadcast,
+        confirmations: 0,
+    };
+    let legacy: PayoutTransactionRecord =
+        serde_json::from_slice(&serde_json::to_vec(&previous).unwrap()).unwrap();
+    assert_eq!(legacy.state, PoolPayoutTransactionState::Broadcast);
+    assert_eq!(legacy.created_at, None);
+    assert_eq!(legacy.confirmed_at, None);
+    assert_eq!(legacy.absent_through, None);
+    // And a record that has none of them serializes exactly as before, on its
+    // own and inside the stored ledger payload.
+    assert_eq!(
+        serde_json::to_vec(&legacy).unwrap(),
+        serde_json::to_vec(&previous).unwrap()
+    );
+    let ledger = DurableLedger::open(None, [0x7e; 32], [0x7f; 32]).unwrap();
+    register_session(&ledger, 1, "worker".to_owned(), payout).unwrap();
+    credit_accepted_share(&ledger, 1, 120).unwrap();
+    ledger
+        .transaction(|state| {
+            state.payout_transactions.insert(txid, legacy.clone());
+            Ok(())
+        })
+        .unwrap();
+    let payload = serde_json::to_string(&ledger_payload(&ledger.state.lock().unwrap())).unwrap();
+    let stored = serde_json::to_string(&PreviousStoredPayoutTransactionRecordV1 {
+        txid,
+        record: previous,
+    })
+    .unwrap();
+    assert!(payload.contains(&stored), "{payload}");
+    assert!(!payload.contains("created_at"));
+    assert!(!payload.contains("confirmed_at"));
+    assert!(!payload.contains("absent_through"));
+}
+
+#[test]
+fn unmined_payouts_are_absent_through_the_tip_and_looked_up_above_it_next() {
+    let root = TestRoot::new("payout-absent-marks");
+    let mut node =
+        Node::open_with_profile(root.path().join("node"), crate::DEVNET_PROFILE).unwrap();
+    let owner = node.wallet_destination();
+    let now = unix_time_seconds().unwrap();
+    for offset in 0..COINBASE_MATURITY + 2 {
+        node.mine_once(owner, now + offset, 10_000).unwrap();
+    }
+    let recipient = test_payout_signer().payout();
+    let ledger = protection_ledger(&node);
+    register_session(&ledger, 1, "unmined".into(), recipient).unwrap();
+    credit_accepted_share(&ledger, 1, 250).unwrap();
+    let tip = |node: &Node| PayoutTransactionLocation {
+        height: node.state.next_height() - 1,
+        block_id: node.state.tip(),
+    };
+    let at = |node: &Node, height: u64| PayoutTransactionLocation {
+        height,
+        block_id: node.active_block_id_at_height(height).unwrap(),
+    };
+    let insert = |transaction: Transaction,
+                  amount_atoms: u64,
+                  created_at: Option<PayoutTransactionLocation>| {
+        let txid = transaction.txid();
+        ledger
+            .transaction(|state| {
+                state.payout_transactions.insert(
+                    txid,
+                    PayoutTransactionRecord {
+                        payout: recipient,
+                        amount_atoms,
+                        fee_atoms: 1,
+                        transaction,
+                        state: PoolPayoutTransactionState::Prepared,
+                        confirmations: 0,
+                        created_at,
+                        confirmed_at: None,
+                        absent_through: None,
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+        txid
+    };
+    let record = |txid: [u8; 32]| ledger.state.lock().unwrap().payout_transactions[&txid].clone();
+
+    // A payment signed two blocks ago and never sent: the lookup reads only
+    // the two blocks above the tip it was created at, then records the tip
+    // it was absent through.
+    let first_tip = tip(&node);
+    let (signed, _) = node.prepare_dev_wallet_payment(recipient, 120, 1).unwrap();
+    let bounded = insert(signed, 120, Some(at(&node, first_tip.height - 2)));
+    payout_protection::refresh_payment_states(&ledger, &mut node).unwrap();
+    let unmined = record(bounded);
+    assert_eq!(unmined.state, PoolPayoutTransactionState::Prepared);
+    assert_eq!(unmined.confirmed_at, None);
+    assert_eq!(unmined.absent_through, Some(first_tip));
+    assert_eq!(node.transaction_lookup_blocks_read(), 2);
+
+    // A record from before creation tips were kept costs one sweep of the
+    // whole chain; the bounded record is not looked up again at this tip.
+    let (signed, _) = node.prepare_dev_wallet_payment(recipient, 130, 1).unwrap();
+    let legacy = insert(signed, 130, None);
+    payout_protection::refresh_payment_states(&ledger, &mut node).unwrap();
+    assert_eq!(record(legacy).absent_through, Some(first_tip));
+    assert_eq!(record(bounded).absent_through, Some(first_tip));
+    assert_eq!(node.transaction_lookup_blocks_read(), 2 + first_tip.height);
+
+    // Nothing changed: no lookup, no ledger write.
+    let generation = ledger.state.lock().unwrap().generation;
+    payout_protection::refresh_payment_states(&ledger, &mut node).unwrap();
+    assert_eq!(ledger.state.lock().unwrap().generation, generation);
+    assert_eq!(node.transaction_lookup_blocks_read(), 2 + first_tip.height);
+
+    // Two more blocks without the payments: both lookups start above the tip
+    // they were absent through, so only those two blocks are read.
+    for offset in 0..2 {
+        node.mine_once(owner, now + COINBASE_MATURITY + 2 + offset, 10_000)
+            .unwrap();
+    }
+    let second_tip = tip(&node);
+    assert_eq!(second_tip.height, first_tip.height + 2);
+    payout_protection::refresh_payment_states(&ledger, &mut node).unwrap();
+    assert_eq!(record(bounded).absent_through, Some(second_tip));
+    assert_eq!(record(legacy).absent_through, Some(second_tip));
+    assert_eq!(record(bounded).state, PoolPayoutTransactionState::Prepared);
+    assert_eq!(node.transaction_lookup_blocks_read(), 4 + first_tip.height);
+    let state = ledger.state.lock().unwrap();
+    validate_ledger(&state).unwrap();
+    assert!(state.payout_protection.is_empty());
+}
+
+#[test]
+fn reorganized_lookup_bounds_fall_back_to_the_fork_point() {
+    let root = TestRoot::new("payout-fork-point-bounds");
+    let mut node =
+        Node::open_with_profile(root.path().join("node"), crate::DEVNET_PROFILE).unwrap();
+    let mut fork =
+        Node::open_with_profile(root.path().join("fork"), crate::DEVNET_PROFILE).unwrap();
+    let owner = node.wallet_destination();
+    let now = unix_time_seconds().unwrap();
+    // The fork has every block but the tip.
+    let tip_height = COINBASE_MATURITY + 2;
+    for height in 1..=tip_height {
+        let block = node.mine_once(owner, now + height, 10_000).unwrap();
+        if height < tip_height {
+            fork.submit_block(block, now + height).unwrap();
+        }
+    }
+    let recipient = test_payout_signer().payout();
+    let ledger = protection_ledger(&node);
+    register_session(&ledger, 1, "forked".into(), recipient).unwrap();
+    credit_accepted_share(&ledger, 1, 250).unwrap();
+    let tip = |node: &Node| PayoutTransactionLocation {
+        height: node.state.next_height() - 1,
+        block_id: node.state.tip(),
+    };
+    let insert = |transaction: Transaction,
+                  amount_atoms: u64,
+                  state: PoolPayoutTransactionState,
+                  confirmations: u64,
+                  confirmed_at: Option<PayoutTransactionLocation>| {
+        let txid = transaction.txid();
+        ledger
+            .transaction(|ledger| {
+                ledger.payout_transactions.insert(
+                    txid,
+                    PayoutTransactionRecord {
+                        payout: recipient,
+                        amount_atoms,
+                        fee_atoms: 1,
+                        transaction,
+                        state,
+                        confirmations,
+                        created_at: None,
+                        confirmed_at,
+                        absent_through: None,
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+        txid
+    };
+    let record = |txid: [u8; 32]| ledger.state.lock().unwrap().payout_transactions[&txid].clone();
+
+    // Records from before locations were kept: one never found, so its first
+    // refresh sweeps the whole chain, and one recorded as confirmed in the
+    // tip block, which is verified without a read.
+    let old_tip = tip(&node);
+    let (signed, _) = node.prepare_dev_wallet_payment(recipient, 120, 1).unwrap();
+    let absent = insert(signed, 120, PoolPayoutTransactionState::Prepared, 0, None);
+    let (signed, _) = node.prepare_dev_wallet_payment(recipient, 130, 1).unwrap();
+    let confirmed = insert(
+        signed,
+        130,
+        PoolPayoutTransactionState::Confirmed,
+        1,
+        Some(old_tip),
+    );
+    payout_protection::refresh_payment_states(&ledger, &mut node).unwrap();
+    assert_eq!(record(absent).absent_through, Some(old_tip));
+    assert_eq!(record(confirmed).state, PoolPayoutTransactionState::Confirmed);
+    assert_eq!(node.transaction_lookup_blocks_read(), tip_height);
+
+    // Two blocks from the fork replace the tip block: both kept positions
+    // leave the active chain, which still agrees with the old one below it.
+    for offset in 1..=2 {
+        let block = fork
+            .mine_once(owner, now + tip_height + offset, 10_000)
+            .unwrap();
+        node.submit_block(block, now + tip_height + offset).unwrap();
+    }
+    let new_tip = tip(&node);
+    assert_eq!(new_tip.height, tip_height + 1);
+    assert_ne!(
+        node.active_block_id_at_height(tip_height),
+        Some(old_tip.block_id)
+    );
+
+    // Only the two blocks above the fork point are read, for both records:
+    // neither falls back to a sweep.
+    payout_protection::refresh_payment_states(&ledger, &mut node).unwrap();
+    assert_eq!(node.transaction_lookup_blocks_read(), tip_height + 2);
+    let still_absent = record(absent);
+    assert_eq!(still_absent.state, PoolPayoutTransactionState::Prepared);
+    assert_eq!(still_absent.absent_through, Some(new_tip));
+    let lost = record(confirmed);
+    assert_eq!(lost.state, PoolPayoutTransactionState::Prepared);
+    assert_eq!(lost.confirmations, 0);
+    assert_eq!(lost.absent_through, Some(new_tip));
+    assert_eq!(lost.confirmed_at, Some(old_tip));
+    let state = ledger.state.lock().unwrap();
+    validate_ledger(&state).unwrap();
+    assert!(state.payout_protection.is_empty());
 }

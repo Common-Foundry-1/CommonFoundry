@@ -70,6 +70,9 @@ fn payout_mempool_conflict_preserves_reservation_and_exact_transaction_on_restar
                     transaction: transaction.clone(),
                     state: PoolPayoutTransactionState::Prepared,
                     confirmations: 0,
+                    created_at: None,
+                    confirmed_at: None,
+                    absent_through: None,
                 },
             );
             Ok(())
@@ -443,7 +446,7 @@ fn bonus_reserve_funds_once_and_pays_the_rate_on_mature_blocks() {
         scan_from_height: Some(1),
     });
     let server = spawn_pool_server(Arc::clone(&node), config.clone()).unwrap();
-    // Startup scans 64 heights per pass from height 1 and has already
+    // Startup scanned 64 heights from height 1 and this snapshot's pass
     // continued to the confirmed tip (103 - 5); nothing has six confirmations.
     let scanning = server.ledger_snapshot().unwrap();
     assert_eq!(
@@ -799,4 +802,331 @@ fn bonus_funding_record_cap_skips_the_transfer_and_still_advances_the_scan() {
         state.bonus_scan.map(|mark| mark.height),
         Some(funding_height)
     );
+}
+
+#[test]
+fn payout_lookups_start_above_the_creation_tip_and_keep_the_confirmed_location() {
+    let root = TestRoot::new("payout-lookup-bounds");
+    let node_directory = root.path().join("node");
+    let open_node = || {
+        Arc::new(Mutex::new(
+            Node::open_with_profile(&node_directory, crate::DEVNET_PROFILE).unwrap(),
+        ))
+    };
+    let node = open_node();
+    let pool_wallet = node.lock().unwrap().wallet_destination();
+    let now = unix_time_seconds().unwrap();
+    for offset in 0..=COINBASE_MATURITY {
+        node.lock()
+            .unwrap()
+            .mine_once(pool_wallet, now + offset, 10_000)
+            .unwrap();
+    }
+    let recipient = test_payout_signer().payout();
+    let (certificate, key, _) = certificate(&root);
+    let mut config = PoolServerConfig::devnet(
+        "127.0.0.1:0".parse().unwrap(),
+        fs::read(certificate).unwrap(),
+        fs::read(key).unwrap(),
+        pool_wallet,
+    );
+    config.ledger_directory = Some(root.path().join("ledger"));
+    config.payout_policy = Some(PoolPayoutPolicy {
+        minimum_payout_atoms: 100,
+        fee_atoms: 1,
+    });
+    let server = spawn_pool_server(Arc::clone(&node), config.clone()).unwrap();
+    register_session(&server.shared.ledger, 1, "bounded".to_owned(), recipient).unwrap();
+    credit_accepted_share(&server.shared.ledger, 1, 120).unwrap();
+    let record = |ledger: &DurableLedger| {
+        let state = ledger.state.lock().unwrap();
+        let (txid, record) = state.payout_transactions.iter().next().unwrap();
+        (*txid, record.clone())
+    };
+    let blocks_read = || node.lock().unwrap().transaction_lookup_blocks_read();
+    let tip = || {
+        let node = node.lock().unwrap();
+        PayoutTransactionLocation {
+            height: node.state.next_height() - 1,
+            block_id: node.state.tip(),
+        }
+    };
+
+    // The payout is created at the tip: no block of that chain holds it.
+    let created_tip = tip();
+    reconcile_pool_payouts(&server.shared, true).unwrap();
+    let (txid, created) = record(&server.shared.ledger);
+    assert_eq!(created.state, PoolPayoutTransactionState::Broadcast);
+    assert_eq!(created.created_at, Some(created_tip));
+    assert_eq!(created.confirmed_at, None);
+    assert_eq!(created.absent_through, None);
+    assert_eq!(blocks_read(), 0);
+
+    // Unmined: it was created at the tip, so no block is read and the tip it
+    // is absent through is kept.
+    let unmined_tip = tip();
+    reconcile_pool_payouts(&server.shared, false).unwrap();
+    let (_, unmined) = record(&server.shared.ledger);
+    assert_eq!(unmined.state, PoolPayoutTransactionState::Broadcast);
+    assert_eq!(unmined.absent_through, Some(unmined_tip));
+    assert_eq!(blocks_read(), 0);
+
+    // Mined: exactly the one block above that tip is read, and where the
+    // payout was found is kept.
+    let block = node
+        .lock()
+        .unwrap()
+        .mine_once(pool_wallet, now + COINBASE_MATURITY + 1, 10_000)
+        .unwrap();
+    assert!(block.transactions.iter().any(|t| t.txid() == txid));
+    reconcile_pool_payouts(&server.shared, false).unwrap();
+    let (_, confirmed) = record(&server.shared.ledger);
+    assert_eq!(confirmed.state, PoolPayoutTransactionState::Confirmed);
+    assert_eq!(confirmed.confirmations, 1);
+    assert_eq!(confirmed.confirmed_at, Some(tip()));
+    assert_eq!(confirmed.confirmed_at.unwrap().height, created_tip.height + 1);
+    assert_eq!(confirmed.absent_through, None);
+    assert_eq!(blocks_read(), 1);
+
+    // Deeper: the kept location still holds, so confirmations count up
+    // without a read.
+    node.lock()
+        .unwrap()
+        .mine_once(pool_wallet, now + COINBASE_MATURITY + 2, 10_000)
+        .unwrap();
+    reconcile_pool_payouts(&server.shared, false).unwrap();
+    let (_, deeper) = record(&server.shared.ledger);
+    assert_eq!(deeper.confirmations, 2);
+    assert_eq!(deeper.confirmed_at, confirmed.confirmed_at);
+    assert_eq!(blocks_read(), 1);
+    server.stop().unwrap();
+    drop(node);
+
+    // A restart verifies the kept location against the chain and reads no
+    // block: not at the startup reconcile, not on a later refresh.
+    let node = open_node();
+    let server = spawn_pool_server(Arc::clone(&node), config).unwrap();
+    let restarted = server.ledger_snapshot().unwrap();
+    assert_eq!(restarted.payout_transactions.len(), 1);
+    assert_eq!(restarted.payout_transactions[0].state, "confirmed");
+    assert_eq!(restarted.payout_transactions[0].confirmations, 2);
+    let (_, reopened) = record(&server.shared.ledger);
+    assert_eq!(reopened.confirmed_at, confirmed.confirmed_at);
+    assert_eq!(node.lock().unwrap().transaction_lookup_blocks_read(), 0);
+    server.stop().unwrap();
+}
+
+#[test]
+fn tip_changes_reconcile_on_the_reconcile_thread_which_outlives_a_failed_run() {
+    let root = TestRoot::new("reconcile-thread");
+    let node = Arc::new(Mutex::new(
+        Node::open_with_profile(root.path().join("node"), crate::DEVNET_PROFILE).unwrap(),
+    ));
+    let pool_wallet = node.lock().unwrap().wallet_destination();
+    let now = unix_time_seconds().unwrap();
+    for offset in 0..=COINBASE_MATURITY {
+        node.lock()
+            .unwrap()
+            .mine_once(pool_wallet, now + offset, 10_000)
+            .unwrap();
+    }
+    let (certificate, key, _) = certificate(&root);
+    let mut config = PoolServerConfig::devnet(
+        "127.0.0.1:0".parse().unwrap(),
+        fs::read(certificate).unwrap(),
+        fs::read(key).unwrap(),
+        pool_wallet,
+    );
+    config.ledger_directory = Some(root.path().join("ledger"));
+    config.payout_policy = Some(PoolPayoutPolicy {
+        minimum_payout_atoms: 100,
+        fee_atoms: 1,
+    });
+    let server = spawn_pool_server(Arc::clone(&node), config).unwrap();
+    register_session(
+        &server.shared.ledger,
+        1,
+        "reconciled".to_owned(),
+        test_payout_signer().payout(),
+    )
+    .unwrap();
+    credit_accepted_share(&server.shared.ledger, 1, 120).unwrap();
+    let requests = || server.shared.reconcile.state.lock().unwrap().requests;
+    // The listener notices a new tip and only asks for reconciliation; the
+    // reconcile thread runs it. Nothing here calls the reconcile functions.
+    let mine_and_request = |offset: u64| {
+        let before = requests();
+        node.lock()
+            .unwrap()
+            .mine_once(pool_wallet, now + COINBASE_MATURITY + offset, 10_000)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while requests() == before {
+            assert!(Instant::now() < deadline, "listener never requested reconciliation");
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(server.wait_for_reconcile(Duration::from_secs(30)).unwrap());
+    };
+
+    // A run that fails (the ledger is faulted) is logged; the thread stays.
+    server.shared.ledger.faulted.store(true, Ordering::Release);
+    mine_and_request(1);
+    assert!(server.shared.ledger.state.lock().unwrap().payout_transactions.is_empty());
+    assert!(!server.reconcile_thread.as_ref().unwrap().is_finished());
+
+    // The next tip change is served: the due payout is created and sent.
+    server.shared.ledger.faulted.store(false, Ordering::Release);
+    mine_and_request(2);
+    let paid = snapshot_ledger(&server.shared.ledger).unwrap();
+    assert_eq!(paid.payout_transactions.len(), 1);
+    assert_eq!(paid.payout_transactions[0].state, "broadcast");
+    assert_eq!(paid.payouts[0].available_payout_atoms, 0);
+
+    // Stopping joins the thread.
+    server.stop().unwrap();
+}
+
+#[test]
+fn payout_mined_below_its_creation_tip_by_a_reorganization_is_confirmed() {
+    let root = TestRoot::new("payout-reorg-below-creation-tip");
+    let node = Arc::new(Mutex::new(
+        Node::open_with_profile(root.path().join("node"), crate::DEVNET_PROFILE).unwrap(),
+    ));
+    let mut fork =
+        Node::open_with_profile(root.path().join("fork"), crate::DEVNET_PROFILE).unwrap();
+    let pool_wallet = node.lock().unwrap().wallet_destination();
+    let other = fork.wallet_destination();
+    let now = unix_time_seconds().unwrap();
+    // The pool wallet owns the first three coinbases, mature at every height
+    // used below, and the fork has every block but the pool node's tip.
+    let tip_height = COINBASE_MATURITY + 5;
+    for height in 1..=tip_height {
+        let destination = if height <= 3 { pool_wallet } else { other };
+        let block = node
+            .lock()
+            .unwrap()
+            .mine_once(destination, now + height, 10_000)
+            .unwrap();
+        if height < tip_height {
+            fork.submit_block(block, now + height).unwrap();
+        }
+    }
+    let recipient = test_payout_signer().payout();
+    let (certificate, key, _) = certificate(&root);
+    let mut config = PoolServerConfig::devnet(
+        "127.0.0.1:0".parse().unwrap(),
+        fs::read(certificate).unwrap(),
+        fs::read(key).unwrap(),
+        pool_wallet,
+    );
+    config.ledger_directory = Some(root.path().join("ledger"));
+    config.payout_policy = Some(PoolPayoutPolicy {
+        minimum_payout_atoms: 100,
+        fee_atoms: 1,
+    });
+    let server = spawn_pool_server(Arc::clone(&node), config).unwrap();
+    register_session(&server.shared.ledger, 1, "reorged".to_owned(), recipient).unwrap();
+    credit_accepted_share(&server.shared.ledger, 1, 120).unwrap();
+    let record = |ledger: &DurableLedger| {
+        let state = ledger.state.lock().unwrap();
+        let (txid, record) = state.payout_transactions.iter().next().unwrap();
+        (*txid, record.clone())
+    };
+    let tip = || {
+        let node = node.lock().unwrap();
+        PayoutTransactionLocation {
+            height: node.state.next_height() - 1,
+            block_id: node.state.tip(),
+        }
+    };
+
+    let created_tip = tip();
+    assert_eq!(created_tip.height, tip_height);
+    reconcile_pool_payouts(&server.shared, true).unwrap();
+    let (txid, created) = record(&server.shared.ledger);
+    assert_eq!(created.state, PoolPayoutTransactionState::Broadcast);
+    assert_eq!(created.created_at, Some(created_tip));
+
+    // A miner that has not seen the pool node's tip block puts the payout in
+    // its own block at that height and extends it; the heavier branch
+    // replaces the tip, so the payout sits at the height it was created at.
+    fork.submit_transaction(created.transaction.clone()).unwrap();
+    let replaced = fork
+        .mine_once(other, now + tip_height + 1, 10_000)
+        .unwrap();
+    assert_eq!(replaced.challenge.height, tip_height);
+    assert!(replaced.transactions.iter().any(|t| t.txid() == txid));
+    let extended = fork
+        .mine_once(other, now + tip_height + 2, 10_000)
+        .unwrap();
+    for block in [replaced.clone(), extended.clone()] {
+        node.lock()
+            .unwrap()
+            .submit_block(block, now + tip_height + 2)
+            .unwrap();
+    }
+    assert_eq!(node.lock().unwrap().state.tip(), extended.block_id());
+
+    // The lookup starts above the fork point, not above the replaced creation
+    // tip: the two blocks of the new branch are read and the payout is
+    // confirmed where it was mined, with nothing held.
+    reconcile_pool_payouts(&server.shared, false).unwrap();
+    let (_, confirmed) = record(&server.shared.ledger);
+    assert_eq!(confirmed.state, PoolPayoutTransactionState::Confirmed);
+    assert_eq!(confirmed.confirmations, 2);
+    assert_eq!(
+        confirmed.confirmed_at,
+        Some(PayoutTransactionLocation {
+            height: tip_height,
+            block_id: replaced.block_id(),
+        })
+    );
+    assert_eq!(confirmed.absent_through, None);
+    assert_eq!(node.lock().unwrap().transaction_lookup_blocks_read(), 2);
+    let snapshot = snapshot_ledger(&server.shared.ledger).unwrap();
+    assert!(snapshot.payout_protection.unresolved_incidents.is_empty());
+    assert_eq!(snapshot.payouts[0].confirmed_payout_atoms, 120);
+    assert!(!snapshot.payouts[0].payout_on_hold);
+    server.stop().unwrap();
+}
+
+#[test]
+fn pool_is_finished_once_the_reconcile_thread_exits() {
+    let root = TestRoot::new("reconcile-thread-exit");
+    let node = Arc::new(Mutex::new(
+        Node::open_with_profile(root.path().join("node"), crate::DEVNET_PROFILE).unwrap(),
+    ));
+    let pool_wallet = node.lock().unwrap().wallet_destination();
+    let (certificate, key, _) = certificate(&root);
+    let config = PoolServerConfig::devnet(
+        "127.0.0.1:0".parse().unwrap(),
+        fs::read(certificate).unwrap(),
+        fs::read(key).unwrap(),
+        pool_wallet,
+    );
+    let server = spawn_pool_server(node, config).unwrap();
+    assert!(!server.is_finished());
+
+    // A panic while holding the reconcile signal poisons it: the reconcile
+    // thread's next wait fails and the thread exits, which ends the service
+    // although the listener is still accepting.
+    let shared = Arc::clone(&server.shared);
+    let _ = thread::spawn(move || {
+        let _guard = shared.reconcile.state.lock().unwrap();
+        panic!("poisoning the reconcile signal");
+    })
+    .join();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !server.is_finished() {
+        assert!(
+            Instant::now() < deadline,
+            "reconcile thread exit was not reported"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(!server.thread.as_ref().unwrap().is_finished());
+    assert!(matches!(
+        server.stop(),
+        Err(PoolError::SharedStatePoisoned)
+    ));
 }

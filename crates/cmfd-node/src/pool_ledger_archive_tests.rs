@@ -65,6 +65,9 @@ fn confirmed_payment(payout: [u8; 32], amount_atoms: u64, confirmations: u64) ->
             transaction,
             state: PoolPayoutTransactionState::Confirmed,
             confirmations,
+            created_at: None,
+            confirmed_at: None,
+            absent_through: None,
         },
     )
 }

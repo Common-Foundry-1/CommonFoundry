@@ -86,7 +86,7 @@ impl std::ops::Deref for FixedBytes {
 pub fn prove_real_bank_opening(
     bank: usize,
     maps: &FixedArtifactMaps,
-    encoded_bank: DeviceBuffer<u8>,
+    encoded_bank: &DeviceBuffer<u8>,
     dynamic_trace: JaggedTraceMle<Felt, TaskScope>,
     fixed_commitment: GpuDigest,
     dynamic_commitment: GpuDigest,

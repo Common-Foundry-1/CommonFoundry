@@ -245,6 +245,26 @@ class MainnetPoolServiceTests(unittest.TestCase):
             with self.assertRaisesRegex(pool.PreflightError, "replay_gpus"):
                 self.preflight()
 
+    def test_optional_proof_resident_banks_sets_the_worker_environment(self):
+        config, _, _ = self.preflight()
+        environment = pool.worker_environment({"KEEP": "1"}, config)
+        self.assertEqual(environment["KEEP"], "1")
+        self.assertEqual(environment["CUDA_VISIBLE_DEVICES"], self.config["gpu_uuid"])
+        self.assertNotIn("CMFD_V4_PROOF_RESIDENT_BANKS", environment)
+        self.config["proof_resident_banks"] = True
+        self.save_config()
+        config, _, _ = self.preflight()
+        self.assertEqual(pool.worker_environment({}, config)["CMFD_V4_PROOF_RESIDENT_BANKS"], "1")
+        self.config["proof_resident_banks"] = False
+        self.save_config()
+        config, _, _ = self.preflight()
+        self.assertNotIn("CMFD_V4_PROOF_RESIDENT_BANKS", pool.worker_environment({}, config))
+        for bad in (1, "true", None):
+            self.config["proof_resident_banks"] = bad
+            self.save_config()
+            with self.assertRaisesRegex(pool.PreflightError, "proof_resident_banks"):
+                self.preflight()
+
     def test_optional_bonus_reserve_becomes_pool_bonus_flags(self):
         config, _, _ = self.preflight()
         with mock.patch.object(pool, "CONFIG_BASE", self.config_base):

@@ -140,6 +140,19 @@ credit, and payout status. The dashboard is deliberately loopback-only. Publish
 it through an authenticated reverse proxy or tunnel if remote viewing is
 needed.
 
+Proof time matters: a chain-winning share is only worth a block if its proof
+is written before another block arrives. With the encoded banks preloaded (the
+default), the proof worker keeps three page-locked trace buffers, about 1.6 GiB
+of locked RAM, and copies each block's traces through them instead of building
+fresh pageable buffers; on an RTX 4090 that cut the time from the proof
+request to a written proof from about 11.2 s to 9.4 s.
+`CMFD_V4_PROOF_PINNED_TRACES=0` turns it off. `CMFD_V4_PROOF_RESIDENT_BANKS=1`
+(`proof_resident_banks` in `pool.json`) also keeps the 6.4 GiB of encoded banks
+on the GPU between proofs, for about 8.9 s in total; it needs that much more
+VRAM, so use it on 24 GB and larger cards. The worker logs
+`trace_load_and_commit_seconds` and `online_seconds` for every proof; their sum
+is the proof time.
+
 The proof worker runs on the pool process's default CUDA device unless
 `--production-v4-pool-proof-gpu` names a GPU (`proof_gpu` in `pool.json`). A
 proof needs about 7 GiB of free VRAM while a replay worker keeps about 6.5 GiB

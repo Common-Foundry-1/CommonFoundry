@@ -67,7 +67,9 @@ use sp1_gpu_jagged_sumcheck::{
 };
 use sp1_gpu_merkle_tree::{CudaTcsProver, Poseidon2SP1Field16CudaProver};
 use sp1_gpu_sys::kernels::cmfd_weight_output_reduction_kernel;
-use sp1_gpu_utils::{AbstractChipLayoutWithHeights, Ext, Felt, JaggedTraceMle, TestGC};
+use sp1_gpu_utils::{
+    AbstractChipLayoutWithHeights, Ext, Felt, JaggedTraceMle, TestGC, TraceDenseData,
+};
 
 #[path = "../real_v4_opening.rs"]
 mod real_v4_opening;
@@ -128,6 +130,151 @@ struct PreparedProver {
     base_input: Vec<u8>,
     encoded_banks: [EncodedBank; 3],
     fixed_maps: [real_v4_opening::FixedArtifactMaps; 3],
+}
+
+/// One encoded model bank on the GPU: uploaded for this proof, or kept resident
+/// by the persistent server (`CMFD_V4_PROOF_RESIDENT_BANKS=1`). Read-only either way.
+enum DeviceBank<'a> {
+    Owned(DeviceBuffer<u8>),
+    Resident(&'a DeviceBuffer<u8>),
+}
+
+impl DeviceBank<'_> {
+    fn get(&self) -> &DeviceBuffer<u8> {
+        match self {
+            Self::Owned(buffer) => buffer,
+            Self::Resident(buffer) => buffer,
+        }
+    }
+}
+
+/// Page-locked host staging for the three dynamic traces, kept for the life of the
+/// persistent server (about 1.6 GiB of locked RAM). On by default whenever the
+/// encoded banks were pinned at start-up; `CMFD_V4_PROOF_PINNED_TRACES=0` turns it
+/// off and `=1` turns it on without preloaded banks.
+/// Each proof copies a trace into it in parallel and uploads it by DMA, instead of
+/// building a fresh pageable buffer and uploading through the driver's bounce copy.
+struct TraceStaging {
+    buffers: [RawBuffer<u8, PinnedAllocator>; 3],
+    layout: [TraceLayout; 3],
+}
+
+/// The jagged metadata of one bank's dynamic trace; identical for every proof.
+struct TraceLayout {
+    dense: TraceDenseData<Felt, CpuBackend>,
+    col_index: Buffer<u32, CpuBackend>,
+    start_indices: Buffer<u32, CpuBackend>,
+    column_heights: Buffer<u32, CpuBackend>,
+}
+
+const TRACE_DENSE_VALUES: usize = (DYNAMIC_COLUMNS + 1) * ROWS;
+
+fn pinned_traces_enabled(prepared: &PreparedProver) -> bool {
+    match std::env::var("CMFD_V4_PROOF_PINNED_TRACES").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => prepared
+            .encoded_banks
+            .iter()
+            .all(|bank| matches!(bank, EncodedBank::Pinned(_))),
+    }
+}
+
+fn dynamic_trace_layout(bank: usize) -> AbstractChipLayoutWithHeights {
+    AbstractChipLayoutWithHeights::new(vec![(
+        format!("v4-bank-{bank}-dynamic"),
+        1,
+        DYNAMIC_COLUMNS,
+        ROWS,
+    )])
+}
+
+impl TraceStaging {
+    fn new() -> Result<Self> {
+        let bytes = TRACE_DENSE_VALUES * size_of::<Felt>();
+        let mut zeros = Some(Buffer::from(vec![Felt::zero(); TRACE_DENSE_VALUES]));
+        let mut layouts = Vec::with_capacity(3);
+        for bank in 0..3 {
+            let trace = JaggedTraceMle::from_chip_layout(
+                zeros.take().expect("dense buffer is returned after each bank"),
+                &dynamic_trace_layout(bank),
+                LOG_ROWS,
+            );
+            let JaggedTraceMle(inner) = trace;
+            let mut dense = inner.dense_data;
+            zeros = Some(std::mem::replace(&mut dense.dense, Buffer::from(Vec::new())));
+            layouts.push(TraceLayout {
+                dense,
+                col_index: inner.col_index,
+                start_indices: inner.start_indices,
+                column_heights: inner.column_heights,
+            });
+        }
+        let mut buffers = Vec::with_capacity(3);
+        for _ in 0..3 {
+            let buffer = RawBuffer::<u8, PinnedAllocator>::try_with_capacity_in(bytes, PINNED_ALLOCATOR)
+                .map_err(|_| anyhow::anyhow!("cannot pin dynamic trace staging"))?;
+            // SAFETY: the allocation holds `bytes` bytes; the zero row prefix is written
+            // once here and never changed, the values are rewritten by every proof.
+            unsafe { std::ptr::write_bytes(buffer.ptr() as *mut u8, 0, ROWS * size_of::<Felt>()) };
+            buffers.push(buffer);
+        }
+        Ok(Self {
+            buffers: buffers.try_into().map_err(|_| anyhow::anyhow!("staging count"))?,
+            layout: layouts.try_into().map_err(|_| anyhow::anyhow!("layout count"))?,
+        })
+    }
+
+    /// Copies one bank's values behind the zero rows and uploads the dense trace.
+    fn upload(
+        &mut self,
+        bank: usize,
+        values: &[Felt],
+        scope: &TaskScope,
+    ) -> Result<(JaggedTraceMle<Felt, TaskScope>, f64)> {
+        ensure!(
+            values.len() == TRACE_DENSE_VALUES - ROWS,
+            "wrong dynamic trace value count"
+        );
+        let started = Instant::now();
+        // SAFETY: each buffer holds TRACE_DENSE_VALUES page-aligned Felt slots and is
+        // only touched by this server thread between proofs.
+        let dense = unsafe {
+            std::slice::from_raw_parts_mut(self.buffers[bank].ptr() as *mut Felt, TRACE_DENSE_VALUES)
+        };
+        let chunk = PIN_COPY_CHUNK_BYTES / size_of::<Felt>();
+        dense[ROWS..]
+            .par_chunks_mut(chunk)
+            .zip(values.par_chunks(chunk))
+            .for_each(|(destination, source)| destination.copy_from_slice(source));
+        let copy_seconds = started.elapsed().as_secs_f64();
+        let layout = &self.layout[bank];
+        let device = DeviceBuffer::from_host_slice(dense, scope)?;
+        let dense_data = TraceDenseData {
+            dense: device.into_inner(),
+            preprocessed_offset: layout.dense.preprocessed_offset,
+            preprocessed_cols: layout.dense.preprocessed_cols,
+            preprocessed_padding: layout.dense.preprocessed_padding,
+            main_padding: layout.dense.main_padding,
+            prep_padding_col_count: layout.dense.prep_padding_col_count,
+            main_padding_col_count: layout.dense.main_padding_col_count,
+            preprocessed_table_index: layout.dense.preprocessed_table_index.clone(),
+            main_table_index: layout.dense.main_table_index.clone(),
+        };
+        let trace = JaggedTraceMle::new(
+            dense_data,
+            DeviceBuffer::from_host(&layout.col_index, scope)?.into_inner(),
+            DeviceBuffer::from_host(&layout.start_indices, scope)?.into_inner(),
+            DeviceBuffer::from_host(&layout.column_heights, scope)?.into_inner(),
+        );
+        Ok((trace, copy_seconds))
+    }
+}
+
+/// `CMFD_V4_PROOF_RESIDENT_BANKS=1` uploads the three encoded banks once when the
+/// server starts and reuses them for every proof (about 6.4 GiB of extra VRAM).
+fn resident_banks_enabled() -> bool {
+    std::env::var("CMFD_V4_PROOF_RESIDENT_BANKS").as_deref() == Ok("1")
 }
 
 /// Host bytes of one encoded model bank: the file mapping, or a page-locked
@@ -242,6 +389,8 @@ fn run_one_shot(args: Vec<OsString>) -> Result<()> {
             &output_path,
             Some(expected),
             true,
+            None,
+            None,
             &scope,
         )
     })??;
@@ -457,6 +606,43 @@ fn run_persistent_server(
     expected_network_id: [u8; 32],
     scope: &TaskScope,
 ) -> Result<()> {
+    let resident = if resident_banks_enabled() {
+        // Opt-in: about 6.4 GiB of VRAM for the life of the server.
+        let started = Instant::now();
+        let banks = [
+            DeviceBuffer::from_host_slice(&prepared.encoded_banks[0], scope)?,
+            DeviceBuffer::from_host_slice(&prepared.encoded_banks[1], scope)?,
+            DeviceBuffer::from_host_slice(&prepared.encoded_banks[2], scope)?,
+        ];
+        scope.synchronize_blocking()?;
+        eprintln!(
+            "resident_banks=3 upload_seconds={:.6}",
+            started.elapsed().as_secs_f64()
+        );
+        Some(banks)
+    } else {
+        None
+    };
+    let mut staging = if pinned_traces_enabled(prepared) {
+        let started = Instant::now();
+        match TraceStaging::new() {
+            Ok(staging) => {
+                eprintln!(
+                    "pinned_traces=3 setup_seconds={:.6}",
+                    started.elapsed().as_secs_f64()
+                );
+                Some(staging)
+            }
+            // Proving still works without staging, only slower.
+            Err(error) => {
+                eprintln!("pinned_traces=0 reason={error}");
+                None
+            }
+        }
+    } else {
+        eprintln!("pinned_traces=0");
+        None
+    };
     println!("CMFD_V4_PROOF_READY");
     std::io::stdout().flush()?;
     for line in BufReader::new(std::io::stdin().lock()).lines() {
@@ -481,6 +667,8 @@ fn run_persistent_server(
             Path::new(fields[4]),
             None,
             false,
+            resident.as_ref(),
+            staging.as_mut(),
             scope,
         )?;
         println!("CMFD_V4_PROOF_DONE");
@@ -516,6 +704,8 @@ fn prove_job(
     output_path: &Path,
     expected_dynamic_words: Option<[[u32; 8]; 3]>,
     self_check: bool,
+    resident: Option<&[DeviceBuffer<u8>; 3]>,
+    staging: Option<&mut TraceStaging>,
     scope: &TaskScope,
 ) -> Result<()> {
     let frozen: FrozenProductionV4Template = serde_json::from_reader(File::open(template_path)?)?;
@@ -546,6 +736,7 @@ fn prove_job(
         ),
     };
 
+    let load_started = Instant::now();
     let mut dynamic_maps = Vec::with_capacity(3);
     for bank in 0..3 {
         let path = PathBuf::from(format!(
@@ -565,7 +756,13 @@ fn prove_job(
         .iter()
         .map(montgomery_values)
         .collect::<Result<Vec<_>>>()?;
-    let (dynamic_traces, dynamic_words) = prepare_dynamic_traces(&dynamic_values, scope)?;
+    let (dynamic_traces, dynamic_words) = prepare_dynamic_traces(&dynamic_values, staging, scope)?;
+    // Not part of online_seconds: the time from the RUN command to a written proof
+    // is this plus online_seconds.
+    eprintln!(
+        "trace_load_and_commit_seconds={:.6}",
+        load_started.elapsed().as_secs_f64()
+    );
     if let Some(expected) = expected_dynamic_words {
         ensure!(
             expected == dynamic_words,
@@ -590,12 +787,14 @@ fn prove_job(
         initial_activation,
         output_path,
         self_check,
+        resident,
         scope,
     )
 }
 
 fn prepare_dynamic_traces(
     values: &[&[Felt]],
+    mut staging: Option<&mut TraceStaging>,
     scope: &TaskScope,
 ) -> Result<(PreparedDynamicTraces, DynamicCommitmentWords)> {
     ensure!(values.len() == 3, "wrong dynamic trace count");
@@ -603,17 +802,24 @@ fn prepare_dynamic_traces(
     let mut words = Vec::with_capacity(3);
     for (bank, values) in values.iter().enumerate() {
         let started = Instant::now();
-        let mut dense = Vec::with_capacity((DYNAMIC_COLUMNS + 1) * ROWS);
-        dense.resize(ROWS, Felt::zero());
-        dense.extend_from_slice(values);
-        let layout = AbstractChipLayoutWithHeights::new(vec![(
-            format!("v4-bank-{bank}-dynamic"),
-            1,
-            DYNAMIC_COLUMNS,
-            ROWS,
-        )]);
-        let trace = JaggedTraceMle::from_chip_layout(Buffer::from(dense), &layout, LOG_ROWS)
-            .into_device(scope);
+        let (trace, dense_seconds) = match staging.as_deref_mut() {
+            Some(staging) => staging.upload(bank, values, scope)?,
+            None => {
+                let mut dense = Vec::with_capacity(TRACE_DENSE_VALUES);
+                dense.resize(ROWS, Felt::zero());
+                dense.extend_from_slice(values);
+                let dense_seconds = started.elapsed().as_secs_f64();
+                let trace = JaggedTraceMle::from_chip_layout(
+                    Buffer::from(dense),
+                    &dynamic_trace_layout(bank),
+                    LOG_ROWS,
+                )
+                .into_device(scope);
+                (trace, dense_seconds)
+            }
+        };
+        scope.synchronize_blocking()?;
+        let upload_seconds = started.elapsed().as_secs_f64() - dense_seconds;
         let prover = FriCudaProver::<TestGC, _, Felt>::new(
             Poseidon2SP1Field16CudaProver::new(scope),
             FriConfig::new(LOG_BLOWUP, QUERIES, POW_BITS),
@@ -627,7 +833,7 @@ fn prepare_dynamic_traces(
         );
         traces.push(trace);
         eprintln!(
-            "bank={bank} fused_commit_seconds={:.6}",
+            "bank={bank} fused_commit_seconds={:.6} dense_build_seconds={dense_seconds:.6} trace_upload_seconds={upload_seconds:.6}",
             started.elapsed().as_secs_f64()
         );
     }
@@ -657,6 +863,7 @@ fn prove_complete_proof(
     initial_activation: Vec<Felt>,
     output_path: &Path,
     self_check: bool,
+    resident: Option<&[DeviceBuffer<u8>; 3]>,
     scope: &TaskScope,
 ) -> Result<()> {
     let (baseline_free, total_device_bytes) = cuda_memory_info()?;
@@ -694,6 +901,7 @@ fn prove_complete_proof(
             statement,
             base_input,
             &encoded_banks[0],
+            resident.map(|banks| &banks[0]),
             dynamic_device,
             &initial_activation,
             &mut cpu_challenger,
@@ -714,6 +922,7 @@ fn prove_complete_proof(
             statement,
             base_input,
             &encoded_banks[1],
+            resident.map(|banks| &banks[1]),
             next_dynamic_device,
             boundary,
             &mut cpu_challenger,
@@ -727,7 +936,7 @@ fn prove_complete_proof(
     openings.push(real_v4_opening::prove_real_bank_opening(
         0,
         &fixed_maps[0],
-        encoded_device,
+        encoded_device.get(),
         dynamic_device,
         gpu_fixed[0],
         gpu_dynamic[0],
@@ -743,6 +952,7 @@ fn prove_complete_proof(
             statement,
             base_input,
             &encoded_banks[2],
+            resident.map(|banks| &banks[2]),
             final_dynamic_device,
             boundary,
             &mut cpu_challenger,
@@ -756,7 +966,7 @@ fn prove_complete_proof(
     openings.push(real_v4_opening::prove_real_bank_opening(
         1,
         &fixed_maps[1],
-        next_encoded_device,
+        next_encoded_device.get(),
         next_dynamic_device,
         gpu_fixed[1],
         gpu_dynamic[1],
@@ -789,7 +999,7 @@ fn prove_complete_proof(
     openings.push(real_v4_opening::prove_real_bank_opening(
         2,
         &fixed_maps[2],
-        final_encoded_device,
+        final_encoded_device.get(),
         final_dynamic_device,
         gpu_fixed[2],
         gpu_dynamic[2],
@@ -912,11 +1122,12 @@ fn self_check_complete_proof(
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-fn prove_bank_relations(
+fn prove_bank_relations<'a>(
     bank: usize,
     statement: ForgeMatrixV4TranscriptStatement,
     base_input: &[u8],
     encoded_bank: &[u8],
+    resident: Option<&'a DeviceBuffer<u8>>,
     dynamic: JaggedTraceMle<Felt, TaskScope>,
     boundary_activation: &[Felt],
     cpu_challenger: &mut cmfd_consensus::forgematrix_v4_basefold::ForgeMatrixV4Challenger,
@@ -926,12 +1137,18 @@ fn prove_bank_relations(
     [ForgeMatrixV4RelationRepetitionProof; 2],
     Vec<CpuOpeningClaim>,
     Vec<CpuOpeningClaim>,
-    DeviceBuffer<u8>,
+    DeviceBank<'a>,
     JaggedTraceMle<Felt, TaskScope>,
 )> {
     let upload_started = Instant::now();
-    let encoded_device = DeviceBuffer::from_host_slice(encoded_bank, scope)?;
-    scope.synchronize_blocking()?;
+    let encoded_device = match resident {
+        Some(buffer) => DeviceBank::Resident(buffer),
+        None => {
+            let uploaded = DeviceBuffer::from_host_slice(encoded_bank, scope)?;
+            scope.synchronize_blocking()?;
+            DeviceBank::Owned(uploaded)
+        }
+    };
     eprintln!(
         "bank={bank} relation_upload_seconds={:.6}",
         upload_started.elapsed().as_secs_f64()
@@ -984,7 +1201,7 @@ fn prove_bank_relations(
         gpu_challenger.observe_ext_element(mask_evaluation);
         let matrix_claim = preactivation_evaluation - mask_evaluation;
 
-        let weights = reduce_weights(&encoded_device, &gpu_matrix_point.2, scope)?;
+        let weights = reduce_weights(encoded_device.get(), &gpu_matrix_point.2, scope)?;
         let boundary = reduce_initial_activation(boundary_activation, &gpu_matrix_point.1);
         let mut input_values = Vec::with_capacity(LAYERS * WIDTH);
         input_values.extend_from_slice(&boundary);

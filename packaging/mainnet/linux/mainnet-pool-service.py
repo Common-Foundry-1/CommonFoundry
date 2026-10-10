@@ -58,6 +58,9 @@ CONFIG_FIELDS = {"schema", "public_numeric_ip", "private_bind_ip", "mainnet_seed
 # as `--pool-share-batch-wait-ms` (node default 100).
 # Optional: GPU UUIDs that each run one replay (share check) worker, as
 # `--production-v4-pool-replay-gpu`; left out, one replay worker uses gpu_uuid.
+# Optional: `proof_resident_banks` (true/false): keep the three encoded model banks on
+# the proof GPU for the life of the pool (about 6.4 GiB more VRAM, about 1 s faster
+# per proof). Sets CMFD_V4_PROOF_RESIDENT_BANKS=1 for the proof worker.
 # Optional: `proof_gpu`, the GPU UUID the proof worker runs on, as
 # `--production-v4-pool-proof-gpu`; left out, the proof worker uses gpu_uuid. On
 # 16 GB cards it must be a GPU that is not in replay_gpus.
@@ -70,6 +73,7 @@ CONFIG_FIELDS = {"schema", "public_numeric_ip", "private_bind_ip", "mainnet_seed
 OPTIONAL_FIELDS = {"mainnet_relays", "prune_keep_blocks", "pool_ledger_max_bytes",
                    "share_batch_size", "share_batch_wait_ms", "replay_gpus",
                    "max_connections", "max_connections_per_source", "proof_gpu",
+                   "proof_resident_banks",
                    "bonus_rate_bps", "bonus_sponsor", "bonus_scan_from_height"}
 MIN_PRUNE_KEEP_BLOCKS = 288
 MIN_POOL_LEDGER_MAX_BYTES = 1024 * 1024
@@ -223,6 +227,8 @@ def validate_config(config: dict) -> dict:
                            ("max_connections_per_source", MAX_POOL_CONNECTIONS_PER_SOURCE)):
         if field in config and (type(config[field]) is not int or not 1 <= config[field] <= maximum):
             raise PreflightError(f"{field} must be an integer from 1 to {maximum}")
+    if "proof_resident_banks" in config and type(config["proof_resident_banks"]) is not bool:
+        raise PreflightError("proof_resident_banks must be true or false")
     if "proof_gpu" in config and (not isinstance(config["proof_gpu"], str)
                                  or not GPU_UUID.fullmatch(config["proof_gpu"])):
         raise PreflightError("proof_gpu must be one exact NVIDIA GPU UUID")
@@ -478,6 +484,16 @@ def build_command(root: Path, state: Path, credential_base: Path, config: dict) 
     ]
 
 
+def worker_environment(base: dict[str, str], config: dict) -> dict[str, str]:
+    """Environment for the pool node and the workers it starts."""
+    environment = dict(base, CUDA_VISIBLE_DEVICES=config["gpu_uuid"],
+                       RAYON_NUM_THREADS=str(config["worker_threads"]),
+                       LD_LIBRARY_PATH=str(ROOT / "lib"))
+    if config.get("proof_resident_banks") is True:
+        environment["CMFD_V4_PROOF_RESIDENT_BANKS"] = "1"
+    return environment
+
+
 def preflight(config_path: Path, root: Path, state: Path, config_base: Path, install_base: Path,
               credential_base: Path) -> tuple[dict, Path, Path]:
     config = validate_config(strict_json(bounded_file(config_path, "mainnet pool config", static=True),
@@ -546,9 +562,7 @@ def main() -> int:
                 *([config["proof_gpu"]] if "proof_gpu" in config else [])}:
         check_gpu_idle(gpu)
     write_marker(STATE, config)
-    environment = dict(os.environ, CUDA_VISIBLE_DEVICES=config["gpu_uuid"],
-                       RAYON_NUM_THREADS=str(config["worker_threads"]),
-                       LD_LIBRARY_PATH=str(ROOT / "lib"))
+    environment = worker_environment(dict(os.environ), config)
     os.execve(str(ROOT / "cmfd-node"), build_command(ROOT, STATE, RUNTIME, config), environment)
     return 1
 

@@ -104,6 +104,12 @@ approved pool GPU still has a compute process. It never stops that process.
    include `gpu_uuid`) runs one replay worker per listed GPU so shares are
    checked on all of them; every listed GPU must be present and idle at
    start. Leave it out to check shares on `gpu_uuid` alone.
+   The optional `proof_resident_banks` (`true`/`false`) keeps the encoded model
+   banks on the proof GPU between proofs: about 1 s faster per proof for about
+   6.4 GiB more VRAM, so leave it off on 16 GB cards. With the banks preloaded
+   (the default) the proof worker also stages each block's traces in about
+   1.6 GiB of locked RAM, which saves about 2 s per proof; set
+   `CMFD_V4_PROOF_PINNED_TRACES=0` in the service environment to turn that off.
    The optional `proof_gpu` (one GPU UUID) runs the proof worker on that GPU
    instead of `gpu_uuid`; a proof needs about 7 GiB of free VRAM, so on 16 GB
    cards it must not also be in `replay_gpus`.

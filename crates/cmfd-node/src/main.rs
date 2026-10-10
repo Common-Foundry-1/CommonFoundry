@@ -35,14 +35,14 @@ use cmfd_node::p2p::{
 };
 use cmfd_node::peer::{PeerAddressPolicy, PeerLimits, StaticPeerConfig};
 use cmfd_node::pool::{
-    DEFAULT_POOL_CONCURRENT_SHARE_VERIFICATIONS, DEFAULT_POOL_CONNECTIONS,
-    DEFAULT_POOL_CONNECTIONS_PER_SOURCE,
-    DEFAULT_POOL_LEDGER_MAX_BYTES, DEFAULT_POOL_MINIMUM_PAYOUT_ATOMS,
-    DEFAULT_POOL_OPERATOR_FEE_BPS, DEFAULT_POOL_PAYOUT_FEE_ATOMS,
-    DEFAULT_POOL_QUEUED_SHARE_VERIFICATIONS, DEFAULT_POOL_SHARE_BATCH_SIZE,
-    DEFAULT_POOL_SHARE_BATCH_WAIT_MS, DEFAULT_POOL_SOCKET_ADDRESS, DEFAULT_PPLNS_WINDOW_SHARES,
-    DEFAULT_SHARE_LEADING_ZERO_BITS, PoolPayoutPolicy, PoolPayoutReconciliationRequest,
-    PoolPplnsPolicy, PoolServerConfig, certificate_sha256, generate_pool_certificate,
+    DEFAULT_POOL_BONUS_RATE_BPS, DEFAULT_POOL_CONCURRENT_SHARE_VERIFICATIONS,
+    DEFAULT_POOL_CONNECTIONS, DEFAULT_POOL_CONNECTIONS_PER_SOURCE, DEFAULT_POOL_LEDGER_MAX_BYTES,
+    DEFAULT_POOL_MINIMUM_PAYOUT_ATOMS, DEFAULT_POOL_OPERATOR_FEE_BPS,
+    DEFAULT_POOL_PAYOUT_FEE_ATOMS, DEFAULT_POOL_QUEUED_SHARE_VERIFICATIONS,
+    DEFAULT_POOL_SHARE_BATCH_SIZE, DEFAULT_POOL_SHARE_BATCH_WAIT_MS, DEFAULT_POOL_SOCKET_ADDRESS,
+    DEFAULT_PPLNS_WINDOW_SHARES, DEFAULT_SHARE_LEADING_ZERO_BITS, MAX_POOL_BONUS_RATE_BPS,
+    PoolBonusPolicy, PoolPayoutPolicy, PoolPayoutReconciliationRequest, PoolPplnsPolicy,
+    PoolServerConfig, certificate_sha256, generate_pool_certificate,
     inspect_pool_payout_protection_with_limit, reconcile_pool_payout_protection_with_limit,
     require_existing_pool_ledger, spawn_pool_server,
 };
@@ -754,6 +754,10 @@ enum Command {
         /// next automatic run would make at it, without sending anything.
         #[arg(long, default_value_t = DEFAULT_POOL_MINIMUM_PAYOUT_ATOMS)]
         pool_minimum_payout_atoms: u64,
+        /// Use the same bonus rate as pool-serve: a pool block that reaches
+        /// maturity during this command is distributed at this rate, once.
+        #[arg(long, default_value_t = DEFAULT_POOL_BONUS_RATE_BPS)]
+        pool_bonus_rate_bps: u16,
     },
     /// Resolve funded payout holds offline without sending or replacing payments.
     PoolPayoutReconcile {
@@ -762,6 +766,10 @@ enum Command {
         /// Use the same ledger size limit as pool-serve.
         #[arg(long, default_value_t = DEFAULT_POOL_LEDGER_MAX_BYTES)]
         pool_ledger_max_bytes: usize,
+        /// Use the same bonus rate as pool-serve: a pool block that reaches
+        /// maturity during this command is distributed at this rate, once.
+        #[arg(long, default_value_t = DEFAULT_POOL_BONUS_RATE_BPS)]
+        pool_bonus_rate_bps: u16,
         #[arg(long, value_parser = parse_hex32)]
         expected_tip: [u8; 32],
         #[arg(long)]
@@ -853,6 +861,20 @@ enum Command {
         /// Operator fee in basis points, deducted from each mature pool block before PPLNS distribution.
         #[arg(long, default_value_t = DEFAULT_POOL_OPERATOR_FEE_BPS)]
         pool_operator_fee_bps: u16,
+        /// Sponsor-funded bonus in basis points added to each mature block's
+        /// PPLNS credits while the bonus reserve lasts (1 to 10000); zero
+        /// disables the bonus and requires no sponsor.
+        #[arg(long, default_value_t = DEFAULT_POOL_BONUS_RATE_BPS)]
+        pool_bonus_rate_bps: u16,
+        /// 32-byte x-only key whose confirmed transfers to the pool wallet
+        /// fund the bonus reserve. Required with a bonus rate above zero.
+        #[arg(long)]
+        pool_bonus_sponsor: Option<String>,
+        /// First chain height scanned for sponsor transfers when the pool
+        /// ledger has no bonus scan mark yet; omitted, scanning starts at the
+        /// current tip.
+        #[arg(long)]
+        pool_bonus_scan_from_height: Option<u64>,
         /// Fixed PPLNS share count; zero automatically uses one block of expected share work.
         #[arg(long, default_value_t = DEFAULT_PPLNS_WINDOW_SHARES)]
         pool_pplns_window_shares: usize,
@@ -1933,6 +1955,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             pool_payout_fee_atoms,
             pool_ledger_max_bytes,
             pool_minimum_payout_atoms,
+            pool_bonus_rate_bps,
         } => {
             let mut node = open_node(
                 &cli.data_dir,
@@ -1947,6 +1970,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 pool_payout_fee_atoms,
                 pool_ledger_max_bytes,
                 pool_minimum_payout_atoms,
+                pool_bonus_rate_bps,
             )?;
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
@@ -1954,6 +1978,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::PoolPayoutReconcile {
             pool_payout_fee_atoms,
             pool_ledger_max_bytes,
+            pool_bonus_rate_bps,
             expected_tip,
             expected_ledger_generation,
             note,
@@ -1979,6 +2004,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     operator_note: note,
                 },
                 pool_ledger_max_bytes,
+                pool_bonus_rate_bps,
             )?;
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
@@ -2053,6 +2079,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             pool_minimum_payout_atoms,
             pool_payout_fee_atoms,
             pool_operator_fee_bps,
+            pool_bonus_rate_bps,
+            pool_bonus_sponsor,
+            pool_bonus_scan_from_height,
             pool_pplns_window_shares,
             pool_max_connections,
             pool_max_connections_per_source,
@@ -2119,6 +2148,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let used_insecure_default_miner =
                 miner.is_none() && node_instance.wallet_is_insecure_demo();
+            let bonus_policy = pool_bonus_policy(
+                pool_bonus_rate_bps,
+                pool_bonus_sponsor.as_deref(),
+                pool_bonus_scan_from_height,
+                miner_destination,
+                node_instance.wallet_destination(),
+            )?;
             let certificate_der = std::fs::read(&certificate)?;
             let private_key_der = std::fs::read(&private_key)?;
             let pin = certificate_sha256(&certificate_der);
@@ -2174,6 +2210,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 operator_fee_bps: pool_operator_fee_bps,
                 window_shares: pool_pplns_window_shares,
             });
+            config.bonus_policy = bonus_policy;
             if automatic_payouts {
                 config.payout_policy = Some(PoolPayoutPolicy {
                     minimum_payout_atoms: pool_minimum_payout_atoms,
@@ -2223,6 +2260,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "minimum_payout_atoms": pool_minimum_payout_atoms,
                     "payout_fee_atoms": pool_payout_fee_atoms,
                     "operator_fee_bps": pool_operator_fee_bps,
+                    "bonus_rate_bps": pool_bonus_rate_bps,
+                    "bonus_sponsor": bonus_policy.map(|policy| hex::encode(policy.sponsor)),
+                    "bonus_scan_from_height": bonus_policy.and_then(|policy| policy.scan_from_height),
                     "pplns_window_shares": if pool_pplns_window_shares == 0 { json!("automatic") } else { json!(pool_pplns_window_shares) },
                     "max_connections": pool_max_connections,
                     "max_connections_per_source": pool_max_connections_per_source,
@@ -3170,6 +3210,52 @@ fn pool_payouts_enabled(
     Ok(enable_testnet_payouts || enable_mainnet_payouts)
 }
 
+/// Builds the pool bonus policy from the `pool-serve` flags. A rate above
+/// zero needs a sponsor, a sponsor needs a rate, and a scan height needs a
+/// sponsor; the sponsor is a valid x-only key other than the pool's own
+/// block-reward destination and its wallet key, whose transfers never fund
+/// the reserve.
+fn pool_bonus_policy(
+    rate_bps: u16,
+    sponsor: Option<&str>,
+    scan_from_height: Option<u64>,
+    miner_destination: [u8; 32],
+    wallet_destination: [u8; 32],
+) -> Result<Option<PoolBonusPolicy>, Box<dyn std::error::Error>> {
+    if rate_bps > MAX_POOL_BONUS_RATE_BPS {
+        return Err(
+            format!("pool-bonus-rate-bps must be between 0 and {MAX_POOL_BONUS_RATE_BPS}").into(),
+        );
+    }
+    let sponsor = match (rate_bps, sponsor) {
+        (0, None) => {
+            if scan_from_height.is_some() {
+                return Err("pool-bonus-scan-from-height requires --pool-bonus-sponsor".into());
+            }
+            return Ok(None);
+        }
+        (0, Some(_)) => {
+            return Err("pool-bonus-sponsor requires --pool-bonus-rate-bps above zero".into());
+        }
+        (_, None) => {
+            return Err("pool-bonus-rate-bps above zero requires --pool-bonus-sponsor".into());
+        }
+        (_, Some(sponsor)) => parse_miner_destination(sponsor)
+            .map_err(|_| "pool-bonus-sponsor must be a 64-hex-character x-only public key")?,
+    };
+    if sponsor == miner_destination {
+        return Err("pool-bonus-sponsor must differ from the pool block-reward destination".into());
+    }
+    if sponsor == wallet_destination {
+        return Err("pool-bonus-sponsor must differ from the pool wallet key".into());
+    }
+    Ok(Some(PoolBonusPolicy {
+        rate_bps,
+        sponsor,
+        scan_from_height,
+    }))
+}
+
 fn peer_warning(allow_public_peers: bool) -> String {
     if allow_public_peers {
         format!(
@@ -3427,6 +3513,9 @@ mod tests {
             p2p_bind,
             pool_dashboard_bind,
             pool_operator_fee_bps,
+            pool_bonus_rate_bps,
+            pool_bonus_sponsor,
+            pool_bonus_scan_from_height,
             pool_pplns_window_shares,
             prune_keep_blocks,
             ..
@@ -3438,6 +3527,9 @@ mod tests {
         assert_eq!(p2p_bind, COMPILED_NETWORK_PROFILE.p2p_address());
         assert_eq!(pool_dashboard_bind, DEFAULT_POOL_DASHBOARD_ADDRESS);
         assert_eq!(pool_operator_fee_bps, 300);
+        assert_eq!(pool_bonus_rate_bps, 0);
+        assert_eq!(pool_bonus_sponsor, None);
+        assert_eq!(pool_bonus_scan_from_height, None);
         assert_eq!(pool_pplns_window_shares, 0);
         assert_eq!(prune_keep_blocks, None);
 
@@ -3462,6 +3554,98 @@ mod tests {
     }
 
     #[test]
+    fn pool_bonus_flags_parse_and_require_a_matching_sponsor_and_rate() {
+        // The secp256k1 generator's x-coordinate: a valid x-only key that is
+        // not the dev wallet.
+        let sponsor =
+            "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".to_string();
+        let miner = cmfd_node::default_miner_destination();
+        let cli = Cli::try_parse_from([
+            "cmfd-node",
+            "pool-serve",
+            "--certificate",
+            "certificate.der",
+            "--private-key",
+            "private-key.der",
+            "--pool-bonus-rate-bps",
+            "1000",
+            "--pool-bonus-sponsor",
+            &sponsor,
+            "--pool-bonus-scan-from-height",
+            "4200",
+        ])
+        .unwrap();
+        let Command::PoolServe {
+            pool_bonus_rate_bps,
+            pool_bonus_sponsor,
+            pool_bonus_scan_from_height,
+            ..
+        } = cli.command
+        else {
+            unreachable!()
+        };
+        assert_eq!(pool_bonus_rate_bps, 1000);
+        assert_eq!(pool_bonus_sponsor.as_deref(), Some(sponsor.as_str()));
+        assert_eq!(pool_bonus_scan_from_height, Some(4200));
+
+        // A pool mining to another key still funds payouts from its wallet;
+        // 2G's x-coordinate stands in for that wallet key.
+        let wallet = parse_miner_destination(
+            "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+        )
+        .unwrap();
+        assert_eq!(
+            pool_bonus_policy(0, None, None, miner, wallet).unwrap(),
+            None
+        );
+        let policy = pool_bonus_policy(1000, Some(&sponsor), Some(4200), miner, wallet)
+            .unwrap()
+            .unwrap();
+        assert_eq!(policy.rate_bps, 1000);
+        assert_eq!(hex::encode(policy.sponsor), sponsor);
+        assert_eq!(policy.scan_from_height, Some(4200));
+        assert_eq!(
+            pool_bonus_policy(MAX_POOL_BONUS_RATE_BPS, Some(&sponsor), None, miner, wallet)
+                .unwrap()
+                .map(|policy| policy.scan_from_height),
+            Some(None)
+        );
+        let error = pool_bonus_policy(1000, Some(&hex::encode(wallet)), None, miner, wallet)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("pool wallet key"), "{error}");
+        for (rate, sponsor, scan_from_height, message) in [
+            (1000, None, None, "requires --pool-bonus-sponsor"),
+            (
+                0,
+                Some(sponsor.as_str()),
+                None,
+                "requires --pool-bonus-rate-bps",
+            ),
+            (0, None, Some(4200), "requires --pool-bonus-sponsor"),
+            (
+                MAX_POOL_BONUS_RATE_BPS + 1,
+                Some(sponsor.as_str()),
+                None,
+                "between 0 and 10000",
+            ),
+            (1000, Some("abc"), None, "64-hex-character"),
+            (1000, Some(&"zz".repeat(32)), None, "64-hex-character"),
+            (
+                1000,
+                Some(&hex::encode(miner)),
+                None,
+                "block-reward destination",
+            ),
+        ] {
+            let error = pool_bonus_policy(rate, sponsor, scan_from_height, miner, wallet)
+                .err()
+                .unwrap_or_else(|| panic!("{rate} {sponsor:?} {scan_from_height:?} accepted"));
+            assert!(error.to_string().contains(message), "{error}");
+        }
+    }
+
+    #[test]
     fn pool_payout_reconciliation_cli_requires_exact_state_and_acknowledgment() {
         assert!(Cli::try_parse_from(["cmfd-node", "pool-payout-status"]).is_err());
         assert!(
@@ -3477,6 +3661,7 @@ mod tests {
             command:
                 Command::PoolPayoutStatus {
                     pool_minimum_payout_atoms,
+                    pool_bonus_rate_bps,
                     ..
                 },
             ..
@@ -3487,11 +3672,14 @@ mod tests {
             "1",
             "--pool-minimum-payout-atoms",
             "250",
+            "--pool-bonus-rate-bps",
+            "1000",
         ])
         else {
             unreachable!()
         };
         assert_eq!(pool_minimum_payout_atoms, 250);
+        assert_eq!(pool_bonus_rate_bps, 1000);
         let tip = "11".repeat(32);
         let arguments = [
             "cmfd-node",

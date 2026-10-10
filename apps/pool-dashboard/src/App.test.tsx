@@ -234,6 +234,42 @@ describe("pool dashboard", () => {
     expect(screen.queryByText(/RCNet-1 wallet package/)).not.toBeInTheDocument();
   });
 
+  it("shows the sponsor bonus and per-block bonus only when a bonus is configured", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify(fixture), { status: 200 })));
+    render(<App />);
+    await screen.findByRole("heading", { name: "ForgeMatrix Pool" });
+    expect(screen.queryByText("Mining bonus")).not.toBeInTheDocument();
+    expect(screen.queryByRole("columnheader", { name: "Bonus" })).not.toBeInTheDocument();
+    cleanup();
+
+    const sponsored = structuredClone(fixture);
+    sponsored.pool.bonus_rate_bps = 1000;
+    sponsored.pool.bonus_sponsor = "cd".repeat(32);
+    sponsored.pool.bonus_reserve_atoms = 700_000_000;
+    sponsored.pool.bonus_funded_atoms = 1_000_000_000;
+    sponsored.pool.bonus_credited_atoms = 300_000_000;
+    sponsored.pool.ledger.blocks.push({
+      ...fixture.pool.ledger.blocks[0],
+      block_id: "91".repeat(32),
+      height: 110,
+      confirmations: 103,
+      pplns_distributed: true,
+      bonus_rate_bps: 1000,
+      bonus_atoms: 130_000_000,
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify(sponsored), { status: 200 })));
+    render(<App />);
+    await screen.findByRole("heading", { name: "ForgeMatrix Pool" });
+    expect(screen.getByText("Mining bonus")).toBeVisible();
+    expect(screen.getByText("+10.00%")).toBeVisible();
+    expect(screen.getByText(/7\.00 CMFD reserve of 10\.00 CMFD funded · 3\.00 CMFD credited · sponsor cdcdcdcd…cdcdcd/)).toBeVisible();
+    expect(screen.getByRole("columnheader", { name: "Bonus" })).toBeVisible();
+    const blocksSection = screen.getByRole("heading", { name: "Pool blocks" }).closest("section");
+    const rows = within(blocksSection!).getAllByRole("row");
+    expect(rows[1]).toHaveTextContent("Maturing 2/100—");
+    expect(rows[2]).toHaveTextContent("1.30 CMFD");
+  });
+
   it("does not promise automatic payouts while settlement is disabled", async () => {
     const paused = structuredClone(fixture);
     paused.pool.automatic_testnet_payouts = false;

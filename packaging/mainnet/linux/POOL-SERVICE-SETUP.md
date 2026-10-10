@@ -111,6 +111,17 @@ approved pool GPU still has a compute process. It never stops that process.
    `max_connections_per_source` (1 to `256`, node default `64`) change the
    miner connection limits; the official miner uses one connection per GPU,
    and the per-source limit caps the GPUs behind one public address.
+   The optional `bonus_rate_bps` (1 to `10000`) and `bonus_sponsor` (the
+   sponsor's 64-character lowercase hex x-only key, which must differ from
+   the pool's own reward destination) turn on a sponsor-funded mining bonus:
+   every mature block's PPLNS credits earn that many basis points more from a
+   reserve the sponsor fills by sending CMFD from that key to the pool's
+   wallet key (see `docs/production-v4-pool.md`, "Bonus reserve"). Both or
+   neither must be present. The optional `bonus_scan_from_height` (at least
+   `0`, needs both) is the first height scanned for sponsor transfers and
+   only applies until the pool ledger has recorded its first scan; without
+   it, scanning starts at the chain tip when the bonus is first enabled, so
+   fund the reserve after that start or set the funding block's height here.
    `automatic_payouts` must be explicitly true; the
    launcher uses the **mainnet-specific** `--enable-mainnet-payouts` flag, never
    `--enable-testnet-payouts`. A runtime without that flag fails closed.

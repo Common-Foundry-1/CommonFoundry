@@ -93,6 +93,10 @@ pub const DEFAULT_POOL_BONUS_RATE_BPS: u16 = 0;
 pub const MAX_POOL_BONUS_RATE_BPS: u16 = 10_000;
 /// Confirmations a sponsor transfer needs before it funds the bonus reserve.
 pub const POOL_BONUS_FUNDING_CONFIRMATIONS: u64 = 6;
+/// Registered sponsor transfers the ledger keeps.
+pub const POOL_MAX_BONUS_FUNDING_RECORDS: usize = 4096;
+/// Chain heights one funding scan reads; the scan mark continues next tick.
+pub const POOL_BONUS_SCAN_BLOCKS_PER_PASS: u64 = 64;
 pub const DEFAULT_PPLNS_WINDOW_SHARES: usize = 0;
 pub const POOL_MAX_PPLNS_WINDOW_SHARES: usize = 65_536;
 pub const POOL_ACCOUNTING_SEMANTICS: &str = "durable PPLNS accounting; each mature pool block is distributed over its discovery-time rolling share window after the disclosed operator fee";
@@ -198,6 +202,10 @@ pub enum PoolError {
         "PPLNS window must be automatic or between 1 and {POOL_MAX_PPLNS_WINDOW_SHARES} shares"
     )]
     InvalidPplnsWindow,
+    #[error("pool bonus rate must be between 1 and {MAX_POOL_BONUS_RATE_BPS} basis points")]
+    InvalidBonusRate,
+    #[error("pool bonus sponsor must be a valid x-only key other than the pool wallet key")]
+    InvalidBonusSponsor,
     #[error("PPLNS work calculation failed: {0}")]
     PplnsWork(String),
     #[error("pool settlement requires the block-reward destination to be this node's wallet")]
@@ -359,8 +367,9 @@ pub struct PoolBonusPolicy {
     /// Key whose confirmed transfers to the pool wallet fund the reserve.
     pub sponsor: [u8; 32],
     /// First chain height scanned for sponsor transfers when the ledger has
-    /// no scan mark yet, or a lower height to rescan from. `None` starts at
-    /// the current tip.
+    /// no scan mark yet; `None` starts at the current tip. Ignored once the
+    /// ledger has a mark (the pool logs a warning at startup when the mark
+    /// is already at or above this height).
     pub scan_from_height: Option<u64>,
 }
 
@@ -601,6 +610,9 @@ pub struct PoolPayoutStats {
     pub payout_on_hold: bool,
     #[serde(default)]
     pub held_payout_atoms: u64,
+    /// Lifetime bonus-reserve credit within `credited_devnet_atoms`.
+    #[serde(default)]
+    pub bonus_atoms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -629,6 +641,21 @@ pub struct PoolBlockStats {
     pub distributable_atoms: Option<u64>,
     pub pplns_window_shares: Option<usize>,
     pub pplns_distributed: bool,
+    /// Bonus rate and atoms this block's distribution paid from the reserve;
+    /// `None` without a PPLNS record.
+    #[serde(default)]
+    pub bonus_rate_bps: Option<u16>,
+    #[serde(default)]
+    pub bonus_atoms: Option<u64>,
+}
+
+/// One confirmed sponsor transfer registered into the bonus reserve.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PoolBonusFundingStats {
+    pub txid: String,
+    pub height: u64,
+    pub amount_atoms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -653,6 +680,19 @@ pub struct PoolLedgerSnapshot {
     pub payout_transactions: Vec<PoolPayoutTransactionStats>,
     #[serde(default)]
     pub payout_protection: PoolPayoutProtectionSnapshot,
+    /// Bonus reserve: lifetime sponsor funding, lifetime bonus credits and the
+    /// balance still available (`funded - credited`).
+    #[serde(default)]
+    pub bonus_funded_atoms: u64,
+    #[serde(default)]
+    pub bonus_credited_atoms: u64,
+    #[serde(default)]
+    pub bonus_reserve_atoms: u64,
+    /// Highest chain height fully scanned for sponsor transfers.
+    #[serde(default)]
+    pub bonus_scanned_height: Option<u64>,
+    #[serde(default)]
+    pub bonus_funding: Vec<PoolBonusFundingStats>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -719,6 +759,17 @@ pub struct PoolDashboardSnapshot {
     pub credited_atoms_last_24h: u64,
     pub estimated_24h_credited_atoms: Option<u64>,
     pub earnings_observation_seconds: u64,
+    /// Configured bonus policy, when any, and the reserve it draws from.
+    #[serde(default)]
+    pub bonus_rate_bps: Option<u16>,
+    #[serde(default)]
+    pub bonus_sponsor: Option<String>,
+    #[serde(default)]
+    pub bonus_reserve_atoms: u64,
+    #[serde(default)]
+    pub bonus_funded_atoms: u64,
+    #[serde(default)]
+    pub bonus_credited_atoms: u64,
     pub workers: Vec<PoolDashboardWorkerStats>,
     pub ledger: PoolLedgerSnapshot,
 }
@@ -1021,6 +1072,32 @@ struct Ledger {
     /// Chain height the ledger last reconciled against. A node below it is
     /// still catching up, not reporting a reorganization.
     observed_chain_height: u64,
+    /// Sponsor-funded bonus reserve: lifetime funding, lifetime credits and
+    /// the balance between them (`reserve == funded - credited`). The reserve
+    /// is not a payout-protection liability: a funding transaction later
+    /// reorganized away is not reversed, the wallet simply holds less than
+    /// the reserve says, and only the ordinary funding checks notice.
+    bonus_funded_atoms: u64,
+    bonus_credited_atoms: u64,
+    bonus_reserve_atoms: u64,
+    bonus_funding: BTreeMap<[u8; 32], BonusFundingRecord>,
+    /// Last chain height fully scanned for sponsor transfers and the active
+    /// block there; a mismatch later means that height was reorganized.
+    bonus_scan: Option<BonusScanMark>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct BonusFundingRecord {
+    height: u64,
+    amount_atoms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct BonusScanMark {
+    height: u64,
+    block_id: [u8; 32],
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1051,6 +1128,9 @@ struct PayoutRecord {
     /// They stay reserved and confirmed for every credit calculation.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     settled_atoms: u64,
+    /// Lifetime bonus-reserve credit, already within `credited_devnet_atoms`.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    bonus_atoms: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1123,6 +1203,12 @@ struct PplnsBlockRecord {
     distributed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_backing_mature: Option<bool>,
+    /// Bonus rate applied at distribution and the atoms it paid from the
+    /// reserve; zero when no bonus was paid.
+    #[serde(default, skip_serializing_if = "is_zero_u16")]
+    bonus_rate_bps: u16,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    bonus_atoms: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1277,6 +1363,23 @@ struct StoredLedgerPayloadV1 {
         skip_serializing_if = "payout_protection::ProtectionState::is_empty"
     )]
     payout_protection: payout_protection::ProtectionState,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    bonus_funded_atoms: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    bonus_credited_atoms: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    bonus_reserve_atoms: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    bonus_funding: Vec<StoredBonusFundingRecordV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bonus_scan: Option<BonusScanMark>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredBonusFundingRecordV1 {
+    txid: [u8; 32],
+    record: BonusFundingRecord,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1939,6 +2042,11 @@ impl LedgerStore {
             earning_history_started_at_unix_seconds: 0,
             earning_events: Vec::new(),
             payout_protection: payout_protection::ProtectionState::default(),
+            bonus_funded_atoms: 0,
+            bonus_credited_atoms: 0,
+            bonus_reserve_atoms: 0,
+            bonus_funding: Vec::new(),
+            bonus_scan: None,
         };
         let mut ledger = ledger_from_payload(stored.generation, payload)?;
         for session in ledger.sessions.values_mut() {
@@ -2005,6 +2113,18 @@ fn ledger_payload(ledger: &Ledger) -> StoredLedgerPayloadV1 {
         observed_chain_height: ledger.observed_chain_height,
         earning_events: ledger.earning_events.iter().cloned().collect(),
         payout_protection: ledger.payout_protection.clone(),
+        bonus_funded_atoms: ledger.bonus_funded_atoms,
+        bonus_credited_atoms: ledger.bonus_credited_atoms,
+        bonus_reserve_atoms: ledger.bonus_reserve_atoms,
+        bonus_funding: ledger
+            .bonus_funding
+            .iter()
+            .map(|(txid, record)| StoredBonusFundingRecordV1 {
+                txid: *txid,
+                record: *record,
+            })
+            .collect(),
+        bonus_scan: ledger.bonus_scan,
     }
 }
 
@@ -2055,6 +2175,14 @@ fn ledger_from_payload(
             ));
         }
     }
+    let mut bonus_funding = BTreeMap::new();
+    for entry in payload.bonus_funding {
+        if bonus_funding.insert(entry.txid, entry.record).is_some() {
+            return Err(PoolError::LedgerCorrupt(
+                "duplicate stored bonus funding transaction".to_owned(),
+            ));
+        }
+    }
     let ledger = Ledger {
         generation,
         guard_version: payload.guard_version,
@@ -2077,6 +2205,11 @@ fn ledger_from_payload(
         earning_events: payload.earning_events.into(),
         payout_protection: payload.payout_protection,
         observed_chain_height: payload.observed_chain_height,
+        bonus_funded_atoms: payload.bonus_funded_atoms,
+        bonus_credited_atoms: payload.bonus_credited_atoms,
+        bonus_reserve_atoms: payload.bonus_reserve_atoms,
+        bonus_funding,
+        bonus_scan: payload.bonus_scan,
     };
     validate_ledger(&ledger)?;
     Ok(ledger)
@@ -2138,8 +2271,44 @@ fn validate_ledger(ledger: &Ledger) -> Result<(), PoolError> {
         || ledger.pplns_shares.len() > POOL_MAX_PPLNS_WINDOW_SHARES
         || ledger.pplns_blocks.len() > POOL_MAX_LEDGER_BLOCKS
         || ledger.earning_events.len() > POOL_MAX_EARNING_EVENTS
+        || ledger.bonus_funding.len() > POOL_MAX_BONUS_FUNDING_RECORDS
     {
         return Err(PoolError::LedgerCapacity);
+    }
+    let funded = ledger
+        .bonus_funding
+        .values()
+        .try_fold(0_u64, |total, record| {
+            if record.amount_atoms == 0 {
+                return Err(PoolError::LedgerCorrupt(
+                    "stored bonus funding record is invalid".to_owned(),
+                ));
+            }
+            checked_ledger_add(total, record.amount_atoms, "bonus funding total")
+        })?;
+    if funded != ledger.bonus_funded_atoms
+        || checked_ledger_add(
+            ledger.bonus_credited_atoms,
+            ledger.bonus_reserve_atoms,
+            "bonus reserve total",
+        )? != ledger.bonus_funded_atoms
+    {
+        return Err(PoolError::LedgerCorrupt(
+            "stored bonus reserve does not match its funding and credits".to_owned(),
+        ));
+    }
+    let payout_bonus = ledger.payouts.values().try_fold(0_u64, |total, record| {
+        if record.bonus_atoms > record.credited_devnet_atoms {
+            return Err(PoolError::LedgerCorrupt(
+                "stored payout bonus exceeds its credit".to_owned(),
+            ));
+        }
+        checked_ledger_add(total, record.bonus_atoms, "payout bonus total")
+    })?;
+    if payout_bonus != ledger.bonus_credited_atoms {
+        return Err(PoolError::LedgerCorrupt(
+            "stored payout bonus totals do not match the credited bonus".to_owned(),
+        ));
     }
     // Decompressing a payout key costs microseconds; a full share window
     // holds tens of thousands of shares over a few dozen keys, so every key is
@@ -2172,6 +2341,8 @@ fn validate_ledger(ledger: &Ledger) -> Result<(), PoolError> {
         if !ledger.blocks.contains_key(block_id)
             || pplns.miner_reward_atoms == 0
             || pplns.operator_fee_bps > 10_000
+            || pplns.bonus_rate_bps > MAX_POOL_BONUS_RATE_BPS
+            || (pplns.bonus_atoms != 0 && !pplns.distributed)
             || (pplns.configured_window_shares != 0
                 && !(1..=POOL_MAX_PPLNS_WINDOW_SHARES).contains(&pplns.configured_window_shares))
         {
@@ -2760,6 +2931,7 @@ struct SharedServer {
     test_credit_atoms_per_share: u64,
     payout_policy: Option<PoolPayoutPolicy>,
     pplns_policy: Option<PoolPplnsPolicy>,
+    bonus_policy: Option<PoolBonusPolicy>,
     max_connections: usize,
     allow_public_clients: bool,
     allow_address_only_payouts: bool,
@@ -2767,6 +2939,13 @@ struct SharedServer {
     production_v4_share_verifier: Option<Arc<dyn ProductionV4PoolShareVerifier>>,
     tls: Arc<ServerConfig>,
     startup_nonce: [u8; 32],
+}
+
+impl SharedServer {
+    /// Bonus rate each mature block's allocations earn; zero without a policy.
+    fn bonus_rate_bps(&self) -> u16 {
+        self.bonus_policy.map_or(0, |policy| policy.rate_bps)
+    }
 }
 
 /// Per-session rejection reasons beyond the ledger's rejected/stale totals.
@@ -3111,6 +3290,14 @@ impl PoolDashboardSource {
             credited_atoms_last_24h,
             estimated_24h_credited_atoms,
             earnings_observation_seconds,
+            bonus_rate_bps: self.shared.bonus_policy.map(|policy| policy.rate_bps),
+            bonus_sponsor: self
+                .shared
+                .bonus_policy
+                .map(|policy| hex::encode(policy.sponsor)),
+            bonus_reserve_atoms: ledger.bonus_reserve_atoms,
+            bonus_funded_atoms: ledger.bonus_funded_atoms,
+            bonus_credited_atoms: ledger.bonus_credited_atoms,
             workers,
             ledger,
         })
@@ -3259,6 +3446,17 @@ pub fn spawn_pool_server(
             return Err(PoolError::InvalidPplnsWindow);
         }
     }
+    if let Some(policy) = config.bonus_policy {
+        if policy.rate_bps == 0 || policy.rate_bps > MAX_POOL_BONUS_RATE_BPS {
+            return Err(PoolError::InvalidBonusRate);
+        }
+        // The wallet key's own transfers never fund the reserve.
+        if policy.sponsor == wallet_destination
+            || VerifyingKey::from_bytes(&policy.sponsor).is_err()
+        {
+            return Err(PoolError::InvalidBonusSponsor);
+        }
+    }
     VerifyingKey::from_bytes(&config.block_destination)
         .map_err(|_| PoolError::Node(NodeError::InvalidMinerDestination))?;
     let tls = Arc::new(server_tls_config(
@@ -3303,6 +3501,22 @@ pub fn spawn_pool_server(
         config.ledger_max_bytes,
     )?;
     let next_session_id = ledger.next_session_id()?;
+    if let Some(from_height) = config
+        .bonus_policy
+        .and_then(|policy| policy.scan_from_height)
+        && let Some(mark) = ledger
+            .state
+            .lock()
+            .map_err(|_| PoolError::SharedStatePoisoned)?
+            .bonus_scan
+        && mark.height >= from_height
+    {
+        tracing::warn!(
+            scan_from_height = from_height,
+            scanned_height = mark.height,
+            "bonus scan-from-height ignored: the ledger already scanned past it, and sponsor transfers below its mark are never registered"
+        );
+    }
     let shared = Arc::new(SharedServer {
         node,
         state: Mutex::new(ServerState {
@@ -3338,6 +3552,7 @@ pub fn spawn_pool_server(
         test_credit_atoms_per_share: config.test_credit_atoms_per_share,
         payout_policy: config.payout_policy,
         pplns_policy: config.pplns_policy,
+        bonus_policy: config.bonus_policy,
         max_connections: config.max_connections,
         allow_public_clients: config.allow_public_clients,
         allow_address_only_payouts: config.allow_address_only_payouts,
@@ -4144,6 +4359,7 @@ fn process_share(
         block_credit.block_id,
         PoolBlockState::Canonical,
         1,
+        shared.bonus_rate_bps(),
     )?;
     let node_submission_seconds = node_submission_started.elapsed().as_secs_f64();
     rotate_if_tip_changed(shared)?;
@@ -4398,11 +4614,24 @@ fn reconcile_pool_blocks_with_recovery(
     shared: &SharedServer,
     recover_missing_pending: bool,
 ) -> Result<(), PoolError> {
-    let node = shared
+    let mut node = shared
         .node
         .lock()
         .map_err(|_| PoolError::SharedStatePoisoned)?;
-    reconcile_pool_blocks_for_node(&shared.ledger, &node, recover_missing_pending)
+    // Funding registered this tick is available to a block maturing this
+    // tick. This path also runs for pools without automatic payouts. A failed
+    // scan is retried next tick and never stops block reconciliation.
+    if let Some(policy) = shared.bonus_policy
+        && let Err(error) = credit_bonus_funding(&shared.ledger, &mut node, policy)
+    {
+        tracing::warn!(%error, "bonus funding scan failed; retrying on the next tick");
+    }
+    reconcile_pool_blocks_for_node(
+        &shared.ledger,
+        &node,
+        recover_missing_pending,
+        shared.bonus_rate_bps(),
+    )
 }
 
 /// The node's tip and the chain height the ledger last reconciled against,
@@ -4414,10 +4643,123 @@ fn node_behind_ledger(ledger: &Ledger, node: &Node) -> Option<(u64, u64)> {
     (tip < ledger.observed_chain_height).then_some((tip, ledger.observed_chain_height))
 }
 
+/// Registers the sponsor's confirmed transfers into the pool wallet as bonus
+/// reserve funding, once per transaction. Each call scans at most
+/// `POOL_BONUS_SCAN_BLOCKS_PER_PASS` heights up to the newest height with
+/// `POOL_BONUS_FUNDING_CONFIRMATIONS` confirmations and records how far it
+/// got; the next call continues from there. A mark whose block left the
+/// active chain restarts `COINBASE_MATURITY` heights lower. Without a mark the
+/// scan starts at `scan_from_height`, or at the confirmed tip when unset, so
+/// transfers sent before the bonus was enabled are only counted when the
+/// operator passes their height. Once `POOL_MAX_BONUS_FUNDING_RECORDS`
+/// transfers are registered, further ones are logged and skipped. The caller
+/// holds the node lock.
+fn credit_bonus_funding(
+    ledger: &DurableLedger,
+    node: &mut Node,
+    policy: PoolBonusPolicy,
+) -> Result<(), PoolError> {
+    let (mark, behind) = {
+        let state = ledger
+            .state
+            .lock()
+            .map_err(|_| PoolError::SharedStatePoisoned)?;
+        (state.bonus_scan, node_behind_ledger(&state, node).is_some())
+    };
+    if behind {
+        return Ok(());
+    }
+    let chain_height = node.state.next_height().saturating_sub(1);
+    let Some(confirmed_tip) = chain_height.checked_sub(POOL_BONUS_FUNDING_CONFIRMATIONS - 1) else {
+        return Ok(());
+    };
+    let start = match mark {
+        Some(mark) if node.active_block_id_at(mark.height) == Some(mark.block_id) => {
+            mark.height.saturating_add(1)
+        }
+        Some(mark) => mark.height.saturating_sub(COINBASE_MATURITY),
+        None => policy.scan_from_height.unwrap_or(confirmed_tip),
+    };
+    if start > confirmed_tip {
+        return Ok(());
+    }
+    let end = confirmed_tip.min(start.saturating_add(POOL_BONUS_SCAN_BLOCKS_PER_PASS - 1));
+    let Some(block_id) = node.active_block_id_at(end) else {
+        return Ok(());
+    };
+    let transfers = node
+        .sponsor_transfers_to_wallet(policy.sponsor, start, end)
+        .map_err(PoolError::Node)?;
+    let (registered, skipped) = ledger.transaction(|ledger| {
+        let mut registered = Vec::new();
+        let mut skipped = Vec::new();
+        for transfer in &transfers {
+            if ledger.bonus_funding.contains_key(&transfer.txid) {
+                continue;
+            }
+            // A full record table skips the transfer rather than failing
+            // every later scan at the same height; the mark still advances.
+            if ledger.bonus_funding.len() >= POOL_MAX_BONUS_FUNDING_RECORDS {
+                skipped.push(*transfer);
+                continue;
+            }
+            ledger.bonus_funded_atoms = checked_ledger_add(
+                ledger.bonus_funded_atoms,
+                transfer.amount_atoms,
+                "bonus funded atoms",
+            )?;
+            ledger.bonus_reserve_atoms = checked_ledger_add(
+                ledger.bonus_reserve_atoms,
+                transfer.amount_atoms,
+                "bonus reserve atoms",
+            )?;
+            ledger.bonus_funding.insert(
+                transfer.txid,
+                BonusFundingRecord {
+                    height: transfer.height,
+                    amount_atoms: transfer.amount_atoms,
+                },
+            );
+            registered.push((*transfer, ledger.bonus_reserve_atoms));
+        }
+        ledger.bonus_scan = Some(BonusScanMark {
+            height: end,
+            block_id,
+        });
+        Ok((registered, skipped))
+    })?;
+    for (transfer, reserve_atoms) in registered {
+        tracing::info!(
+            txid = %hex::encode(transfer.txid),
+            amount_atoms = transfer.amount_atoms,
+            height = transfer.height,
+            reserve_atoms,
+            "bonus reserve funded"
+        );
+    }
+    for transfer in skipped {
+        tracing::warn!(
+            txid = %hex::encode(transfer.txid),
+            amount_atoms = transfer.amount_atoms,
+            height = transfer.height,
+            cap = POOL_MAX_BONUS_FUNDING_RECORDS,
+            "bonus funding record cap reached; transfer not registered"
+        );
+    }
+    tracing::debug!(
+        from_height = start,
+        to_height = end,
+        transfers = transfers.len(),
+        "bonus funding scan"
+    );
+    Ok(())
+}
+
 fn reconcile_pool_blocks_for_node(
     ledger: &DurableLedger,
     node: &Node,
     recover_missing_pending: bool,
+    bonus_rate_bps: u16,
 ) -> Result<(), PoolError> {
     let blocks = {
         let state = ledger
@@ -4523,7 +4865,7 @@ fn reconcile_pool_blocks_for_node(
             record.state = state;
             record.confirmations = confirmations;
             if state == PoolBlockState::Canonical && confirmations >= COINBASE_MATURITY {
-                distribute_mature_pplns_block(ledger, block_id)?;
+                distribute_mature_pplns_block(ledger, block_id, bonus_rate_bps)?;
             }
             payout_protection::observe_backing(ledger, node, block_id)?;
         }
@@ -4711,7 +5053,14 @@ fn reconcile_pool_payouts(shared: &SharedServer, create_new: bool) -> Result<(),
             return Ok(());
         }
     }
-    reconcile_pool_blocks_for_node(&shared.ledger, &node, true)?;
+    reconcile_pool_blocks_for_node(&shared.ledger, &node, true, shared.bonus_rate_bps())?;
+    // New sponsor funding counts as an asset before the funding check below;
+    // a failed scan is retried next tick and never stops payouts.
+    if let Some(bonus_policy) = shared.bonus_policy
+        && let Err(error) = credit_bonus_funding(&shared.ledger, &mut node, bonus_policy)
+    {
+        tracing::warn!(%error, "bonus funding scan failed; retrying on the next tick");
+    }
     payout_protection::refresh_payment_states(&shared.ledger, &mut node)?;
     payout_protection::check_funding(&shared.ledger, &node, policy.fee_atoms)?;
     payout_protection::auto_resolve(&shared.ledger, &node, policy.fee_atoms)?;
@@ -5142,6 +5491,8 @@ fn reserve_pending_pool_block(
                         allocations,
                         distributed: false,
                         last_backing_mature: None,
+                        bonus_rate_bps: 0,
+                        bonus_atoms: 0,
                     },
                 )
                 .is_some()
@@ -5175,6 +5526,7 @@ fn finalize_pending_pool_block(
     block_id: [u8; 32],
     state: PoolBlockState,
     confirmations: u64,
+    bonus_rate_bps: u16,
 ) -> Result<PoolSessionStats, PoolError> {
     if matches!(state, PoolBlockState::Pending | PoolBlockState::Unknown) {
         return Err(PoolError::LedgerCorrupt(
@@ -5196,7 +5548,7 @@ fn finalize_pending_pool_block(
         stored.state = state;
         stored.confirmations = confirmations;
         if state == PoolBlockState::Canonical && confirmations >= COINBASE_MATURITY {
-            distribute_mature_pplns_block(ledger, block_id)?;
+            distribute_mature_pplns_block(ledger, block_id, bonus_rate_bps)?;
         }
         session_snapshot(
             record.session_id,
@@ -5497,7 +5849,15 @@ fn finalize_pending_block_accounting(
     Ok(())
 }
 
-fn distribute_mature_pplns_block(ledger: &mut Ledger, block_id: [u8; 32]) -> Result<(), PoolError> {
+/// Credits a mature block's frozen allocations, plus `bonus_rate_bps` of each
+/// from the bonus reserve while it lasts. The operator fee never applies to
+/// the bonus; with a zero rate or an empty reserve the ledger changes exactly
+/// as it did without a bonus policy.
+fn distribute_mature_pplns_block(
+    ledger: &mut Ledger,
+    block_id: [u8; 32],
+    bonus_rate_bps: u16,
+) -> Result<(), PoolError> {
     let Some(pplns) = ledger.pplns_blocks.get(&block_id) else {
         return Ok(());
     };
@@ -5512,6 +5872,17 @@ fn distribute_mature_pplns_block(ledger: &mut Ledger, block_id: [u8; 32]) -> Res
     let operator_fee = pplns.operator_fee_atoms;
     let distributable = pplns.distributable_atoms;
     let allocations = pplns.allocations.clone();
+    let bonuses = bonus_split(
+        &allocations
+            .iter()
+            .map(|allocation| allocation.atoms)
+            .collect::<Vec<_>>(),
+        bonus_rate_bps,
+        ledger.bonus_reserve_atoms,
+    );
+    let bonus_total = bonuses.iter().try_fold(0_u64, |total, bonus| {
+        checked_ledger_add(total, *bonus, "bonus total")
+    })?;
     let credited_at = unix_time_seconds()?;
     ledger.operator_fee_atoms = checked_ledger_add(
         ledger.operator_fee_atoms,
@@ -5523,40 +5894,90 @@ fn distribute_mature_pplns_block(ledger: &mut Ledger, block_id: [u8; 32]) -> Res
         distributable,
         "PPLNS credited atoms",
     )?;
-    for allocation in allocations {
+    if bonus_total != 0 {
+        ledger.credited_devnet_atoms = checked_ledger_add(
+            ledger.credited_devnet_atoms,
+            bonus_total,
+            "bonus credited atoms",
+        )?;
+        ledger.bonus_credited_atoms = checked_ledger_add(
+            ledger.bonus_credited_atoms,
+            bonus_total,
+            "bonus credited atoms",
+        )?;
+        ledger.bonus_reserve_atoms = ledger
+            .bonus_reserve_atoms
+            .checked_sub(bonus_total)
+            .ok_or_else(|| PoolError::LedgerCorrupt("bonus reserve underflow".to_owned()))?;
+    }
+    for (allocation, bonus) in allocations.into_iter().zip(bonuses) {
+        let atoms = checked_ledger_add(allocation.atoms, bonus, "PPLNS credit with bonus")?;
         if let Some(session) = ledger.sessions.get_mut(&allocation.session_id)
             && session.payout == allocation.payout
         {
-            session.credited_devnet_atoms = checked_ledger_add(
-                session.credited_devnet_atoms,
-                allocation.atoms,
-                "session PPLNS credit",
-            )?;
+            session.credited_devnet_atoms =
+                checked_ledger_add(session.credited_devnet_atoms, atoms, "session PPLNS credit")?;
         }
         let payout = ledger.payouts.entry(allocation.payout).or_default();
         if ledger.sessions.contains_key(&allocation.session_id) {
             payout.last_session_id = allocation.session_id;
         }
-        payout.credited_devnet_atoms = checked_ledger_add(
-            payout.credited_devnet_atoms,
-            allocation.atoms,
-            "payout PPLNS credit",
-        )?;
+        payout.credited_devnet_atoms =
+            checked_ledger_add(payout.credited_devnet_atoms, atoms, "payout PPLNS credit")?;
+        payout.bonus_atoms = checked_ledger_add(payout.bonus_atoms, bonus, "payout bonus")?;
         record_earning_at(
             ledger,
             allocation.session_id,
             allocation.payout,
             allocation.worker,
-            allocation.atoms,
+            atoms,
             credited_at,
         )?;
     }
-    ledger
+    let pplns = ledger
         .pplns_blocks
         .get_mut(&block_id)
-        .expect("checked above")
-        .distributed = true;
+        .expect("checked above");
+    pplns.distributed = true;
+    if bonus_total != 0 {
+        pplns.bonus_rate_bps = bonus_rate_bps;
+        pplns.bonus_atoms = bonus_total;
+    }
     Ok(())
+}
+
+/// Bonus atoms per allocation: `rate_bps` of each, floored. When the reserve
+/// cannot cover the total, each bonus is scaled by `available / total` and
+/// the atoms lost to flooring go one each to the largest fractional
+/// remainders (ties in allocation order), so the sum is exactly `available`.
+fn bonus_split(allocations: &[u64], rate_bps: u16, reserve_atoms: u64) -> Vec<u64> {
+    let wants = allocations
+        .iter()
+        .map(|atoms| u128::from(*atoms) * u128::from(rate_bps) / 10_000)
+        .collect::<Vec<_>>();
+    let total_want = wants.iter().sum::<u128>();
+    let available = total_want.min(u128::from(reserve_atoms));
+    if available == 0 {
+        return vec![0; allocations.len()];
+    }
+    if available == total_want {
+        return wants.iter().map(|want| *want as u64).collect();
+    }
+    let mut bonuses = wants
+        .iter()
+        .map(|want| (want * available / total_want) as u64)
+        .collect::<Vec<_>>();
+    let mut remainders = wants
+        .iter()
+        .enumerate()
+        .map(|(index, want)| (want * available % total_want, index))
+        .collect::<Vec<_>>();
+    remainders.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
+    let short = available - bonuses.iter().map(|bonus| u128::from(*bonus)).sum::<u128>();
+    for (_, index) in remainders.into_iter().take(short as usize) {
+        bonuses[index] += 1;
+    }
+    bonuses
 }
 
 fn apply_accepted_share_credit(
@@ -5778,6 +6199,7 @@ fn snapshot_ledger(ledger: &DurableLedger) -> Result<PoolLedgerSnapshot, PoolErr
                 } else {
                     0
                 },
+                bonus_atoms: record.bonus_atoms,
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -5799,6 +6221,8 @@ fn snapshot_ledger(ledger: &DurableLedger) -> Result<PoolLedgerSnapshot, PoolErr
                 distributable_atoms: pplns.map(|record| record.distributable_atoms),
                 pplns_window_shares: pplns.map(|record| record.window_share_count),
                 pplns_distributed: pplns.is_some_and(|record| record.distributed),
+                bonus_rate_bps: pplns.map(|record| record.bonus_rate_bps),
+                bonus_atoms: pplns.map(|record| record.bonus_atoms),
             }
         })
         .collect::<Vec<_>>();
@@ -5854,6 +6278,19 @@ fn snapshot_ledger(ledger: &DurableLedger) -> Result<PoolLedgerSnapshot, PoolErr
         blocks,
         payout_transactions,
         payout_protection: payout_protection::snapshot(&ledger),
+        bonus_funded_atoms: ledger.bonus_funded_atoms,
+        bonus_credited_atoms: ledger.bonus_credited_atoms,
+        bonus_reserve_atoms: ledger.bonus_reserve_atoms,
+        bonus_scanned_height: ledger.bonus_scan.map(|mark| mark.height),
+        bonus_funding: ledger
+            .bonus_funding
+            .iter()
+            .map(|(txid, record)| PoolBonusFundingStats {
+                txid: hex::encode(txid),
+                height: record.height,
+                amount_atoms: record.amount_atoms,
+            })
+            .collect(),
     })
 }
 
@@ -6646,13 +7083,21 @@ mod tests {
     #[test]
     fn connection_limits_accept_the_full_range_and_reject_outside_it() {
         use super::{
-            validate_connection_limits, PoolError, DEFAULT_POOL_CONNECTIONS,
-            DEFAULT_POOL_CONNECTIONS_PER_SOURCE, POOL_MAX_CONNECTIONS,
-            POOL_MAX_CONNECTIONS_PER_SOURCE,
+            DEFAULT_POOL_CONNECTIONS, DEFAULT_POOL_CONNECTIONS_PER_SOURCE, POOL_MAX_CONNECTIONS,
+            POOL_MAX_CONNECTIONS_PER_SOURCE, PoolError, validate_connection_limits,
         };
-        assert!(validate_connection_limits(DEFAULT_POOL_CONNECTIONS, DEFAULT_POOL_CONNECTIONS_PER_SOURCE).is_ok());
+        assert!(
+            validate_connection_limits(
+                DEFAULT_POOL_CONNECTIONS,
+                DEFAULT_POOL_CONNECTIONS_PER_SOURCE
+            )
+            .is_ok()
+        );
         assert!(validate_connection_limits(128, 32).is_ok());
-        assert!(validate_connection_limits(POOL_MAX_CONNECTIONS, POOL_MAX_CONNECTIONS_PER_SOURCE).is_ok());
+        assert!(
+            validate_connection_limits(POOL_MAX_CONNECTIONS, POOL_MAX_CONNECTIONS_PER_SOURCE)
+                .is_ok()
+        );
         assert!(matches!(
             validate_connection_limits(0, 8),
             Err(PoolError::InvalidConnectionLimit)
@@ -7602,7 +8047,7 @@ mod tests {
         .unwrap();
         // The ledger last saw this block with 15 confirmations from a node at
         // height 20; this node has only reached height 10 so far.
-        finalize_pending_pool_block(&ledger, block_id, PoolBlockState::Canonical, 15).unwrap();
+        finalize_pending_pool_block(&ledger, block_id, PoolBlockState::Canonical, 15, 0).unwrap();
         ledger
             .transaction(|ledger| {
                 ledger.observed_chain_height = 20;
@@ -7610,7 +8055,7 @@ mod tests {
             })
             .unwrap();
         let generation = ledger.state.lock().unwrap().generation;
-        reconcile_pool_blocks_for_node(&ledger, &node, true).unwrap();
+        reconcile_pool_blocks_for_node(&ledger, &node, true, 0).unwrap();
         {
             let state = ledger.state.lock().unwrap();
             assert_eq!(
@@ -7627,7 +8072,7 @@ mod tests {
             node.mine_once(miner, timestamp(height), crate::DEFAULT_MINING_ATTEMPTS)
                 .unwrap();
         }
-        reconcile_pool_blocks_for_node(&ledger, &node, true).unwrap();
+        reconcile_pool_blocks_for_node(&ledger, &node, true, 0).unwrap();
         let state = ledger.state.lock().unwrap();
         assert_eq!(
             state.blocks[&block_id].confirmations,
@@ -7917,6 +8362,39 @@ mod tests {
             spawn_pool_server(Arc::clone(&node), window),
             Err(PoolError::InvalidPplnsWindow)
         ));
+
+        let sponsor: [u8; 32] = SigningKey::from_bytes(&[0x5b; 32])
+            .unwrap()
+            .verifying_key()
+            .to_bytes()
+            .into();
+        // x = 5 is not the x-coordinate of any secp256k1 point.
+        let mut not_a_point = [0; 32];
+        not_a_point[31] = 5;
+        for (rate_bps, sponsor, rate_error) in [
+            (0, sponsor, true),
+            (MAX_POOL_BONUS_RATE_BPS + 1, sponsor, true),
+            (1_000, destination, false),
+            (1_000, not_a_point, false),
+        ] {
+            let mut bonus = config();
+            bonus.bonus_policy = Some(PoolBonusPolicy {
+                rate_bps,
+                sponsor,
+                scan_from_height: None,
+            });
+            let error = spawn_pool_server(Arc::clone(&node), bonus)
+                .err()
+                .unwrap_or_else(|| panic!("{rate_bps} {} accepted", hex::encode(sponsor)));
+            assert!(
+                match error {
+                    PoolError::InvalidBonusRate => rate_error,
+                    PoolError::InvalidBonusSponsor => !rate_error,
+                    _ => false,
+                },
+                "{rate_bps} {error}"
+            );
+        }
 
         for (size, wait) in [
             (0, DEFAULT_POOL_SHARE_BATCH_WAIT_MS),
@@ -8297,7 +8775,8 @@ mod tests {
             block_target: [0x3f; 32],
         };
         reserve_pending_pool_block(&ledger, 3, block, 1, Some(policy)).unwrap();
-        finalize_pending_pool_block(&ledger, block.block_id, PoolBlockState::Canonical, 1).unwrap();
+        finalize_pending_pool_block(&ledger, block.block_id, PoolBlockState::Canonical, 1, 0)
+            .unwrap();
         let immature = snapshot_ledger(&ledger).unwrap();
         assert_eq!(immature.credited_devnet_atoms, 0);
         assert_eq!(immature.operator_fee_atoms, 0);
@@ -8308,6 +8787,7 @@ mod tests {
             block.block_id,
             PoolBlockState::Canonical,
             COINBASE_MATURITY - 1,
+            0,
         )
         .unwrap();
         assert_eq!(snapshot_ledger(&ledger).unwrap().credited_devnet_atoms, 0);
@@ -8316,6 +8796,7 @@ mod tests {
             block.block_id,
             PoolBlockState::Canonical,
             COINBASE_MATURITY,
+            0,
         )
         .unwrap();
         let mature = snapshot_ledger(&ledger).unwrap();
@@ -8353,6 +8834,7 @@ mod tests {
             block.block_id,
             PoolBlockState::Canonical,
             COINBASE_MATURITY + 1,
+            0,
         )
         .unwrap();
         assert_eq!(snapshot_ledger(&ledger).unwrap().credited_devnet_atoms, 98);
@@ -8427,7 +8909,8 @@ mod tests {
             block_target: [0x7f; 32],
         };
         reserve_pending_pool_block(&ledger, 1, block, 1, Some(policy)).unwrap();
-        finalize_pending_pool_block(&ledger, block.block_id, PoolBlockState::Orphaned, 0).unwrap();
+        finalize_pending_pool_block(&ledger, block.block_id, PoolBlockState::Orphaned, 0, 0)
+            .unwrap();
 
         let snapshot = snapshot_ledger(&ledger).unwrap();
         assert_eq!(snapshot.pool_blocks, 1);
@@ -8466,6 +8949,7 @@ mod tests {
                 block.block_id,
                 PoolBlockState::Canonical,
                 COINBASE_MATURITY - 1,
+                0,
             )
             .unwrap();
             assert_eq!(snapshot_ledger(&ledger).unwrap().credited_devnet_atoms, 0);
@@ -8479,6 +8963,7 @@ mod tests {
                 block.block_id,
                 PoolBlockState::Canonical,
                 COINBASE_MATURITY,
+                0,
             )
             .unwrap();
             finalize_pending_pool_block(
@@ -8486,6 +8971,7 @@ mod tests {
                 block.block_id,
                 PoolBlockState::Canonical,
                 COINBASE_MATURITY + 1,
+                0,
             )
             .unwrap();
         }
@@ -8533,6 +9019,7 @@ mod tests {
             first.block_id,
             PoolBlockState::Canonical,
             COINBASE_MATURITY,
+            0,
         )
         .unwrap();
         reserve_pending_pool_block(&ledger, 1, second, 1, Some(second_policy)).unwrap();
@@ -8541,6 +9028,7 @@ mod tests {
             second.block_id,
             PoolBlockState::Canonical,
             COINBASE_MATURITY,
+            0,
         )
         .unwrap();
 
@@ -8577,6 +9065,7 @@ mod tests {
             block.block_id,
             PoolBlockState::Canonical,
             COINBASE_MATURITY,
+            0,
         )
         .unwrap();
 
@@ -8662,9 +9151,9 @@ mod tests {
 
         let recovered =
             DurableLedger::open(Some(directory.clone()), network_id, fingerprint).unwrap();
-        finalize_pending_pool_block(&recovered, block.block_id, PoolBlockState::Canonical, 1)
+        finalize_pending_pool_block(&recovered, block.block_id, PoolBlockState::Canonical, 1, 0)
             .unwrap();
-        finalize_pending_pool_block(&recovered, block.block_id, PoolBlockState::Canonical, 1)
+        finalize_pending_pool_block(&recovered, block.block_id, PoolBlockState::Canonical, 1, 0)
             .unwrap();
         drop(recovered);
 
@@ -9615,5 +10104,349 @@ mod tests {
         println!(
             "CMFD_POOL_TLS_IDENTITY_OK tls=1.3 correct_pin=accepted wrong_pin=rejected mismatched_key=rejected malformed_der=rejected no_node=true no_gpu=true"
         );
+    }
+
+    #[test]
+    fn bonus_split_is_exact_proportional_with_largest_remainders_and_empty_safe() {
+        // The reserve covers every bonus: each allocation earns its floor.
+        assert_eq!(
+            bonus_split(&[1_000, 2_000, 3_005], 1_000, 10_000),
+            vec![100, 200, 300]
+        );
+        assert_eq!(
+            bonus_split(&[1_000, 2_000, 3_005], 1_000, 600),
+            vec![100, 200, 300]
+        );
+        // One atom short: 99.83, 199.67 and 299.5 floor to 597, and the two
+        // largest remainders (the first, then the second) take one more each.
+        assert_eq!(
+            bonus_split(&[1_000, 2_000, 3_005], 1_000, 599),
+            vec![100, 200, 299]
+        );
+        // Equal remainders are broken in allocation order.
+        assert_eq!(bonus_split(&[10, 10, 10], 10_000, 2), vec![1, 1, 0]);
+        for reserve in [0, 1, 7, 599, 600] {
+            let bonuses = bonus_split(&[1_000, 2_000, 3_005], 1_000, reserve);
+            assert_eq!(bonuses.iter().sum::<u64>(), reserve.min(600), "{reserve}");
+        }
+        // Nothing to pay: an empty reserve, a zero rate or no allocations.
+        assert_eq!(bonus_split(&[1_000, 2_000], 1_000, 0), vec![0, 0]);
+        assert_eq!(bonus_split(&[1_000, 2_000], 0, u64::MAX), vec![0, 0]);
+        assert!(bonus_split(&[], 1_000, u64::MAX).is_empty());
+        // Sub-atom bonuses floor to zero.
+        assert_eq!(bonus_split(&[9, 10], 1_000, u64::MAX), vec![0, 1]);
+        // The arithmetic is u128: a full-rate bonus on the largest allocations.
+        assert_eq!(
+            bonus_split(&[u64::MAX, u64::MAX], 10_000, u64::MAX),
+            vec![u64::MAX / 2 + 1, u64::MAX / 2]
+        );
+    }
+
+    /// Distributes one mature PPLNS block (reward 1000, 3% operator fee) on
+    /// clones of the same ledger under different bonus rates and reserves.
+    #[test]
+    fn mature_block_bonus_distribution_pays_from_the_reserve_or_nothing() {
+        let ledger = DurableLedger::open(None, [0x41; 32], [0x42; 32]).unwrap();
+        let payout = test_payout_signer().payout();
+        register_session(&ledger, 1, "miner".to_owned(), payout).unwrap();
+        let policy = PoolPplnsPolicy {
+            operator_fee_bps: 300,
+            window_shares: 4,
+        };
+        record_accepted_share(&ledger, 1, 1, Some(policy), [0xff; 32]).unwrap();
+        let block_id = [0x5d; 32];
+        reserve_pending_pool_block(
+            &ledger,
+            1,
+            PoolBlockCredit {
+                block_id,
+                parent: [0x62; 32],
+                height: 7,
+                miner_reward_atoms: 1_000,
+                share_target: [0xff; 32],
+                block_target: [0x3f; 32],
+            },
+            1,
+            Some(policy),
+        )
+        .unwrap();
+        finalize_pending_pool_block(
+            &ledger,
+            block_id,
+            PoolBlockState::Canonical,
+            COINBASE_MATURITY - 1,
+            1_000,
+        )
+        .unwrap();
+        let immature = ledger.state.lock().unwrap().clone();
+        assert_eq!(immature.bonus_reserve_atoms, 0);
+        let credited = |ledger: &Ledger| {
+            (
+                ledger.credited_devnet_atoms,
+                ledger.operator_fee_atoms,
+                ledger.sessions[&1].credited_devnet_atoms,
+                ledger
+                    .payouts
+                    .get(&payout)
+                    .map_or(0, |record| record.credited_devnet_atoms),
+            )
+        };
+        let before = credited(&immature);
+        let bytes = |ledger: &Ledger| serde_json::to_vec(&ledger_payload(ledger)).unwrap();
+
+        // No policy, and a policy with an empty reserve: the same bytes.
+        let mut plain = immature.clone();
+        distribute_mature_pplns_block(&mut plain, block_id, 0).unwrap();
+        let mut empty_reserve = immature.clone();
+        distribute_mature_pplns_block(&mut empty_reserve, block_id, 1_000).unwrap();
+        // Only the earning clock may differ between the two calls.
+        empty_reserve.earning_history_started_at_unix_seconds =
+            plain.earning_history_started_at_unix_seconds;
+        for (event, reference) in empty_reserve
+            .earning_events
+            .iter_mut()
+            .zip(&plain.earning_events)
+        {
+            event.credited_at_unix_seconds = reference.credited_at_unix_seconds;
+        }
+        assert_eq!(bytes(&empty_reserve), bytes(&plain));
+        assert!(!String::from_utf8(bytes(&plain)).unwrap().contains("bonus"));
+        let after = credited(&plain);
+        assert_eq!(after.0 - before.0, 970);
+        assert_eq!(after.1 - before.1, 30);
+        assert_eq!(after.2 - before.2, 970);
+        assert_eq!(after.3 - before.3, 970);
+        validate_ledger(&plain).unwrap();
+
+        // A reserve short of the 97-atom bonus pays what is left, and the
+        // operator fee stays at 3% of the reward.
+        let fund = |ledger: &mut Ledger, amount_atoms: u64| {
+            ledger.bonus_funded_atoms = amount_atoms;
+            ledger.bonus_reserve_atoms = amount_atoms;
+            ledger.bonus_funding.insert(
+                [0x71; 32],
+                BonusFundingRecord {
+                    height: 1,
+                    amount_atoms,
+                },
+            );
+        };
+        let mut short = immature.clone();
+        fund(&mut short, 50);
+        distribute_mature_pplns_block(&mut short, block_id, 1_000).unwrap();
+        let after = credited(&short);
+        assert_eq!(after.0 - before.0, 1_020);
+        assert_eq!(after.1 - before.1, 30);
+        assert_eq!(after.2 - before.2, 1_020);
+        assert_eq!(after.3 - before.3, 1_020);
+        assert_eq!(short.bonus_credited_atoms, 50);
+        assert_eq!(short.bonus_reserve_atoms, 0);
+        assert_eq!(short.payouts[&payout].bonus_atoms, 50);
+        let pplns = &short.pplns_blocks[&block_id];
+        assert_eq!((pplns.bonus_rate_bps, pplns.bonus_atoms), (1_000, 50));
+        assert_eq!(short.earning_events.back().unwrap().atoms, 1_020);
+        validate_ledger(&short).unwrap();
+
+        // A reserve that covers it pays the full rate, once.
+        let mut covered = immature.clone();
+        fund(&mut covered, 1_000);
+        distribute_mature_pplns_block(&mut covered, block_id, 1_000).unwrap();
+        distribute_mature_pplns_block(&mut covered, block_id, 1_000).unwrap();
+        assert_eq!(credited(&covered).0 - before.0, 1_067);
+        assert_eq!(covered.bonus_credited_atoms, 97);
+        assert_eq!(covered.bonus_reserve_atoms, 903);
+        assert_eq!(covered.pplns_blocks[&block_id].bonus_atoms, 97);
+        validate_ledger(&covered).unwrap();
+    }
+
+    #[test]
+    fn ledger_bonus_fields_round_trip_and_default_when_absent() {
+        let ledger = DurableLedger::open(None, [0x41; 32], [0x42; 32]).unwrap();
+        let payout = test_payout_signer().payout();
+        register_session(&ledger, 1, "miner".to_owned(), payout).unwrap();
+        credit_accepted_share(&ledger, 1, 60).unwrap();
+        ledger
+            .transaction(|ledger| {
+                ledger.bonus_funded_atoms = 150;
+                ledger.bonus_credited_atoms = 50;
+                ledger.bonus_reserve_atoms = 100;
+                ledger.bonus_funding.insert(
+                    [0x71; 32],
+                    BonusFundingRecord {
+                        height: 10,
+                        amount_atoms: 100,
+                    },
+                );
+                ledger.bonus_funding.insert(
+                    [0x72; 32],
+                    BonusFundingRecord {
+                        height: 12,
+                        amount_atoms: 50,
+                    },
+                );
+                ledger.bonus_scan = Some(BonusScanMark {
+                    height: 12,
+                    block_id: [0x73; 32],
+                });
+                ledger.payouts.get_mut(&payout).unwrap().bonus_atoms = 50;
+                Ok(())
+            })
+            .unwrap();
+        let state = ledger.state.lock().unwrap().clone();
+        let json = serde_json::to_vec(&ledger_payload(&state)).unwrap();
+        let restored =
+            ledger_from_payload(state.generation, serde_json::from_slice(&json).unwrap()).unwrap();
+        assert_eq!(
+            (
+                restored.bonus_funded_atoms,
+                restored.bonus_credited_atoms,
+                restored.bonus_reserve_atoms
+            ),
+            (150, 50, 100)
+        );
+        assert_eq!(restored.bonus_funding, state.bonus_funding);
+        assert_eq!(restored.bonus_scan, state.bonus_scan);
+        assert_eq!(restored.payouts[&payout].bonus_atoms, 50);
+        let snapshot = snapshot_ledger(&ledger).unwrap();
+        assert_eq!(
+            (
+                snapshot.bonus_funded_atoms,
+                snapshot.bonus_credited_atoms,
+                snapshot.bonus_reserve_atoms,
+                snapshot.bonus_scanned_height
+            ),
+            (150, 50, 100, Some(12))
+        );
+        assert_eq!(
+            snapshot.bonus_funding,
+            vec![
+                PoolBonusFundingStats {
+                    txid: hex::encode([0x71; 32]),
+                    height: 10,
+                    amount_atoms: 100,
+                },
+                PoolBonusFundingStats {
+                    txid: hex::encode([0x72; 32]),
+                    height: 12,
+                    amount_atoms: 50,
+                },
+            ]
+        );
+        assert_eq!(snapshot.payouts[0].bonus_atoms, 50);
+
+        // A snapshot written before the bonus reserve existed has none of
+        // its keys and loads with an empty reserve.
+        let mut value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        for key in [
+            "bonus_funded_atoms",
+            "bonus_credited_atoms",
+            "bonus_reserve_atoms",
+            "bonus_funding",
+            "bonus_scan",
+        ] {
+            assert!(
+                value.as_object_mut().unwrap().remove(key).is_some(),
+                "{key}"
+            );
+        }
+        assert!(
+            value["payouts"][0]["record"]
+                .as_object_mut()
+                .unwrap()
+                .remove("bonus_atoms")
+                .is_some()
+        );
+        let legacy = ledger_from_payload(1, serde_json::from_value(value).unwrap()).unwrap();
+        assert_eq!(
+            (
+                legacy.bonus_funded_atoms,
+                legacy.bonus_credited_atoms,
+                legacy.bonus_reserve_atoms
+            ),
+            (0, 0, 0)
+        );
+        assert!(legacy.bonus_funding.is_empty());
+        assert!(legacy.bonus_scan.is_none());
+        assert_eq!(legacy.payouts[&payout].bonus_atoms, 0);
+
+        // A ledger that never had a bonus still writes no bonus key.
+        let plain = DurableLedger::open(None, [0x41; 32], [0x42; 32]).unwrap();
+        register_session(&plain, 1, "miner".to_owned(), payout).unwrap();
+        credit_accepted_share(&plain, 1, 60).unwrap();
+        let plain_json =
+            serde_json::to_string(&ledger_payload(&plain.state.lock().unwrap())).unwrap();
+        assert!(!plain_json.contains("bonus"));
+    }
+
+    #[test]
+    fn ledger_rejects_an_inconsistent_bonus_reserve_and_duplicate_funding() {
+        let ledger = DurableLedger::open(None, [0x41; 32], [0x42; 32]).unwrap();
+        let payout = test_payout_signer().payout();
+        register_session(&ledger, 1, "miner".to_owned(), payout).unwrap();
+        credit_accepted_share(&ledger, 1, 60).unwrap();
+        let funding = BonusFundingRecord {
+            height: 10,
+            amount_atoms: 100,
+        };
+        ledger
+            .transaction(|ledger| {
+                ledger.bonus_funded_atoms = 100;
+                ledger.bonus_reserve_atoms = 100;
+                ledger.bonus_funding.insert([0x71; 32], funding);
+                Ok(())
+            })
+            .unwrap();
+        let base = ledger.state.lock().unwrap().clone();
+        validate_ledger(&base).unwrap();
+        let corrupt =
+            |broken: &Ledger| matches!(validate_ledger(broken), Err(PoolError::LedgerCorrupt(_)));
+
+        let mut reserve = base.clone();
+        reserve.bonus_reserve_atoms = 99;
+        assert!(corrupt(&reserve));
+        let mut credited = base.clone();
+        credited.bonus_credited_atoms = 1;
+        assert!(corrupt(&credited));
+        let mut unfunded = base.clone();
+        unfunded.bonus_funding.insert(
+            [0x72; 32],
+            BonusFundingRecord {
+                height: 11,
+                amount_atoms: 1,
+            },
+        );
+        assert!(corrupt(&unfunded));
+        let mut zero = base.clone();
+        zero.bonus_funding
+            .get_mut(&[0x71; 32])
+            .unwrap()
+            .amount_atoms = 0;
+        zero.bonus_funded_atoms = 0;
+        zero.bonus_reserve_atoms = 0;
+        assert!(corrupt(&zero));
+        let mut payout_bonus = base.clone();
+        payout_bonus.payouts.get_mut(&payout).unwrap().bonus_atoms = 1;
+        assert!(corrupt(&payout_bonus));
+
+        let mut duplicate = ledger_payload(&base);
+        duplicate.bonus_funding.push(StoredBonusFundingRecordV1 {
+            txid: [0x71; 32],
+            record: funding,
+        });
+        assert!(matches!(
+            ledger_from_payload(base.generation, duplicate),
+            Err(PoolError::LedgerCorrupt(message)) if message.contains("duplicate stored bonus funding")
+        ));
+
+        let mut full = base.clone();
+        for index in 0..POOL_MAX_BONUS_FUNDING_RECORDS as u64 {
+            let mut txid = [0x74; 32];
+            txid[..8].copy_from_slice(&index.to_le_bytes());
+            full.bonus_funding.insert(txid, funding);
+        }
+        assert!(matches!(
+            validate_ledger(&full),
+            Err(PoolError::LedgerCapacity)
+        ));
     }
 }

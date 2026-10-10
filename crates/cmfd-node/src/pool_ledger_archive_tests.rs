@@ -38,6 +38,7 @@ fn ledger_with_settled_blocks(
             block_id,
             PoolBlockState::Canonical,
             chain_height - height,
+            0,
         )
         .unwrap();
     }
@@ -174,7 +175,7 @@ fn orphaned_blocks_that_never_distributed_retire_when_deep() {
         block_target: [0x3f; 32],
     };
     reserve_pending_pool_block(&ledger, 1, orphan, 1, Some(policy)).unwrap();
-    finalize_pending_pool_block(&ledger, orphan.block_id, PoolBlockState::Orphaned, 0).unwrap();
+    finalize_pending_pool_block(&ledger, orphan.block_id, PoolBlockState::Orphaned, 0, 0).unwrap();
     let before = snapshot_ledger(&ledger).unwrap();
     assert_eq!(before.orphaned_pool_blocks, 1);
     assert_eq!(before.pool_blocks, 102);
@@ -421,7 +422,7 @@ fn orphans_a_prune_drops_stay_orphaned() {
             block_target: [0x3f; 32],
         };
         reserve_pending_pool_block(&ledger, 1, credit, 1, Some(policy)).unwrap();
-        finalize_pending_pool_block(&ledger, block_id, PoolBlockState::Orphaned, 0).unwrap();
+        finalize_pending_pool_block(&ledger, block_id, PoolBlockState::Orphaned, 0, 0).unwrap();
     }
 
     for height in 26..=80 {
@@ -433,7 +434,7 @@ fn orphans_a_prune_drops_stay_orphaned() {
     assert_eq!(report.dropped_side_blocks, 1);
     assert!(!node.contains_block(orphan_id));
 
-    reconcile_pool_blocks_for_node(&ledger, &node, false).unwrap();
+    reconcile_pool_blocks_for_node(&ledger, &node, false, 0).unwrap();
     let state = ledger.state.lock().unwrap();
     assert_eq!(state.blocks[&orphan_id].state, PoolBlockState::Orphaned);
     assert_eq!(state.blocks[&unseen].state, PoolBlockState::Unknown);

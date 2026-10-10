@@ -29,6 +29,13 @@ export interface PoolPayout {
   available_payout_atoms: number;
   payout_on_hold?: boolean;
   held_payout_atoms?: number;
+  bonus_atoms?: number;
+}
+
+export interface PoolBonusFunding {
+  txid: string;
+  height: number;
+  amount_atoms: number;
 }
 
 export interface PoolPayoutProtection {
@@ -52,6 +59,8 @@ export interface PoolBlock {
   distributable_atoms: number | null;
   pplns_window_shares: number | null;
   pplns_distributed: boolean;
+  bonus_rate_bps?: number | null;
+  bonus_atoms?: number | null;
 }
 
 export interface PoolPayoutTransaction {
@@ -82,6 +91,11 @@ export interface PoolLedger {
   blocks: PoolBlock[];
   payout_transactions: PoolPayoutTransaction[];
   payout_protection?: PoolPayoutProtection;
+  bonus_funded_atoms?: number;
+  bonus_credited_atoms?: number;
+  bonus_reserve_atoms?: number;
+  bonus_scanned_height?: number | null;
+  bonus_funding?: PoolBonusFunding[];
 }
 
 export interface PoolSnapshot {
@@ -114,6 +128,11 @@ export interface PoolSnapshot {
   credited_atoms_last_24h: number;
   estimated_24h_credited_atoms: number | null;
   earnings_observation_seconds: number;
+  bonus_rate_bps?: number | null;
+  bonus_sponsor?: string | null;
+  bonus_reserve_atoms?: number;
+  bonus_funded_atoms?: number;
+  bonus_credited_atoms?: number;
   workers: PoolWorker[];
   ledger: PoolLedger;
 }

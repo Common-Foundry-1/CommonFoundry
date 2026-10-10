@@ -245,6 +245,54 @@ class MainnetPoolServiceTests(unittest.TestCase):
             with self.assertRaisesRegex(pool.PreflightError, "replay_gpus"):
                 self.preflight()
 
+    def test_optional_bonus_reserve_becomes_pool_bonus_flags(self):
+        config, _, _ = self.preflight()
+        with mock.patch.object(pool, "CONFIG_BASE", self.config_base):
+            command = pool.build_command(self.root, self.state, self.credential_base, config)
+        for flag in ("--pool-bonus-rate-bps", "--pool-bonus-sponsor", "--pool-bonus-scan-from-height"):
+            self.assertNotIn(flag, command)
+        sponsor = "ab" * 32
+        self.config["bonus_rate_bps"] = 1000
+        self.config["bonus_sponsor"] = sponsor
+        self.save_config()
+        config, _, _ = self.preflight()
+        with mock.patch.object(pool, "CONFIG_BASE", self.config_base):
+            command = pool.build_command(self.root, self.state, self.credential_base, config)
+        self.assertEqual(command[command.index("--pool-bonus-rate-bps") + 1], "1000")
+        self.assertEqual(command[command.index("--pool-bonus-sponsor") + 1], sponsor)
+        self.assertNotIn("--pool-bonus-scan-from-height", command)
+        self.config["bonus_scan_from_height"] = 0
+        self.save_config()
+        config, _, _ = self.preflight()
+        with mock.patch.object(pool, "CONFIG_BASE", self.config_base):
+            command = pool.build_command(self.root, self.state, self.credential_base, config)
+        self.assertEqual(command[command.index("--pool-bonus-scan-from-height") + 1], "0")
+        for bad in (-1, "4200", 4200.0, True, None, 2**64):
+            self.config["bonus_scan_from_height"] = bad
+            self.save_config()
+            with self.assertRaisesRegex(pool.PreflightError, "bonus_scan_from_height"):
+                self.preflight()
+        del self.config["bonus_scan_from_height"]
+        for bad in (0, -1, 10_001, "1000", 1000.0, True, None):
+            self.config["bonus_rate_bps"] = bad
+            self.save_config()
+            with self.assertRaisesRegex(pool.PreflightError, "bonus_rate_bps"):
+                self.preflight()
+        self.config["bonus_rate_bps"] = 1000
+        for bad in ("AB" * 32, "ab" * 31, "zz" * 32, 1, None):
+            self.config["bonus_sponsor"] = bad
+            self.save_config()
+            with self.assertRaisesRegex(pool.PreflightError, "bonus_sponsor"):
+                self.preflight()
+        for lone in ("bonus_rate_bps", "bonus_sponsor", "bonus_scan_from_height"):
+            self.config.pop("bonus_rate_bps", None)
+            self.config.pop("bonus_sponsor", None)
+            self.config[lone] = sponsor if lone == "bonus_sponsor" else 1000
+            self.save_config()
+            with self.assertRaisesRegex(pool.PreflightError, "bonus_"):
+                self.preflight()
+            del self.config[lone]
+
     def test_placeholder_or_legacy_payout_config_fails_closed(self):
         self.config["operator_fee_bps"] = "SET_APPROVED_MAINNET_VALUE"
         self.save_config()

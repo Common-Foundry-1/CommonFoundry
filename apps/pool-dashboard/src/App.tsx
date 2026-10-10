@@ -9,6 +9,7 @@ import {
   Cpu,
   ExternalLink,
   Gauge,
+  Gift,
   Percent,
   Pickaxe,
   RefreshCw,
@@ -240,6 +241,8 @@ export function App() {
     (sum, payout) => sum + (payout.confirmations > 0 ? payout.amount_atoms : 0),
     0,
   );
+  const bonusRateBps = typeof pool.bonus_rate_bps === "number" && pool.bonus_rate_bps > 0 ? pool.bonus_rate_bps : null;
+  const showBonus = bonusRateBps !== null || ledger.blocks.some((block) => (block.bonus_atoms ?? 0) > 0);
   const pin = document.certificate_sha256;
   const connectConfig = [
     `Pool URL: ${document.public_pool_url}`,
@@ -317,6 +320,14 @@ export function App() {
             value={pool.operator_fee_bps === null ? "N/A" : `${(pool.operator_fee_bps / 100).toFixed(2)}%`}
             detail={`${formatAtoms(ledger.operator_fee_atoms)} from matured blocks`}
           />
+          {bonusRateBps !== null ? (
+            <Stat
+              icon={<Gift />}
+              label="Mining bonus"
+              value={`+${(bonusRateBps / 100).toFixed(2)}%`}
+              detail={`${formatAtoms(pool.bonus_reserve_atoms ?? 0)} reserve of ${formatAtoms(pool.bonus_funded_atoms ?? 0)} funded · ${formatAtoms(pool.bonus_credited_atoms ?? 0)} credited · sponsor ${pool.bonus_sponsor ? shortHex(pool.bonus_sponsor, 8, 6) : "—"}`}
+            />
+          ) : null}
           <Stat icon={<WalletCards />} label="Confirmed payouts" value={formatAtoms(confirmedPayouts)} detail={settlementStatus} tone={payoutsHeld ? "warn" : undefined} />
         </section>
 
@@ -429,7 +440,7 @@ export function App() {
           ) : (
             <div className="table-scroll">
               <table>
-                <thead><tr><th>Height</th><th>Block</th><th>State</th><th className="numeric">Confirmations</th><th className="numeric">Miner reward</th><th className="numeric">Operator fee</th><th className="numeric">PPLNS distribution</th></tr></thead>
+                <thead><tr><th>Height</th><th>Block</th><th>State</th><th className="numeric">Confirmations</th><th className="numeric">Miner reward</th><th className="numeric">Operator fee</th><th className="numeric">PPLNS distribution</th>{showBonus ? <th className="numeric">Bonus</th> : null}</tr></thead>
                 <tbody>
                   {ledger.blocks.map((block) => (
                     <tr key={block.block_id}>
@@ -450,6 +461,9 @@ export function App() {
                             ? `Maturing ${Math.min(block.confirmations, COINBASE_MATURITY)}/${COINBASE_MATURITY}`
                             : "—"}
                       </td>
+                      {showBonus ? (
+                        <td className="numeric">{block.bonus_atoms == null ? "—" : formatAtoms(block.bonus_atoms)}</td>
+                      ) : null}
                     </tr>
                   ))}
                 </tbody>
@@ -467,12 +481,13 @@ export function App() {
           {heldAccounts.length > 0 ? (
             <div className="table-scroll">
               <table aria-label="Held payout accounts">
-                <thead><tr><th>Recipient on hold</th><th className="numeric">Held unreserved credit</th><th className="numeric">Reserved payments</th></tr></thead>
+                <thead><tr><th>Recipient on hold</th><th className="numeric">Held unreserved credit</th><th className="numeric">Reserved payments</th>{showBonus ? <th className="numeric">Bonus</th> : null}</tr></thead>
                 <tbody>{heldAccounts.map((payout) => (
                   <tr key={payout.payout}>
                     <td><code title={payout.payout}>{shortHex(payout.payout)}</code></td>
                     <td className="numeric">{formatAtoms(payout.held_payout_atoms ?? 0)}</td>
                     <td className="numeric">{formatAtoms(payout.reserved_payout_atoms - payout.confirmed_payout_atoms)}</td>
+                    {showBonus ? <td className="numeric">{formatAtoms(payout.bonus_atoms ?? 0)}</td> : null}
                   </tr>
                 ))}</tbody>
               </table>

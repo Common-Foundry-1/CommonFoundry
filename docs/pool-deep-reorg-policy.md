@@ -99,10 +99,15 @@ Command skeletons (replace angle-bracket placeholders; include the service's
 normal global model/verifier/wallet options before the subcommand):
 
 ```text
-cmfd-node --data-dir <existing-pool-data> <runtime-options> pool-payout-status --pool-payout-fee-atoms <configured-fee-atoms> --pool-minimum-payout-atoms <configured-minimum-atoms>
+cmfd-node --data-dir <existing-pool-data> <runtime-options> pool-payout-status --pool-payout-fee-atoms <configured-fee-atoms> --pool-minimum-payout-atoms <configured-minimum-atoms> --pool-bonus-rate-bps <configured-bonus-rate-bps>
 
-cmfd-node --data-dir <existing-pool-data> <runtime-options> pool-payout-reconcile --pool-payout-fee-atoms <configured-fee-atoms> --expected-tip <64-hex-inspected-tip> --expected-ledger-generation <inspected-generation> --note "Reviewed funding and outstanding signed payments" --acknowledge-reconciliation
+cmfd-node --data-dir <existing-pool-data> <runtime-options> pool-payout-reconcile --pool-payout-fee-atoms <configured-fee-atoms> --pool-bonus-rate-bps <configured-bonus-rate-bps> --expected-tip <64-hex-inspected-tip> --expected-ledger-generation <inspected-generation> --note "Reviewed funding and outstanding signed payments" --acknowledge-reconciliation
 ```
+
+Omit `--pool-bonus-rate-bps` on a pool without a bonus reserve. With one, pass
+the service's rate: both commands distribute any pool block that reached
+maturity while the pool was stopped, once, and a block distributed at rate
+zero never receives its bonus later.
 
 On Windows invoke the verified `cmfd-node.exe` using PowerShell's `&` when the
 path is quoted. Amounts in the report are decimal **atomic-unit strings**, not

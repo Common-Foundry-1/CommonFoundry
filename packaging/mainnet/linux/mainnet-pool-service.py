@@ -63,9 +63,14 @@ CONFIG_FIELDS = {"schema", "public_numeric_ip", "private_bind_ip", "mainnet_seed
 # 16 GB cards it must be a GPU that is not in replay_gpus.
 # Optional: miner connection limits, as `--pool-max-connections` (node default 256,
 # up to 4096) and `--pool-max-connections-per-source` (node default 64, up to 256).
+# Optional: sponsor-funded bonus reserve, as `--pool-bonus-rate-bps` (1 to 10000)
+# with `--pool-bonus-sponsor` (the sponsor's 64-hex x-only key); both or neither.
+# `bonus_scan_from_height` (`--pool-bonus-scan-from-height`) needs both and only
+# matters until the ledger has its first bonus scan mark.
 OPTIONAL_FIELDS = {"mainnet_relays", "prune_keep_blocks", "pool_ledger_max_bytes",
                    "share_batch_size", "share_batch_wait_ms", "replay_gpus",
-                   "max_connections", "max_connections_per_source", "proof_gpu"}
+                   "max_connections", "max_connections_per_source", "proof_gpu",
+                   "bonus_rate_bps", "bonus_sponsor", "bonus_scan_from_height"}
 MIN_PRUNE_KEEP_BLOCKS = 288
 MIN_POOL_LEDGER_MAX_BYTES = 1024 * 1024
 MAX_POOL_LEDGER_MAX_BYTES = 1024 * 1024 * 1024
@@ -73,6 +78,7 @@ MAX_SHARE_BATCH_SIZE = 64
 MAX_SHARE_BATCH_WAIT_MS = 1000
 MAX_POOL_CONNECTIONS = 4096
 MAX_POOL_CONNECTIONS_PER_SOURCE = 256
+MAX_POOL_BONUS_RATE_BPS = 10_000
 MAX_REPLAY_GPUS = 16
 MAX_RELAYS = 8
 COMPETING_UNITS = (
@@ -220,6 +226,19 @@ def validate_config(config: dict) -> dict:
     if "proof_gpu" in config and (not isinstance(config["proof_gpu"], str)
                                  or not GPU_UUID.fullmatch(config["proof_gpu"])):
         raise PreflightError("proof_gpu must be one exact NVIDIA GPU UUID")
+    if ("bonus_rate_bps" in config) != ("bonus_sponsor" in config):
+        raise PreflightError("bonus_rate_bps and bonus_sponsor must be set together")
+    if "bonus_rate_bps" in config and (type(config["bonus_rate_bps"]) is not int
+                                       or not 1 <= config["bonus_rate_bps"] <= MAX_POOL_BONUS_RATE_BPS):
+        raise PreflightError(f"bonus_rate_bps must be an integer from 1 to {MAX_POOL_BONUS_RATE_BPS}")
+    if "bonus_sponsor" in config and (not isinstance(config["bonus_sponsor"], str)
+                                      or not HEX64.fullmatch(config["bonus_sponsor"])):
+        raise PreflightError("bonus_sponsor must be the sponsor's 64-character lowercase hex x-only key")
+    if "bonus_scan_from_height" in config:
+        if "bonus_sponsor" not in config:
+            raise PreflightError("bonus_scan_from_height requires bonus_rate_bps and bonus_sponsor")
+        if type(config["bonus_scan_from_height"]) is not int or not 0 <= config["bonus_scan_from_height"] < 2**64:
+            raise PreflightError("bonus_scan_from_height must be an integer of at least 0")
     if "replay_gpus" in config:
         gpus = config["replay_gpus"]
         if (type(gpus) is not list or not 1 <= len(gpus) <= MAX_REPLAY_GPUS
@@ -452,6 +471,10 @@ def build_command(root: Path, state: Path, credential_base: Path, config: dict) 
           if "max_connections" in config else ()),
         *(("--pool-max-connections-per-source", str(config["max_connections_per_source"]))
           if "max_connections_per_source" in config else ()),
+        *(("--pool-bonus-rate-bps", str(config["bonus_rate_bps"]),
+           "--pool-bonus-sponsor", config["bonus_sponsor"]) if "bonus_sponsor" in config else ()),
+        *(("--pool-bonus-scan-from-height", str(config["bonus_scan_from_height"]))
+          if "bonus_scan_from_height" in config else ()),
     ]
 
 

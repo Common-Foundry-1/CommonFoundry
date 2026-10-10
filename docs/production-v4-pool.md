@@ -200,6 +200,70 @@ The operator fee remains in the pool wallet as operator revenue. It is separate
 from `PayoutFeeAtoms` / `CMFD_POOL_PAYOUT_FEE_ATOMS`, which is the network fee
 burned by each miner payout transaction.
 
+## Bonus reserve
+
+A sponsor (for example the Common Foundry stewardship fund) can fund a mining
+bonus on a community pool. The bonus is pool-local accounting: it changes no
+consensus rule and no wire message. The operator starts `pool-serve` with
+`--pool-bonus-rate-bps N` (1 to 10000) and `--pool-bonus-sponsor KEY`, the
+sponsor's 64-hex x-only key; both are required together, and the sponsor must
+differ from the pool's own block-reward destination. The service launcher reads
+the same values from `bonus_rate_bps` and `bonus_sponsor` in `pool.json`.
+
+The sponsor funds the reserve by sending CMFD from that key to the pool's
+wallet key, the `block_reward_destination` printed at startup. A transaction
+counts once it has at least six confirmations, when it has an input signed by
+the sponsor key, no input signed by the pool wallet key, and outputs locked to
+the pool wallet key that are spendable at their block's height (a time-locked
+output never funds the reserve); the sum of those outputs is added to the
+reserve. Each funding transaction is registered once by its txid, so
+rescanning the same heights never double-counts, and the ledger keeps at most
+4096 funding transactions: a transfer beyond that is logged and skipped, so
+fund in a few large transfers. The pool looks for sponsor transfers 64 heights
+per tick and records how far it has scanned in the ledger. When the bonus is
+first enabled the scan starts at the current tip, so fund the reserve after
+that start, or pass `--pool-bonus-scan-from-height H` (`bonus_scan_from_height`
+in `pool.json`) with the funding block's height; that flag only applies while
+the ledger has no scan mark yet. Once a mark exists the flag is ignored and
+the pool logs a warning at startup when the mark is already at or above it; a
+transfer below the mark is never registered. Enabling the bonus writes bonus
+fields into the pool ledger, which from then on loads only with this release
+or later; keep that in mind before rolling `pool-serve` back.
+
+At maturity each miner's net PPLNS allocation (after the operator fee) earns
+`floor(allocation × rate / 10000)` extra atoms from the reserve. No operator
+fee is taken from the bonus. When the reserve is smaller than the total bonus
+the block would earn, the remaining reserve is split across the allocations in
+proportion to their bonus with deterministic largest remainders, so the sum
+paid is exactly the reserve, and later blocks earn no bonus until the sponsor
+tops it up. Bonus credit is ordinary credit: it adds to the miner's balance,
+counts in the 24-hour earnings, and is paid by the normal payout transactions.
+
+The reserve stays in the pool wallet, so payout protection counts those coins
+as ordinary wallet assets; it does not treat the unspent reserve as a
+liability. If a registered funding transaction is reorganized away, the
+reserve is not reversed (a transaction mined again under the same txid is not
+registered twice): the wallet simply holds fewer coins than
+`bonus_reserve_atoms` says, and the loss surfaces only through the ordinary
+payout funding checks, once outstanding credits exceed the mature wallet
+funds, and only after payout protection has been armed by an earlier incident.
+After a deep reorganization compare the reserve with the wallet balance and
+ask the sponsor to fund again.
+
+Pass the same `--pool-bonus-rate-bps` to `pool-payout-status` and
+`pool-payout-reconcile`. Those offline commands distribute any pool block that
+reached maturity while the pool was stopped, once; without the rate such a
+block earns no bonus, and a distribution is never repeated.
+
+The dashboard shows the bonus next to the operator fee (`bonus_rate_bps`,
+`bonus_sponsor`, `bonus_reserve_atoms`, `bonus_funded_atoms` and
+`bonus_credited_atoms` on the pool snapshot) with a Bonus column in the block
+table (`bonus_atoms` per block). The ledger snapshot printed by
+`pool-payout-status` carries the lifetime `bonus_funded_atoms`,
+`bonus_credited_atoms`, the current `bonus_reserve_atoms`, the
+`bonus_scanned_height`, the registered `bonus_funding` transactions and
+`bonus_atoms` per payout key.
+
 ## Persistence and backups
 
 Stop the pool before backing up `pool-data` and `pool-tls`. The TLS private key

@@ -167,6 +167,7 @@ fn payout_reorg_hold_restart_restore_manual_resume_and_second_paid_reorg() {
         block.block_id(),
         PoolBlockState::Canonical,
         COINBASE_MATURITY,
+        0,
     )
     .unwrap();
     let earned = snapshot_ledger(&ledger).unwrap().credited_devnet_atoms;
@@ -451,6 +452,7 @@ fn distributed_reward_losing_maturity_holds_without_revoking_credit() {
         block_id,
         PoolBlockState::Canonical,
         COINBASE_MATURITY,
+        0,
     )
     .unwrap();
     ledger
@@ -597,4 +599,105 @@ fn payout_hold_lifts_itself_once_the_payout_is_confirmed_deep_enough() {
     let generation = ledger.state.lock().unwrap().generation;
     payout_protection::auto_resolve(&ledger, &node, 1).unwrap();
     assert_eq!(ledger.state.lock().unwrap().generation, generation);
+}
+
+#[test]
+fn offline_status_distributes_a_block_maturing_at_the_configured_bonus_rate() {
+    let root = TestRoot::new("payout-status-bonus");
+    let mut node =
+        Node::open_with_profile(root.path().join("node"), crate::DEVNET_PROFILE).unwrap();
+    let owner = node.wallet_destination();
+    let recipient = test_payout_signer().payout();
+    let now = unix_time_seconds().unwrap();
+    let mut blocks = Vec::new();
+    for offset in 0..COINBASE_MATURITY {
+        blocks.push(node.mine_once(owner, now + offset, 10_000).unwrap());
+    }
+    let block = &blocks[0];
+    let reward: u64 = block
+        .coinbase
+        .outputs
+        .iter()
+        .filter(|o| o.lock == OutputLock::Key(owner))
+        .map(|o| o.value)
+        .sum();
+    let ledger = protection_ledger(&node);
+    register_session(&ledger, 1, "bonus".into(), recipient).unwrap();
+    reserve_pending_pool_block(
+        &ledger,
+        1,
+        PoolBlockCredit {
+            block_id: block.block_id(),
+            parent: block.challenge.previous_block,
+            height: block.challenge.height,
+            miner_reward_atoms: reward,
+            share_target: [0xff; 32],
+            block_target: block.challenge.target,
+        },
+        0,
+        Some(PoolPplnsPolicy {
+            operator_fee_bps: 300,
+            window_shares: 1,
+        }),
+    )
+    .unwrap();
+    // The pool stopped one confirmation short of maturity with a funded reserve.
+    finalize_pending_pool_block(
+        &ledger,
+        block.block_id(),
+        PoolBlockState::Canonical,
+        COINBASE_MATURITY - 1,
+        0,
+    )
+    .unwrap();
+    let reserve = 100_000_000_000;
+    ledger
+        .transaction(|ledger| {
+            ledger.bonus_funded_atoms = reserve;
+            ledger.bonus_reserve_atoms = reserve;
+            ledger.bonus_funding.insert(
+                [0x71; 32],
+                BonusFundingRecord {
+                    height: 1,
+                    amount_atoms: reserve,
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+    drop(ledger);
+
+    assert!(matches!(
+        inspect_pool_payout_protection_with_limit(
+            &mut node,
+            1,
+            DEFAULT_POOL_LEDGER_MAX_BYTES,
+            DEFAULT_POOL_MINIMUM_PAYOUT_ATOMS,
+            MAX_POOL_BONUS_RATE_BPS + 1,
+        ),
+        Err(PoolError::InvalidBonusRate)
+    ));
+    // The status command matures the block at the service's rate, once.
+    let report = inspect_pool_payout_protection_with_limit(
+        &mut node,
+        1,
+        DEFAULT_POOL_LEDGER_MAX_BYTES,
+        DEFAULT_POOL_MINIMUM_PAYOUT_ATOMS,
+        1_000,
+    )
+    .unwrap();
+    let distributable = reward - operator_fee_atoms(reward, 300);
+    let bonus = distributable / 10;
+    assert!(bonus > 0);
+    assert_eq!(
+        report.outstanding_credit_atoms,
+        (distributable + bonus).to_string()
+    );
+    let snapshot = snapshot_ledger(&protection_ledger(&node)).unwrap();
+    assert!(snapshot.blocks[0].pplns_distributed);
+    assert_eq!(snapshot.blocks[0].bonus_rate_bps, Some(1_000));
+    assert_eq!(snapshot.blocks[0].bonus_atoms, Some(bonus));
+    assert_eq!(snapshot.bonus_credited_atoms, bonus);
+    assert_eq!(snapshot.bonus_reserve_atoms, reserve - bonus);
+    assert_eq!(snapshot.payouts[0].bonus_atoms, bonus);
 }

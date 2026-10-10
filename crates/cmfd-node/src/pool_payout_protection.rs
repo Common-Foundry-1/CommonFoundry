@@ -718,19 +718,27 @@ pub fn inspect_pool_payout_protection(
         fee_atoms,
         DEFAULT_POOL_LEDGER_MAX_BYTES,
         DEFAULT_POOL_MINIMUM_PAYOUT_ATOMS,
+        DEFAULT_POOL_BONUS_RATE_BPS,
     )
 }
 
-/// `inspect_pool_payout_protection` for a pool run with `--pool-ledger-max-bytes`
-/// and `--pool-minimum-payout-atoms`; the minimum selects the dry-run payouts.
+/// `inspect_pool_payout_protection` for a pool run with `--pool-ledger-max-bytes`,
+/// `--pool-minimum-payout-atoms` and `--pool-bonus-rate-bps`; the minimum selects
+/// the dry-run payouts. A pool block that reaches maturity here is distributed
+/// at `bonus_rate_bps`, once, so pass the service's rate or the block earns no
+/// bonus.
 pub fn inspect_pool_payout_protection_with_limit(
     node: &mut Node,
     fee_atoms: u64,
     ledger_max_bytes: usize,
     minimum_payout_atoms: u64,
+    bonus_rate_bps: u16,
 ) -> Result<PoolPayoutProtectionReport, PoolError> {
+    if bonus_rate_bps > MAX_POOL_BONUS_RATE_BPS {
+        return Err(PoolError::InvalidBonusRate);
+    }
     let ledger = open_operator_ledger(node, fee_atoms, ledger_max_bytes)?;
-    reconcile_pool_blocks_for_node(&ledger, node, true)?;
+    reconcile_pool_blocks_for_node(&ledger, node, true, bonus_rate_bps)?;
     refresh_payment_states(&ledger, node)?;
     check_funding(&ledger, node, fee_atoms)?;
     report(node, &ledger, fee_atoms, Some(minimum_payout_atoms))
@@ -743,15 +751,26 @@ pub fn reconcile_pool_payout_protection(
     node: &mut Node,
     request: PoolPayoutReconciliationRequest,
 ) -> Result<PoolPayoutProtectionReport, PoolError> {
-    reconcile_pool_payout_protection_with_limit(node, request, DEFAULT_POOL_LEDGER_MAX_BYTES)
+    reconcile_pool_payout_protection_with_limit(
+        node,
+        request,
+        DEFAULT_POOL_LEDGER_MAX_BYTES,
+        DEFAULT_POOL_BONUS_RATE_BPS,
+    )
 }
 
-/// `reconcile_pool_payout_protection` for a pool run with `--pool-ledger-max-bytes`.
+/// `reconcile_pool_payout_protection` for a pool run with `--pool-ledger-max-bytes`
+/// and `--pool-bonus-rate-bps`; a pool block that reaches maturity here is
+/// distributed at `bonus_rate_bps`, once.
 pub fn reconcile_pool_payout_protection_with_limit(
     node: &mut Node,
     request: PoolPayoutReconciliationRequest,
     ledger_max_bytes: usize,
+    bonus_rate_bps: u16,
 ) -> Result<PoolPayoutProtectionReport, PoolError> {
+    if bonus_rate_bps > MAX_POOL_BONUS_RATE_BPS {
+        return Err(PoolError::InvalidBonusRate);
+    }
     if request.operator_note.trim().is_empty()
         || request.operator_note.len() > 256
         || request.operator_note.chars().any(char::is_control)
@@ -774,7 +793,7 @@ pub fn reconcile_pool_payout_protection_with_limit(
             "chain tip or ledger generation changed; inspect again".into(),
         ));
     }
-    reconcile_pool_blocks_for_node(&ledger, node, true)?;
+    reconcile_pool_blocks_for_node(&ledger, node, true, bonus_rate_bps)?;
     refresh_payment_states(&ledger, node)?;
     check_funding(&ledger, node, request.fee_atoms)?;
     let before = report(node, &ledger, request.fee_atoms, None)?;

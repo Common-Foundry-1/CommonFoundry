@@ -5871,15 +5871,80 @@ impl Node {
 
     /// Sponsor transfers into the pool wallet in canonical blocks at heights
     /// `from_height..=to_height`, clamped to the active chain, in chain order.
+    /// A transaction qualifies when a key input is witnessed by `sponsor`, no
+    /// key input is witnessed by the wallet key (so the pool's own payouts and
+    /// change never count), and it has outputs locked to the wallet key that
+    /// are spendable at the block's own height; the transfer amount is the
+    /// sum of those outputs. Each block is read once.
     pub(crate) fn sponsor_transfers_to_wallet(
         &mut self,
         sponsor: [u8; 32],
         from_height: u64,
         to_height: u64,
     ) -> Result<Vec<SponsorTransfer>, NodeError> {
-        // TODO(bonus-reserve): implemented in the bonus-reserve change.
-        let _ = (sponsor, from_height, to_height);
-        Ok(Vec::new())
+        let wallet = self.wallet_destination();
+        let result = (|| {
+            let mut transfers = Vec::new();
+            // Height zero is the virtual genesis anchor and has no block.
+            let Some(tip) = self.index.active_chain.len().checked_sub(1) else {
+                return Ok(transfers);
+            };
+            let Ok(from) = usize::try_from(from_height.max(1)) else {
+                return Ok(transfers);
+            };
+            let to = usize::try_from(to_height).unwrap_or(usize::MAX).min(tip);
+            for height in from..=to {
+                let block_id = self.index.active_chain[height];
+                let indexed = self.index.blocks.get(&block_id).cloned().ok_or_else(|| {
+                    NodeError::CorruptLog(
+                        "sponsor transfer lookup refers to an absent block".to_owned(),
+                    )
+                })?;
+                let block = read_indexed_block(
+                    &self.log,
+                    &self.data_dir.join(BLOCK_LOG_FILE),
+                    &indexed,
+                    block_id,
+                    self.params.network_id,
+                    matches!(self.profile.proof, ProofProfile::ProductionV3),
+                )?;
+                for transaction in &block.transactions {
+                    let (mut sponsor_signed, mut wallet_signed) = (false, false);
+                    for input in &transaction.inputs {
+                        if let InputWitness::Key { public_key, .. } = &input.witness {
+                            sponsor_signed |= *public_key == sponsor;
+                            wallet_signed |= *public_key == wallet;
+                        }
+                    }
+                    if !sponsor_signed || wallet_signed {
+                        continue;
+                    }
+                    // A time-locked output is not a mature wallet asset yet,
+                    // so it never funds the reserve.
+                    let amount_atoms = transaction
+                        .outputs
+                        .iter()
+                        .filter(|output| {
+                            output.lock == OutputLock::Key(wallet)
+                                && output.spendable_height <= height as u64
+                        })
+                        .try_fold(0_u64, |sum, output| sum.checked_add(output.value))
+                        .ok_or_else(|| {
+                            NodeError::CorruptLog("sponsor transfer amount overflow".to_owned())
+                        })?;
+                    if amount_atoms == 0 {
+                        continue;
+                    }
+                    transfers.push(SponsorTransfer {
+                        txid: transaction.txid(),
+                        height: height as u64,
+                        amount_atoms,
+                    });
+                }
+            }
+            Ok(transfers)
+        })();
+        self.latch_authenticated_storage_failure(result)
     }
 
     pub fn wallet_destination(&self) -> [u8; 32] {
@@ -19033,6 +19098,169 @@ mod tests {
         );
         assert!(node.mempool.is_empty());
         assert_eq!(node.mempool_bytes, 0);
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn sponsor_transfers_to_wallet_applies_the_three_funding_conditions() {
+        fn signed(
+            node: &Node,
+            inputs: Vec<OutPoint>,
+            outputs: Vec<(u64, [u8; 32], u64)>,
+            keys: &[&SigningKey],
+        ) -> Transaction {
+            let mut transaction = Transaction {
+                network_id: node.params.network_id,
+                version: TRANSACTION_VERSION,
+                inputs: inputs
+                    .into_iter()
+                    .map(|previous| TxInput {
+                        previous,
+                        witness: InputWitness::Key {
+                            public_key: [0; 32],
+                            signature: Vec::new(),
+                        },
+                    })
+                    .collect(),
+                outputs: outputs
+                    .into_iter()
+                    .map(|(value, key, spendable_height)| TxOutput {
+                        value,
+                        lock: OutputLock::Key(key),
+                        spendable_height,
+                    })
+                    .collect(),
+            };
+            transaction.sign_all(keys).unwrap();
+            transaction
+        }
+        fn mine(node: &mut Node) {
+            let height = node.state.next_height();
+            let destination = node.wallet_destination();
+            node.mine_once(
+                destination,
+                DEVNET_GENESIS_TIMESTAMP + height * 60,
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        }
+
+        let path = test_dir("sponsor-transfers");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        let blocks = mine_default_chain_to(&mut node, 101);
+        let wallet = node.wallet_destination();
+        let sponsor_key = SigningKey::from_bytes(&[0x5c; 32]).unwrap();
+        let sponsor: [u8; 32] = sponsor_key.verifying_key().to_bytes().into();
+        let other = insecure_dev_destination(0x5d);
+
+        // Height 102: the wallet pays the sponsor, a wallet-signed input.
+        let (to_sponsor, _) = node.prepare_dev_wallet_payment(sponsor, 1_000, 1).unwrap();
+        node.submit_transaction(to_sponsor.clone()).unwrap();
+        mine(&mut node);
+        // Height 103: the sponsor funds the wallet with 600 and keeps 399.
+        let funding = signed(
+            &node,
+            vec![OutPoint {
+                txid: to_sponsor.txid(),
+                index: 0,
+            }],
+            vec![(600, wallet, 103), (399, sponsor, 103)],
+            &[&sponsor_key],
+        );
+        node.submit_transaction(funding.clone()).unwrap();
+        mine(&mut node);
+        // Height 104: sponsor-signed, but nothing locked to the wallet.
+        let elsewhere = signed(
+            &node,
+            vec![OutPoint {
+                txid: funding.txid(),
+                index: 1,
+            }],
+            vec![(199, other, 104), (199, sponsor, 104)],
+            &[&sponsor_key],
+        );
+        node.submit_transaction(elsewhere.clone()).unwrap();
+        mine(&mut node);
+        // Height 105: a sponsor coin and a wallet coinbase, co-signed by the
+        // wallet key, is the wallet moving its own coins.
+        let coinbase = &blocks[4];
+        assert_eq!(coinbase.coinbase.height, 5);
+        let cosigned = signed(
+            &node,
+            vec![
+                OutPoint {
+                    txid: elsewhere.txid(),
+                    index: 1,
+                },
+                OutPoint {
+                    txid: coinbase.coinbase_outpoint_id(),
+                    index: 0,
+                },
+            ],
+            vec![(coinbase.coinbase.outputs[0].value + 198, wallet, 105)],
+            &[&sponsor_key, &node.wallet_signing_key],
+        );
+        node.submit_transaction(cosigned.clone()).unwrap();
+        mine(&mut node);
+        // Height 106: the wallet pays the sponsor again. Height 107: the
+        // sponsor funds 100 spendable at once and 50 locked far ahead; only
+        // the spendable output funds the reserve.
+        let (to_sponsor_again, _) = node.prepare_dev_wallet_payment(sponsor, 1_000, 1).unwrap();
+        node.submit_transaction(to_sponsor_again.clone()).unwrap();
+        mine(&mut node);
+        let locked = signed(
+            &node,
+            vec![OutPoint {
+                txid: to_sponsor_again.txid(),
+                index: 0,
+            }],
+            vec![
+                (100, wallet, 107),
+                (50, wallet, 107 + 1_000),
+                (849, sponsor, 107),
+            ],
+            &[&sponsor_key],
+        );
+        node.submit_transaction(locked.clone()).unwrap();
+        mine(&mut node);
+
+        let transfers = node.sponsor_transfers_to_wallet(sponsor, 1, 200).unwrap();
+        assert_eq!(
+            transfers,
+            vec![
+                SponsorTransfer {
+                    txid: funding.txid(),
+                    height: 103,
+                    amount_atoms: 600,
+                },
+                SponsorTransfer {
+                    txid: locked.txid(),
+                    height: 107,
+                    amount_atoms: 100,
+                },
+            ]
+        );
+        assert_eq!(
+            node.sponsor_transfers_to_wallet(sponsor, 0, 103).unwrap(),
+            transfers[..1].to_vec()
+        );
+        assert!(
+            node.sponsor_transfers_to_wallet(sponsor, 104, 106)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            node.sponsor_transfers_to_wallet(sponsor, 103, 102)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            node.sponsor_transfers_to_wallet(other, 1, 200)
+                .unwrap()
+                .is_empty()
+        );
         drop(node);
         clean_test_dir(&path);
     }

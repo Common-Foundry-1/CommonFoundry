@@ -1725,7 +1725,9 @@ done"#;
         // A worker that keeps failing still fails the request after one retry.
         let command = fake_worker(&worker_test_path("retry-crash-unused"));
         let mut worker = PersistentWorker::start(&command, "READY", "test worker").unwrap();
-        worker.invoke_retrying_once(&fields("CRASH"), "DONE").unwrap_err();
+        worker
+            .invoke_retrying_once(&fields("CRASH"), "DONE")
+            .unwrap_err();
         assert_eq!(worker.restarts, 1);
         assert!(worker.process.is_none());
     }

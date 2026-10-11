@@ -636,6 +636,10 @@ struct SyncStatus {
     headers: u64,
     last_error: Option<String>,
     scanning_since: Option<(Instant, u64)>,
+    /// Set once the wallet first reaches the endpoint's tip, like Bitcoin
+    /// Core's initial-block-download latch. Until then the wallet reports
+    /// initial block download, so stale balances never look current.
+    synced: bool,
 }
 
 struct Context {
@@ -792,6 +796,7 @@ fn sync_loop(context: &Context, mut source: Upstream) {
                 let mut status = lock(&context.status);
                 status.last_error = None;
                 status.scanning_since = None;
+                status.synced = true;
                 POLL_INTERVAL
             }
             Ok(false) => Duration::ZERO,
@@ -824,6 +829,10 @@ fn sync_round(
         expected_next,
         BLOCKS_PER_ROUND,
         &|| context.stopping(),
+        &|upstream_height| {
+            let mut status = lock(&context.status);
+            status.headers = status.headers.max(upstream_height);
+        },
     )?;
     let mut status = lock(&context.status);
     status.headers = progress.upstream_height;
@@ -1769,6 +1778,22 @@ fn version_number() -> u64 {
     major * 1_000_000 + minor * 10_000 + patch * 100
 }
 
+/// `(verificationprogress, initialblockdownload)`. Until the wallet has
+/// reached the endpoint's tip once, it is in initial download and never
+/// reports full progress, even before it has learned the endpoint's height.
+fn sync_view(height: u64, headers: u64, synced: bool) -> (f64, bool) {
+    let progress = if headers == 0 {
+        1.0
+    } else {
+        height as f64 / headers as f64
+    };
+    if synced {
+        (progress, height + 1 < headers)
+    } else {
+        (progress.min(0.999_999), true)
+    }
+}
+
 fn blockchain_info(context: &Context) -> Value {
     let (height, hash, time) = {
         let wallet = lock(&context.wallet);
@@ -1777,6 +1802,7 @@ fn blockchain_info(context: &Context) -> Value {
     };
     let status = lock(&context.status);
     let headers = status.headers.max(height);
+    let (progress, initial_download) = sync_view(height, headers, status.synced);
     json!({
         "chain": context.chain,
         "blocks": height,
@@ -1785,8 +1811,8 @@ fn blockchain_info(context: &Context) -> Value {
         "difficulty": 0,
         "time": time,
         "mediantime": time,
-        "verificationprogress": if headers == 0 { 1.0 } else { height as f64 / headers as f64 },
-        "initialblockdownload": height + 1 < headers,
+        "verificationprogress": progress,
+        "initialblockdownload": initial_download,
         "chainwork": "",
         "size_on_disk": 0,
         "pruned": false,
@@ -2297,6 +2323,19 @@ mod tests {
             Params::parse(Some(&unknown), names).err().unwrap().code,
             RPC_INVALID_PARAMETER
         );
+    }
+
+    #[test]
+    fn a_wallet_that_has_not_caught_up_reports_initial_download() {
+        // Restarted days behind, before the endpoint's height is known.
+        assert_eq!(sync_view(3_960, 3_960, false), (0.999_999, true));
+        // Endpoint height known, still catching up.
+        let (progress, initial) = sync_view(4_160, 12_301, false);
+        assert!(initial && progress < 0.34);
+        // Caught up once: Bitcoin Core semantics.
+        assert_eq!(sync_view(12_301, 12_301, true), (1.0, false));
+        assert!(!sync_view(12_300, 12_301, true).1);
+        assert!(sync_view(12_000, 12_301, true).1);
     }
 
     #[test]

@@ -1790,14 +1790,17 @@ fn lock(wallet: &Mutex<Wallet>) -> std::sync::MutexGuard<'_, Wallet> {
 /// Follows the source's active chain for at most `max_blocks` blocks,
 /// disconnecting the wallet's tip whenever the source's chain no longer
 /// contains it. The wallet lock is held only while applying a block.
+/// `on_tip` receives the source's height before any block is fetched.
 pub fn sync_with(
     wallet: &Mutex<Wallet>,
     source: &mut impl ChainSource,
     expected_next: &mut Option<[u8; 32]>,
     max_blocks: usize,
     stop: &dyn Fn() -> bool,
+    on_tip: &dyn Fn(u64),
 ) -> Result<SyncProgress, String> {
     let upstream = source.tip().map_err(|error| error.to_string())?;
+    on_tip(upstream.height);
     let progress = |caught_up: bool, height: u64| SyncProgress {
         caught_up,
         height,
@@ -2065,8 +2068,15 @@ mod tests {
     fn sync(wallet: &Mutex<Wallet>, node: &mut Node) {
         let mut next = None;
         loop {
-            let progress =
-                sync_with(wallet, &mut NodeSource(node), &mut next, 1_000, &|| false).unwrap();
+            let progress = sync_with(
+                wallet,
+                &mut NodeSource(node),
+                &mut next,
+                1_000,
+                &|| false,
+                &|_| {},
+            )
+            .unwrap();
             if progress.caught_up {
                 return;
             }

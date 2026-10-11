@@ -124,7 +124,9 @@ Credit deposits after at least 60 confirmations, for example with
 
 `getblockchaininfo` reports `blocks` (the wallet's height) and `headers` (the
 endpoint's); `getconnectioncount` is 1 while the endpoint answers, and
-`warnings` explains any problem. The wallet keeps answering while the endpoint
+`warnings` explains any problem. As in Bitcoin Core, `initialblockdownload`
+stays `true` after every start until the wallet has reached the endpoint's tip,
+so wait for it to turn `false` before trusting balances after downtime. The wallet keeps answering while the endpoint
 is unreachable and catches up when it returns. Payments whose broadcast could
 not be confirmed are kept and rebroadcast until they are mined.
 

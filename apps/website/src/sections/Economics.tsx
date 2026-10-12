@@ -96,9 +96,11 @@ export function Economics() {
               aria-valuetext={`Block ${height.toLocaleString("en-US")}, ${formatCmfd(atomicSubsidy)} CMFD per block`}
             />
             <div className="emission-control__labels" aria-hidden="true">
-              <span>Year 0</span>
-              <span>Year 5</span>
-              <span>Tail</span>
+              {[0, 1, 2, 3, 4, 5].map((yearNumber) => (
+                <span key={yearNumber} style={{ left: `${yearNumber * 20}%` }}>
+                  {yearNumber === 5 ? "Year 5 · Tail" : `Year ${yearNumber}`}
+                </span>
+              ))}
             </div>
           </div>
         </div>

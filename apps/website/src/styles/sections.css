@@ -818,11 +818,26 @@
 }
 
 .emission-control__labels {
-  display: flex;
-  justify-content: space-between;
+  position: relative;
+  height: 1.2em;
   color: var(--mineral-500);
   font-size: 0.78rem;
   text-transform: uppercase;
+}
+
+.emission-control__labels span {
+  position: absolute;
+  top: 0;
+  transform: translateX(-50%);
+  white-space: nowrap;
+}
+
+.emission-control__labels span:first-child {
+  transform: none;
+}
+
+.emission-control__labels span:last-child {
+  transform: translateX(-100%);
 }
 
 .allocation {
@@ -1511,6 +1526,10 @@
 
   .emission-control output span {
     font-size: 0.78rem;
+  }
+
+  .emission-control__labels span:not(:first-child):not(:last-child) {
+    display: none;
   }
 
   .allocation__bar {

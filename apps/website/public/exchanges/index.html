@@ -168,7 +168,7 @@ footer a:hover { color: var(--accent); }
 <div class="page">
   <header class="masthead">
     <a class="brand" href="/">Common <span>Foundry</span></a>
-    <div class="release">Mainnet · release v1.0.10 · exchange integration</div>
+    <div class="release">Mainnet · release v1.0.14 · exchange integration</div>
   </header>
 
   <div class="hero">
@@ -177,7 +177,7 @@ footer a:hover { color: var(--accent); }
     <p class="lede">Run <strong>cmfd-node exchange-wallet</strong> on your own server and point your existing Bitcoin integration at it. It answers Bitcoin Core's wallet RPC (<code>getnewaddress</code>, <code>listsinceblock</code>, <code>sendtoaddress</code> and the rest), keeps your keys with you, and reads the chain from our hosted endpoint, so you never download the chain.</p>
     <div class="hero-actions">
       <a class="button primary" href="#setup">Set it up in four steps</a>
-      <a class="button" href="https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/tag/v1.0.10">Download v1.0.10</a>
+      <a class="button" href="https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/tag/v1.0.14">Download v1.0.14</a>
     </div>
   </div>
 
@@ -213,13 +213,13 @@ footer a:hover { color: var(--accent); }
         <ol class="steps">
           <li>
             <h3>Download and verify the release</h3>
-            <p>Get the runtime archive for your platform from the <a href="https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/tag/v1.0.10">v1.0.10 release</a>, together with <code>SHA256SUMS.txt</code>, <code>SHA256SUMS.txt.sig</code> and <code>MAINNET-RELEASE.allowed_signers</code>. Check the signature, then the archive.</p>
-            <div class="code"><div class="label"><span>shell</span><button class="copy" type="button">Copy</button></div><pre>ssh-keygen -Y verify -f MAINNET-RELEASE.allowed_signers \
+            <p>Get the runtime archive for your platform from the <a href="https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/tag/v1.0.14">v1.0.14 release</a>, together with <code>SHA256SUMS.txt</code> and <code>SHA256SUMS.txt.sig</code>. Get the signing key separately, from <a href="https://commonfoundry.ai/mainnet-release-key.txt">commonfoundry.ai/mainnet-release-key.txt</a>. Check the signature, then the archive.</p>
+            <div class="code"><div class="label"><span>shell</span><button class="copy" type="button">Copy</button></div><pre>ssh-keygen -Y verify -f mainnet-release-key.txt \
   -I commonfoundry-mainnet-owner -n commonfoundry-release \
   -s SHA256SUMS.txt.sig &lt; SHA256SUMS.txt
 sha256sum --ignore-missing -c SHA256SUMS.txt
-tar -xzf commonfoundry-mainnet-runtime-linux-x86_64-v1.0.10.tar.gz</pre></div>
-            <p>The signing key is <span class="mono-small">SHA256:cA1Tsf8hL/pxDV5WpOE3iPW3b4uDQosu1dOh//4a/fk</span>. The wallet is part of <code>cmfd-node</code> in that archive; Windows uses the <code>.zip</code> runtime and <code>cmfd-node.exe</code>.</p>
+tar -xzf commonfoundry-mainnet-runtime-linux-x86_64-v1.0.14.tar.gz</pre></div>
+            <p>A good signature names the key <span class="mono-small">SHA256:cA1Tsf8hL/pxDV5WpOE3iPW3b4uDQosu1dOh//4a/fk</span>; stop if it shows any other. The wallet is part of <code>cmfd-node</code> in that archive; Windows uses the <code>.zip</code> runtime and <code>cmfd-node.exe</code>.</p>
           </li>
           <li>
             <h3>Write the settings file</h3>
@@ -325,7 +325,7 @@ bitcoin-cli … gettransaction "&lt;txid&gt;"</pre></div>
               <tr><td>Balances</td><td><code>getbalance</code> <code>getbalances</code> <code>getunconfirmedbalance</code> <code>getwalletinfo</code></td></tr>
               <tr><td>Withdrawals</td><td><code>sendtoaddress</code> <code>sendmany</code> <code>abandontransaction</code> <code>settxfee</code> <code>estimatesmartfee</code></td></tr>
               <tr><td>Security</td><td><code>encryptwallet</code> <code>walletpassphrase</code> <code>walletlock</code> <code>walletpassphrasechange</code> <code>backupwallet</code></td></tr>
-              <tr><td>Chain and status</td><td><code>getblockchaininfo</code> <code>getblockcount</code> <code>getbestblockhash</code> <code>getblockhash</code> <code>getblock</code> <code>getrawtransaction</code> <code>sendrawtransaction</code> <code>getrawmempool</code> <code>getnetworkinfo</code> <code>getconnectioncount</code> <code>getinfo</code> <code>listwallets</code> <code>uptime</code> <code>ping</code> <code>help</code> <code>stop</code></td></tr>
+              <tr><td>Chain and status</td><td><code>getblockchaininfo</code> <code>getblockcount</code> <code>getbestblockhash</code> <code>getblockhash</code> <code>getblock</code> <code>gettxoutsetinfo</code> <code>getrawtransaction</code> <code>sendrawtransaction</code> <code>getrawmempool</code> <code>getnetworkinfo</code> <code>getconnectioncount</code> <code>getinfo</code> <code>listwallets</code> <code>uptime</code> <code>ping</code> <code>help</code> <code>stop</code></td></tr>
             </tbody>
           </table>
         </div>
@@ -366,6 +366,7 @@ bitcoin-cli … gettransaction "&lt;txid&gt;"</pre></div>
         <h3>Monitoring</h3>
         <ul class="plain">
           <li><code>getblockchaininfo</code> reports <code>blocks</code> (the wallet's height) and <code>headers</code> (the endpoint's); they should match within a block.</li>
+          <li>As in Bitcoin Core, <code>initialblockdownload</code> stays <code>true</code> after every start until the wallet has reached the endpoint's tip. After downtime, wait for it to turn <code>false</code> before trusting balances.</li>
           <li><code>getconnectioncount</code> is 1 while the endpoint answers. <code>warnings</code> explains any problem.</li>
           <li>The wallet keeps answering while the endpoint is unreachable and catches up when it returns. Logs are in <code>&lt;wallet-dir&gt;/logs</code>.</li>
         </ul>
@@ -380,28 +381,28 @@ bitcoin-cli … gettransaction "&lt;txid&gt;"</pre></div>
           <table>
             <tbody>
               <tr><td>URL</td><td><code>https://sg-rpc.commonfoundry.ai/mainnet</code></td></tr>
-              <tr><td>Transport</td><td>HTTPS, JSON-RPC 2.0, HTTP Basic credentials per exchange</td></tr>
+              <tr><td>Transport</td><td>HTTPS, JSON-RPC 1.0 or 2.0, HTTP Basic credentials per exchange</td></tr>
               <tr><td>Rate limit</td><td>5 requests per second (burst 20) and 8 connections per IP. The wallet stays under it on its own.</td></tr>
               <tr><td>Privacy</td><td>What one exchange registers or receives is visible only to that exchange's credential.</td></tr>
               <tr><td>Network ID</td><td><span class="mono-small">88296bc39c10e8bc1dd4818d4d42412fe5f08210651110377f495da299812f62</span></td></tr>
             </tbody>
           </table>
         </div>
-        <p>Prefer your own infrastructure? Run a full node with <code>cmfd-node run --exchange-rpc-bind 127.0.0.1:&lt;port&gt; --exchange-rpc-auth-file &lt;file&gt;</code> and set <code>upstream=http://127.0.0.1:&lt;port&gt;</code>. Plain <code>http://</code> is accepted only for this machine. A full node stores the chain, which grows by roughly 12 GB a day.</p>
+        <p>Prefer your own infrastructure? Run a full node with <code>cmfd-node run --exchange-rpc-bind 127.0.0.1:&lt;port&gt; --exchange-rpc-auth-file &lt;file&gt;</code> and set <code>upstream=http://127.0.0.1:&lt;port&gt;</code>. Plain <code>http://</code> is accepted only for this machine.</p>
       </section>
 
       <section id="advanced">
         <h2>Advanced route</h2>
-        <p>Some exchanges prefer to hold one key file per address and build every transaction themselves. For that, the release includes offline tools (<code>exchange-key-new</code>, <code>exchange-tx-sign</code>) and the exchange JSON-RPC with deposit event streams. The <a href="https://github.com/Common-Foundry-1/CommonFoundry/blob/v1.0.10/exchange-kit/INTEGRATION-GUIDE.md">full integration guide</a> covers this route in detail, along with error catalogs and the hosted endpoint's method list.</p>
+        <p>Some exchanges prefer to hold one key file per address and build every transaction themselves. For that, the release includes offline tools (<code>exchange-key-new</code>, <code>exchange-tx-sign</code>) and the exchange JSON-RPC with deposit event streams. The <a href="https://github.com/Common-Foundry-1/CommonFoundry/blob/v1.0.14/exchange-kit/INTEGRATION-GUIDE.md">full integration guide</a> covers this route in detail, along with error catalogs and the hosted endpoint's method list.</p>
       </section>
     </main>
   </div>
 
   <footer>
-    <span>Common Foundry mainnet · exchange integration · v1.0.10</span>
+    <span>Common Foundry mainnet · exchange integration · v1.0.14</span>
     <span>
-      <a href="https://github.com/Common-Foundry-1/CommonFoundry/blob/v1.0.10/exchange-kit/INTEGRATION-GUIDE.md">Integration guide</a> ·
-      <a href="https://github.com/Common-Foundry-1/CommonFoundry/blob/v1.0.10/docs/mainnet-release-verification.md">Release verification</a> ·
+      <a href="https://github.com/Common-Foundry-1/CommonFoundry/blob/v1.0.14/exchange-kit/INTEGRATION-GUIDE.md">Integration guide</a> ·
+      <a href="https://github.com/Common-Foundry-1/CommonFoundry/blob/v1.0.14/docs/mainnet-release-verification.md">Release verification</a> ·
       <a href="https://explorer.commonfoundry.ai">Explorer</a>
     </span>
   </footer>

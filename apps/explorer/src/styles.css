@@ -47,7 +47,7 @@ code { font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace; }
 .brand strong { font-family: Georgia, "Times New Roman", serif; font-size: 1rem; font-weight: 600; }
 .brand small { margin-top: 5px; color: #aaa9a4; font-size: .62rem; font-weight: 800; letter-spacing: .17em; text-transform: uppercase; }
 .topbar nav { display: flex; align-items: center; gap: 2px; }
-.topbar nav a, .topbar nav button { padding: 9px 10px; color: #c7c5c0; background: none; border: 0; font-size: .76rem; font-weight: 700; text-decoration: none; }
+.topbar nav a, .topbar nav button { padding: 9px 10px; color: #c7c5c0; background: none; border: 0; font-size: .76rem; font-weight: 700; text-decoration: none; white-space: nowrap; }
 .topbar nav a:hover, .topbar nav button:hover { color: #fff; }
 .search-form { display: grid; grid-template-columns: auto minmax(0,1fr) auto; align-items: center; gap: 10px; height: 40px; padding: 0 11px; color: #898a87; background: #242626; border: 1px solid #454747; }
 .search-form:focus-within { border-color: #a44c21; box-shadow: 0 0 0 2px rgba(221,92,28,.12); }
@@ -318,5 +318,5 @@ footer code { font-size: .6rem; }
 .richlist-label { display: inline-block; margin-left: 10px; padding: 2px 8px; color: var(--copper-600); font-size: .6rem; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; border: 1px solid var(--copper-600); }
 @media (max-width: 780px) {
   .richlist-table th, .richlist-table td { padding: 10px 12px; }
-  .richlist-label { margin: 4px 0 0; }
+  .richlist-label { display: table; margin: 6px 0 0; }
 }

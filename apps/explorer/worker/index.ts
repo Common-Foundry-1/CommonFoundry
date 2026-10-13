@@ -326,7 +326,9 @@ async function richListResponse(request: Request, env: Env): Promise<Response> {
   if (env.EXPLORER_EXPECTED_NETWORK_ID !== MAINNET_NETWORK_ID) {
     return Response.json({ error: "explorer_configuration_invalid" }, { status: 503, headers: { "Cache-Control": "no-store" } });
   }
-  const unavailable = () => Response.json({ error: "richlist_unavailable" }, { status: 503, headers: { "Cache-Control": "no-store" } });
+  const unavailable = () => Response.json({ error: "richlist_unavailable" }, {
+    status: 503, headers: { "Cache-Control": "no-store", [NETWORK_HEADER]: MAINNET_NETWORK_ID },
+  });
   try {
     const upstream = await fetch(RICHLIST_URL, {
       headers: { Accept: "application/json" },

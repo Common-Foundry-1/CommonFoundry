@@ -66,7 +66,14 @@ export async function loadTransaction(query: string, preview: boolean): Promise<
 
 export async function loadRichList(preview: boolean): Promise<RichList> {
   if (preview) throw new Error("The rich list requires a live mainnet node; preview balances are never generated.");
-  return fetchJson("/api/richlist", isRichList);
+  try {
+    return await fetchJson("/api/richlist", isRichList);
+  } catch (error) {
+    if (error instanceof ExplorerRequestError && error.message === "richlist_unavailable") {
+      throw new ExplorerRequestError("The rich list is being updated. Please try again in a minute.", error.status, "richlist_unavailable");
+    }
+    throw error;
+  }
 }
 
 export async function loadAddress(query: string, cursor: string | null = null, preview = false): Promise<ExplorerAddress> {

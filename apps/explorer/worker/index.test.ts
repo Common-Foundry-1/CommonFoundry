@@ -413,6 +413,7 @@ describe("rich list", () => {
     vi.stubGlobal("fetch", vi.fn().mockImplementation(async () => Response.json(list({ verified_against_node: false }))));
     const unchecked = await worker.fetch(new Request("https://explorer.test/api/richlist"), environment());
     expect(unchecked.status).toBe(503);
+    expect(unchecked.headers.get(NETWORK_HEADER)).toBe(MAINNET_NETWORK_ID);
     expect(await unchecked.json()).toEqual({ error: "richlist_unavailable" });
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("not found", { status: 404 })));
     expect((await worker.fetch(new Request("https://explorer.test/api/richlist"), environment())).status).toBe(503);

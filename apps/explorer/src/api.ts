@@ -1,7 +1,7 @@
 import { demoBlock, demoSnapshot, demoTransactions } from "./demoData";
-import type { ExplorerAddress, ExplorerBlockDetail, ExplorerSnapshot, ExplorerTransaction } from "./types";
+import type { ExplorerAddress, ExplorerBlockDetail, ExplorerSnapshot, ExplorerTransaction, RichList } from "./types";
 import { MAINNET_NETWORK_ID, NETWORK_HEADER } from "../shared/network";
-import { isExplorerAddress, isExplorerBlockDetail, isExplorerSnapshot, isExplorerTransaction } from "./validation";
+import { isExplorerAddress, isExplorerBlockDetail, isExplorerSnapshot, isExplorerTransaction, isRichList } from "./validation";
 import { ADDRESS_HASH, isAddressCursor } from "../shared/address";
 
 export type ExplorerLoad = { data: ExplorerSnapshot; preview: boolean };
@@ -62,6 +62,11 @@ export async function loadTransaction(query: string, preview: boolean): Promise<
   const transaction = demoTransactions.find((item) => item.txid === query);
   if (!transaction) throw new Error("Transaction not found in preview data.");
   return transaction;
+}
+
+export async function loadRichList(preview: boolean): Promise<RichList> {
+  if (preview) throw new Error("The rich list requires a live mainnet node; preview balances are never generated.");
+  return fetchJson("/api/richlist", isRichList);
 }
 
 export async function loadAddress(query: string, cursor: string | null = null, preview = false): Promise<ExplorerAddress> {

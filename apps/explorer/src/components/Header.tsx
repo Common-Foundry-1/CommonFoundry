@@ -7,14 +7,16 @@ type HeaderProps = {
   network: string;
   connected: boolean;
   onHome: () => void;
+  onRichList?: () => void;
   onSearch: (query: string, kind: ExplorerSearchKind) => void;
 };
 
-export function Header({ network, connected, onHome, onSearch }: HeaderProps) {
+export function Header({ network, connected, onHome, onRichList, onSearch }: HeaderProps) {
   const [query, setQuery] = useState("");
   const [searchKind, setSearchKind] = useState<ExplorerSearchKind>("chain");
   const [mobileOpen, setMobileOpen] = useState(false);
   const home = () => { setMobileOpen(false); onHome(); };
+  const richList = () => { setMobileOpen(false); onRichList?.(); };
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
@@ -37,6 +39,7 @@ export function Header({ network, connected, onHome, onSearch }: HeaderProps) {
         <a href="#blocks" onClick={() => setMobileOpen(false)}>Blocks</a>
         <a href="#transactions" onClick={() => setMobileOpen(false)}>Transactions</a>
         <a href="#network" onClick={() => setMobileOpen(false)}>Network</a>
+        {onRichList && <button type="button" onClick={richList}>Rich list</button>}
         <a href="https://wallet.commonfoundry.ai" target="_blank" rel="noopener noreferrer">Wallet</a>
       </nav>
 

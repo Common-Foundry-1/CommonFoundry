@@ -7,6 +7,11 @@ const SUPPLY_TOTAL_PATH = "/api/supply/total";
 const SUPPLY_CIRCULATING_PATH = "/api/supply/circulating";
 const PRICE_PATH = "/api/price";
 const PRICE_FEED_URL = "https://tidoex.com/api/v2/markets?market_id=CMFD_USDT";
+const RICHLIST_PATH = "/api/richlist";
+// Published by the rich-list job beside the hosted exchange RPC; checked against the node's
+// own output-set total before every publication (schema CMFD_RICHLIST_V1).
+const RICHLIST_URL = "https://sg-rpc.commonfoundry.ai/stats/richlist.json";
+const RICHLIST_MAX_ENTRIES = 1000;
 const ATOMS_PER_CMFD = 100_000_000n;
 const ATOMS_PATTERN = /^(0|[1-9][0-9]{0,30})$/;
 const BLOCK_PATH = /^\/v1\/explorer\/block\/(?:[0-9]+|[0-9a-fA-F]{64})$/;
@@ -279,6 +284,85 @@ async function priceResponse(request: Request, env: Env): Promise<Response> {
   }
 }
 
+type RichListEntry = { rank: number; address: string; balance_atoms: string; outputs: number };
+
+/** The published rich list, or null when it is malformed or was not checked against the node. */
+export function parseRichList(value: unknown): {
+  height: number; block_hash: string; generated_at: number; total_supply_atoms: string;
+  addresses_with_balance: number; top: RichListEntry[];
+} | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const list = value as Record<string, unknown>;
+  const count = (field: unknown) => Number.isSafeInteger(field) && (field as number) >= 0;
+  if (list.schema !== "CMFD_RICHLIST_V1" || list.verified_against_node !== true || !count(list.height)
+      || typeof list.block_hash !== "string" || !/^[0-9a-f]{64}$/.test(list.block_hash) || !count(list.generated_at)
+      || typeof list.total_supply_atoms !== "string" || !ATOMS_PATTERN.test(list.total_supply_atoms)
+      || !count(list.addresses_with_balance) || !Array.isArray(list.top) || list.top.length > RICHLIST_MAX_ENTRIES) {
+    return null;
+  }
+  const top: RichListEntry[] = [];
+  for (const [index, item] of list.top.entries()) {
+    if (typeof item !== "object" || item === null) return null;
+    const entry = item as Record<string, unknown>;
+    if (entry.rank !== index + 1 || typeof entry.address !== "string" || !/^[0-9a-f]{64}$/.test(entry.address)
+        || typeof entry.balance_atoms !== "string" || !ATOMS_PATTERN.test(entry.balance_atoms)
+        || !Number.isSafeInteger(entry.outputs) || (entry.outputs as number) < 1) {
+      return null;
+    }
+    top.push({ rank: entry.rank, address: entry.address, balance_atoms: entry.balance_atoms, outputs: entry.outputs as number });
+  }
+  return {
+    height: list.height as number, block_hash: list.block_hash, generated_at: list.generated_at as number,
+    total_supply_atoms: list.total_supply_atoms, addresses_with_balance: list.addresses_with_balance as number, top,
+  };
+}
+
+/** The largest balances on mainnet, labelling the steward and community funds. */
+async function richListResponse(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "GET") {
+    return Response.json({ error: "method_not_allowed" }, { status: 405, headers: { Allow: "GET" } });
+  }
+  if (env.EXPLORER_NETWORK !== "mainnet") return Response.json({ error: "not_found" }, { status: 404 });
+  if (env.EXPLORER_EXPECTED_NETWORK_ID !== MAINNET_NETWORK_ID) {
+    return Response.json({ error: "explorer_configuration_invalid" }, { status: 503, headers: { "Cache-Control": "no-store" } });
+  }
+  const unavailable = () => Response.json({ error: "richlist_unavailable" }, { status: 503, headers: { "Cache-Control": "no-store" } });
+  try {
+    const upstream = await fetch(RICHLIST_URL, {
+      headers: { Accept: "application/json" },
+      redirect: "manual",
+      signal: AbortSignal.timeout(10_000),
+      cf: { cacheTtl: 60, cacheEverything: true },
+    });
+    if (!upstream.ok) {
+      await upstream.body?.cancel();
+      return unavailable();
+    }
+    const list = parseRichList(await upstream.json());
+    if (!list) return unavailable();
+    const labels = new Map<string, string>(FUND_ADDRESSES.map((fund) => [fund.address, `${fund.label} fund`]));
+    return Response.json({
+      network: env.EXPLORER_NETWORK,
+      height: list.height,
+      block_hash: list.block_hash,
+      generated_at: list.generated_at,
+      total_supply: formatCmfd(list.total_supply_atoms),
+      total_supply_atoms: list.total_supply_atoms,
+      addresses_with_balance: list.addresses_with_balance,
+      top: list.top.map((entry) => ({
+        ...entry,
+        label: labels.get(entry.address) ?? null,
+        balance: formatCmfd(entry.balance_atoms),
+      })),
+      definition: "Balances are the value of each address's unspent outputs at the stated block, including coinbase rewards that are not spendable yet. Outputs locked to inference channels have no address and are not listed. The list is rebuilt from every block and published only when its outputs match the node's own output-set count and total.",
+    }, {
+      headers: { "Cache-Control": "public, max-age=60", "Access-Control-Allow-Origin": "*", [NETWORK_HEADER]: MAINNET_NETWORK_ID },
+    });
+  } catch {
+    return unavailable();
+  }
+}
+
 // Always fetch the full page: a 304 would pair a cached page with a fresh nonce.
 function fetchAsset(request: Request, env: Env): Promise<Response> {
   const headers = new Headers(request.headers);
@@ -296,7 +380,9 @@ export default {
         ? await supplyResponse(request, env, url.pathname)
         : url.pathname === PRICE_PATH
           ? await priceResponse(request, env)
-          : await fetchAsset(request, env);
+          : url.pathname === RICHLIST_PATH
+            ? await richListResponse(request, env)
+            : await fetchAsset(request, env);
     return withSecurityHeaders(response);
   },
 } satisfies ExportedHandler<Env>;

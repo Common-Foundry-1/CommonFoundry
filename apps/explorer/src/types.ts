@@ -52,11 +52,29 @@ export type ExplorerBlockDetail = ExplorerBlock & {
   transactions_detail: ExplorerTransaction[];
 };
 
+export type RichListEntry = {
+  rank: number;
+  address: string;
+  label: string | null;
+  balance_atoms: string;
+  outputs: number;
+};
+
+export type RichList = {
+  height: number;
+  block_hash: string;
+  generated_at: number;
+  total_supply_atoms: string;
+  addresses_with_balance: number;
+  top: RichListEntry[];
+};
+
 export type ExplorerView =
   | { kind: "overview" }
   | { kind: "block"; block: ExplorerBlockDetail }
   | { kind: "transaction"; transaction: ExplorerTransaction }
-  | { kind: "address"; address: ExplorerAddress };
+  | { kind: "address"; address: ExplorerAddress }
+  | { kind: "richlist"; richlist: RichList };
 
 export type ExplorerSearchKind = "chain" | "address";
 

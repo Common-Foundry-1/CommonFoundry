@@ -6,7 +6,8 @@ export type ExplorerRoute =
   | { kind: "overview" }
   | { kind: "block"; query: string }
   | { kind: "transaction"; txid: string }
-  | { kind: "address"; address: string };
+  | { kind: "address"; address: string }
+  | { kind: "richlist" };
 
 const HEIGHT = /^\d{1,20}$/;
 const MAX_HEIGHT = 18_446_744_073_709_551_615n;
@@ -15,6 +16,7 @@ const MAX_HEIGHT = 18_446_744_073_709_551_615n;
 export function parseRoute(pathname: string): ExplorerRoute | null {
   const segments = pathname.split("/").filter((segment) => segment.length > 0);
   if (segments.length === 0) return { kind: "overview" };
+  if (segments.length === 1 && segments[0] === "richlist") return { kind: "richlist" };
   if (segments.length !== 2) return null;
   let value: string;
   try { value = decodeURIComponent(segments[1]); } catch { return null; }
@@ -39,5 +41,6 @@ export function viewPath(view: ExplorerView): string {
     case "block": return `/block/${view.block.block_id}`;
     case "transaction": return `/tx/${view.transaction.txid}`;
     case "address": return `/address/${view.address.address.toLowerCase()}`;
+    case "richlist": return "/richlist";
   }
 }

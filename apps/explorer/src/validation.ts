@@ -1,4 +1,4 @@
-import type { ExplorerAddress, ExplorerAddressActivity, ExplorerBlock, ExplorerBlockDetail, ExplorerSnapshot, ExplorerTransaction } from "./types";
+import type { ExplorerAddress, ExplorerAddressActivity, ExplorerBlock, ExplorerBlockDetail, ExplorerSnapshot, ExplorerTransaction, RichList, RichListEntry } from "./types";
 import { ADDRESS_PAGE_SIZE, isAddressCursor } from "../shared/address";
 
 const HASH = /^[0-9a-f]{64}$/i;
@@ -74,4 +74,14 @@ export function isExplorerAddress(value: unknown): value is ExplorerAddress {
   const last = entries[entries.length - 1];
   return tip.toLowerCase() === value.tip.toLowerCase() && BigInt(lastHeight) === BigInt(last.block_height)
     && ((position === "0") === (last.kind === "coinbase"));
+}
+
+export function isRichList(value: unknown): value is RichList {
+  if (!record(value) || !natural(value.height) || !hash(value.block_hash) || !natural(value.generated_at)
+      || !totalAtoms(value.total_supply_atoms) || !natural(value.addresses_with_balance)
+      || !Array.isArray(value.top) || value.top.length > 1000) return false;
+  return value.top.every((entry, index) => record(entry) && entry.rank === index + 1 && hash(entry.address)
+    && (entry.label === null || (typeof entry.label === "string" && entry.label.length <= 64))
+    && totalAtoms(entry.balance_atoms) && natural(entry.outputs) && entry.outputs > 0
+    && (index === 0 || BigInt(entry.balance_atoms) <= BigInt((value.top as RichListEntry[])[index - 1].balance_atoms)));
 }

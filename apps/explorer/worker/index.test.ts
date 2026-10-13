@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import worker, { formatCmfd, FUND_ADDRESSES, isExplorerApiPath, mintedAtoms, SECURITY_HEADERS } from "./index";
+import worker, { formatCmfd, FUND_ADDRESSES, isExplorerApiPath, mintedAtoms, parseRichList, SECURITY_HEADERS } from "./index";
 import { MAINNET_NETWORK_ID, NETWORK_HEADER } from "../shared/network";
 
 function environment(overrides: Partial<Env> = {}): Env {
@@ -362,6 +362,64 @@ describe("mainnet explorer identity gate", () => {
     const upstream = vi.fn(); vi.stubGlobal("fetch", upstream);
     const response = await worker.fetch(new Request("https://explorer.test/"), environment());
     expect(await response.text()).toBe("static explorer");
+    expect(upstream).not.toHaveBeenCalled();
+  });
+});
+
+describe("rich list", () => {
+  const other = "ab".repeat(32);
+  const list = (overrides: Record<string, unknown> = {}) => ({
+    schema: "CMFD_RICHLIST_V1", height: 14800, block_hash: "cd".repeat(32), generated_at: 1791900000,
+    total_supply_atoms: "737100000000000", unspent_outputs: 70300, addresses_with_balance: 4321, unkeyed_atoms: "0",
+    verified_against_node: true,
+    top: [
+      { rank: 1, address: FUND_ADDRESSES[0].address, balance_atoms: "150000000000000", outputs: 14800 },
+      { rank: 2, address: other, balance_atoms: "900000000", outputs: 3 },
+    ],
+    ...overrides,
+  });
+
+  it("serves the checked list with the fund labels", async () => {
+    const upstream = vi.fn().mockImplementation(async () => Response.json(list()));
+    vi.stubGlobal("fetch", upstream);
+    const response = await worker.fetch(new Request("https://explorer.test/api/richlist"), environment());
+    expect(response.status).toBe(200);
+    expect(response.headers.get(NETWORK_HEADER)).toBe(MAINNET_NETWORK_ID);
+    expect(response.headers.get("Cache-Control")).toBe("public, max-age=60");
+    const body = await response.json() as { top: Record<string, unknown>[]; height: number; total_supply: string };
+    expect(body.height).toBe(14800);
+    expect(body.total_supply).toBe("7371000.00000000");
+    expect(body.top[0]).toEqual({ rank: 1, address: FUND_ADDRESSES[0].address, balance_atoms: "150000000000000", outputs: 14800,
+      label: "steward fund", balance: "1500000.00000000" });
+    expect(body.top[1].label).toBeNull();
+    const [url, options] = upstream.mock.calls[0];
+    expect(String(url)).toBe("https://sg-rpc.commonfoundry.ai/stats/richlist.json");
+    expect(options.redirect).toBe("manual");
+  });
+
+  it("refuses lists that were not checked against the node or are malformed", () => {
+    expect(parseRichList(list())).not.toBeNull();
+    expect(parseRichList(list({ verified_against_node: false }))).toBeNull();
+    expect(parseRichList(list({ schema: "CMFD_RICHLIST_V2" }))).toBeNull();
+    expect(parseRichList(list({ top: [{ rank: 2, address: other, balance_atoms: "1", outputs: 1 }] }))).toBeNull();
+    expect(parseRichList(list({ top: [{ rank: 1, address: other.toUpperCase(), balance_atoms: "1", outputs: 1 }] }))).toBeNull();
+    expect(parseRichList(list({ top: [{ rank: 1, address: other, balance_atoms: "01", outputs: 1 }] }))).toBeNull();
+    expect(parseRichList(list({ top: [{ rank: 1, address: other, balance_atoms: "1", outputs: 0 }] }))).toBeNull();
+    expect(parseRichList(list({ total_supply_atoms: 5 }))).toBeNull();
+    expect(parseRichList([])).toBeNull();
+  });
+
+  it("answers 503 for a bad or missing list, and only on mainnet", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(async () => Response.json(list({ verified_against_node: false }))));
+    const unchecked = await worker.fetch(new Request("https://explorer.test/api/richlist"), environment());
+    expect(unchecked.status).toBe(503);
+    expect(await unchecked.json()).toEqual({ error: "richlist_unavailable" });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("not found", { status: 404 })));
+    expect((await worker.fetch(new Request("https://explorer.test/api/richlist"), environment())).status).toBe(503);
+    const upstream = vi.fn(); vi.stubGlobal("fetch", upstream);
+    const rc = await worker.fetch(new Request("https://explorer.test/api/richlist"), environment({ EXPLORER_NETWORK: "rc", EXPLORER_EXPECTED_NETWORK_ID: "" }));
+    expect(rc.status).toBe(404);
+    expect((await worker.fetch(new Request("https://explorer.test/api/richlist", { method: "POST" }), environment())).status).toBe(405);
     expect(upstream).not.toHaveBeenCalled();
   });
 });

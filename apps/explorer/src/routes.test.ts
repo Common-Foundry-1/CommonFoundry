@@ -11,11 +11,13 @@ test("parses the pages the explorer serves from a path", () => {
   expect(parseRoute(`/block/${fixtureAddress}`)).toEqual({ kind: "block", query: fixtureAddress });
   expect(parseRoute(`/tx/${fixtureAddress}`)).toEqual({ kind: "transaction", txid: fixtureAddress });
   expect(parseRoute(`/transaction/${fixtureAddress}`)).toEqual({ kind: "transaction", txid: fixtureAddress });
+  expect(parseRoute("/richlist")).toEqual({ kind: "richlist" });
+  expect(parseRoute("/richlist/")).toEqual({ kind: "richlist" });
 });
 
 test("rejects paths that name nothing", () => {
   for (const path of ["/address", "/address/abc", `/address/${fixtureAddress}/extra`, "/wallet/" + fixtureAddress,
-    "/block/18446744073709551616", "/block/-1", "/block/1e3", "/tx/42", "/address/%E0%A4%A", "/nope"]) {
+    "/block/18446744073709551616", "/block/-1", "/block/1e3", "/tx/42", "/address/%E0%A4%A", "/nope", "/richlist/1", "/RichList"]) {
     expect(parseRoute(path), path).toBeNull();
   }
 });
@@ -23,5 +25,6 @@ test("rejects paths that name nothing", () => {
 test("view paths round-trip through the parser", () => {
   const address = addressFixture({ address: fixtureAddress.toUpperCase() });
   expect(viewPath({ kind: "overview" })).toBe("/");
+  expect(parseRoute(viewPath({ kind: "richlist", richlist: { height: 1, block_hash: "ab".repeat(32), generated_at: 1, total_supply_atoms: "1", addresses_with_balance: 1, top: [] } }))).toEqual({ kind: "richlist" });
   expect(parseRoute(viewPath({ kind: "address", address }))).toEqual({ kind: "address", address: fixtureAddress });
 });

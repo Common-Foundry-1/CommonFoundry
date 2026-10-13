@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AlertTriangle, LoaderCircle } from "lucide-react";
-import { ExplorerRequestError, loadAddress, loadBlock, loadExplorer, loadTransaction, MAINNET_MODE } from "./api";
+import { ExplorerRequestError, loadAddress, loadBlock, loadExplorer, loadRichList, loadTransaction, MAINNET_MODE } from "./api";
 import { ADDRESS_HASH } from "../shared/address";
 import { demoBlock } from "./demoData";
 import { parseRoute, viewPath, type ExplorerRoute } from "./routes";
@@ -9,6 +9,7 @@ import { AddressDetail } from "./components/AddressDetail";
 import { BlockDetail, TransactionDetail } from "./components/DetailViews";
 import { Header } from "./components/Header";
 import { Overview } from "./components/Overview";
+import { RichList } from "./components/RichList";
 
 type NavigationOptions = { replace?: boolean; path?: string };
 
@@ -105,6 +106,9 @@ export default function App() {
   const openAddress = (address: string, options: NavigationOptions = {}) => navigate(async () => ({
     kind: "address", address: await loadAddress(address, null, preview),
   }), options);
+  const openRichList = (options: NavigationOptions = {}) => navigate(async () => ({
+    kind: "richlist", richlist: await loadRichList(preview),
+  }), options);
 
   const openRoute = (route: ExplorerRoute, replace: boolean) => {
     switch (route.kind) {
@@ -112,6 +116,7 @@ export default function App() {
       case "block": void openBlock(route.query, { replace }); return;
       case "transaction": void openTransaction(route.txid, { replace }); return;
       case "address": void openAddress(route.address, { replace }); return;
+      case "richlist": void openRichList({ replace }); return;
     }
   };
   const openRouteRef = useRef(openRoute);
@@ -172,13 +177,14 @@ export default function App() {
   if (!snapshot) return <div className="load-state error"><AlertTriangle /><strong>{MAINNET_MODE ? "Mainnet explorer awaiting connection" : "Explorer unavailable"}</strong><span>{error}</span><button type="button" onClick={() => void refresh(true)}>Retry</button></div>;
 
   return <div className="app-shell">
-    <Header network={snapshot.network_short_name} connected={!preview} onHome={home} onSearch={(query, kind) => void search(query, kind)} />
+    <Header network={snapshot.network_short_name} connected={!preview} onHome={home} onRichList={() => void openRichList()} onSearch={(query, kind) => void search(query, kind)} />
     {error && <div className="error-banner" role="alert"><AlertTriangle size={15} />{error}<button type="button" onClick={() => setError(null)}>Dismiss</button></div>}
     {navigating ? <main className="detail-loading" role="status"><LoaderCircle className="spin" /> Looking up chain data…</main> : <>
       {view.kind === "overview" && <Overview snapshot={snapshot} preview={preview} onBlock={(block) => void openBlock(block)} onTransaction={(tx) => void openTransaction(tx)} />}
       {view.kind === "block" && <BlockDetail block={view.block} onBack={home} onTransaction={(tx) => void openTransaction(tx)} />}
       {view.kind === "transaction" && <TransactionDetail transaction={view.transaction} onBack={home} />}
       {view.kind === "address" && <AddressDetail initial={view.address} liveTip={snapshot.tip} onBack={home} onBlock={(id) => void openBlock(id)} onTransaction={(id) => void openTransaction(id)} />}
+      {view.kind === "richlist" && <RichList list={view.richlist} onBack={home} onAddress={(address) => void openAddress(address)} />}
     </>}
     <footer><span>Common Foundry Explorer</span><code>{snapshot.network_id.slice(0, 16)}…</code><span>Built for independently verifiable compute.</span></footer>
   </div>;

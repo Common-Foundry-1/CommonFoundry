@@ -168,7 +168,7 @@ footer a:hover { color: var(--accent); }
 <div class="page">
   <header class="masthead">
     <a class="brand" href="/">Common <span>Foundry</span></a>
-    <div class="release">Mainnet · release v1.0.14 · exchange integration</div>
+    <div class="release">Mainnet · release v1.0.15 · exchange integration</div>
   </header>
 
   <div class="hero">
@@ -177,7 +177,7 @@ footer a:hover { color: var(--accent); }
     <p class="lede">Run <strong>cmfd-node exchange-wallet</strong> on your own server and point your existing Bitcoin integration at it. It answers Bitcoin Core's wallet RPC (<code>getnewaddress</code>, <code>listsinceblock</code>, <code>sendtoaddress</code> and the rest), keeps your keys with you, and reads the chain from our hosted endpoint, so you never download the chain.</p>
     <div class="hero-actions">
       <a class="button primary" href="#setup">Set it up in four steps</a>
-      <a class="button" href="https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/tag/v1.0.14">Download v1.0.14</a>
+      <a class="button" href="https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/tag/v1.0.15">Download v1.0.15</a>
     </div>
   </div>
 
@@ -213,12 +213,12 @@ footer a:hover { color: var(--accent); }
         <ol class="steps">
           <li>
             <h3>Download and verify the release</h3>
-            <p>Get the runtime archive for your platform from the <a href="https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/tag/v1.0.14">v1.0.14 release</a>, together with <code>SHA256SUMS.txt</code> and <code>SHA256SUMS.txt.sig</code>. Get the signing key separately, from <a href="https://commonfoundry.ai/mainnet-release-key.txt">commonfoundry.ai/mainnet-release-key.txt</a>. Check the signature, then the archive.</p>
+            <p>Get the runtime archive for your platform from the <a href="https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/tag/v1.0.15">v1.0.15 release</a>, together with <code>SHA256SUMS.txt</code> and <code>SHA256SUMS.txt.sig</code>. Get the signing key separately, from <a href="https://commonfoundry.ai/mainnet-release-key.txt">commonfoundry.ai/mainnet-release-key.txt</a>. Check the signature, then the archive.</p>
             <div class="code"><div class="label"><span>shell</span><button class="copy" type="button">Copy</button></div><pre>ssh-keygen -Y verify -f mainnet-release-key.txt \
   -I commonfoundry-mainnet-owner -n commonfoundry-release \
   -s SHA256SUMS.txt.sig &lt; SHA256SUMS.txt
 sha256sum --ignore-missing -c SHA256SUMS.txt
-tar -xzf commonfoundry-mainnet-runtime-linux-x86_64-v1.0.14.tar.gz</pre></div>
+tar -xzf commonfoundry-mainnet-runtime-linux-x86_64-v1.0.15.tar.gz</pre></div>
             <p>A good signature names the key <span class="mono-small">SHA256:cA1Tsf8hL/pxDV5WpOE3iPW3b4uDQosu1dOh//4a/fk</span>; stop if it shows any other. The wallet is part of <code>cmfd-node</code> in that archive; Windows uses the <code>.zip</code> runtime and <code>cmfd-node.exe</code>.</p>
           </li>
           <li>
@@ -339,7 +339,7 @@ bitcoin-cli … gettransaction "&lt;txid&gt;"</pre></div>
           <div><dt>Fees</dt><dd>Every transaction pays the network minimum of 0.1 CMFD, which is burned. <code>settxfee</code>, <code>fee_rate</code> and <code>conf_target</code> are accepted and ignored; <code>estimatesmartfee</code> returns 0.1.</dd></div>
           <div><dt>Change</dt><dd>Unconfirmed outputs cannot be spent, so change returns after one block. The wallet keeps 25 coins ready to cover this.</dd></div>
           <div><dt>Incoming</dt><dd>Deposits appear once mined (1 confirmation), not while in the mempool.</dd></div>
-          <div><dt>Input limit</dt><dd>A transaction takes at most 128 inputs. When the wallet holds more than 200 coins, it merges the 128 smallest into one and pays the 0.1 CMFD fee for it. Merges are not listed by <code>listtransactions</code>; <code>gettransaction</code> shows them. Set <code>consolidatethreshold=0</code> to turn this off.</dd></div>
+          <div><dt>Input limit</dt><dd>A transaction takes at most 128 inputs. When the wallet holds more than 200 coins, it merges the 128 smallest into one and pays the 0.1 CMFD fee for it. Merges are not listed by <code>listtransactions</code>; <code>gettransaction</code> shows them. Set <code>consolidatethreshold=0</code> to turn this off. Deposits younger than 100 blocks are never merged, and withdrawals spend them only when older coins cannot pay.</dd></div>
           <div><dt>Not available</dt><dd>Raw-transaction building (<code>createrawtransaction</code>, <code>signrawtransactionwithwallet</code>, <code>fundrawtransaction</code>), key import and export, message signing, and multiple wallets.</dd></div>
         </dl>
       </section>
@@ -393,16 +393,16 @@ bitcoin-cli … gettransaction "&lt;txid&gt;"</pre></div>
 
       <section id="advanced">
         <h2>Advanced route</h2>
-        <p>Some exchanges prefer to hold one key file per address and build every transaction themselves. For that, the release includes offline tools (<code>exchange-key-new</code>, <code>exchange-tx-sign</code>) and the exchange JSON-RPC with deposit event streams. The <a href="https://github.com/Common-Foundry-1/CommonFoundry/blob/v1.0.14/exchange-kit/INTEGRATION-GUIDE.md">full integration guide</a> covers this route in detail, along with error catalogs and the hosted endpoint's method list.</p>
+        <p>Some exchanges prefer to hold one key file per address and build every transaction themselves. For that, the release includes offline tools (<code>exchange-key-new</code>, <code>exchange-tx-sign</code>) and the exchange JSON-RPC with deposit event streams. The <a href="https://github.com/Common-Foundry-1/CommonFoundry/blob/v1.0.15/exchange-kit/INTEGRATION-GUIDE.md">full integration guide</a> covers this route in detail, along with error catalogs and the hosted endpoint's method list.</p>
       </section>
     </main>
   </div>
 
   <footer>
-    <span>Common Foundry mainnet · exchange integration · v1.0.14</span>
+    <span>Common Foundry mainnet · exchange integration · v1.0.15</span>
     <span>
-      <a href="https://github.com/Common-Foundry-1/CommonFoundry/blob/v1.0.14/exchange-kit/INTEGRATION-GUIDE.md">Integration guide</a> ·
-      <a href="https://github.com/Common-Foundry-1/CommonFoundry/blob/v1.0.14/docs/mainnet-release-verification.md">Release verification</a> ·
+      <a href="https://github.com/Common-Foundry-1/CommonFoundry/blob/v1.0.15/exchange-kit/INTEGRATION-GUIDE.md">Integration guide</a> ·
+      <a href="https://github.com/Common-Foundry-1/CommonFoundry/blob/v1.0.15/docs/mainnet-release-verification.md">Release verification</a> ·
       <a href="https://explorer.commonfoundry.ai">Explorer</a>
     </span>
   </footer>

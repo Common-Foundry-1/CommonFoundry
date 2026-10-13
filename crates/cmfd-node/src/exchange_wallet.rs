@@ -7,6 +7,7 @@
 //! exchange's own node) through [`ChainSource`]; the wallet keeps only its own
 //! coins, transactions and the hashes of the blocks it has scanned.
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, Write};
@@ -55,6 +56,10 @@ const SAVE_EVERY_BLOCKS: u64 = 100;
 const KEEP_SPENDABLE_COINS: usize = 25;
 /// Smallest coin produced when splitting change (1 CMFD).
 const MIN_SPLIT_CHANGE: u64 = 100_000_000;
+/// Deposits younger than this are never merged and are spent only when older
+/// coins cannot pay, so an exchange that finds deposits with `listunspent`
+/// sees them first.
+const SETTLED_CONFIRMATIONS: u64 = 100;
 const SAVE_EVERY: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Error)]
@@ -1316,6 +1321,12 @@ impl Wallet {
             .collect()
     }
 
+    /// Change, or a deposit at least `SETTLED_CONFIRMATIONS` deep.
+    fn is_settled(&self, coin: &Coin) -> bool {
+        coin.chain == KeyChain::Change
+            || self.confirmations_at(coin.height) >= SETTLED_CONFIRMATIONS
+    }
+
     pub fn balance(&self, minimum_confirmations: u64) -> u64 {
         let confirmed = self
             .spendable(minimum_confirmations)
@@ -1394,7 +1405,8 @@ impl Wallet {
             .try_fold(0_u64, |sum, (_, value)| sum.checked_add(*value))
             .ok_or_else(|| WalletError::Invalid("Amount out of range".to_owned()))?;
         let mut coins = self.spendable(minimum_confirmations);
-        coins.sort_by(|left, right| right.value.cmp(&left.value));
+        // Largest first, with deposits that are not yet settled last.
+        coins.sort_by_key(|coin| (!self.is_settled(coin), Reverse(coin.value)));
         let mut fee = cmfd_consensus::economics::minimum_transaction_fee(self.network_id).max(1);
         loop {
             let needed = if subtract_fee_from.is_empty() {
@@ -1620,6 +1632,10 @@ impl Wallet {
         }
         let mut coins = self.spendable(1);
         if coins.len() <= threshold {
+            return Ok(None);
+        }
+        coins.retain(|coin| self.is_settled(coin));
+        if coins.len() < 2 {
             return Ok(None);
         }
         coins.sort_by_key(|coin| coin.value);
@@ -2372,6 +2388,12 @@ mod tests {
         ));
         mine(&mut node, miner);
         sync(&wallet, &mut node);
+        // The small coins are deposits that are not yet settled: no merge.
+        assert!(lock(&wallet).prepare_consolidation(200).unwrap().is_none());
+        for _ in 0..SETTLED_CONFIRMATIONS {
+            mine(&mut node, miner);
+        }
+        sync(&wallet, &mut node);
         let merge = lock(&wallet).prepare_consolidation(200).unwrap().unwrap();
         NodeSource(&mut node).broadcast(&merge.transaction).unwrap();
         assert!(lock(&wallet).prepare_consolidation(200).unwrap().is_none());
@@ -2396,5 +2418,57 @@ mod tests {
             Err(WalletError::Locked)
         ));
         assert!(lock(&wallet).prepare_consolidation(1).unwrap().is_none());
+    }
+
+    #[test]
+    fn new_deposits_are_spent_last_and_not_merged() {
+        let node_dir = TestDirectory::new("settled-node");
+        let payer_dir = TestDirectory::new("settled-payer");
+        let exchange_dir = TestDirectory::new("settled-exchange");
+        let mut node = Node::open_with_profile(&node_dir.0, DEVNET_PROFILE).unwrap();
+        let network = node.params.network_id;
+        let miner = node.wallet_destination();
+        let payer = Mutex::new(Wallet::create(&payer_dir.0, network, &tip_of(&node)).unwrap());
+        let exchange =
+            Mutex::new(Wallet::create(&exchange_dir.0, network, &tip_of(&node)).unwrap());
+        let funding_address = lock(&payer).new_address(KeyChain::Receive, "").unwrap();
+        let reward = mine(&mut node, funding_address).coinbase.outputs[0].value;
+        for _ in 0..COINBASE_MATURITY {
+            mine(&mut node, miner);
+        }
+        sync(&payer, &mut node);
+
+        let deposit = |node: &mut Node, value: u64| {
+            let address = lock(&exchange).new_address(KeyChain::Receive, "").unwrap();
+            let prepared = lock(&payer)
+                .prepare_send(&[(address, value)], &[], 1, None, None)
+                .unwrap();
+            NodeSource(node).broadcast(&prepared.transaction).unwrap();
+            mine(node, miner);
+            sync(&payer, node);
+            sync(&exchange, node);
+            (H32(prepared.txid), 0)
+        };
+        // A settled deposit, then a larger one that has just confirmed.
+        let old = deposit(&mut node, reward / 4);
+        for _ in 0..SETTLED_CONFIRMATIONS {
+            mine(&mut node, miner);
+        }
+        let new = deposit(&mut node, reward / 2);
+        assert_eq!(lock(&exchange).spendable(1).len(), 2);
+
+        // The new deposit is not merged, which leaves nothing to merge.
+        assert!(lock(&exchange).prepare_consolidation(1).unwrap().is_none());
+        // A withdrawal pays from the settled deposit although the new one is larger.
+        let outside = outside_address();
+        let first = lock(&exchange)
+            .prepare_send(&[(outside, 1_000_000)], &[], 1, None, None)
+            .unwrap();
+        assert_eq!(lock(&exchange).tx(first.txid).unwrap().spends, vec![old]);
+        // With that coin reserved, the new deposit still pays rather than fail.
+        let second = lock(&exchange)
+            .prepare_send(&[(outside, reward / 8)], &[], 1, None, None)
+            .unwrap();
+        assert_eq!(lock(&exchange).tx(second.txid).unwrap().spends, vec![new]);
     }
 }

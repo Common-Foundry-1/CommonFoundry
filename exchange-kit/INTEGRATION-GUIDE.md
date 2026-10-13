@@ -116,6 +116,8 @@ Credit deposits after at least 60 confirmations, for example with
   coins (`consolidatethreshold` in the config; 0 turns it off), it merges the
   128 smallest into one, paying the 0.1 CMFD fee. Merges are not listed by
   `listtransactions`; `gettransaction` shows them.
+- **Deposits younger than 100 blocks are never merged**, and withdrawals spend
+  them only when older coins cannot pay.
 - **Not available:** raw-transaction building (`createrawtransaction`,
   `signrawtransactionwithwallet`, `fundrawtransaction`), key import and export,
   message signing and multiple wallets.

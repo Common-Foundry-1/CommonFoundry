@@ -394,6 +394,19 @@ fn real_mainnet_peer_backlog_catches_moving_head_without_poll_sleep() {
     println!("REAL_PEER_STAGE three ordinary one-block sessions with full real proofs");
     let (baseline, checker) =
         open_node(&output.join("ordinary-sessions"), &launch, &artifacts, None);
+    // Each block's work is re-executed on the CPU before the sessions, which
+    // then time catch-up as the moving-peer stage below does: a debug-build
+    // check outlasts the fixture peer's wait after a served block. Admission
+    // still checks each block's work against this result and records it.
+    let started = Instant::now();
+    for block in b.iter() {
+        let BlockProof::V4Candidate(proof) = &block.proof else {
+            unreachable!("the fixture holds ProductionV4 blocks only");
+        };
+        checker.prewarm(proof.challenge_digest).unwrap();
+        check_memory();
+    }
+    let ordinary_work_prewarm_ms = started.elapsed().as_millis();
     let fixture_peer =
         FixturePeer::start(baseline.lock().unwrap().peer_hello(), Arc::clone(&b), false);
     let dispatches = Arc::clone(&baseline.lock().unwrap().block_preverifier.worker_dispatches);
@@ -471,6 +484,7 @@ fn real_mainnet_peer_backlog_catches_moving_head_without_poll_sleep() {
         "real_v4_blocks_per_case": 3, "frame_bytes_each": FRAME_BYTES,
         "session_byte_limit": limits.max_bytes_per_peer, "blocks_per_session": limits.max_blocks_per_session,
         "fixture_blocks_offered_per_session": 1,
+        "ordinary_work_prewarm_ms": ordinary_work_prewarm_ms,
         "ordinary_session_ms": ordinary_session_ms, "ordinary_proof_dispatches": ordinary_dispatches,
         "ordinary_peer_stats": ordinary_stats,
         "poll_interval_seconds": 60, "qualification_timeout_seconds": 45,

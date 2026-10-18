@@ -15,7 +15,12 @@ ExecStartPre=/usr/local/sbin/commonfoundry-disk-guard
 LoadCredential=wallet-passphrase:/etc/commonfoundry/wallet-passphrase
 RuntimeDirectory=commonfoundry
 RuntimeDirectoryMode=0700
-ExecStartPre=/usr/bin/install --mode=0600 %d/wallet-passphrase /run/commonfoundry/wallet-passphrase
+# systemd 249 (Ubuntu 22.04) has no %d specifier and fills the credentials
+# directory only for ExecStart=, so a privileged ("+") copy reads the root-only
+# /etc source and gives the service user a 0600 runtime copy. LoadCredential= is
+# kept on purpose to declare the same source. A drop-in that changes User=/Group=
+# or the source path must change this line too.
+ExecStartPre=+/usr/bin/install --mode=0600 --owner=commonfoundry --group=commonfoundry /etc/commonfoundry/wallet-passphrase /run/commonfoundry/wallet-passphrase
 ExecStart=/opt/commonfoundry/current/cmfd-node --data-dir /var/lib/commonfoundry --wallet-passphrase-file /run/commonfoundry/wallet-passphrase run --bind 127.0.0.1:19443 --p2p-bind 0.0.0.0:19444 --allow-public-peers --no-default-seeds
 Restart=on-failure
 RestartSec=5s

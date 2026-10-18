@@ -124,6 +124,7 @@ class StorageReadinessTests(unittest.TestCase):
         self.assertIn("--bind 127.0.0.1:29443 --p2p-bind 0.0.0.0:29444", source)
         self.assertIn("User=commonfoundry-mainnet\n", source)
         self.assertIn("TimeoutStartSec=infinity", source)
+        self.assertIn("RestartPreventExitStatus=4\n", source)
         self.assertNotIn("/opt/commonfoundry/", source)
         self.assertNotIn("/var/lib/commonfoundry ", source)
         self.assertNotIn("19444", source)
@@ -165,17 +166,65 @@ class StorageReadinessTests(unittest.TestCase):
                 self.assertEqual(opened.stdout, b"p")
             self.assertNotEqual(probe("-w", models), 0)
 
+    def test_credential_copies_work_on_systemd_249(self):
+        # Ubuntu 22.04 ships systemd 249. It refuses to load a unit that uses the
+        # %d specifier (added in 250: "Invalid slot"), and it fills
+        # $CREDENTIALS_DIRECTORY only for ExecStart=, not for ExecStartPre=. So
+        # the copy reads the root-only LoadCredential= source as root ("+") and
+        # gives the service user the same 0600 file in its private runtime directory.
+        repo = Path(__file__).resolve().parents[2]
+        copies = 0
+        for unit in sorted(repo.glob("packaging/**/*.service")):
+            lines = [line for line in unit.read_text().splitlines() if not line.startswith("#")]
+            self.assertFalse([line for line in lines if "%d" in line], unit)
+            settings = {}
+            for line in lines:
+                key, _, value = line.partition("=")
+                settings.setdefault(key, []).append(value)
+            destinations = []
+            for command in settings.get("ExecStartPre", []):
+                self.assertNotIn("CREDENTIALS_DIRECTORY", command, unit)
+                argv = command.split()
+                if argv[0].lstrip("+") != "/usr/bin/install":
+                    continue
+                copies += 1
+                self.assertEqual(argv[:4], ["+/usr/bin/install", "--mode=0600",
+                                            "--owner=" + settings["User"][0], "--group=" + settings["Group"][0]], unit)
+                self.assertEqual(len(argv), 6, unit)
+                self.assertIn(argv[4], [value.split(":", 1)[1] for value in settings["LoadCredential"]], unit)
+                self.assertEqual(argv[5].rpartition("/")[0], "/run/" + settings["RuntimeDirectory"][0], unit)
+                self.assertEqual(settings["RuntimeDirectoryMode"], ["0700"], unit)
+                destinations.append(argv[5])
+            if not destinations:
+                continue
+            # The copies must be exactly the files the service reads: the node's
+            # --wallet-passphrase-file, or the paths the pool launcher passes on.
+            start = settings["ExecStart"][0].split()
+            if "--wallet-passphrase-file" in start:
+                reads = [start[start.index("--wallet-passphrase-file") + 1]]
+            else:
+                launcher = (unit.parent / Path(start[1]).name).read_text()
+                runtime = re.search(r'(?m)^RUNTIME = Path\("([^"]+)"\)$', launcher).group(1)
+                reads = [runtime + "/" + name for name in re.findall(
+                    r'"--(?:wallet-passphrase-file|private-key)", str\(credential_base / "([^"]+)"\)', launcher)]
+            self.assertEqual(sorted(destinations), sorted(reads), unit)
+        self.assertEqual(copies, 4)
+
     @unittest.skipUnless(sys.platform.startswith("linux") and shutil.which("systemd-analyze"), "systemd syntax verification is Linux-only")
     def test_systemd_parser_accepts_templates_without_installing_them(self):
         repo = Path(__file__).resolve().parents[2]
+        units = [*(repo / "packaging/mainnet/linux").glob("commonfoundry-mainnet-*.*"),
+                 repo / "packaging/production-rc/linux/commonfoundry-node.service"]
         with tempfile.TemporaryDirectory() as temporary:
             paths = []
-            for original in (repo / "packaging/mainnet/linux").glob("commonfoundry-mainnet-*.*"):
+            for original in units:
                 if original.suffix not in (".service", ".timer"):
                     continue
                 # Only executable existence is stubbed. No service is installed
-                # or started; all original policy and path directives are parsed.
-                source = re.sub(r"(?m)^(ExecStart(?:Pre)?)=.*$", r"\1=/usr/bin/true", original.read_text())
+                # or started; all original policy and path directives, command
+                # prefixes and arguments are parsed, so a specifier this host's
+                # systemd lacks (such as %d before systemd 250) fails here.
+                source = re.sub(r"(?m)^(ExecStart(?:Pre)?=[-+!:]*)\S+", r"\1/usr/bin/true", original.read_text())
                 path = Path(temporary) / original.name
                 path.write_text(source)
                 paths.append(str(path))

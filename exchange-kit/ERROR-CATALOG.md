@@ -24,9 +24,17 @@ meaning; the composite pair always maps to one handling rule.
 | `-32009` | Idempotency, state, anchor, approval, or signer conflict | Stop and reconcile durable state; do not create a replacement |
 | `-32010` | Credential scope or withdrawal availability failure | Correct routing/configuration; never share credentials |
 | `-32011` | Method requires custody v3 | Stop and qualify the explicit v3 deployment |
+| `-32030` | Block admission halted or work engine failed (`work_rule_halted`, `work_engine_failed`); or, for chain-state reads and `preparewithdrawal`, stored blocks above the validated height are not yet checked (`work_check_pending`) | Halted or failed: pause crediting and withdrawals and retry later, the node operator must act. Pending check: keep retrying; on the first start after an upgrade it lasts until the node has checked every block it stored since the release checkpoint, about (those blocks) ÷ (blocks it checks per hour − 62) hours, often many hours (see the [integration guide](../docs/exchange-integration.md#the-served-chain-and-the-validated-height)) |
 | `-32603` | Internal invariant failure | Stop the affected workflow and preserve node logs |
 
 `retryable: true` permits an unchanged retry after the indicated transient
 condition clears. It never permits changing an anchor, request fields,
 transaction bytes, approval, signer response, or cursor already committed by
 the exchange.
+
+`mempool_close_limit` (`-32005`, retryable) refuses a payment-channel close (a
+settlement or a refund) because the node's mempool already holds its budget of
+closes: 128 closes or 96 KiB of them, inside the general mempool limits.
+Transfers, sweeps and withdrawals are never refused for it. The sender resends
+the identical close later, once blocks have taken some of the waiting closes
+out of the mempool.

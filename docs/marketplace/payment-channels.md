@@ -23,6 +23,12 @@ that payment.
 7. If the provider disappears, the customer can reclaim the unused deposit
    after `refund_height`; the close fee is still burned.
 
+A node's mempool holds at most 128 channel closes (settlements and refunds),
+96 KiB of them in all, inside its general limits. A close past that budget is
+refused with the retryable `mempool_close_limit` (HTTP 422, JSON-RPC -32005).
+Send the identical close again later, once blocks have taken some of the
+waiting closes out of the mempool; nothing about the close has to change.
+
 The signed state is cumulative, so an old state can only pay the provider less.
 The provider has the newest state and therefore has the incentive and ability
 to submit it. A customer's maximum exposure to nondelivery is one configured

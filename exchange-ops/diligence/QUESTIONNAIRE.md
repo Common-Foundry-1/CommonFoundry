@@ -12,7 +12,7 @@ Every answer must name its owner, date, evidence artifact, and approval status.
 | Distribution | Per-block 70/25/5 bootstrap; miner-only tail; no encoded up-front premine | Destination ownership disclosures; legal confirmation of no token sale |
 | Deposit model | Immutable pseudonymous labels mapped to externally supplied x-only keys; durable added/removed event feed | Exchange custody architecture and confirmation policy |
 | Withdrawal model | Prepared journal, threshold approvals, external anchors, provider-neutral signer responses | Exchange policy, approver roster, HSM design, rehearsal |
-| Address format | Raw lowercase x-only-key hex; no checksum | Product decision and wallet-wide implementation |
+| Address format | x-only key as lowercase hex or as a checksummed bech32m address (`cmfd1...`, BIP-350); both accepted as input everywhere, hex stays the default output; released in 1.0.16 | Signed 1.0.16 release; desktop wallet and explorer display; venue choice of display form |
 | RPC transport | Loopback HTTP with separate Basic-auth scopes | Exchange-managed mTLS proxy and network controls |
 | Audit | Internal review and audit candidate only | Named independent auditor and accepted final report |
 | HSM | Protocol/reference signer only | Selected vendor, adapter, possession test, failover evidence |

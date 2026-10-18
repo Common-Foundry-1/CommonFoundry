@@ -158,7 +158,70 @@ The proof worker runs on the pool process's default CUDA device unless
 proof needs about 7 GiB of free VRAM while a replay worker keeps about 6.5 GiB
 resident, so on 16 GB cards the proof GPU must not also run a replay worker;
 the pool logs a warning when it does. A proof-worker failure on a chain-winning
-share is retried once after the worker restarts.
+share is retried once after the worker restarts. While a share is proved, its
+replay worker is free for other shares and for block work checks, and no
+replay worker lock is held while the proof worker is taken. On a single-GPU
+pool (and always under WSL) the proof therefore runs beside that GPU's share
+replays; the extra GPU load during a proof has not been measured yet.
+
+With `--work-engine auto` (the default) the node re-executes each new block's
+work on an idle replay worker and falls back to the CPU engine. It uses a
+replay worker for this only while the worker runs the release's
+`cmfd-v4-replay` file: the file's SHA-256 is checked at startup and again each
+time a replay worker starts. Any other replay worker still serves shares; the
+pool then prints a warning and checks blocks on the CPU engine only. The
+startup report's `work_checks_use_replay_workers` and the node status's
+`work_rule.engines` (`cpu+gpu` or `cpu`) show which applies. Mainnet packaging
+refuses a replay worker whose SHA-256 differs from the one compiled into the
+node. For a block the pool finds, the replay worker that replayed it also
+replays one known answer before it is released (waiting at most 2 s; a
+worker that takes longer is restarted), so the node can use the pool's own
+result without borrowing that worker again. A worker that gets that known
+answer wrong is retired until its known answers pass again, and the block is
+checked on another worker or on the CPU. The pool's CPU engine reads the
+model bank from disk for each block it checks; `--work-bank resident` holds
+the bank in memory instead (about 6 GiB more), if the proof worker can spare
+it.
+
+Run the release's `cmfd-v4-replay` for shares and block checks alike: one
+`--production-v4-pool-replay-worker` path serves both, and the release check
+applies to that file. With any other replay worker, shares still work, but
+every block is checked on the CPU. On the first start the pool then hands out
+no work for hours while it checks the stored blocks, and afterwards each new
+block waits one CPU check (about 6 to 36 s, depending on the CPU and the bank
+mode) before the pool moves its template to it, so the pool mines on the old
+tip meanwhile and loses some of the blocks it finds. If a pool has to check on
+the CPU, `--work-bank resident` (with at least 8 GiB of free RAM) and more
+`--work-threads` shorten each check.
+
+On the first start after an upgrade, `pool-serve` checks every block it stored
+since the release checkpoint before it opens the miner port: minutes with the
+release replay worker, hours on the CPU. Its progress is in
+`<data-dir>/logs/cmfd-node.log.<date>` ("checking stored blocks"). Do not
+restart it to hurry it; progress is kept, but every start loads the model bank
+and repeats the known answers. A pool unit should carry
+`RestartPreventExitStatus=3 4`: status 3 means block admission has halted and
+waits for an operator (the log names the block and the next step), and status
+4 means the start was refused for a reason a restart does not change (a stored
+chain that conflicts with the release checkpoint or needs a resync, a
+work-status store that cannot be opened, or a release file that is not the
+pinned one). In both cases fix what the log names, then reset the unit's
+failed state and start it.
+
+New blocks reach a pool fastest over direct links. Give `pool-serve` static
+peers (`--peer`) to the other pools' P2P listeners and to the relays
+`88.198.110.195:29444` and `209.145.48.36:29444` (public addresses also need
+`--allow-public-peers`), instead of depending on the seed alone. The packaged
+Linux service takes the relays from `mainnet_relays` in `pool.json`.
+
+`work_checks_use_replay_workers` and `work_rule.engines` say which engines are
+installed, not whether they are healthy. Before a pool takes miners, also
+check that the startup `work_rule` line shows `"gpu_qualified": true` (the GPU
+known answers ran and passed) and that node status shows
+`work_rule.independent_engines: true` and `work_rule.alarms.engine_failures: 0`.
+A replay worker retired later (a wrong known answer, or a restart from a file
+that no longer matches the release build) raises `engine_failures`; on a
+single-GPU pool it also turns `independent_engines` false.
 
 `pool-serve` accepts 256 simultaneous miner connections by default and at most
 64 from one source address. Change them with `--pool-max-connections` (1 to
@@ -219,7 +282,8 @@ A sponsor (for example the Common Foundry stewardship fund) can fund a mining
 bonus on a community pool. The bonus is pool-local accounting: it changes no
 consensus rule and no wire message. The operator starts `pool-serve` with
 `--pool-bonus-rate-bps N` (1 to 10000) and `--pool-bonus-sponsor KEY`, the
-sponsor's 64-hex x-only key; both are required together, and the sponsor must
+sponsor's x-only key as 64 hex characters or a `cmfd1...` address; both are
+required together, and the sponsor must
 differ from the pool's own block-reward destination. The service launcher reads
 the same values from `bonus_rate_bps` and `bonus_sponsor` in `pool.json`.
 

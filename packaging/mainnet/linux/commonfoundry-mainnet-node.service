@@ -21,12 +21,19 @@ ExecStartPre=/usr/bin/test -f /opt/commonfoundry-mainnet/current/production-v4/M
 ExecStartPre=/usr/bin/test -r /opt/commonfoundry-mainnet/current/production-v4/MODEL-V2.bank
 ExecStartPre=/usr/bin/test -f /opt/commonfoundry-mainnet/current/production-v4/FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json
 ExecStartPre=/usr/bin/test -r /opt/commonfoundry-mainnet/current/production-v4/FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json
-ExecStartPre=/usr/bin/install --mode=0600 %d/wallet-passphrase /run/commonfoundry-mainnet/wallet-passphrase
+# systemd 249 (Ubuntu 22.04) has no %d specifier and fills the credentials
+# directory only for ExecStart=, so a privileged ("+") copy reads the root-only
+# /etc source and gives the service user a 0600 runtime copy. LoadCredential= is
+# kept on purpose to declare the same source. A drop-in that changes User=/Group=
+# or the source path must change this line too.
+ExecStartPre=+/usr/bin/install --mode=0600 --owner=commonfoundry-mainnet --group=commonfoundry-mainnet /etc/commonfoundry-mainnet/wallet-passphrase /run/commonfoundry-mainnet/wallet-passphrase
 ExecStartPre=/opt/commonfoundry-mainnet/current/cmfd-launch fetch --runtime /opt/commonfoundry-mainnet/current/cmfd-node --wait
 ExecStart=/opt/commonfoundry-mainnet/current/cmfd-node --data-dir /var/lib/commonfoundry-mainnet --wallet-passphrase-file /run/commonfoundry-mainnet/wallet-passphrase run --bind 127.0.0.1:29443 --p2p-bind 0.0.0.0:29444 --allow-public-peers --no-default-seeds
 TimeoutStartSec=infinity
 TimeoutStopSec=90
 Restart=on-failure
+# A start refused for a reason a restart does not change exits with 4.
+RestartPreventExitStatus=4
 RestartSec=15
 UMask=0077
 LimitNOFILE=65536

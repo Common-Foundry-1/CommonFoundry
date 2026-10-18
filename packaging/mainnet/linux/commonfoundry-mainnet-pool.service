@@ -19,15 +19,23 @@ LoadCredential=wallet-passphrase:/etc/commonfoundry-mainnet-pool/wallet-passphra
 LoadCredential=pool-private-key:/etc/commonfoundry-mainnet-pool/pool-key.der
 Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStartPre=/opt/commonfoundry-mainnet-pool/current/cmfd-node mainnet-launch-info
-# systemd may use an ACL-backed 0440 credential; the wallet requires 0600.
-# Copies remain in the service-owned 0700 runtime directory and vanish on stop.
-ExecStartPre=/usr/bin/install --mode=0600 %d/wallet-passphrase /run/commonfoundry-mainnet-pool/wallet-passphrase
-ExecStartPre=/usr/bin/install --mode=0600 %d/pool-private-key /run/commonfoundry-mainnet-pool/pool-private-key
+# The wallet requires a 0600 passphrase file. Privileged ("+") copies read the
+# root-only /etc sources and leave service-owned 0600 files in the 0700 runtime
+# directory; they vanish on stop. systemd 249 (Ubuntu 22.04) has no %d specifier
+# and fills the credentials directory only for ExecStart=, so the copies cannot
+# use it. LoadCredential= is kept on purpose to declare the same sources.
+# A drop-in that changes User=/Group= or a source path must change these lines too.
+ExecStartPre=+/usr/bin/install --mode=0600 --owner=commonfoundry-mainnet-pool --group=commonfoundry-mainnet-pool /etc/commonfoundry-mainnet-pool/wallet-passphrase /run/commonfoundry-mainnet-pool/wallet-passphrase
+ExecStartPre=+/usr/bin/install --mode=0600 --owner=commonfoundry-mainnet-pool --group=commonfoundry-mainnet-pool /etc/commonfoundry-mainnet-pool/pool-key.der /run/commonfoundry-mainnet-pool/pool-private-key
 ExecStart=/usr/bin/python3 /opt/commonfoundry-mainnet-pool/current/mainnet-pool-service.py --run /etc/commonfoundry-mainnet-pool/pool.json
 KillSignal=SIGINT
 TimeoutStartSec=infinity
 TimeoutStopSec=240
 Restart=on-failure
+# Status 3: the node will not start this service while block admission is halted
+# by the work rule; an operator acts first (see the instructions in the log).
+# Status 4: a start refused for a reason a restart does not change.
+RestartPreventExitStatus=3 4
 RestartSec=30
 UMask=0077
 LimitNOFILE=65536

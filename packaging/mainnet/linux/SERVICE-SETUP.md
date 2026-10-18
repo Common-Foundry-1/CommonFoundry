@@ -59,12 +59,114 @@ plan. The node additionally checks the compiled plan digest and beacon signature
 Do not make the whole release directory writable. Review these ownership/mode
 settings after every release switch.
 
-The service uses systemd credentials for the passphrase and waits for the fixed
-launch certificate before starting the node. Waiting may last through the
-preparation window; `TimeoutStartSec=infinity` is intentional. Stop/cancel still
-works through systemd. RPC binds only to localhost:29443. Public inbound peers
+Before starting the node, a privileged (`ExecStartPre=+`) step copies the
+root-only `/etc/commonfoundry-mainnet/wallet-passphrase` into the 0700 runtime
+directory as a service-owned 0600 file; the copy disappears when the service
+stops. systemd 249 (Ubuntu 22.04) fills the `LoadCredential` directory only for
+`ExecStart=`, so the copy reads the `/etc` file directly. That line names the
+service user, group and source path literally: a drop-in that overrides `User=`,
+`Group=` or the passphrase path must override the copy line as well.
+
+The service waits for the fixed launch certificate before starting the node.
+Waiting may last through the preparation window; `TimeoutStartSec=infinity` is
+intentional. Stop/cancel still works through systemd. RPC binds only to localhost:29443. Public inbound peers
 use TCP 29444. Firewall changes and public reachability must be checked separately;
 the template neither changes the firewall nor provisions a public seed.
+
+## Block checks (from 1.0.16)
+
+The node re-executes the work of every new block above the release checkpoint
+on its CPU before it accepts the block. For each block it reads the 6.4 GB
+model bank. With the default `--work-bank auto` it holds the bank in memory
+when about 8 GiB is available at start (a systemd `MemoryMax=` or container
+limit counts), and otherwise reads it from disk for every block, which needs an
+SSD. On a server with the memory to spare, pass `--work-bank resident`
+explicitly, so a busy moment at start does not leave it streaming.
+`--work-threads <n>` sets the CPU threads per block (default: half the logical
+processors, at most 8). A node that needs more than about 60 seconds per block
+cannot keep up with the chain; the project's relays take 6 to 28 seconds with
+the bank in memory. Both options belong after `run`. To add them, use a
+drop-in that clears `ExecStart=` and repeats the packaged line with the
+options added, for example
+`/etc/systemd/system/commonfoundry-mainnet-node.service.d/40-work.conf`:
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/opt/commonfoundry-mainnet/current/cmfd-node --data-dir /var/lib/commonfoundry-mainnet --wallet-passphrase-file /run/commonfoundry-mainnet/wallet-passphrase run --bind 127.0.0.1:29443 --p2p-bind 0.0.0.0:29444 --allow-public-peers --no-default-seeds --work-bank resident
+```
+
+Then run `systemctl daemon-reload`. Recheck the drop-in after every release
+switch, since it repeats the packaged line.
+
+**First start after an upgrade.** Before that start, copy `startup-index.bin`
+in the data directory aside (for example as `startup-index.bin.v1`) so a
+rollback to an older release does not rescan the whole log (see
+`docs/storage-recovery.md`). The node then opens its RPC, exchange RPC and P2P
+straight away and checks every block it stored since the release checkpoint in
+the background. Until it is done, the exchange RPC serves only checked blocks,
+and balance, UTXO and supply reads answer the retryable `work_check_pending`.
+The check takes about (blocks stored since the checkpoint) ÷ (blocks checked
+per hour − 62) hours. The chain adds about 1,500 blocks a day, and a server CPU
+checks roughly 130 to 600 blocks an hour, so a node upgraded one day after the
+release needs from about 3 to about 22 hours. Watch it with
+
+```sh
+curl -s http://127.0.0.1:29443/v1/status
+```
+
+until `work_rule.validated_height` reaches `accepted_height`. The daily file
+log `/var/lib/commonfoundry-mainnet/logs/cmfd-node.log.<date>` records the
+progress as well; the journal shows only errors by default. **Do not restart
+the node to hurry it:** progress is kept, but every start loads the model bank
+and repeats the engine self-checks. A node set up from scratch checks every
+block above the checkpoint the same way, so plan that CPU time.
+
+At start the node prints a `work_backlog` line with `"mode": "background"`,
+`blocks_left`, `validated_height` and `tip_height`. While more than 30 stored
+active blocks are left above the validated height, the file log gets a warn
+line with target `work_rule` about every 10 minutes (the first one 10 minutes
+after the start) with `blocks_left`, `checked` (blocks checked since the
+start), `checked_per_hour` (over the last 10 minutes), `eta`, `validated_height`
+and `tip_height`. New blocks keep arriving meanwhile, so `eta` follows how fast
+`blocks_left` fell over those 10 minutes, not `checked_per_hour`; it reads
+`none at this rate` while the node checks no faster than blocks arrive. The
+journal shows the `work_backlog` line, and the warn lines only when the node
+runs with `-v` or more.
+
+The packaged unit keeps `Restart=on-failure` on purpose: a node halted by the
+work rule restarts and then serves its status, halted, with the steps in its
+log. A `run` node has one kind of work engine, the CPU, so it does not settle
+a block whose work it finds does not match: it holds
+`work_rule.validated_height` below that block, reports
+`work_rule.unsettled_height` and `work_rule.unsettled_block_id`, and checks the
+block again every 6 hours. Compare that block id with another node and the
+explorer. `cmfd-node work-reconsider` only makes the node check the block
+again; if the block matches elsewhere, report it to the release maintainers.
+Monitor `halted`, `engine_state`, `unsettled_height` and the gap between
+`validated_height` and `accepted_height` in `/v1/status`.
+
+A node whose stored chain at or below the checkpoint differs from the chain the
+release pins refuses to start and prints the `cmfd-node
+storage-quarantine-block` command to run with the node stopped.
+
+The packaged unit has `RestartPreventExitStatus=4`. Exit status 4 means the
+node refused to start for a reason a restart does not change: the stored chain
+conflict above, that conflict on a block already pruned (the node then needs a
+resync from an empty data directory), a work-status store that cannot be opened
+(its permissions or a read-only file system), or a release file that is not the
+pinned one. The journal (`journalctl -u commonfoundry-mainnet-node`) names
+which. Fix it, then run
+`systemctl reset-failed commonfoundry-mainnet-node` and start the service. A
+full disk or a failed read or write is not status 4; the unit restarts after
+those. `cmfd-node run` does not stop with status 3: a node that halts block
+admission while it runs stops with status 1, restarts and serves its status,
+halted, as described above. A unit of your own should carry
+`RestartPreventExitStatus=4`; `3 4`, as for a pool, does no harm.
+
+The file log is written at debug level, rolls daily and is never deleted.
+Remove old files with a daily job or a logrotate rule, for example
+`find /var/lib/commonfoundry-mainnet/logs -name 'cmfd-node.log.*' -mtime +14 -delete`.
 
 ## Capacity and monitoring
 

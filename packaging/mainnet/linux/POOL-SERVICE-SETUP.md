@@ -248,9 +248,9 @@ idle replay worker for this only while that worker runs the release's
 from the new `MAINNET-PACKAGE.json`; otherwise it checks blocks on its CPU, and
 each new block then waits one CPU check before the pool moves to it, which
 costs orphaned blocks. Before taking miners, check that the node's startup
-lines show `work_checks_use_replay_workers: true` and `"gpu_qualified": true`,
-and that `/v1/status` shows `work_rule.independent_engines: true` and
-`work_rule.alarms.engine_failures: 0` (see `docs/production-v4-pool.md`).
+lines show `work_checks_use_replay_workers: true`, `"qualified": true` and
+`"gpu_qualified": true`, and later that the journal has no `work engine worker
+retired` error (see `docs/production-v4-pool.md`).
 
 On the first start after an upgrade the pool hands out no work until it has
 checked every block it stored since the release checkpoint: minutes with the

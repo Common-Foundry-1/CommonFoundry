@@ -216,12 +216,15 @@ Linux service takes the relays from `mainnet_relays` in `pool.json`.
 
 `work_checks_use_replay_workers` and `work_rule.engines` say which engines are
 installed, not whether they are healthy. Before a pool takes miners, also
-check that the startup `work_rule` line shows `"gpu_qualified": true` (the GPU
-known answers ran and passed) and that node status shows
-`work_rule.independent_engines: true` and `work_rule.alarms.engine_failures: 0`.
-A replay worker retired later (a wrong known answer, or a restart from a file
-that no longer matches the release build) raises `engine_failures`; on a
-single-GPU pool it also turns `independent_engines` false.
+check that the startup `work_rule` line shows `"qualified": true` and
+`"gpu_qualified": true` (the CPU and GPU known answers ran and passed).
+`pool-serve` has no status endpoint, so watch its log afterwards: a replay
+worker retired later (a wrong known answer, or a restart from a file that no
+longer matches the release build) writes an error line `work engine worker
+retired` with target `work_rule`. On a single-GPU pool, a block whose work does
+not match can then no longer be confirmed by a second engine until the worker
+is back. A `cmfd-node run` node reports the same in `/v1/status` as
+`work_rule.independent_engines` and `work_rule.alarms.engine_failures`.
 
 `pool-serve` accepts 256 simultaneous miner connections by default and at most
 64 from one source address. Change them with `--pool-max-connections` (1 to

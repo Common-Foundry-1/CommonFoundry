@@ -29,6 +29,17 @@ class RecordingFixtureRpc(conformance.FixtureRpc):
 
 
 class ExchangeConformanceTests(unittest.TestCase):
+    def test_integration_methods_match_the_node(self) -> None:
+        # The node advertises its integration methods in getexchangeinfo; the
+        # tool requires exactly that set, so the two lists must not drift.
+        source = (SCRIPT_DIRECTORY.parent / "crates" / "cmfd-node" / "src" / "exchange_rpc.rs").read_text(
+            encoding="utf-8"
+        )
+        start = source.index('"integration": [', source.index('"methods": {'))
+        listed = source[start : source.index("]", start)]
+        node_methods = {line.strip().strip(",").strip('"') for line in listed.splitlines()[1:] if line.strip()}
+        self.assertEqual(node_methods, conformance.REQUIRED_INTEGRATION_METHODS)
+
     def test_error_catalog_uses_unique_composite_routes(self) -> None:
         catalog_path = SCRIPT_DIRECTORY.parent / "exchange-kit" / "errors.json"
         catalog = json.loads(catalog_path.read_text(encoding="utf-8"))

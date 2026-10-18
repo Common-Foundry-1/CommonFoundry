@@ -62,6 +62,7 @@ REQUIRED_INTEGRATION_METHODS = {
     "getbestblockhash",
     "getblockhash",
     "getblock",
+    "gettxoutsetinfo",
     "getrawtransaction",
     "gettransaction",
     "getaddressbalance",

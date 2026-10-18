@@ -269,9 +269,9 @@ matrix, transition, range, wiring, fixed-model, equality-link, and final-output
 claims into a canonical n=33 frame projected at 133,409 bytes. A companion
 cross-field AIR proves that the exact activation bytes hashed by BLAKE3 have the
 same multilinear evaluation opened by Dory. Its bounded canonical zlib codec
-measured 156,500 to 156,650 bytes on the 32-byte bridge fixture, down from
-222,256 to 222,384 native bytes. The resulting cross-shape composition remains
-27,980 to 28,130 bytes over the 261,947-byte V3 structured-proof cap.
+measured 156,063 to 157,455 bytes on the 32-byte bridge fixture, down from
+221,744 to 223,024 native bytes. The resulting cross-shape composition remains
+27,543 to 28,935 bytes over the 261,947-byte V3 structured-proof cap.
 Query/grinding and
 higher-blowup sweeps do not close that gap at an operationally acceptable cost,
 and a 56-point sweep across FRI terminal lengths zero through seven and maximum
@@ -403,6 +403,11 @@ admission rules; transaction propagation remains pull-only. Each
 block is fully validated before it is indexed, the active branch is selected by
 strictly greater cumulative work, and the checksummed block log is replayed on
 startup to reconstruct forks and the active tip.
+
+The wallet, mining and transaction/block submission routes answer only
+requests whose `Host` is a `127.0.0.0/8` address, `[::1]` or `localhost` and
+that carry no foreign browser `Origin`, so a DNS-rebinding web page cannot use
+them; see [docs/devnet-0.md](docs/devnet-0.md#loopback-rpc).
 
 Exchange integration work has a separate, default-disabled authenticated
 JSON-RPC listener for chain reads, canonical transaction broadcast, and a

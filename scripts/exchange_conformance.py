@@ -29,7 +29,19 @@ from typing import Any, Protocol
 
 
 EVIDENCE_SCHEMA = "CMFD_EXCHANGE_CONFORMANCE_V1"
-TOOL_VERSION = "1.1.0"
+TOOL_VERSION = "1.3.1"
+# Networks whose nodes re-execute each block's work: an endpoint on one of
+# them must report the work rule.
+WORK_RULE_NETWORK_IDS = frozenset(
+    {
+        # Mainnet.
+        "88296bc39c10e8bc1dd4818d4d42412fe5f08210651110377f495da299812f62",
+        # RCNet-1.
+        "3e99d45959c19c0053d8e9fef34875b57b46a8a1ce330637daddab515bc7b92d",
+        # The production V4 test network.
+        "b9e55d5a5e80c8e3d73bf81b199bc643ac9367436962c28b6aacdc37f3809962",
+    }
+)
 CHAIN_API_VERSION = "chain-preview-v0.4"
 CUSTODY_API_VERSION = "chain-preview-v0.5"
 HEX32 = re.compile(r"^[0-9a-f]{64}$")
@@ -223,7 +235,9 @@ def validate_encoding_capability(value: Any) -> bool:
         }
         and value["amounts"] == AMOUNT_ENCODING
         and value["destination"] == DESTINATION_ENCODING
-        and value["checksummed_address_available"] is False
+        # 1.0.16 nodes accept checksummed (bech32m) addresses for every
+        # destination parameter; destination fields in responses stay hex.
+        and value["checksummed_address_available"] is True
     )
 
 
@@ -676,6 +690,7 @@ def run_read_conformance(
     client: Rpc,
     expected_network_id: str,
     expected_consensus_fingerprint: str,
+    require_work_rule: bool = False,
 ) -> dict[str, Any]:
     checks: list[dict[str, str]] = []
     identity: dict[str, Any] = {}
@@ -822,6 +837,40 @@ def run_read_conformance(
     if isinstance(chain, dict):
         check(checks, "chain.identity_consistent", chain.get("network_id") == expected_network_id and chain.get("consensus_fingerprint") == expected_consensus_fingerprint, "chain status matches both operator pins")
         check(checks, "chain.storage_healthy", chain.get("storage_healthy") is True, "authenticated storage reports healthy")
+        # A node on a network without a work rule reports none (absent or
+        # null). On a network with one, the rule must be reported.
+        work_rule = chain.get("work_rule")
+        work_rule_required = (
+            require_work_rule or expected_network_id in WORK_RULE_NETWORK_IDS
+        )
+        if work_rule_required:
+            check(
+                checks,
+                "chain.work_rule_present",
+                isinstance(work_rule, dict),
+                "node on a network with a work rule reports it",
+            )
+        if work_rule_required or work_rule is not None:
+            work_rule_valid = isinstance(work_rule, dict)
+            validated = work_rule.get("validated_height") if work_rule_valid else None
+            blocks = chain.get("blocks")
+            check(
+                checks,
+                "chain.work_rule_ready",
+                work_rule_valid
+                and work_rule.get("enforced") is True
+                and work_rule.get("halted") is False
+                and work_rule.get("engine_ready") is True,
+                "node re-executes each new block's work, is not halted, and its engine is ready",
+            )
+            check(
+                checks,
+                "chain.validated_cap",
+                type(validated) is int
+                and type(blocks) is int
+                and 0 <= blocks <= validated,
+                "reported chain height does not exceed the validated height",
+            )
     check(checks, "chain.height_type", type(height) is int and height >= 0, "height is a nonnegative JSON integer")
     check(checks, "chain.tip_shape", isinstance(tip, str) and bool(HEX32.fullmatch(tip)), "tip is a canonical 32-byte hash")
     if type(height) is int and height >= 0 and isinstance(tip, str):
@@ -1051,7 +1100,7 @@ def fixture_responses() -> dict[str, Any]:
             "encodings": {
                 "amounts": AMOUNT_ENCODING,
                 "destination": DESTINATION_ENCODING,
-                "checksummed_address_available": False,
+                "checksummed_address_available": True,
             },
             "methods": {
                 "integration": sorted(REQUIRED_INTEGRATION_METHODS),
@@ -1082,6 +1131,13 @@ def fixture_responses() -> dict[str, Any]:
             "network_id": network,
             "consensus_fingerprint": fingerprint,
             "storage_healthy": True,
+            "blocks": 1,
+            "work_rule": {
+                "enforced": True,
+                "halted": False,
+                "engine_ready": True,
+                "validated_height": 1,
+            },
         },
         "getblockcount": 1,
         "getbestblockhash": tip,
@@ -1165,7 +1221,11 @@ def run_live(args: argparse.Namespace) -> dict[str, Any]:
     client = RpcClient(args.endpoint, args.authentication_file, args.timeout_seconds)
     report = base_report("live")
     report["endpoint"] = client.endpoint
-    report.update(run_read_conformance(client, expected_network, expected_fingerprint))
+    report.update(
+        run_read_conformance(
+            client, expected_network, expected_fingerprint, args.require_work_rule
+        )
+    )
     if report.get("read_conformance_verified") is not True:
         report["scenarios"].extend(
             [
@@ -1210,6 +1270,11 @@ def parser() -> argparse.ArgumentParser:
     live.add_argument("--withdrawal-authentication-file", type=Path)
     live.add_argument("--expected-network-id", required=True)
     live.add_argument("--expected-consensus-fingerprint", required=True)
+    live.add_argument(
+        "--require-work-rule",
+        action="store_true",
+        help="require the work rule on a network not listed as having one",
+    )
     live.add_argument("--registration-file", type=Path)
     live.add_argument("--allow-registration", action="store_true")
     live.add_argument("--timeout-seconds", type=float, default=10.0)

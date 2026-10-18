@@ -29,7 +29,7 @@ fn hash(value: &serde_json::Value) -> [u8; 32] {
 }
 
 #[test]
-#[ignore = "requires explicitly selected preserved full proof, statement, candidate and pinned model inputs; CPU only"]
+#[ignore = "requires production-mainnet feature (with the release work checkpoint pinned), explicitly selected preserved full proof, statement, candidate and pinned model inputs; CPU only"]
 fn preserved_full_v4_explorer_read_cost() {
     let proof_path = input("CMFD_EXPLORER_FULL_PROOF");
     let proof = fs::read(&proof_path).unwrap();
@@ -124,6 +124,9 @@ fn preserved_full_v4_explorer_read_cost() {
     )
     .unwrap();
     let open_ms = opening.elapsed().as_millis();
+    // The block's work is re-executed on the CPU, whatever checkpoint the
+    // release pins.
+    crate::work_gate::test_support::check_work_from_genesis(&mut node, None);
     println!(
         "FULL_V4_RESOURCE_STAGE submitting preserved block through normal CPU consensus validation"
     );
@@ -160,7 +163,7 @@ fn preserved_full_v4_explorer_read_cost() {
         black_box(page);
     }
     let address_reads_us = address_start.elapsed().as_micros();
-    assert_eq!(node.explorer_block_reads - reads, ITERATIONS);
+    assert_eq!(node.explorer_block_reads - reads, 0);
     let identity_start = Instant::now();
     for _ in 0..20 {
         assert_eq!(black_box(block.block_id()), block_id);

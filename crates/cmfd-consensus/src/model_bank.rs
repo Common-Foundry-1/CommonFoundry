@@ -581,13 +581,13 @@ pub fn verify_model_bank<R: Read>(
     reader: R,
     expected: &ModelBankManifest,
 ) -> Result<(), ModelBankError> {
-    verify_model_bank_with_consumer(reader, expected, |_| Ok::<(), ModelBankError>(())).map_err(
-        |error| match error {
+    verify_model_bank_with_consumer(reader, expected, |_| Ok::<(), ModelBankError>(()))
+        .map(|_| ())
+        .map_err(|error| match error {
             ModelBankConsumerError::ModelBank(error) | ModelBankConsumerError::Consumer(error) => {
                 error
             }
-        },
-    )
+        })
 }
 
 /// Authenticates the complete model bank and retains its canonical base-input
@@ -596,10 +596,22 @@ pub fn verify_model_bank_and_retain_base_input<R: Read>(
     reader: R,
     expected: &ModelBankManifest,
 ) -> Result<Vec<u8>, ModelBankError> {
+    verify_model_bank_and_retain_base_input_and_layer_roots(reader, expected)
+        .map(|(base_input, _)| base_input)
+}
+
+/// Authenticates the complete model bank and retains its canonical base-input
+/// prefix together with the plain BLAKE3 root of every layer, in layer order.
+/// Both are returned only after the same reader has passed every payload,
+/// layer-root aggregate and EOF check.
+pub fn verify_model_bank_and_retain_base_input_and_layer_roots<R: Read>(
+    reader: R,
+    expected: &ModelBankManifest,
+) -> Result<(Vec<u8>, Vec<[u8; 32]>), ModelBankError> {
     let capacity =
         usize::try_from(expected.base_input_bytes).map_err(|_| ModelBankError::SizeOverflow)?;
     let mut base_input = Vec::with_capacity(capacity);
-    verify_model_bank_with_consumer(reader, expected, |chunk| {
+    let layer_roots = verify_model_bank_with_consumer(reader, expected, |chunk| {
         if matches!(chunk.section, ModelBankByteSection::BaseInput) {
             if u64::try_from(base_input.len()).ok() != Some(chunk.section_offset) {
                 return Err(ModelBankError::NonCanonicalLengths);
@@ -614,7 +626,7 @@ pub fn verify_model_bank_and_retain_base_input<R: Read>(
     if base_input.len() != capacity {
         return Err(ModelBankError::BaseInputLength);
     }
-    Ok(base_input)
+    Ok((base_input, layer_roots))
 }
 
 /// Verifies and field-encodes one canonical bank on a single reader while
@@ -752,7 +764,7 @@ where
     });
 
     match verified {
-        Ok(()) => {}
+        Ok(_) => {}
         Err(ModelBankConsumerError::ModelBank(error)) => {
             return Err(ModelBankFieldStreamError::ModelBank(error));
         }
@@ -826,7 +838,7 @@ fn verify_model_bank_with_consumer<R, F, E>(
     mut reader: R,
     expected: &ModelBankManifest,
     mut consume: F,
-) -> Result<(), ModelBankConsumerError<E>>
+) -> Result<Vec<[u8; 32]>, ModelBankConsumerError<E>>
 where
     R: Read,
     F: FnMut(ModelBankByteChunk<'_>) -> Result<(), E>,
@@ -850,6 +862,7 @@ where
     )?;
 
     let mut layer_aggregate = start_layer_aggregate(actual.layers);
+    let mut layer_roots = Vec::with_capacity(actual.layers as usize);
     for layer_index in 0..actual.layers {
         let mut layer_hasher = Hasher::new();
         stream_section(
@@ -861,7 +874,9 @@ where
             ModelBankByteSection::Layer { index: layer_index },
             &mut consume,
         )?;
-        add_layer_root(&mut layer_aggregate, layer_index, layer_hasher.finalize());
+        let layer_root = layer_hasher.finalize();
+        add_layer_root(&mut layer_aggregate, layer_index, layer_root);
+        layer_roots.push(*layer_root.as_bytes());
     }
 
     if payload_offset != actual.payload_bytes {
@@ -882,7 +897,7 @@ where
 
     let mut trailing = [0_u8; 1];
     match reader.read(&mut trailing) {
-        Ok(0) => Ok(()),
+        Ok(0) => Ok(layer_roots),
         Ok(_) => Err(ModelBankConsumerError::ModelBank(
             ModelBankError::TrailingBytes,
         )),
@@ -2136,6 +2151,37 @@ mod tests {
         *mutated.last_mut().unwrap() ^= 1;
         assert!(matches!(
             verify_model_bank_and_retain_base_input(Cursor::new(mutated), &built.manifest),
+            Err(ModelBankError::RawRootMismatch)
+        ));
+    }
+
+    #[test]
+    fn retained_layer_roots_are_published_only_after_full_bank_authentication() {
+        let built = fixture();
+        let (base_input, layer_roots) = verify_model_bank_and_retain_base_input_and_layer_roots(
+            Cursor::new(&built.bytes),
+            &built.manifest,
+        )
+        .unwrap();
+        let base_bytes = built.manifest.base_input_bytes as usize;
+        let layer_bytes = built.manifest.bytes_per_layer as usize;
+        let payload = &built.bytes[MODEL_BANK_HEADER_BYTES..];
+        assert_eq!(base_input, payload[..base_bytes]);
+        assert_eq!(layer_roots.len(), built.manifest.layers as usize);
+        for (layer, root) in payload[base_bytes..]
+            .chunks_exact(layer_bytes)
+            .zip(&layer_roots)
+        {
+            assert_eq!(blake3::hash(layer).as_bytes(), root);
+        }
+
+        let mut mutated = built.bytes.clone();
+        *mutated.last_mut().unwrap() ^= 1;
+        assert!(matches!(
+            verify_model_bank_and_retain_base_input_and_layer_roots(
+                Cursor::new(mutated),
+                &built.manifest
+            ),
             Err(ModelBankError::RawRootMismatch)
         ));
     }

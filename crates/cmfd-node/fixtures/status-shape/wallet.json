@@ -1,0 +1,38 @@
+{
+  "accepted_height": "number",
+  "balances": {
+    "immature_atoms": "string",
+    "pending_atoms": "string",
+    "spendable_atoms": "string",
+    "verifying_atoms": "string"
+  },
+  "destination": "string",
+  "devnet_only": "bool",
+  "history": [
+    {
+      "confirmations": "number",
+      "counterparty": "null",
+      "fee_burned_atoms": "string",
+      "height": "number",
+      "kind": "string",
+      "net_amount_atoms": "string",
+      "status": "string",
+      "timestamp": "number",
+      "txid": "string"
+    }
+  ],
+  "history_limit": "number",
+  "immature_utxo_count": "number",
+  "insecure_demo_wallet": "bool",
+  "mempool": {
+    "bytes": "number",
+    "transactions": "number"
+  },
+  "network": "string",
+  "next_height": "number",
+  "reserved_utxo_count": "number",
+  "spendable_utxo_count": "number",
+  "validated_height": "number",
+  "verifying_utxo_count": "number",
+  "warning": "string"
+}

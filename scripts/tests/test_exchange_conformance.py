@@ -107,6 +107,18 @@ class ExchangeConformanceTests(unittest.TestCase):
                 self.assertEqual(evidence["report"]["result"], "fail")
                 self.assertIn(failed_check, evidence["report"]["failed_checks"])
 
+        # A node from before checksummed addresses fails the encodings check.
+        responses = conformance.fixture_responses()
+        responses["getexchangeinfo"]["encodings"]["checksummed_address_available"] = False
+        result = conformance.run_read_conformance(
+            conformance.FixtureRpc(responses), "11" * 32, "22" * 32
+        )
+        evidence = conformance.complete_report(
+            {**conformance.base_report("test"), **result}
+        )
+        self.assertFalse(result["read_conformance_verified"])
+        self.assertIn("contract.encodings", evidence["report"]["failed_checks"])
+
         secret = "garbage-custody-password-0123456789"
         responses = conformance.fixture_responses()
         responses["getexchangeinfo"]["custody"] = {
@@ -153,6 +165,83 @@ class ExchangeConformanceTests(unittest.TestCase):
         )
         self.assertIn("chain.status_shape", evidence["report"]["failed_checks"])
         self.assertIn("deposits.page_shape", evidence["report"]["failed_checks"])
+
+    def test_work_rule_status_must_be_ready_and_cap_the_reported_height(self) -> None:
+        def failed_checks(responses: dict[str, object]) -> list[str]:
+            report = conformance.base_report("test")
+            report.update(conformance.run_read_conformance(
+                conformance.FixtureRpc(responses), "11" * 32, "22" * 32
+            ))
+            return conformance.complete_report(report)["report"]["failed_checks"]
+
+        self.assertEqual(failed_checks(conformance.fixture_responses()), [])
+        for field, value in [
+            ("enforced", False),
+            ("halted", True),
+            ("engine_ready", False),
+        ]:
+            responses = conformance.fixture_responses()
+            responses["getblockchaininfo"]["work_rule"][field] = value
+            self.assertEqual(failed_checks(responses), ["chain.work_rule_ready"], field)
+        responses = conformance.fixture_responses()
+        responses["getblockchaininfo"]["blocks"] = 2
+        self.assertEqual(failed_checks(responses), ["chain.validated_cap"])
+        responses = conformance.fixture_responses()
+        responses["getblockchaininfo"]["work_rule"] = "enforced"
+        self.assertEqual(
+            failed_checks(responses),
+            ["chain.work_rule_ready", "chain.validated_cap"],
+        )
+
+        # An endpoint on a network without a work rule reports none, as an
+        # absent field (before 1.0.16) or as null.
+        for absent in (True, False):
+            responses = conformance.fixture_responses()
+            if absent:
+                del responses["getblockchaininfo"]["work_rule"]
+            else:
+                responses["getblockchaininfo"]["work_rule"] = None
+            report = conformance.run_read_conformance(
+                conformance.FixtureRpc(responses), "11" * 32, "22" * 32
+            )
+            self.assertTrue(report["read_conformance_verified"], absent)
+            names = [entry["name"] for entry in report["checks"]]
+            self.assertNotIn("chain.validated_cap", names)
+            self.assertNotIn("chain.work_rule_present", names)
+
+            # Where the rule is required, the same endpoint fails.
+            report = conformance.run_read_conformance(
+                conformance.FixtureRpc(responses), "11" * 32, "22" * 32, True
+            )
+            failed = [
+                entry["name"]
+                for entry in report["checks"]
+                if entry["status"] != "pass"
+            ]
+            self.assertEqual(
+                failed,
+                [
+                    "chain.work_rule_present",
+                    "chain.work_rule_ready",
+                    "chain.validated_cap",
+                ],
+                absent,
+            )
+            self.assertFalse(report["read_conformance_verified"])
+
+    def test_a_network_with_a_work_rule_requires_it(self) -> None:
+        mainnet = "88296bc39c10e8bc1dd4818d4d42412fe5f08210651110377f495da299812f62"
+        self.assertIn(mainnet, conformance.WORK_RULE_NETWORK_IDS)
+        responses = conformance.fixture_responses()
+        del responses["getblockchaininfo"]["work_rule"]
+        report = conformance.run_read_conformance(
+            conformance.FixtureRpc(responses), mainnet, "22" * 32
+        )
+        failed = [
+            entry["name"] for entry in report["checks"] if entry["status"] != "pass"
+        ]
+        self.assertIn("chain.work_rule_present", failed)
+        self.assertFalse(report["read_conformance_verified"])
 
     def test_deposit_page_cannot_skip_an_unreturned_cursor(self) -> None:
         responses = conformance.fixture_responses()
@@ -461,6 +550,7 @@ class ExchangeConformanceTests(unittest.TestCase):
                 timeout_seconds=1.0,
                 registration_file=registrations,
                 allow_registration=True,
+                require_work_rule=False,
             )
             with mock.patch.object(conformance, "RpcClient", return_value=client) as factory:
                 evidence = conformance.run_live(args)

@@ -1,0 +1,95 @@
+{
+  "schema": "CommonFoundry/ForgeMatrix/V4/ExecutionVectors/v1",
+  "purpose": "Mainnet ProductionV4 blocks whose work was re-executed independently; each expected digest in vectors equals the block's published value. Each changed_vectors entry is one of those blocks with one header field or the nonce changed, and the work an independent engine computed for it.",
+  "model_manifest_digest": "68f6fe674f75a363c62c275ebb11fa74aa089e9bbde5bcb952ec35b8890b575c",
+  "vectors": [
+    {
+      "height": 4082,
+      "network_id": "88296bc39c10e8bc1dd4818d4d42412fe5f08210651110377f495da299812f62",
+      "previous_block": "b98cd2f0aecc57e7401ac79704eedc8facb22203d826b2f5482d4b25936df388",
+      "transaction_root": "14b3cfe51fe351ce20df1745e80c9b8bbfdacb7ebd6be35de6ac93d03ebfa4ef",
+      "timestamp": 1791261163,
+      "target": "00000476ff4867c35977daaebe1e9ab009bcd612a577fcfcb02f644b51d7883d",
+      "nonce": "17280",
+      "challenge_digest": "02658192604e1933fbbf7e19d8034fd480e7facdda5cb840550fe84403af4e38",
+      "final_activation_digest": "71c631ef54e1b9dd863ae64a520e2368ebdbb45e1695d99146d8eaf0493d9d9d",
+      "work_digest": "0000017d54a704eff9ad4830476cb40b60d564003bdb23f7591a19112c587d7c"
+    },
+    {
+      "height": 17855,
+      "network_id": "88296bc39c10e8bc1dd4818d4d42412fe5f08210651110377f495da299812f62",
+      "previous_block": "6c5f441a2be162073579e955395d38d903ba6f24d108ecde96ceaa7a2e1776dd",
+      "transaction_root": "fd4c966262a4f57f58bba349bba6cb7b0e237a868453292224b64a05bf413af9",
+      "timestamp": 1792097084,
+      "target": "000014f0f3756d1e18cf917af6dfa6a98daae0d6c61b2267c3344d928a3359e2",
+      "nonce": "4372134556320682385",
+      "challenge_digest": "3cc9193f0c6ab701fd3f1eca865872b7ecf47b6e4e18d01f8521c0599dffcbc8",
+      "final_activation_digest": "ad280f70ff8aaebf10724b9db6df392ba70e25cb314ae51ea374593d275c70fc",
+      "work_digest": "000006f298c3682ec417ed7d46610a5285e3c0ddf45cb866b7e8d2363298394f"
+    },
+    {
+      "height": 17856,
+      "network_id": "88296bc39c10e8bc1dd4818d4d42412fe5f08210651110377f495da299812f62",
+      "previous_block": "1667b165f17515e4959101e1ff3ce68642829185e5dca6deaeb28b5919d9bcf2",
+      "transaction_root": "8bd534f7c3651a9d6c08f058805fc822eee2423d5bfde8477103d9505eea68d4",
+      "timestamp": 1792097093,
+      "target": "00001489a43d7a86391de9271abe139ba43ecc1c007e80ae26efb17c6134921d",
+      "nonce": "8089177216320120014",
+      "challenge_digest": "10563e99d0c68785b349a10ccc65a002da8c895fb8341f0a31e90b70d546541c",
+      "final_activation_digest": "1151b468cca53c22ed3f92606f5b0ff53219367116e4a021f5c60542b884553a",
+      "work_digest": "0000088d5858511ef921774bd486ce9e4f84ad9c25dfbdf3bdad2683fb3e4d21"
+    },
+    {
+      "height": 17857,
+      "network_id": "88296bc39c10e8bc1dd4818d4d42412fe5f08210651110377f495da299812f62",
+      "previous_block": "d1012afb3eedad42811040d5097d479e37bbf0c78b41e6daf887c0b2101b667c",
+      "transaction_root": "713799945430e9d37c883176d7cb3e2c5bb07ee9dec792e0f730538f3fcfa686",
+      "timestamp": 1792097179,
+      "target": "000014c116bcf429a67fec50e77c3301b9add57d69b35b7bdd7027641e205075",
+      "nonce": "7714269557985817496",
+      "challenge_digest": "e16690fae2653f41db99923a3a4b84b87ee2698176c2b6ed744ba3f50178d9d1",
+      "final_activation_digest": "b24dd822816fe85ffdd0d2cc6d1b4d18d3c3f131522be464652188712abc18cd",
+      "work_digest": "000008e3ae5353e74c790880f460e631dfdc183bfc9f2d600ca9266bc77afbe6"
+    },
+    {
+      "height": 17858,
+      "network_id": "88296bc39c10e8bc1dd4818d4d42412fe5f08210651110377f495da299812f62",
+      "previous_block": "0718e3fe1887f650ee4d716b83cf4882d7d225163f3c18bcdbc5f5479a8b45b1",
+      "transaction_root": "8a1d61cde146dec88ceac7872b57564af204a24f8c82cc2a5e3b0318eda995cc",
+      "timestamp": 1792097240,
+      "target": "000014c2502c42e5c3febb92355e5d85188eb83641578e55a65f3602ab728d03",
+      "nonce": "4333591392753931840",
+      "challenge_digest": "54a8af5d649ff93d6f6732b3b62910bbc775395e1333f3d225b491b59848613a",
+      "final_activation_digest": "649a67c0d0efd50f8c22a717da4dee53234656468f2dda3622467f700667e3f0",
+      "work_digest": "0000041d0dbc253f0e9cfc9d362996b64d0db0d3f1b26f1bfb89f5493b99c5d5"
+    },
+    {
+      "height": 17859,
+      "network_id": "88296bc39c10e8bc1dd4818d4d42412fe5f08210651110377f495da299812f62",
+      "previous_block": "2a72edc06f1b4c723604063531c639de2f5dcdee0219ffec0eb7da47c6e50793",
+      "transaction_root": "250679c59ab894e886661d554dc33d41b282c1881d952fe89f74e9c2dc85a88e",
+      "timestamp": 1792097350,
+      "target": "0000149d2cd09274d4b47e6fa7e5473ff46c6287cfb05443b64b864b91d955e7",
+      "nonce": "2753730476415469578",
+      "challenge_digest": "ffb278868d7cf0d7af7b02552b4143b8513d6d0d8e9ede83773b85d4a4591e6b",
+      "final_activation_digest": "301a6b5bca49657ede1be86b219a946fc0ebfa63d45ce6aeb6480498ff523589",
+      "work_digest": "00000a02f22dfed910411a52bb3aabbca035b592c4986cb3297d5c28684297c9"
+    }
+  ],
+  "changed_vectors": [
+    {
+      "height": 17859,
+      "change": "nonce+1",
+      "challenge_digest": "55af0eb55cdf5dcca680997ce33ed51bd9f5a8c1768519d3ce3516c783c8dd6b",
+      "final_activation_digest": "67951daa4b207c844b1fa1d58e5ea32cbe5c960a11a405799e149a0717ef2a05",
+      "work_digest": "dee4f19b6e0352630c6f85821a179ee00734be8efbb19b5fe5b241320a49f096"
+    },
+    {
+      "height": 17858,
+      "change": "timestamp+1",
+      "challenge_digest": "5392ef00e3447c7536fcaa5886fa9a848303292f2300e434fb4af53c4bb6fa2c",
+      "final_activation_digest": "ac1d9981f37a46be8c9862e15c952d09c221ae083d3ba358b91dd03e32c2d97e",
+      "work_digest": "99027e9b18397869b07e5609f72c92b23b9c352860b9a60c0f12f39f3d74546d"
+    }
+  ]
+}

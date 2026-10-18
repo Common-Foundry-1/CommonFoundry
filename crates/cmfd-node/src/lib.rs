@@ -1,13 +1,13 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Cursor, Read, Seek, SeekFrom, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::Barrier;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, TryLockError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock, TryLockError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -50,6 +50,7 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+pub mod address;
 #[cfg(windows)]
 pub(crate) mod exchange_acl;
 pub mod exchange_acl_qualification;
@@ -90,6 +91,7 @@ mod explorer_resource_qualification;
 #[cfg(test)]
 mod fast_startup_tests;
 mod history_scrub;
+pub mod honest_work;
 pub mod logging;
 #[cfg(feature = "production-v4")]
 pub mod mainnet_custody;
@@ -109,6 +111,11 @@ mod pruning_tests;
 pub mod rcnet_candidate;
 #[cfg(all(test, feature = "production-v4"))]
 mod real_fork_checkpoint_tests;
+#[cfg(all(
+    test,
+    not(any(feature = "production-v3-testnet", feature = "production-v4-testnet"))
+))]
+mod rpc_host_guard_tests;
 pub mod seed_peers;
 pub use history_scrub::{HistoryScrub, spawn_history_scrub};
 use pruning::StoredBlock;
@@ -116,12 +123,18 @@ pub use pruning::{
     MIN_PRUNE_KEEP_BLOCKS, PRUNE_CHECK_INTERVAL, PruneReport, PrunerHandle, prune_shared_node,
     prune_shared_node_until_stopped, spawn_pruner,
 };
+#[cfg(test)]
+mod catch_up_static_tests;
 mod startup_snapshot;
+#[cfg(test)]
+mod status_shape_tests;
 pub mod storage;
 pub mod wallet_backup;
 mod wallet_history;
 pub mod wallet_keyring;
 pub mod wallet_signing_protocol;
+pub mod work_checkpoint;
+pub mod work_gate;
 
 #[path = "../release_gate.rs"]
 #[allow(dead_code)]
@@ -150,6 +163,12 @@ pub const DEFAULT_MINING_ATTEMPTS: u64 = 1_000_000;
 pub const MAX_MINING_SEARCH_ATTEMPTS: u64 = DEFAULT_MINING_ATTEMPTS;
 pub const MAX_MEMPOOL_TRANSACTIONS: usize = 1_024;
 pub const MAX_MEMPOOL_BYTES: usize = 512 * 1024;
+/// Channel closes may hold at most this many of the mempool's places, and
+/// [`MAX_MEMPOOL_CLOSE_BYTES`] of its bytes. A close is carried forward to
+/// each next height until a block mines it, and its fee is burned only then,
+/// so without a budget of their own closes could hold every place.
+pub const MAX_MEMPOOL_CLOSES: usize = 128;
+pub const MAX_MEMPOOL_CLOSE_BYTES: usize = 96 * 1024;
 pub const MIN_RELAY_FEE_PER_KIB: u64 = 1;
 pub const MAX_WALLET_HISTORY: usize = 100;
 pub const MAX_OBSERVED_PEERS: usize = 64;
@@ -509,6 +528,10 @@ pub enum NodeError {
     ProductionV4ActivationEvidence(&'static str),
     #[error("the authenticated ProductionV4 {0} does not match its compiled identity pin")]
     ProductionV4ArtifactIdentityMismatch(&'static str),
+    #[error(
+        "the ProductionV4 model bank needs {bytes} bytes of memory to be held resident; free memory or start with `--work-bank streamed`"
+    )]
+    ProductionV4WorkBankMemory { bytes: usize },
     #[error("offline RCNet-1 ProductionV4 qualification invariant failed: {0}")]
     ProductionV4QualificationInvariant(&'static str),
     #[error("network metadata is missing while a nonempty block log already exists")]
@@ -538,9 +561,13 @@ pub enum NodeError {
     InvalidSystemTime,
     #[error("no currently valid template timestamp exists; wait for wall clock time to catch up")]
     TemplateTimeUnavailable,
-    #[error("miner destination must be a 64-character hex Schnorr public key")]
+    #[error(
+        "miner destination must be a checksummed address (cmfd1..., tcmfd1... on test networks) or a 64-character hex Schnorr public key"
+    )]
     InvalidMinerDestination,
-    #[error("explorer address must be a 64-character hexadecimal key destination")]
+    #[error(
+        "explorer address must be a checksummed address (cmfd1..., tcmfd1... on test networks) or a 64-character hexadecimal key destination"
+    )]
     InvalidExplorerAddress,
     #[error("explorer cursor is invalid for this address")]
     InvalidExplorerCursor,
@@ -595,6 +622,43 @@ pub enum NodeError {
     StaleBlockAdmission,
     #[error("block was already rejected by deterministic consensus validation: {0:?}")]
     CachedInvalidBlock([u8; 32]),
+    #[error("block {} does not match its independently re-executed work", hex::encode(.0))]
+    WorkRecomputationMismatch([u8; 32]),
+    #[error(
+        "block {} does not match the work this node re-executed; no second engine has checked it",
+        hex::encode(.0)
+    )]
+    WorkMismatchUnconfirmed([u8; 32]),
+    #[error(
+        "block {} at height {height} is not on the chain pinned by the release checkpoint at height {checkpoint_height}",
+        hex::encode(.block_id)
+    )]
+    WorkCheckpointConflict {
+        block_id: [u8; 32],
+        height: u64,
+        checkpoint_height: u64,
+    },
+    #[error("block builds on {}, whose work does not match", hex::encode(.0))]
+    InvalidAncestor([u8; 32]),
+    #[error("block work cannot be checked right now; retry later")]
+    WorkCheckUnavailable,
+    #[error("block was withdrawn by its sender while its work was being checked")]
+    WorkCheckWithdrawn,
+    #[error("block waits until earlier blocks of its branch are checked; retry later")]
+    WorkCheckPending,
+    #[error(
+        "this node recently refused several blocks from this peer on one engine's check; its other blocks wait, retry later"
+    )]
+    WorkCheckDeferred,
+    #[error("block above the release checkpoint has no work verdict yet; retry later")]
+    WorkCheckRequired,
+    #[error("block admission is halted until an operator reviews this node's work checks")]
+    WorkRuleHalted,
+    #[error(
+        "stored block {} cannot be removed in place because it is pruned; resync this node from an empty data directory",
+        hex::encode(.0)
+    )]
+    WorkRuleResyncRequired([u8; 32]),
     #[error("fork state reconstruction exceeded its bounded work slice; retry the candidate")]
     ForkReconstructionDeferred,
     #[error("transaction is already in the mempool: {0:?}")]
@@ -611,9 +675,15 @@ pub enum NodeError {
     MempoolTransactionLimit,
     #[error("mempool bytes would exceed {MAX_MEMPOOL_BYTES}")]
     MempoolByteLimit,
+    #[error(
+        "mempool channel closes would exceed {MAX_MEMPOOL_CLOSES} or {MAX_MEMPOOL_CLOSE_BYTES} bytes"
+    )]
+    MempoolCloseLimit,
     #[error("transaction burns a fee of {actual}, below the relay minimum of {required}")]
     MempoolFeeTooLow { required: u64, actual: u64 },
-    #[error("wallet recipient must be a 64-character hex Schnorr public key")]
+    #[error(
+        "wallet recipient must be a checksummed address (cmfd1..., tcmfd1... on test networks) or a 64-character hex Schnorr public key"
+    )]
     InvalidWalletRecipient,
     #[error("wallet amount must be an unsigned decimal CMFD value with at most 8 decimal places")]
     InvalidWalletAmount,
@@ -625,6 +695,11 @@ pub enum NodeError {
     InvalidWalletPaymentPlan(&'static str),
     #[error("wallet funds are immature: {immature} atoms immature, {required} atoms required")]
     WalletFundsImmature { immature: u64, required: u64 },
+    #[error(
+        "wallet funds are still being verified: {verifying} atoms are in blocks this node has not \
+         finished checking yet, {required} atoms required"
+    )]
+    WalletFundsVerifying { verifying: u64, required: u64 },
     #[error(
         "wallet has insufficient funds: {available} atoms available, {required} atoms required"
     )]
@@ -706,6 +781,7 @@ impl NodeError {
             | Self::ProductionV4ArtifactPinsMissing
             | Self::ProductionV4ActivationEvidence(_)
             | Self::ProductionV4ArtifactIdentityMismatch(_)
+            | Self::ProductionV4WorkBankMemory { .. }
             | Self::ProductionV4QualificationInvariant(_) => {
                 ("proof_verifier_configuration", 500, false)
             }
@@ -748,6 +824,17 @@ impl NodeError {
             Self::InvalidPruneSetting(_) => ("invalid_prune_setting", 400, false),
             Self::StaleBlockAdmission => ("stale_block_admission", 409, true),
             Self::CachedInvalidBlock(_) => ("cached_invalid_block", 422, false),
+            Self::WorkRecomputationMismatch(_) => ("work_recomputation_mismatch", 422, false),
+            Self::WorkMismatchUnconfirmed(_) => ("work_mismatch_unconfirmed", 422, false),
+            Self::WorkCheckpointConflict { .. } => ("work_checkpoint_conflict", 422, false),
+            Self::InvalidAncestor(_) => ("invalid_ancestor", 422, false),
+            Self::WorkCheckUnavailable => ("work_check_unavailable", 503, true),
+            Self::WorkCheckWithdrawn => ("work_check_withdrawn", 503, true),
+            Self::WorkCheckPending => ("work_check_pending", 503, true),
+            Self::WorkCheckDeferred => ("work_check_deferred", 503, true),
+            Self::WorkCheckRequired => ("work_check_required", 503, true),
+            Self::WorkRuleHalted => ("work_rule_halted", 503, true),
+            Self::WorkRuleResyncRequired(_) => ("work_rule_resync_required", 500, false),
             Self::ForkReconstructionDeferred => ("fork_reconstruction_deferred", 503, true),
             Self::DuplicateMempoolTransaction(_) => ("duplicate_mempool_transaction", 409, false),
             Self::MempoolInputConflict(_) => ("mempool_input_conflict", 409, false),
@@ -760,6 +847,7 @@ impl NodeError {
             }
             Self::MempoolTransactionLimit => ("mempool_transaction_limit", 422, true),
             Self::MempoolByteLimit => ("mempool_byte_limit", 422, true),
+            Self::MempoolCloseLimit => ("mempool_close_limit", 422, true),
             Self::MempoolFeeTooLow { .. } => ("mempool_fee_too_low", 422, false),
             Self::InvalidWalletRecipient => ("invalid_wallet_recipient", 400, false),
             Self::InvalidWalletAmount => ("invalid_wallet_amount", 400, false),
@@ -767,6 +855,7 @@ impl NodeError {
             Self::WalletZeroAmount => ("wallet_zero_amount", 400, false),
             Self::InvalidWalletPaymentPlan(_) => ("invalid_wallet_payment_plan", 500, false),
             Self::WalletFundsImmature { .. } => ("wallet_funds_immature", 422, true),
+            Self::WalletFundsVerifying { .. } => ("wallet_funds_verifying", 422, true),
             Self::WalletInsufficientFunds { .. } => ("wallet_insufficient_funds", 422, false),
             Self::WalletInputLimit { .. } => ("wallet_input_limit", 422, false),
             Self::InvalidConsolidationMaxInputs => ("invalid_consolidation_max_inputs", 400, false),
@@ -1025,6 +1114,15 @@ impl ProofVerificationQueue {
         // block must not be discarded after the short local queue timeout
         // merely because a local block is being verified.
         self.acquire_class(ProofQueueClass::Normal, None, Some(request))
+    }
+
+    /// A priority wait bounded by a remote request, for a block from a
+    /// trusted peer.
+    fn acquire_priority_cancellable(
+        self: &Arc<Self>,
+        request: RemoteProofRequest,
+    ) -> Result<ProofVerificationPermit, NodeError> {
+        self.acquire_class(ProofQueueClass::Priority, None, Some(request))
     }
 
     fn acquire_priority(self: &Arc<Self>) -> Result<ProofVerificationPermit, NodeError> {
@@ -1378,10 +1476,15 @@ impl RemoteProofPeerId {
 #[repr(u8)]
 enum RemoteProofRequestState {
     Active = 0,
+    /// Withdrawn by the peer: it closed its connection or sent other input.
     Cancelled = 1,
     Committing = 2,
     Completed = 3,
     Faulted = 4,
+    /// Reached its deadline.
+    Expired = 5,
+    /// Stopped by this node, which is shutting the session down.
+    Stopped = 6,
 }
 
 impl RemoteProofRequestState {
@@ -1391,8 +1494,14 @@ impl RemoteProofRequestState {
             1 => Self::Cancelled,
             2 => Self::Committing,
             3 => Self::Completed,
+            5 => Self::Expired,
+            6 => Self::Stopped,
             _ => Self::Faulted,
         }
+    }
+
+    fn ended_early(self) -> bool {
+        matches!(self, Self::Cancelled | Self::Expired | Self::Stopped)
     }
 }
 
@@ -1424,12 +1533,29 @@ impl RemoteProofRequest {
         RemoteProofRequestState::load(self.inner.state.load(Ordering::Acquire))
     }
 
+    /// Ends the request because its peer withdrew it. Returns whether this
+    /// ended it: the first of a withdrawal, the deadline and a local stop
+    /// wins, and only a withdrawal is the peer's doing.
     pub(crate) fn cancel(&self) -> bool {
+        self.end(RemoteProofRequestState::Cancelled)
+    }
+
+    /// Ends the request at its deadline.
+    pub(crate) fn expire(&self) -> bool {
+        self.end(RemoteProofRequestState::Expired)
+    }
+
+    /// Ends the request because this node is stopping the session.
+    pub(crate) fn stop(&self) -> bool {
+        self.end(RemoteProofRequestState::Stopped)
+    }
+
+    fn end(&self, cause: RemoteProofRequestState) -> bool {
         self.inner
             .state
             .compare_exchange(
                 RemoteProofRequestState::Active as u8,
-                RemoteProofRequestState::Cancelled as u8,
+                cause as u8,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
@@ -1438,13 +1564,28 @@ impl RemoteProofRequest {
 
     fn cancel_if_expired(&self) {
         if Instant::now() >= self.inner.deadline {
-            self.cancel();
+            self.expire();
         }
     }
 
     pub(crate) fn is_cancelled(&self) -> bool {
         self.cancel_if_expired();
+        self.state().ended_early()
+    }
+
+    /// Whether the request ended because its peer withdrew it.
+    pub(crate) fn withdrawn(&self) -> bool {
         self.state() == RemoteProofRequestState::Cancelled
+    }
+
+    /// Whether the request ended because its peer withdrew it or this node
+    /// stopped it; unlike [`is_cancelled`](Self::is_cancelled), not because
+    /// its deadline passed.
+    pub(crate) fn withdrawn_or_stopped(&self) -> bool {
+        matches!(
+            self.state(),
+            RemoteProofRequestState::Cancelled | RemoteProofRequestState::Stopped
+        )
     }
 
     fn ensure_live(&self) -> Result<(), NodeError> {
@@ -1463,7 +1604,7 @@ impl RemoteProofRequest {
             .checked_duration_since(Instant::now())
             .filter(|remaining| !remaining.is_zero())
             .ok_or_else(|| {
-                self.cancel();
+                self.expire();
                 NodeError::ProofVerificationQueueTimeout
             })
     }
@@ -1484,7 +1625,7 @@ impl RemoteProofRequest {
         // read and CAS: an already-expired request gives up its owned
         // Committing state before any append begins.
         if Instant::now() >= self.inner.deadline {
-            self.cancel();
+            self.expire();
             return Err(NodeError::ProofVerificationQueueTimeout);
         }
         after_deadline_check();
@@ -1496,16 +1637,19 @@ impl RemoteProofRequest {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .map_err(|state| match RemoteProofRequestState::load(state) {
-                RemoteProofRequestState::Cancelled => NodeError::ProofVerificationQueueTimeout,
-                _ => NodeError::ProofVerificationQueuePoisoned,
+            .map_err(|state| {
+                if RemoteProofRequestState::load(state).ended_early() {
+                    NodeError::ProofVerificationQueueTimeout
+                } else {
+                    NodeError::ProofVerificationQueuePoisoned
+                }
             })?;
         if Instant::now() >= self.inner.deadline {
             self.inner
                 .state
                 .compare_exchange(
                     RemoteProofRequestState::Committing as u8,
-                    RemoteProofRequestState::Cancelled as u8,
+                    RemoteProofRequestState::Expired as u8,
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 )
@@ -2446,6 +2590,8 @@ pub struct NodeStatus {
     /// the startup scan or by the background history scrub after a fast start.
     pub history_scrub_complete: bool,
     pub history_scrub_verified_records: u64,
+    /// The release work rule, for a network that has one.
+    pub work_rule: Option<work_gate::WorkRuleStatus>,
     pub peers: Vec<PeerObservation>,
 }
 
@@ -2477,6 +2623,9 @@ pub struct PeerObservation {
     pub active_connections: usize,
     pub remote_height: Option<u64>,
     pub remote_tip: Option<String>,
+    /// The tip this peer advertises builds on a block this node knows is
+    /// invalid; its height is not a sign that this node is behind.
+    pub on_invalid_chain: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -2496,8 +2645,16 @@ struct PeerObservationRecord {
     active_connections: usize,
     remote_height: Option<u64>,
     remote_tip: Option<[u8; 32]>,
+    /// An advertised tip that was found to build on a known-invalid block.
+    invalid_tip: Option<[u8; 32]>,
     sync_cursor: Option<[u8; 32]>,
     relay_cursor: Option<[u8; 32]>,
+}
+
+impl PeerObservationRecord {
+    fn on_invalid_chain(&self) -> bool {
+        self.invalid_tip.is_some() && self.invalid_tip == self.remote_tip
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3395,6 +3552,10 @@ pub struct WalletBalances {
     pub spendable_atoms: String,
     pub immature_atoms: String,
     pub pending_atoms: String,
+    /// Coins in blocks above the validated height, which cannot be spent
+    /// until this node has re-executed those blocks' work. The wallet's own
+    /// change is not counted here.
+    pub verifying_atoms: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -3429,6 +3590,15 @@ pub struct WalletSnapshot {
     pub spendable_utxo_count: usize,
     pub immature_utxo_count: usize,
     pub reserved_utxo_count: usize,
+    pub verifying_utxo_count: usize,
+    /// Every active block up to this height has had its work re-executed;
+    /// `None` on a network without that rule.
+    pub validated_height: Option<u64>,
+    /// Coins in active blocks up to this height are spendable; only on a
+    /// desktop wallet catching up, where it can be above the validated
+    /// height.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub available_height: Option<u64>,
     pub mempool: WalletMempoolStatus,
     pub history_limit: usize,
     pub history: Vec<WalletHistoryEntry>,
@@ -3841,6 +4011,9 @@ pub struct Node {
     wallet_history_cache: Option<wallet_history::WalletHistoryCache>,
     /// Whole-chain wallet history scan running off the node lock, if any.
     wallet_history_scan: Option<wallet_history::WalletHistoryScan>,
+    /// The outputs of the active blocks above the validated height, last read
+    /// for a coin the history cache could not place.
+    unchecked_outputs: Mutex<wallet_history::UncheckedOutputsMemo>,
     #[cfg(test)]
     wallet_history_inline_scan_bytes: u64,
     /// Per-txid progress of active-chain transaction lookups, so repeated
@@ -3894,10 +4067,32 @@ pub struct Node {
     rejected_proof_order: VecDeque<[u8; 32]>,
     rejected_body_digests: HashSet<[u8; 32]>,
     rejected_body_order: VecDeque<[u8; 32]>,
+    /// Of the remembered rejected block ids, those refused because their
+    /// work did not match, and whether two engines agreed. One engine's
+    /// verdict does not mark the peers that serve the block (see
+    /// [`Node::marks_peer_on_invalid_chain`]). Every key is in
+    /// `rejected_proof_ids` and leaves this map when it leaves that set.
+    work_rejections: HashMap<[u8; 32], work_gate::WorkRejectionKind>,
+    /// The release work rule and its engines, if this network has one.
+    work_gate: Option<work_gate::WorkGate>,
+    /// Where the background check reports the peer of a noted block that
+    /// two independent engines found does not match (see
+    /// [`work_gate::WorkBlame`]).
+    work_blame: Vec<std::sync::Weak<dyn work_gate::WorkBlame>>,
+    /// The authenticated model bank the CPU work engine reads (ProductionV4).
+    #[cfg_attr(not(feature = "production-v4"), allow(dead_code))]
+    work_bank: Option<work_gate::WorkBank>,
     public_peer_mode: bool,
     peer_observations: BTreeMap<PeerObservationKey, PeerObservationRecord>,
+    /// Times a peer's advertised tip was newly found to build on a block this
+    /// node knows is invalid.
+    invalid_chain_peer_events: u64,
     #[cfg(test)]
     commit_race_barrier: Option<Arc<CommitRaceBarrier>>,
+    /// Runs once in a shared block admission, with the node unlocked, after
+    /// the work admission and before the commit.
+    #[cfg(test)]
+    after_work_admission: Option<Box<dyn FnOnce() + Send>>,
     #[cfg(test)]
     completion_fault_barrier: Option<Arc<CompletionFaultBarrier>>,
     #[cfg(test)]
@@ -4357,7 +4552,7 @@ struct PreparedBlock {
     activation_chain: Option<Vec<[u8; 32]>>,
     candidate: ValidatedCandidate,
     transaction_ids: Vec<[u8; 32]>,
-    address_entries: Vec<([u8; 32], explorer_address_index::AddressLocation)>,
+    address_entries: Vec<explorer_address_index::AddressEntry>,
 }
 
 impl PreparedBlock {
@@ -4801,7 +4996,35 @@ fn network_params_and_verifier_with_launch(
     production_v4_artifacts: Option<&ProductionV4VerifierArtifacts>,
     launch: Option<&mainnet_runtime::AuthenticatedMainnetRuntime>,
 ) -> Result<(NetworkParams, ConsensusPowVerifier), NodeError> {
+    network_params_verifier_and_work_bank_with_launch(
+        profile,
+        production_v3_record,
+        production_v4_artifacts,
+        launch,
+    )
+    .map(|(params, verifier, _)| (params, verifier))
+}
+
+/// Also returns, for ProductionV4, the model bank file and what the
+/// verifier's single authenticated pass over it captured, for the work
+/// engines.
+fn network_params_verifier_and_work_bank_with_launch(
+    profile: NetworkProfile,
+    production_v3_record: Option<&ProductionV3VerifierRecord>,
+    production_v4_artifacts: Option<&ProductionV4VerifierArtifacts>,
+    launch: Option<&mainnet_runtime::AuthenticatedMainnetRuntime>,
+) -> Result<
+    (
+        NetworkParams,
+        ConsensusPowVerifier,
+        Option<work_gate::WorkBank>,
+    ),
+    NodeError,
+> {
     mainnet_runtime::require_authenticated_profile(profile, launch)?;
+    // Only a ProductionV4 build reads a model bank.
+    #[cfg_attr(not(feature = "production-v4"), allow(unused_mut))]
+    let mut work_bank = None;
     let verifier = match profile.proof {
         ProofProfile::DevnetV2Reference => {
             if production_v3_record.is_some() || production_v4_artifacts.is_some() {
@@ -4880,12 +5103,27 @@ fn network_params_and_verifier_with_launch(
 
                 let mut bank_reader =
                     open_production_v4_pinned_reader(&artifacts.bank, pins.bank, "model bank")?;
-                let verifier = ConsensusPowVerifier::v4_candidate_for_network(
-                    profile.network_id,
-                    record,
-                    BufReader::with_capacity(64 * 1024 * 1024, &mut bank_reader),
-                )?;
+                let (verifier, identity) =
+                    ConsensusPowVerifier::v4_candidate_for_network_with_layer_roots(
+                        profile.network_id,
+                        record,
+                        BufReader::with_capacity(64 * 1024 * 1024, &mut bank_reader),
+                    )?;
+                // The same open file, so the work engines read the bytes
+                // this pass authenticated, whatever happens to the path.
+                let bank_file = bank_reader.inner.try_clone().map_err(|source| {
+                    io_error(
+                        "keep the ProductionV4 model bank open",
+                        &artifacts.bank,
+                        source,
+                    )
+                })?;
                 bank_reader.verify_pin(pins.bank, "model bank")?;
+                work_bank = Some(work_gate::WorkBank {
+                    file: bank_file,
+                    path: artifacts.bank.clone(),
+                    identity,
+                });
                 verifier
             }
             #[cfg(not(feature = "production-v4"))]
@@ -4896,7 +5134,7 @@ fn network_params_and_verifier_with_launch(
         }
     };
     let params = network_params_from_pow_with_launch(profile, verifier.parameters(), launch)?;
-    Ok((params, verifier))
+    Ok((params, verifier, work_bank))
 }
 
 #[cfg(feature = "production-v4")]
@@ -5113,16 +5351,22 @@ pub fn default_miner_destination() -> [u8; 32] {
         .into()
 }
 
+/// Prefix of checksummed addresses on the network this binary was built for:
+/// `cmfd` on mainnet, `tcmfd` on every test network.
+pub fn address_hrp() -> &'static str {
+    address::hrp_for_network(COMPILED_NETWORK_PROFILE.short_name())
+}
+
+/// Reads a key destination given as a checksummed address of this network or
+/// as 64 hex digits in either case, and checks that it is an x-only key.
+fn parse_key_destination(value: &str) -> Option<[u8; 32]> {
+    address::decode_any_case_hex(address_hrp(), value)
+        .ok()
+        .map(|(key, _)| key)
+}
+
 pub fn parse_miner_destination(value: &str) -> Result<[u8; 32], NodeError> {
-    if value.len() != 64 {
-        return Err(NodeError::InvalidMinerDestination);
-    }
-    let bytes = hex::decode(value).map_err(|_| NodeError::InvalidMinerDestination)?;
-    let destination: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| NodeError::InvalidMinerDestination)?;
-    VerifyingKey::from_bytes(&destination).map_err(|_| NodeError::InvalidMinerDestination)?;
-    Ok(destination)
+    parse_key_destination(value).ok_or(NodeError::InvalidMinerDestination)
 }
 
 pub fn unix_time_seconds() -> Result<u64, NodeError> {
@@ -5130,6 +5374,11 @@ pub fn unix_time_seconds() -> Result<u64, NodeError> {
         .duration_since(UNIX_EPOCH)
         .map_err(|_| NodeError::InvalidSystemTime)?
         .as_secs())
+}
+
+/// Milliseconds since `started_at`, for the startup phase log lines.
+fn startup_elapsed_ms(started_at: std::time::Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Builds the deterministic RCNet-1 block-one qualification template entirely
@@ -5643,12 +5892,31 @@ impl Node {
         exchange_withdrawal_security: Option<&ExchangeWithdrawalSecurityConfig>,
         launch: Option<&mainnet_runtime::AuthenticatedMainnetRuntime>,
     ) -> Result<Self, NodeError> {
-        let (params, verifier) = network_params_and_verifier_with_launch(
+        let started_at = std::time::Instant::now();
+        let (params, verifier, work_bank) = network_params_verifier_and_work_bank_with_launch(
             profile,
             production_v3_record,
             production_v4_artifacts,
             launch,
         )?;
+        tracing::info!(
+            elapsed_ms = startup_elapsed_ms(started_at),
+            "startup: proof inputs authenticated"
+        );
+        // A compiled work checkpoint that does not match its digest refuses
+        // the open here rather than panicking when the rule is first built.
+        if matches!(profile.proof, ProofProfile::ProductionV4) {
+            cmfd_consensus::forgematrix_v4_work_rule_checked(params.network_id).map_err(
+                |error| {
+                    tracing::error!(
+                        target: "work_rule",
+                        %error,
+                        "the compiled work checkpoint is inconsistent; refusing to open"
+                    );
+                    NodeError::ProductionV4ArtifactIdentityMismatch("work checkpoint")
+                },
+            )?;
+        }
         let block_preverifier = BlockPreverifier::new(verifier.clone(), profile.proof);
         let external_replay = verifier_worker.is_some();
         if let Some(config) = verifier_worker {
@@ -5658,6 +5926,10 @@ impl Node {
         }
         let data_dir = data_dir.as_ref().to_path_buf();
         let lock = DataDirLock::acquire(&data_dir)?;
+        tracing::info!(
+            elapsed_ms = startup_elapsed_ms(started_at),
+            "startup: data directory locked"
+        );
         let exchange_withdrawal_security = exchange_withdrawal_security
             .map(|config| exchange_withdrawal::LoadedWithdrawalSecurity::load(config, &data_dir))
             .transpose()
@@ -5684,6 +5956,10 @@ impl Node {
             &log_path,
             wallet_passphrase,
         )?;
+        tracing::info!(
+            elapsed_ms = startup_elapsed_ms(started_at),
+            "startup: wallet key loaded"
+        );
 
         let restored =
             startup_snapshot::load_startup_snapshot(&data_dir, &log, &log_path, params, &verifier)?;
@@ -5700,6 +5976,11 @@ impl Node {
                 )
             }
             None => {
+                let replay_started_at = std::time::Instant::now();
+                tracing::info!(
+                    log_bytes = log.metadata().map_or(0, |metadata| metadata.len()),
+                    "startup: no startup snapshot matches the block log; replaying all of it, which checks every stored proof again"
+                );
                 let mut state = ChainState::new(params, verifier.clone())?;
                 let mut index = BlockIndex::new(params.genesis_hash);
                 let replay = replay_log(
@@ -5712,6 +5993,12 @@ impl Node {
                     params,
                     external_replay.then_some(&block_preverifier),
                 )?;
+                tracing::info!(
+                    records = replay.record_count,
+                    log_bytes = replay.log_length,
+                    seconds = replay_started_at.elapsed().as_secs_f64(),
+                    "startup: block log replayed"
+                );
                 (state, index, replay, false, true)
             }
         };
@@ -5757,6 +6044,7 @@ impl Node {
             explorer_history_cache: None,
             wallet_history_cache: None,
             wallet_history_scan: None,
+            unchecked_outputs: Mutex::new(wallet_history::UncheckedOutputsMemo::default()),
             #[cfg(test)]
             wallet_history_inline_scan_bytes: wallet_history::INLINE_SCAN_BYTES,
             transaction_scan_marks: HashMap::new(),
@@ -5787,10 +6075,20 @@ impl Node {
             rejected_proof_order: VecDeque::new(),
             rejected_body_digests: HashSet::new(),
             rejected_body_order: VecDeque::new(),
+            work_rejections: HashMap::new(),
+            work_gate: work_gate::WorkGate::compiled(
+                matches!(profile.proof, ProofProfile::ProductionV4),
+                params.network_id,
+            ),
+            work_blame: Vec::new(),
+            work_bank,
             public_peer_mode: false,
             peer_observations: BTreeMap::new(),
+            invalid_chain_peer_events: 0,
             #[cfg(test)]
             commit_race_barrier: None,
+            #[cfg(test)]
+            after_work_admission: None,
             #[cfg(test)]
             completion_fault_barrier: None,
             #[cfg(test)]
@@ -5818,6 +6116,13 @@ impl Node {
         // Keep the next start fast; the cache covers every current record.
         let _ = node.persist_index_cache();
         node.remember_active_branch_checkpoint(true);
+        tracing::info!(
+            elapsed_ms = startup_elapsed_ms(started_at),
+            records = node.record_count,
+            startup_snapshot_used,
+            history_verified,
+            "startup: node open"
+        );
         Ok(node)
     }
 
@@ -5914,8 +6219,12 @@ impl Node {
     /// Permanently closes proof admission and terminates the current external
     /// verifier generation. Service owners call this before joining RPC/P2P
     /// threads so queued requests cannot restart a worker during shutdown.
+    /// It also closes the work lane, which ends a running block work check.
     pub fn shutdown_proof_verifier(&self) {
         self.block_preverifier.shutdown();
+        if let Some(gate) = self.work_gate.as_ref() {
+            gate.close_lane();
+        }
     }
 
     /// Enables hash-pinned, killable proof verification for Devnet testing.
@@ -6219,6 +6528,7 @@ impl Node {
             pruned_height: self.prune_height(),
             history_scrub_complete: self.history_scrub.complete,
             history_scrub_verified_records: self.history_scrub.verified_records,
+            work_rule: self.work_rule_status(),
             peers: self.peer_observations(),
         })
     }
@@ -6253,6 +6563,44 @@ impl Node {
         record.successful_sessions = record.successful_sessions.saturating_add(1);
         record.remote_height = Some(remote_height);
         record.remote_tip = Some(remote_tip);
+    }
+
+    /// Notes that the tip a peer advertised builds on a block this node knows
+    /// is invalid, until the peer advertises another tip.
+    pub(crate) fn record_peer_on_invalid_chain(
+        &mut self,
+        direction: PeerDirection,
+        address: String,
+        remote_height: u64,
+        remote_tip: [u8; 32],
+        now: u64,
+    ) {
+        let Some(record) = self.peer_observation_mut(direction, address, now) else {
+            return;
+        };
+        record.last_seen = now;
+        record.remote_height = Some(remote_height);
+        record.remote_tip = Some(remote_tip);
+        let newly = record.invalid_tip != Some(remote_tip);
+        record.invalid_tip = Some(remote_tip);
+        if newly {
+            self.invalid_chain_peer_events = self.invalid_chain_peer_events.saturating_add(1);
+        }
+    }
+
+    /// Times a peer's advertised tip was newly found to build on a block this
+    /// node knows is invalid.
+    pub fn invalid_chain_peer_events(&self) -> u64 {
+        self.invalid_chain_peer_events
+    }
+
+    /// Peers whose advertised tip builds on a block this node knows is
+    /// invalid.
+    pub fn peers_on_invalid_chain(&self) -> usize {
+        self.peer_observations
+            .values()
+            .filter(|record| record.on_invalid_chain())
+            .count()
     }
 
     pub(crate) fn record_peer_ended(
@@ -6309,6 +6657,7 @@ impl Node {
                     active_connections: 0,
                     remote_height: None,
                     remote_tip: None,
+                    invalid_tip: None,
                     sync_cursor: None,
                     relay_cursor: None,
                 }),
@@ -6337,6 +6686,7 @@ impl Node {
                 active_connections: record.active_connections,
                 remote_height: record.remote_height,
                 remote_tip: record.remote_tip.map(hex::encode),
+                on_invalid_chain: record.on_invalid_chain(),
             })
             .collect();
         peers.sort_by(|left, right| {
@@ -6365,12 +6715,31 @@ impl Node {
 
     fn wallet_snapshot_unlatched(&mut self) -> Result<WalletSnapshot, NodeError> {
         let destination = self.wallet_destination();
+        let accepted_height = self.state.next_height().saturating_sub(1);
+        let validated_height = self.work_validated_height();
+        let available_height = self.wallet_available_height();
+        // The history scan also records where each wallet coin was created,
+        // which the balances below need, so it runs first.
+        let mut history = self.pending_wallet_history(destination)?;
+        let mut confirmed = self.confirmed_wallet_history(
+            destination,
+            accepted_height,
+            available_height,
+            MAX_WALLET_HISTORY.saturating_sub(history.len()),
+        )?;
+        confirmed.reverse();
+        history.extend(confirmed);
+        history.truncate(MAX_WALLET_HISTORY);
+
         let reserved = self.wallet_reserved_inputs();
+        let verifying_coin = self.wallet_coin_check();
         let mut spendable = 0_u64;
         let mut immature = 0_u64;
+        let mut verifying = 0_u64;
         let mut spendable_utxo_count = 0_usize;
         let mut immature_utxo_count = 0_usize;
         let mut reserved_utxo_count = 0_usize;
+        let mut verifying_utxo_count = 0_usize;
         for (outpoint, output) in self.state.utxos().iter() {
             if output.lock != OutputLock::Key(destination) {
                 continue;
@@ -6380,6 +6749,9 @@ impl Node {
                 immature_utxo_count += 1;
             } else if reserved.contains(outpoint) {
                 reserved_utxo_count += 1;
+            } else if verifying_coin(outpoint, destination) {
+                verifying = checked_wallet_add(verifying, output.value)?;
+                verifying_utxo_count += 1;
             } else {
                 spendable = checked_wallet_add(spendable, output.value)?;
                 spendable_utxo_count += 1;
@@ -6395,17 +6767,6 @@ impl Node {
             }
         }
 
-        let accepted_height = self.state.next_height().saturating_sub(1);
-        let mut history = self.pending_wallet_history(destination)?;
-        let mut confirmed = self.confirmed_wallet_history(
-            destination,
-            accepted_height,
-            MAX_WALLET_HISTORY.saturating_sub(history.len()),
-        )?;
-        confirmed.reverse();
-        history.extend(confirmed);
-        history.truncate(MAX_WALLET_HISTORY);
-
         Ok(WalletSnapshot {
             network: self.profile.name,
             devnet_only: self.profile.is_devnet(),
@@ -6418,10 +6779,14 @@ impl Node {
                 spendable_atoms: spendable.to_string(),
                 immature_atoms: immature.to_string(),
                 pending_atoms: pending.to_string(),
+                verifying_atoms: verifying.to_string(),
             },
             spendable_utxo_count,
             immature_utxo_count,
             reserved_utxo_count,
+            verifying_utxo_count,
+            validated_height,
+            available_height: available_height.filter(|_| self.wallet_catch_up().is_some()),
             mempool: WalletMempoolStatus {
                 transactions: self.mempool.len(),
                 bytes: self.mempool_bytes,
@@ -6583,8 +6948,10 @@ impl Node {
             .ok_or(NodeError::WalletAmountOverflow)?;
         let mut reserved = self.wallet_reserved_inputs();
         reserved.extend(additional_reserved);
+        let verifying_coin = self.wallet_coin_check();
         let mut candidates = Vec::new();
         let mut immature = 0_u64;
+        let mut verifying = 0_u64;
         for (outpoint, output) in self.state.utxos().iter() {
             let OutputLock::Key(public_key) = output.lock else {
                 continue;
@@ -6594,7 +6961,11 @@ impl Node {
             }
             if self.state.next_height() < output.spendable_height {
                 immature = checked_wallet_add(immature, output.value)?;
-            } else if !reserved.contains(outpoint) {
+            } else if reserved.contains(outpoint) {
+                continue;
+            } else if verifying_coin(outpoint, public_key) {
+                verifying = checked_wallet_add(verifying, output.value)?;
+            } else {
                 candidates.push((*outpoint, output.value));
             }
         }
@@ -6609,7 +6980,14 @@ impl Node {
                     required,
                 });
             }
-            let available_with_immature = checked_wallet_add(available, immature)?;
+            let available_with_verifying = checked_wallet_add(available, verifying)?;
+            if available_with_verifying >= required {
+                return Err(NodeError::WalletFundsVerifying {
+                    verifying,
+                    required,
+                });
+            }
+            let available_with_immature = checked_wallet_add(available_with_verifying, immature)?;
             if available_with_immature >= required {
                 return Err(NodeError::WalletFundsImmature { immature, required });
             }
@@ -6960,17 +7338,20 @@ impl Node {
         }
         let destination = self.wallet_destination();
         let reserved = self.wallet_reserved_inputs();
-        let mut candidates: Vec<_> = self
-            .state
-            .utxos()
-            .iter()
-            .filter(|(outpoint, output)| {
-                output.lock == OutputLock::Key(destination)
-                    && self.state.next_height() >= output.spendable_height
-                    && !reserved.contains(outpoint)
-            })
-            .map(|(outpoint, output)| (*outpoint, output.value))
-            .collect();
+        let mut candidates: Vec<_> = {
+            let verifying_coin = self.wallet_coin_check();
+            self.state
+                .utxos()
+                .iter()
+                .filter(|(outpoint, output)| {
+                    output.lock == OutputLock::Key(destination)
+                        && self.state.next_height() >= output.spendable_height
+                        && !reserved.contains(outpoint)
+                        && !verifying_coin(outpoint, destination)
+                })
+                .map(|(outpoint, output)| (*outpoint, output.value))
+                .collect()
+        };
         candidates.sort_unstable_by(|left, right| {
             left.1
                 .cmp(&right.1)
@@ -7106,6 +7487,7 @@ impl Node {
         &mut self,
         destination: [u8; 32],
         accepted_height: u64,
+        validated_height: Option<u64>,
         history_limit: usize,
     ) -> Result<Vec<WalletHistoryEntry>, NodeError> {
         if let Some(scan) = self.wallet_history_scan.take() {
@@ -7143,7 +7525,12 @@ impl Node {
                     targets,
                 )?);
             }
-            let history = cache.history(accepted_height, next_height, history_limit);
+            let history = cache.history(
+                accepted_height,
+                next_height,
+                validated_height,
+                history_limit,
+            );
             self.wallet_history_cache = Some(cache);
             return Ok(history);
         }
@@ -7156,9 +7543,117 @@ impl Node {
             &targets,
             None,
         )?;
-        let history = cache.history(accepted_height, next_height, history_limit);
+        let history = cache.history(
+            accepted_height,
+            next_height,
+            validated_height,
+            history_limit,
+        );
         self.wallet_history_cache = Some(cache);
         Ok(history)
+    }
+
+    /// Decides which unspent wallet coins still wait for this node to
+    /// re-execute the work of the block that holds them: the closure takes a
+    /// coin and the key it is locked to. A coin in an active block above the
+    /// available height (the validated height, unless a desktop wallet
+    /// catching up has re-executed enough blocks above the ones it admitted
+    /// without an engine run) waits, unless it is the wallet's own change or
+    /// consolidation output. Nothing waits on a network without the work
+    /// rule, or once every active block is checked.
+    ///
+    /// The wallet history cache says where each wallet coin was created. For
+    /// a coin it cannot place (no snapshot has scanned it, as on a pool or
+    /// headless node), the active blocks above the validated height are read
+    /// once per tip and validated height, within the same byte budget as an
+    /// inline history scan; a coin none of them created was created at or
+    /// below the validated height. Beyond that budget such a coin waits.
+    fn wallet_coin_check(&self) -> impl Fn(&OutPoint, [u8; 32]) -> bool + '_ {
+        let accepted_height = self.state.next_height().saturating_sub(1);
+        let validated = self
+            .wallet_available_height()
+            .filter(|validated| *validated < accepted_height);
+        let cache = self
+            .wallet_history_cache
+            .as_ref()
+            .filter(|cache| cache.follows(&self.index.active_chain));
+        let unchecked = std::cell::OnceCell::new();
+        move |outpoint, owner| {
+            let Some(validated) = validated else {
+                return false;
+            };
+            let origin = match cache
+                .filter(|cache| cache.destination() == owner)
+                .and_then(|cache| cache.wallet_output_origin(outpoint))
+            {
+                Some(origin) => origin,
+                None => match unchecked.get_or_init(|| self.unchecked_wallet_outputs(validated)) {
+                    Some(outputs) => match outputs.origin(outpoint, owner) {
+                        Some(origin) => origin,
+                        None => return false,
+                    },
+                    None => return true,
+                },
+            };
+            origin.height > validated && !origin.own_change
+        }
+    }
+
+    /// The outputs of the active blocks above `validated`, the validated
+    /// height, or `None` when they exceed the inline read budget or cannot
+    /// be read. A read is reused while the tip stays and the validated height
+    /// only rises; a failed read is not tried again for the same tip and
+    /// validated height.
+    fn unchecked_wallet_outputs(
+        &self,
+        validated: u64,
+    ) -> Option<Arc<wallet_history::UncheckedOutputs>> {
+        let tip = self.state.tip();
+        let mut memo = self
+            .unchecked_outputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(outputs) = memo
+            .read
+            .as_ref()
+            .filter(|outputs| outputs.covers(tip, validated))
+        {
+            return Some(Arc::clone(outputs));
+        }
+        if memo.failed == Some((tip, validated)) {
+            return None;
+        }
+        let from = usize::try_from(validated).ok()?.checked_add(1)?;
+        let mut bytes = 0_u64;
+        for block_id in self.index.active_chain.get(from..).unwrap_or_default() {
+            bytes = bytes.saturating_add(self.index.blocks.get(block_id)?.locator.length);
+            if bytes > self.wallet_history_inline_scan_bytes() {
+                return None;
+            }
+        }
+        let read = self.wallet_history_scan_targets(from).and_then(|targets| {
+            wallet_history::UncheckedOutputs::read(
+                &self.log,
+                &self.data_dir.join(BLOCK_LOG_FILE),
+                self.params.network_id,
+                matches!(self.profile.proof, ProofProfile::ProductionV3),
+                tip,
+                validated,
+                &targets,
+            )
+        });
+        match read {
+            Ok(outputs) => {
+                let outputs = Arc::new(outputs);
+                memo.read = Some(Arc::clone(&outputs));
+                Some(outputs)
+            }
+            Err(error) => {
+                tracing::warn!(%error, "could not read the blocks above the validated height for wallet coins");
+                memo.failed = Some((tip, validated));
+                None
+            }
+        }
     }
 
     fn wallet_history_inline_scan_bytes(&self) -> u64 {
@@ -7525,10 +8020,18 @@ impl Node {
 
     /// Confirmations of active-chain transactions with no floor and no hint:
     /// [`Self::active_transaction_lookups`] bounded by the scan marks alone.
+    /// They count only blocks up to the exchange served height
+    /// ([`Self::exchange_served_cap`]), so a transaction in a block above it
+    /// is found with no confirmations.
     pub(crate) fn active_transaction_confirmations_for(
         &mut self,
         txids: &HashSet<[u8; 32]>,
     ) -> Result<HashMap<[u8; 32], u64>, NodeError> {
+        let unserved = self
+            .state
+            .next_height()
+            .saturating_sub(1)
+            .saturating_sub(self.exchange_served_cap());
         let requests = txids
             .iter()
             .map(|txid| {
@@ -7545,7 +8048,7 @@ impl Node {
             .active_transaction_lookups(&requests)?
             .found
             .into_iter()
-            .map(|(txid, result)| (txid, result.confirmations))
+            .map(|(txid, result)| (txid, result.confirmations.saturating_sub(unserved)))
             .collect())
     }
 
@@ -7671,6 +8174,7 @@ impl Node {
         if inventory.is_empty() && effective_tip != peer_tip {
             inventory = self.relay_inventory_after(peer_tip, max);
         }
+        self.limit_wallet_relay_inventory(&mut inventory);
         (inventory, cursor)
     }
 
@@ -7862,9 +8366,10 @@ impl Node {
 
     fn submit_transaction_inner(
         &mut self,
-        transaction: Transaction,
+        mut transaction: Transaction,
         allow_exchange_withdrawal_reservations: bool,
     ) -> Result<MempoolEntry, NodeError> {
+        rebase_channel_close(&mut transaction, self.state.next_height());
         if self.exchange_custody_v3_wallet_state.locks_native_wallet()
             && !allow_exchange_withdrawal_reservations
         {
@@ -7903,8 +8408,29 @@ impl Node {
         if next_bytes > MAX_MEMPOOL_BYTES {
             return Err(NodeError::MempoolByteLimit);
         }
-
+        // A close that conflicts with the mempool or spends no output on the
+        // active chain is refused for that, below, not for the budget.
         let spent = mempool_spent_inputs(&self.mempool);
+        if is_channel_close(&transaction)
+            && transaction.inputs.iter().all(|input| {
+                !spent.contains(&input.previous)
+                    && self.state.utxos().get(&input.previous).is_some()
+            })
+        {
+            let (closes, close_bytes) = self
+                .mempool
+                .values()
+                .filter(|entry| is_channel_close(&entry.transaction))
+                .fold((0_usize, 0_usize), |(count, bytes), entry| {
+                    (count + 1, bytes.saturating_add(entry.encoded_bytes))
+                });
+            if closes >= MAX_MEMPOOL_CLOSES
+                || close_bytes.saturating_add(canonical.len()) > MAX_MEMPOOL_CLOSE_BYTES
+            {
+                return Err(NodeError::MempoolCloseLimit);
+            }
+        }
+
         let fee_burned =
             validate_mempool_transaction(&self.state, &transaction, canonical.len(), &spent)?;
 
@@ -8013,6 +8539,30 @@ impl Node {
         self.submit_block_with_preverification(block, accepted_at, None, None, None, None, None)
     }
 
+    /// [`preflight_external_block_admission`](Self::preflight_external_block_admission),
+    /// remembering a block whose work this node already found not to match,
+    /// so that sync does not download it again. A remembered refusal this
+    /// node's engines no longer stand behind (see
+    /// [`stale_work_rejection`](Self::stale_work_rejection)) is forgotten
+    /// first, so the block is checked again.
+    fn preflight_external_block_admission_remembered(
+        &mut self,
+        block: &Block,
+        accepted_at: u64,
+        sender: Option<work_gate::BlockSender>,
+    ) -> Result<(), NodeError> {
+        let block_id = block.block_id();
+        if self.stale_work_rejection(&block_id) {
+            self.forget_rejected_proof(block_id);
+        }
+        let result =
+            self.preflight_external_block_admission_from(block, accepted_at, sender, false);
+        if let Err(error) = &result {
+            self.remember_work_mismatch(block, error);
+        }
+        result
+    }
+
     /// Rejects cheap duplicate, ancestry, and successor-header failures before
     /// dispatching an expensive external proof verification. This is only an
     /// admission gate: stateful validation happens outside the node mutex after
@@ -8023,22 +8573,42 @@ impl Node {
         block: &Block,
         accepted_at: u64,
     ) -> Result<(), NodeError> {
+        self.preflight_external_block_admission_from(block, accepted_at, None, false)
+    }
+
+    /// [`preflight_external_block_admission`](Self::preflight_external_block_admission)
+    /// for a block that may have come from `sender`, a peer; see
+    /// [`work_rule_preflight`](Self::work_rule_preflight) for `any_depth`.
+    fn preflight_external_block_admission_from(
+        &self,
+        block: &Block,
+        accepted_at: u64,
+        sender: Option<work_gate::BlockSender>,
+        any_depth: bool,
+    ) -> Result<(), NodeError> {
         let block_id = block.block_id();
         if self.index.contains(block_id) {
             return Err(NodeError::DuplicateBlock(block_id));
         }
-        if self.rejected_proof_ids.contains(&block_id) {
-            return Err(NodeError::CachedInvalidBlock(block_id));
+        if self.rejected_proof_ids.contains(&block_id) && !self.stale_work_rejection(&block_id) {
+            // One engine's remembered mismatch is refused as that, so its
+            // re-send costs the sender nothing either.
+            return Err(if self.unconfirmed_work_rejection(&block_id) {
+                NodeError::WorkMismatchUnconfirmed(block_id)
+            } else {
+                NodeError::CachedInvalidBlock(block_id)
+            });
         }
         if !matches!(
             self.profile.proof,
             ProofProfile::ProductionV3 | ProofProfile::ProductionV4
         ) {
-            return Ok(());
+            return self.work_rule_preflight(block, sender, any_depth);
         }
         if self.storage_faulted {
             return Err(NodeError::StorageFaulted);
         }
+        self.work_rule_lineage(block)?;
         validate_block_resources(block)?;
         let body_digest = canonical_block_cache_digest(block)?;
         if self.rejected_body_digests.contains(&body_digest) {
@@ -8080,7 +8650,7 @@ impl Node {
         // the independently derived block target never consumes queue or
         // external-worker capacity.
         self.verifier.preflight(&block.challenge, &block.proof)?;
-        Ok(())
+        self.work_rule_preflight(block, sender, any_depth)
     }
 
     pub(crate) fn begin_external_block_admission(
@@ -8336,12 +8906,39 @@ impl Node {
         }))
     }
 
+    /// Remembers `block_id` as refused. A desktop wallet catching up also
+    /// drops a grant still waiting for that block, so a later arrival is
+    /// checked.
     fn remember_rejected_proof(&mut self, block_id: [u8; 32]) {
+        if let Some(catch_up) = self.wallet_catch_up() {
+            catch_up.take_grant(&block_id);
+        }
+        let work_rejections = &mut self.work_rejections;
         remember_bounded_digest(
             &mut self.rejected_proof_ids,
             &mut self.rejected_proof_order,
             block_id,
+            |expired| {
+                work_rejections.remove(&expired);
+            },
         );
+    }
+
+    /// Forgets a remembered rejected block id, so the block is checked again
+    /// on its next arrival.
+    fn forget_rejected_proof(&mut self, block_id: [u8; 32]) {
+        if self.rejected_proof_ids.remove(&block_id) {
+            self.rejected_proof_order.retain(|id| *id != block_id);
+        }
+        self.work_rejections.remove(&block_id);
+    }
+
+    /// Remembers a block refused because its work did not match, and how
+    /// that was decided: a re-send is refused at once, and sync does not
+    /// download it again. A block already remembered keeps its place.
+    fn remember_work_rejection(&mut self, block_id: [u8; 32], kind: work_gate::WorkRejectionKind) {
+        self.remember_rejected_proof(block_id);
+        self.work_rejections.insert(block_id, kind);
     }
 
     fn remember_rejected_body(&mut self, body_digest: [u8; 32]) {
@@ -8349,6 +8946,7 @@ impl Node {
             &mut self.rejected_body_digests,
             &mut self.rejected_body_order,
             body_digest,
+            |_| {},
         );
     }
 
@@ -8500,6 +9098,7 @@ impl Node {
         if self.storage_faulted {
             return Err(NodeError::StorageFaulted);
         }
+        let granted = self.require_work_verdict(&block)?;
         let previous_tip = self.state.tip();
         let confirmed_txids: HashSet<_> =
             block.transactions.iter().map(Transaction::txid).collect();
@@ -8647,8 +9246,12 @@ impl Node {
             }
             return Err(error);
         }
+        let committed_height = locator.height;
         match commit_prepared(&mut self.state, &mut self.index, prepared, locator) {
             Ok(outcome) => {
+                if granted && let Some(catch_up) = self.wallet_catch_up() {
+                    catch_up.raise_top_granted(committed_height);
+                }
                 self.chain_revision = next_revision;
                 self.record_count = self.record_count.saturating_add(1);
                 self.last_record_digest = record_digest;
@@ -8710,48 +9313,122 @@ impl Node {
         }
     }
 
+    /// Keeps the mempool transactions that are still valid for the next
+    /// block after the chain moved. Each is checked on its own, and those
+    /// left are then checked once as one block set: they formed one before,
+    /// less what the block confirmed or spent, so that normally passes. Only
+    /// if it does not is each checked again with those kept before it, which
+    /// costs a check of the whole prefix per transaction.
     fn revalidate_mempool(&mut self, confirmed_txids: &HashSet<[u8; 32]>) {
         let old_pool = std::mem::take(&mut self.mempool);
-        let mut retained = BTreeMap::new();
-        let mut retained_transactions = Vec::new();
-        let mut retained_spends = HashSet::new();
-        let mut retained_bytes = 0_usize;
+        let mut candidates = Vec::new();
+        let mut candidate_spends = HashSet::new();
 
-        for (txid, entry) in old_pool {
+        for (txid, mut entry) in old_pool {
             if confirmed_txids.contains(&txid) {
                 continue;
             }
+            if rebase_channel_close(&mut entry.transaction, self.state.next_height()) {
+                let Ok(canonical) = encode_transaction(&entry.transaction) else {
+                    continue;
+                };
+                entry.txid = entry.transaction.txid();
+                entry.encoded_bytes = canonical.len();
+            }
+            #[cfg(test)]
+            count_revalidated_transactions(1);
             let Ok(fee_burned) = validate_mempool_transaction(
                 &self.state,
                 &entry.transaction,
                 entry.encoded_bytes,
-                &retained_spends,
+                &candidate_spends,
             ) else {
                 continue;
             };
-            retained_transactions.push(entry.transaction.clone());
-            if self
-                .state
-                .validate_transactions_for_next_block(&retained_transactions)
-                .is_err()
-            {
-                retained_transactions.pop();
-                continue;
-            }
-            retained_spends.extend(entry.transaction.inputs.iter().map(|input| input.previous));
-            retained_bytes += entry.encoded_bytes;
-            retained.insert(
-                txid,
-                MempoolEntry {
-                    fee_burned,
-                    ..entry
-                },
-            );
+            candidate_spends.extend(entry.transaction.inputs.iter().map(|input| input.previous));
+            candidates.push(MempoolEntry {
+                fee_burned,
+                ..entry
+            });
         }
 
-        self.mempool = retained;
-        self.mempool_bytes = retained_bytes;
+        let transactions = candidates
+            .iter()
+            .map(|entry| entry.transaction.clone())
+            .collect::<Vec<_>>();
+        #[cfg(test)]
+        count_revalidated_transactions(transactions.len());
+        let kept = if self
+            .state
+            .validate_transactions_for_next_block(&transactions)
+            .is_ok()
+        {
+            candidates
+        } else {
+            let mut kept = Vec::new();
+            let mut kept_transactions = Vec::new();
+            for entry in candidates {
+                kept_transactions.push(entry.transaction.clone());
+                #[cfg(test)]
+                count_revalidated_transactions(kept_transactions.len());
+                if self
+                    .state
+                    .validate_transactions_for_next_block(&kept_transactions)
+                    .is_err()
+                {
+                    kept_transactions.pop();
+                    continue;
+                }
+                kept.push(entry);
+            }
+            kept
+        };
+
+        self.mempool_bytes = kept.iter().map(|entry| entry.encoded_bytes).sum();
+        self.mempool = kept.into_iter().map(|entry| (entry.txid, entry)).collect();
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Transactions that block-set checks in [`Node::revalidate_mempool`]
+    /// covered on this thread, each counted once per check it was in.
+    static REVALIDATED_TRANSACTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn count_revalidated_transactions(count: usize) {
+    REVALIDATED_TRANSACTIONS.with(|counted| counted.set(counted.get() + count));
+}
+
+/// Moves an inference channel close to `height`. Consensus accepts a close
+/// only with every output spendable at the height that mines it, and the
+/// witness does not commit to that height. Pools take mempool transactions
+/// only when the tip changes, so a close held at one height would miss every
+/// template; carried forward, it waits for a block like any other
+/// transaction. Returns whether anything changed.
+fn rebase_channel_close(transaction: &mut Transaction, height: u64) -> bool {
+    if !is_channel_close(transaction) {
+        return false;
+    }
+    let mut changed = false;
+    for output in &mut transaction.outputs {
+        changed |= output.spendable_height != height;
+        output.spendable_height = height;
+    }
+    changed
+}
+
+/// Whether `transaction` closes an inference channel: one input, spent by
+/// a settlement or a refund.
+fn is_channel_close(transaction: &Transaction) -> bool {
+    matches!(
+        transaction.inputs.as_slice(),
+        [input] if matches!(
+            input.witness,
+            InputWitness::InferenceSettlement { .. } | InputWitness::InferenceRefund { .. }
+        )
+    )
 }
 
 fn mempool_spent_inputs(mempool: &BTreeMap<[u8; 32], MempoolEntry>) -> HashSet<OutPoint> {
@@ -8905,14 +9582,34 @@ pub fn submit_shared_block(
         block,
         accepted_at,
         SharedBlockPolicy::AnyBranch,
+        BlockOrigin::InProcess,
         None,
         None,
     )
 }
 
-/// P2P submission route with a connection-lifetime cancellation signal. A
-/// disconnected session is removed from both verifier queues before it can be
-/// granted scarce worker capacity.
+/// [`submit_shared_block`] for a block posted to the RPC; `loopback` for a
+/// connection from this machine.
+pub(crate) fn submit_shared_rpc_block(
+    shared: &Arc<Mutex<Node>>,
+    block: Block,
+    accepted_at: u64,
+    loopback: bool,
+) -> Result<u64, NodeError> {
+    submit_shared_block_with_policy(
+        shared,
+        block,
+        accepted_at,
+        SharedBlockPolicy::AnyBranch,
+        BlockOrigin::Rpc { loopback },
+        None,
+        None,
+    )
+}
+
+/// [`submit_shared_peer_block_from`] for a block from an anonymous peer that
+/// did not send it itself.
+#[cfg(test)]
 pub(crate) fn submit_shared_peer_block_cancellable(
     shared: &Arc<Mutex<Node>>,
     block: Block,
@@ -8920,11 +9617,29 @@ pub(crate) fn submit_shared_peer_block_cancellable(
     peer: RemoteProofPeerId,
     request: RemoteProofRequest,
 ) -> Result<u64, NodeError> {
+    submit_shared_peer_block_from(shared, block, accepted_at, peer, request, false, None)
+}
+
+/// P2P submission route with a connection-lifetime cancellation signal. A
+/// disconnected session is removed from both verifier queues before it can be
+/// granted scarce worker capacity. `sender` is the peer that sent the block,
+/// or that a sync session fetched it from; the peer may be `trusted` (see
+/// [`BlockOrigin::Peer`]).
+pub(crate) fn submit_shared_peer_block_from(
+    shared: &Arc<Mutex<Node>>,
+    block: Block,
+    accepted_at: u64,
+    peer: RemoteProofPeerId,
+    request: RemoteProofRequest,
+    trusted: bool,
+    sender: Option<work_gate::BlockSender>,
+) -> Result<u64, NodeError> {
     submit_shared_block_with_policy(
         shared,
         block,
         accepted_at,
         SharedBlockPolicy::AnyBranch,
+        BlockOrigin::Peer { trusted, sender },
         Some(peer),
         Some(request),
     )
@@ -8943,6 +9658,7 @@ pub fn submit_shared_tip_block(
         block,
         accepted_at,
         SharedBlockPolicy::ActiveTipOnly,
+        BlockOrigin::InProcess,
         None,
         None,
     )
@@ -8952,6 +9668,49 @@ pub fn submit_shared_tip_block(
 enum SharedBlockPolicy {
     AnyBranch,
     ActiveTipOnly,
+}
+
+/// Where a block submitted for admission came from. Above the release
+/// checkpoint it decides whether the block's work check waits for the work
+/// lane as priority: a local miner's block (from this process or over
+/// loopback) and a block from an operator-configured or bootstrap peer do; a
+/// block from any other peer does not, even one that extends the tip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BlockOrigin {
+    /// This process. A block that extends the active tip waits as priority.
+    InProcess,
+    /// The RPC. A connection from this machine (`loopback`) waits as
+    /// priority.
+    Rpc { loopback: bool },
+    /// A peer: the one that sent the block, or the one a sync session
+    /// fetched it from (`sender`, if known). An operator-configured or
+    /// bootstrap peer, or one on this machine (`trusted`), waits as priority.
+    Peer {
+        trusted: bool,
+        sender: Option<work_gate::BlockSender>,
+    },
+}
+
+impl BlockOrigin {
+    /// The peer the block came from, if a peer did.
+    fn sender(self) -> Option<work_gate::BlockSender> {
+        match self {
+            Self::Peer { sender, .. } => sender,
+            Self::InProcess | Self::Rpc { .. } => None,
+        }
+    }
+
+    /// The peer address the block counts against under
+    /// [`work_gate::MAX_LONE_REFUSALS_PER_SENDER`]: none for a trusted peer.
+    fn counted_sender(self) -> Option<IpAddr> {
+        match self {
+            Self::Peer {
+                trusted: false,
+                sender,
+            } => sender.map(|sender| sender.address),
+            Self::Peer { .. } | Self::InProcess | Self::Rpc { .. } => None,
+        }
+    }
 }
 
 struct ProofAttemptStart {
@@ -9049,12 +9808,13 @@ fn submit_shared_block_with_policy(
     block: Block,
     accepted_at: u64,
     policy: SharedBlockPolicy,
+    origin: BlockOrigin,
     remote_peer: Option<RemoteProofPeerId>,
     remote_request: Option<RemoteProofRequest>,
 ) -> Result<u64, NodeError> {
     let block_id = block.block_id();
     ensure_remote_request_live(remote_request.as_ref())?;
-    let (block_preverifier, production_admission) = {
+    let (block_preverifier, production_admission, work_rule) = {
         let node = lock_shared_node(shared, remote_request.as_ref())?;
         (
             node.block_preverifier(),
@@ -9062,20 +9822,23 @@ fn submit_shared_block_with_policy(
                 node.profile.proof,
                 ProofProfile::ProductionV3 | ProofProfile::ProductionV4
             ),
+            node.work_gate.is_some(),
         )
     };
-    if production_admission {
+    if production_admission || work_rule {
         // Keep trivial duplicates, cached deterministic rejects, unknown
         // parents, malformed bodies, and impossible headers out of the scarce
         // proof queue. This snapshot is deliberately discarded and repeated
         // authoritatively after the permit is acquired.
-        let node = lock_shared_node(shared, remote_request.as_ref())?;
+        let mut node = lock_shared_node(shared, remote_request.as_ref())?;
         if matches!(policy, SharedBlockPolicy::ActiveTipOnly)
             && block.challenge.previous_block != node.state.tip()
         {
             return Err(NodeError::StaleBlockAdmission);
         }
-        node.preflight_external_block_admission(&block, accepted_at)?;
+        node.preflight_external_block_admission_remembered(&block, accepted_at, origin.sender())?;
+        // Before its proof is checked: a deferred block costs nothing.
+        node.require_lone_refusal_budget(&block, origin.counted_sender())?;
     }
     ensure_remote_request_live(remote_request.as_ref())?;
     let block_cache_digest = canonical_block_cache_digest(&block)?;
@@ -9117,14 +9880,18 @@ fn submit_shared_block_with_policy(
             }
         };
         {
-            let node = lock_shared_node(shared, remote_request.as_ref())?;
+            let mut node = lock_shared_node(shared, remote_request.as_ref())?;
             if matches!(policy, SharedBlockPolicy::ActiveTipOnly)
                 && block.challenge.previous_block != node.state.tip()
             {
                 return Err(NodeError::StaleBlockAdmission);
             }
             if production_admission {
-                node.preflight_external_block_admission(&block, accepted_at)?;
+                node.preflight_external_block_admission_remembered(
+                    &block,
+                    accepted_at,
+                    origin.sender(),
+                )?;
             }
         }
         let result = if remote_permit
@@ -9155,6 +9922,44 @@ fn submit_shared_block_with_policy(
         }
     };
 
+    ensure_remote_request_live(remote_request.as_ref())?;
+
+    let work = {
+        let node = lock_shared_node(shared, remote_request.as_ref())?;
+        if matches!(policy, SharedBlockPolicy::ActiveTipOnly)
+            && block.challenge.previous_block != node.state.tip()
+        {
+            return Err(NodeError::StaleBlockAdmission);
+        }
+        node.work_admission(
+            &block,
+            matches!(policy, SharedBlockPolicy::ActiveTipOnly),
+            origin,
+        )?
+    };
+    #[cfg(test)]
+    {
+        let hook = lock_shared_node(shared, remote_request.as_ref())?
+            .after_work_admission
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+    if let Some(work) = work
+        && let Err(rejection) = work.ensure(remote_request.as_ref())
+    {
+        // A verdict reached after the request's deadline still counts: the
+        // node lock is taken without the deadline, and the mismatch is
+        // returned as it is.
+        if rejection.remember {
+            shared
+                .lock()
+                .map_err(|_| NodeError::SharedNodePoisoned)?
+                .remember_work_mismatch(&block, &rejection.error);
+        }
+        return Err(rejection.error);
+    }
     ensure_remote_request_live(remote_request.as_ref())?;
 
     let admission_work = {
@@ -9287,17 +10092,22 @@ fn canonical_block_cache_digest(block: &Block) -> Result<[u8; 32], NodeError> {
     Ok(*hasher.finalize().as_bytes())
 }
 
+/// Remembers `digest`, dropping the oldest entries past
+/// [`MAX_REJECTED_BLOCK_IDS`] and passing each one to `expired`. A digest
+/// already held keeps its place.
 fn remember_bounded_digest(
     entries: &mut HashSet<[u8; 32]>,
     order: &mut VecDeque<[u8; 32]>,
     digest: [u8; 32],
+    mut expired: impl FnMut([u8; 32]),
 ) {
     if entries.insert(digest) {
         order.push_back(digest);
     }
     while order.len() > MAX_REJECTED_BLOCK_IDS {
-        if let Some(expired) = order.pop_front() {
-            entries.remove(&expired);
+        if let Some(oldest) = order.pop_front() {
+            entries.remove(&oldest);
+            expired(oldest);
         }
     }
 }
@@ -9324,12 +10134,19 @@ fn is_cacheable_proof_rejection(error: &NodeError) -> bool {
     )
 }
 
+/// Whether a remote block's outcome counts against its sender: a failed
+/// proof, or work that two independent engines agree does not match. A
+/// mismatch only one engine found ([`NodeError::WorkMismatchUnconfirmed`])
+/// does not.
 fn is_remote_peer_proof_failure(error: &NodeError) -> bool {
     matches!(
         error,
         NodeError::ProofVerifierWorker(worker_error)
             if worker_error.is_dispatched_proof_failure()
-    ) || matches!(error, NodeError::Pow(_))
+    ) || matches!(
+        error,
+        NodeError::Pow(_) | NodeError::WorkRecomputationMismatch(_)
+    )
 }
 
 fn finalize_proof_attempt<T>(
@@ -9678,7 +10495,9 @@ fn commit_prepared(
     index
         .transactions
         .insert_block(prepared.block_id, prepared.transaction_ids);
-    index.addresses.insert_entries(prepared.address_entries);
+    index
+        .addresses
+        .insert_block_entries(prepared.address_entries);
     if activates {
         if was_active {
             index.active_chain.push(prepared.block_id);
@@ -9727,9 +10546,36 @@ struct RpcRequestHead {
     target: String,
     content_type: Option<String>,
     authorization: Option<Zeroizing<String>>,
+    browser: RpcBrowserHeaders,
     expect_continue: bool,
     body_length: usize,
     body_prefix: Vec<u8>,
+}
+
+/// Browser-controlled headers that decide whether a local-only route may run.
+/// Repeats are recorded rather than rejected so every other route parses
+/// exactly as before; a local-only route refuses them as ambiguous.
+#[derive(Debug, Default)]
+struct RpcBrowserHeaders {
+    host: Option<String>,
+    origin: Option<String>,
+    sec_fetch_site: Option<String>,
+    repeated: bool,
+}
+
+impl RpcBrowserHeaders {
+    fn record(&mut self, name: &str, value: &str) {
+        let slot = if name.eq_ignore_ascii_case("host") {
+            &mut self.host
+        } else if name.eq_ignore_ascii_case("origin") {
+            &mut self.origin
+        } else if name.eq_ignore_ascii_case("sec-fetch-site") {
+            &mut self.sec_fetch_site
+        } else {
+            return;
+        };
+        self.repeated |= slot.replace(value.to_owned()).is_some();
+    }
 }
 
 struct DeadlineReader<'a> {
@@ -10028,19 +10874,115 @@ fn handle_rpc_connection_shared(
         .map_err(|_| NodeError::SharedNodePoisoned)?
         .params
         .network_id;
-    let request = match read_rpc_request(&mut deadline_reader, network_id) {
+    let head = match read_checked_rpc_request_head(&mut deadline_reader, network_id) {
+        Ok(head) => head,
+        Err(error) => {
+            return write_rpc_response(stream, RpcResponse::node_error(error));
+        }
+    };
+    // A local-only route is refused on its head: its body, up to the block
+    // size, is never read.
+    if let Some(refusal) = local_only_rpc_refusal(&head.target, &head.browser) {
+        return write_rpc_response(stream, refusal);
+    }
+    let request = match read_rpc_request_body(&mut deadline_reader, head) {
         Ok(request) => request,
         Err(error) => {
             return write_rpc_response(stream, RpcResponse::node_error(error));
         }
     };
     let response = if request.method == "POST" && request.target == "/v1/block" {
-        route_shared_block_request(request, shared)
+        // A local miner submits over loopback.
+        let loopback = stream
+            .peer_addr()
+            .is_ok_and(|address| address.ip().to_canonical().is_loopback());
+        route_shared_block_request(request, shared, loopback)
     } else {
         let mut node = shared.lock().map_err(|_| NodeError::SharedNodePoisoned)?;
         route_rpc_request(request, &mut node)
     };
     write_rpc_response(stream, response)
+}
+
+/// Routes that read the node wallet or change node state answer only local
+/// clients: wallet reads and spends, development mining to a caller-chosen
+/// destination, and transaction and block submission. The check is by path for
+/// any method, so a future `/v1/wallet/...` route is covered too. The remaining
+/// routes are public chain-data reads, and the explorer reaches its read paths
+/// through a tunnel that forwards its public hostname as Host.
+fn is_local_only_rpc_target(target: &str) -> bool {
+    let path = target.split_once('?').map_or(target, |(path, _)| path);
+    matches!(
+        path,
+        "/v1/wallet" | "/v1/mine" | "/v1/transaction" | "/v1/block"
+    ) || path.starts_with("/v1/wallet/")
+}
+
+/// Refuses a local-only route unless its Host names this machine and no
+/// browser context points elsewhere. A page that DNS-rebinds its own hostname
+/// to 127.0.0.1 is same-origin to the browser, but still sends that hostname
+/// as Host. `Origin` and `Sec-Fetch-Site` also stop cross-site pages that
+/// address 127.0.0.1 directly.
+fn local_only_rpc_refusal(target: &str, browser: &RpcBrowserHeaders) -> Option<RpcResponse> {
+    if !is_local_only_rpc_target(target) {
+        return None;
+    }
+    let error = if browser.repeated {
+        "local-only RPC route refuses repeated Host, Origin or Sec-Fetch-Site headers"
+    } else if !browser.host.as_deref().is_some_and(is_loopback_authority) {
+        "local-only RPC route requires a loopback Host header (127.0.0.0/8, [::1] or localhost)"
+    } else if browser
+        .origin
+        .as_deref()
+        .is_some_and(|origin| !is_loopback_origin(origin))
+    {
+        "local-only RPC route refuses a non-loopback browser Origin"
+    } else if browser
+        .sec_fetch_site
+        .as_deref()
+        .is_some_and(|site| site.eq_ignore_ascii_case("cross-site"))
+    {
+        "local-only RPC route refuses cross-site browser requests"
+    } else {
+        return None;
+    };
+    Some(RpcResponse::json_error(403, "Forbidden", error))
+}
+
+/// Whether `authority` (`host[:port]`) names this machine: an IPv4 literal in
+/// 127.0.0.0/8, `[::1]` or `localhost` (any case), with any numeric port.
+fn is_loopback_authority(authority: &str) -> bool {
+    let (host, port) = match authority.rfind(':') {
+        // A colon followed by `]` is inside an IPv6 literal, not a port.
+        Some(colon) if !authority[colon..].contains(']') => {
+            (&authority[..colon], Some(&authority[colon + 1..]))
+        }
+        _ => (authority, None),
+    };
+    if port.is_some_and(|port| port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit())) {
+        return false;
+    }
+    if let Some(address) = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+    {
+        return address
+            .parse::<Ipv6Addr>()
+            .is_ok_and(|address| address.is_loopback());
+    }
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<Ipv4Addr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+/// Whether a browser `Origin` is a page served from this machine. Opaque
+/// (`null`) and non-HTTP origins are not.
+fn is_loopback_origin(origin: &str) -> bool {
+    origin.split_once("://").is_some_and(|(scheme, authority)| {
+        (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+            && is_loopback_authority(authority)
+    })
 }
 
 fn route_rpc_request(request: RpcRequest, node: &mut Node) -> RpcResponse {
@@ -10109,7 +11051,7 @@ fn route_rpc_request_inner(request: RpcRequest, node: &mut Node) -> RpcResponse 
         }
         ("GET", target) if target.starts_with("/v1/explorer/transaction/") => {
             let query = &target[25..];
-            match node.explorer_transaction(query) {
+            match node.explorer_transaction_detail(query) {
                 Ok(Some(transaction)) => match serde_json::to_value(transaction) {
                     Ok(value) => RpcResponse::json(200, "OK", value),
                     Err(error) => RpcResponse::json_error(500, "Internal Server Error", error),
@@ -10246,6 +11188,7 @@ fn route_rpc_request_inner(request: RpcRequest, node: &mut Node) -> RpcResponse 
                     error @ (NodeError::MempoolUnconfirmedInput(_)
                     | NodeError::MempoolTransactionLimit
                     | NodeError::MempoolByteLimit
+                    | NodeError::MempoolCloseLimit
                     | NodeError::MempoolFeeTooLow { .. }
                     | NodeError::Chain(_)),
                 ) => RpcResponse::json_error(422, "Unprocessable Content", error),
@@ -10296,7 +11239,11 @@ fn route_rpc_request_inner(request: RpcRequest, node: &mut Node) -> RpcResponse 
     }
 }
 
-fn route_shared_block_request(request: RpcRequest, shared: &Arc<Mutex<Node>>) -> RpcResponse {
+fn route_shared_block_request(
+    request: RpcRequest,
+    shared: &Arc<Mutex<Node>>,
+    loopback: bool,
+) -> RpcResponse {
     let network_id = match shared.lock() {
         Ok(node) => node.params.network_id,
         Err(_) => return RpcResponse::node_error(NodeError::SharedNodePoisoned),
@@ -10309,7 +11256,7 @@ fn route_shared_block_request(request: RpcRequest, shared: &Arc<Mutex<Node>>) ->
         Ok(accepted_at) => accepted_at,
         Err(error) => return RpcResponse::node_error(error),
     };
-    let fees_burned = match submit_shared_block(shared, block, accepted_at) {
+    let fees_burned = match submit_shared_rpc_block(shared, block, accepted_at, loopback) {
         Ok(fees_burned) => fees_burned,
         Err(error) => return RpcResponse::node_error(error),
     };
@@ -10376,15 +11323,7 @@ fn has_json_content_type(content_type: Option<&str>) -> bool {
 }
 
 fn parse_wallet_recipient(value: &str) -> Result<[u8; 32], NodeError> {
-    if value.len() != 64 {
-        return Err(NodeError::InvalidWalletRecipient);
-    }
-    let bytes = hex::decode(value).map_err(|_| NodeError::InvalidWalletRecipient)?;
-    let recipient: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| NodeError::InvalidWalletRecipient)?;
-    VerifyingKey::from_bytes(&recipient).map_err(|_| NodeError::InvalidWalletRecipient)?;
-    Ok(recipient)
+    parse_key_destination(value).ok_or(NodeError::InvalidWalletRecipient)
 }
 
 fn parse_cmfd_atoms(value: &str) -> Result<u64, NodeError> {
@@ -10527,14 +11466,29 @@ fn template_json(template: &BlockTemplate, profile: NetworkProfile) -> serde_jso
     })
 }
 
-fn read_rpc_request(reader: &mut impl Read, network_id: [u8; 32]) -> Result<RpcRequest, NodeError> {
+#[cfg(test)]
+fn read_rpc_request(
+    reader: &mut impl Read,
+    network_id: [u8; 32],
+) -> Result<(RpcRequest, RpcBrowserHeaders), NodeError> {
+    let mut head = read_checked_rpc_request_head(reader, network_id)?;
+    let browser = std::mem::take(&mut head.browser);
+    Ok((read_rpc_request_body(reader, head)?, browser))
+}
+
+/// The head of a node RPC request, which may not ask for
+/// `Expect: 100-continue`.
+fn read_checked_rpc_request_head(
+    reader: &mut impl Read,
+    network_id: [u8; 32],
+) -> Result<RpcRequestHead, NodeError> {
     let head = read_rpc_request_head(reader, network_id)?;
     if head.expect_continue {
         return Err(NodeError::InvalidRpcRequest(
             "Expect: 100-continue is not supported".to_owned(),
         ));
     }
-    read_rpc_request_body(reader, head)
+    Ok(head)
 }
 
 fn read_rpc_request_head(
@@ -10583,6 +11537,7 @@ fn read_rpc_request_head(
     let mut content_length = None;
     let mut content_type = None;
     let mut authorization = None;
+    let mut browser = RpcBrowserHeaders::default();
     let mut expect_continue = false;
     let mut expect_seen = false;
     let body_limit = rpc_body_limit(request_parts[0], request_parts[1], network_id);
@@ -10635,6 +11590,8 @@ fn read_rpc_request_head(
             return Err(NodeError::InvalidRpcRequest(
                 "Transfer-Encoding is not supported".to_owned(),
             ));
+        } else {
+            browser.record(name, value);
         }
     }
 
@@ -10661,6 +11618,7 @@ fn read_rpc_request_head(
         target: request_parts[1].to_owned(),
         content_type,
         authorization,
+        browser,
         expect_continue,
         body_length,
         body_prefix,
@@ -11632,6 +12590,18 @@ fn positioned_read_exact(file: &File, mut buffer: &mut [u8], mut offset: u64) ->
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Block-log bytes this thread read through `read_located_record`.
+    static LOG_RECORD_BYTES_READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Block-log bytes this thread has read through the authenticated record path.
+#[cfg(test)]
+pub(crate) fn log_record_bytes_read() -> u64 {
+    LOG_RECORD_BYTES_READ.with(std::cell::Cell::get)
+}
+
 fn read_located_record(
     file: &File,
     path: &Path,
@@ -11701,6 +12671,8 @@ fn read_located_record(
             ),
         )
     })?;
+    #[cfg(test)]
+    LOG_RECORD_BYTES_READ.with(|read| read.set(read.get() + locator.length));
     let mut reader = Cursor::new(bytes.as_slice());
     let record =
         read_log_record(&mut reader, path, locator.ordinal, network_id)?.ok_or_else(|| {
@@ -12378,14 +13350,37 @@ fn scan_replay_log(
     let mut saw_full_record = false;
     let mut last_pruned = params.genesis_hash;
     let mut pruned_height = 0_u64;
+    let started = Instant::now();
+    tracing::info!(
+        bytes = reader
+            .get_ref()
+            .metadata()
+            .map(|metadata| metadata.len())
+            .ok(),
+        "scanning the retained block log"
+    );
     loop {
         let offset = reader
             .stream_position()
             .map_err(|source| io_error("locate block log record", path, source))?;
+        if record_index > 0 && record_index.is_multiple_of(1_000) {
+            tracing::info!(
+                records = record_index,
+                bytes = offset,
+                seconds = started.elapsed().as_secs(),
+                "block log scan progress"
+            );
+        }
         let Some(record) = read_log_record(&mut reader, path, record_index, network_id)? else {
             let log_length = reader
                 .stream_position()
                 .map_err(|source| io_error("locate block log end", path, source))?;
+            tracing::info!(
+                records = record_index,
+                address_entries = addresses.entry_count(),
+                seconds = started.elapsed().as_secs(),
+                "block log scanned"
+            );
             return Ok(ScannedReplayLog {
                 records,
                 children,
@@ -12463,7 +13458,7 @@ fn scan_replay_log(
         }
         let position = records.len();
         transactions.insert_block(block_id, block.transactions.iter().map(Transaction::txid));
-        addresses.insert_entries(
+        addresses.insert_block_entries(
             explorer_address_index::AddressHistoryIndex::stored_block_entries(&block),
         );
         children.entry(parent).or_default().push(position);
@@ -12854,10 +13849,8 @@ mod tests {
         let active = queue.acquire().unwrap();
         let waiter_queue = Arc::clone(&queue);
         let waiter = thread::spawn(move || waiter_queue.acquire().map(drop));
-        for _ in 0..10_000 {
-            if queue.counts().unwrap() == (1, 1) {
-                break;
-            }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while queue.counts().unwrap() != (1, 1) && Instant::now() < deadline {
             thread::yield_now();
         }
         assert_eq!(queue.counts().unwrap(), (1, 1));
@@ -13735,7 +14728,7 @@ mod tests {
             Err(NodeError::ProofVerificationQueueTimeout)
         ));
         let node = shared.lock().unwrap();
-        assert_eq!(request.state(), RemoteProofRequestState::Cancelled);
+        assert_eq!(request.state(), RemoteProofRequestState::Expired);
         assert_eq!(node.peer_hello().height, 0);
         assert!(!node.contains_block(block_id));
         assert_eq!(node.log.metadata().unwrap().len(), log_len);
@@ -15792,6 +16785,331 @@ mod tests {
         assert_eq!(node.mempool.len(), 1);
         assert!(node.mempool.contains_key(&first.txid()));
         assert_eq!(node.mempool_bytes, bytes_before);
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    const CHANNEL_CUSTOMER_SECRET: [u8; 32] = [0x41; 32];
+    const CHANNEL_PROVIDER_SECRET: [u8; 32] = [0x42; 32];
+
+    /// Funds `rounds` times 128 inference channels between two test keys,
+    /// each the output of a funding transaction mined on `node`, and each
+    /// refundable at once.
+    fn funded_channels(
+        node: &mut Node,
+        rounds: u8,
+    ) -> Vec<(cmfd_marketplace::ChannelTerms, OutPoint)> {
+        let customer = SigningKey::from_bytes(&CHANNEL_CUSTOMER_SECRET).unwrap();
+        let provider = SigningKey::from_bytes(&CHANNEL_PROVIDER_SECRET).unwrap();
+        let mut channels = Vec::new();
+        for round in 0..rounds {
+            let at = |node: &Node| DEVNET_GENESIS_TIMESTAMP + 60 * node.state.next_height();
+            let block = node
+                .mine_once(
+                    default_miner_destination(),
+                    at(node),
+                    DEFAULT_MINING_ATTEMPTS,
+                )
+                .unwrap();
+            let mut funding = spend_coinbase_output(node, &block, 1, 0x11, 0x23, 1);
+            let terms = (0..128_u8)
+                .map(|index| {
+                    let mut job_id = [0x24; 32];
+                    job_id[..2].copy_from_slice(&[round, index]);
+                    cmfd_marketplace::ChannelTerms {
+                        network_id: node.params.network_id,
+                        job_id,
+                        customer_key: customer.verifying_key().to_bytes().into(),
+                        provider_key: provider.verifying_key().to_bytes().into(),
+                        model_digest: [0x25; 32],
+                        runtime_digest: [0x26; 32],
+                        input_digest: [0x27; 32],
+                        deposit: 1_000_000,
+                        close_fee_burn: 1_000,
+                        base_price: 100,
+                        input_price_per_1000: 0,
+                        output_price_per_1000: 4_000,
+                        max_input_tokens: 1,
+                        max_output_tokens: 1_024,
+                        output_chunk_tokens: 32,
+                        refund_height: 0,
+                    }
+                })
+                .collect::<Vec<_>>();
+            funding.outputs = terms
+                .iter()
+                .map(|terms| TxOutput {
+                    value: terms.deposit,
+                    lock: OutputLock::InferenceChannel {
+                        channel_id: terms.channel_id().unwrap(),
+                    },
+                    spendable_height: node.state.next_height(),
+                })
+                .collect();
+            funding
+                .sign_all(&[&SigningKey::from_bytes(&[0x11; 32]).unwrap()])
+                .unwrap();
+            let txid = funding.txid();
+            node.submit_transaction(funding).unwrap();
+            node.mine_once(
+                default_miner_destination(),
+                at(node),
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+            channels.extend(terms.into_iter().enumerate().map(|(index, terms)| {
+                (
+                    terms,
+                    OutPoint {
+                        txid,
+                        index: index as u32,
+                    },
+                )
+            }));
+        }
+        assert!(
+            channels
+                .iter()
+                .all(|(_, funding)| node.state.utxos().get(funding).is_some())
+        );
+        channels
+    }
+
+    /// The refund of a channel for the next block.
+    fn refund_close(
+        node: &Node,
+        terms: &cmfd_marketplace::ChannelTerms,
+        funding: OutPoint,
+    ) -> Transaction {
+        Transaction {
+            network_id: terms.network_id,
+            version: TRANSACTION_VERSION,
+            inputs: vec![TxInput {
+                previous: funding,
+                witness: InputWitness::InferenceRefund {
+                    terms: terms.clone(),
+                },
+            }],
+            outputs: vec![TxOutput {
+                value: terms.deposit - terms.close_fee_burn,
+                lock: OutputLock::Key(terms.customer_key),
+                spendable_height: node.state.next_height(),
+            }],
+        }
+    }
+
+    #[test]
+    fn channel_closes_take_a_bounded_share_of_the_mempool() {
+        let path = test_dir("mempool-close-budget");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        let spare = node
+            .mine_once(
+                default_miner_destination(),
+                DEVNET_GENESIS_TIMESTAMP + 60,
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        let channels = funded_channels(&mut node, 2);
+        assert_eq!(channels.len(), 2 * MAX_MEMPOOL_CLOSES);
+        for (index, (terms, funding)) in channels.iter().enumerate() {
+            let result = node.submit_transaction(refund_close(&node, terms, *funding));
+            if index < MAX_MEMPOOL_CLOSES {
+                result.unwrap();
+            } else {
+                assert!(
+                    matches!(result, Err(NodeError::MempoolCloseLimit)),
+                    "close {index}: {result:?}"
+                );
+            }
+        }
+        assert_eq!(node.mempool.len(), MAX_MEMPOOL_CLOSES);
+        // With the budget used, a second close of a pending channel is still
+        // refused as a conflict, and one of an output not on the chain as
+        // that, not as over the budget.
+        let (terms, funding) = &channels[0];
+        assert!(matches!(
+            node.submit_transaction(settlement_close(&node, terms, *funding)),
+            Err(NodeError::MempoolInputConflict(input)) if input == *funding
+        ));
+        let missing = OutPoint {
+            txid: [0x6d; 32],
+            index: 0,
+        };
+        assert!(matches!(
+            node.submit_transaction(refund_close(&node, terms, missing)),
+            Err(NodeError::MempoolUnconfirmedInput(input)) if input == missing
+        ));
+        let refused = NodeError::MempoolCloseLimit.client_error();
+        assert_eq!(
+            (refused.code, refused.status, refused.retryable),
+            ("mempool_close_limit", 422, true)
+        );
+
+        // Other transactions still have room.
+        let payment = spend_coinbase_output(&node, &spare, 2, 0x12, 0x36, 1);
+        node.submit_transaction(payment).unwrap();
+        assert_eq!(node.mempool.len(), MAX_MEMPOOL_CLOSES + 1);
+
+        // Once a block mines the closes, another close has room.
+        let at = DEVNET_GENESIS_TIMESTAMP + 60 * node.state.next_height();
+        node.mine_once(default_miner_destination(), at, DEFAULT_MINING_ATTEMPTS)
+            .unwrap();
+        assert!(node.mempool.is_empty(), "the block mined every close");
+        let (terms, funding) = &channels[MAX_MEMPOOL_CLOSES];
+        node.submit_transaction(refund_close(&node, terms, *funding))
+            .unwrap();
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    /// The settlement of a channel for the next block: the customer's first
+    /// payment state, closed by the provider.
+    fn settlement_close(
+        node: &Node,
+        terms: &cmfd_marketplace::ChannelTerms,
+        funding: OutPoint,
+    ) -> Transaction {
+        let customer = SigningKey::from_bytes(&CHANNEL_CUSTOMER_SECRET).unwrap();
+        let provider = SigningKey::from_bytes(&CHANNEL_PROVIDER_SECRET).unwrap();
+        let state = cmfd_marketplace::SignedPaymentState::sign(
+            terms.initial_state(0, 32).unwrap(),
+            &customer,
+        );
+        let settlement = cmfd_marketplace::Settlement::close(state, &provider);
+        let height = node.state.next_height();
+        let outputs = [
+            (settlement.state.state.provider_payment, terms.provider_key),
+            (settlement.state.state.customer_refund, terms.customer_key),
+        ]
+        .into_iter()
+        .filter(|(value, _)| *value > 0)
+        .map(|(value, key)| TxOutput {
+            value,
+            lock: OutputLock::Key(key),
+            spendable_height: height,
+        })
+        .collect();
+        Transaction {
+            network_id: terms.network_id,
+            version: TRANSACTION_VERSION,
+            inputs: vec![TxInput {
+                previous: funding,
+                witness: InputWitness::InferenceSettlement {
+                    terms: terms.clone(),
+                    settlement,
+                },
+            }],
+            outputs,
+        }
+    }
+
+    #[test]
+    fn mempool_revalidation_after_a_block_checks_each_transaction_a_bounded_number_of_times() {
+        let path = test_dir("mempool-revalidation-cost");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        let channels = funded_channels(&mut node, 2);
+        // Settlements held in the mempool beyond the close budget, as they
+        // could be before it existed, each for a height that is not the next
+        // one, as after a block: revalidation carries them forward.
+        let mut stale = HashSet::new();
+        for (terms, funding) in &channels {
+            let mut close = settlement_close(&node, terms, *funding);
+            for output in &mut close.outputs {
+                output.spendable_height = node.state.next_height() - 1;
+            }
+            stale.insert(close.txid());
+            let encoded_bytes = encode_transaction(&close).unwrap().len();
+            node.mempool_bytes += encoded_bytes;
+            node.mempool.insert(
+                close.txid(),
+                MempoolEntry {
+                    txid: close.txid(),
+                    transaction: close,
+                    encoded_bytes,
+                    fee_burned: terms.close_fee_burn,
+                },
+            );
+        }
+        let entries = node.mempool.len();
+        assert_eq!(entries, channels.len());
+        REVALIDATED_TRANSACTIONS.with(|counted| counted.set(0));
+        let started = Instant::now();
+        node.revalidate_mempool(&HashSet::new());
+        let elapsed = started.elapsed();
+        let counted = REVALIDATED_TRANSACTIONS.with(std::cell::Cell::get);
+        eprintln!(
+            "revalidated {entries} settlement closes in {:.3} s, {counted} transaction checks",
+            elapsed.as_secs_f64()
+        );
+        // Every close is carried forward to the next height.
+        assert_eq!(node.mempool.len(), entries);
+        assert!(node.mempool.iter().all(|(txid, entry)| {
+            !stale.contains(txid)
+                && *txid == entry.transaction.txid()
+                && entry
+                    .transaction
+                    .outputs
+                    .iter()
+                    .all(|output| output.spendable_height == node.state.next_height())
+        }));
+        assert_eq!(
+            node.mempool_bytes,
+            node.mempool
+                .values()
+                .map(|entry| entry.encoded_bytes)
+                .sum::<usize>()
+        );
+        // Once alone and once in the whole set: not once per prefix.
+        assert_eq!(counted, 2 * entries);
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn mempool_revalidation_checks_prefixes_only_when_the_whole_set_fails() {
+        let path = test_dir("mempool-revalidation-fallback");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        let block = node
+            .mine_once(
+                default_miner_destination(),
+                DEVNET_GENESIS_TIMESTAMP + 60,
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        // Two fundings of one channel: each valid alone, not both in one block.
+        let channel_id = [0x5c; 32];
+        let funding = |output_index: u32, owner: u8| {
+            let mut transaction =
+                spend_coinbase_output(&node, &block, output_index, owner, 0x35, 1);
+            transaction.outputs[0].lock = OutputLock::InferenceChannel { channel_id };
+            transaction
+                .sign_all(&[&SigningKey::from_bytes(&[owner; 32]).unwrap()])
+                .unwrap();
+            transaction
+        };
+        for transaction in [funding(1, 0x11), funding(2, 0x12)] {
+            let encoded_bytes = encode_transaction(&transaction).unwrap().len();
+            node.mempool_bytes += encoded_bytes;
+            node.mempool.insert(
+                transaction.txid(),
+                MempoolEntry {
+                    txid: transaction.txid(),
+                    transaction,
+                    encoded_bytes,
+                    fee_burned: 1,
+                },
+            );
+        }
+        let first = *node.mempool.keys().next().unwrap();
+        REVALIDATED_TRANSACTIONS.with(|counted| counted.set(0));
+        node.revalidate_mempool(&HashSet::new());
+        assert_eq!(node.mempool.keys().copied().collect::<Vec<_>>(), [first]);
+        assert_eq!(node.mempool_bytes, node.mempool[&first].encoded_bytes);
+        // Two alone, the set of two, then the prefixes of one and two.
+        assert_eq!(REVALIDATED_TRANSACTIONS.with(std::cell::Cell::get), 7);
         drop(node);
         clean_test_dir(&path);
     }
@@ -18600,7 +19918,7 @@ mod tests {
     #[test]
     fn rpc_parser_accepts_a_bounded_binary_post() {
         let request = b"POST /v1/block HTTP/1.1\r\nContent-Type: application/octet-stream\r\nContent-Length: 3\r\n\r\nabc";
-        let parsed = read_rpc_request(&mut &request[..], DEVNET_PROFILE.network_id).unwrap();
+        let (parsed, _) = read_rpc_request(&mut &request[..], DEVNET_PROFILE.network_id).unwrap();
         assert_eq!(parsed.method, "POST");
         assert_eq!(parsed.target, "/v1/block");
         assert_eq!(parsed.body, b"abc");
@@ -19316,6 +20634,45 @@ mod tests {
     }
 
     #[test]
+    fn key_destination_inputs_accept_hex_in_either_case_and_checksummed_addresses() {
+        use crate::address::{MAINNET_HRP, TEST_NETWORK_HRP, encode};
+
+        let key = insecure_dev_destination(0x41);
+        let checksummed = encode(address_hrp(), &key);
+        let other_network = if address_hrp() == MAINNET_HRP {
+            TEST_NETWORK_HRP
+        } else {
+            MAINNET_HRP
+        };
+        for text in [
+            hex::encode(key),
+            hex::encode_upper(key),
+            checksummed.clone(),
+            checksummed.to_ascii_uppercase(),
+        ] {
+            assert_eq!(parse_miner_destination(&text).unwrap(), key, "{text}");
+            assert_eq!(parse_wallet_recipient(&text).unwrap(), key, "{text}");
+        }
+        let mut typo = checksummed.into_bytes();
+        typo[10] = if typo[10] == b'q' { b'p' } else { b'q' };
+        let typo = String::from_utf8(typo).unwrap();
+        for text in [
+            typo,
+            encode(other_network, &key),
+            hex::encode(key)[..63].to_owned(),
+        ] {
+            assert!(matches!(
+                parse_miner_destination(&text),
+                Err(NodeError::InvalidMinerDestination)
+            ));
+            assert!(matches!(
+                parse_wallet_recipient(&text),
+                Err(NodeError::InvalidWalletRecipient)
+            ));
+        }
+    }
+
+    #[test]
     fn transport_neutral_methods_share_validation_without_mutating_the_node() {
         let path = test_dir("transport-method-validation");
         clean_test_dir(&path);
@@ -19506,7 +20863,7 @@ mod tests {
         };
         let shared = Arc::new(Mutex::new(node));
 
-        let response = route_shared_block_request(request, &shared);
+        let response = route_shared_block_request(request, &shared, true);
         assert_eq!(response.status, 200);
         let node = shared.lock().unwrap();
         assert_eq!(node.state.tip(), block.block_id());
@@ -19921,6 +21278,320 @@ mod tests {
         assert_eq!(mature.immature_utxo_count, 99);
         assert_eq!(mature.history.len(), MAX_WALLET_HISTORY);
         assert_eq!(mature.history[0].height, Some(100));
+
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    /// Marks the active blocks up to `height` verified, as the work check
+    /// would.
+    fn mark_work_verified_through(node: &Node, height: u64) {
+        for (position, block_id) in node.index.active_chain.iter().enumerate().skip(1) {
+            if position as u64 > height {
+                break;
+            }
+            crate::work_gate::test_support::mark_verified(node, position as u64, *block_id);
+        }
+    }
+
+    #[test]
+    fn wallet_coins_above_the_validated_height_are_shown_but_not_spent() {
+        use crate::work_gate::test_support::{ScriptedEngine, install};
+        use cmfd_consensus::ForgeMatrixV4WorkRule;
+
+        let path = test_dir("wallet-verifying");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        let mut chain = mine_default_chain_to(&mut node, 100);
+        // Block 1's coin, the only mature one, pays block 101's transaction;
+        // its change is the wallet's own.
+        let recipient = insecure_dev_destination(0x5a);
+        let sent = node.send_from_dev_wallet(recipient, COIN, 1).unwrap();
+        let change = sent.change_atoms.parse::<u64>().unwrap();
+        chain.extend(mine_default_chain_to(&mut node, 103));
+        assert_eq!(chain[100].transactions.len(), 1);
+        let reward = |height: usize| chain[height - 1].coinbase.outputs[0].value;
+        // An entry reads as verifying exactly when its block is above the
+        // validated height, unless the wallet sent it.
+        let check_history = |snapshot: &WalletSnapshot, validated: u64| {
+            assert!(!snapshot.history.is_empty());
+            assert!(snapshot.history.iter().any(|entry| entry.kind == "sent"));
+            for entry in &snapshot.history {
+                let height = entry.height.unwrap();
+                assert_eq!(
+                    entry.status == "verifying",
+                    height > validated && entry.kind != "sent",
+                    "{entry:?}"
+                );
+            }
+        };
+
+        // Without the work rule nothing waits: blocks 2..=4 are mature.
+        let before = node.wallet_snapshot().unwrap();
+        assert_eq!(before.validated_height, None);
+        assert_eq!(before.balances.verifying_atoms, "0");
+        assert_eq!(before.verifying_utxo_count, 0);
+        assert_eq!(before.spendable_utxo_count, 4);
+
+        // The rule arrives with the checkpoint at block 1, so blocks 2..=103
+        // are stored but not yet checked.
+        let rule = ForgeMatrixV4WorkRule::with_pinned_heights(1, chain[0].block_id(), []).unwrap();
+        install(
+            &mut node,
+            Some(rule),
+            Some(ScriptedEngine::new(crate::honest_work::WorkEngineKind::Cpu)),
+            None,
+        );
+        let waiting = node.wallet_snapshot().unwrap();
+        assert_eq!(waiting.validated_height, Some(1));
+        // Mature coins from blocks 2..=4 wait; the change in block 103 does
+        // not, and neither does anything immature.
+        assert_eq!(
+            waiting.balances.verifying_atoms,
+            (reward(2) + reward(3) + reward(4)).to_string()
+        );
+        assert_eq!(waiting.verifying_utxo_count, 3);
+        assert_eq!(waiting.balances.spendable_atoms, change.to_string());
+        assert_eq!(waiting.spendable_utxo_count, 1);
+        assert_eq!(waiting.immature_utxo_count, before.immature_utxo_count);
+        check_history(&waiting, 1);
+
+        // A payment the change covers goes through; one that needs the
+        // waiting coins is refused, retryably, and changes nothing.
+        let error = node.send_from_dev_wallet(recipient, change, 1).unwrap_err();
+        assert!(matches!(
+            error,
+            NodeError::WalletFundsVerifying { verifying, required }
+                if verifying == reward(2) + reward(3) + reward(4) && required == change + 1
+        ));
+        let client = error.client_error();
+        assert_eq!(
+            (client.code, client.status, client.retryable),
+            ("wallet_funds_verifying", 422, true)
+        );
+        assert!(node.mempool.is_empty());
+        // Consolidation leaves the waiting coins alone, so the change alone
+        // is not enough.
+        assert!(matches!(
+            node.consolidate_dev_wallet(1, 10),
+            Err(NodeError::WalletNotEnoughUtxos(1))
+        ));
+        node.send_from_dev_wallet(recipient, change / 2, 1).unwrap();
+
+        // Once blocks 2 and 3 are checked, their coins can be spent.
+        mark_work_verified_through(&node, 3);
+        let mut partly = node.wallet_snapshot().unwrap();
+        assert_eq!(partly.validated_height, Some(3));
+        assert_eq!(partly.balances.verifying_atoms, reward(4).to_string());
+        assert_eq!(partly.spendable_utxo_count, 2);
+        assert_eq!(partly.reserved_utxo_count, 1);
+        // The pending payment is first; the confirmed entries follow.
+        assert_eq!(partly.history[0].status, "pending");
+        partly.history.remove(0);
+        check_history(&partly, 3);
+
+        // Every active block checked: nothing waits.
+        mark_work_verified_through(&node, 103);
+        let all = node.wallet_snapshot().unwrap();
+        assert_eq!(all.validated_height, Some(103));
+        assert_eq!(all.balances.verifying_atoms, "0");
+        assert_eq!(all.spendable_utxo_count, 3);
+        let mut confirmed = all.clone();
+        confirmed.history.remove(0);
+        check_history(&confirmed, 103);
+
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn wallet_coins_no_snapshot_has_placed_are_placed_from_the_unchecked_blocks() {
+        use crate::work_gate::test_support::{ScriptedEngine, install};
+        use cmfd_consensus::ForgeMatrixV4WorkRule;
+
+        let path = test_dir("wallet-verifying-unscanned");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        let mut chain = mine_default_chain_to(&mut node, 100);
+        // Block 1's coin pays block 101's transaction; its change is the
+        // wallet's own.
+        let recipient = insecure_dev_destination(0x5b);
+        let sent = node.send_from_dev_wallet(recipient, COIN, 1).unwrap();
+        let change = sent.change_atoms.parse::<u64>().unwrap();
+        chain.extend(mine_default_chain_to(&mut node, 103));
+        let reward = |height: usize| chain[height - 1].coinbase.outputs[0].value;
+        let rule = ForgeMatrixV4WorkRule::with_pinned_heights(1, chain[0].block_id(), []).unwrap();
+        install(
+            &mut node,
+            Some(rule),
+            Some(ScriptedEngine::new(crate::honest_work::WorkEngineKind::Cpu)),
+            None,
+        );
+        let forget_placements = |node: &mut Node| {
+            node.wallet_history_cache = None;
+            *node.unchecked_outputs.lock().unwrap() = Default::default();
+        };
+        forget_placements(&mut node);
+
+        // No snapshot has scanned the history, so the blocks above the
+        // validated height are read: the change can be spent, and the mature
+        // coins of blocks 2 to 4 wait.
+        node.plan_dev_wallet_payment(recipient, change - 1, 1)
+            .unwrap();
+        assert!(matches!(
+            node.plan_dev_wallet_payment(recipient, change, 1),
+            Err(NodeError::WalletFundsVerifying { verifying, .. })
+                if verifying == reward(2) + reward(3) + reward(4)
+        ));
+        let first_read = node.unchecked_outputs.lock().unwrap().read.clone().unwrap();
+        // Once block 2 is checked, no unchecked block holds its coin. The
+        // blocks read for the lower validated height still answer.
+        mark_work_verified_through(&node, 2);
+        node.plan_dev_wallet_payment(recipient, change + reward(2) - 1, 1)
+            .unwrap();
+        let read = node.unchecked_outputs.lock().unwrap().read.clone().unwrap();
+        assert!(Arc::ptr_eq(&read, &first_read));
+        assert!(matches!(
+            node.plan_dev_wallet_payment(recipient, change + reward(2), 1),
+            Err(NodeError::WalletFundsVerifying { verifying, .. })
+                if verifying == reward(3) + reward(4)
+        ));
+
+        // Beyond the read budget a coin that cannot be placed waits, the
+        // change included.
+        node.wallet_history_inline_scan_bytes = 0;
+        forget_placements(&mut node);
+        assert!(matches!(
+            node.plan_dev_wallet_payment(recipient, 1, 1),
+            Err(NodeError::WalletFundsVerifying { .. })
+        ));
+        // A snapshot's history scan places them again.
+        node.wallet_history_inline_scan_bytes = wallet_history::INLINE_SCAN_BYTES;
+        assert_eq!(node.wallet_snapshot().unwrap().spendable_utxo_count, 2);
+        node.wallet_history_inline_scan_bytes = 0;
+        *node.unchecked_outputs.lock().unwrap() = Default::default();
+        node.plan_dev_wallet_payment(recipient, change + reward(2) - 1, 1)
+            .unwrap();
+
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn wallet_coins_wait_above_the_catch_up_available_height_only() {
+        use crate::work_gate::CatchUpSource;
+        use crate::work_gate::test_support::{ScriptedEngine, install, mark_verified};
+        use cmfd_consensus::ForgeMatrixV4WorkRule;
+
+        let path = test_dir("wallet-catch-up-available");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        let mut chain = mine_default_chain_to(&mut node, 100);
+        // Block 1's coin pays block 101's transaction; its change is the
+        // wallet's own.
+        let recipient = insecure_dev_destination(0x5c);
+        let sent = node.send_from_dev_wallet(recipient, COIN, 1).unwrap();
+        let change = sent.change_atoms.parse::<u64>().unwrap();
+        chain.extend(mine_default_chain_to(&mut node, 103));
+        let reward = |height: usize| chain[height - 1].coinbase.outputs[0].value;
+        let check_history = |snapshot: &WalletSnapshot, available: u64| {
+            assert!(snapshot.history.iter().any(|entry| entry.kind == "sent"));
+            for entry in &snapshot.history {
+                let height = entry.height.unwrap();
+                assert_eq!(
+                    entry.status == "verifying",
+                    height > available && entry.kind != "sent",
+                    "{entry:?}"
+                );
+            }
+        };
+        let rule =
+            || ForgeMatrixV4WorkRule::with_pinned_heights(1, chain[0].block_id(), []).unwrap();
+        let sources = || {
+            [0_u8, 1]
+                .map(|group| CatchUpSource {
+                    addr: std::net::SocketAddr::from(([127, 0, 0, 1], 21_100 + u16::from(group))),
+                    group,
+                })
+                .to_vec()
+        };
+        let engine = ScriptedEngine::new(crate::honest_work::WorkEngineKind::Cpu);
+        install(&mut node, Some(rule()), Some(engine.clone()), None);
+        let off = node.wallet_snapshot().unwrap();
+        assert_eq!(off.available_height, None);
+        assert!(
+            serde_json::to_value(&off)
+                .unwrap()
+                .get("available_height")
+                .is_none()
+        );
+
+        // Blocks 2 to 103 were stored with neither a grant nor a check: the
+        // mature coins of blocks 2 to 4 wait, the change does not.
+        assert!(node.enable_wallet_catch_up(sources()).unwrap());
+        node.wallet_catch_up().unwrap().set_depth(3);
+        let waiting = node.wallet_snapshot().unwrap();
+        assert_eq!(
+            (waiting.validated_height, waiting.available_height),
+            (Some(1), Some(1))
+        );
+        assert_eq!(
+            serde_json::to_value(&waiting).unwrap()["available_height"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            waiting.balances.verifying_atoms,
+            (reward(2) + reward(3) + reward(4)).to_string()
+        );
+        assert_eq!(waiting.balances.spendable_atoms, change.to_string());
+        check_history(&waiting, 1);
+        assert!(matches!(
+            node.consolidate_dev_wallet(1, 10),
+            Err(NodeError::WalletNotEnoughUtxos(1))
+        ));
+
+        // Grant records for 2 to 99 and 103, and 100 to 102 checked here: a
+        // qualifying run below the tip covers everything under it.
+        let catch_up = node.wallet_catch_up().unwrap();
+        for height in (2..=99).chain([103]) {
+            catch_up
+                .grant(
+                    height as u64,
+                    chain[height - 1].block_id(),
+                    std::time::Instant::now(),
+                )
+                .unwrap();
+        }
+        drop(catch_up);
+        for height in 100..=102 {
+            mark_verified(&node, height, chain[height as usize - 1].block_id());
+        }
+        // Read again from the start, as the next start of the wallet would.
+        install(&mut node, Some(rule()), Some(engine.clone()), None);
+        assert!(node.enable_wallet_catch_up(sources()).unwrap());
+        node.wallet_catch_up().unwrap().set_depth(3);
+        assert_eq!(node.wallet_available_height(), Some(102));
+        assert_eq!(node.work_validated_height(), Some(1));
+        let covered = node.wallet_snapshot().unwrap();
+        assert_eq!(
+            (covered.validated_height, covered.available_height),
+            (Some(1), Some(102))
+        );
+        assert_eq!(covered.balances.verifying_atoms, "0");
+        assert_eq!(covered.spendable_utxo_count, 4);
+        check_history(&covered, 102);
+        {
+            let destination = node.wallet_destination();
+            let coin = |height: usize| OutPoint {
+                txid: chain[height - 1].coinbase_outpoint_id(),
+                index: 0,
+            };
+            let verifying = node.wallet_coin_check();
+            assert!(!verifying(&coin(4), destination));
+            assert!(verifying(&coin(103), destination), "above the run");
+        }
+        // Consolidation uses the same split.
+        node.consolidate_dev_wallet(1, 10).unwrap();
 
         drop(node);
         clean_test_dir(&path);
@@ -20609,15 +22280,76 @@ mod tests {
         let destination = node.wallet_destination();
         let accepted_height = node.state.next_height().saturating_sub(1);
         let cached = node
-            .confirmed_wallet_history(destination, accepted_height, MAX_WALLET_HISTORY)
+            .confirmed_wallet_history(destination, accepted_height, None, MAX_WALLET_HISTORY)
             .unwrap();
         let reference = node
             .reference_confirmed_wallet_history(destination, accepted_height, MAX_WALLET_HISTORY)
             .unwrap();
         assert_eq!(cached, reference);
         assert!(node.wallet_history_scan.is_none());
-        let reads = node.wallet_history_cache.as_ref().unwrap().blocks_read();
+        let cache = node.wallet_history_cache.as_ref().unwrap();
+        let origins = reference_wallet_output_origins(node);
+        assert_eq!(cache.wallet_output_origins(), &origins);
+        let unspent = node
+            .state
+            .utxos()
+            .iter()
+            .filter(|(_, output)| output.lock == OutputLock::Key(destination))
+            .map(|(outpoint, _)| *outpoint)
+            .collect::<HashSet<_>>();
+        assert_eq!(origins.keys().copied().collect::<HashSet<_>>(), unspent);
+        let reads = cache.blocks_read();
         (cached, reads)
+    }
+
+    /// Every unspent wallet output, with the height of its block and whether
+    /// the wallet's own coins paid for it, read from the whole active chain.
+    fn reference_wallet_output_origins(
+        node: &Node,
+    ) -> HashMap<OutPoint, wallet_history::WalletOutputOrigin> {
+        let destination = node.wallet_destination();
+        let mut origins = HashMap::new();
+        for position in 1..node.index.active_chain.len() {
+            let block_id = node.index.active_chain[position];
+            let block = read_indexed_block(
+                &node.log,
+                &node.data_dir.join(BLOCK_LOG_FILE),
+                &node.index.blocks[&block_id],
+                block_id,
+                node.params.network_id,
+                false,
+            )
+            .unwrap();
+            let height = block.challenge.height;
+            let credit = |origins: &mut HashMap<_, _>, txid, outputs: &[TxOutput], own_change| {
+                for (index, output) in outputs.iter().enumerate() {
+                    if output.lock == OutputLock::Key(destination) {
+                        let index = index as u32;
+                        let origin = wallet_history::WalletOutputOrigin { height, own_change };
+                        origins.insert(OutPoint { txid, index }, origin);
+                    }
+                }
+            };
+            credit(
+                &mut origins,
+                block.coinbase_outpoint_id(),
+                &block.coinbase.outputs,
+                false,
+            );
+            for transaction in &block.transactions {
+                let mut own_change = false;
+                for input in &transaction.inputs {
+                    own_change |= origins.remove(&input.previous).is_some();
+                }
+                credit(
+                    &mut origins,
+                    transaction.txid(),
+                    &transaction.outputs,
+                    own_change,
+                );
+            }
+        }
+        origins
     }
 
     /// Like `check_cached_wallet_history`, but first lets a background scan of
@@ -20628,7 +22360,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(120);
         loop {
             let cached = node
-                .confirmed_wallet_history(destination, accepted_height, MAX_WALLET_HISTORY)
+                .confirmed_wallet_history(destination, accepted_height, None, MAX_WALLET_HISTORY)
                 .unwrap();
             if node.wallet_history_scan.is_none() {
                 break;
@@ -20786,7 +22518,7 @@ mod tests {
         assert_eq!(node.state.tip(), parent);
         let accepted_height = node.state.next_height() - 1;
         let rebuilt = node
-            .confirmed_wallet_history(destination, accepted_height, MAX_WALLET_HISTORY)
+            .confirmed_wallet_history(destination, accepted_height, None, MAX_WALLET_HISTORY)
             .unwrap();
         assert!(rebuilt.is_empty());
         assert!(node.wallet_history_scan.is_some());
@@ -20811,7 +22543,7 @@ mod tests {
         node.wallet_history_inline_scan_bytes = 0;
         let accepted_height = node.state.next_height() - 1;
         let first = node
-            .confirmed_wallet_history(destination, accepted_height, MAX_WALLET_HISTORY)
+            .confirmed_wallet_history(destination, accepted_height, None, MAX_WALLET_HISTORY)
             .unwrap();
         assert!(first.is_empty());
         assert!(node.wallet_history_scan.is_some());

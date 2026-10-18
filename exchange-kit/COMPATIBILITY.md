@@ -47,8 +47,26 @@ The following require a new API token and a new exchange qualification run:
 - changing approval, signer-package, anchor, or transaction digest bytes;
 - weakening authentication, scope separation, persistence, or fail-closed behavior.
 
+Serving the chain only up to the node's validated height (1.0.16) kept
+`chain-preview-v0.4`. Chain heights and confirmations are those a lagging node
+of an earlier release could report for a shorter chain, and confirmations are
+still counted the same way from the reported height. Not every answer has an
+earlier equivalent. The exceptions are the retryable `work_check_pending`
+(`-32030`); the transaction status `pending_check`, which clients must treat
+like an unconfirmed transaction (a client that validates strictly against the
+earlier schema rejects it); deposit events held, not removed, while the
+validated height is below them; and a withdrawal mined above the validated
+height reading `Confirmed` with 0 confirmations. These exceptions do not change
+the token either: 1.0.16 keeps `chain-preview-v0.4`, and the exchange
+conformance version moves to 1.3.1 instead. A client that validates strictly
+against the earlier schema must therefore accept `pending_check` before its
+node is upgraded. It still requires a new exchange qualification run.
+
 Adding an optional response field may retain a token, but still requires an
-updated kit revision and regression evidence. Adding a method does not imply
+updated kit revision and regression evidence. 1.0.16 adds the optional
+`work_rule.bank` to `getblockchaininfo`, and its schema now also declares
+`pruned`, `pruneheight` and `prune_keep_blocks`, which nodes have returned
+since proof pruning was added. Adding a method does not imply
 that an older node supports it; capability discovery must use a documented
 method or an out-of-band release manifest, never trial calls with privileged
 credentials.

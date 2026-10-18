@@ -71,14 +71,15 @@ directory:
 .\target\debug\cmfd-node.exe --data-dir .\devnet-0-linear5y\offline status
 ```
 
-`mine-once` pays this data directory's test wallet unless a valid 64-character
-x-only Schnorr public key is supplied:
+`mine-once` pays this data directory's test wallet unless a valid x-only
+Schnorr public key is supplied, as 64 hex characters or as a checksummed
+`tcmfd1...` address:
 
 ```powershell
 .\target\debug\cmfd-node.exe `
   --data-dir .\devnet-0-linear5y\offline `
   mine-once `
-  --miner <64-hex-x-only-public-key> `
+  --miner <64-hex-key-or-tcmfd1-address> `
   --attempts 1000000
 ```
 
@@ -221,8 +222,9 @@ ProductionV4 launchers supply it automatically. Hostnames are deliberately not
 accepted.
 `--share-leading-zero-bits` may be 0 through 7 on Devnet-0 and defaults to 7;
 smaller values make test shares easier. If `--miner` is omitted, blocks pay the
-pool node data directory's wallet destination. A supplied `--miner` must be a
-64-character x-only Schnorr public key.
+pool node data directory's wallet destination. A supplied `--miner` must be an
+x-only Schnorr public key: 64 hex characters or a checksummed `tcmfd1...`
+address.
 
 ProductionV4 operators may add `--pool-dashboard-assets <built-dist>` and
 `--pool-public-url <exact-pinned-url>` together. The read-only dashboard binds
@@ -553,12 +555,28 @@ The first node above uses `http://127.0.0.1:18443`.
 | `GET` | `/v1/status` | Fingerprint, active tip, cumulative work, target, UTXO count, and mempool totals |
 | `GET` | `/v1/mempool` | Ordered transaction IDs, encoded sizes, burned fees, and pool totals |
 | `GET` | `/v1/wallet` | Data-directory wallet destination, active-chain balances, output counts, mempool state, and history |
-| `GET` | `/v1/template?miner=<64-hex-x-only-public-key>` | JSON template containing the current mempool transactions and exact burned fees |
+| `GET` | `/v1/template?miner=<64-hex-key-or-tcmfd1-address>` | JSON template containing the current mempool transactions and exact burned fees |
 | `POST` | `/v1/wallet/send` | Sign and admit a test-wallet send from JSON `recipient`, `amount`, and `fee` fields |
 | `POST` | `/v1/wallet/consolidate` | Consolidate mature, unreserved test-wallet outputs from JSON `fee` and `max_inputs` fields |
 | `POST` | `/v1/transaction` | Admit one canonical raw transaction to the volatile mempool |
-| `POST` | `/v1/mine?miner=<64-hex-x-only-public-key>&attempts=<1..1000000>` | Build, mine, validate, persist, and apply one block; body must be empty |
+| `POST` | `/v1/mine?miner=<64-hex-key-or-tcmfd1-address>&attempts=<1..1000000>` | Build, mine, validate, persist, and apply one block; body must be empty |
 | `POST` | `/v1/block` | Validate, persist, and index one canonical raw block |
+
+The wallet routes (`/v1/wallet` and everything under `/v1/wallet/`),
+`/v1/mine`, `/v1/transaction` and `/v1/block` are local-only, because they read
+the node wallet or change node state. They answer only when the `Host` header
+names this machine: an IPv4 literal in `127.0.0.0/8`, `[::1]` or `localhost`, in
+any case and with any port. A browser `Origin` header, when present, must be an
+`http` or `https` loopback origin (`null` is refused), and
+`Sec-Fetch-Site: cross-site` is refused. Anything else, including a missing or
+repeated `Host`, gets `403 Forbidden` with a JSON `error`. This stops a web page
+that re-resolves its own hostname to 127.0.0.1 (DNS rebinding) from reading or
+spending the node wallet or submitting to the node. curl, PowerShell, Python
+`urllib` and the wallet's Vite proxy already send a loopback `Host` for
+`127.0.0.1` URLs. The public reads (`/health`, `/v1/status`, `/v1/mempool`,
+`/v1/template` and the `/v1/explorer` paths) ignore these headers, so the
+explorer can still reach its read paths through a tunnel that forwards its
+public hostname. HTTP/1.0 requests are rejected with `400` on every route.
 
 Wallet send and consolidation requests require the
 `Content-Type: application/json` header; CMFD amounts are decimal strings with
@@ -567,6 +585,79 @@ require
 `Content-Type: application/octet-stream`. Their body limits are 64 KiB and
 1 MiB respectively. Template JSON is descriptive; `/v1/block` accepts the
 canonical binary block frame, not that JSON.
+
+From 1.0.16, on a network with a work rule, nodes independently re-execute each
+block's work before they accept it, and `/v1/status` carries a `work_rule`
+object (`null` on a network without one). Its `validated_height` is the height
+up to which every active block has been checked; `unsettled_height` and
+`unsettled_block_id` name the stored block just above it when one engine found
+its work does not match and nothing has settled it; `backlog_paused` is true
+while the check of stored blocks is paused (a laptop on battery); `halted` and
+`engine_state` report whether blocks are admitted at all. `bank` says whether
+the CPU engine holds the model bank in memory (`resident`), so a block's check
+reads no disk, or reads it from the bank file for each block (`streamed`).
+`run --work-bank` chooses: the default `auto` holds it resident (about 6 GiB)
+when the memory available leaves 2 GiB beside it. On Linux, available memory
+also counts the limits of the node's cgroups (a container's memory limit or a
+systemd `MemoryMax=`), so a node limited to less than about 8 GiB streams.
+Within a limit, file cache the kernel counts as active (for example the bank
+pages the node just read) counts as used, so `auto` may stream even where the
+limit leaves room; set `--work-bank resident` on such a host instead.
+`pool-serve` streams it unless `--work-bank` says otherwise; the desktop
+wallet always streams it. `--work-bank resident` refuses to start, naming
+memory, when the bank cannot be allocated; on Linux with memory overcommit the
+allocation may succeed anyway and the kernel's out-of-memory killer then acts,
+so force it only on a host known to have the room. The resident copy is
+ordinary memory, not locked: on a host with swap it can be paged out under
+memory pressure, so keep swap off or `vm.swappiness` low on servers that rely
+on it, and prefer hosts with ECC memory. If a held byte changes in memory,
+the node's re-execution mismatches and it refuses blocks until its next
+known-answer round, which checks the held layers, takes the engine out of
+service. Loading it reads and checks the whole bank a second time at startup,
+after the read the node does when it opens; on a slow disk with a cold cache
+that adds about a minute before the node serves anything.
+
+`/v1/wallet` reports the same `validated_height`, a `balances.verifying_atoms`
+total and a
+`verifying_utxo_count` for coins in blocks above it (the wallet's own change
+is not among them: it can be spent at once). History entries in those blocks
+read `verifying`, except payments the wallet sent. `/v1/wallet/send` refuses a
+payment that needs those coins with the retryable `wallet_funds_verifying`
+(HTTP 422), to retry once the validated height passes them;
+`/v1/wallet/consolidate` leaves them out.
+
+The desktop wallet, started with the default `--work-check standard`, catches
+up faster after time offline. It takes a block without re-executing its work
+only when two Common Foundry relays run by different providers list it, the
+block lies at least 60 blocks below the height both report, and it extends the
+wallet's own tip; the newest blocks are always re-executed here, and the rest
+in the background, lowest first. Its coins become available once at least 60
+blocks this computer re-executed sit on top. Such a wallet's `/v1/status`
+`work_rule` carries a `wallet_catch_up` object: `state` (`caught_up`,
+`catching_up`, `checking_newest`, `waiting_for_check` with a `reason` of
+`earlier_blocks`, `difficulty` or `other`, `single_source` while fewer than two
+relays can be reached, or `release_stale` once the release's checkpoint block
+is more than 60 days old), `available_height`, `blocks_left` (the count the
+wallet shows), `newest_checked` of `newest_needed`, `sources_answering`, and
+`granted_above_available`, during which Solo mining waits. Its `/v1/wallet`
+then carries `available_height`: coins in blocks up to it are spendable, the
+rest count as `verifying`, and `validated_height` keeps its meaning. Servers,
+pools, relays and a wallet started with `--work-check full` never carry either
+field.
+
+A block that only one of the node's engines finds does not match is refused
+(`work_mismatch_unconfirmed`) at no cost to its peer. Each peer address (an
+IPv6 /64 counts as one) may have at most 2 such refusals in any 10 minutes.
+After that, its other blocks that would need a work check are answered as
+busy (`work_check_deferred`, retryable) and run nothing until its oldest
+refusal is 10 minutes old. This covers blocks a peer sends, blocks a sync
+session fetches from it and blocks noted for the background check. The
+peer's reputation does not change, it is not held off as a sync target, and
+the same block from any other peer is checked as usual. A block's work counts
+against the first peer whose copy of it was checked, not against every peer
+that relays it. Operator-configured, bootstrap and loopback peers are not
+counted. A mismatch that two engines agree on still costs its peer a penalty
+and a cooldown.
 
 PowerShell examples while `run` is active:
 

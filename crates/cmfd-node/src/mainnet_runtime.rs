@@ -458,4 +458,70 @@ mod tests {
                 .unwrap()
         );
     }
+
+    /// The mainnet fingerprint served by the seed since launch. Peer hello,
+    /// data-dir metadata, startup snapshots and pool ledgers all compare it,
+    /// so it must stay byte-identical across releases.
+    #[cfg(feature = "production-v4")]
+    const MAINNET_FINGERPRINT: &str =
+        "e9d81f15c580031302656609eb24fa8351efe0a34135ad894c793f3dd9044079";
+    /// The mainnet virtual genesis derived from the launch beacon.
+    #[cfg(feature = "production-v4")]
+    const MAINNET_GENESIS: &str =
+        "d8c9baa3b5a93f9ed0cbaa6a62e536b6df3f319dfeb2c72f49f88d684a6fdfe4";
+
+    #[cfg(feature = "production-v4")]
+    fn mainnet_launch_with_genesis(genesis: [u8; 32]) -> AuthenticatedMainnetRuntime {
+        let pin = crate::release_gate::MAINNET_RELEASE_CONFIGURATION
+            .expect("compiled mainnet release pin");
+        let mut profile = crate::network_profile::mainnet_profile_template(Some(pin)).unwrap();
+        profile.virtual_genesis_hash = genesis;
+        AuthenticatedMainnetRuntime {
+            profile,
+            launch_plan_digest: pin.launch_plan_digest,
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "production-v4")]
+    fn mainnet_fingerprint_is_unchanged() {
+        let genesis = hex::decode(MAINNET_GENESIS).unwrap().try_into().unwrap();
+        let parameters = mainnet_launch_with_genesis(genesis)
+            .network_parameters()
+            .unwrap();
+        assert_eq!(
+            hex::encode(parameters.fingerprint().unwrap()),
+            MAINNET_FINGERPRINT
+        );
+    }
+
+    /// Same check from the tracked launch plan and the published beacon:
+    /// `CMFD_MAINNET_LAUNCH_BEACON` names a copy of `LAUNCH-BEACON.json`.
+    #[test]
+    #[cfg(feature = "production-v4")]
+    #[ignore = "needs the mainnet launch beacon; set CMFD_MAINNET_LAUNCH_BEACON"]
+    fn mainnet_fingerprint_from_plan_and_beacon_is_unchanged() {
+        let beacon = std::path::PathBuf::from(
+            std::env::var_os("CMFD_MAINNET_LAUNCH_BEACON").expect("CMFD_MAINNET_LAUNCH_BEACON"),
+        );
+        let plan =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/mainnet/MAINNET-PLAN.json");
+        let pin = crate::release_gate::MAINNET_RELEASE_CONFIGURATION
+            .expect("compiled mainnet release pin");
+        let launch = AuthenticatedMainnetRuntime::authenticate(
+            &read_bounded_file(&plan, 32 * 1024).unwrap(),
+            &read_bounded_file(&beacon, cmfd_launch::MAX_BEACON_DOCUMENT_BYTES).unwrap(),
+            pin.launch_plan_digest,
+            crate::unix_time_seconds().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode(launch.profile().virtual_genesis_hash),
+            MAINNET_GENESIS
+        );
+        assert_eq!(
+            hex::encode(launch.network_parameters().unwrap().fingerprint().unwrap()),
+            MAINNET_FINGERPRINT
+        );
+    }
 }

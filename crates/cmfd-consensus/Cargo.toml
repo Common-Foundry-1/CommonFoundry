@@ -26,6 +26,7 @@ fs2 = { workspace = true, optional = true }
 getrandom.workspace = true
 hex.workspace = true
 k256.workspace = true
+matrixmultiply = { version = "=0.3.11", optional = true }
 primitive-types.workspace = true
 p3-blake3 = { version = "=0.6.3", optional = true }
 p3-blake3-air = { version = "=0.6.3", optional = true }
@@ -81,6 +82,9 @@ dory-bls12-381-prototype = [
 dory-v3-consensus-adapter = ["dory-bls12-381-prototype", "whir-prototype"]
 dory-opening-prototype = ["dep:ark-serialize", "dep:dory-pcs"]
 gpu-proof-prover = ["whir-prototype", "dep:cmfd-proof-accel", "dep:fs2"]
+forgematrix-v4-executor = ["dep:matrixmultiply"]
+# Sparse work rules for tests and local qualification; never in a release build.
+work-rule-test-support = []
 forgematrix-v4-verifier = [
     "dep:slop-algebra",
     "dep:slop-basefold",
@@ -152,6 +156,10 @@ path = "src/lib.rs"
 [[bin]]
 name = "cmfd-consensus"
 path = "src/main.rs"
+
+[[example]]
+name = "forgematrix_v4_execute"
+required-features = ["forgematrix-v4-executor", "forgematrix-v4-verifier"]
 
 [[example]]
 name = "forgematrix_v4_fixed_record"

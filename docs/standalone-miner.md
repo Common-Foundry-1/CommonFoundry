@@ -70,8 +70,9 @@ The Windows ZIP includes:
 Run `LIST-GPUS.bat`, then launch `START-MINER.bat`. Its defaults try a GUI
 wallet on the same computer first and the community bootstrap second, so the
 peer settings normally need no editing. Leave `GPU_INDEXES` blank to use every
-supported card automatically. Copy the 64-character address from the wallet's
-**Receive** page into `PAYOUT_ADDRESS` before starting. The connected node owns
+supported card automatically. Copy the address from the wallet's **Receive**
+page (64 hex characters, or a checksummed `cmfd1...` address) into
+`PAYOUT_ADDRESS` before starting. The connected node owns
 the chain and creates each payout-bound template. `WORKERS_PER_GPU=0` is the
 recommended automatic high-throughput setting.
 
@@ -98,25 +99,25 @@ cmfd-miner devices
 Mine with every supported GPU and the community bootstrap:
 
 ```text
-cmfd-miner mine --miner <64-character-wallet-receive-address> --peer 127.0.0.1:18444 --peer 107.214.187.2:18444 --allow-public-peers
+cmfd-miner mine --miner <wallet-receive-address> --peer 127.0.0.1:18444 --peer 107.214.187.2:18444 --allow-public-peers
 ```
 
 Select GPUs 0, 1, and 3:
 
 ```text
-cmfd-miner mine --miner <64-character-wallet-receive-address> --peer 127.0.0.1:18444 --device 0 --device 1 --device 3
+cmfd-miner mine --miner <wallet-receive-address> --peer 127.0.0.1:18444 --device 0 --device 1 --device 3
 ```
 
 Change the live-statistics interval from its five-second default:
 
 ```text
-cmfd-miner mine --miner <64-character-wallet-receive-address> --peer 127.0.0.1:18444 --stats-seconds 10
+cmfd-miner mine --miner <wallet-receive-address> --peer 127.0.0.1:18444 --stats-seconds 10
 ```
 
 Limit host preparation to four workers per selected GPU:
 
 ```text
-cmfd-miner mine --miner <64-character-wallet-receive-address> --peer 127.0.0.1:18444 --workers-per-gpu 4
+cmfd-miner mine --miner <wallet-receive-address> --peer 127.0.0.1:18444 --workers-per-gpu 4
 ```
 
 The standalone miner currently performs continuous solo mining. The node
@@ -146,8 +147,26 @@ is counted as a cryptographic block rejection.
 `--miner` (or `PAYOUT_ADDRESS` in the packaged launch file) selects the coinbase
 payout destination. It does not identify or locate a node. `--peer` selects the
 node that receives blocks. One outbound miner-to-node peer configuration is
-enough; the wallet/node does not also need to list the miner as a peer.
+enough; the wallet/node does not also need to list the miner as a peer (see
+below for the one thing listing it changes on a ProductionV4 node).
 
 For diagnostics, `cmfd-miner full-node` preserves the former embedded-node
 mode with its own data directory and P2P listener. Normal rig operation should
 use `cmfd-miner mine` or the packaged launcher.
+
+`cmfd-miner full-node` does not mine ProductionV4 blocks. A ProductionV4 solo
+miner submits each block to a node, which re-executes the block's work before
+it accepts the block. A node whose work engine runs on a GPU (a pool node)
+answers within a fraction of a second; a node that checks on its CPU takes
+several seconds or more per block, and the block reaches the network that much
+later. A block from the miner's own machine (loopback), or from a peer the node
+lists in `--peer`, is checked ahead of blocks from other peers. A block posted
+to a node's RPC from another machine is not: run the miner on the node's
+machine, or have it reach the node over P2P from an address the node lists in
+`--peer`. Listing the miner's address is optional and only buys that order.
+The node then also dials that address as one of its configured peers and
+treats it as one, and on IPv6 the whole /64 the address is in counts as that
+peer; the same holds for the network's bootstrap peers. Do not put a node's
+P2P or RPC port behind a proxy or tunnel that makes remote connections arrive
+from loopback: the node would treat every such connection as its own
+machine's.

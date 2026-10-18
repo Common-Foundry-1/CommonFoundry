@@ -15,6 +15,7 @@ fn main() {
         "CARGO_FEATURE_PRODUCTION_MAINNET",
         "CARGO_FEATURE_PRODUCTION_V3_TESTNET",
         "CARGO_FEATURE_PRODUCTION_V4_TESTNET",
+        "CARGO_FEATURE_WORK_RULE_TEST_SUPPORT",
         "CMFD_BUILD_SOURCE_COMMIT",
     ] {
         println!("cargo:rerun-if-env-changed={variable}");
@@ -23,6 +24,8 @@ fn main() {
     println!("cargo:rerun-if-changed=production_v4_activation_pin.inc.rs");
     println!("cargo:rerun-if-changed=mainnet_release_pin.inc.rs");
     println!("cargo:rerun-if-changed=../cmfd-consensus/mainnet_network_id.inc.rs");
+    println!("cargo:rerun-if-changed=../cmfd-consensus/mainnet_work_checkpoint.inc.rs");
+    println!("cargo:rerun-if-changed=../cmfd-consensus/rcnet1_work_checkpoint.inc.rs");
     println!("cargo:rerun-if-changed=../cmfd-launch/src/schedule.rs");
     println!("cargo:rerun-if-changed=src/network_profile.rs");
 
@@ -39,11 +42,18 @@ fn main() {
         panic!("mainnet, production-rc and production testnet profiles are mutually exclusive");
     }
 
+    // Test work rules can replace the consensus work rule; a release never
+    // carries them.
+    let work_rule_test_support = env::var_os("CARGO_FEATURE_WORK_RULE_TEST_SUPPORT").is_some();
+
     if env::var_os("CARGO_FEATURE_PRODUCTION_MAINNET").is_some()
         || env::var("CMFD_RELEASE_LABEL")
             .ok()
             .is_some_and(|label| release_gate::is_mainnet_label(&label))
     {
+        if work_rule_test_support {
+            panic!("production mainnet build gate: work-rule-test-support is not allowed");
+        }
         let source_commit = env::var("CMFD_BUILD_SOURCE_COMMIT").unwrap_or_default();
         release_gate::validate_mainnet_release(
             release_gate::COMPILED_RELEASE_PROFILE,
@@ -52,6 +62,8 @@ fn main() {
             &source_commit,
         )
         .unwrap_or_else(|error| panic!("production mainnet build gate: {error}"));
+        release_gate::validate_work_checkpoint(release_gate::MAINNET_WORK_CHECKPOINT)
+            .unwrap_or_else(|error| panic!("production mainnet build gate: {error}"));
         println!("cargo:rustc-env=CMFD_BUILD_SOURCE_COMMIT={source_commit}");
         return;
     }
@@ -62,6 +74,9 @@ fn main() {
             .is_some_and(|label| release_gate::is_production_rc_label(&label));
 
     if requested {
+        if work_rule_test_support {
+            panic!("production RC build gate: work-rule-test-support is not allowed");
+        }
         let source_commit = env::var("CMFD_BUILD_SOURCE_COMMIT").unwrap_or_default();
         let network = network_profile::RCNET1_PROFILE;
         let compiled_network_identity = release_gate::ProductionRcNetworkIdentityPin {
@@ -72,11 +87,15 @@ fn main() {
             steward_reward_destination: network.rewards.steward,
             community_reward_destination: network.rewards.community,
         };
-        match release_gate::validate_production_rc_for_network(
+        let gate = release_gate::validate_production_rc_for_network(
             release_gate::COMPILED_RELEASE_PROFILE,
             &source_commit,
             compiled_network_identity,
-        ) {
+        )
+        .and_then(|()| {
+            release_gate::validate_work_checkpoint(release_gate::RCNET1_WORK_CHECKPOINT)
+        });
+        match gate {
             Ok(()) => {
                 println!("cargo:rustc-env=CMFD_BUILD_SOURCE_COMMIT={source_commit}");
             }

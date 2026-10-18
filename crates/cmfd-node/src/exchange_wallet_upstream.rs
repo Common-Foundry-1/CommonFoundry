@@ -1,5 +1,13 @@
 //! JSON-RPC client for the exchange RPC endpoint that feeds the exchange
 //! wallet: the hosted endpoint over HTTPS or the exchange's own node.
+//!
+//! On a network with a work rule the wallet follows only an endpoint whose
+//! node re-executes each block's work itself, and only up to that node's
+//! validated height: the endpoint must report the rule as enforced, not
+//! halted and with a ready engine, under a release checkpoint at or above the
+//! one this binary was built with, and its chain must hold this binary's
+//! checkpoint block. Otherwise the wallet stops following it (fails closed)
+//! and reports why.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, TcpStream, ToSocketAddrs};
@@ -208,15 +216,40 @@ pub struct Upstream {
     endpoint: Endpoint,
     connection: Option<BufReader<Box<dyn Stream>>>,
     next_id: u64,
+    /// This binary's work-rule checkpoint (height, block id), if its network
+    /// has one.
+    checkpoint: Option<(u64, [u8; 32])>,
+    /// The endpoint's chain was seen to hold the checkpoint block, on the
+    /// current connection.
+    checkpoint_seen: bool,
+    /// Why the endpoint was last refused as a chain source, until it next
+    /// passes the checks.
+    refusal: Option<String>,
 }
 
 impl Upstream {
     pub fn new(endpoint: Endpoint) -> Self {
+        let checkpoint = cmfd_consensus::forgematrix_v4_work_rule(endpoint.network_id)
+            .map(|rule| (rule.checkpoint_height(), rule.checkpoint_block_id()));
+        Self::with_checkpoint(endpoint, checkpoint)
+    }
+
+    /// An upstream checked against `checkpoint` instead of the compiled one.
+    pub(crate) fn with_checkpoint(endpoint: Endpoint, checkpoint: Option<(u64, [u8; 32])>) -> Self {
         Self {
             endpoint,
             connection: None,
             next_id: 1,
+            checkpoint,
+            checkpoint_seen: false,
+            refusal: None,
         }
+    }
+
+    /// Why the endpoint was last refused as a chain source, if it was and has
+    /// not passed the checks since.
+    pub fn refusal(&self) -> Option<&str> {
+        self.refusal.as_deref()
     }
 
     pub fn endpoint(&self) -> &Endpoint {
@@ -329,6 +362,8 @@ impl Upstream {
             }
         }
         let tcp = connected.ok_or(last_error)?;
+        // A new connection may reach another server behind the same name.
+        self.checkpoint_seen = false;
         tcp.set_read_timeout(Some(IO_TIMEOUT))?;
         tcp.set_write_timeout(Some(IO_TIMEOUT))?;
         tcp.set_nodelay(true)?;
@@ -628,15 +663,98 @@ pub fn parse_block(document: &Value) -> Result<SourceBlock, SourceError> {
     })
 }
 
+/// The height up to which a wallet may follow an endpoint whose
+/// `getblockchaininfo` is `info`, given this binary's checkpoint height: the
+/// lower of its tip and its validated height. Fails, with the reason, unless
+/// the endpoint reports the work rule enforced, not halted and with a ready
+/// engine, under a checkpoint at or above `checkpoint_height`.
+pub(crate) fn followable_height(info: &Value, checkpoint_height: u64) -> Result<u64, String> {
+    let blocks = info
+        .get("blocks")
+        .and_then(Value::as_u64)
+        .ok_or("getblockchaininfo has no blocks")?;
+    let rule = info
+        .get("work_rule")
+        .filter(|rule| rule.is_object())
+        .ok_or("the upstream does not report the work rule; it must run a node release that re-executes each block's work")?;
+    let flag = |name: &str| rule.get(name).and_then(Value::as_bool);
+    if flag("enforced") != Some(true) {
+        return Err(
+            "the upstream node does not re-execute block work yet (work_rule.enforced is not true)"
+                .to_owned(),
+        );
+    }
+    if flag("halted") != Some(false) {
+        return Err("the upstream node has halted block admission".to_owned());
+    }
+    if flag("engine_ready") != Some(true) {
+        return Err(format!(
+            "the upstream node's work engine is not ready (engine_state {})",
+            rule.get("engine_state").unwrap_or(&Value::Null)
+        ));
+    }
+    let upstream_checkpoint = rule
+        .get("checkpoint_height")
+        .and_then(Value::as_u64)
+        .ok_or("the upstream reports no work checkpoint height")?;
+    if upstream_checkpoint < checkpoint_height {
+        return Err(format!(
+            "the upstream node's work checkpoint is height {upstream_checkpoint}, below this release's {checkpoint_height}; it must be upgraded"
+        ));
+    }
+    let validated = rule
+        .get("validated_height")
+        .and_then(Value::as_u64)
+        .ok_or("the upstream reports no validated height")?;
+    Ok(blocks.min(validated))
+}
+
+impl Upstream {
+    fn refuse(&mut self, reason: String) -> SourceError {
+        self.checkpoint_seen = false;
+        self.refusal = Some(reason.clone());
+        SourceError::Unavailable(reason)
+    }
+}
+
 impl ChainSource for Upstream {
     fn tip(&mut self) -> Result<ChainTip, SourceError> {
         let info = self.chain_info()?;
-        Ok(ChainTip {
-            height: info.get("blocks").and_then(Value::as_u64).ok_or_else(|| {
-                SourceError::Invalid("getblockchaininfo has no blocks".to_owned())
-            })?,
-            hash: hash_field(&info, "bestblockhash")?,
-        })
+        let blocks = info
+            .get("blocks")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| SourceError::Invalid("getblockchaininfo has no blocks".to_owned()))?;
+        let best = hash_field(&info, "bestblockhash")?;
+        let Some((checkpoint_height, checkpoint_id)) = self.checkpoint else {
+            return Ok(ChainTip {
+                height: blocks,
+                hash: best,
+            });
+        };
+        let height =
+            followable_height(&info, checkpoint_height).map_err(|reason| self.refuse(reason))?;
+        if !self.checkpoint_seen {
+            match self.block_hash(checkpoint_height)? {
+                Some(id) if id == checkpoint_id => self.checkpoint_seen = true,
+                _ => {
+                    return Err(self.refuse(format!(
+                        "the upstream chain does not hold this release's checkpoint block {} at height {checkpoint_height}",
+                        hex::encode(checkpoint_id)
+                    )));
+                }
+            }
+        }
+        let hash = if height == blocks {
+            best
+        } else {
+            self.block_hash(height)?.ok_or_else(|| {
+                SourceError::Unavailable(format!(
+                    "the upstream has no block at its validated height {height}"
+                ))
+            })?
+        };
+        self.refusal = None;
+        Ok(ChainTip { height, hash })
     }
 
     fn block_hash(&mut self, height: u64) -> Result<Option<[u8; 32]>, SourceError> {
@@ -680,6 +798,227 @@ impl Upstream {
     }
 }
 
+/// Which endpoint the wallet follows, as the last `tip` decided. The chain
+/// synchronization's [`Upstreams`] writes it at every `tip`; other sets of
+/// connections read it so that they read only from that endpoint.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FollowedEndpoint {
+    /// The endpoint the last `tip` accepted; `None` before the first `tip`
+    /// and after one that no endpoint passed.
+    pub index: Option<usize>,
+    /// Why the active endpoint was last refused as a chain source, if it was
+    /// and has not passed the checks since.
+    pub refusal: Option<String>,
+}
+
+/// The configured endpoints, in order of preference: a primary and an
+/// optional second one. Calls go to the active endpoint. Only `tip`, which
+/// runs the work-rule checks, moves to another endpoint when the active one
+/// fails, and the first that passes is used from then on. A broadcast tries
+/// the other endpoints for that one transaction without moving. The other
+/// chain reads stay on the endpoint `tip` last accepted, so the wallet never
+/// reads blocks from an endpoint that has not passed the checks.
+pub struct Upstreams {
+    upstreams: Vec<Upstream>,
+    active: usize,
+    followed: Arc<Mutex<FollowedEndpoint>>,
+}
+
+impl Upstreams {
+    pub fn new(upstreams: Vec<Upstream>) -> Self {
+        assert!(!upstreams.is_empty(), "at least one upstream endpoint");
+        Self {
+            upstreams,
+            active: 0,
+            followed: Arc::default(),
+        }
+    }
+
+    /// The endpoint calls go to now.
+    pub fn active_endpoint(&self) -> &Endpoint {
+        self.upstreams[self.active].endpoint()
+    }
+
+    /// Why the endpoint calls go to now was last refused as a chain source,
+    /// if it was and has not passed the checks since.
+    pub fn refusal(&self) -> Option<&str> {
+        self.upstreams[self.active].refusal()
+    }
+
+    /// Where every `tip` records the endpoint it accepted.
+    pub fn followed(&self) -> Arc<Mutex<FollowedEndpoint>> {
+        Arc::clone(&self.followed)
+    }
+
+    /// Sends later calls to the endpoint at `index`, so a second set of
+    /// connections reads from the endpoint the wallet follows.
+    pub fn use_endpoint(&mut self, index: usize) {
+        if index < self.upstreams.len() {
+            self.active = index;
+        }
+    }
+
+    /// Moves back to the primary endpoint if it passes the checks with a
+    /// followable height of at least `min_height`, the wallet's tip, so the
+    /// wallet never moves to an endpoint that would leave it waiting.
+    /// Returns whether calls go to the primary; otherwise they stay where
+    /// they are.
+    pub fn retry_primary(&mut self, min_height: u64) -> bool {
+        if self.active == 0 {
+            return true;
+        }
+        match self.upstreams[0].tip() {
+            Ok(tip) if tip.height >= min_height => {
+                tracing::info!(
+                    now = %self.upstreams[0].endpoint().host,
+                    height = tip.height,
+                    "the primary upstream endpoint passes the checks again; following it"
+                );
+                self.active = 0;
+                true
+            }
+            Ok(tip) => {
+                tracing::info!(
+                    primary = %self.upstreams[0].endpoint().host,
+                    primary_height = tip.height,
+                    wallet_height = min_height,
+                    "the primary upstream endpoint is behind the wallet; staying on the second one"
+                );
+                false
+            }
+            Err(error) => {
+                tracing::debug!(
+                    primary = %self.upstreams[0].endpoint().host,
+                    %error,
+                    "the primary upstream endpoint still fails"
+                );
+                false
+            }
+        }
+    }
+
+    /// Whether calls go to an endpoint other than the primary.
+    pub fn on_fallback(&self) -> bool {
+        self.active != 0
+    }
+
+    /// Runs `call` on the active endpoint and, while `fail_over` says its
+    /// error may not be the others' too, on each other endpoint in turn.
+    /// Returns the first success, or the active endpoint's error. Only with
+    /// `adopt` does the endpoint that answered become the active one.
+    fn with_failover<T, E: std::fmt::Display>(
+        &mut self,
+        mut call: impl FnMut(&mut Upstream) -> Result<T, E>,
+        fail_over: impl Fn(&E) -> bool,
+        adopt: bool,
+    ) -> Result<T, E> {
+        let first = match call(&mut self.upstreams[self.active]) {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        if !fail_over(&first) {
+            return Err(first);
+        }
+        let count = self.upstreams.len();
+        for step in 1..count {
+            let index = (self.active + step) % count;
+            match call(&mut self.upstreams[index]) {
+                Ok(value) => {
+                    if adopt {
+                        tracing::warn!(
+                            failed = %self.upstreams[self.active].endpoint().host,
+                            error = %first,
+                            now = %self.upstreams[index].endpoint().host,
+                            "the upstream endpoint failed; following the next configured one"
+                        );
+                        self.active = index;
+                    } else {
+                        tracing::warn!(
+                            failed = %self.upstreams[self.active].endpoint().host,
+                            error = %first,
+                            answered = %self.upstreams[index].endpoint().host,
+                            "the upstream endpoint failed; the next configured one took this call"
+                        );
+                    }
+                    return Ok(value);
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        endpoint = %self.upstreams[index].endpoint().host,
+                        %error,
+                        "the next upstream endpoint failed too"
+                    );
+                }
+            }
+        }
+        Err(first)
+    }
+
+    /// Calls `method`; a transport failure or retryable error tries the
+    /// other endpoints for this call only. Only for broadcasts: chain reads
+    /// use [`Self::read`].
+    pub fn call(&mut self, method: &str, params: Value) -> Result<Value, CallError> {
+        self.with_failover(
+            |upstream| upstream.call(method, params.clone()),
+            CallError::retryable,
+            false,
+        )
+    }
+
+    /// Calls `method` on the active endpoint only.
+    pub fn read(&mut self, method: &str, params: Value) -> Result<Value, CallError> {
+        self.upstreams[self.active].call(method, params)
+    }
+
+    /// One broadcast attempt per endpoint, for payments an RPC caller is
+    /// waiting on; a definite refusal is not retried elsewhere.
+    pub fn broadcast_once(&mut self, transaction: &[u8]) -> Result<(), BroadcastError> {
+        self.with_failover(
+            |upstream| upstream.broadcast_once(transaction),
+            |error| matches!(error, BroadcastError::Unknown(_)),
+            false,
+        )
+    }
+}
+
+impl ChainSource for Upstreams {
+    fn tip(&mut self) -> Result<ChainTip, SourceError> {
+        let outcome = self.with_failover(|upstream| upstream.tip(), |_| true, true);
+        let followed = FollowedEndpoint {
+            index: outcome.is_ok().then_some(self.active),
+            refusal: self.refusal().map(str::to_owned),
+        };
+        *self
+            .followed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = followed;
+        outcome
+    }
+
+    // Chain reads stay on the endpoint the last `tip` accepted; if it fails,
+    // the round ends and the next `tip` picks an endpoint that passes the
+    // checks.
+    fn block_hash(&mut self, height: u64) -> Result<Option<[u8; 32]>, SourceError> {
+        self.upstreams[self.active].block_hash(height)
+    }
+
+    fn block(&mut self, hash: [u8; 32]) -> Result<Option<SourceBlock>, SourceError> {
+        self.upstreams[self.active].block(hash)
+    }
+
+    fn broadcast(&mut self, transaction: &[u8]) -> Result<(), BroadcastError> {
+        self.with_failover(
+            |upstream| upstream.broadcast(transaction),
+            |error| matches!(error, BroadcastError::Unknown(_)),
+            false,
+        )
+    }
+
+    fn mempool_contains(&mut self, txid: [u8; 32]) -> Result<bool, SourceError> {
+        self.upstreams[self.active].mempool_contains(txid)
+    }
+}
+
 fn broadcast_outcome(outcome: Result<Value, CallError>) -> Result<(), BroadcastError> {
     match outcome {
         Ok(_) => Ok(()),
@@ -693,5 +1032,405 @@ fn broadcast_outcome(outcome: Result<Value, CallError>) -> Result<(), BroadcastE
             ..
         }) => Err(BroadcastError::Rejected(message)),
         Err(error) => Err(BroadcastError::Unknown(error.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{SocketAddr, TcpListener};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread::JoinHandle;
+    use std::time::Duration;
+
+    use serde_json::{Value, json};
+
+    use super::*;
+
+    const NETWORK: [u8; 32] = [0x11; 32];
+    const CHECKPOINT: (u64, [u8; 32]) = (2, [0x02; 32]);
+
+    /// A loopback exchange RPC that answers `getblockchaininfo` with `info`
+    /// and `getblockhash` from `hashes`, one request per connection.
+    struct FakeEndpoint {
+        address: SocketAddr,
+        info: Arc<Mutex<Value>>,
+        hashes: Arc<Mutex<Vec<[u8; 32]>>>,
+        /// While set, `getblockhash` fails with an internal error.
+        broken: Arc<AtomicBool>,
+        /// While set, `sendrawtransaction` fails with a retryable error.
+        send_busy: Arc<AtomicBool>,
+        stop: Arc<AtomicBool>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl FakeEndpoint {
+        fn spawn(info: Value) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let info = Arc::new(Mutex::new(info));
+            let hashes = Arc::new(Mutex::new((0..=5_u8).map(|height| [height; 32]).collect()));
+            let broken = Arc::new(AtomicBool::new(false));
+            let send_busy = Arc::new(AtomicBool::new(false));
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread = {
+                let (info, hashes, broken, send_busy, stop) = (
+                    info.clone(),
+                    hashes.clone(),
+                    broken.clone(),
+                    send_busy.clone(),
+                    stop.clone(),
+                );
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::SeqCst) {
+                        match listener.accept() {
+                            Ok((stream, _)) => {
+                                answer(stream, &info, &hashes, &broken, &send_busy);
+                            }
+                            Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                        }
+                    }
+                })
+            };
+            Self {
+                address,
+                info,
+                hashes,
+                broken,
+                send_busy,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        fn upstream(&self, checkpoint: Option<(u64, [u8; 32])>) -> Upstream {
+            let endpoint =
+                Endpoint::new(&format!("http://{}/", self.address), "x", "y", NETWORK).unwrap();
+            Upstream::with_checkpoint(endpoint, checkpoint)
+        }
+
+        fn set(&self, pointer: &str, value: Value) {
+            *self.info.lock().unwrap().pointer_mut(pointer).unwrap() = value;
+        }
+    }
+
+    impl Drop for FakeEndpoint {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(thread) = self.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
+
+    fn answer(
+        stream: std::net::TcpStream,
+        info: &Mutex<Value>,
+        hashes: &Mutex<Vec<[u8; 32]>>,
+        broken: &AtomicBool,
+        send_busy: &AtomicBool,
+    ) {
+        stream.set_nonblocking(false).unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut length = 0;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let line = line.trim_end();
+            if line.is_empty() {
+                break;
+            }
+            if let Some(value) = line.strip_prefix("Content-Length: ") {
+                length = value.parse().unwrap();
+            }
+        }
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).unwrap();
+        let request: Value = serde_json::from_slice(&body).unwrap();
+        let response = match request["method"].as_str().unwrap() {
+            "getblockchaininfo" => json!({"result": info.lock().unwrap().clone()}),
+            "getblockhash" if broken.load(Ordering::SeqCst) => {
+                json!({"error": {"code": -32603, "message": "internal error",
+                    "data": {"code": "internal_error", "retryable": false}}})
+            }
+            "getblockhash" => {
+                let height = request["params"][0].as_u64().unwrap() as usize;
+                match hashes.lock().unwrap().get(height) {
+                    Some(hash) => json!({"result": hex::encode(hash)}),
+                    None => json!({"error": {"code": -32001, "message": "not found",
+                        "data": {"code": "block_not_found", "retryable": false}}}),
+                }
+            }
+            "sendrawtransaction" if send_busy.load(Ordering::SeqCst) => {
+                json!({"error": {"code": -32603, "message": "busy",
+                    "data": {"code": "busy", "retryable": true}}})
+            }
+            "sendrawtransaction" => json!({"result": hex::encode([9_u8; 32])}),
+            other => panic!("unexpected method {other}"),
+        };
+        let mut response = response;
+        response["jsonrpc"] = json!("2.0");
+        response["id"] = request["id"].clone();
+        let body = serde_json::to_vec(&response).unwrap();
+        let mut stream = reader.into_inner();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        stream.write_all(&body).unwrap();
+    }
+
+    /// An enforcing upstream at tip 5, validated up to 4, checkpoint 3.
+    fn enforcing_info() -> Value {
+        json!({
+            "network_id": hex::encode(NETWORK),
+            "blocks": 5,
+            "bestblockhash": hex::encode([5_u8; 32]),
+            "work_rule": {
+                "enforced": true,
+                "engine_ready": true,
+                "engine_state": "ready",
+                "halted": false,
+                "checkpoint_height": 3,
+                "validated_height": 4,
+            },
+        })
+    }
+
+    #[test]
+    fn followable_height_requires_an_enforcing_upstream_at_or_past_the_checkpoint() {
+        let info = enforcing_info();
+        assert_eq!(followable_height(&info, 2), Ok(4));
+        // A later release's checkpoint is fine; an earlier one is not.
+        assert_eq!(followable_height(&info, 3), Ok(4));
+        assert!(
+            followable_height(&info, 4)
+                .unwrap_err()
+                .contains("below this release's 4")
+        );
+        let mut tip_below = info.clone();
+        tip_below["work_rule"]["validated_height"] = json!(9);
+        assert_eq!(followable_height(&tip_below, 2), Ok(5));
+
+        for (field, value, reason) in [
+            ("enforced", json!(false), "does not re-execute"),
+            ("halted", json!(true), "halted"),
+            ("engine_ready", json!(false), "not ready"),
+            ("checkpoint_height", Value::Null, "no work checkpoint"),
+            ("validated_height", Value::Null, "no validated height"),
+        ] {
+            let mut info = info.clone();
+            info["work_rule"][field] = value;
+            let error = followable_height(&info, 2).unwrap_err();
+            assert!(error.contains(reason), "{field}: {error}");
+        }
+        let mut missing = info.clone();
+        missing.as_object_mut().unwrap().remove("work_rule");
+        assert!(
+            followable_height(&missing, 2)
+                .unwrap_err()
+                .contains("does not report the work rule")
+        );
+        missing["work_rule"] = Value::Null;
+        assert!(followable_height(&missing, 2).is_err());
+    }
+
+    #[test]
+    fn an_upstream_is_followed_only_while_it_meets_the_work_rule() {
+        let server = FakeEndpoint::spawn(enforcing_info());
+        let mut upstream = server.upstream(Some(CHECKPOINT));
+        let tip = upstream.tip().unwrap();
+        assert_eq!((tip.height, tip.hash), (4, [4; 32]));
+        assert_eq!(upstream.refusal(), None);
+
+        server.set("/work_rule/halted", json!(true));
+        assert!(matches!(upstream.tip(), Err(SourceError::Unavailable(_))));
+        assert!(upstream.refusal().unwrap().contains("halted"));
+        server.set("/work_rule/halted", json!(false));
+        assert_eq!(upstream.tip().unwrap().height, 4);
+        assert_eq!(upstream.refusal(), None);
+
+        // A chain without this release's checkpoint block is refused.
+        server.hashes.lock().unwrap()[2] = [9; 32];
+        upstream.tip().unwrap_err();
+        assert!(upstream.refusal().unwrap().contains("checkpoint block"));
+        server.hashes.lock().unwrap()[2] = CHECKPOINT.1;
+
+        // So is a node from before the work rule.
+        server
+            .info
+            .lock()
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("work_rule");
+        upstream.tip().unwrap_err();
+        assert!(
+            upstream
+                .refusal()
+                .unwrap()
+                .contains("does not report the work rule")
+        );
+
+        // A network without a work rule follows the reported tip.
+        let tip = server.upstream(None).tip().unwrap();
+        assert_eq!((tip.height, tip.hash), (5, [5; 32]));
+    }
+
+    #[test]
+    fn a_second_upstream_is_used_while_the_first_fails() {
+        let first = FakeEndpoint::spawn(enforcing_info());
+        let second = FakeEndpoint::spawn(enforcing_info());
+        second.set("/work_rule/validated_height", json!(3));
+        first.set("/work_rule/halted", json!(true));
+        let mut upstreams = Upstreams::new(vec![
+            first.upstream(Some(CHECKPOINT)),
+            second.upstream(Some(CHECKPOINT)),
+        ]);
+
+        assert_eq!(upstreams.tip().unwrap().height, 3);
+        assert_eq!(upstreams.active_endpoint().port, second.address.port());
+        assert_eq!(upstreams.refusal(), None);
+        // It stays on the second while that one answers.
+        first.set("/work_rule/halted", json!(false));
+        assert_eq!(upstreams.tip().unwrap().height, 3);
+        // And goes back to the first once the second fails.
+        second.set("/work_rule/engine_ready", json!(false));
+        assert_eq!(upstreams.tip().unwrap().height, 4);
+        assert_eq!(upstreams.active_endpoint().port, first.address.port());
+
+        // With both refused, the active one's reason is reported.
+        first.set("/work_rule/enforced", json!(false));
+        upstreams.tip().unwrap_err();
+        assert!(upstreams.refusal().unwrap().contains("does not re-execute"));
+    }
+
+    #[test]
+    fn chain_reads_never_move_to_an_endpoint_that_has_not_passed_the_checks() {
+        let first = FakeEndpoint::spawn(enforcing_info());
+        let second = FakeEndpoint::spawn(enforcing_info());
+        second
+            .info
+            .lock()
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("work_rule");
+        let mut upstreams = Upstreams::new(vec![
+            first.upstream(Some(CHECKPOINT)),
+            second.upstream(Some(CHECKPOINT)),
+        ]);
+        assert_eq!(upstreams.tip().unwrap().height, 4);
+
+        // The followed endpoint fails during the round: the read fails
+        // instead of being answered by the endpoint without the work rule.
+        first.broken.store(true, Ordering::SeqCst);
+        assert!(upstreams.block_hash(3).is_err());
+        assert!(upstreams.read("getblockhash", json!([3])).is_err());
+        assert_eq!(upstreams.active_endpoint().port, first.address.port());
+
+        // The next tip refuses the second endpoint, so the wallet waits.
+        first.set("/work_rule/halted", json!(true));
+        upstreams.tip().unwrap_err();
+        assert_eq!(upstreams.active_endpoint().port, first.address.port());
+        assert!(upstreams.refusal().unwrap().contains("halted"));
+        let followed = upstreams.followed();
+        assert_eq!(followed.lock().unwrap().index, None);
+        assert!(
+            followed
+                .lock()
+                .unwrap()
+                .refusal
+                .as_deref()
+                .unwrap()
+                .contains("halted")
+        );
+    }
+
+    #[test]
+    fn a_broadcast_answered_by_the_second_endpoint_does_not_move_chain_reads() {
+        let first = FakeEndpoint::spawn(enforcing_info());
+        let second = FakeEndpoint::spawn(enforcing_info());
+        second
+            .info
+            .lock()
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("work_rule");
+        let mut upstreams = Upstreams::new(vec![
+            first.upstream(Some(CHECKPOINT)),
+            second.upstream(Some(CHECKPOINT)),
+        ]);
+        assert_eq!(upstreams.tip().unwrap().height, 4);
+        assert_eq!(
+            *upstreams.followed().lock().unwrap(),
+            FollowedEndpoint {
+                index: Some(0),
+                refusal: None
+            }
+        );
+
+        // The first endpoint is busy for a payment: the second takes it, and
+        // reads still go to the first, which passed the checks.
+        first.send_busy.store(true, Ordering::SeqCst);
+        upstreams.broadcast_once(&[1, 2, 3]).unwrap();
+        assert_eq!(upstreams.active_endpoint().port, first.address.port());
+        first.broken.store(true, Ordering::SeqCst);
+        assert!(upstreams.read("getblockhash", json!([3])).is_err());
+        assert!(upstreams.block_hash(3).is_err());
+        first.broken.store(false, Ordering::SeqCst);
+        assert_eq!(upstreams.block_hash(3).unwrap(), Some([3; 32]));
+        assert_eq!(upstreams.followed().lock().unwrap().index, Some(0));
+
+        // A second set of connections reads from the endpoint followed.
+        let mut reads = Upstreams::new(vec![
+            first.upstream(Some(CHECKPOINT)),
+            second.upstream(Some(CHECKPOINT)),
+        ]);
+        reads.use_endpoint(1);
+        assert_eq!(reads.active_endpoint().port, second.address.port());
+        reads.use_endpoint(5);
+        assert_eq!(reads.active_endpoint().port, second.address.port());
+    }
+
+    #[test]
+    fn the_primary_is_followed_again_only_once_it_reaches_the_wallet() {
+        let first = FakeEndpoint::spawn(enforcing_info());
+        let second = FakeEndpoint::spawn(enforcing_info());
+        first.set("/work_rule/halted", json!(true));
+        let mut upstreams = Upstreams::new(vec![
+            first.upstream(Some(CHECKPOINT)),
+            second.upstream(Some(CHECKPOINT)),
+        ]);
+        assert_eq!(upstreams.tip().unwrap().height, 4);
+        assert!(upstreams.on_fallback());
+        assert_eq!(upstreams.followed().lock().unwrap().index, Some(1));
+
+        // Still refused: stay on the second.
+        assert!(!upstreams.retry_primary(4));
+        assert!(upstreams.on_fallback());
+
+        // The primary passes again but has checked only up to height 3 while
+        // the wallet is at 4: stay on the second, which keeps the wallet
+        // moving.
+        first.set("/work_rule/halted", json!(false));
+        first.set("/work_rule/validated_height", json!(3));
+        assert!(!upstreams.retry_primary(4));
+        assert!(upstreams.on_fallback());
+        assert_eq!(upstreams.tip().unwrap().height, 4);
+        assert_eq!(upstreams.followed().lock().unwrap().index, Some(1));
+
+        // Once it reaches the wallet it is followed again.
+        first.set("/work_rule/validated_height", json!(4));
+        assert!(upstreams.retry_primary(4));
+        assert!(!upstreams.on_fallback());
+        assert_eq!(upstreams.tip().unwrap().height, 4);
+        assert_eq!(upstreams.followed().lock().unwrap().index, Some(0));
+        assert!(upstreams.retry_primary(10));
     }
 }

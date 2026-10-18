@@ -31,7 +31,7 @@ fn open_isolated(
     profile: NetworkProfile,
     artifacts: &ProductionV4VerifierArtifacts,
 ) -> Node {
-    Node::open_with_profile_artifacts_and_worker(
+    let mut node = Node::open_with_profile_artifacts_and_worker(
         path,
         profile,
         None,
@@ -40,7 +40,12 @@ fn open_isolated(
         None,
         None,
     )
-    .unwrap()
+    .unwrap();
+    // This identity replaces Testnet-1's genesis, so the work rule compiled
+    // for Testnet-1 cannot apply to it; this rehearsal checks proofs,
+    // difficulty and restart, not work re-execution.
+    node.install_work_rule_for_test(None);
+    node
 }
 
 #[test]
@@ -110,6 +115,7 @@ fn real_5x_proofs_two_nodes_and_restart() {
             },
             scratch_directory: scratch.clone(),
             worker_scratch_directory: scratch.to_str().unwrap().into(),
+            work_check_pin: None,
         },
     )
     .unwrap();

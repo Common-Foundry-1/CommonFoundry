@@ -142,16 +142,19 @@ fn open_node(
     launch: &mainnet_runtime::AuthenticatedMainnetRuntime,
     artifacts: &ProductionV4VerifierArtifacts,
 ) -> Arc<Mutex<Node>> {
-    let node =
+    let mut node =
         Node::open_with_authenticated_mainnet(path, launch, artifacts, Some(PASSPHRASE)).unwrap();
     assert_eq!(node.network_profile(), launch.profile());
     assert_eq!(node.profile.proof, ProofProfile::ProductionV4);
+    // Every block above genesis has its work re-executed on the CPU,
+    // whatever checkpoint the release pins.
+    crate::work_gate::test_support::check_work_from_genesis(&mut node, None);
     check_memory();
     Arc::new(Mutex::new(node))
 }
 
 #[test]
-#[ignore = "requires production-mainnet feature, six real-mainnet blocks and pinned models; CPU only; run alone"]
+#[ignore = "requires production-mainnet feature (with the release work checkpoint pinned), six real-mainnet blocks and pinned models; CPU only; run alone"]
 fn real_mainnet_short_fork_cold_and_warm_checkpoint_reuse() {
     assert_eq!(
         std::env::var("CMFD_RUN_REAL_FORK_CHECKPOINT").as_deref(),

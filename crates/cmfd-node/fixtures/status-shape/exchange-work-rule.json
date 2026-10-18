@@ -1,0 +1,20 @@
+{
+  "activation_height": "number",
+  "alarms": {
+    "engine_divergence": "number",
+    "engine_failures": "number",
+    "own_engine_mismatches": "number",
+    "peers_on_invalid_chain": "number",
+    "store_conflicts": "number"
+  },
+  "bank": "null",
+  "checkpoint_hash": "string",
+  "checkpoint_height": "number",
+  "enforced": "bool",
+  "engine_ready": "bool",
+  "engine_state": "string",
+  "engines": "string",
+  "halted": "bool",
+  "independent_engines": "bool",
+  "validated_height": "number"
+}

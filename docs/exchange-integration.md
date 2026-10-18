@@ -249,6 +249,11 @@ python .\tools\exchange_conformance.py live `
   --output C:\exchange-evidence\contract-conformance.json
 ```
 
+On mainnet and the other networks whose nodes re-execute each block's work,
+the tool also requires the node to report `work_rule` as enforced, not halted
+and with a ready engine, with `blocks` at or below `validated_height`; pass
+`--require-work-rule` to require the same on another network.
+
 The endpoint remains loopback-only Basic authentication without server
 authentication, so protect the host and port against hijacking. A passing
 report proves only the declared contract checks; it never means deposits or
@@ -293,10 +298,10 @@ return HTTP 401; authenticated JSON-RPC errors return HTTP 200.
 | Method | Parameters | Result |
 |---|---|---|
 | `getexchangeinfo` | `[]` | Exact API/network pins, enabled custody mode and methods, encodings, index health/capacity, and an explicit non-production status |
-| `getblockchaininfo` | `[]` | Network pins, height/tip/work, storage health, active and recently reachable peers, conservative sync state, warnings; `pruned`, plus `pruneheight` and `prune_keep_blocks` on a [pruned node](proof-pruning.md) |
-| `getblockcount` | `[]` | Active tip height |
-| `getbestblockhash` | `[]` | Active tip ID |
-| `getblockhash` | `[height]` | Active-chain ID at the height |
+| `getblockchaininfo` | `[]` | Network pins, served height/tip/work, storage health, active and recently reachable peers, conservative sync state, warnings; `pruned`, plus `pruneheight` and `prune_keep_blocks` on a [pruned node](proof-pruning.md); `work_rule` (null on a network without one) |
+| `getblockcount` | `[]` | Served chain height: the active tip, or the validated height on a network with a work rule |
+| `getbestblockhash` | `[]` | Block ID at the served chain height |
+| `getblockhash` | `[height]` | Active-chain ID at the height, up to the served chain height |
 | `getblock` | `[hash, verbosity=1]` | Canonical block-frame hex at `0` (`block_proof_pruned` below `pruneheight` on a pruned node); block with txids at `1`; block with explicit transaction objects at `2` |
 | `gettxoutsetinfo` | `[]` | Active-chain height, best block, unspent-output count and `total_amount_atoms`, the total supply (every minted coin minus burned fees) |
 | `getrawmempool` | `[verbose=false]` | Txid array, or txid-keyed size and `fee_atoms` records |
@@ -419,8 +424,11 @@ procedure.
 IDs are lowercase 64-character hex. Timestamps are Unix seconds. `nonce` and
 all monetary values are strings when their exact integer representation matters.
 Transaction outputs identify `value_atoms`, `spendable_height`, `lock_type`,
-and either `destination_hex` or `channel_id`. `destination_hex` is currently a
-raw 32-byte x-only Schnorr public key, not a checksummed display address.
+and either `destination_hex` or `channel_id`. `destination_hex` is always the
+raw 32-byte x-only Schnorr public key in hex. Destination parameters also accept
+the same key as a checksummed bech32m address (`cmfd1...` on mainnet,
+`tcmfd1...` on test networks; BIP-350), and `getexchangeinfo` reports
+`encodings.checksummed_address_available: true`.
 Coinbase is a separate block field rather than an ordinary transaction; its
 `outpoint_txid` and each output's `n` form the exact outpoint an indexer needs.
 
@@ -453,8 +461,10 @@ Each mapping connects an exchange label to one raw 32-byte x-only Schnorr public
 key. A successful response means the node has checked active-chain history from
 height one and durably published all matching events.
 The label must contain 1-128 visible ASCII bytes. The destination must be
-exactly 64 lowercase hexadecimal characters and decode as a valid key.
-Retrying the exact same label and destination is idempotent. Reusing a label
+exactly 64 lowercase hexadecimal characters or a checksummed address of the
+node's network (all lowercase or all uppercase), and decode as a valid key.
+Responses carry it as hex. Retrying the exact same label and destination is
+idempotent, in either form. Reusing a label
 for a different destination returns `watch_label_conflict`; reusing a
 destination under a different label returns `watch_destination_conflict`.
 
@@ -531,6 +541,72 @@ credit until both the chosen threshold and `spendable_height` condition hold,
 and still apply a removal event if a deeper reorganization crosses it. Mempool
 visibility is useful only for display and risk monitoring; it must never create
 an exchange balance.
+
+### The served chain and the validated height
+
+From 1.0.16, on a network with a work rule, nodes independently re-execute each
+block's work from its header and nonce before they accept it. Blocks a node
+stored before it had the rule (or while it was stopped) are checked in the
+background, and `getblockchaininfo` reports progress in
+`work_rule.validated_height`: every active block up to that height has been
+checked by this node. The exchange RPC serves the active chain only up to that
+height:
+
+- `getblockcount`, `getbestblockhash`, and `getblockchaininfo`'s `blocks`,
+  `bestblockhash` and `chainwork` stop at it;
+- `getblockhash` and `getblock` report an active block above it as not found,
+  and `confirmations` and `nextblockhash` stop at it;
+- `gettransaction` and `getrawtransaction` count confirmations from it, and
+  report a transaction in a block above it with `status: "pending_check"`, no
+  block and 0 confirmations;
+- withdrawal status (`getwithdrawal`) counts confirmations from it, so a
+  withdrawal mined above it reads confirmed with 0 confirmations;
+- the deposit index advances only along the served chain, so new
+  `getdepositevents` additions and `getexchangeinfo`'s `indexed_tip` stop at
+  it. If the validated height falls behind an index built earlier (a restart
+  that left stored blocks to check, or a revocation), the indexed blocks that
+  are still active are held: their deposits are not removed, nothing is added
+  until they are checked, and `indexed_tip` stays above the validated height
+  meanwhile. Only a reorganization removes deposits. Watch registration fails
+  with the retryable `work_check_pending` (-32030) while blocks are held.
+
+`getaddressbalance`, `getbalance`, `getaddressutxos`, `gettxoutsetinfo` and
+`preparewithdrawal` read the chain state at the node's tip, which holds the
+outputs of every stored block. While stored blocks above the validated height
+are still being checked, they fail with the retryable `work_check_pending`
+(-32030); once the validated height reaches the tip they answer, and their
+`height` and `bestblock` agree with `getblockcount`. The validated height
+normally equals the tip.
+
+The first start after an upgrade is the exception. The node opens its RPC,
+exchange RPC and P2P straight away and checks every block it stored since the
+release checkpoint in the background, so the reads above wait for all of them.
+A node that was stopped for a while also checks every block it syncs, so it
+catches up at the same rate. The first start takes about (blocks
+stored since the checkpoint) ÷ (blocks the node checks per hour − 62) hours:
+the chain adds about 62 blocks an hour, and a server CPU checks roughly 130 to
+600 blocks an hour, so one day of stored blocks (about 1,500) takes from about
+3 to about 22 hours. Watch `work_rule.validated_height` (also `blocks`) in
+`getblockchaininfo` approach `headers`, or compare it with `accepted_height` in
+the node's `GET /v1/status`; the node's daily log in
+`<data-dir>/logs/cmfd-node.log.<date>` shows the progress too, in a `work_rule`
+warn line about every 10 minutes while more than 30 stored active blocks are
+left (`blocks_left`, `checked`, `checked_per_hour`, `eta`, `validated_height`,
+`tip_height`). Do not restart the node to hurry it: progress is kept, but every
+start loads the model bank and runs the engine self-checks again. Keep the gap short by upgrading soon
+after a release, and plan the CPU time for a node set up from scratch, which
+checks every block above the checkpoint; the hosted endpoint avoids both.
+
+While the node has halted block admission, or its work engine has failed, the
+chain, balance, mempool and deposit reads, `sendrawtransaction`,
+`registerwatchdestination(s)`, `preparewithdrawal` and `releasewithdrawal` fail
+with the retryable `work_rule_halted` or `work_engine_failed` (code -32030).
+`getblockchaininfo`, `getexchangeinfo`, `getwatchdestination`, `getwithdrawal`,
+`getwithdrawaljournalinfo` and the v3 custody record methods
+(`getwithdrawalsigningpackage`, `getwithdrawalapprovalpayload`,
+`cancelwithdrawal`) still answer: they read or change stored records only.
+Treat the error as a pause in crediting and withdrawals, not as a
+reorganization.
 
 `getdepositevents` synchronizes before serving every page. Any index, capacity,
 or storage error therefore blocks even historical reads by design. Treat every
@@ -664,9 +740,8 @@ The current node now has durable full-history watch-only events for explicitly
 registered key destinations and a durable idempotent withdrawal journal. It
 still has one signing key in legacy v0.4; explicit v0.5 migration adds a
 multi-key provider-neutral custody boundary, but no certified vendor provider.
-Neither path has a node-generated deposit-key or checksummed address-derivation
-pool. The native development RPC also has unauthenticated loopback
-wallet-spending routes.
+Neither path has a node-generated deposit-key pool. The native development RPC
+also has unauthenticated loopback wallet-spending routes.
 Do not expose or use those routes for exchange custody, and do not infer
 production custody security from authentication on this integration listener.
 

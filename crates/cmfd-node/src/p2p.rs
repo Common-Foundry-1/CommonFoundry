@@ -15,9 +15,15 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
+#[path = "p2p_catch_up_tests.rs"]
+mod catch_up_tests;
 #[cfg(all(test, feature = "production-v4", any(windows, target_os = "linux")))]
 #[path = "real_peer_catchup_tests.rs"]
 mod real_peer_catchup_tests;
+#[cfg(test)]
+#[path = "p2p_work_rule_tests.rs"]
+mod work_rule_tests;
 
 use cmfd_consensus::{
     Block, ChainError, MAX_TRANSACTION_BYTES, Transaction, WireError, decode_block,
@@ -32,9 +38,13 @@ use crate::peer::{
     PeerConnection, PeerError, PeerHello, PeerLimits, PeerMessage, PeerSession,
     SUBMIT_BLOCK_RESPONSE_BUDGET, StaticPeerConfig, validate_peer_address,
 };
+use crate::work_gate::{
+    BlockSender, CatchUpFollow, FetchedFrom, PROBE_BUDGET, PROBE_CONNECT, PROBE_MIN_ATTEMPT,
+    PROBE_READ, WalletCatchUp, WorkBlame,
+};
 use crate::{
     BlockPreverifier, Node, NodeError, PeerDirection, RemoteProofPeerId, RemoteProofRequest,
-    submit_shared_peer_block_cancellable, unix_time_seconds,
+    submit_shared_peer_block_from, unix_time_seconds,
 };
 
 /// Absolute item-count cap for one block synchronization request. The active
@@ -96,6 +106,10 @@ const CLEAN_SESSION_CREDIT: u16 = 10;
 const TRANSIENT_FAILURE_PENALTY: u16 = 5;
 const UNKNOWN_REQUEST_PENALTY: u16 = 10;
 const INVALID_BLOCK_PENALTY: u16 = 25;
+// A sender that withdraws a block while its work is being checked used a
+// work-check run and got no verdict. Smaller than a rejection, since a
+// dropped connection can be honest, but enough that repeating it is banned.
+const WITHDRAWN_WORK_CHECK_PENALTY: u16 = 20;
 const INVALID_TRANSACTION_PENALTY: u16 = 25;
 const PROTOCOL_VIOLATION_PENALTY: u16 = 50;
 const RESOURCE_ABUSE_PENALTY: u16 = PEER_BAN_SCORE;
@@ -209,6 +223,8 @@ pub enum P2pError {
     BusyBlockSubmission([u8; 32]),
     #[error("peer inventory is not parent-ordered at block {block_id:?}")]
     NonContiguousInventory { block_id: [u8; 32] },
+    #[error("peer offered block {}, which this node knows is invalid", hex::encode(.0))]
+    KnownInvalidInventory([u8; 32]),
     #[error("peer requested an unknown or body-less block {0:?}")]
     UnknownRequestedBlock([u8; 32]),
     #[error("peer requested block {} whose proof this pruned node no longer stores", hex::encode(.0))]
@@ -303,6 +319,19 @@ enum PeerReputationKey {
 }
 
 impl PeerReputationKey {
+    /// The address that stands for every address of this key: an IPv4
+    /// address, or the IPv6 /64 prefix with the rest zeroed.
+    fn address(self) -> IpAddr {
+        match self {
+            Self::V4(octets) => IpAddr::from(octets),
+            Self::V6(prefix) => {
+                let mut octets = [0_u8; 16];
+                octets[..8].copy_from_slice(&prefix);
+                IpAddr::from(octets)
+            }
+        }
+    }
+
     fn from_ip(ip: IpAddr) -> Self {
         match ip {
             IpAddr::V4(ip) => Self::V4(ip.octets()),
@@ -368,11 +397,85 @@ struct PeerSecurityState {
     /// Operator-configured peers; assumed to accept compressed blocks until
     /// they prove otherwise.
     static_peers: BTreeSet<PeerReputationKey>,
+    /// The network's compiled bootstrap peers (seed and relays).
+    bootstrap_peers: BTreeSet<PeerReputationKey>,
+    /// Addresses whose last submitted block failed its proof or work check,
+    /// and when they may submit again. Keyed by address, so a reconnect does
+    /// not end it.
+    proof_cooldowns: BTreeMap<PeerReputationKey, Instant>,
+    /// Addresses whose served block failed its proof or work check, and when
+    /// this node syncs from them again. Apart from `proof_cooldowns`, so
+    /// their own submissions keep the shorter cooldown.
+    sync_holdoffs: BTreeMap<PeerReputationKey, Instant>,
 }
+
+/// Addresses held in proof cooldown (and, apart, held off as sync targets)
+/// at once; when full, the one whose cooldown ends first is dropped.
+const MAX_PROOF_COOLDOWN_ADDRESSES: usize = 4_096;
+
+/// Records that `key` is held off until `until`, in a map bounded by
+/// [`MAX_PROOF_COOLDOWN_ADDRESSES`].
+fn hold_off_until(
+    map: &mut BTreeMap<PeerReputationKey, Instant>,
+    key: PeerReputationKey,
+    now: Instant,
+    until: Instant,
+) {
+    map.retain(|_, until| *until > now);
+    if map.len() >= MAX_PROOF_COOLDOWN_ADDRESSES
+        && !map.contains_key(&key)
+        && let Some(first) = map
+            .iter()
+            .min_by_key(|(_, until)| **until)
+            .map(|(key, _)| *key)
+    {
+        map.remove(&first);
+    }
+    map.insert(key, until);
+}
+/// How long a peer whose served block failed its proof or work check is not
+/// synced from again (operator-configured and bootstrap peers excepted). Each
+/// such block costs this node a full work check, and a block whose work was
+/// never done is cheap to make, so one address gets one check per period.
+/// A peer whose block one engine refused is held off as long, which covers
+/// the window its one-engine refusals are counted over.
+const OUTBOUND_WORK_REFUSAL_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+const _: () = assert!(
+    OUTBOUND_WORK_REFUSAL_COOLDOWN.as_secs() >= crate::work_gate::LONE_REFUSAL_WINDOW.as_secs()
+);
 
 #[derive(Debug, Default)]
 struct PeerSecurity {
     state: Mutex<PeerSecurityState>,
+}
+
+/// A noted block that two independent engines found does not match costs its
+/// peer what a confirmed refusal at admission would have: a peer that sent
+/// it is charged (nothing if it is operator-configured or bootstrap) and its
+/// submissions held off for the proof cooldown; a peer a sync session
+/// fetched it from is not charged, since a peer that has not upgraded may
+/// follow such a block honestly, but is not synced from for a while (unless
+/// it is operator-configured or bootstrap).
+impl WorkBlame for PeerSecurity {
+    fn blame(&self, sender: BlockSender) {
+        let address = sender.address;
+        let now = Instant::now();
+        let result = self.is_trusted_peer(address).and_then(|trusted| {
+            if sender.fetched {
+                if !trusted {
+                    self.start_sync_holdoff_at(address, now)?;
+                }
+            } else {
+                let penalty = if trusted { 0 } else { INVALID_BLOCK_PENALTY };
+                self.record_failure_at(address, penalty, now, "noted block failed its work check")?;
+                self.start_proof_cooldown_at(address, now)?;
+            }
+            Ok(())
+        });
+        if let Err(error) = result {
+            tracing::warn!(%error, peer = %address, "failed to hold off the peer of a block that failed its work check");
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -452,6 +555,109 @@ impl PeerSecurity {
         if entry.banned_until.is_none() {
             entry.score = entry.score.saturating_sub(CLEAN_SESSION_CREDIT);
         }
+        Ok(())
+    }
+
+    /// Whether `ip` is in proof cooldown: its last submitted block failed its
+    /// proof or work check less than the cooldown ago.
+    fn in_proof_cooldown(&self, ip: IpAddr) -> Result<bool, P2pError> {
+        self.in_proof_cooldown_at(ip, Instant::now())
+    }
+
+    fn in_proof_cooldown_at(&self, ip: IpAddr, now: Instant) -> Result<bool, P2pError> {
+        let key = PeerReputationKey::from_ip(ip);
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| P2pError::PoisonedPeerReputation)?;
+        match state.proof_cooldowns.get(&key) {
+            Some(until) if *until > now => Ok(true),
+            Some(_) => {
+                state.proof_cooldowns.remove(&key);
+                Ok(false)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Starts `ip`'s proof cooldown after a submitted block failed its proof
+    /// or work check.
+    fn start_proof_cooldown(&self, ip: IpAddr) -> Result<(), P2pError> {
+        self.start_proof_cooldown_at(ip, Instant::now())
+    }
+
+    fn start_proof_cooldown_at(&self, ip: IpAddr, now: Instant) -> Result<(), P2pError> {
+        let key = PeerReputationKey::from_ip(ip);
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| P2pError::PoisonedPeerReputation)?;
+        hold_off_until(
+            &mut state.proof_cooldowns,
+            key,
+            now,
+            now + crate::INVALID_REMOTE_PROOF_COOLDOWN,
+        );
+        Ok(())
+    }
+
+    /// Whether this node is holding off syncing from `ip`: a block it served
+    /// failed its proof or work check less than
+    /// [`OUTBOUND_WORK_REFUSAL_COOLDOWN`] ago.
+    fn in_sync_holdoff_at(&self, ip: IpAddr, now: Instant) -> Result<bool, P2pError> {
+        let key = PeerReputationKey::from_ip(ip);
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| P2pError::PoisonedPeerReputation)?;
+        match state.sync_holdoffs.get(&key) {
+            Some(until) if *until > now => Ok(true),
+            Some(_) => {
+                state.sync_holdoffs.remove(&key);
+                Ok(false)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Holds `ip` off as a sync target for [`OUTBOUND_WORK_REFUSAL_COOLDOWN`]
+    /// after a block fetched from it failed its proof or work check.
+    fn start_sync_holdoff_at(&self, ip: IpAddr, now: Instant) -> Result<(), P2pError> {
+        let key = PeerReputationKey::from_ip(ip);
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| P2pError::PoisonedPeerReputation)?;
+        hold_off_until(
+            &mut state.sync_holdoffs,
+            key,
+            now,
+            now + OUTBOUND_WORK_REFUSAL_COOLDOWN,
+        );
+        Ok(())
+    }
+
+    /// Whether `ip` is one of the operator-configured peers or the network's
+    /// compiled bootstrap peers.
+    fn is_trusted_peer(&self, ip: IpAddr) -> Result<bool, P2pError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| P2pError::PoisonedPeerReputation)?;
+        let key = PeerReputationKey::from_ip(ip);
+        Ok(state.static_peers.contains(&key) || state.bootstrap_peers.contains(&key))
+    }
+
+    fn register_bootstrap_peers(&self, peers: &[SocketAddr]) -> Result<(), P2pError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| P2pError::PoisonedPeerReputation)?;
+        state.bootstrap_peers.extend(
+            peers
+                .iter()
+                .map(|peer| PeerReputationKey::from_ip(peer.ip())),
+        );
         Ok(())
     }
 
@@ -1279,7 +1485,15 @@ pub fn sync_from_peer_once_with_policy(
     limits: PeerLimits,
     address_policy: PeerAddressPolicy,
 ) -> Result<SyncReport, P2pError> {
-    sync_from_peer_once_inner_with_policy(shared, address, limits, address_policy, None, None)
+    sync_from_peer_once_inner_with_policy(
+        shared,
+        address,
+        limits,
+        address_policy,
+        None,
+        None,
+        false,
+    )
 }
 
 fn sync_from_peer_once_inner(
@@ -1295,9 +1509,13 @@ fn sync_from_peer_once_inner(
         PeerAddressPolicy::PrivateOnly,
         nonce_override,
         None,
+        false,
     )
 }
 
+/// One sync session with the peer at `address`, which is `trusted` if it is
+/// operator-configured or a bootstrap peer: the blocks fetched from it then
+/// wait for the work lane as priority (see [`FetchedFrom`]).
 #[tracing::instrument(skip_all, fields(peer = %address, direction = "outbound"))]
 fn sync_from_peer_once_inner_with_policy(
     shared: Arc<Mutex<Node>>,
@@ -1306,6 +1524,7 @@ fn sync_from_peer_once_inner_with_policy(
     address_policy: PeerAddressPolicy,
     nonce_override: Option<[u8; 32]>,
     active_sockets: Option<&Arc<ActiveSocketRegistry>>,
+    trusted: bool,
 ) -> Result<SyncReport, P2pError> {
     let observation_address = observed_address(PeerDirection::Outbound, address);
     record_peer_started(
@@ -1321,6 +1540,7 @@ fn sync_from_peer_once_inner_with_policy(
         nonce_override,
         active_sockets,
         SYNC_SESSION_FETCH_BUDGET,
+        trusted,
     );
     if let Ok(report) = &result {
         record_peer_succeeded(
@@ -1350,15 +1570,25 @@ fn sync_from_peer_once_inner_with_policy(
 const MAX_FETCHED_BLOCK_SUBMIT_ATTEMPTS: usize = 3;
 const FETCHED_BLOCK_QUEUE_FULL_PAUSE: Duration = Duration::from_millis(250);
 
+/// Submits a block a sync session fetched `from` a peer.
 fn submit_fetched_block(
     shared: &Arc<Mutex<Node>>,
     block: Block,
     proof_peer: RemoteProofPeerId,
+    from: FetchedFrom,
     active_sockets: Option<&Arc<ActiveSocketRegistry>>,
 ) -> Result<bool, P2pError> {
     let stopping = active_sockets.map(|registry| Arc::clone(&registry.stopping));
     submit_fetched_block_with(block, stopping, |block, accepted_at, request| {
-        submit_shared_peer_block_cancellable(shared, block, accepted_at, proof_peer, request)
+        submit_shared_peer_block_from(
+            shared,
+            block,
+            accepted_at,
+            proof_peer,
+            request,
+            from.trusted,
+            Some(from.block_sender()),
+        )
     })
 }
 
@@ -1457,7 +1687,8 @@ impl Drop for PrefetchSlots {
 
 /// Submits a window of fetched, contiguous blocks in order after their proofs
 /// were pre-warmed concurrently, advancing the peer cursor and the session
-/// counters exactly as one-at-a-time submission did.
+/// counters exactly as one-at-a-time submission did. Each block's work is
+/// computed just before its own submission (see [`prewarm_fetched_work`]).
 #[allow(clippy::too_many_arguments)]
 fn submit_fetched_window(
     shared: &Arc<Mutex<Node>>,
@@ -1465,6 +1696,7 @@ fn submit_fetched_window(
     pending: &mut Vec<Block>,
     slots: &mut PrefetchSlots,
     proof_peer: RemoteProofPeerId,
+    from: FetchedFrom,
     active_sockets: Option<&Arc<ActiveSocketRegistry>>,
     observation_address: &str,
     sync_cursor: &mut Option<[u8; 32]>,
@@ -1474,10 +1706,15 @@ fn submit_fetched_window(
     if pending.is_empty() {
         return Ok(());
     }
-    crate::prewarm_fetched_proofs(preverifier, pending);
+    // A peer with no one-engine refusals left has its blocks deferred before
+    // their proofs are checked; checking them all here first would waste it.
+    if !lock_node(shared)?.lone_refusals_exhausted(from) {
+        crate::prewarm_fetched_proofs(preverifier, pending);
+    }
     for block in pending.drain(..) {
         let block_id = block.block_id();
-        let accepted = submit_fetched_block(shared, block, proof_peer, active_sockets)?;
+        prewarm_fetched_work(shared, preverifier, &block, from, active_sockets)?;
+        let accepted = submit_fetched_block(shared, block, proof_peer, from, active_sockets)?;
         if lock_node(shared)?.advance_peer_sync_cursor(observation_address, *sync_cursor, block_id)
         {
             *sync_cursor = Some(block_id);
@@ -1489,6 +1726,54 @@ fn submit_fetched_window(
         }
     }
     slots.release_all();
+    Ok(())
+}
+
+/// How long a sync prewarm waits for the work lane: in practice no limit, as
+/// the wait ends on local shutdown; the bound only keeps the deadline finite.
+const WORK_PREWARM_LANE_PATIENCE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Computes a fetched block's work into the memo just before its ordered
+/// submission, so the block is admitted however slow this node's engine is
+/// and however long it waits for the work lane. Nothing runs unless the
+/// block first passes every check its admission makes before its work is
+/// checked: those under the node lock (its parent is indexed by now) and its
+/// proof. Otherwise, and when the lane cannot take another waiter, the
+/// submission deals with the block as usual. The wait and the compute end
+/// only on local shutdown. Only this node-initiated path keeps a result
+/// computed for a block before its admission.
+fn prewarm_fetched_work(
+    shared: &Arc<Mutex<Node>>,
+    preverifier: &BlockPreverifier,
+    block: &Block,
+    from: FetchedFrom,
+    active_sockets: Option<&Arc<ActiveSocketRegistry>>,
+) -> Result<(), P2pError> {
+    let accepted_at = unix_time_seconds()?;
+    let Some(prewarm) = lock_node(shared)?.work_prewarm(block, accepted_at, from) else {
+        return Ok(());
+    };
+    // A cached result for a window the session checked concurrently; the
+    // proof of a lone block is checked here, and its submission reuses it.
+    if preverifier.prewarm_fetched_proof(block).is_err() {
+        return Ok(());
+    }
+    let stopping = active_sockets.map(|registry| Arc::clone(&registry.stopping));
+    let stopped = || {
+        stopping
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+    };
+    if stopped() {
+        return Ok(());
+    }
+    let request = RemoteProofRequest::new(checked_submit_deadline(
+        Instant::now(),
+        WORK_PREWARM_LANE_PATIENCE,
+    )?);
+    let monitor = PeerSubmissionMonitor::local_validation(stopping.clone(), request.clone())?;
+    prewarm.run(request, &stopped);
+    drop(monitor);
     Ok(())
 }
 
@@ -1508,6 +1793,186 @@ fn expect_sync_inventory(message: PeerMessage) -> Result<Vec<[u8; 32]>, P2pError
     Ok(inventory)
 }
 
+/// What a sync session of a desktop wallet catching up read under its first
+/// node lock.
+struct CatchUpSession {
+    catch_up: Arc<WalletCatchUp>,
+    /// The wallet's active-chain locator, tip first, which corroborating
+    /// sources are asked with.
+    tip_locator: Vec<[u8; 32]>,
+    /// Corroboration may be asked for (see
+    /// [`Node::wallet_corroboration_due`]).
+    corroboration_due: bool,
+}
+
+/// A sync session of a desktop wallet catching up with one of its sources.
+/// When it ends, however it ends, the source's session summary is logged.
+struct SourceSession {
+    catch_up: Arc<WalletCatchUp>,
+    source: u8,
+    reported: u64,
+    /// The source that corroborated this session's blocks, and the height
+    /// it reported.
+    voucher: Option<(u8, u64)>,
+}
+
+impl Drop for SourceSession {
+    fn drop(&mut self) {
+        self.catch_up
+            .log_session_summary(self.source, self.reported, self.voucher, Instant::now());
+    }
+}
+
+/// The catch-up part of a sync session with the peer at `address`, which
+/// reported `reported` to this wallet at `local` (`hello` is the session's
+/// own). A session with a source records the height it reported, and if it
+/// is at least the catch-up depth ahead and corroboration is due, asks the
+/// sources in other groups which blocks follow this wallet's tip: its blocks
+/// at least the depth below that height may then be admitted without an
+/// engine run. A session with any other peer downloads no blocks while
+/// sources in two groups show this wallet far behind and keep delivering.
+/// Returns the session's catch-up, the source session, and whether to skip
+/// the block download.
+#[allow(clippy::too_many_arguments)]
+fn follow_catch_up_session(
+    shared: &Arc<Mutex<Node>>,
+    session: &CatchUpSession,
+    address: SocketAddr,
+    local: u64,
+    reported: u64,
+    hello: PeerHello,
+    limits: PeerLimits,
+    address_policy: PeerAddressPolicy,
+) -> Result<(Option<CatchUpFollow>, Option<SourceSession>, bool), P2pError> {
+    let catch_up = &session.catch_up;
+    let now = Instant::now();
+    let Some(source) = catch_up.source_index(address) else {
+        return Ok((None, None, catch_up.sources_ahead(local, now)));
+    };
+    catch_up.note_view(source, reported, &[], now);
+    let mut source_session = SourceSession {
+        catch_up: Arc::clone(catch_up),
+        source,
+        reported,
+        voucher: None,
+    };
+    let depth = catch_up.depth();
+    if !session.corroboration_due || reported < local.saturating_add(depth) {
+        return Ok((None, Some(source_session), false));
+    }
+    source_session.voucher = probe_catch_up_inventory(
+        shared,
+        catch_up,
+        source,
+        hello,
+        &session.tip_locator,
+        limits,
+        address_policy,
+    )?;
+    let follow = CatchUpFollow {
+        below: reported - depth,
+        source,
+    };
+    Ok((Some(follow), Some(source_session), false))
+}
+
+/// Asks the sources in groups other than `source`'s, in turn, which blocks
+/// follow this wallet's tip (`locator`, tip first), until one lists a block
+/// not stored here, none is left, or [`PROBE_BUDGET`] has passed since the
+/// start. Each source answers one headers request on a connection of its
+/// own, opened with `hello`. No blocks or mempool are fetched, and no
+/// reputation, discovery state or penalty is recorded either way; a source
+/// that fails before it answers is not asked again for a while. Returns the
+/// source that listed such a block, with the height it reported.
+fn probe_catch_up_inventory(
+    shared: &Arc<Mutex<Node>>,
+    catch_up: &WalletCatchUp,
+    source: u8,
+    hello: PeerHello,
+    locator: &[[u8; 32]],
+    limits: PeerLimits,
+    address_policy: PeerAddressPolicy,
+) -> Result<Option<(u8, u64)>, P2pError> {
+    let started = Instant::now();
+    let deadline = checked_submit_deadline(started, PROBE_BUDGET)?;
+    let mut voucher = None;
+    for candidate in catch_up.probe_candidates(source, started) {
+        let Some(remaining) = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| *remaining >= PROBE_MIN_ATTEMPT)
+        else {
+            break;
+        };
+        let Some(candidate_address) = catch_up.source_addr(candidate) else {
+            continue;
+        };
+        catch_up.note_probe_attempt();
+        let attempt_limits = PeerLimits {
+            connect_timeout: PROBE_CONNECT.min(remaining),
+            idle_timeout: PROBE_READ.min(remaining),
+            total_timeout: remaining,
+            ..limits
+        };
+        let answer = probe_catch_up_source(
+            candidate_address,
+            hello,
+            locator,
+            attempt_limits,
+            address_policy,
+            deadline,
+        );
+        let (reported, block_ids) = match answer {
+            Ok(answer) => answer,
+            Err(error) => {
+                tracing::debug!(peer = %candidate_address, %error, "a catch-up source did not answer");
+                catch_up.note_probe_failed(candidate, Instant::now());
+                continue;
+            }
+        };
+        let lists_new = {
+            let node = lock_node(shared)?;
+            block_ids
+                .iter()
+                .any(|block_id| !node.contains_block(*block_id))
+        };
+        let now = Instant::now();
+        catch_up.note_view(candidate, reported, &block_ids, now);
+        if lists_new {
+            catch_up.note_probe_hit(now);
+            voucher = Some((candidate, reported));
+            break;
+        }
+        // Pruned below this wallet's tip, or behind it.
+        catch_up.note_probe_miss();
+    }
+    catch_up.note_probe_elapsed(started.elapsed());
+    Ok(voucher)
+}
+
+/// One corroborating connection: the source's reported height and the ids
+/// it lists after `locator`, all before `deadline`.
+fn probe_catch_up_source(
+    address: SocketAddr,
+    hello: PeerHello,
+    locator: &[[u8; 32]],
+    limits: PeerLimits,
+    address_policy: PeerAddressPolicy,
+    deadline: Instant,
+) -> Result<(u64, Vec<[u8; 32]>), P2pError> {
+    let session = PeerSession::new(hello, limits)?;
+    let mut connection =
+        PeerConnection::connect_with_policy_before(address, session, address_policy, deadline)?;
+    connection.send_hello()?;
+    let remote_hello = expect_hello(connection.receive()?)?;
+    connection.send(PeerMessage::GetHeaders {
+        locator: locator.to_vec(),
+        stop: remote_hello.tip,
+    })?;
+    let block_ids = expect_sync_inventory(connection.receive()?)?;
+    Ok((remote_hello.height, block_ids))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn perform_sync_from_peer_once_inner_with_policy(
     shared: Arc<Mutex<Node>>,
     address: SocketAddr,
@@ -1516,15 +1981,25 @@ fn perform_sync_from_peer_once_inner_with_policy(
     nonce_override: Option<[u8; 32]>,
     active_sockets: Option<&Arc<ActiveSocketRegistry>>,
     fetch_budget: Duration,
+    trusted: bool,
 ) -> Result<SyncReport, P2pError> {
     let observation_address = observed_address(PeerDirection::Outbound, address);
-    let (hello, locator, mut sync_cursor) = {
+    let (hello, locator, mut sync_cursor, catch_up) = {
         let node = lock_node(&shared)?;
         let hello = node.peer_hello();
         let (locator, cursor) = node.peer_sync_locator(&observation_address, MAX_BLOCKS_PER_SYNC);
-        (hello, locator, cursor)
+        // A desktop wallet catching up asks other sources which blocks
+        // follow its own tip.
+        let catch_up = node.wallet_catch_up().map(|catch_up| CatchUpSession {
+            catch_up,
+            tip_locator: node.block_locator(MAX_BLOCKS_PER_SYNC),
+            corroboration_due: node.wallet_corroboration_due(),
+        });
+        (hello, locator, cursor, catch_up)
     };
     let block_batch_limit = block_sync_batch_limit(hello.network_id, limits);
+    let local_work = hello.cumulative_work;
+    let local_height = hello.height;
     let hello = with_nonce(hello, nonce_override);
 
     let session = PeerSession::new(hello, limits)?;
@@ -1539,12 +2014,37 @@ fn perform_sync_from_peer_once_inner_with_policy(
     connection.send_hello()?;
     let remote_hello = expect_hello(connection.receive()?)?;
     let proof_peer = next_remote_proof_peer_id()?;
+    let (catch_up_follow, source_session, skip_blocks) = match &catch_up {
+        Some(session) => follow_catch_up_session(
+            &shared,
+            session,
+            address,
+            local_height,
+            remote_hello.height,
+            hello,
+            limits,
+            address_policy,
+        )?,
+        None => (None, None, false),
+    };
+    let from = FetchedFrom {
+        sender: PeerReputationKey::from_ip(address.ip()).address(),
+        trusted,
+        heavier: remote_hello.cumulative_work > local_work,
+        catch_up: catch_up_follow,
+    };
 
-    connection.send(PeerMessage::GetHeaders {
-        locator,
-        stop: remote_hello.tip,
-    })?;
-    let mut inventory = expect_sync_inventory(connection.receive()?)?;
+    let mut inventory = if skip_blocks {
+        // Sources in two groups show this wallet far behind and keep
+        // delivering: only the mempool is exchanged with this peer.
+        Vec::new()
+    } else {
+        connection.send(PeerMessage::GetHeaders {
+            locator,
+            stop: remote_hello.tip,
+        })?;
+        expect_sync_inventory(connection.receive()?)?
+    };
     let mut inventory_items = inventory.len();
     let mut header_rounds = 1;
 
@@ -1579,10 +2079,68 @@ fn perform_sync_from_peer_once_inner_with_policy(
                 continue;
             }
             reached_unknown = true;
+            if lock_node(&shared)?.known_invalid_block(requested) {
+                // The peer's chain builds on a block this node rejected: do
+                // not download it again (a copy would be refused at once).
+                // Keep what was already delivered.
+                submit_fetched_window(
+                    &shared,
+                    &preverifier,
+                    &mut pending,
+                    &mut slots,
+                    proof_peer,
+                    from,
+                    active_sockets,
+                    &observation_address,
+                    &mut sync_cursor,
+                    &mut accepted_blocks,
+                    &mut already_known,
+                )?;
+                let mut node = lock_node(&shared)?;
+                if node.marks_peer_on_invalid_chain(requested) {
+                    node.record_peer_on_invalid_chain(
+                        PeerDirection::Outbound,
+                        observation_address.clone(),
+                        remote_hello.height,
+                        remote_hello.tip,
+                        observation_time(),
+                    );
+                }
+                return Err(P2pError::KnownInvalidInventory(*requested));
+            }
             if requested_blocks >= block_batch_limit
                 || (requested_blocks > 0 && fetch_started.elapsed() >= fetch_budget)
             {
                 break;
+            }
+            // A peer with no one-engine refusals left would have this block
+            // deferred: it is not downloaded. Keep what was delivered.
+            let next_height = match pending.last() {
+                Some(block) => Some(block.challenge.height.saturating_add(1)),
+                None => previous_inventory_id.and_then(|previous| {
+                    lock_node(&shared)
+                        .ok()?
+                        .index
+                        .blocks
+                        .get(&previous)
+                        .map(|entry| entry.height().saturating_add(1))
+                }),
+            };
+            if lock_node(&shared)?.sync_fetch_deferred(from, requested, next_height) {
+                submit_fetched_window(
+                    &shared,
+                    &preverifier,
+                    &mut pending,
+                    &mut slots,
+                    proof_peer,
+                    from,
+                    active_sockets,
+                    &observation_address,
+                    &mut sync_cursor,
+                    &mut accepted_blocks,
+                    &mut already_known,
+                )?;
+                return Err(P2pError::Node(NodeError::WorkCheckDeferred));
             }
             // Buffer a small window of fetched blocks so their proofs can be
             // checked concurrently; hold only what the node-wide cap allows.
@@ -1595,6 +2153,7 @@ fn perform_sync_from_peer_once_inner_with_policy(
                     &mut pending,
                     &mut slots,
                     proof_peer,
+                    from,
                     active_sockets,
                     &observation_address,
                     &mut sync_cursor,
@@ -1621,6 +2180,7 @@ fn perform_sync_from_peer_once_inner_with_policy(
                         &mut pending,
                         &mut slots,
                         proof_peer,
+                        from,
                         active_sockets,
                         &observation_address,
                         &mut sync_cursor,
@@ -1648,6 +2208,7 @@ fn perform_sync_from_peer_once_inner_with_policy(
                     &mut pending,
                     &mut slots,
                     proof_peer,
+                    from,
                     active_sockets,
                     &observation_address,
                     &mut sync_cursor,
@@ -1674,6 +2235,7 @@ fn perform_sync_from_peer_once_inner_with_policy(
             &mut pending,
             &mut slots,
             proof_peer,
+            from,
             active_sockets,
             &observation_address,
             &mut sync_cursor,
@@ -1699,6 +2261,11 @@ fn perform_sync_from_peer_once_inner_with_policy(
         inventory = expect_sync_inventory(connection.receive()?)?;
         inventory_items += inventory.len();
         header_rounds += 1;
+    }
+    if let Some(source_session) = &source_session
+        && accepted_blocks > 0
+    {
+        source_session.catch_up.note_source_progress(Instant::now());
     }
 
     connection.send(PeerMessage::GetMempool)?;
@@ -2078,10 +2645,12 @@ fn perform_respond_to_peer_inner_with_policy(
     let remote_hello = expect_hello(connection.receive()?)?;
     *handshake_complete = true;
     let proof_peer = next_remote_proof_peer_id()?;
+    let proof_cooldowns = uses_remote_proof_cooldowns(&*lock_node(&shared)?);
+    let trusted_peer = options.security.is_trusted_peer(remote_address.ip())?;
     record_peer_succeeded(
         &shared,
         PeerDirection::Inbound,
-        observation_address,
+        observation_address.clone(),
         remote_hello,
     );
 
@@ -2158,7 +2727,11 @@ fn perform_respond_to_peer_inner_with_policy(
                 };
                 match admission {
                     Ok(_) | Err(NodeError::DuplicateMempoolTransaction(_)) => {}
-                    Err(NodeError::MempoolTransactionLimit | NodeError::MempoolByteLimit) => {}
+                    Err(
+                        NodeError::MempoolTransactionLimit
+                        | NodeError::MempoolByteLimit
+                        | NodeError::MempoolCloseLimit,
+                    ) => {}
                     Err(error) if error.client_error().status < 500 => {
                         let peer_fault = transaction_rejection_is_peer_fault(&error);
                         tracing::debug!(
@@ -2202,14 +2775,59 @@ fn perform_respond_to_peer_inner_with_policy(
                     checked_submit_deadline(started, SUBMIT_BLOCK_SERVER_RESPONSE_BUDGET)?;
                 let request = RemoteProofRequest::new(acceptance_deadline);
                 let monitor = PeerSubmissionMonitor::start(&connection, request.clone())?;
-                let mut below_prune_point = false;
-                let status = match submit_shared_peer_block_cancellable(
-                    &shared,
-                    block,
-                    accepted_at,
-                    proof_peer,
-                    request,
-                ) {
+                let peer_ip = remote_address.ip();
+                let mut penalty = 0;
+                let result = if proof_cooldowns && options.security.in_proof_cooldown(peer_ip)? {
+                    // A block this node already has is still answered as
+                    // known, so the sender does not back off for it.
+                    if lock_node(&shared)?.contains_block(block_id) {
+                        Err(NodeError::DuplicateBlock(block_id))
+                    } else {
+                        Err(NodeError::ProofVerificationQueueFull)
+                    }
+                } else {
+                    // A local miner submits over loopback.
+                    submit_shared_peer_block_from(
+                        &shared,
+                        block,
+                        accepted_at,
+                        proof_peer,
+                        request,
+                        trusted_peer || peer_ip.to_canonical().is_loopback(),
+                        Some(BlockSender {
+                            address: PeerReputationKey::from_ip(peer_ip).address(),
+                            fetched: false,
+                            trusted: trusted_peer || peer_ip.to_canonical().is_loopback(),
+                        }),
+                    )
+                };
+                if proof_cooldowns
+                    && let Err(error) = &result
+                    && starts_proof_cooldown(error)
+                {
+                    options.security.start_proof_cooldown(peer_ip)?;
+                }
+                // A peer whose own tip this node knows is invalid is not ahead
+                // of it. A block it only relays does not say that of its tip.
+                if block_id == remote_hello.tip
+                    && match &result {
+                        Err(NodeError::InvalidAncestor(_)) => true,
+                        Err(
+                            NodeError::CachedInvalidBlock(_)
+                            | NodeError::WorkRecomputationMismatch(_),
+                        ) => lock_node(&shared)?.marks_peer_on_invalid_chain(&block_id),
+                        _ => false,
+                    }
+                {
+                    lock_node(&shared)?.record_peer_on_invalid_chain(
+                        PeerDirection::Inbound,
+                        observation_address.clone(),
+                        remote_hello.height,
+                        remote_hello.tip,
+                        observation_time(),
+                    );
+                }
+                let status = match result {
                     Ok(_) => BlockSubmissionStatus::Accepted,
                     Err(NodeError::DuplicateBlock(_)) => BlockSubmissionStatus::AlreadyKnown,
                     Err(error @ NodeError::BelowPrunePoint(_)) => {
@@ -2221,10 +2839,22 @@ fn perform_respond_to_peer_inner_with_policy(
                             %error,
                             "ignored submitted block below the prune point"
                         );
-                        below_prune_point = true;
                         BlockSubmissionStatus::Rejected
                     }
+                    Err(error @ NodeError::WorkCheckDeferred) => {
+                        // It ran nothing, so an address can send these as
+                        // fast as it likes: not worth a warning each.
+                        penalty = deferred_block_penalty(&error, trusted_peer);
+                        tracing::debug!(
+                            block_id = %hex::encode(block_id),
+                            height = block_height,
+                            reason = error.client_error().code,
+                            "deferred submitted block"
+                        );
+                        BlockSubmissionStatus::Busy
+                    }
                     Err(error) if is_retryable_block_admission(&error) => {
+                        penalty = deferred_block_penalty(&error, trusted_peer);
                         // The wire status cannot carry a reason, and peers
                         // report every retryable cause with the same deferred status.
                         tracing::warn!(
@@ -2246,28 +2876,20 @@ fn perform_respond_to_peer_inner_with_policy(
                             elapsed_ms = started.elapsed().as_millis() as u64,
                             "rejected submitted block"
                         );
+                        penalty = submitted_block_penalty(&error, trusted_peer);
                         BlockSubmissionStatus::Rejected
                     }
                     Err(error) => return Err(error.into()),
                 };
                 drop(monitor);
-                send_block_submission_result_before(
+                let sent = send_block_submission_result_before(
                     &shared,
                     &mut connection,
                     block_id,
                     status,
                     response_deadline,
-                )?;
-                if status == BlockSubmissionStatus::Rejected
-                    && !below_prune_point
-                    && options.security.record_failure(
-                        remote_address.ip(),
-                        INVALID_BLOCK_PENALTY,
-                        "deterministically rejected block",
-                    )?
-                {
-                    return Err(P2pError::PeerTemporarilyBanned(remote_address.ip()));
-                }
+                );
+                penalize_submission_then(&options.security, peer_ip, penalty, sent)?;
             }
             PeerMessage::GetPeers { listen_port } => {
                 let Some(discovery) = options.discovery.as_ref() else {
@@ -2293,6 +2915,75 @@ fn perform_respond_to_peer_inner_with_policy(
 
 fn is_retryable_block_admission(error: &NodeError) -> bool {
     error.client_error().retryable
+}
+
+/// Whether a peer whose submitted block fails its proof or work check is held
+/// off for a cooldown: on production networks, and wherever a work rule is
+/// applied.
+fn uses_remote_proof_cooldowns(node: &Node) -> bool {
+    matches!(
+        node.profile.proof,
+        crate::ProofProfile::ProductionV3 | crate::ProofProfile::ProductionV4
+    ) || node.work_gate.is_some()
+}
+
+/// Whether a submitted block's outcome holds its sender's address off for a
+/// cooldown: its proof failed, two independent engines agree its work does
+/// not match, or its sender withdrew it while its work was being checked.
+fn starts_proof_cooldown(error: &NodeError) -> bool {
+    crate::is_remote_peer_proof_failure(error) || matches!(error, NodeError::WorkCheckWithdrawn)
+}
+
+/// The reputation cost of a submitted block that was deferred: nothing, unless
+/// its sender withdrew it while its work was being checked. Operator-configured
+/// and bootstrap peers are not charged for that either.
+fn deferred_block_penalty(error: &NodeError, trusted_peer: bool) -> u16 {
+    match error {
+        NodeError::WorkCheckWithdrawn if !trusted_peer => WITHDRAWN_WORK_CHECK_PENALTY,
+        _ => 0,
+    }
+}
+
+/// Records the penalty for a submitted block's verdict, then returns whether
+/// its reply was sent: a peer that closes its connection before the reply is
+/// penalized all the same.
+fn penalize_submission_then(
+    security: &PeerSecurity,
+    ip: IpAddr,
+    penalty: u16,
+    sent: Result<(), P2pError>,
+) -> Result<(), P2pError> {
+    if security.record_failure(ip, penalty, "rejected or withdrawn block")? {
+        return Err(P2pError::PeerTemporarilyBanned(ip));
+    }
+    sent
+}
+
+/// The reputation cost of a submitted block that was rejected. A block on a
+/// fork deeper than this pruned node can follow, a block at or below the
+/// release checkpoint that is off its pinned chain (an old orphan an honest
+/// peer may still hold), and a block whose work only one of this node's
+/// engines found does not match (that engine may be the one at fault) cost
+/// nothing; so do work-rule rejections from operator-configured and bootstrap
+/// peers, which may still run an earlier release.
+fn submitted_block_penalty(error: &NodeError, trusted_peer: bool) -> u16 {
+    match error {
+        NodeError::BelowPrunePoint(_) | NodeError::WorkMismatchUnconfirmed(_) => 0,
+        NodeError::WorkCheckpointConflict {
+            height,
+            checkpoint_height,
+            ..
+        } if height <= checkpoint_height => 0,
+        NodeError::WorkRecomputationMismatch(_)
+        | NodeError::WorkCheckpointConflict { .. }
+        | NodeError::InvalidAncestor(_)
+        | NodeError::CachedInvalidBlock(_)
+            if trusted_peer =>
+        {
+            0
+        }
+        _ => INVALID_BLOCK_PENALTY,
+    }
 }
 
 /// Blame a relaying peer only for invalidity intrinsic to the transaction.
@@ -2383,6 +3074,9 @@ fn outbound_reputation_penalty(error: &P2pError) -> (u16, &'static str) {
         )
         | P2pError::RejectedBlockSubmission(_)
         | P2pError::BusyBlockSubmission(_) => (0, "no remote peer fault"),
+        // A peer that has not upgraded may still follow a branch this node
+        // rejects; it is not at fault for offering it.
+        P2pError::KnownInvalidInventory(_) => (0, "peer follows a known-invalid branch"),
         P2pError::Peer(_)
         | P2pError::UnexpectedMessage { .. }
         | P2pError::WrongBlock { .. }
@@ -2446,10 +3140,12 @@ impl PeerSubmissionMonitor {
                     .name("cmfd-pull-validation-monitor".to_owned())
                     .spawn(move || {
                         while !watcher_stop.load(Ordering::Acquire) {
-                            if cancellation.load(Ordering::Acquire)
-                                || Instant::now() >= request.deadline()
-                            {
-                                request.cancel();
+                            if cancellation.load(Ordering::Acquire) {
+                                request.stop();
+                                break;
+                            }
+                            if Instant::now() >= request.deadline() {
+                                request.expire();
                                 break;
                             }
                             thread::sleep(PEER_DISCONNECT_POLL_INTERVAL);
@@ -2477,7 +3173,7 @@ impl PeerSubmissionMonitor {
                 let mut byte = [0_u8; 1];
                 while !watcher_stop.load(Ordering::Acquire) {
                     if Instant::now() >= watcher_request.deadline() {
-                        watcher_request.cancel();
+                        watcher_request.expire();
                         break;
                     }
                     match stream.peek(&mut byte) {
@@ -2689,6 +3385,7 @@ fn spawn_inbound_listener_inner_with_policy(
         || Arc::new(PeerSecurity::default()),
         |discovery| Arc::clone(&discovery.security),
     );
+    register_peer_security(&shared, &security)?;
     let thread_stop = Arc::clone(&stop);
     let thread_active_sockets = Arc::clone(&active_sockets);
     let options = InboundPeerOptions {
@@ -3063,6 +3760,7 @@ fn spawn_peer_polling_inner(
         |discovery| Arc::clone(&discovery.security),
     );
     security.register_static_peers(&config.peers)?;
+    register_peer_security(&shared, &security)?;
     let stop = Arc::new((Mutex::new(false), Condvar::new()));
     let active_sockets = Arc::new(ActiveSocketRegistry::default());
     let thread_stop = Arc::clone(&stop);
@@ -3462,6 +4160,72 @@ fn record_compressed_outcome<T>(
     }
 }
 
+/// Whether blocks fetched from `peer` come from an operator-configured or
+/// bootstrap peer.
+fn trusted_sync_peer(security: &PeerSecurity, peer: SocketAddr) -> bool {
+    security.is_trusted_peer(peer.ip()).unwrap_or_else(|error| {
+        tracing::warn!(%error, %peer, "failed to consult whether a sync peer is trusted");
+        false
+    })
+}
+
+/// Whether the poll skips `peer` this round: a block it served failed its
+/// proof or work check recently, and it is not an operator-configured or
+/// bootstrap peer.
+fn outbound_sync_held_off(security: &PeerSecurity, peer: SocketAddr) -> bool {
+    !trusted_sync_peer(security, peer)
+        && security
+            .in_sync_holdoff_at(peer.ip(), Instant::now())
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, %peer, "failed to consult the sync cooldown of a peer");
+                false
+            })
+}
+
+/// Registers the network's bootstrap peers with `security`, and `security`
+/// with the node, for the peers of noted blocks the background check finds
+/// wrong (see [`WorkBlame`]).
+fn register_peer_security(
+    shared: &Arc<Mutex<Node>>,
+    security: &Arc<PeerSecurity>,
+) -> Result<(), P2pError> {
+    let mut node = lock_node(shared)?;
+    security.register_bootstrap_peers(&node.profile.bootstrap_peers())?;
+    let sink: std::sync::Weak<dyn WorkBlame> = Arc::<PeerSecurity>::downgrade(security);
+    node.register_work_blame(sink);
+    Ok(())
+}
+
+/// After a sync session from `peer`: if a block it served failed its proof,
+/// or two independent engines agree its work does not match, or one engine
+/// alone refused it, or its block was deferred because this node refused
+/// others from it that way, holds the peer off as a sync target for a while
+/// (for a one-engine refusal, until it leaves the window it is counted over),
+/// unless it is an operator-configured or bootstrap peer. Its reputation is
+/// not charged: a peer that has not upgraded may follow such a block
+/// honestly.
+fn hold_off_outbound_peer_after(
+    security: &PeerSecurity,
+    peer: SocketAddr,
+    result: &Result<SyncReport, P2pError>,
+) {
+    let Err(P2pError::Node(error)) = result else {
+        return;
+    };
+    let refused_on_one_engine = matches!(
+        error,
+        NodeError::WorkMismatchUnconfirmed(_) | NodeError::WorkCheckDeferred
+    );
+    if !(starts_proof_cooldown(error) || refused_on_one_engine) || trusted_sync_peer(security, peer)
+    {
+        return;
+    }
+    tracing::info!(%peer, %error, cooldown_secs = OUTBOUND_WORK_REFUSAL_COOLDOWN.as_secs(), "not syncing from this peer for a while");
+    if let Err(error) = security.start_sync_holdoff_at(peer.ip(), Instant::now()) {
+        tracing::warn!(%error, %peer, "failed to start the sync cooldown of a peer");
+    }
+}
+
 fn record_poll_sync_result(
     options: &PeerPollOptions,
     peer: SocketAddr,
@@ -3478,10 +4242,22 @@ fn record_poll_sync_result(
             })
     });
     if let Some(discovery) = options.discovery.as_ref() {
-        let update = if result.is_ok() {
-            discovery.mark_verified(peer)
-        } else {
-            discovery.mark_failed(peer)
+        let update = match result {
+            Ok(_) => discovery.mark_verified(peer),
+            // A peer that has not upgraded may follow a branch this node
+            // rejects; like the reputation penalty, discovery does not count
+            // that against it, so the peer keeps its schedule and its place
+            // in the table, and a verified one keeps receiving new tips. Nor
+            // does it count a block refused on one engine's check, or one
+            // deferred because this node recently refused others from the
+            // peer that way.
+            Err(
+                P2pError::KnownInvalidInventory(_)
+                | P2pError::Node(
+                    NodeError::WorkMismatchUnconfirmed(_) | NodeError::WorkCheckDeferred,
+                ),
+            ) => Ok(()),
+            Err(_) => discovery.mark_failed(peer),
         };
         if let Err(error) = update {
             tracing::warn!(%error, %peer, "failed to update peer discovery state");
@@ -3532,6 +4308,10 @@ fn static_peer_poll_loop(
                     continue;
                 }
             }
+            if outbound_sync_held_off(&options.security, peer) {
+                tracing::debug!(%peer, "skipping a peer whose served block failed its check");
+                continue;
+            }
             // Errors are already logged via tracing inside these calls;
             // a failure with one peer must not stop later peers or rounds.
             let cursor_before = peer_sync_progress_cursor(&shared, peer);
@@ -3544,9 +4324,11 @@ fn static_peer_poll_loop(
                 config.address_policy,
                 options.nonce_override,
                 Some(&active_sockets),
+                trusted_sync_peer(&options.security, peer),
             );
             let sync_rate = sync_session_rate(&sync_result, session_started.elapsed());
             record_compressed_outcome(&options.security, peer, limits, &sync_result);
+            hold_off_outbound_peer_after(&options.security, peer, &sync_result);
             let mut round_succeeded = sync_result.is_ok();
             let sync_banned = record_poll_sync_result(&options, peer, &sync_result);
             if sync_banned {
@@ -3666,6 +4448,7 @@ fn static_peer_poll_loop(
                 config.address_policy,
                 options.nonce_override,
                 Some(&active_sockets),
+                trusted_sync_peer(&options.security, peer),
             );
             candidate.rate = sync_session_rate(&result, session_started.elapsed());
             record_compressed_outcome(&options.security, peer, limits, &result);
@@ -3884,6 +4667,217 @@ mod tests {
         if path.exists() {
             fs::remove_dir_all(path).expect("remove isolated P2P test directory");
         }
+    }
+
+    #[test]
+    fn work_rule_rejections_cost_static_peers_and_old_orphans_nothing() {
+        let id = [1; 32];
+        let conflict = |height| NodeError::WorkCheckpointConflict {
+            block_id: id,
+            height,
+            checkpoint_height: 5,
+        };
+        assert_eq!(submitted_block_penalty(&conflict(5), false), 0);
+        assert_eq!(
+            submitted_block_penalty(&conflict(6), false),
+            INVALID_BLOCK_PENALTY
+        );
+        assert_eq!(
+            submitted_block_penalty(&NodeError::WorkRecomputationMismatch(id), false),
+            INVALID_BLOCK_PENALTY
+        );
+        assert_eq!(
+            submitted_block_penalty(&NodeError::InvalidAncestor(id), false),
+            INVALID_BLOCK_PENALTY
+        );
+        assert_eq!(
+            submitted_block_penalty(&NodeError::WorkMismatchUnconfirmed(id), false),
+            0,
+            "one engine's mismatch costs nothing"
+        );
+        for error in [
+            NodeError::WorkRecomputationMismatch(id),
+            NodeError::WorkMismatchUnconfirmed(id),
+            conflict(6),
+            NodeError::InvalidAncestor(id),
+            NodeError::CachedInvalidBlock(id),
+        ] {
+            assert_eq!(submitted_block_penalty(&error, true), 0, "{error}");
+        }
+        assert_eq!(
+            submitted_block_penalty(&NodeError::Chain(ChainError::WrongNetwork), true),
+            INVALID_BLOCK_PENALTY,
+            "other rejections from static peers still count"
+        );
+        assert_eq!(
+            submitted_block_penalty(&NodeError::BelowPrunePoint(id), false),
+            0
+        );
+    }
+
+    #[test]
+    fn a_withdrawn_work_check_holds_the_sender_off_and_costs_reputation() {
+        let id = [1; 32];
+        assert!(starts_proof_cooldown(&NodeError::WorkCheckWithdrawn));
+        assert!(starts_proof_cooldown(
+            &NodeError::WorkRecomputationMismatch(id)
+        ));
+        for error in [
+            NodeError::WorkMismatchUnconfirmed(id),
+            NodeError::ProofVerificationQueueTimeout,
+            NodeError::WorkCheckUnavailable,
+            NodeError::WorkCheckPending,
+            NodeError::WorkCheckDeferred,
+        ] {
+            assert!(!starts_proof_cooldown(&error), "{error}");
+        }
+        assert!(
+            NodeError::WorkCheckWithdrawn.client_error().retryable,
+            "answered as busy"
+        );
+        assert_eq!(
+            deferred_block_penalty(&NodeError::WorkCheckWithdrawn, false),
+            WITHDRAWN_WORK_CHECK_PENALTY
+        );
+        assert_eq!(
+            deferred_block_penalty(&NodeError::WorkCheckWithdrawn, true),
+            0
+        );
+        for error in [
+            NodeError::ProofVerificationQueueTimeout,
+            NodeError::ProofVerificationQueueFull,
+            NodeError::WorkCheckUnavailable,
+            NodeError::WorkCheckPending,
+            NodeError::WorkCheckDeferred,
+            NodeError::WorkRuleHalted,
+        ] {
+            assert_eq!(deferred_block_penalty(&error, false), 0, "{error}");
+        }
+        assert!(is_retryable_block_admission(&NodeError::WorkCheckDeferred));
+    }
+
+    #[test]
+    fn a_sender_that_keeps_withdrawing_its_block_is_banned() {
+        let security = PeerSecurity::default();
+        let ip: IpAddr = "198.51.100.9".parse().unwrap();
+        let penalty = deferred_block_penalty(&NodeError::WorkCheckWithdrawn, false);
+        let withdrawals = PEER_BAN_SCORE.div_ceil(penalty);
+        for attempt in 1..withdrawals {
+            let unsent = Err(P2pError::Peer(PeerError::ConnectionClosed));
+            assert!(
+                matches!(
+                    penalize_submission_then(&security, ip, penalty, unsent),
+                    Err(P2pError::Peer(PeerError::ConnectionClosed))
+                ),
+                "withdrawal {attempt} is charged but not yet banned"
+            );
+        }
+        let unsent = Err(P2pError::Peer(PeerError::ConnectionClosed));
+        assert!(matches!(
+            penalize_submission_then(&security, ip, penalty, unsent),
+            Err(P2pError::PeerTemporarilyBanned(banned)) if banned == ip
+        ));
+        assert!(security.is_banned(ip).unwrap());
+        assert!(withdrawals <= 5);
+    }
+
+    #[test]
+    fn a_rejected_submission_is_penalized_even_when_its_reply_cannot_be_sent() {
+        let security = PeerSecurity::default();
+        let ip: IpAddr = "198.51.100.4".parse().unwrap();
+        let unsent = Err(P2pError::Peer(PeerError::ConnectionClosed));
+        assert!(matches!(
+            penalize_submission_then(&security, ip, INVALID_BLOCK_PENALTY, unsent),
+            Err(P2pError::Peer(PeerError::ConnectionClosed))
+        ));
+        let score = |security: &PeerSecurity| {
+            security
+                .state
+                .lock()
+                .unwrap()
+                .reputations
+                .get(&PeerReputationKey::from_ip(ip))
+                .map_or(0, |entry| entry.score)
+        };
+        assert_eq!(score(&security), INVALID_BLOCK_PENALTY);
+        penalize_submission_then(&security, ip, 0, Ok(())).unwrap();
+        assert_eq!(score(&security), INVALID_BLOCK_PENALTY);
+    }
+
+    #[test]
+    fn a_noted_blocks_peer_is_treated_as_a_confirmed_refusal_would_treat_it() {
+        let security = PeerSecurity::default();
+        let static_peer: SocketAddr = "198.51.100.7:29444".parse().unwrap();
+        security.register_static_peers(&[static_peer]).unwrap();
+        let score = |ip: IpAddr| {
+            security
+                .state
+                .lock()
+                .unwrap()
+                .reputations
+                .get(&PeerReputationKey::from_ip(ip))
+                .map_or(0, |entry| entry.score)
+        };
+        let now = Instant::now();
+        let blame = |address: IpAddr, fetched: bool| {
+            security.blame(BlockSender {
+                address,
+                fetched,
+                trusted: false,
+            });
+        };
+
+        // A peer that sent it: charged and its submissions held off, but
+        // still synced from.
+        let sent: IpAddr = "203.0.113.7".parse().unwrap();
+        blame(sent, false);
+        assert_eq!(score(sent), INVALID_BLOCK_PENALTY);
+        assert!(security.in_proof_cooldown(sent).unwrap());
+        assert!(!security.in_sync_holdoff_at(sent, now).unwrap());
+        // An operator-configured one is not charged, but is held off.
+        blame(static_peer.ip(), false);
+        assert_eq!(score(static_peer.ip()), 0);
+        assert!(security.in_proof_cooldown(static_peer.ip()).unwrap());
+
+        // A peer a sync session fetched it from: not charged, not synced from
+        // for a while; its own submissions are not held off.
+        let served: IpAddr = "203.0.113.8".parse().unwrap();
+        blame(served, true);
+        assert_eq!(score(served), 0);
+        assert!(security.in_sync_holdoff_at(served, now).unwrap());
+        assert!(!security.in_proof_cooldown(served).unwrap());
+        // An operator-configured one is still synced from.
+        blame(static_peer.ip(), true);
+        assert!(!security.in_sync_holdoff_at(static_peer.ip(), now).unwrap());
+        assert_eq!(score(static_peer.ip()), 0);
+    }
+
+    #[test]
+    fn the_proof_cooldown_follows_the_address_and_is_bounded() {
+        let security = PeerSecurity::default();
+        let now = Instant::now();
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        let other: IpAddr = "203.0.113.8".parse().unwrap();
+        assert!(!security.in_proof_cooldown_at(ip, now).unwrap());
+        security.start_proof_cooldown_at(ip, now).unwrap();
+        // A new session from the same address is still held off.
+        assert!(
+            security
+                .in_proof_cooldown_at(ip, now + Duration::from_secs(29))
+                .unwrap()
+        );
+        assert!(!security.in_proof_cooldown_at(other, now).unwrap());
+        assert!(
+            !security
+                .in_proof_cooldown_at(ip, now + crate::INVALID_REMOTE_PROOF_COOLDOWN)
+                .unwrap()
+        );
+        for index in 0..MAX_PROOF_COOLDOWN_ADDRESSES as u32 + 10 {
+            let address = IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + index));
+            security.start_proof_cooldown_at(address, now).unwrap();
+        }
+        let state = security.state.lock().unwrap();
+        assert_eq!(state.proof_cooldowns.len(), MAX_PROOF_COOLDOWN_ADDRESSES);
     }
 
     #[test]
@@ -4583,6 +5577,76 @@ mod tests {
     }
 
     #[test]
+    fn known_invalid_inventory_and_deferred_blocks_do_not_back_off_or_drop_a_discovered_peer() {
+        let path = test_dir("discovery-known-invalid");
+        let node = open_shared(&path);
+        let hello = node.lock().unwrap().peer_hello();
+        let listen_address: SocketAddr = "127.0.0.1:22446".parse().unwrap();
+        let unverified: SocketAddr = "127.0.0.1:22447".parse().unwrap();
+        let verified: SocketAddr = "127.0.0.1:22448".parse().unwrap();
+        let discovery = Arc::new(PeerDiscovery::open(
+            &path,
+            hello,
+            listen_address,
+            PeerAddressPolicy::PrivateOnly,
+        ));
+        discovery.add_candidate(unverified).unwrap();
+        discovery.mark_verified(verified).unwrap();
+        let options = PeerPollOptions {
+            nonce_override: None,
+            discovery: Some(Arc::clone(&discovery)),
+            security: Arc::new(PeerSecurity::default()),
+            relay_backoff: Arc::new(RelayBackoff::default()),
+        };
+        let known_invalid: Result<SyncReport, P2pError> =
+            Err(P2pError::KnownInvalidInventory([7; 32]));
+        let deferred: Result<SyncReport, P2pError> =
+            Err(P2pError::Node(NodeError::WorkCheckDeferred));
+        let refused: Result<SyncReport, P2pError> =
+            Err(P2pError::Node(NodeError::WorkMismatchUnconfirmed([8; 32])));
+        let failures = |address: &SocketAddr| {
+            discovery
+                .state
+                .lock()
+                .unwrap()
+                .peers
+                .get(address)
+                .map(|peer| peer.failures)
+        };
+
+        for _ in 0..=MAX_UNVERIFIED_PEER_FAILURES {
+            assert!(!record_poll_sync_result(
+                &options,
+                unverified,
+                &known_invalid
+            ));
+            assert!(!record_poll_sync_result(&options, verified, &known_invalid));
+            assert!(!record_poll_sync_result(&options, unverified, &deferred));
+            assert!(!record_poll_sync_result(&options, verified, &deferred));
+            assert!(!record_poll_sync_result(&options, unverified, &refused));
+            assert!(!record_poll_sync_result(&options, verified, &refused));
+        }
+        assert_eq!(failures(&unverified), Some(0));
+        assert_eq!(failures(&verified), Some(0));
+        assert_eq!(discovery.announce_targets(8).unwrap(), vec![verified]);
+
+        // Any other failure still counts, and still drops a never-verified
+        // peer at the limit.
+        let other: Result<SyncReport, P2pError> = Err(P2pError::PoisonedPeerDiscovery);
+        record_poll_sync_result(&options, verified, &other);
+        assert_eq!(failures(&verified), Some(1));
+        assert!(discovery.announce_targets(8).unwrap().is_empty());
+        for _ in 0..MAX_UNVERIFIED_PEER_FAILURES {
+            record_poll_sync_result(&options, unverified, &other);
+        }
+        assert_eq!(failures(&unverified), None);
+
+        drop(discovery);
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
     fn peer_discovery_gossips_an_address_only_after_connect_back_verification() {
         const CLIENT_NONCE: [u8; 32] = [0x53; 32];
         let seed_path = test_dir("discovery-seed");
@@ -5092,6 +6156,7 @@ mod tests {
             PeerAddressPolicy::PrivateOnly,
             Some(TARGET_NONCE),
             None,
+            false,
         )
         .unwrap();
 
@@ -5290,6 +6355,7 @@ mod tests {
             Some(TARGET_NONCE),
             None,
             Duration::ZERO,
+            false,
         )
         .unwrap();
         assert_eq!(report.inventory_items, 6);
@@ -6252,6 +7318,7 @@ mod tests {
             NodeError::ExchangeCustodyV3WalletExclusive,
             NodeError::MempoolTransactionLimit,
             NodeError::MempoolByteLimit,
+            NodeError::MempoolCloseLimit,
             NodeError::MempoolFeeTooLow {
                 required: 2,
                 actual: 1,
@@ -7159,6 +8226,7 @@ mod tests {
             PeerAddressPolicy::PrivateOnly,
             Some(TARGET_NONCE),
             Some(&registry),
+            false,
         );
         server.join().unwrap();
         assert!(result.is_err());
@@ -7985,7 +9053,13 @@ mod tests {
         let target_path = test_dir("relay-failure-catchup-target");
         let source = open_shared(&source_path);
         let target = open_shared(&target_path);
-        mine(&source, 6, unix_time_seconds().unwrap());
+        // Too old for the tip announcer, as in the stalled-peer test below:
+        // an announcer relay to the source would be a second relay failure.
+        mine(
+            &source,
+            6,
+            unix_time_seconds().unwrap() - 2 * TIP_ANNOUNCE_MAX_MEDIAN_AGE_SECONDS,
+        );
         let limits = PeerLimits {
             max_blocks_per_session: 1,
             ..test_limits()
@@ -8091,10 +9165,17 @@ mod tests {
         let target_path = test_dir("catchup-burst-target");
         let source = open_shared(&source_path);
         let target = open_shared(&target_path);
-        mine(&source, 6, unix_time_seconds().unwrap());
+        // Catch-up blocks, not news: with a median time past older than the
+        // announcer's window, the tip announcer never relays them, so every
+        // connection to the stalled peer below comes from the polling round.
+        // This relies on the announcer's freshness rule; if it ever relays
+        // old tips, the stalled peer's count below goes up again.
+        mine(
+            &source,
+            6,
+            unix_time_seconds().unwrap() - 2 * TIP_ANNOUNCE_MAX_MEDIAN_AGE_SECONDS,
+        );
         let limits = PeerLimits {
-            connect_timeout: Duration::from_millis(100),
-            idle_timeout: Duration::from_millis(100),
             max_blocks_per_session: 1,
             ..test_limits()
         };
@@ -8120,13 +9201,19 @@ mod tests {
         let worker_connections = Arc::clone(&stalled_connections);
         let stalled_worker = thread::spawn(move || {
             let mut sockets = Vec::new();
-            while !worker_stop.load(Ordering::Acquire) {
+            loop {
+                // Read the flag before accepting, so connections queued before
+                // the stop are still counted.
+                let stopping = worker_stop.load(Ordering::Acquire);
                 match stalled_socket.accept() {
                     Ok((stream, _)) => {
                         sockets.push(stream);
                         worker_connections.fetch_add(1, Ordering::Release);
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if stopping {
+                            break;
+                        }
                         thread::sleep(Duration::from_millis(1));
                     }
                     Err(error) => panic!("stalled fixture accept failed: {error}"),
@@ -8143,23 +9230,43 @@ mod tests {
             },
             // Make the round boundary explicit: only bounded continuations,
             // not another periodic pass, can deliver the remaining blocks.
-            Duration::from_secs(30),
+            Duration::from_secs(10 * 60),
             Some(TARGET_NONCE),
         )
         .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while target.lock().unwrap().peer_hello().height < 4 && Instant::now() < deadline {
+        // The ordinary pull plus the fastest peer's extra sessions deliver
+        // every block in this one round. The deadline ends long before the
+        // next round could start, so only continuations can reach this height.
+        // The tighter bound is the product's own: continuations must start
+        // within catchup_start_budget() of the ordinary pass (30 s here), so
+        // a runner too slow for that ends the round short of this height.
+        let expected_height = 6.min(1 + MAX_CATCHUP_EXTRA_SESSIONS_FASTEST_PEER) as u64;
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(120);
+        while target.lock().unwrap().peer_hello().height < expected_height
+            && Instant::now() < deadline
+        {
             thread::sleep(Duration::from_millis(5));
         }
+        let elapsed = started.elapsed();
         let height = target.lock().unwrap().peer_hello().height;
-        let stalled_attempts = stalled_connections.load(Ordering::Acquire);
         poller.stop().unwrap();
         stalled_stop.store(true, Ordering::Release);
         stalled_worker.join().unwrap();
+        let stalled_attempts = stalled_connections.load(Ordering::Acquire);
         source_listener.stop().unwrap();
+        let sessions = target
+            .lock()
+            .unwrap()
+            .peer_observations()
+            .into_iter()
+            .filter(|peer| peer.direction == PeerDirection::Outbound)
+            .map(|peer| (peer.address, peer.successful_sessions, peer.failed_sessions))
+            .collect::<Vec<_>>();
         assert_eq!(
-            height, 4,
-            "one-block catch-up unnecessarily waited for another full polling round"
+            height, expected_height,
+            "one-block catch-up unnecessarily waited for another full polling round \
+             (after {elapsed:?}; outbound address, successful and failed sessions: {sessions:?})"
         );
         assert_eq!(
             stalled_attempts, 2,
@@ -8167,7 +9274,11 @@ mod tests {
         );
         assert_eq!(
             target.lock().unwrap().peer_hello().tip,
-            source.lock().unwrap().active_block_id_at_height(4).unwrap()
+            source
+                .lock()
+                .unwrap()
+                .active_block_id_at_height(expected_height)
+                .unwrap()
         );
         drop(source);
         drop(target);

@@ -328,16 +328,19 @@ impl ExchangeCustodyRuntimeV3 {
                 }
                 reconstruct_plan(record, self.store.journal().binding, &self.keyring)?
             }
-            None => custody_plan_from_wallet(
-                &request.request_id,
-                node.plan_exchange_custody_payment(
-                    request.destination,
-                    request.amount_atoms,
-                    request.fee_atoms,
-                    &signable_keyring_destinations(&self.keyring),
-                    self.keyring.active_change_key().public_key,
-                )?,
-            ),
+            None => {
+                node.require_exchange_tip_checked()?;
+                custody_plan_from_wallet(
+                    &request.request_id,
+                    node.plan_exchange_custody_payment(
+                        request.destination,
+                        request.amount_atoms,
+                        request.fee_atoms,
+                        &signable_keyring_destinations(&self.keyring),
+                        self.keyring.active_change_key().public_key,
+                    )?,
+                )
+            }
         };
         let candidate = {
             let engine = ExchangeCustodyEngineV3::new(

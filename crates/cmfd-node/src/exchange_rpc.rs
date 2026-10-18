@@ -49,6 +49,7 @@ use crate::wallet_signing_protocol::{
     MAX_SIGNER_RESPONSE_BYTES, ReleaseAuthorizationV1, SignerResponseV1, SigningPackageV1,
     WithdrawalAnchorV1, release_authorization_digest,
 };
+use crate::work_gate::ExchangeReadRefusal;
 use crate::{
     BLOCK_LOG_FILE, BlockRecordLocator, DeadlineReader, ExchangeCustodyV3Config, Node, NodeError,
     ProofProfile, RPC_READ_TIMEOUT, RPC_TOTAL_READ_TIMEOUT, RPC_WRITE_TIMEOUT, RpcResponse,
@@ -688,6 +689,123 @@ impl RpcFault {
     }
 }
 
+/// The error for chain reads while the settled height cannot advance.
+fn exchange_read_refusal_fault(refusal: ExchangeReadRefusal) -> RpcFault {
+    let (data_code, message) = match refusal {
+        ExchangeReadRefusal::Halted => (
+            "work_rule_halted",
+            "block admission is halted until the node operator acts; retry later",
+        ),
+        ExchangeReadRefusal::EngineFailed => (
+            "work_engine_failed",
+            "this node cannot check new blocks until its work engine is restored; retry later",
+        ),
+    };
+    RpcFault {
+        code: -32030,
+        message: message.to_owned(),
+        data_code,
+        retryable: true,
+    }
+}
+
+/// The highest active height this RPC serves. On a network with a work rule
+/// it is the validated height: blocks above it are stored but their work is
+/// not yet re-executed here, so they are reported as absent, never as
+/// confirmed.
+fn served_height(node: &Node) -> Result<u64, RpcFault> {
+    node.exchange_served_height()
+        .map_err(exchange_read_refusal_fault)
+}
+
+/// The served height and the active block there.
+fn served_tip(node: &Node) -> Result<(u64, [u8; 32]), RpcFault> {
+    let height = served_height(node)?;
+    let block_id = node.active_block_id_at_height(height).ok_or_else(|| {
+        node_fault(NodeError::CorruptLog(
+            "the served height is above the active tip".to_owned(),
+        ))
+    })?;
+    Ok((height, block_id))
+}
+
+/// Methods whose answer depends on the served chain or on the chain state at
+/// the tip, and so fail with a retryable error while the node is halted or
+/// its work engine has failed. Status reads (`getblockchaininfo`,
+/// `getexchangeinfo`) and stored records (`getwatchdestination`, the
+/// withdrawal journal) still answer.
+fn reads_served_chain(method: &str) -> bool {
+    matches!(
+        method,
+        "getblockcount"
+            | "getbestblockhash"
+            | "getblockhash"
+            | "getblock"
+            | "gettxoutsetinfo"
+            | "getrawtransaction"
+            | "gettransaction"
+            | "getaddressbalance"
+            | "getaddressutxos"
+            | "getbalance"
+            | "getrawmempool"
+            | "sendrawtransaction"
+            | "registerwatchdestination"
+            | "registerwatchdestinations"
+            | "getdepositevents"
+            | "preparewithdrawal"
+            | "releasewithdrawal"
+    )
+}
+
+/// Methods that read the chain state at the tip (the UTXO set, which holds
+/// the outputs of every stored block). They answer only while the served
+/// height is the tip, so they never report or spend an output from a block
+/// whose work this node has not re-executed.
+fn reads_tip_state(method: &str) -> bool {
+    matches!(
+        method,
+        "gettxoutsetinfo"
+            | "getaddressbalance"
+            | "getaddressutxos"
+            | "getbalance"
+            | "preparewithdrawal"
+    )
+}
+
+/// Whether `node` can answer `method` now; see [`reads_served_chain`] and
+/// [`reads_tip_state`].
+fn require_served(method: &str, node: &Node) -> Result<(), RpcFault> {
+    if !reads_served_chain(method) {
+        return Ok(());
+    }
+    let served = served_height(node)?;
+    if reads_tip_state(method) && served < node.state.next_height().saturating_sub(1) {
+        return Err(work_check_pending_fault());
+    }
+    Ok(())
+}
+
+/// A read of the chain state at the tip while some stored blocks are not yet
+/// checked.
+fn work_check_pending_fault() -> RpcFault {
+    RpcFault {
+        code: -32030,
+        message: "this node has not yet re-executed the work of every stored block, so it does not answer from its chain state; retry later".to_owned(),
+        data_code: "work_check_pending",
+        retryable: true,
+    }
+}
+
+fn refuse_unserved_read(method: &str, shared: &Arc<Mutex<Node>>) -> Result<(), RpcFault> {
+    if !reads_served_chain(method) {
+        return Ok(());
+    }
+    let node = shared
+        .lock()
+        .map_err(|_| node_fault(NodeError::SharedNodePoisoned))?;
+    require_served(method, &node)
+}
+
 #[cfg(test)]
 fn dispatch_json_rpc(body: &[u8], node: &mut Node) -> Value {
     match parse_json_rpc(body) {
@@ -829,7 +947,9 @@ fn dispatch_shared_request_scoped_backend(
                 retryable: false,
             })
         } else if let Some(backend) = withdrawal_backend {
-            route_withdrawal_backend(&request.method, &request.params, shared, backend)
+            refuse_unserved_read(&request.method, shared).and_then(|()| {
+                route_withdrawal_backend(&request.method, &request.params, shared, backend)
+            })
         } else {
             Err(RpcFault {
                 code: -32010,
@@ -855,6 +975,9 @@ fn dispatch_shared_request_scoped_backend(
         Ok(transaction) => transaction,
         Err(error) => return rpc_failure(request.id, error),
     };
+    if let Err(error) = refuse_unserved_read(&request.method, shared) {
+        return rpc_failure(request.id, error);
+    }
     if request.method == "getblock" {
         let result = route_getblock_shared(&request.params, shared);
         return finish_request(request.id, result);
@@ -994,7 +1117,7 @@ fn route_prepare_withdrawal_v3(
     require_parameter_count(params, 4, 4)?;
     let request = WithdrawalRequest {
         request_id: string(&params[0], "request_id")?.to_owned(),
-        destination: hash_parameter(&params[1], "destination")?,
+        destination: destination_parameter(&params[1], "destination")?,
         amount_atoms: canonical_decimal_u64_string(&params[2], "amount_atoms")?,
         fee_atoms: canonical_decimal_u64_string(&params[3], "fee_atoms")?,
     };
@@ -1256,7 +1379,7 @@ fn route_prepare_withdrawal(
     require_parameter_count(params, 4, 4)?;
     let request = WithdrawalRequest {
         request_id: string(&params[0], "request_id")?.to_owned(),
-        destination: hash_parameter(&params[1], "destination")?,
+        destination: destination_parameter(&params[1], "destination")?,
         amount_atoms: canonical_decimal_u64_string(&params[2], "amount_atoms")?,
         fee_atoms: canonical_decimal_u64_string(&params[3], "fee_atoms")?,
     };
@@ -1518,7 +1641,7 @@ fn route_register_watch_destination(
 ) -> Result<Value, RpcFault> {
     require_parameter_count(params, 2, 2)?;
     let label = string(&params[0], "label")?;
-    let destination = hash_parameter(&params[1], "destination")?;
+    let destination = destination_parameter(&params[1], "destination")?;
     let mut index = lock_exchange_index(exchange_index)?;
     let registration = index
         .register_watch_destination(shared, label, destination)
@@ -1550,7 +1673,7 @@ fn route_register_watch_destinations(
             })?;
         registrations.push(WatchDestinationRegistration {
             label: parameter.label,
-            destination: hash_parameter(
+            destination: destination_parameter(
                 &Value::String(parameter.destination_hex),
                 "destination_hex",
             )?,
@@ -1615,7 +1738,7 @@ fn route_get_exchange_info(
         "encodings": {
             "amounts": "canonical unsigned decimal atom strings",
             "destination": "64 lowercase hexadecimal characters encoding a 32-byte x-only secp256k1 public key",
-            "checksummed_address_available": false,
+            "checksummed_address_available": true,
         },
         "methods": {
             "integration": [
@@ -1811,6 +1934,7 @@ fn route_method(
     node: &mut Node,
     prepared_transaction: Option<Transaction>,
 ) -> Result<Value, RpcFault> {
+    require_served(method, node)?;
     match method {
         "getblockchaininfo" => {
             require_parameter_count(params, 0, 0)?;
@@ -1818,20 +1942,22 @@ fn route_method(
         }
         "getblockcount" => {
             require_parameter_count(params, 0, 0)?;
-            let status = node.status().map_err(node_fault)?;
-            Ok(json!(status.accepted_height))
+            Ok(json!(served_height(node)?))
         }
         "getbestblockhash" => {
             require_parameter_count(params, 0, 0)?;
-            let status = node.status().map_err(node_fault)?;
-            Ok(json!(status.tip))
+            let (_, block_id) = served_tip(node)?;
+            Ok(json!(hex::encode(block_id)))
         }
         "getblockhash" => {
             require_parameter_count(params, 1, 1)?;
             let height = unsigned_integer(&params[0], "height")?;
-            let block_id = node.active_block_id_at_height(height).ok_or_else(|| {
-                RpcFault::not_found("block_not_found", "active-chain height was not found")
-            })?;
+            let block_id = (height <= served_height(node)?)
+                .then(|| node.active_block_id_at_height(height))
+                .flatten()
+                .ok_or_else(|| {
+                    RpcFault::not_found("block_not_found", "active-chain height was not found")
+                })?;
             Ok(json!(hex::encode(block_id)))
         }
         "getblock" => route_getblock(node, params),
@@ -1842,7 +1968,7 @@ fn route_method(
         "getaddressutxos" => route_get_address_utxos(node, params),
         "getaddressbalance" | "getbalance" => {
             require_parameter_count(params, 1, 1)?;
-            let destination = hash_parameter(&params[0], "destination_hex")?;
+            let destination = destination_parameter(&params[0], "destination_hex")?;
             k256::schnorr::VerifyingKey::from_bytes(&destination).map_err(|_| {
                 RpcFault::invalid_params("destination_hex must encode a valid x-only secp256k1 key")
             })?;
@@ -1958,7 +2084,7 @@ struct UtxoCursorParameter {
 
 fn route_get_address_utxos(node: &Node, params: &[Value]) -> Result<Value, RpcFault> {
     require_parameter_count(params, 1, 3)?;
-    let destination = hash_parameter(&params[0], "destination_hex")?;
+    let destination = destination_parameter(&params[0], "destination_hex")?;
     k256::schnorr::VerifyingKey::from_bytes(&destination).map_err(|_| {
         RpcFault::invalid_params("destination_hex must encode a valid x-only secp256k1 key")
     })?;
@@ -2065,6 +2191,8 @@ fn route_get_transaction(
     document["active"] = json!(read.confirmations > 0);
     document["status"] = json!(if read.confirmations > 0 {
         "confirmed"
+    } else if read.pending_check {
+        "pending_check"
     } else if read.confirmations == 0 {
         "mempool"
     } else {
@@ -2127,7 +2255,8 @@ fn getblock_parameters(params: &[Value]) -> Result<([u8; 32], u64), RpcFault> {
 
 fn route_getblock(node: &mut Node, params: &[Value]) -> Result<Value, RpcFault> {
     let (block_id, verbosity) = getblock_parameters(params)?;
-    let planned = plan_block_read(node, block_id, verbosity);
+    let served = served_height(node)?;
+    let planned = plan_block_read(node, block_id, verbosity, served);
     let plan = node
         .latch_authenticated_storage_failure(planned)
         .map_err(node_fault)?
@@ -2142,7 +2271,8 @@ fn route_getblock_shared(params: &[Value], shared: &Arc<Mutex<Node>>) -> Result<
         let mut node = shared
             .lock()
             .map_err(|_| node_fault(NodeError::SharedNodePoisoned))?;
-        let planned = plan_block_read(&node, block_id, verbosity);
+        let served = served_height(&node)?;
+        let planned = plan_block_read(&node, block_id, verbosity, served);
         node.latch_authenticated_storage_failure(planned)
             .map_err(node_fault)?
             .ok_or_else(block_not_found)?
@@ -2162,16 +2292,22 @@ fn block_not_found() -> RpcFault {
     )
 }
 
+/// Plans a block read on the chain served up to `served`: an active block
+/// above it is reported as absent, and confirmations and the next block stop
+/// there.
 fn plan_block_read(
     node: &Node,
     block_id: [u8; 32],
     verbosity: u64,
+    served: u64,
 ) -> Result<Option<BlockReadPlan>, NodeError> {
     if node.active_block_id_at_height(0) == Some(block_id) {
         return if verbosity == 0 {
             Ok(None)
         } else {
-            Ok(Some(BlockReadPlan::Virtual(virtual_genesis_document(node))))
+            Ok(Some(BlockReadPlan::Virtual(virtual_genesis_document(
+                node, served,
+            ))))
         };
     }
     let Some(indexed) = node.index.blocks.get(&block_id).cloned() else {
@@ -2182,13 +2318,16 @@ fn plan_block_read(
             "fork index key does not match its durable record locator".to_owned(),
         ));
     }
-    let confirmations = node.active_chain_confirmations(block_id);
-    let next_block = confirmations.and_then(|_| {
-        indexed
-            .height()
-            .checked_add(1)
-            .and_then(|height| node.active_block_id_at_height(height))
-    });
+    let height = indexed.height();
+    let active = node.active_chain_confirmations(block_id).is_some();
+    if active && height > served {
+        return Ok(None);
+    }
+    let confirmations = active.then(|| served - height + 1);
+    let next_block = height
+        .checked_add(1)
+        .filter(|next| active && *next <= served)
+        .and_then(|next| node.active_block_id_at_height(next));
     let log_path = node.data_dir.join(BLOCK_LOG_FILE);
     let log = node.clone_log_for_read().map_err(|source| {
         crate::io_error(
@@ -2335,6 +2474,22 @@ fn string<'a>(value: &'a Value, name: &'static str) -> Result<&'a str, RpcFault>
         .ok_or_else(|| RpcFault::invalid_params(format!("{name} must be a string")))
 }
 
+/// A key destination parameter: 64 lowercase hexadecimal characters or a
+/// checksummed address of this network (`cmfd1...` on mainnet). Each method
+/// checks the key itself and reports an invalid key with its own error, as it
+/// did when destinations were hex only. Responses stay hex.
+fn destination_parameter(value: &Value, name: &'static str) -> Result<[u8; 32], RpcFault> {
+    let encoded = string(value, name)?;
+    crate::address::decode_payload(crate::address_hrp(), encoded)
+        .map(|(destination, _)| destination)
+        .map_err(|error| {
+            RpcFault::invalid_params(format!(
+                "{name} must be 64 lowercase hexadecimal characters or a {}1... address ({error})",
+                crate::address_hrp()
+            ))
+        })
+}
+
 fn hash_parameter(value: &Value, name: &'static str) -> Result<[u8; 32], RpcFault> {
     let encoded = string(value, name)?;
     if encoded.len() != 64
@@ -2424,6 +2579,9 @@ fn exchange_custody_v3_fault(error: ExchangeCustodyRuntimeV3Error) -> RpcFault {
 }
 
 fn exchange_custody_v3_node_fault(error: NodeError) -> RpcFault {
+    if matches!(error, NodeError::WorkCheckPending) {
+        return work_check_pending_fault();
+    }
     let client = error.client_error();
     match client.code {
         "wallet_funds_immature"
@@ -2537,6 +2695,12 @@ fn exchange_custody_v3_client_message(error: &ExchangeCustodyRuntimeV3Error) -> 
 }
 
 fn exchange_withdrawal_fault(error: ExchangeWithdrawalError) -> RpcFault {
+    if matches!(
+        error,
+        ExchangeWithdrawalError::Node(NodeError::WorkCheckPending)
+    ) {
+        return work_check_pending_fault();
+    }
     log_exchange_withdrawal_failure("request", &error);
     let data_code = error.code();
     let code = match data_code {
@@ -2654,6 +2818,7 @@ fn exchange_index_fault(error: ExchangeIndexError) -> RpcFault {
         | "corrupt_block_log"
         | "storage_io" => -32007,
         "exchange_index_chain_changed" => -32008,
+        "work_check_pending" => -32030,
         _ => -32603,
     };
     RpcFault {
@@ -2701,7 +2866,8 @@ fn log_exchange_index_failure(context: &'static str, error: &ExchangeIndexError)
         | ExchangeIndexError::DestinationConflict
         | ExchangeIndexError::InvalidCursor
         | ExchangeIndexError::InvalidPageLimit
-        | ExchangeIndexError::ChainChanged => {}
+        | ExchangeIndexError::ChainChanged
+        | ExchangeIndexError::WorkCheckPending => {}
     }
 }
 
@@ -2713,6 +2879,7 @@ fn node_fault(error: NodeError) -> RpcFault {
         | "mempool_unconfirmed_input"
         | "mempool_transaction_limit"
         | "mempool_byte_limit"
+        | "mempool_close_limit"
         | "mempool_fee_too_low"
         | "duplicate_mempool_transaction"
         | "chain_rejected"
@@ -2754,8 +2921,10 @@ fn blockchain_info(node: &Node) -> Result<Value, NodeError> {
             })
         })
         .collect::<Vec<_>>();
+    // A peer whose tip builds on a block this node rejected is not ahead.
     let observed_peer_height = recent_reachable_peers
         .iter()
+        .filter(|peer| !peer.on_invalid_chain)
         .filter_map(|peer| peer.remote_height)
         .max();
     let headers = observed_peer_height
@@ -2790,16 +2959,35 @@ fn blockchain_info(node: &Node) -> Result<Value, NodeError> {
         "peer height and tip observations are unauthenticated and advisory; exchange readiness requires an external checkpoint or trusted multi-node policy"
             .to_owned(),
     );
+    // `blocks` and `bestblockhash` describe the served chain, which stops at
+    // the validated height; this status still answers while other chain
+    // reads are refused, so a client can see why.
+    let served = node.exchange_served_cap();
+    let served_tip = node.active_block_id_at_height(served).ok_or_else(|| {
+        NodeError::CorruptLog("the served height is above the active tip".to_owned())
+    })?;
+    let served_work = node
+        .index
+        .work_at(served_tip)
+        .ok_or_else(|| NodeError::CorruptLog("the served block has no indexed work".to_owned()))?;
+    match node.exchange_served_height() {
+        Err(refusal) => warnings.push(exchange_read_refusal_fault(refusal).message),
+        Ok(_) if served < status.accepted_height => warnings.push(format!(
+            "{} stored blocks above height {served} are not served until this node has re-executed their work",
+            status.accepted_height - served
+        )),
+        Ok(_) => {}
+    }
 
     let mut info = json!({
         "api_version": EXCHANGE_RPC_API_VERSION,
         "chain": status.network_short_name,
         "network_id": status.network_id,
         "consensus_fingerprint": status.consensus_fingerprint,
-        "blocks": status.accepted_height,
+        "blocks": served,
         "headers": headers,
-        "bestblockhash": status.tip,
-        "chainwork": status.cumulative_work,
+        "bestblockhash": hex::encode(served_tip),
+        "chainwork": hex::encode(cmfd_consensus::chain_work_bytes(served_work)),
         "initialblockdownload": true,
         "verificationprogress": verification_progress,
         "connections": connections,
@@ -2809,6 +2997,20 @@ fn blockchain_info(node: &Node) -> Result<Value, NodeError> {
         "storage_healthy": status.storage_healthy,
         "first_block_height": 1,
         "sync_basis": "external_readiness_policy_required",
+        "work_rule": status.work_rule.as_ref().map(|rule| json!({
+            "enforced": rule.enforced,
+            "engines": rule.engines,
+            "bank": rule.bank,
+            "independent_engines": rule.independent_engines,
+            "engine_ready": rule.engine_ready,
+            "engine_state": rule.engine_state,
+            "halted": rule.halted,
+            "checkpoint_height": rule.checkpoint_height,
+            "checkpoint_hash": rule.checkpoint_hash,
+            "activation_height": rule.activation_height,
+            "validated_height": rule.validated_height,
+            "alarms": rule.alarms,
+        })),
         "warnings": warnings,
     });
     // As in Bitcoin Core, `pruneheight` is the lowest block whose raw bytes
@@ -2887,10 +3089,11 @@ fn block_document(
     }))
 }
 
-fn virtual_genesis_document(node: &Node) -> Value {
+fn virtual_genesis_document(node: &Node, served: u64) -> Value {
     let block_id = node.profile.virtual_genesis_hash;
     let confirmations = node
         .active_chain_confirmations(block_id)
+        .map(|_| served.saturating_add(1))
         .and_then(|value| i64::try_from(value).ok())
         .unwrap_or(1);
     json!({
@@ -2903,7 +3106,10 @@ fn virtual_genesis_document(node: &Node) -> Value {
         "version": 0,
         "time": node.profile.virtual_genesis_timestamp,
         "previousblockhash": Value::Null,
-        "nextblockhash": node.active_block_id_at_height(1).map(hex::encode),
+        "nextblockhash": (served >= 1)
+            .then(|| node.active_block_id_at_height(1))
+            .flatten()
+            .map(hex::encode),
         "merkleroot": Value::Null,
         "target": Value::Null,
         "proof": Value::Null,
@@ -3239,6 +3445,40 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    /// Checks a `getblockchaininfo` result against the published exchange
+    /// schema: every key it emits is declared there, and every key the schema
+    /// requires is present, at the top level and in `work_rule`.
+    fn assert_blockchain_info_matches_schema(info: &Value) {
+        let schema: Value = serde_json::from_str(include_str!(
+            "../../../exchange-kit/schemas/exchange-rpc.schema.json"
+        ))
+        .unwrap();
+        let check = |object: &Value, definition: &Value, label: &str| {
+            let properties = definition["properties"].as_object().unwrap();
+            for key in object.as_object().unwrap().keys() {
+                assert!(
+                    properties.contains_key(key),
+                    "{label} emits `{key}`, which the exchange schema does not declare"
+                );
+            }
+            for key in definition["required"].as_array().unwrap() {
+                let key = key.as_str().unwrap();
+                assert!(
+                    object.get(key).is_some(),
+                    "{label} lacks `{key}`, which the exchange schema requires"
+                );
+            }
+        };
+        let definition = &schema["$defs"]["BlockchainInfo"];
+        check(info, definition, "getblockchaininfo");
+        if info["work_rule"].is_object() {
+            let rule = &definition["properties"]["work_rule"]["oneOf"][1];
+            check(&info["work_rule"], rule, "work_rule");
+            let banks = rule["properties"]["bank"]["enum"].as_array().unwrap();
+            assert!(banks.contains(&info["work_rule"]["bank"]));
+        }
+    }
+
     #[test]
     fn pruned_blocks_keep_verbose_documents_but_no_raw_frame() {
         let directory = test_directory("pruned");
@@ -3276,6 +3516,7 @@ mod tests {
         assert_eq!(info["pruned"], true);
         assert_eq!(info["pruneheight"], 65);
         assert_eq!(info["prune_keep_blocks"], 10);
+        assert_blockchain_info_matches_schema(&info);
         // Everything but the proof bytes survives, including the reported
         // size of the original block.
         let pruned = call(
@@ -3556,6 +3797,105 @@ mod tests {
             &exchange_index,
         );
         assert_eq!(unknown_field["error"]["data"]["code"], "invalid_params");
+
+        drop(exchange_index);
+        drop(shared);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn destination_parameters_accept_checksummed_addresses_and_answer_in_hex() {
+        use crate::address::{MAINNET_HRP, TEST_NETWORK_HRP, encode};
+
+        let directory = test_directory("exchange-checksummed-destinations");
+        let _ = fs::remove_dir_all(&directory);
+        let node = Node::open_with_profile(&directory, DEVNET_PROFILE).unwrap();
+        let wallet = node.wallet_destination();
+        let random_key = || -> [u8; 32] {
+            k256::schnorr::SigningKey::random(&mut k256::elliptic_curve::rand_core::OsRng)
+                .verifying_key()
+                .to_bytes()
+                .into()
+        };
+        let (single, batched) = (random_key(), random_key());
+        let shared = Arc::new(Mutex::new(node));
+        let exchange_index = Arc::new(Mutex::new(
+            ExchangeDepositIndex::open_and_sync(&shared).unwrap(),
+        ));
+        let call = |method: &str, params: Value| {
+            shared_call(
+                json!({"jsonrpc":"2.0","id":method,"method":method,"params":params}),
+                &shared,
+                &exchange_index,
+            )
+        };
+        let hrp = crate::address_hrp();
+
+        let info = call("getexchangeinfo", json!([]));
+        assert_eq!(
+            info["result"]["encodings"]["checksummed_address_available"],
+            true
+        );
+
+        let checksummed = encode(hrp, &wallet);
+        let balance = call("getaddressbalance", json!([hex::encode(wallet)]));
+        let utxos = call("getaddressutxos", json!([hex::encode(wallet)]));
+        assert!(balance["result"].is_object(), "{balance}");
+        for text in [checksummed.clone(), checksummed.to_ascii_uppercase()] {
+            assert_eq!(
+                call("getaddressbalance", json!([text]))["result"],
+                balance["result"]
+            );
+            assert_eq!(
+                call("getaddressutxos", json!([text]))["result"],
+                utxos["result"]
+            );
+        }
+
+        // Registration takes either form, answers in hex, and a retry in the
+        // other spelling is the same registration.
+        let registered = call(
+            "registerwatchdestination",
+            json!(["account-001", encode(hrp, &single)]),
+        );
+        assert_eq!(
+            registered["result"]["destination_hex"],
+            hex::encode(single),
+            "{registered}"
+        );
+        let retry = call(
+            "registerwatchdestination",
+            json!(["account-001", hex::encode(single)]),
+        );
+        assert_eq!(retry["result"], registered["result"]);
+        let batch = call(
+            "registerwatchdestinations",
+            json!([[{"label":"account-002","destination_hex":encode(hrp, &batched)}]]),
+        );
+        assert_eq!(
+            batch["result"]["registrations"][0]["destination_hex"],
+            hex::encode(batched),
+            "{batch}"
+        );
+
+        let other_network = if hrp == MAINNET_HRP {
+            TEST_NETWORK_HRP
+        } else {
+            MAINNET_HRP
+        };
+        let mut typo = checksummed.clone().into_bytes();
+        typo[12] = if typo[12] == b'q' { b'p' } else { b'q' };
+        for text in [
+            String::from_utf8(typo).unwrap(),
+            encode(other_network, &wallet),
+            hex::encode_upper(wallet),
+        ] {
+            let refused = call("getaddressbalance", json!([text]));
+            assert_eq!(refused["error"]["data"]["code"], "invalid_params", "{text}");
+        }
+        // Hash parameters do not take addresses.
+        let refused = call("getrawtransaction", json!([checksummed]));
+        assert_eq!(refused["error"]["data"]["code"], "invalid_params");
 
         drop(exchange_index);
         drop(shared);
@@ -4536,6 +4876,624 @@ mod tests {
 
         drop(node);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn chain_info_reports_the_work_rule_and_ignores_peers_on_an_invalid_chain() {
+        use crate::work_gate::test_support::{install, rule_from_genesis};
+        use crate::work_gate::tests::{cpu, devnet, mine, shared};
+
+        let (source_path, mut source) = devnet("exchange-work-rule-source");
+        let now = unix_time_seconds().unwrap();
+        let chain = mine(&mut source, 1, now);
+        let (path, mut node) = devnet("exchange-work-rule");
+        let info = blockchain_info(&node).unwrap();
+        assert!(info["work_rule"].is_null());
+        assert_blockchain_info_matches_schema(&info);
+
+        let rule = rule_from_genesis(&node);
+        node.install_work_rule_for_test(Some(rule.clone()));
+        let pending = blockchain_info(&node).unwrap()["work_rule"].clone();
+        assert_eq!(pending["enforced"], false);
+        assert_eq!(pending["engine_ready"], false);
+        assert_eq!(pending["engine_state"], "pending");
+        assert_eq!(pending["activation_height"], 1);
+
+        let engine = cpu();
+        engine.answer(&chain[0], true);
+        install(&mut node, Some(rule), Some(engine), None);
+        let shared_node = shared(node);
+        crate::submit_shared_block(&shared_node, chain[0].clone(), now).unwrap();
+        let mut node = shared_node.lock().unwrap();
+        let info = blockchain_info(&node).unwrap();
+        assert_blockchain_info_matches_schema(&info);
+        let work_rule = info["work_rule"].clone();
+        assert_eq!(
+            work_rule,
+            json!({
+                "enforced": true,
+                "engines": "cpu",
+                "bank": null,
+                "independent_engines": false,
+                "engine_ready": true,
+                "engine_state": "ready",
+                "halted": false,
+                "checkpoint_height": 0,
+                "checkpoint_hash": hex::encode(DEVNET_PROFILE.virtual_genesis_hash),
+                "activation_height": 1,
+                "validated_height": 1,
+                "alarms": {
+                    "engine_divergence": 0,
+                    "own_engine_mismatches": 0,
+                    "engine_failures": 0,
+                    "store_conflicts": 0,
+                    "peers_on_invalid_chain": 0,
+                },
+            })
+        );
+        let status = node.status().unwrap().work_rule.unwrap();
+        assert_eq!(status.engines, Some("cpu"));
+        assert!(!status.independent_engines);
+
+        // A peer that claims a longer chain makes the node look behind, until
+        // its tip is found to build on an invalid block.
+        let address = "127.0.0.1:18445".to_owned();
+        node.record_peer_started(PeerDirection::Outbound, address.clone(), now);
+        node.record_peer_succeeded(PeerDirection::Outbound, address.clone(), 50, [7; 32], now);
+        node.record_peer_ended(PeerDirection::Outbound, address.clone(), false, now);
+        assert_eq!(blockchain_info(&node).unwrap()["headers"], 50);
+        node.record_peer_on_invalid_chain(PeerDirection::Outbound, address, 50, [7; 32], now);
+        let info = blockchain_info(&node).unwrap();
+        assert_eq!(info["headers"], 1);
+        assert_eq!(info["recent_reachable_peers"], 1);
+        assert_eq!(info["work_rule"]["alarms"]["peers_on_invalid_chain"], 1);
+        assert_eq!(status.alarms.peers_on_invalid_chain, 0);
+        assert_eq!(
+            node.status()
+                .unwrap()
+                .work_rule
+                .unwrap()
+                .alarms
+                .peers_on_invalid_chain,
+            1
+        );
+
+        drop(node);
+        drop((shared_node, source));
+        crate::tests::clean_test_dir(&path);
+        crate::tests::clean_test_dir(&source_path);
+    }
+
+    /// A Devnet node with four stored blocks and a work rule whose
+    /// checkpoint is block 2, so blocks 3 and 4 are stored but unchecked.
+    fn node_with_unchecked_blocks(
+        label: &str,
+    ) -> (
+        PathBuf,
+        Arc<Mutex<Node>>,
+        Vec<cmfd_consensus::Block>,
+        Arc<crate::work_gate::test_support::ScriptedEngine>,
+    ) {
+        node_with_unchecked_blocks_and(label, |_, _| {})
+    }
+
+    /// [`node_with_unchecked_blocks`], calling `before_block` with the
+    /// blocks mined so far before each block is mined.
+    fn node_with_unchecked_blocks_and(
+        label: &str,
+        mut before_block: impl FnMut(&mut Node, &[cmfd_consensus::Block]),
+    ) -> (
+        PathBuf,
+        Arc<Mutex<Node>>,
+        Vec<cmfd_consensus::Block>,
+        Arc<crate::work_gate::test_support::ScriptedEngine>,
+    ) {
+        use crate::work_gate::test_support::install;
+        use crate::work_gate::tests::{cpu, devnet};
+
+        let (path, mut node) = devnet(label);
+        let destination = node.wallet_destination();
+        let mut blocks = Vec::new();
+        for height in 1..=4 {
+            before_block(&mut node, &blocks);
+            blocks.push(
+                node.mine_once(
+                    destination,
+                    DEVNET_PROFILE.virtual_genesis_timestamp + 60 * height,
+                    DEFAULT_MINING_ATTEMPTS,
+                )
+                .unwrap(),
+            );
+        }
+        let rule = cmfd_consensus::ForgeMatrixV4WorkRule::with_pinned_heights(
+            2,
+            blocks[1].block_id(),
+            [(1, blocks[0].block_id())],
+        )
+        .unwrap();
+        let engine = cpu();
+        install(&mut node, Some(rule), Some(engine.clone()), None);
+        assert_eq!(node.work_validated_height(), Some(2));
+        (path, Arc::new(Mutex::new(node)), blocks, engine)
+    }
+
+    fn check_next_stored_block(shared: &Arc<Mutex<Node>>) {
+        let turn = crate::work_gate::WorkBacklog::new()
+            .run_turn(shared, &|| false)
+            .unwrap();
+        assert!(
+            matches!(turn, crate::work_gate::WorkBacklogTurn::Checked(_)),
+            "{turn:?}"
+        );
+    }
+
+    #[test]
+    fn chain_reads_stop_at_the_validated_height_and_are_retryable_while_halted() {
+        use crate::work_gate::test_support::set_halted;
+
+        let (path, shared, blocks, engine) = node_with_unchecked_blocks("exchange-served");
+        let id = |height: usize| hex::encode(blocks[height - 1].block_id());
+        let destination_hex = hex::encode(shared.lock().unwrap().wallet_destination());
+        let exchange_index = Arc::new(Mutex::new(
+            ExchangeDepositIndex::open_and_sync(&shared).unwrap(),
+        ));
+        let call = |method: &str, params: Value| {
+            shared_call(
+                json!({"jsonrpc":"2.0","id":method,"method":method,"params":params}),
+                &shared,
+                &exchange_index,
+            )
+        };
+        let deposit_heights = || {
+            let page = call("getdepositevents", json!(["0", 100]));
+            let heights = page["result"]["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|event| event["blockheight"].as_u64().unwrap())
+                .collect::<Vec<_>>();
+            (page["result"]["indexed_tip"]["height"].clone(), heights)
+        };
+
+        // Blocks 3 and 4 are stored, but the chain served ends at block 2.
+        assert_eq!(call("getblockcount", json!([]))["result"], 2);
+        assert_eq!(call("getbestblockhash", json!([]))["result"], id(2));
+        assert_eq!(call("getblockhash", json!([2]))["result"], id(2));
+        assert_eq!(
+            call("getblockhash", json!([3]))["error"]["data"]["code"],
+            "block_not_found"
+        );
+        let info = call("getblockchaininfo", json!([]))["result"].clone();
+        assert_eq!(info["blocks"], 2);
+        assert_eq!(info["bestblockhash"], id(2));
+        assert_eq!(info["work_rule"]["validated_height"], 2);
+        assert!(
+            info["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning
+                    .as_str()
+                    .unwrap()
+                    .starts_with("2 stored blocks above height 2")),
+            "{info}"
+        );
+        let second = call("getblock", json!([id(2), 1]))["result"].clone();
+        assert_eq!(second["confirmations"], 1);
+        assert_eq!(second["nextblockhash"], Value::Null);
+        assert_eq!(
+            call("getblock", json!([id(1), 1]))["result"]["confirmations"],
+            2
+        );
+        assert_eq!(
+            call("getblock", json!([id(3), 1]))["error"]["data"]["code"],
+            "block_not_found"
+        );
+        let genesis = hex::encode(DEVNET_PROFILE.virtual_genesis_hash);
+        assert_eq!(
+            call("getblock", json!([genesis, 1]))["result"]["confirmations"],
+            3
+        );
+        let coinbase = |height: usize| hex::encode(blocks[height - 1].coinbase_outpoint_id());
+        let served = call("gettransaction", json!([coinbase(2)]))["result"].clone();
+        assert_eq!(served["confirmations"], 1);
+        assert_eq!(served["height"], 2);
+        assert_eq!(served["bestblock"], id(2));
+        // A transaction mined above it is reported without its block.
+        let pending = call("gettransaction", json!([coinbase(3)]))["result"].clone();
+        assert_eq!(pending["status"], "pending_check", "{pending}");
+        assert_eq!(pending["confirmations"], 0);
+        assert_eq!(pending["active"], false);
+        assert_eq!(pending["blockhash"], Value::Null);
+        assert_eq!(pending["blockheight"], Value::Null);
+        assert_eq!(pending["bestblock"], id(2));
+
+        // Deposits are reported on the served chain only.
+        let registered = call(
+            "registerwatchdestination",
+            json!(["miner", destination_hex]),
+        );
+        assert_eq!(registered["result"]["registered_at_height"], 2);
+        assert_eq!(registered["result"]["registered_at_tip"], id(2));
+        let (indexed_tip, heights) = deposit_heights();
+        assert_eq!(indexed_tip, 2);
+        assert!(
+            !heights.is_empty() && heights.iter().all(|height| *height <= 2),
+            "{heights:?}"
+        );
+        let served_deposits = heights.len();
+
+        // Once block 3 is checked, it is served.
+        engine.answer(&blocks[2], true);
+        check_next_stored_block(&shared);
+        assert_eq!(call("getblockcount", json!([]))["result"], 3);
+        let second = call("getblock", json!([id(2), 1]))["result"].clone();
+        assert_eq!(second["nextblockhash"], id(3));
+        assert_eq!(second["confirmations"], 2);
+        let (indexed_tip, heights) = deposit_heights();
+        assert_eq!(indexed_tip, 3);
+        assert!(
+            heights.len() > served_deposits && heights.iter().all(|height| *height <= 3),
+            "{heights:?}"
+        );
+
+        // While admission is halted, chain reads fail with a retryable error
+        // and the status still says why.
+        set_halted(&shared.lock().unwrap(), true);
+        for (method, params) in [
+            ("getblockcount", json!([])),
+            ("getbestblockhash", json!([])),
+            ("getblockhash", json!([1])),
+            ("getblock", json!([id(1), 1])),
+            ("gettransaction", json!([coinbase(1)])),
+            ("getaddressbalance", json!([destination_hex])),
+            ("getrawmempool", json!([])),
+            ("getdepositevents", json!(["0", 1])),
+        ] {
+            let error = call(method, params)["error"].clone();
+            assert_eq!(error["code"], -32030, "{method}: {error}");
+            assert_eq!(error["data"]["code"], "work_rule_halted", "{method}");
+            assert_eq!(error["data"]["retryable"], true, "{method}");
+        }
+        let info = call("getblockchaininfo", json!([]))["result"].clone();
+        assert_eq!(info["blocks"], 3);
+        assert_eq!(info["work_rule"]["halted"], true);
+        assert!(
+            info["warnings"]
+                .to_string()
+                .contains("block admission is halted"),
+            "{info}"
+        );
+        assert!(call("getexchangeinfo", json!([]))["result"].is_object());
+        assert!(call("getwatchdestination", json!(["miner"]))["result"].is_object());
+        set_halted(&shared.lock().unwrap(), false);
+        assert_eq!(call("getblockcount", json!([]))["result"], 3);
+
+        // So do they once the work engine has failed.
+        engine.fail_next(crate::honest_work::WorkEngineError::Integrity(
+            "layer 1".to_owned(),
+        ));
+        let _ = crate::work_gate::WorkBacklog::new().run_turn(&shared, &|| false);
+        let error = call("getblockcount", json!([]))["error"].clone();
+        assert_eq!(error["data"]["code"], "work_engine_failed", "{error}");
+        assert_eq!(error["data"]["retryable"], true);
+        let info = call("getblockchaininfo", json!([]))["result"].clone();
+        assert_eq!(info["work_rule"]["engine_state"], "failed");
+        assert_eq!(info["blocks"], 3);
+
+        drop((exchange_index, shared));
+        crate::tests::clean_test_dir(&path);
+    }
+
+    #[test]
+    fn chain_state_reads_wait_until_every_stored_block_is_checked() {
+        // Block 2 (checked) and block 3 (not checked) each hold a payment.
+        let mut payments = Vec::new();
+        let (path, shared, blocks, engine) =
+            node_with_unchecked_blocks_and("exchange-tip-state", |node, mined| {
+                if let Some(funding) = mined.last().filter(|_| mined.len() <= 2) {
+                    let payment =
+                        crate::tests::spend_coinbase_output(node, funding, 2, 0x12, 0x31, 10);
+                    payments.push(payment.txid());
+                    node.submit_transaction(payment).unwrap();
+                }
+            });
+        let id = |height: usize| hex::encode(blocks[height - 1].block_id());
+        let destination_hex = hex::encode(shared.lock().unwrap().wallet_destination());
+        let exchange_index = Arc::new(Mutex::new(
+            ExchangeDepositIndex::open_and_sync(&shared).unwrap(),
+        ));
+        let call = |method: &str, params: Value| {
+            shared_call(
+                json!({"jsonrpc":"2.0","id":method,"method":method,"params":params}),
+                &shared,
+                &exchange_index,
+            )
+        };
+        let state_reads = [
+            ("getaddressbalance", json!([destination_hex])),
+            ("getbalance", json!([destination_hex])),
+            ("getaddressutxos", json!([destination_hex])),
+            ("gettxoutsetinfo", json!([])),
+        ];
+        let confirmations = |payment: usize| {
+            let txid = payments[payment];
+            shared
+                .lock()
+                .unwrap()
+                .active_transaction_confirmations_for(&std::collections::HashSet::from([txid]))
+                .unwrap()
+                .get(&txid)
+                .copied()
+        };
+
+        // The chain state includes blocks 3 and 4, which are not checked.
+        for (method, params) in state_reads.clone() {
+            let error = call(method, params)["error"].clone();
+            assert_eq!(error["code"], -32030, "{method}: {error}");
+            assert_eq!(error["data"]["code"], "work_check_pending", "{method}");
+            assert_eq!(error["data"]["retryable"], true, "{method}");
+        }
+        // Withdrawal planning checks the same under its own node lock.
+        assert!(matches!(
+            shared.lock().unwrap().require_exchange_tip_checked(),
+            Err(NodeError::WorkCheckPending)
+        ));
+        for fault in [
+            exchange_withdrawal_fault(ExchangeWithdrawalError::Node(NodeError::WorkCheckPending)),
+            exchange_custody_v3_fault(ExchangeCustodyRuntimeV3Error::Node(
+                NodeError::WorkCheckPending,
+            )),
+        ] {
+            assert_eq!(
+                (fault.code, fault.data_code, fault.retryable),
+                (-32030, "work_check_pending", true)
+            );
+        }
+        // Withdrawal confirmations count only checked blocks; a transaction
+        // above them is found with none.
+        assert_eq!(confirmations(0), Some(1));
+        assert_eq!(confirmations(1), Some(0));
+
+        engine.answer(&blocks[2], true);
+        check_next_stored_block(&shared);
+        assert_eq!(
+            call("gettxoutsetinfo", json!([]))["error"]["data"]["code"],
+            "work_check_pending"
+        );
+        engine.answer(&blocks[3], true);
+        check_next_stored_block(&shared);
+
+        // With every stored block checked, they answer at the served tip.
+        for (method, params) in state_reads {
+            let result = call(method, params)["result"].clone();
+            assert_eq!(result["height"], 4, "{method}: {result}");
+            assert_eq!(result["bestblock"], id(4), "{method}");
+        }
+        assert_eq!(confirmations(0), Some(3));
+        assert_eq!(confirmations(1), Some(2));
+        shared
+            .lock()
+            .unwrap()
+            .require_exchange_tip_checked()
+            .unwrap();
+
+        drop((exchange_index, shared));
+        crate::tests::clean_test_dir(&path);
+    }
+
+    #[test]
+    fn deposits_indexed_above_a_lower_validated_height_are_held_not_removed() {
+        use crate::work_gate::test_support::install;
+        use crate::work_gate::tests::{cpu, devnet};
+
+        // A node indexes deposits to height 4 before it has the work rule.
+        let (path, mut node) = devnet("exchange-held-deposits");
+        let destination = node.wallet_destination();
+        let blocks = (1..=4)
+            .map(|height| {
+                node.mine_once(
+                    destination,
+                    DEVNET_PROFILE.virtual_genesis_timestamp + 60 * height,
+                    DEFAULT_MINING_ATTEMPTS,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let shared = Arc::new(Mutex::new(node));
+        let exchange_index = Arc::new(Mutex::new(
+            ExchangeDepositIndex::open_and_sync(&shared).unwrap(),
+        ));
+        let call = |method: &str, params: Value| {
+            shared_call(
+                json!({"jsonrpc":"2.0","id":method,"method":method,"params":params}),
+                &shared,
+                &exchange_index,
+            )
+        };
+        let page = || call("getdepositevents", json!(["0", 100]))["result"].clone();
+        let other = hex::encode(
+            k256::schnorr::SigningKey::from_bytes(&[0x31; 32])
+                .unwrap()
+                .verifying_key()
+                .to_bytes(),
+        );
+        assert!(
+            call(
+                "registerwatchdestination",
+                json!(["miner", hex::encode(destination)])
+            )
+            .get("result")
+            .is_some()
+        );
+        let before = page();
+        assert_eq!(before["indexed_tip"]["height"], 4);
+        let events = before["events"].as_array().unwrap();
+        assert!(
+            events.len() >= 4 && events.iter().all(|event| event["kind"] == "deposit_added"),
+            "{before}"
+        );
+
+        // It then re-executes block work from checkpoint 2: blocks 3 and 4
+        // are not yet checked. Their deposits are held, not removed.
+        let rule = cmfd_consensus::ForgeMatrixV4WorkRule::with_pinned_heights(
+            2,
+            blocks[1].block_id(),
+            [(1, blocks[0].block_id())],
+        )
+        .unwrap();
+        let engine = cpu();
+        install(
+            &mut shared.lock().unwrap(),
+            Some(rule),
+            Some(engine.clone()),
+            None,
+        );
+        assert_eq!(call("getblockcount", json!([]))["result"], 2);
+        assert_eq!(page(), before);
+        let refused = call("registerwatchdestination", json!(["other", other]))["error"].clone();
+        assert_eq!(refused["code"], -32030, "{refused}");
+        assert_eq!(refused["data"]["code"], "work_check_pending");
+        assert_eq!(refused["data"]["retryable"], true);
+
+        // Once they are checked, nothing was removed or added twice.
+        for block in &blocks[2..] {
+            engine.answer(block, true);
+            check_next_stored_block(&shared);
+        }
+        assert_eq!(call("getblockcount", json!([]))["result"], 4);
+        assert_eq!(page(), before);
+        assert!(
+            call("registerwatchdestination", json!(["other", other]))
+                .get("result")
+                .is_some()
+        );
+
+        drop((exchange_index, shared));
+        crate::tests::clean_test_dir(&path);
+    }
+
+    /// Reads the exchange RPC the way an exchange-wallet daemon from before
+    /// the work rule does: the tip from `getblockchaininfo`, then blocks by
+    /// height and hash.
+    struct ExchangeRpcSource<'a> {
+        shared: &'a Arc<Mutex<Node>>,
+        exchange_index: &'a SharedExchangeDepositIndex,
+    }
+
+    impl ExchangeRpcSource<'_> {
+        fn call(&self, method: &str, params: Value) -> Result<Value, Value> {
+            let response = shared_call(
+                json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}),
+                self.shared,
+                self.exchange_index,
+            );
+            match response.get("error") {
+                Some(error) => Err(error.clone()),
+                None => Ok(response["result"].clone()),
+            }
+        }
+    }
+
+    impl crate::exchange_wallet::ChainSource for ExchangeRpcSource<'_> {
+        fn tip(
+            &mut self,
+        ) -> Result<crate::exchange_wallet::ChainTip, crate::exchange_wallet::SourceError> {
+            let info = self.call("getblockchaininfo", json!([])).unwrap();
+            Ok(crate::exchange_wallet::ChainTip {
+                height: info["blocks"].as_u64().unwrap(),
+                hash: hash_parameter(&info["bestblockhash"], "tip").unwrap(),
+            })
+        }
+
+        fn block_hash(
+            &mut self,
+            height: u64,
+        ) -> Result<Option<[u8; 32]>, crate::exchange_wallet::SourceError> {
+            match self.call("getblockhash", json!([height])) {
+                Ok(hash) => Ok(Some(hash_parameter(&hash, "hash").unwrap())),
+                Err(error) if error["code"] == -32001 => Ok(None),
+                Err(error) => Err(crate::exchange_wallet::SourceError::Invalid(
+                    error.to_string(),
+                )),
+            }
+        }
+
+        fn block(
+            &mut self,
+            hash: [u8; 32],
+        ) -> Result<Option<crate::exchange_wallet::SourceBlock>, crate::exchange_wallet::SourceError>
+        {
+            match self.call("getblock", json!([hex::encode(hash), 2])) {
+                Ok(document) => crate::exchange_wallet_upstream::parse_block(&document).map(Some),
+                Err(error) if error["code"] == -32001 => Ok(None),
+                Err(error) => Err(crate::exchange_wallet::SourceError::Invalid(
+                    error.to_string(),
+                )),
+            }
+        }
+
+        fn broadcast(&mut self, _: &[u8]) -> Result<(), crate::exchange_wallet::BroadcastError> {
+            unreachable!("the test only reads the chain")
+        }
+
+        fn mempool_contains(
+            &mut self,
+            _: [u8; 32],
+        ) -> Result<bool, crate::exchange_wallet::SourceError> {
+            Ok(false)
+        }
+    }
+
+    #[test]
+    fn an_exchange_wallet_from_before_the_work_rule_never_follows_past_the_validated_height() {
+        use crate::exchange_wallet::{ChainTip, Wallet, sync_with};
+
+        let (path, shared, blocks, engine) = node_with_unchecked_blocks("exchange-served-wallet");
+        let exchange_index = Arc::new(Mutex::new(
+            ExchangeDepositIndex::open_and_sync(&shared).unwrap(),
+        ));
+        let wallet_directory = test_directory("served-wallet");
+        let _ = fs::remove_dir_all(&wallet_directory);
+        fs::create_dir_all(&wallet_directory).unwrap();
+        let wallet = Mutex::new(
+            Wallet::create(
+                &wallet_directory,
+                DEVNET_PROFILE.network_id,
+                &ChainTip {
+                    height: 0,
+                    hash: DEVNET_PROFILE.virtual_genesis_hash,
+                },
+            )
+            .unwrap(),
+        );
+        let mut source = ExchangeRpcSource {
+            shared: &shared,
+            exchange_index: &exchange_index,
+        };
+        let follow = |source: &mut ExchangeRpcSource<'_>| {
+            let mut next = None;
+            for _ in 0..10 {
+                let progress =
+                    sync_with(&wallet, source, &mut next, 100, &|| false, &|_| {}).unwrap();
+                if progress.caught_up {
+                    return progress.height;
+                }
+            }
+            panic!("the wallet never caught up");
+        };
+
+        assert_eq!(follow(&mut source), 2);
+        assert_eq!(wallet.lock().unwrap().tip().1, blocks[1].block_id());
+        engine.answer(&blocks[2], true);
+        check_next_stored_block(&shared);
+        assert_eq!(follow(&mut source), 3);
+        assert_eq!(wallet.lock().unwrap().tip().1, blocks[2].block_id());
+
+        drop(wallet);
+        let _ = fs::remove_dir_all(&wallet_directory);
+        drop((exchange_index, shared));
+        crate::tests::clean_test_dir(&path);
     }
 
     #[test]

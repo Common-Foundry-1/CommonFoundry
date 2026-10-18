@@ -119,6 +119,48 @@
       "action": "Reconcile the identifier and current active-chain or durable state."
     },
     {
+      "scope": [
+        "getblockcount",
+        "getbestblockhash",
+        "getblockhash",
+        "getblock",
+        "gettxoutsetinfo",
+        "getrawtransaction",
+        "gettransaction",
+        "getaddressbalance",
+        "getaddressutxos",
+        "getbalance",
+        "getrawmempool",
+        "sendrawtransaction",
+        "registerwatchdestination",
+        "registerwatchdestinations",
+        "getdepositevents",
+        "preparewithdrawal",
+        "releasewithdrawal"
+      ],
+      "jsonrpc_code": -32030,
+      "retryable": true,
+      "data_codes": ["work_rule_halted", "work_engine_failed"],
+      "meaning": "The node has halted block admission, or its work engine has failed, so the chain it serves cannot advance. getblockchaininfo and getexchangeinfo still answer and show the reason.",
+      "action": "Pause deposit crediting and withdrawals, keep the committed cursor, and retry later; the node operator must act. Use a second endpoint if one is configured."
+    },
+    {
+      "scope": [
+        "gettxoutsetinfo",
+        "getaddressbalance",
+        "getaddressutxos",
+        "getbalance",
+        "preparewithdrawal",
+        "registerwatchdestination",
+        "registerwatchdestinations"
+      ],
+      "jsonrpc_code": -32030,
+      "retryable": true,
+      "data_codes": ["work_check_pending"],
+      "meaning": "The node stores blocks above its validated height whose work it has not yet re-executed. Balance, UTXO and supply reads and withdrawal preparation read the chain state at the tip, which includes those blocks, so they wait until the validated height reaches the tip; watch registration waits while the deposit index holds blocks above the validated height.",
+      "action": "Keep retrying. Chain reads, deposit events and broadcasts still answer. It lasts until the validated height reaches the tip. On the first start after an upgrade the node first checks every block it stored since the release checkpoint: about (those blocks) / (blocks it checks per hour - 62) hours, often many hours. Do not restart the node to shorten it."
+    },
+    {
       "scope": ["sendrawtransaction"],
       "jsonrpc_code": -32005,
       "retryable": false,
@@ -144,7 +186,7 @@
       "scope": ["sendrawtransaction"],
       "jsonrpc_code": -32005,
       "retryable": true,
-      "data_codes": ["mempool_transaction_limit", "mempool_byte_limit", "chain_temporarily_rejected"],
+      "data_codes": ["mempool_transaction_limit", "mempool_byte_limit", "mempool_close_limit", "chain_temporarily_rejected"],
       "meaning": "A transient admission capacity or chain-time condition rejected the transaction.",
       "action": "Retry the identical canonical transaction after the condition clears."
     },

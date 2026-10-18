@@ -27,7 +27,7 @@ use k256::elliptic_curve::PrimeField;
 use k256::elliptic_curve::bigint::U256;
 use k256::elliptic_curve::ops::Reduce;
 use k256::elliptic_curve::sec1::ToEncodedPoint;
-use k256::schnorr::{SigningKey, VerifyingKey};
+use k256::schnorr::SigningKey;
 use k256::{FieldBytes, NonZeroScalar, ProjectivePoint, PublicKey, Scalar};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -135,14 +135,6 @@ pub fn parse_h32(text: &str) -> Option<H32> {
         && !text.bytes().any(|byte| byte.is_ascii_uppercase())
         && hex::decode_to_slice(text, &mut bytes).is_ok())
     .then_some(H32(bytes))
-}
-
-/// A Common Foundry address: 64 lowercase hex characters encoding a valid
-/// x-only secp256k1 public key.
-pub fn parse_address(text: &str) -> Option<[u8; 32]> {
-    let address = parse_h32(text)?.0;
-    VerifyingKey::from_bytes(&address).ok()?;
-    Some(address)
 }
 
 pub fn unix_now() -> u64 {
@@ -1837,7 +1829,21 @@ pub fn sync_with(
         if hash == upstream.hash {
             return Ok(progress(true, height));
         }
-        if height >= upstream.height {
+        if height > upstream.height {
+            let held = lock(wallet).hash_at(upstream.height);
+            match held {
+                // The source's chain does not hold the wallet's block at the
+                // source's height: leave the wallet's branch.
+                Some(held) if held != upstream.hash => {
+                    disconnect()?;
+                    *expected_next = None;
+                    continue;
+                }
+                // The source is behind the wallet; wait for it.
+                _ => return Ok(progress(true, height)),
+            }
+        }
+        if height == upstream.height {
             match source
                 .block_hash(height)
                 .map_err(|error| error.to_string())?
@@ -2036,6 +2042,45 @@ mod tests {
 
         fn mempool_contains(&mut self, txid: [u8; 32]) -> Result<bool, SourceError> {
             Ok(self.0.mempool_entries().any(|entry| entry.txid == txid))
+        }
+    }
+
+    /// Serves `node` only up to `cap`, as an endpoint does up to its
+    /// validated height.
+    struct CappedSource<'a> {
+        node: NodeSource<'a>,
+        cap: u64,
+    }
+
+    impl ChainSource for CappedSource<'_> {
+        fn tip(&mut self) -> Result<ChainTip, SourceError> {
+            Ok(ChainTip {
+                height: self.cap,
+                hash: self.node.0.active_block_id_at_height(self.cap).unwrap(),
+            })
+        }
+
+        fn block_hash(&mut self, height: u64) -> Result<Option<[u8; 32]>, SourceError> {
+            if height > self.cap {
+                return Ok(None);
+            }
+            self.node.block_hash(height)
+        }
+
+        fn block(&mut self, hash: [u8; 32]) -> Result<Option<SourceBlock>, SourceError> {
+            let mut block = self.node.block(hash)?;
+            if let Some(block) = block.as_mut().filter(|block| block.height >= self.cap) {
+                block.next = None;
+            }
+            Ok(block)
+        }
+
+        fn broadcast(&mut self, transaction: &[u8]) -> Result<(), BroadcastError> {
+            self.node.broadcast(transaction)
+        }
+
+        fn mempool_contains(&mut self, txid: [u8; 32]) -> Result<bool, SourceError> {
+            self.node.mempool_contains(txid)
         }
     }
 
@@ -2292,6 +2337,50 @@ mod tests {
         let reopened = Wallet::open(&wallet_dir.0, network).unwrap();
         assert_eq!(reopened.tip(), (height, hash));
         assert_eq!(reopened.balance(1), reward - 100_000_000 - prepared.fee);
+    }
+
+    #[test]
+    fn a_wallet_ahead_of_its_source_leaves_a_branch_the_source_does_not_hold() {
+        let node_dir = TestDirectory::new("ahead-node");
+        let wallet_dir = TestDirectory::new("ahead");
+        let mut node = Node::open_with_profile(&node_dir.0, DEVNET_PROFILE).unwrap();
+        let network = node.params.network_id;
+        let wallet = Mutex::new(Wallet::create(&wallet_dir.0, network, &tip_of(&node)).unwrap());
+        let first = mine(&mut node, outside_address());
+        for _ in 0..2 {
+            mine(&mut node, outside_address());
+        }
+        sync(&wallet, &mut node);
+        assert_eq!(lock(&wallet).tip().0, 3);
+
+        // A longer branch from block 1 replaces blocks 2 and 3, and the
+        // source serves only up to height 2.
+        let mut parent = first.block_id();
+        let mut branch = Vec::new();
+        for offset in 0..3 {
+            let timestamp = DEVNET_GENESIS_TIMESTAMP + (2 + offset) * 60 + 7;
+            let block = fork_block(&node, parent, timestamp, outside_address());
+            parent = block.block_id();
+            branch.push(parent);
+            node.submit_block(block, timestamp).unwrap();
+        }
+        assert_eq!(node.state.tip(), branch[2]);
+        let mut source = CappedSource {
+            node: NodeSource(&mut node),
+            cap: 2,
+        };
+        let progress = sync_with(&wallet, &mut source, &mut None, 100, &|| false, &|_| {}).unwrap();
+        assert!(progress.caught_up);
+        assert_eq!(lock(&wallet).tip(), (2, branch[0]));
+
+        // On the same chain, a wallet ahead of its source waits for it.
+        source.cap = 3;
+        sync_with(&wallet, &mut source, &mut None, 100, &|| false, &|_| {}).unwrap();
+        assert_eq!(lock(&wallet).tip(), (3, branch[1]));
+        source.cap = 2;
+        let progress = sync_with(&wallet, &mut source, &mut None, 100, &|| false, &|_| {}).unwrap();
+        assert!(progress.caught_up);
+        assert_eq!(lock(&wallet).tip(), (3, branch[1]));
     }
 
     #[test]

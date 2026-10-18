@@ -19,6 +19,16 @@
       "type": "string",
       "pattern": "^[0-9a-f]{64}$"
     },
+    "Destination": {
+      "description": "A key destination parameter: 64 lowercase hexadecimal characters (a 32-byte x-only secp256k1 public key), or the same key as a checksummed bech32m address with the node's network prefix (cmfd1 on mainnet, tcmfd1 on test networks), all lowercase or all uppercase. The node also checks the checksum, the prefix and the key. Responses always carry the destination as 64 lowercase hexadecimal characters.",
+      "oneOf": [
+        { "$ref": "#/$defs/Hash32" },
+        {
+          "type": "string",
+          "pattern": "^(?:t?cmfd1[02-9ac-hj-np-z]{58}|T?CMFD1[02-9AC-HJ-NP-Z]{58})$"
+        }
+      ]
+    },
     "NonzeroHash32": {
       "allOf": [
         { "$ref": "#/$defs/Hash32" },
@@ -152,7 +162,53 @@
         "storage_healthy": { "type": "boolean" },
         "first_block_height": { "const": 1 },
         "sync_basis": { "const": "external_readiness_policy_required" },
-        "warnings": { "type": "array", "items": { "type": "string" } }
+        "warnings": { "type": "array", "items": { "type": "string" } },
+        "pruned": { "type": "boolean" },
+        "pruneheight": {
+          "description": "Present only when pruned: the lowest block whose raw bytes are still stored.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "prune_keep_blocks": {
+          "description": "Present only when pruned: the configured number of recent blocks kept in full, or null.",
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "work_rule": {
+          "description": "Null on a network without a work rule. Otherwise blocks and bestblockhash stop at validated_height.",
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "required": [
+                "enforced", "engines", "independent_engines", "engine_ready",
+                "engine_state", "halted", "checkpoint_height", "checkpoint_hash",
+                "activation_height", "validated_height", "alarms"
+              ],
+              "properties": {
+                "enforced": { "type": "boolean" },
+                "engines": { "enum": [null, "cpu", "gpu", "cpu+gpu"] },
+                "bank": {
+                  "description": "Whether the CPU engine holds the model bank in memory or reads it for each block. Null until the node has installed its work engines; absent from nodes older than 1.0.16.",
+                  "enum": [null, "resident", "streamed"]
+                },
+                "independent_engines": { "type": "boolean" },
+                "engine_ready": { "type": "boolean" },
+                "engine_state": { "enum": ["pending", "qualifying", "ready", "failed"] },
+                "halted": { "type": "boolean" },
+                "checkpoint_height": { "type": "integer", "minimum": 0 },
+                "checkpoint_hash": { "$ref": "#/$defs/Hash32" },
+                "activation_height": { "type": "integer", "minimum": 1 },
+                "validated_height": { "type": "integer", "minimum": 0 },
+                "alarms": {
+                  "type": "object",
+                  "additionalProperties": { "type": "integer", "minimum": 0 }
+                }
+              },
+              "additionalProperties": false
+            }
+          ]
+        }
       },
       "additionalProperties": false
     },
@@ -304,6 +360,7 @@
           "enum": [
             "confirmed",
             "mempool",
+            "pending_check",
             "inactive"
           ]
         },
@@ -672,7 +729,7 @@
       "required": ["label", "destination_hex"],
       "properties": {
         "label": { "$ref": "#/$defs/VisibleAsciiId" },
-        "destination_hex": { "$ref": "#/$defs/Hash32" }
+        "destination_hex": { "$ref": "#/$defs/Destination" }
       },
       "additionalProperties": false
     },
@@ -721,7 +778,7 @@
           "properties": {
             "amounts": { "const": "canonical unsigned decimal atom strings" },
             "destination": { "const": "64 lowercase hexadecimal characters encoding a 32-byte x-only secp256k1 public key" },
-            "checksummed_address_available": { "const": false }
+            "checksummed_address_available": { "const": true }
           },
           "additionalProperties": false
         },

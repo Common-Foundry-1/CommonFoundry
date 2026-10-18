@@ -87,6 +87,8 @@ pub(crate) enum ExchangeIndexError {
     InvalidPageLimit,
     #[error("the active chain changed while the exchange index was scanning")]
     ChainChanged,
+    #[error("indexed blocks above the validated height are not yet checked")]
+    WorkCheckPending,
     #[error(transparent)]
     Node(#[from] NodeError),
 }
@@ -109,13 +111,14 @@ impl ExchangeIndexError {
             Self::InvalidCursor => "deposit_cursor_ahead",
             Self::InvalidPageLimit => "invalid_deposit_event_page_limit",
             Self::ChainChanged => "exchange_index_chain_changed",
+            Self::WorkCheckPending => "work_check_pending",
             Self::Node(error) => error.client_error().code,
         }
     }
 
     pub(crate) fn retryable(&self) -> bool {
         match self {
-            Self::ChainChanged => true,
+            Self::ChainChanged | Self::WorkCheckPending => true,
             Self::Node(error) => error.client_error().retryable,
             _ => false,
         }
@@ -166,6 +169,7 @@ impl ExchangeIndexError {
             Self::ChainChanged => {
                 "active chain changed during the deposit scan; retry the request".to_owned()
             }
+            Self::WorkCheckPending => "this node indexed blocks above its validated height before it checked their work; registration waits until they are checked, retry later".to_owned(),
             Self::Node(error) => error.client_error().message,
         }
     }
@@ -559,7 +563,7 @@ impl ExchangeDepositIndex {
     ) -> Result<ChainReadPlan, ExchangeIndexError> {
         let node = lock_node(shared)?;
         self.check_node_binding(&node)?;
-        let mut active_chain = checked_active_chain(&node)?;
+        let mut active_chain = checked_active_chain(&node, &self.state.indexed_chain)?;
         let common = common_prefix_len(&self.state.indexed_chain, &active_chain);
         let read_blocks = !self.state.watches.is_empty();
         if read_blocks && active_chain.len() - common > MAX_BLOCKS_PER_SYNCHRONIZE {
@@ -579,16 +583,24 @@ impl ExchangeDepositIndex {
     ) -> Result<ChainReadPlan, ExchangeIndexError> {
         let node = lock_node(shared)?;
         self.check_node_binding(&node)?;
-        let active_chain = checked_active_chain(&node)?;
+        let active_chain = checked_active_chain(&node, &self.state.indexed_chain)?;
         if active_chain != self.state.indexed_chain {
             return Err(ExchangeIndexError::ChainChanged);
         }
+        // A new watch would scan held blocks above the validated height, and
+        // the index would never rescan them for it once they are checked.
+        if active_chain.len() > served_chain_length(&node) {
+            return Err(ExchangeIndexError::WorkCheckPending);
+        }
+        let served_length = u64::try_from(active_chain.len())
+            .map_err(|_| ExchangeIndexError::Capacity("indexed chain"))?;
         let mut positions = BTreeSet::new();
         for destination in destinations {
             for height in node
                 .index
                 .addresses
                 .active_heights(destination, &node.index)
+                .filter(|height| *height < served_length)
             {
                 positions.insert(
                     usize::try_from(height)
@@ -757,17 +769,37 @@ struct ChainReadPlan {
     require_v2: bool,
 }
 
-fn checked_active_chain(node: &Node) -> Result<Vec<[u8; 32]>, ExchangeIndexError> {
+/// The number of active blocks, from the virtual genesis, the exchange RPC
+/// serves: up to the validated height on a network with a work rule.
+fn served_chain_length(node: &Node) -> usize {
+    usize::try_from(node.exchange_served_cap())
+        .unwrap_or(usize::MAX)
+        .saturating_add(1)
+        .min(node.index.active_chain.len())
+}
+
+/// The chain the index follows, given the chain it has indexed. It advances
+/// only along the served chain. Indexed blocks above the validated height
+/// that are still active are held: they are neither removed nor extended
+/// until they are checked, so a validated height that falls behind (a
+/// restart, a revocation) does not retract deposits. A reorganization still
+/// removes the blocks it replaced.
+fn checked_active_chain(
+    node: &Node,
+    indexed_chain: &[[u8; 32]],
+) -> Result<Vec<[u8; 32]>, ExchangeIndexError> {
     if node.index.active_chain.is_empty() || node.index.active_chain[0] != node.params.genesis_hash
     {
         return Err(ExchangeIndexError::Node(NodeError::CorruptLog(
             "active chain is missing its virtual genesis".to_owned(),
         )));
     }
-    if node.index.active_chain.len() > MAX_INDEXED_CHAIN_BLOCKS {
+    let length =
+        served_chain_length(node).max(common_prefix_len(indexed_chain, &node.index.active_chain));
+    if length > MAX_INDEXED_CHAIN_BLOCKS {
         return Err(ExchangeIndexError::Capacity("indexed chain"));
     }
-    Ok(node.index.active_chain.clone())
+    Ok(node.index.active_chain[..length].to_vec())
 }
 
 fn capture_chain_plan(
@@ -1671,7 +1703,7 @@ fn persist_slot(path: &Path, bytes: &[u8]) -> Result<(), ExchangeIndexError> {
             .map_err(|source| index_io("write exchange deposit index", &temporary, source))?;
         file.sync_all()
             .map_err(|source| index_io("sync exchange deposit index", &temporary, source))?;
-        publish_snapshot(&temporary, path)
+        publish_snapshot(&file, &temporary, path)
             .map_err(|source| index_io("publish exchange deposit index", path, source))?;
         sync_parent_directory(path)
             .map_err(|error| node_io_as_index(error, "sync exchange deposit index directory", path))
@@ -1682,42 +1714,20 @@ fn persist_slot(path: &Path, bytes: &[u8]) -> Result<(), ExchangeIndexError> {
     result
 }
 
+/// Renames the synced temporary file over the slot in one step, then flushes
+/// it through its still-open handle, so the file and its new name are
+/// committed before this returns. std renames over a slot another handle
+/// holds open (a virus scan, a backup tool), which `MoveFileExW` with
+/// `MOVEFILE_REPLACE_EXISTING` refuses with error 5; this is the publish of
+/// the startup snapshot slots (startup_snapshot.rs `publish_slot`).
 #[cfg(windows)]
-fn publish_snapshot(temporary: &Path, path: &Path) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    };
-
-    let temporary = temporary
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    let path = path
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    // SAFETY: both arguments are valid, NUL-terminated UTF-16 paths for the
-    // duration of the call. The flags request atomic replacement plus a
-    // write-through publication before success is reported.
-    if unsafe {
-        MoveFileExW(
-            temporary.as_ptr(),
-            path.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    } == 0
-    {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+fn publish_snapshot(file: &fs::File, temporary: &Path, path: &Path) -> io::Result<()> {
+    fs::rename(temporary, path)?;
+    file.sync_all()
 }
 
 #[cfg(not(windows))]
-fn publish_snapshot(temporary: &Path, path: &Path) -> io::Result<()> {
+fn publish_snapshot(_file: &fs::File, temporary: &Path, path: &Path) -> io::Result<()> {
     fs::rename(temporary, path)
 }
 
@@ -1856,11 +1866,15 @@ mod tests {
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
 
     fn test_dir(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
+        let dir = std::env::temp_dir().join(format!(
             "cmfd-exchange-index-{label}-{}-{}",
             std::process::id(),
             NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed)
-        ))
+        ));
+        // A directory left by an earlier run under the same process id
+        // would hold its index.
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
     }
 
     fn random_destination() -> [u8; 32] {
@@ -2739,6 +2753,36 @@ mod tests {
         ));
 
         drop(shared);
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn a_slot_publish_replaces_a_slot_another_handle_holds_open() {
+        let path = test_dir("publish-open");
+        fs::create_dir_all(&path).unwrap();
+        let slot = snapshot_path(&path, 0);
+        persist_slot(&slot, b"first").unwrap();
+        // A virus scan or a backup tool reading the old slot.
+        let reader = fs::File::open(&slot).unwrap();
+        persist_slot(&slot, b"second").unwrap();
+        drop(reader);
+        assert_eq!(fs::read(&slot).unwrap(), b"second");
+        let names = || {
+            let mut names: Vec<_> = fs::read_dir(&path)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(names(), [format!("{EXCHANGE_INDEX_FILE_PREFIX}.0.bin")]);
+        // A publish that cannot replace its target keeps the target and
+        // removes its temporary.
+        let blocked = snapshot_path(&path, 1);
+        fs::create_dir(&blocked).unwrap();
+        assert!(persist_slot(&blocked, b"third").is_err());
+        assert!(blocked.is_dir());
+        assert_eq!(names().len(), 2);
         let _ = fs::remove_dir_all(path);
     }
 }

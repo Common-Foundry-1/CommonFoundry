@@ -18,6 +18,10 @@ Both connect to the chain through one of:
 - **Own node:** `cmfd-node run --exchange-rpc-bind 127.0.0.1:<port>
   --exchange-rpc-auth-file <file>`, reachable on loopback only. See
   [START-HERE](START-HERE.md) and the [full integration guide](../docs/exchange-integration.md).
+  From 1.0.16 the node holds its 6 GiB model bank in memory when at least
+  8 GiB is available, counting a container's memory limit, and otherwise
+  reads it from disk for each block; `--work-bank streamed|resident` sets
+  this.
 
 Keys never leave your systems in either setup: the endpoint and the node only
 see public keys and signed transactions.
@@ -27,15 +31,24 @@ see public keys and signed transactions.
 | Item | Value |
 |---|---|
 | Unit | 1 CMFD = 100,000,000 atoms; the exchange RPC uses decimal atom strings, the exchange wallet CMFD numbers |
-| Address | 64 lowercase hex characters: a BIP340 x-only public key (`destination_hex`); no checksum |
+| Address | A BIP340 x-only public key, written either as 64 lowercase hex characters (`destination_hex`, no checksum) or as a checksummed bech32m address, `cmfd1` + 58 characters (BIP-350; `tcmfd1…` on test networks). Both forms are accepted wherever an address is an input; the exchange RPC answers in hex |
 | Block target | 60 seconds |
 | Coinbase maturity | 100 blocks (`spendable_height` = block height + 100) |
 | Minimum fee | 0.1 CMFD (10,000,000 atoms) per transaction; the fee is burned |
 | Transaction limits | 128 inputs, 128 outputs, 64 KiB encoded |
 
-Because addresses carry no checksum, validate every customer withdrawal address
-before accepting it: it must be 64 lowercase hex characters, and
-`exchange-tx-sign` rejects anything that is not a valid public key.
+Both forms name the same key, so hex addresses issued before 1.0.16 stay valid
+and need no migration. Only the checksummed form catches typos: a hex address
+with a wrong character can still be a valid key. Validate every customer
+withdrawal address before accepting it, with `validateaddress` in the exchange
+wallet. With the exchange RPC, every destination parameter and
+`exchange-tx-sign` reject a bad checksum, an address for another network, and
+anything that is not a valid public key.
+
+Which form to show customers: both pay the same key. The checksummed form
+protects customers whose software checks it (the desktop wallet from 1.0.16,
+this wallet's `validateaddress`). Desktop wallets up to 1.0.15 accept only hex,
+so show hex, or both forms, until your customers have upgraded.
 
 ## 1. The exchange wallet (recommended)
 
@@ -57,6 +70,18 @@ rpcpassword=<at least 16 random characters>
 upstream=https://sg-rpc.commonfoundry.ai/mainnet
 upstreamuser=<your hosted endpoint user>
 upstreampassword=<your hosted endpoint password>
+# Optional second endpoint, used while the first one fails or does not pass
+# the checks described below. Set all three or none.
+#fallbackupstream=https://<second endpoint>/mainnet
+#fallbackupstreamuser=<user for the second endpoint>
+#fallbackupstreampassword=<password for the second endpoint>
+# The one address form every method prints: hex (the default, as before
+# 1.0.16) or bech32m (checksummed cmfd1... addresses). Both forms are always
+# accepted as input. Pick one before you hand out addresses: your database
+# stores whatever getnewaddress and listsinceblock print. Keep hex on a wallet
+# that has already handed out addresses; bech32m is for a new wallet before
+# its first address. To show cmfd1... to customers, convert it in your UI.
+#addressformat=bech32m
 ```
 
 Start it with the node binary from the signed release:
@@ -71,6 +96,38 @@ will ever hand out derives from it, so one backup is enough; you do not need a
 new backup after `getnewaddress`. Encrypt it with `encryptwallet`, then call
 `walletpassphrase` before sending, exactly as with bitcoind. Logs go to
 `<wallet-dir>/logs`. Run one wallet process per `wallet.json`.
+
+### Which chain the wallet follows
+
+From 1.0.16, nodes independently re-execute each block's work before they
+accept it. The wallet follows an endpoint only while the endpoint's
+`getblockchaininfo` reports `work_rule` with `enforced: true`,
+`halted: false` and `engine_ready: true`, and a `checkpoint_height` at or above
+the checkpoint this wallet release was built with, and only if the endpoint's
+block at that height is this release's checkpoint block. A later release that
+moves the checkpoint forward therefore does not stop an older wallet, but a
+newer wallet stops following an endpoint whose checkpoint is older than its
+own: upgrade the node first (see [Upgrading the wallet](#upgrading-the-wallet)).
+The
+wallet follows the endpoint's chain up to `work_rule.validated_height`, never
+past it. `work_rule.bank` (`"resident"`, `"streamed"` or `null`) says how the
+node's CPU engine reads the model bank; it is informational, and nodes older
+than 1.0.16 omit it.
+
+Otherwise the wallet stops following the chain, and new deposits wait. Its
+`getblockchaininfo` then reports `initialblockdownload: true` with the reason
+in `warnings`, and it resumes by itself once the endpoint passes again. While
+it is refused, chain reads the wallet passes to the endpoint (`getblock`,
+`getrawtransaction`, `getrawmempool`, `gettxoutsetinfo`) fail with -9, and
+`getblockhash` answers only up to the wallet's own tip. With a second endpoint
+configured, the wallet switches to it, after the same checks, while the first
+one fails or does not pass. Every five minutes it checks the first one again
+and goes back to it only once it passes and has reached the wallet's tip. A
+payment the followed endpoint cannot take is sent through the other one, but
+every chain read goes to the endpoint the wallet follows. After a start, chain
+reads fail with -9 until an endpoint passes the checks. If the endpoint's
+validated height falls below the wallet's tip on another branch, the wallet
+leaves that branch.
 
 Use any Bitcoin Core client library or `bitcoin-cli`:
 
@@ -101,8 +158,16 @@ Credit deposits after at least 60 confirmations, for example with
 
 ### What differs from Bitcoin Core
 
-- **Addresses** are 64 lowercase hex characters (an x-only public key) with no
-  checksum. Check every customer withdrawal address with `validateaddress`.
+- **Addresses** are x-only public keys. Every method accepts them as 64
+  lowercase hex characters or as checksummed `cmfd1…` addresses (all lowercase
+  or all uppercase), and prints them in the `addressformat` setting's form
+  (hex unless set). Check every customer withdrawal address with
+  `validateaddress`. It returns `isvalid`; `address`, the canonical form in
+  the configured format; `pubkey`, the key in hex; and `format`, the form the
+  caller passed (`hex` or `bech32m`). An invalid address returns
+  `isvalid: false` and an `error` that names the problem: a bad checksum,
+  another network, mixed case, or not a key. `sendmany` refuses the same key
+  written in both forms as a duplicated address.
 - **Fees** are the network minimum, 0.1 CMFD per transaction, burned.
   `settxfee`, `fee_rate` and `conf_target` are accepted and ignored;
   `estimatesmartfee` returns 0.1.
@@ -137,6 +202,34 @@ and start the wallet. It rescans from the block at which the wallet was created
 (about 4 blocks per second from the hosted endpoint) and finds every address,
 including ones handed out after the backup was taken.
 
+### Upgrading the wallet
+
+At this and every later release, upgrade the node the wallet reads from
+first, then the wallet. On the hosted endpoint, wait until it runs the new
+release (its `getblockchaininfo` shows the new `work_rule.checkpoint_height`);
+on your own node, wait until its first start has checked its stored blocks
+(`work_rule.validated_height` reaches the tip). A wallet that is newer than its
+endpoint stops following it and new deposits wait until the endpoint is
+upgraded. A 1.0.15 wallet against a 1.0.16 endpoint keeps working: it waits
+for blocks above the height the endpoint serves and credits nothing early.
+To upgrade, replace `cmfd-node` and restart the wallet; `wallet.json` and
+`cmfd-wallet.conf` stay as they are.
+
+What changed for integrations in 1.0.16:
+
+- Every method accepts `cmfd1…` addresses as input; output follows the new
+  optional `addressformat` setting (hex unless set).
+- `validateaddress` returns the canonical `address` and adds `pubkey` and
+  `format`.
+- New optional `fallbackupstream`, `fallbackupstreamuser` and
+  `fallbackupstreampassword` settings (see [Setup](#setup)).
+- The wallet follows an endpoint only while it passes the checks in
+  [Which chain the wallet follows](#which-chain-the-wallet-follows). While it
+  is refused, `getblockchaininfo` reports `initialblockdownload: true` with the
+  reason in `warnings`, and chain reads passed to the endpoint return -9.
+- `getblockhash` above the wallet's own tip returns -8 from the wallet itself;
+  it is no longer passed to the endpoint.
+
 ## 2. Building transactions yourself
 
 This is the lower-level route: you hold one key file per address, detect
@@ -149,17 +242,18 @@ with the node binary from the signed release. This runs offline:
 
 ```sh
 cmfd-node exchange-key-new --output /secure/keys/customer-000123.key
-# {"status":"created","key_file":"...","destination_hex":"9f0c…","warning":"…"}
+# {"status":"created","key_file":"...","destination_hex":"9f0c…","address":"cmfd1…","warning":"…"}
 cmfd-node exchange-key-show --key /secure/keys/customer-000123.key
 ```
 
 The key file holds the 32-byte secret as 64 hex characters. It is created new
 (never overwritten) and owner-only on Unix. It is the only copy of the secret:
 back it up under your own key-management policy. Show customers the
-`destination_hex`.
+`destination_hex`, the checksummed `address`, or both (see
+[Chain facts](#chain-facts)).
 
 Keys can also be produced by any BIP340 implementation. The node accepts any
-valid x-only public key as a destination.
+valid x-only public key as a destination, in hex or as a `cmfd1…` address.
 
 ### Detecting deposits
 
@@ -192,8 +286,34 @@ Register each deposit address once, then follow one event stream:
 confirmations (about one hour). Coinbase deposits
 (`"coinbase": true`) can only be spent once `getblockcount + 1 ≥ spendable_height`.
 
+**The validated height.** From 1.0.16 the node re-executes each block's work
+before it counts the block. `getblockcount`, `getbestblockhash`,
+`getblockhash`, `getblock`, transaction confirmations and the deposit events
+stop at the node's validated height (`getblockchaininfo` →
+`work_rule.validated_height`, also reported as `blocks`). Blocks above it are
+stored but not yet checked by the node, and are reported as not found. The
+validated height normally equals the tip. If it falls behind, for example while
+a restarted node checks blocks it stored earlier, deposit events already
+reported above it stay as they are: none is removed (only a reorganization
+removes one) and no new one is added until the blocks are checked. Until then
+the confirmations of an event above the validated height, counted from
+`getblockcount`, are zero or negative (treat them as 0), and
+`indexed_tip` can be above `getblockcount`. Watch registration waits with the
+retryable `work_check_pending` (-32030).
+
+`getaddressbalance`, `getaddressutxos`, `gettxoutsetinfo` and
+`preparewithdrawal` read the chain state at the node's tip, which includes the
+unchecked blocks. While there are any, they fail with the retryable
+`work_check_pending` (-32030), and they answer again once the validated height
+reaches the tip. On the first start after an upgrade the node first checks
+every block it stored since the release checkpoint, which can take many hours
+(see the [full integration guide](../docs/exchange-integration.md#the-served-chain-and-the-validated-height));
+keep retrying. Credit deposits from the events and the confirmations above.
+
 Without watch registration you can instead poll `getaddressbalance` /
-`getaddressutxos` per address, but the event stream scales better and reports
+`getaddressutxos` per address and credit an output only once
+`getblockcount − blockheight + 1` reaches 60 for its transaction
+(`gettransaction`); the event stream scales better and reports
 reorganizations explicitly.
 
 ### Sweeping and withdrawals
@@ -232,7 +352,10 @@ Spend with `exchange-tx-sign`, then broadcast the hex it prints.
    broadcasting, then submit:
    `{"method":"sendrawtransaction","params":["<transaction_hex>"]}`.
 5. Track it with `gettransaction [txid]`: `status` moves from `mempool` to
-   `confirmed` and `confirmations` counts up.
+   `confirmed` and `confirmations` counts up. A transaction in a block above
+   the validated height reads `pending_check`, with no block and 0
+   confirmations, until the node has checked that block. It is mined, not
+   dropped: do not build a replacement.
 
 A sweep is the same request with many deposit-key inputs (up to 128) and one
 output to the hot wallet.
@@ -265,7 +388,17 @@ Every error carries `error.data.code` and `error.data.retryable`. Retry only
 when `retryable` is true, and never let a timeout trigger a new withdrawal
 transaction: look the txid up first. The machine-readable catalog is
 [errors.json](errors.json). On the hosted endpoint, `upstream_busy` (retryable)
-means the node was momentarily at capacity.
+means the node was momentarily at capacity. `work_rule_halted` and
+`work_engine_failed` (code -32030, retryable) mean the node has halted block
+admission or cannot check new blocks; chain, balance and deposit reads and
+broadcasts wait until its operator acts, while `getblockchaininfo` and
+`getexchangeinfo` still answer. Pause crediting and withdrawals and retry
+later. `work_check_pending` (also -32030, retryable) means the node is still
+checking stored blocks above its validated height; balance and UTXO reads,
+`preparewithdrawal` and watch registration wait for it, and other reads answer.
+`mempool_close_limit` (-32005, retryable) applies only to payment-channel
+closes, never to deposits, sweeps or withdrawals: the mempool already holds its
+budget of closes, and the identical close can be sent again later.
 
 ## 3. Hosted endpoint specifics
 

@@ -76,6 +76,11 @@ impl ProofSummary {
         }
     }
 
+    /// Whether the pruned proof was a ProductionV4 candidate proof.
+    pub(crate) const fn is_v4_candidate(&self) -> bool {
+        self.kind == 4
+    }
+
     pub fn kind_name(&self) -> &'static str {
         match self.kind {
             1 => "v1_legacy",
@@ -398,6 +403,25 @@ pub fn candidate_path(data_dir: &Path, height: u64) -> PathBuf {
     candidate_directory(data_dir).join(format!("{height:012}{STATE_FILE_SUFFIX}"))
 }
 
+/// The names, inside `data_dir`, of the saved chain-state candidates folder
+/// and the anchor files, those that exist.
+pub(crate) fn prune_state_names(data_dir: &Path) -> io::Result<Vec<String>> {
+    let mut names = Vec::new();
+    if candidate_directory(data_dir).exists() {
+        names.push(CANDIDATE_DIRECTORY.to_owned());
+    }
+    for entry in fs::read_dir(data_dir)? {
+        let name = entry?.file_name();
+        if let Some(name) = name.to_str()
+            && name.starts_with(ANCHOR_PREFIX)
+            && name.ends_with(STATE_FILE_SUFFIX)
+        {
+            names.push(name.to_owned());
+        }
+    }
+    Ok(names)
+}
+
 pub fn anchor_path(data_dir: &Path, height: u64) -> PathBuf {
     data_dir.join(format!("{ANCHOR_PREFIX}{height:012}{STATE_FILE_SUFFIX}"))
 }
@@ -553,7 +577,7 @@ pub fn remove_if_present(path: &Path) -> Result<(), NodeError> {
 // ---------------------------------------------------------------------------
 // Pruning a live node
 
-const TEMPORARY_LOG_FILE: &str = "blocks.log.prune-tmp";
+pub(crate) const TEMPORARY_LOG_FILE: &str = "blocks.log.prune-tmp";
 /// Saved candidates kept beyond what the keep window needs.
 const SPARE_CANDIDATES: u64 = 4;
 
@@ -844,8 +868,30 @@ impl super::Node {
         if self.storage_faulted {
             return Err(NodeError::StorageFaulted);
         }
+        // A node halted by the work rule keeps every proof it has: the halted
+        // block is evidence, and the operator removes it from the full log.
+        if self.work_rule_halted() {
+            return Ok(None);
+        }
         let tip_height = self.state.next_height().saturating_sub(1);
-        let limit = tip_height.saturating_sub(keep);
+        let mut limit = tip_height.saturating_sub(keep);
+        // A block whose work is not checked yet keeps its proof, and so does
+        // everything above it; checked blocks below it can still be pruned.
+        if let Some(unverified) = self.lowest_unverified_full_height()
+            && unverified <= limit
+        {
+            tracing::warn!(
+                target: "work_rule",
+                height = unverified,
+                prune_limit = limit,
+                "pruning is held below an active block whose work is not verified yet. If this \
+                 node has one kind of work engine and it keeps finding that the block does not \
+                 match, `cmfd-node work-reconsider <block id>` only makes it check the block \
+                 again; if the block matches on another node or on the explorer, this node needs \
+                 a release that moves the checkpoint past it: report it to the release maintainers"
+            );
+            limit = unverified.saturating_sub(1);
+        }
         let floor = self.prune_height().unwrap_or(0);
         let mut chosen = None;
         for height in list_candidates(&self.data_dir).into_iter().rev() {
@@ -1067,6 +1113,16 @@ impl super::Node {
         }
         let anchor_height = anchor.height;
         self.index.blocks = blocks;
+        // Their index entries go too, which leaves what a full scan of the
+        // new log builds: the index cache loader refuses an entry for a block
+        // the fork index does not hold, and would scan the log on every start.
+        let retained = &self.index.blocks;
+        self.index
+            .transactions
+            .retain_blocks(|block_id| retained.contains_key(block_id));
+        self.index
+            .addresses
+            .retain_blocks(|block_id| retained.contains_key(block_id));
         self.index.anchor = Some(Arc::new(super::PruneAnchor {
             block_id: anchor.block_id,
             height: anchor_height,
@@ -1083,9 +1139,20 @@ impl super::Node {
         self.remember_active_branch_checkpoint(true);
         let _ = self.persist_startup_snapshot();
         // The new file was written from authenticated reads, so it counts as
-        // verified history; work planned against the old file restarts.
+        // verified history; work planned against the old file restarts. Hint
+        // address entries from an older index cache still need the scrub to
+        // decode their records, so while any remain on retained blocks the
+        // scrub runs a pass over the new file.
         self.log_epoch = self.log_epoch.saturating_add(1);
-        self.history_scrub = super::history_scrub::Progress::verified(self.record_count);
+        let hints_retained = self
+            .index
+            .addresses
+            .has_hints_in(|block_id| self.index.blocks.contains_key(block_id));
+        self.history_scrub = if hints_retained {
+            super::history_scrub::Progress::default()
+        } else {
+            super::history_scrub::Progress::verified(self.record_count)
+        };
         let _ = self.persist_index_cache();
         for height in list_anchors(&self.data_dir) {
             if durable && height != anchor_height {

@@ -1,8 +1,9 @@
 //! End-to-end checks of opt-in proof pruning on a devnet node.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use cmfd_consensus::wire::{decode_block, decode_transaction};
 use cmfd_consensus::{Block, COINBASE_MATURITY};
@@ -279,10 +280,71 @@ fn pruned_node_keeps_history_restarts_reorganizes_and_refuses_deep_forks() {
     // The abandoned blocks 139..140 forked below the new anchor and are gone.
     assert_eq!(report.dropped_side_blocks, 2);
     assert_eq!(pruning::list_anchors(&dir.0), vec![192]);
+    // The running node no longer names them either; the cache writer's own
+    // filter must not be what keeps the cache below clean.
+    let (transactions, addresses) = index_entries(&node);
+    assert!(!transactions.is_empty() && !addresses.is_empty());
+    for (_, block_id, _) in &transactions {
+        assert!(node.index.blocks.contains_key(block_id));
+    }
+    for (_, location) in addresses.keys() {
+        assert!(node.index.blocks.contains_key(&location.block_id));
+    }
     drop(node);
+    // Their index entries went with them, so the index cache the prune wrote
+    // still loads: the restart scans no history and leaves it to the scrub.
     let node = Node::open_with_profile(&dir.0, DEVNET_PROFILE).unwrap();
     assert_eq!(node.prune_height(), Some(192));
     assert_eq!(tip_height(&node), 210);
+    assert!(node.startup_snapshot_used);
+    assert!(!node.status().unwrap().history_scrub_complete);
+    let cached = index_entries(&node);
+    let shared = std::sync::Mutex::new(node);
+    history_scrub::scrub(&shared, &AtomicBool::new(false), false).unwrap();
+    let mut node = shared.into_inner().unwrap();
+    let status = node.status().unwrap();
+    assert!(status.history_scrub_complete);
+    assert!(status.storage_healthy);
+    let found = |node: &mut Node| {
+        node.explorer_transaction(&hex::encode(txid))
+            .unwrap()
+            .unwrap()
+            .block_height
+    };
+    assert_eq!(found(&mut node), Some(tx_height));
+    drop(node);
+
+    // A full scan of the pruned log builds the same indexes.
+    fs::remove_file(dir.0.join("startup-index.bin")).unwrap();
+    let mut node = Node::open_with_profile(&dir.0, DEVNET_PROFILE).unwrap();
+    assert!(node.startup_snapshot_used);
+    assert!(node.status().unwrap().history_scrub_complete);
+    assert_eq!(index_entries(&node), cached);
+    assert_eq!(found(&mut node), Some(tx_height));
+}
+
+type IndexEntries = (
+    BTreeSet<([u8; 32], [u8; 32], usize)>,
+    BTreeMap<
+        ([u8; 32], explorer_address_index::AddressLocation),
+        Option<explorer_address_index::AddressActivity>,
+    >,
+);
+
+/// Every transaction and address index entry, to compare two starts.
+fn index_entries(node: &Node) -> IndexEntries {
+    (
+        node.index
+            .transactions
+            .entries()
+            .map(|(txid, location)| (txid, location.block_id, location.transaction_position))
+            .collect(),
+        node.index
+            .addresses
+            .entries()
+            .map(|(address, location, facts)| ((address, location), facts))
+            .collect(),
+    )
 }
 
 #[test]
@@ -508,4 +570,143 @@ fn already_pruned_history_counts_at_its_real_size_for_free_space() {
     let report = node.prune_block_log();
     pruning::set_free_space_for_test(None);
     assert_eq!(report.unwrap().unwrap().anchor_height, 192);
+}
+
+#[test]
+fn a_pruned_node_checks_checkpoint_ancestry_through_its_pruned_history() {
+    use crate::honest_work::WorkEngineKind;
+    use crate::work_gate::test_support::{ScriptedEngine, install, recorded};
+
+    let dir = TestDirectory::new("work-rule");
+    let mut node = Node::open_with_profile(&dir.0, DEVNET_PROFILE).unwrap();
+    let miner = node.wallet_destination();
+    node.prune_keep_blocks = Some(10);
+    mine_to(&mut node, 140, miner);
+    node.prune_block_log().unwrap().unwrap();
+    drop(node);
+
+    // Reopened, the pruned history is read back from its records, and a
+    // checkpoint inside it is still the new block's ancestor.
+    let mut node = Node::open_with_profile(&dir.0, DEVNET_PROFILE).unwrap();
+    assert_eq!(node.prune_height(), Some(128));
+    let checkpoint = node.active_block_id_at_height(5).unwrap();
+    assert!(node.block_is_pruned(checkpoint));
+    let timestamp = DEVNET_GENESIS_TIMESTAMP + 141 * 60;
+    let block = fork_block(&node, node.state.tip(), timestamp, miner);
+    let engine = ScriptedEngine::new(WorkEngineKind::Cpu);
+    engine.answer(&block, true);
+    let rule =
+        cmfd_consensus::ForgeMatrixV4WorkRule::with_pinned_heights(5, checkpoint, []).unwrap();
+    install(&mut node, Some(rule), Some(engine.clone()), None);
+    let shared = Arc::new(Mutex::new(node));
+    submit_shared_block(&shared, block.clone(), timestamp).unwrap();
+    assert_eq!(engine.block_calls(), 1);
+    let node = shared.lock().unwrap();
+    assert_eq!(node.state.tip(), block.block_id());
+    assert_eq!(recorded(&node), (1, 0));
+}
+
+#[test]
+fn unchecked_blocks_keep_their_proofs_and_pruning_resumes_once_they_are_checked() {
+    use crate::honest_work::WorkEngineKind;
+    use crate::work_gate::WorkBacklog;
+    use crate::work_gate::test_support::{ScriptedEngine, install};
+
+    let dir = TestDirectory::new("work-backlog");
+    let mut node = Node::open_with_profile(&dir.0, DEVNET_PROFILE).unwrap();
+    let miner = node.wallet_destination();
+    node.prune_keep_blocks = Some(10);
+    mine_to(&mut node, 64, miner);
+    let mut stored = Vec::new();
+    while tip_height(&node) < 100 {
+        stored.push(mine(&mut node, miner));
+    }
+    // Stored by an earlier release: blocks 1..=64 pruned, the rest full, none
+    // of them checked.
+    assert_eq!(node.prune_block_log().unwrap().unwrap().anchor_height, 64);
+    while tip_height(&node) < 140 {
+        stored.push(mine(&mut node, miner));
+    }
+    let engine = ScriptedEngine::new(WorkEngineKind::Cpu);
+    for block in &stored {
+        engine.answer(block, true);
+    }
+    install(&mut node, None, Some(engine.clone()), None);
+    assert_eq!(node.lowest_unverified_full_height(), Some(65));
+    assert!(node.prune_block_log().unwrap().is_none());
+
+    let shared = Arc::new(Mutex::new(node));
+    let mut backlog = WorkBacklog::new();
+    for _ in 65..=100 {
+        backlog.run_turn(&shared, &|| false).unwrap();
+    }
+    {
+        let mut node = shared.lock().unwrap();
+        assert_eq!(node.lowest_unverified_full_height(), Some(101));
+        assert!(
+            node.prune_block_log().unwrap().is_none(),
+            "the next usable anchor is above an unchecked block"
+        );
+    }
+    while backlog.run_turn(&shared, &|| false).unwrap() != crate::work_gate::WorkBacklogTurn::Idle {
+    }
+    let mut node = shared.lock().unwrap();
+    assert_eq!(engine.block_calls(), stored.len());
+    // The pruned blocks below are not checked yet (Devnet's pruned records
+    // keep no claim to check), but they no longer hold pruning back.
+    assert_eq!(node.work_validated_height(), Some(0));
+    assert_eq!(node.lowest_unverified_full_height(), None);
+    // A node halted by the work rule keeps every proof.
+    crate::work_gate::test_support::set_halted(&node, true);
+    assert!(node.prune_block_log().unwrap().is_none());
+    crate::work_gate::test_support::set_halted(&node, false);
+    assert_eq!(node.prune_block_log().unwrap().unwrap().anchor_height, 128);
+}
+
+#[test]
+fn a_pruned_stored_block_off_the_pinned_chain_needs_a_resync() {
+    use crate::honest_work::{HonestWorkChecker, WorkEngine, WorkEngineKind};
+    use crate::work_gate::test_support::ScriptedEngine;
+
+    let dir = TestDirectory::new("work-resync");
+    let mut node = Node::open_with_profile(&dir.0, DEVNET_PROFILE).unwrap();
+    let miner = node.wallet_destination();
+    node.prune_keep_blocks = Some(10);
+    mine_to(&mut node, 140, miner);
+    node.prune_block_log().unwrap().unwrap();
+    let checkpoint = node.active_block_id_at_height(5).unwrap();
+    let stored = node.active_block_id_at_height(3).unwrap();
+    assert!(node.block_is_pruned(stored));
+    let rule =
+        cmfd_consensus::ForgeMatrixV4WorkRule::with_pinned_heights(5, checkpoint, [(3, [7; 32])])
+            .unwrap();
+    node.install_work_rule_for_test(Some(rule));
+    let checker = HonestWorkChecker::new(
+        Some(ScriptedEngine::new(WorkEngineKind::Cpu) as Arc<dyn WorkEngine>),
+        None,
+        false,
+    )
+    .unwrap();
+    let error = node.install_work_checker(Arc::new(checker)).unwrap_err();
+    assert!(matches!(error, NodeError::WorkRuleResyncRequired(id) if id == stored));
+    assert_eq!(error.client_error().code, "work_rule_resync_required");
+
+    // Nor can a pruned block be removed from the log.
+    drop(node);
+    let evidence = dir.0.join("evidence");
+    let log_bytes = fs::metadata(dir.0.join(BLOCK_LOG_FILE)).unwrap().len();
+    assert!(matches!(
+        crate::storage::quarantine_block_log_from_block(
+            &dir.0,
+            DEVNET_PROFILE,
+            Some(stored),
+            &evidence
+        ),
+        Err(NodeError::WorkRuleResyncRequired(id)) if id == stored
+    ));
+    assert!(!evidence.exists());
+    assert_eq!(
+        fs::metadata(dir.0.join(BLOCK_LOG_FILE)).unwrap().len(),
+        log_bytes
+    );
 }

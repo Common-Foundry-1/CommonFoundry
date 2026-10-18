@@ -209,7 +209,8 @@ enum Command {
         /// CPU preparation workers per GPU; 0 automatically divides host threads across GPUs.
         #[arg(long, default_value_t = AUTO_WORKERS_PER_GPU)]
         workers_per_gpu: usize,
-        /// 32-byte x-only Schnorr payout key as 64 hexadecimal characters.
+        /// 32-byte x-only Schnorr payout key: a checksummed address (cmfd1...)
+        /// or 64 hexadecimal characters.
         #[arg(long)]
         miner: Option<String>,
         /// Seconds between rig-rate reports.
@@ -225,7 +226,8 @@ enum Command {
         /// Complete cmfd+tls://NUMERIC_IP:PORT?pin=64_HEX pool URL.
         #[arg(long)]
         pool: String,
-        /// 32-byte x-only payout address as 64 hexadecimal characters.
+        /// 32-byte x-only payout address: a checksummed address (cmfd1...) or
+        /// 64 hexadecimal characters.
         #[arg(long)]
         miner: String,
         /// Pool worker name: 1-32 letters, numbers, dots, underscores, or hyphens.
@@ -260,7 +262,8 @@ enum Command {
         /// Allow a numeric public peer address for explicitly enabled public testing.
         #[arg(long)]
         allow_public_peers: bool,
-        /// 32-byte x-only Schnorr payout key as 64 hexadecimal characters.
+        /// 32-byte x-only Schnorr payout key: a checksummed address (cmfd1...)
+        /// or 64 hexadecimal characters.
         #[arg(long)]
         miner: String,
         /// Nonce to qualify. The low-difficulty tester network normally uses zero.
@@ -323,7 +326,8 @@ enum Command {
         /// Exact canonical RCNET1-LAUNCH-CANDIDATE-V2.json.
         #[arg(long)]
         candidate: PathBuf,
-        /// 32-byte x-only Schnorr payout key as 64 hexadecimal characters.
+        /// 32-byte x-only Schnorr payout key: a checksummed address (cmfd1...)
+        /// or 64 hexadecimal characters.
         #[arg(long)]
         miner: String,
         /// Complete release-pinned ProductionV4 model bank.
@@ -485,7 +489,8 @@ enum Command {
         /// CPU preparation workers per GPU; 0 automatically divides host threads across GPUs.
         #[arg(long, default_value_t = AUTO_WORKERS_PER_GPU)]
         workers_per_gpu: usize,
-        /// 32-byte x-only Schnorr payout key as 64 hexadecimal characters.
+        /// 32-byte x-only Schnorr payout key: a checksummed address (cmfd1...)
+        /// or 64 hexadecimal characters.
         #[arg(long)]
         miner: Option<String>,
         /// Seconds between rig-rate reports.
@@ -6722,6 +6727,42 @@ mod tests {
         })
         .unwrap_err();
         assert!(error.to_string().contains("cmfd-miner mine --peer"));
+        assert!(!data_dir.exists());
+    }
+
+    /// Every ProductionV4 network (mainnet, RCNet, the V4 testnet) re-executes
+    /// each block's work before admitting it. The embedded node does not mine
+    /// there: a V4 block goes to a node that checks it. The refusal comes
+    /// before any data directory, node, listener or CUDA library is opened.
+    #[cfg(all(feature = "production-v4-testnet", not(feature = "production-v3")))]
+    #[test]
+    fn production_v4_full_node_refuses_before_opening_a_node_or_cuda() {
+        assert_eq!(
+            mining_runtime(COMPILED_NETWORK_PROFILE),
+            MiningRuntime::ProductionV4
+        );
+        let data_dir =
+            std::env::temp_dir().join(format!("cmfd-disabled-v4-full-node-{}", std::process::id()));
+        assert!(!data_dir.exists());
+        let error = run_full_node_miner(FullNodeMinerOptions {
+            data_dir: data_dir.clone(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            peers: Vec::new(),
+            allow_public_peers: false,
+            requested_devices: Vec::new(),
+            cuda_library: Some(PathBuf::from("missing-cuda-library")),
+            batch_size: 0,
+            workers_per_gpu: 0,
+            miner: None,
+            stats_seconds: 0,
+        })
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("ProductionV4 embedded mining is not supported"),
+            "{error}"
+        );
         assert!(!data_dir.exists());
     }
 

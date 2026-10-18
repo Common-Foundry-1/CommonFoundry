@@ -45,6 +45,9 @@ struct ReadPlan {
     instance: u64,
     revision: u64,
     chain: Vec<[u8; 32]>,
+    /// The highest height the exchange RPC serves (see
+    /// [`Node::exchange_served_cap`]); blocks above it are not reported.
+    served: u64,
     log: crate::LogReadHandle,
     path: PathBuf,
     network: [u8; 32],
@@ -65,6 +68,10 @@ pub(crate) struct TransactionRead {
     pub confirmations: i64,
     pub tip: [u8; 32],
     pub tip_height: u64,
+    /// The transaction is in an active block above the served height: mined,
+    /// but its block's work is not yet re-executed here, so it is reported
+    /// with no block and no confirmations.
+    pub pending_check: bool,
 }
 
 impl ReadPlan {
@@ -79,6 +86,7 @@ impl ReadPlan {
             instance: node.instance_id,
             revision: node.chain_revision,
             chain: node.index.active_chain.clone(),
+            served: node.exchange_served_cap(),
             log: node.clone_log_for_read().map_err(NodeError::RpcIo)?,
             path: node.data_dir.join(BLOCK_LOG_FILE),
             network: node.params.network_id,
@@ -209,14 +217,18 @@ impl TransactionLookupIndex {
                 Some(id) => id,
                 None => {
                     if let Some(entry) = node.mempool.get(&txid) {
+                        let served = node.exchange_served_cap();
                         return Ok(Some(TransactionRead {
                             body: TransactionBody::Regular(entry.transaction.clone()),
                             block_id: None,
                             height: None,
                             timestamp: None,
                             confirmations: 0,
-                            tip: node.state.tip(),
-                            tip_height: node.state.next_height().saturating_sub(1),
+                            tip: node
+                                .active_block_id_at_height(served)
+                                .ok_or(QueryError::ChainChanged)?,
+                            tip_height: served,
+                            pending_check: false,
                         }));
                     }
                     match node.index.transactions.active_location(&txid, &node.index) {
@@ -239,12 +251,19 @@ impl TransactionLookupIndex {
         let (id, locator) = plan.blocks[0];
         let block = plan.read_checked(shared, id, &locator)?;
         plan.recheck(shared)?;
-        let confirmations = plan
-            .chain
-            .iter()
-            .position(|candidate| *candidate == id)
-            .map(|position| i64::try_from(plan.chain.len() - position).unwrap_or(i64::MAX))
-            .unwrap_or(-1);
+        // A transaction in an active block above the served height is
+        // reported without its block: that block's work is not yet
+        // re-executed here.
+        let served = usize::try_from(plan.served).map_err(|_| QueryError::ChainChanged)?;
+        let (confirmations, pending_check) =
+            match plan.chain.iter().position(|candidate| *candidate == id) {
+                Some(position) if position > served => (0, true),
+                Some(position) => (
+                    i64::try_from(served + 1 - position).unwrap_or(i64::MAX),
+                    false,
+                ),
+                None => (-1, false),
+            };
         let height = block.challenge.height;
         let timestamp = block.challenge.timestamp;
         let body = if block.coinbase_outpoint_id() == txid {
@@ -258,12 +277,13 @@ impl TransactionLookupIndex {
         };
         Ok(Some(TransactionRead {
             body,
-            block_id: Some(id),
-            height: Some(height),
-            timestamp: Some(timestamp),
+            block_id: (!pending_check).then_some(id),
+            height: (!pending_check).then_some(height),
+            timestamp: (!pending_check).then_some(timestamp),
             confirmations,
-            tip: *plan.chain.last().ok_or(QueryError::ChainChanged)?,
-            tip_height: plan.chain.len().saturating_sub(1) as u64,
+            tip: *plan.chain.get(served).ok_or(QueryError::ChainChanged)?,
+            tip_height: plan.served,
+            pending_check,
         }))
     }
 }

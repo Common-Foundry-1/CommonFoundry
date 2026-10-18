@@ -592,6 +592,7 @@ impl ExchangeWithdrawalJournal {
         let mut node = lock_node(shared)?;
         self.check_node_binding(&node)?;
         if is_new {
+            node.require_exchange_tip_checked()?;
             let plan = node.plan_dev_wallet_payment(
                 request.destination,
                 request.amount_atoms,

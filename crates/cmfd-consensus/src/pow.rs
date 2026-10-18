@@ -33,7 +33,7 @@ use crate::{
         decode_forgematrix_v4_transparent_proof,
     },
     forgematrix_v4_proof_system_digest, forgematrix_v4_work_digest,
-    verify_model_bank_and_retain_base_input,
+    verify_model_bank_and_retain_base_input_and_layer_roots,
 };
 
 #[cfg(feature = "dory-v3-consensus-adapter")]
@@ -496,6 +496,8 @@ pub enum ForgeMatrixV4ConsensusError {
     WorkDigest,
     #[error("ProductionV4 proof does not meet the block target")]
     HighHash,
+    #[error("ProductionV4 work digest does not match the independently re-executed work")]
+    WorkRecomputationMismatch,
     #[error("ProductionV4 fixed artifact record is invalid: {0}")]
     FixedArtifact(#[from] ForgeMatrixV4FixedArtifactRecordError),
     #[error("ProductionV4 model bank is invalid: {0}")]
@@ -612,6 +614,17 @@ enum ForgeMatrixV3VerifierAuthority {
 pub struct ForgeMatrixV3ConsensusVerifier {
     parameters: ForgeMatrixV3CandidateParameters,
     authority: ForgeMatrixV3VerifierAuthority,
+}
+
+/// What a ProductionV4 verifier retained from its authenticated pass over the
+/// model bank: the manifest it was checked against, the base input and the
+/// plain BLAKE3 root of every layer.
+#[cfg(feature = "forgematrix-v4-verifier")]
+#[derive(Clone, Debug)]
+pub struct ForgeMatrixV4BankIdentity {
+    pub manifest: crate::ModelBankManifest,
+    pub base_input: Arc<[u8]>,
+    pub layer_roots: Arc<[[u8; 32]]>,
 }
 
 #[cfg(feature = "forgematrix-v4-verifier")]
@@ -913,6 +926,20 @@ impl ConsensusPowVerifier {
         fixed_record: ForgeMatrixV4FixedArtifactRecordV1,
         model_bank: ModelBank,
     ) -> Result<Self, PowError> {
+        Self::v4_candidate_for_network_with_layer_roots(network_id, fixed_record, model_bank)
+            .map(|(verifier, _)| verifier)
+    }
+
+    /// Same as [`Self::v4_candidate_for_network`], and also returns the
+    /// authenticated base input and per-layer roots captured during the same
+    /// single pass over the bank, so the bank's layers can later be re-read
+    /// and checked one at a time.
+    #[cfg(feature = "forgematrix-v4-verifier")]
+    pub fn v4_candidate_for_network_with_layer_roots<ModelBank: Read>(
+        network_id: [u8; 32],
+        fixed_record: ForgeMatrixV4FixedArtifactRecordV1,
+        model_bank: ModelBank,
+    ) -> Result<(Self, ForgeMatrixV4BankIdentity), PowError> {
         fixed_record
             .validate()
             .map_err(ForgeMatrixV4ConsensusError::from)?;
@@ -924,16 +951,27 @@ impl ConsensusPowVerifier {
             return Err(ForgeMatrixV4ConsensusError::ParameterMismatch.into());
         }
         let parameters = ForgeMatrixV4CandidateParameters::from_record(network_id, &fixed_record)?;
-        let base_input =
-            verify_model_bank_and_retain_base_input(model_bank, fixed_record.manifest())
-                .map_err(ForgeMatrixV4ConsensusError::from)?;
-        Ok(Self::V4Candidate(Arc::new(VerifierInstance::new(
+        let (base_input, layer_roots) = verify_model_bank_and_retain_base_input_and_layer_roots(
+            model_bank,
+            fixed_record.manifest(),
+        )
+        .map_err(ForgeMatrixV4ConsensusError::from)?;
+        let base_input: Arc<[u8]> = Arc::from(base_input);
+        let verifier = Self::V4Candidate(Arc::new(VerifierInstance::new(
             ForgeMatrixV4ConsensusVerifier {
                 parameters,
                 fixed_commitments: fixed_record.fixed_commitments(),
-                base_input: Arc::from(base_input),
+                base_input: Arc::clone(&base_input),
             },
-        ))))
+        )));
+        Ok((
+            verifier,
+            ForgeMatrixV4BankIdentity {
+                manifest: *fixed_record.manifest(),
+                base_input,
+                layer_roots: Arc::from(layer_roots),
+            },
+        ))
     }
 
     /// Test-only constructor for exercising the bank-read authority boundary

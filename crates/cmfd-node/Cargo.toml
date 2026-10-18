@@ -15,12 +15,15 @@ production-v3 = [
 production-v3-testnet = ["production-v3"]
 production-v4 = [
     "dep:cmfd-launch",
+    "cmfd-consensus/forgematrix-v4-executor",
     "cmfd-consensus/forgematrix-v4-verifier",
     "cmfd-proof-worker/production-v3",
 ]
 production-v4-testnet = ["production-v4"]
 production-rc = ["production-v4"]
 production-mainnet = ["production-v4"]
+# Test work rules (Node::install_work_rule_for_test); never in a release build.
+work-rule-test-support = ["cmfd-consensus/work-rule-test-support"]
 
 [dependencies]
 argon2.workspace = true
@@ -66,6 +69,10 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_SystemServices",
     "Win32_System_Threading",
 ] }
+
+[dev-dependencies]
+cmfd-consensus = { path = "../cmfd-consensus", features = ["work-rule-test-support"] }
+cmfd-marketplace = { path = "../cmfd-marketplace" }
 
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { version = "0.61", features = [

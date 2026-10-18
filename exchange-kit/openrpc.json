@@ -50,7 +50,7 @@
     },
     {
       "name": "getblockcount",
-      "summary": "Return active tip height",
+      "summary": "Return the served chain height: the active tip, or the validated height on a network with a work rule",
       "paramStructure": "by-position",
       "params": [],
       "result": {
@@ -58,6 +58,7 @@
         "schema": { "type": "integer", "minimum": 0 }
       },
       "errors": [
+        { "$ref": "#/components/errors/WorkRuleUnavailable" },
         { "$ref": "#/components/errors/InvalidParams" },
         { "$ref": "#/components/errors/InternalError" }
       ],
@@ -65,7 +66,7 @@
     },
     {
       "name": "getbestblockhash",
-      "summary": "Return active tip block ID",
+      "summary": "Return the block ID at the served chain height",
       "paramStructure": "by-position",
       "params": [],
       "result": {
@@ -73,6 +74,7 @@
         "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/Hash32" }
       },
       "errors": [
+        { "$ref": "#/components/errors/WorkRuleUnavailable" },
         { "$ref": "#/components/errors/InvalidParams" },
         { "$ref": "#/components/errors/InternalError" }
       ],
@@ -80,7 +82,7 @@
     },
     {
       "name": "getblockhash",
-      "summary": "Return active-chain block ID at a height",
+      "summary": "Return the active-chain block ID at a height up to the served chain height",
       "paramStructure": "by-position",
       "params": [
         {
@@ -94,6 +96,7 @@
         "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/Hash32" }
       },
       "errors": [
+        { "$ref": "#/components/errors/WorkRuleUnavailable" },
         { "$ref": "#/components/errors/InvalidParams" },
         { "$ref": "#/components/errors/BlockNotFound" },
         { "$ref": "#/components/errors/InternalError" }
@@ -122,6 +125,7 @@
         "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/BlockResult" }
       },
       "errors": [
+        { "$ref": "#/components/errors/WorkRuleUnavailable" },
         { "$ref": "#/components/errors/InvalidParams" },
         { "$ref": "#/components/errors/BlockNotFound" },
         { "$ref": "#/components/errors/CustodyFault" },
@@ -175,6 +179,7 @@
         }
       },
       "errors": [
+        { "$ref": "#/components/errors/WorkRuleUnavailable" },
         {
           "$ref": "#/components/errors/InvalidParams"
         },
@@ -216,6 +221,7 @@
         }
       },
       "errors": [
+        { "$ref": "#/components/errors/WorkRuleUnavailable" },
         {
           "$ref": "#/components/errors/InvalidParams"
         },
@@ -239,7 +245,7 @@
           "name": "destination_hex",
           "required": true,
           "schema": {
-            "$ref": "./schemas/exchange-rpc.schema.json#/$defs/Hash32"
+            "$ref": "./schemas/exchange-rpc.schema.json#/$defs/Destination"
           }
         },
         {
@@ -275,6 +281,8 @@
         }
       },
       "errors": [
+        { "$ref": "#/components/errors/WorkRuleUnavailable" },
+        { "$ref": "#/components/errors/WorkCheckPending" },
         {
           "$ref": "#/components/errors/InvalidParams"
         },
@@ -298,7 +306,7 @@
           "name": "destination_hex",
           "required": true,
           "schema": {
-            "$ref": "./schemas/exchange-rpc.schema.json#/$defs/Hash32"
+            "$ref": "./schemas/exchange-rpc.schema.json#/$defs/Destination"
           }
         }
       ],
@@ -309,6 +317,8 @@
         }
       },
       "errors": [
+        { "$ref": "#/components/errors/WorkRuleUnavailable" },
+        { "$ref": "#/components/errors/WorkCheckPending" },
         {
           "$ref": "#/components/errors/InvalidParams"
         },
@@ -332,7 +342,7 @@
           "name": "destination_hex",
           "required": true,
           "schema": {
-            "$ref": "./schemas/exchange-rpc.schema.json#/$defs/Hash32"
+            "$ref": "./schemas/exchange-rpc.schema.json#/$defs/Destination"
           }
         }
       ],
@@ -343,6 +353,8 @@
         }
       },
       "errors": [
+        { "$ref": "#/components/errors/WorkRuleUnavailable" },
+        { "$ref": "#/components/errors/WorkCheckPending" },
         {
           "$ref": "#/components/errors/InvalidParams"
         },
@@ -376,6 +388,8 @@
         }
       },
       "errors": [
+        { "$ref": "#/components/errors/WorkRuleUnavailable" },
+        { "$ref": "#/components/errors/WorkCheckPending" },
         { "$ref": "#/components/errors/InvalidParams" },
         { "$ref": "#/components/errors/InternalError" }
       ],
@@ -397,6 +411,7 @@
         "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/MempoolResult" }
       },
       "errors": [
+        { "$ref": "#/components/errors/WorkRuleUnavailable" },
         { "$ref": "#/components/errors/InvalidParams" },
         { "$ref": "#/components/errors/InternalError" }
       ],
@@ -419,6 +434,7 @@
         "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/Hash32" }
       },
       "errors": [
+        { "$ref": "#/components/errors/WorkRuleUnavailable" },
         { "$ref": "#/components/errors/InvalidParams" },
         { "$ref": "#/components/errors/MempoolRejected" },
         { "$ref": "#/components/errors/CustodyFault" },
@@ -440,7 +456,7 @@
         {
           "name": "destination_hex",
           "required": true,
-          "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/Hash32" }
+          "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/Destination" }
         }
       ],
       "result": {
@@ -448,6 +464,8 @@
         "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/WatchDestination" }
       },
       "errors": [
+        { "$ref": "#/components/errors/WorkRuleUnavailable" },
+        { "$ref": "#/components/errors/WorkCheckPending" },
         { "$ref": "#/components/errors/InvalidParams" },
         { "$ref": "#/components/errors/WatchConflict" },
         { "$ref": "#/components/errors/ChainChanged" },
@@ -478,6 +496,8 @@
         "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/WatchRegistrationBatchResult" }
       },
       "errors": [
+        { "$ref": "#/components/errors/WorkRuleUnavailable" },
+        { "$ref": "#/components/errors/WorkCheckPending" },
         { "$ref": "#/components/errors/InvalidParams" },
         { "$ref": "#/components/errors/WatchConflict" },
         { "$ref": "#/components/errors/ChainChanged" },
@@ -531,6 +551,7 @@
         "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/DepositEventPage" }
       },
       "errors": [
+        { "$ref": "#/components/errors/WorkRuleUnavailable" },
         { "$ref": "#/components/errors/InvalidParams" },
         { "$ref": "#/components/errors/ChainChanged" },
         { "$ref": "#/components/errors/CustodyFault" },
@@ -545,12 +566,14 @@
       "paramStructure": "by-position",
       "params": [
         { "name": "request_id", "required": true, "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/VisibleAsciiId" } },
-        { "name": "destination_hex", "required": true, "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/Hash32" } },
+        { "name": "destination_hex", "required": true, "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/Destination" } },
         { "name": "amount_atoms", "required": true, "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/PositiveU64String" } },
         { "name": "fee_atoms", "required": true, "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/CanonicalU64String" } }
       ],
       "result": { "name": "result", "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/WithdrawalV3" } },
       "errors": [
+        { "$ref": "#/components/errors/WorkRuleUnavailable" },
+        { "$ref": "#/components/errors/WorkCheckPending" },
         { "$ref": "#/components/errors/InvalidParams" },
         { "$ref": "#/components/errors/OperationalLimit" },
         { "$ref": "#/components/errors/WithdrawalConflict" },
@@ -601,6 +624,7 @@
       ],
       "result": { "name": "result", "schema": { "$ref": "./schemas/exchange-rpc.schema.json#/$defs/WithdrawalV3" } },
       "errors": [
+        { "$ref": "#/components/errors/WorkRuleUnavailable" },
         { "$ref": "#/components/errors/InvalidParams" },
         { "$ref": "#/components/errors/OperationalLimit" },
         { "$ref": "#/components/errors/WithdrawalConflict" },
@@ -732,6 +756,16 @@
         "code": -32006,
         "message": "wallet has insufficient funds for the withdrawal",
         "data": { "code": "wallet_insufficient_funds", "retryable": false }
+      },
+      "WorkRuleUnavailable": {
+        "code": -32030,
+        "message": "block admission is halted until the node operator acts; retry later",
+        "data": { "code": "work_rule_halted", "retryable": true }
+      },
+      "WorkCheckPending": {
+        "code": -32030,
+        "message": "this node has not yet re-executed the work of every stored block, so it does not answer from its chain state; retry later",
+        "data": { "code": "work_check_pending", "retryable": true }
       },
       "CustodyFault": {
         "code": -32007,

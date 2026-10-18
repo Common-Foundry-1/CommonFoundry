@@ -8,6 +8,11 @@
 //! needs to attribute spent inputs, and the newest entries. The blocks nearest
 //! the scanned tip stay individually undoable, so ordinary tip reorgs roll back
 //! without a rescan; only a reorg below that window rebuilds the cache.
+//!
+//! The cache also remembers the block height each unspent wallet output was
+//! created at, and whether it is the wallet's own change, so that coins in
+//! blocks whose work this node has not yet re-executed can be told apart
+//! without reading those blocks again.
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
@@ -16,7 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 
-use cmfd_consensus::{OutPoint, OutputLock, TxOutput};
+use cmfd_consensus::{InputWitness, OutPoint, OutputLock, TxOutput};
 
 use crate::{
     IndexedBlock, MAX_WALLET_HISTORY, NodeError, WalletHistoryEntry, checked_wallet_add, io_error,
@@ -49,7 +54,16 @@ struct CachedEntry {
 }
 
 impl CachedEntry {
-    fn render(&self, accepted_height: u64, next_height: u64) -> WalletHistoryEntry {
+    /// `validated_height` is the height up to which every active block's
+    /// work has been re-executed, if the network has that rule; an entry
+    /// above it reads as `verifying`, except a payment the wallet sent: its
+    /// change can be spent at once.
+    fn render(
+        &self,
+        accepted_height: u64,
+        next_height: u64,
+        validated_height: Option<u64>,
+    ) -> WalletHistoryEntry {
         WalletHistoryEntry {
             kind: self.kind,
             txid: self.txid.clone(),
@@ -58,7 +72,11 @@ impl CachedEntry {
             confirmations: accepted_height
                 .saturating_sub(self.height)
                 .saturating_add(1),
-            status: if next_height < self.wallet_spendable_height {
+            status: if self.kind != "sent"
+                && validated_height.is_some_and(|validated| self.height > validated)
+            {
+                "verifying"
+            } else if next_height < self.wallet_spendable_height {
                 "immature"
             } else {
                 "confirmed"
@@ -82,12 +100,25 @@ enum OutputChange {
     },
 }
 
+/// Where an unspent wallet output was created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WalletOutputOrigin {
+    /// The height of the block that created it.
+    pub(crate) height: u64,
+    /// It was created by a transaction that spends the wallet's own coins:
+    /// change, or a consolidation.
+    pub(crate) own_change: bool,
+}
+
 #[derive(Debug, Clone)]
 struct ScannedBlock {
     position: usize,
     block_id: [u8; 32],
     entries: Vec<CachedEntry>,
     changes: Vec<OutputChange>,
+    /// Each wallet output origin this block set or cleared, with the value
+    /// it replaced, in order.
+    origin_changes: Vec<(OutPoint, Option<WalletOutputOrigin>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +126,8 @@ pub(crate) struct WalletHistoryCache {
     destination: [u8; 32],
     /// Outputs the scan has seen and not yet seen spent, as of the scanned tip.
     outputs: HashMap<OutPoint, TxOutput>,
+    /// Where each unspent wallet output in `outputs` was created.
+    origins: HashMap<OutPoint, WalletOutputOrigin>,
     /// Last block folded below the undo window; virtual genesis at first.
     folded_position: usize,
     folded_block_id: [u8; 32],
@@ -112,6 +145,7 @@ impl WalletHistoryCache {
         Self {
             destination,
             outputs: HashMap::new(),
+            origins: HashMap::new(),
             folded_position: 0,
             folded_block_id: genesis,
             folded_entries: VecDeque::new(),
@@ -131,6 +165,30 @@ impl WalletHistoryCache {
         self.window
             .back()
             .map_or(self.folded_position, |scanned| scanned.position)
+    }
+
+    /// The block id at [`scanned_position`](Self::scanned_position).
+    fn scanned_block_id(&self) -> [u8; 32] {
+        self.window
+            .back()
+            .map_or(self.folded_block_id, |scanned| scanned.block_id)
+    }
+
+    /// Whether every block this cache scanned is still on `active_chain`, so
+    /// that its view is a prefix of the active chain.
+    pub(crate) fn follows(&self, active_chain: &[[u8; 32]]) -> bool {
+        active_chain.get(self.scanned_position()) == Some(&self.scanned_block_id())
+    }
+
+    /// Where the unspent wallet output `outpoint` was created, if a block the
+    /// cache scanned created it.
+    pub(crate) fn wallet_output_origin(&self, outpoint: &OutPoint) -> Option<WalletOutputOrigin> {
+        self.origins.get(outpoint).copied()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wallet_output_origins(&self) -> &HashMap<OutPoint, WalletOutputOrigin> {
+        &self.origins
     }
 
     #[cfg(test)]
@@ -161,6 +219,16 @@ impl WalletHistoryCache {
                 .window
                 .pop_back()
                 .expect("window back was just observed");
+            for (outpoint, previous) in scanned.origin_changes.into_iter().rev() {
+                match previous {
+                    Some(previous) => {
+                        self.origins.insert(outpoint, previous);
+                    }
+                    None => {
+                        self.origins.remove(&outpoint);
+                    }
+                }
+            }
             for change in scanned.changes.into_iter().rev() {
                 match change {
                     OutputChange::Inserted { outpoint, previous } => match previous {
@@ -212,6 +280,18 @@ impl WalletHistoryCache {
         let timestamp = block.challenge.timestamp;
         let mut entries = Vec::new();
         let mut changes = Vec::new();
+        let mut origin_changes = Vec::new();
+        let mut set_origin = |origins: &mut HashMap<OutPoint, WalletOutputOrigin>,
+                              outpoint: OutPoint,
+                              origin: Option<WalletOutputOrigin>| {
+            let previous = match origin {
+                Some(origin) => origins.insert(outpoint, origin),
+                None => origins.remove(&outpoint),
+            };
+            if previous != origin {
+                origin_changes.push((outpoint, previous));
+            }
+        };
 
         let coinbase_txid = block.coinbase_outpoint_id();
         let mut mined = 0_u64;
@@ -224,6 +304,11 @@ impl WalletHistoryCache {
             if output.lock == OutputLock::Key(destination) {
                 mined = checked_wallet_add(mined, output.value)?;
                 mined_spendable_height = mined_spendable_height.max(output.spendable_height);
+                let origin = WalletOutputOrigin {
+                    height,
+                    own_change: false,
+                };
+                set_origin(&mut self.origins, outpoint, Some(origin));
             }
             let previous = self.outputs.insert(outpoint, output.clone());
             changes.push(OutputChange::Inserted { outpoint, previous });
@@ -251,6 +336,7 @@ impl WalletHistoryCache {
                         "active wallet history transaction refers to an absent output".to_owned(),
                     )
                 })?;
+                set_origin(&mut self.origins, input.previous, None);
                 input_total = checked_wallet_add(input_total, previous.value)?;
                 match previous.lock {
                     OutputLock::Key(owner) if owner == destination => {
@@ -267,6 +353,7 @@ impl WalletHistoryCache {
                 });
             }
             let txid = transaction.txid();
+            let own_change = wallet_inputs > 0;
             let mut output_total = 0_u64;
             let mut wallet_outputs = 0_u64;
             let mut wallet_spendable_height = 0_u64;
@@ -278,6 +365,12 @@ impl WalletHistoryCache {
                         wallet_outputs = checked_wallet_add(wallet_outputs, output.value)?;
                         wallet_spendable_height =
                             wallet_spendable_height.max(output.spendable_height);
+                        let origin = WalletOutputOrigin { height, own_change };
+                        let outpoint = OutPoint {
+                            txid,
+                            index: index as u32,
+                        };
+                        set_origin(&mut self.origins, outpoint, Some(origin));
                     }
                     OutputLock::Key(owner) if recipient.is_none() => {
                         recipient = Some(hex::encode(owner));
@@ -318,6 +411,7 @@ impl WalletHistoryCache {
             block_id,
             entries,
             changes,
+            origin_changes,
         });
         while self.window.len() > self.undo_depth {
             self.fold_oldest();
@@ -325,12 +419,14 @@ impl WalletHistoryCache {
         Ok(())
     }
 
-    /// The newest `limit` entries in chain order, with confirmations and
-    /// maturity evaluated against the current tip.
+    /// The newest `limit` entries in chain order, with confirmations,
+    /// maturity and the work check evaluated against the current tip and
+    /// `validated_height`.
     pub(crate) fn history(
         &self,
         accepted_height: u64,
         next_height: u64,
+        validated_height: Option<u64>,
         limit: usize,
     ) -> Vec<WalletHistoryEntry> {
         let mut newest = Vec::with_capacity(limit.min(MAX_WALLET_HISTORY));
@@ -348,7 +444,7 @@ impl WalletHistoryCache {
         newest.reverse();
         newest
             .into_iter()
-            .map(|entry| entry.render(accepted_height, next_height))
+            .map(|entry| entry.render(accepted_height, next_height, validated_height))
             .collect()
     }
 }
@@ -376,6 +472,104 @@ pub(crate) fn scan(
         cache.extend(*position, *block_id, &block)?;
     }
     Ok(())
+}
+
+/// Every output the active blocks above the validated height created, read
+/// from those blocks themselves. It answers where a wallet coin was created
+/// when the history cache cannot (no snapshot has scanned it yet, as on a
+/// pool or headless node): a coin it does not list was created at or below
+/// the validated height.
+#[derive(Debug)]
+pub(crate) struct UncheckedOutputs {
+    tip: [u8; 32],
+    validated: u64,
+    /// Each output's block height and the keys whose coins its transaction
+    /// spent (none for a coinbase output).
+    origins: HashMap<OutPoint, (u64, Vec<[u8; 32]>)>,
+}
+
+impl UncheckedOutputs {
+    /// Reads `targets`, the active blocks from `validated + 1` to `tip`.
+    pub(crate) fn read(
+        log: &File,
+        log_path: &Path,
+        network_id: [u8; 32],
+        require_v2: bool,
+        tip: [u8; 32],
+        validated: u64,
+        targets: &[ScanTarget],
+    ) -> Result<Self, NodeError> {
+        let mut origins = HashMap::new();
+        for (_, block_id, indexed) in targets {
+            let block =
+                read_indexed_block(log, log_path, indexed, *block_id, network_id, require_v2)?;
+            let height = block.challenge.height;
+            let coinbase_txid = block.coinbase_outpoint_id();
+            for index in 0..block.coinbase.outputs.len() {
+                let outpoint = OutPoint {
+                    txid: coinbase_txid,
+                    index: index as u32,
+                };
+                origins.insert(outpoint, (height, Vec::new()));
+            }
+            for transaction in &block.transactions {
+                // A key witness names the key the spent coin is locked to:
+                // consensus refuses any other.
+                let spenders: Vec<[u8; 32]> = transaction
+                    .inputs
+                    .iter()
+                    .filter_map(|input| match &input.witness {
+                        InputWitness::Key { public_key, .. } => Some(*public_key),
+                        _ => None,
+                    })
+                    .collect();
+                let txid = transaction.txid();
+                for index in 0..transaction.outputs.len() {
+                    let outpoint = OutPoint {
+                        txid,
+                        index: index as u32,
+                    };
+                    origins.insert(outpoint, (height, spenders.clone()));
+                }
+            }
+        }
+        Ok(Self {
+            tip,
+            validated,
+            origins,
+        })
+    }
+
+    /// Whether this answers for the active tip `tip` and validated height
+    /// `validated`: it was read for that tip at or below that height. A
+    /// height the validated height has since passed is told apart by the
+    /// caller, which compares each origin's height with `validated`.
+    pub(crate) fn covers(&self, tip: [u8; 32], validated: u64) -> bool {
+        self.tip == tip && self.validated <= validated
+    }
+
+    /// Where `outpoint`, a coin locked to `owner`, was created, if a block
+    /// above the validated height created it.
+    pub(crate) fn origin(
+        &self,
+        outpoint: &OutPoint,
+        owner: [u8; 32],
+    ) -> Option<WalletOutputOrigin> {
+        self.origins
+            .get(outpoint)
+            .map(|(height, spenders)| WalletOutputOrigin {
+                height: *height,
+                own_change: spenders.contains(&owner),
+            })
+    }
+}
+
+/// The last [`UncheckedOutputs`] read, and the tip and validated height a
+/// read last failed for, which is not tried again for them.
+#[derive(Debug, Default)]
+pub(crate) struct UncheckedOutputsMemo {
+    pub(crate) read: Option<Arc<UncheckedOutputs>>,
+    pub(crate) failed: Option<([u8; 32], u64)>,
 }
 
 /// A whole-chain history scan running off the node lock.

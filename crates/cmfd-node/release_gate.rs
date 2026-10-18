@@ -167,6 +167,43 @@ pub const MAINNET_NETWORK_ID: Option<[u8; 32]> =
 pub const MAINNET_RELEASE_CONFIGURATION: Option<MainnetReleaseConfiguration> =
     include!("mainnet_release_pin.inc.rs");
 
+/// The release work checkpoint as pinned in `cmfd-consensus`, read here from
+/// the same files so the build gate can refuse a release without one. Mirrors
+/// `cmfd_consensus::work_rule::WorkCheckpointPin`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkCheckpointPin {
+    pub height: u64,
+    pub block_id: [u8; 32],
+    pub ids: &'static [u8],
+    pub ids_blake3: [u8; 32],
+}
+
+pub const MAINNET_WORK_CHECKPOINT: Option<WorkCheckpointPin> =
+    include!("../cmfd-consensus/mainnet_work_checkpoint.inc.rs");
+pub const RCNET1_WORK_CHECKPOINT: Option<WorkCheckpointPin> =
+    include!("../cmfd-consensus/rcnet1_work_checkpoint.inc.rs");
+
+/// A release build must pin its work checkpoint. The list's BLAKE3 digest is
+/// checked by the consensus crate's tests and when the rule is first built.
+pub fn validate_work_checkpoint(pin: Option<WorkCheckpointPin>) -> Result<(), &'static str> {
+    let pin = pin.ok_or("work checkpoint is not pinned")?;
+    let expected_bytes = usize::try_from(pin.height)
+        .ok()
+        .and_then(|height| height.checked_mul(32));
+    if pin.height == 0 || expected_bytes != Some(pin.ids.len()) {
+        return Err(
+            "work checkpoint id list does not hold 32 bytes per height up to the checkpoint",
+        );
+    }
+    if pin.block_id == [0; 32] || pin.ids_blake3 == [0; 32] {
+        return Err("work checkpoint block id or list digest is zero");
+    }
+    if pin.ids[pin.ids.len() - 32..] != pin.block_id {
+        return Err("work checkpoint id list does not end at the checkpoint block id");
+    }
+    Ok(())
+}
+
 /// The exact ceremony artifacts accepted by the private ProductionV3 test
 /// network. `RCNET1-MODEL-V2.bank` and its manifest are the miner-side inputs;
 /// `RCNET1-MODEL-RECORD-V2.json` is the small verifier record carried by nodes
@@ -284,6 +321,17 @@ pub const PRODUCTION_V4_ARTIFACT_PINS: ProductionV4ArtifactIdentityPins =
             ],
         },
     };
+
+/// SHA-256 of the `cmfd-v4-replay` worker shipped with the release: the
+/// Linux x86_64 build, which a Windows pool runs through WSL. A pool's
+/// block work checks use its replay workers only while they run this exact
+/// file; its shares may use any replay worker.
+#[cfg(feature = "production-v4")]
+#[allow(dead_code)] // build.rs includes this module without starting pool workers.
+pub const PRODUCTION_V4_REPLAY_WORKER_SHA256: [u8; 32] = [
+    0x33, 0xce, 0x76, 0xf3, 0x83, 0x2e, 0x77, 0x03, 0xd5, 0xaa, 0x82, 0x00, 0xed, 0x51, 0xac, 0xfe,
+    0x3b, 0xec, 0xfc, 0xfb, 0x2c, 0x2b, 0x06, 0x38, 0x86, 0xaa, 0xf1, 0xdb, 0x5a, 0xb1, 0xf9, 0xf0,
+];
 
 #[cfg(feature = "production-v4-testnet")]
 pub const COMPILED_RELEASE_PROFILE: CompiledReleaseProfile = CompiledReleaseProfile {
@@ -1903,6 +1951,60 @@ mod tests {
             validate_production_rc(profile(Some(identity)), BUILD_SOURCE_COMMIT)
                 .unwrap_err()
                 .contains("insecure development key")
+        );
+    }
+
+    #[test]
+    fn release_work_checkpoint_must_be_pinned_and_complete() {
+        static IDS: [[u8; 32]; 2] = [[0x11; 32], [0x22; 32]];
+        let ids: &'static [u8] = IDS.as_flattened();
+        let pin = WorkCheckpointPin {
+            height: 2,
+            block_id: [0x22; 32],
+            ids,
+            ids_blake3: [0x33; 32],
+        };
+        assert_eq!(validate_work_checkpoint(Some(pin)), Ok(()));
+        assert_eq!(
+            validate_work_checkpoint(None),
+            Err("work checkpoint is not pinned")
+        );
+        for wrong in [
+            WorkCheckpointPin { height: 3, ..pin },
+            WorkCheckpointPin { height: 0, ..pin },
+            WorkCheckpointPin {
+                ids: &ids[..32],
+                ..pin
+            },
+        ] {
+            assert!(
+                validate_work_checkpoint(Some(wrong))
+                    .unwrap_err()
+                    .contains("32 bytes per height")
+            );
+        }
+        for wrong in [
+            WorkCheckpointPin {
+                block_id: [0; 32],
+                ..pin
+            },
+            WorkCheckpointPin {
+                ids_blake3: [0; 32],
+                ..pin
+            },
+        ] {
+            assert!(
+                validate_work_checkpoint(Some(wrong))
+                    .unwrap_err()
+                    .contains("zero")
+            );
+        }
+        assert_eq!(
+            validate_work_checkpoint(Some(WorkCheckpointPin {
+                block_id: [0x11; 32],
+                ..pin
+            })),
+            Err("work checkpoint id list does not end at the checkpoint block id")
         );
     }
 }

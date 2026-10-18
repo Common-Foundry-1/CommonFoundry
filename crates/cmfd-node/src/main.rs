@@ -3,9 +3,10 @@ use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError, sync_channel};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use cmfd_consensus::forgematrix::target_with_leading_zero_bits;
@@ -52,7 +53,7 @@ use cmfd_node::pool_dashboard::{
 #[cfg(feature = "production-v4")]
 use cmfd_node::production_v4_pool::{
     ProductionV4PersistentPoolVerifier, ProductionV4PoolVerifierConfig,
-    ProductionV4PoolWorkerCommand,
+    ProductionV4PoolWorkerCommand, ReplayWorkerPin,
 };
 #[cfg(feature = "production-v4")]
 use cmfd_node::rcnet_candidate::{
@@ -60,7 +61,10 @@ use cmfd_node::rcnet_candidate::{
     write_mainnet_plan_create_new,
 };
 use cmfd_node::seed_peers::{SeedSet, SystemSeedResolver};
-use cmfd_node::storage::{inspect_block_log, repair_partial_block_log_tail};
+use cmfd_node::storage::{
+    inspect_block_log, quarantine_block_log_from_block, reconsider_work_block,
+    repair_partial_block_log_tail,
+};
 #[cfg(test)]
 use cmfd_node::wallet_backup::MAXIMUM_PASSPHRASE_BYTES;
 #[cfg(feature = "production-v4-testnet")]
@@ -98,6 +102,27 @@ fn parse_hex32(value: &str) -> Result<[u8; 32], String> {
         .map_err(|_| "expected a 32-byte hexadecimal value".to_owned())?
         .try_into()
         .map_err(|_| "expected a 32-byte hexadecimal value".to_owned())
+}
+
+/// A reward destination: 64 lowercase hex characters or a checksummed address
+/// with `hrp`. The plan builder checks the key itself.
+#[cfg(feature = "production-v4")]
+fn reward_destination(hrp: &str, value: &str) -> Result<[u8; 32], String> {
+    cmfd_node::address::decode_payload(hrp, value)
+        .map(|(key, _)| key)
+        .map_err(|error| error.to_string())
+}
+
+/// Mainnet plans pay mainnet (`cmfd1...`) addresses.
+#[cfg(feature = "production-v4")]
+fn parse_mainnet_reward_destination(value: &str) -> Result<[u8; 32], String> {
+    reward_destination(cmfd_node::address::MAINNET_HRP, value)
+}
+
+/// RCNet candidates pay test-network (`tcmfd1...`) addresses.
+#[cfg(feature = "production-v4")]
+fn parse_test_network_reward_destination(value: &str) -> Result<[u8; 32], String> {
+    reward_destination(cmfd_node::address::TEST_NETWORK_HRP, value)
 }
 
 #[cfg(feature = "production-v4-testnet")]
@@ -324,6 +349,25 @@ fn parse_distinct_password_frame(
 }
 
 #[derive(Debug, Subcommand)]
+enum WorkCheckpointCommand {
+    /// Write the active chain's block ids at heights 1..=HEIGHT to a new file
+    /// (32 bytes each) after checking that each links to the one before, and
+    /// print the checkpoint block id and the file's BLAKE3. HEIGHT must be at
+    /// least 100 blocks below the tip. Opens the data directory exclusively:
+    /// run it on a stopped node or a copy of its data directory.
+    Export {
+        #[arg(long)]
+        height: u64,
+        #[arg(long)]
+        out: PathBuf,
+        /// Accept a checkpoint less than 100 blocks below the tip (development
+        /// networks and tests only).
+        #[arg(long)]
+        allow_shallow: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 #[allow(clippy::large_enum_variant)] // Parsed once at startup; boxing CLI fields adds needless indirection.
 enum Command {
     /// Print the compiled network identity and consensus manifest.
@@ -377,9 +421,11 @@ enum Command {
         /// First-block target; must be nonzero and no larger than pow-limit.
         #[arg(long, value_parser = parse_hex32)]
         initial_target: [u8; 32],
-        #[arg(long, value_parser = parse_hex32)]
+        /// 64 lowercase hex characters or a cmfd1... address.
+        #[arg(long, value_parser = parse_mainnet_reward_destination)]
         steward_reward_destination: [u8; 32],
-        #[arg(long, value_parser = parse_hex32)]
+        /// 64 lowercase hex characters or a cmfd1... address.
+        #[arg(long, value_parser = parse_mainnet_reward_destination)]
         community_reward_destination: [u8; 32],
     },
     /// Derive a canonical RCNet identity candidate from authenticated ProductionV4 artifacts.
@@ -395,9 +441,11 @@ enum Command {
         virtual_genesis_timestamp: u64,
         #[arg(long, value_parser = parse_hex32)]
         pow_limit: [u8; 32],
-        #[arg(long, value_parser = parse_hex32)]
+        /// 64 lowercase hex characters or a tcmfd1... address.
+        #[arg(long, value_parser = parse_test_network_reward_destination)]
         steward_reward_destination: [u8; 32],
-        #[arg(long, value_parser = parse_hex32)]
+        /// 64 lowercase hex characters or a tcmfd1... address.
+        #[arg(long, value_parser = parse_test_network_reward_destination)]
         community_reward_destination: [u8; 32],
     },
     /// Create a dedicated encrypted RCNet-1 wallet and independent backup offline.
@@ -471,6 +519,18 @@ enum Command {
         /// a reorganization deeper than this window.
         #[arg(long)]
         prune_keep_blocks: Option<u64>,
+        /// Compute threads per block for the CPU work engine, which
+        /// re-executes each new block's work above the release checkpoint
+        /// (default: half the logical processors, at most 8).
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..=256))]
+        work_threads: Option<u16>,
+        /// How the CPU work engine reads the model bank: `resident` loads
+        /// its layers into memory once (about 6 GiB), so a block's check
+        /// reads no disk; `streamed` reads them from the bank file for each
+        /// block; `auto` holds it resident when the memory available leaves
+        /// 2 GiB beside it.
+        #[arg(long, value_enum, default_value_t = WorkBank::Auto)]
+        work_bank: WorkBank,
     },
     /// Generate a create-new raw 32-byte withdrawal-journal authentication key.
     ExchangeWithdrawalKeygen {
@@ -479,13 +539,15 @@ enum Command {
         output: PathBuf,
     },
     /// Create a new exchange deposit or hot-wallet key file (offline; no node
-    /// or data directory). Prints the key's destination (x-only public key).
+    /// or data directory). Prints the key's destination (x-only public key) in
+    /// hex and as a checksummed address.
     ExchangeKeyNew {
         /// Output path for the secret key. Existing files are never overwritten.
         #[arg(long)]
         output: PathBuf,
     },
-    /// Print the destination (x-only public key) of an existing exchange key file.
+    /// Print the destination (x-only public key) of an existing exchange key
+    /// file, in hex and as a checksummed address.
     ExchangeKeyShow {
         #[arg(long)]
         key: PathBuf,
@@ -708,7 +770,8 @@ enum Command {
     },
     /// Mine, validate, persist, and apply one bounded reference block locally.
     MineOnce {
-        /// 32-byte x-only Schnorr public key as 64 hex characters.
+        /// 32-byte x-only Schnorr public key: a checksummed address (cmfd1...)
+        /// or 64 hex characters.
         #[arg(long)]
         miner: Option<String>,
         #[arg(long, default_value_t = DEFAULT_MINING_ATTEMPTS)]
@@ -740,8 +803,35 @@ enum Command {
         #[arg(long)]
         quarantine_output: PathBuf,
     },
+    /// Remove a stored block and every record stored after it from the block
+    /// log of a stopped node, keeping the removed bytes as evidence. The next
+    /// start replays the log and opens at the block's parent. With no
+    /// --block-id, the block named by the work-check halt marker is removed
+    /// and the marker cleared.
+    StorageQuarantineBlock {
+        /// Create-new evidence file that receives the exact removed bytes.
+        #[arg(long)]
+        quarantine_output: PathBuf,
+        /// The first block to remove, in hex.
+        #[arg(long, value_parser = parse_block_id_hex)]
+        block_id: Option<[u8; 32]>,
+    },
+    /// Forget what the work check recorded about a block of a stopped node
+    /// (verified, invalid, or found not to match on this node's one engine),
+    /// so the next start checks it again, and clear a work-check halt marker
+    /// that names it.
+    WorkReconsider {
+        /// The block, in hex.
+        #[arg(value_parser = parse_block_id_hex)]
+        block_id: [u8; 32],
+    },
     /// Replay storage and write a locally authenticated fast-start checkpoint.
     StorageCheckpoint,
+    /// Release work checkpoint tools.
+    WorkCheckpoint {
+        #[command(subcommand)]
+        action: WorkCheckpointCommand,
+    },
     /// Offline pool accounting inspection; records holds but never sends payments.
     PoolPayoutStatus {
         /// Use the same fee as pool-serve. Amount is in atomic units.
@@ -817,7 +907,8 @@ enum Command {
         /// DER-encoded PKCS#8 private key generated by pool-certificate.
         #[arg(long)]
         private_key: PathBuf,
-        /// Pool-owned 32-byte x-only Schnorr block-reward destination.
+        /// Pool-owned 32-byte x-only Schnorr block-reward destination: a
+        /// checksummed address (cmfd1...) or 64 hex characters.
         #[arg(long)]
         miner: Option<String>,
         /// Easier reference-pool share target; chain work starts at 8 leading zero bits.
@@ -866,8 +957,9 @@ enum Command {
         /// disables the bonus and requires no sponsor.
         #[arg(long, default_value_t = DEFAULT_POOL_BONUS_RATE_BPS)]
         pool_bonus_rate_bps: u16,
-        /// 32-byte x-only key whose confirmed transfers to the pool wallet
-        /// fund the bonus reserve. Required with a bonus rate above zero.
+        /// 32-byte x-only key (cmfd1... or 64 hex characters) whose confirmed
+        /// transfers to the pool wallet fund the bonus reserve. Required with a
+        /// bonus rate above zero.
         #[arg(long)]
         pool_bonus_sponsor: Option<String>,
         /// First chain height scanned for sponsor transfers when the pool
@@ -920,7 +1012,48 @@ enum Command {
         /// blocks keep.
         #[arg(long)]
         prune_keep_blocks: Option<u64>,
+        /// Compute threads per block for the CPU work engine, which
+        /// re-executes each new block's work above the release checkpoint
+        /// (default: half the logical processors, at most 8).
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..=256))]
+        work_threads: Option<u16>,
+        /// Engines that re-execute block work: `auto` adds, beside the CPU
+        /// engine, a GPU engine that borrows this pool's replay workers while
+        /// they are idle and falls back to the CPU when they are not; `cpu`
+        /// keeps the replay workers for shares only.
+        #[arg(long, value_enum, default_value_t = PoolWorkEngine::Auto)]
+        work_engine: PoolWorkEngine,
+        /// How the CPU work engine reads the model bank, as for `run`. The
+        /// default streams it: a pool's CPU engine stands behind its replay
+        /// workers, and its proof worker needs the memory.
+        #[arg(long, value_enum, default_value_t = WorkBank::Streamed)]
+        work_bank: WorkBank,
     },
+}
+
+/// The engines `pool-serve` re-executes block work with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum PoolWorkEngine {
+    Auto,
+    Cpu,
+}
+
+/// How the CPU work engine reads the model bank.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum WorkBank {
+    Auto,
+    Resident,
+    Streamed,
+}
+
+impl From<WorkBank> for cmfd_node::work_gate::WorkBankMode {
+    fn from(bank: WorkBank) -> Self {
+        match bank {
+            WorkBank::Auto => Self::Auto,
+            WorkBank::Resident => Self::Resident,
+            WorkBank::Streamed => Self::Streamed,
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -945,7 +1078,92 @@ fn parse_cli() -> Result<Cli, Box<dyn std::error::Error>> {
     Ok(Cli::parse())
 }
 
+/// The exit status of a node that does not start because block admission is
+/// halted by the work rule, so that a service manager can be told not to
+/// restart it (`RestartPreventExitStatus=`).
+const WORK_HALT_EXIT_STATUS: i32 = 3;
+
+/// A node that does not start its services because block admission is
+/// halted.
+#[derive(Debug)]
+struct WorkHaltRefusal(String);
+
+impl std::fmt::Display for WorkHaltRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for WorkHaltRefusal {}
+
+/// The exit status of a node that does not start for a reason a restart
+/// does not change (its stored chain conflicts with the release checkpoint,
+/// needs a resync, its work-status store cannot be opened, or a release
+/// input is not the pinned one), so that a service manager can be told not
+/// to restart it (`RestartPreventExitStatus=`) instead of reading the model
+/// bank again and again.
+const STARTUP_REFUSAL_EXIT_STATUS: i32 = 4;
+
+/// A node that does not start, with the operator's instructions, for a
+/// reason [`STARTUP_REFUSAL_EXIT_STATUS`] covers.
+#[derive(Debug)]
+struct StartupRefusal(String);
+
+impl std::fmt::Display for StartupRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for StartupRefusal {}
+
+/// Whether `error` stops a start for a reason a restart does not change. A
+/// work-status store that cannot be opened counts only when it is refused
+/// for its permissions, a read-only file system or its contents; a failed
+/// read or write, a full disk or a lack of resources may pass.
+fn is_lasting_startup_refusal(error: &cmfd_node::NodeError) -> bool {
+    match error {
+        cmfd_node::NodeError::WorkCheckpointConflict { .. }
+        | cmfd_node::NodeError::WorkRuleResyncRequired(_)
+        | cmfd_node::NodeError::ProductionV4ArtifactIdentityMismatch(_) => true,
+        cmfd_node::NodeError::Io {
+            operation: "open the work-status store",
+            source,
+            ..
+        } => matches!(
+            source.kind(),
+            std::io::ErrorKind::PermissionDenied
+                | std::io::ErrorKind::ReadOnlyFilesystem
+                | std::io::ErrorKind::InvalidData
+        ),
+        _ => false,
+    }
+}
+
+/// The exit status for an error `main` stops with, if it is not the default.
+fn exit_status_for(error: &(dyn std::error::Error + 'static)) -> Option<i32> {
+    if error.is::<WorkHaltRefusal>() {
+        return Some(WORK_HALT_EXIT_STATUS);
+    }
+    (error.is::<StartupRefusal>()
+        || error
+            .downcast_ref::<cmfd_node::NodeError>()
+            .is_some_and(is_lasting_startup_refusal))
+    .then_some(STARTUP_REFUSAL_EXIT_STATUS)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let result = run_command();
+    if let Err(error) = &result
+        && let Some(status) = exit_status_for(error.as_ref())
+    {
+        eprintln!("Error: {error}");
+        std::process::exit(status);
+    }
+    result
+}
+
+fn run_command() -> Result<(), Box<dyn std::error::Error>> {
     if cmfd_proof_worker::verifier_worker_mode_requested() {
         std::process::exit(cmfd_proof_worker::worker_main());
     }
@@ -989,6 +1207,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "status": "created",
                 "key_file": output,
                 "destination_hex": hex::encode(destination),
+                "address": cmfd_node::address::encode(cmfd_node::address_hrp(), &destination),
                 "warning": "the key file is the only copy of this secret; back it up and keep it private"
             }))?
         );
@@ -996,10 +1215,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Command::ExchangeKeyShow { key } = &cli.command {
         let key = cmfd_node::exchange_tx_tool::read_key_file(key)?;
+        let destination = cmfd_node::exchange_tx_tool::destination_of(&key);
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
-                "destination_hex": hex::encode(cmfd_node::exchange_tx_tool::destination_of(&key)),
+                "destination_hex": hex::encode(destination),
+                "address": cmfd_node::address::encode(cmfd_node::address_hrp(), &destination),
             }))?
         );
         return Ok(());
@@ -1460,6 +1681,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         return Ok(());
     }
+    if let Command::StorageQuarantineBlock {
+        quarantine_output,
+        block_id,
+    } = &cli.command
+    {
+        let report = quarantine_block_log_from_block(
+            &cli.data_dir,
+            COMPILED_NETWORK_PROFILE,
+            *block_id,
+            quarantine_output,
+        )?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "status": "quarantined",
+                "quarantine": report,
+            }))?
+        );
+        return Ok(());
+    }
+    if let Command::WorkReconsider { block_id } = &cli.command {
+        let report = reconsider_work_block(&cli.data_dir, COMPILED_NETWORK_PROFILE, *block_id)?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "status": if report.record_cleared || report.halt_cleared {
+                    "reconsidered"
+                } else {
+                    "nothing_recorded"
+                },
+                "reconsider": report,
+            }))?
+        );
+        return Ok(());
+    }
     if let Command::StorageRepairTail { quarantine_output } = &cli.command {
         let repaired = repair_partial_block_log_tail(
             &cli.data_dir,
@@ -1510,6 +1766,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let _log_guard = cmfd_node::logging::init_tracing(&cli.data_dir, cli.verbose);
+    let backlog_mode = startup_backlog_mode(&cli.command);
+    let work_priority = work_thread_priority(&cli.command);
     match cli.command {
         Command::NetworkInfo => unreachable!("network-info exits before node initialization"),
         #[cfg(feature = "production-v4")]
@@ -1751,6 +2009,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             no_default_seeds,
             allow_public_peers,
             prune_keep_blocks,
+            work_threads,
+            work_bank,
         } => {
             let shutdown = install_shutdown_handler()?;
             let (peers, allow_public_peers) =
@@ -1766,6 +2026,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?;
             node.set_public_peer_mode(allow_public_peers);
             node.configure_pruning(prune_keep_blocks)?;
+            install_work_engines(&mut node, work_threads, work_priority, work_bank, None)?;
             if prune_keep_blocks.is_some()
                 && let Some(report) = node.prune_block_log()?
             {
@@ -1773,6 +2034,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let discovery_hello = node.peer_hello();
             let shared = Arc::new(Mutex::new(node));
+            // Its services open at once, and stored blocks are checked in
+            // the background. A halted node still starts: its exchange RPC
+            // serves chain reads only up to the validated height and answers
+            // them with a retryable error while admission is halted.
+            let Some((work_backlog, halted_at_start)) =
+                start_work_backlog(&shared, &shutdown, backlog_mode, None)?
+            else {
+                if let Ok(node) = shared.lock() {
+                    node.shutdown_proof_verifier();
+                }
+                return Ok(());
+            };
             // The startup prune above already ran; the next check is one
             // interval later.
             let pruner = prune_keep_blocks
@@ -1863,8 +2136,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .insert("exchange_rpc_custody".to_owned(), json!("v3"));
             }
             println!("{}", serde_json::to_string_pretty(&startup)?);
+            let halted_while_running = work_halt_watch(
+                shared
+                    .lock()
+                    .map_err(|_| cmfd_node::NodeError::SharedNodePoisoned)?
+                    .work_rule_halt_flag(),
+                halted_at_start,
+            );
             let service_exit = shutdown.wait_for_service_exit(|| {
-                if rpc.is_finished() {
+                if halted_while_running() {
+                    Some(WORK_HALT_SERVICE)
+                } else if rpc.is_finished() {
                     Some("RPC")
                 } else if exchange_rpc.as_ref().is_some_and(|rpc| rpc.is_finished()) {
                     Some("exchange RPC")
@@ -1876,6 +2158,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     None
                 }
             })?;
+            let halt_exit = work_halt_exit(service_exit, &shared);
+            // The work lane closes first: a remote check the background
+            // thread may be waiting behind then ends.
+            if let Ok(node) = shared.lock() {
+                node.shutdown_proof_verifier();
+            }
+            if let Some(work_backlog) = work_backlog {
+                work_backlog.stop();
+            }
             if let Ok(node) = shared.lock() {
                 if let Err(error) = node.persist_startup_snapshot() {
                     eprintln!("startup checkpoint not written: {error}");
@@ -1883,7 +2174,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Err(error) = node.persist_index_cache() {
                     eprintln!("startup index cache not written: {error}");
                 }
-                node.shutdown_proof_verifier();
             }
             let exchange_rpc_result = match exchange_rpc {
                 Some(exchange_rpc) => exchange_rpc.stop(),
@@ -1904,6 +2194,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             rpc_result?;
             poll_result?;
             inbound_result?;
+            if let Some(halt_exit) = halt_exit {
+                return Err(halt_exit.into());
+            }
             if let Some(service) = service_exit {
                 return Err(format!("{service} service exited unexpectedly").into());
             }
@@ -2030,10 +2323,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             Ok(())
         }
+        Command::WorkCheckpoint {
+            action:
+                WorkCheckpointCommand::Export {
+                    height,
+                    out,
+                    allow_shallow,
+                },
+        } => {
+            let node = open_node(
+                &cli.data_dir,
+                production_v3_record.as_ref(),
+                production_v4_artifacts.as_ref(),
+                verifier_worker.as_ref(),
+                wallet_passphrase.as_ref().map(|value| value.as_slice()),
+                exchange_withdrawal_security.as_ref(),
+            )?;
+            let export = node.export_work_checkpoint(height, &out, allow_shallow)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "status": "exported",
+                    "network": COMPILED_NETWORK_PROFILE.short_name(),
+                    "out": out,
+                    "checkpoint_height": export.checkpoint_height,
+                    "checkpoint_block_id": hex::encode(export.checkpoint_block_id),
+                    "ids_blake3": hex::encode(export.ids_blake3),
+                    "bytes": export.bytes,
+                    "tip_height": export.tip_height,
+                    "depth": export.depth,
+                }))?
+            );
+            Ok(())
+        }
         Command::WalletBackup { .. }
         | Command::WalletRestore { .. }
         | Command::StorageInspect
-        | Command::StorageRepairTail { .. } => {
+        | Command::StorageRepairTail { .. }
+        | Command::StorageQuarantineBlock { .. }
+        | Command::WorkReconsider { .. } => {
             unreachable!("offline maintenance commands exit before node initialization")
         }
         Command::PoolCertificate {
@@ -2095,6 +2423,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             pool_dashboard_bind,
             shutdown_request_file,
             prune_keep_blocks,
+            work_threads,
+            work_engine,
+            work_bank,
         } => {
             require_pool_mining_profile()?;
             let automatic_payouts = pool_payouts_enabled(
@@ -2136,12 +2467,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?;
             node_instance.set_public_peer_mode(allow_public_peers);
             node_instance.configure_pruning(prune_keep_blocks)?;
-            if prune_keep_blocks.is_some()
-                && let Some(report) = node_instance.prune_block_log()?
-            {
-                eprintln!("{}", serde_json::to_string(&prune_report_json(&report))?);
-            }
-            let discovery_hello = node_instance.peer_hello();
             let miner_destination = match miner.as_deref() {
                 Some(value) => parse_miner_destination(value)?,
                 None => node_instance.wallet_destination(),
@@ -2158,7 +2483,70 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let certificate_der = std::fs::read(&certificate)?;
             let private_key_der = std::fs::read(&private_key)?;
             let pin = certificate_sha256(&certificate_der);
+            let mut config =
+                PoolServerConfig::devnet(bind, certificate_der, private_key_der, miner_destination);
+            config.share_target = target_with_leading_zero_bits(share_leading_zero_bits);
+            config.ledger_directory = Some(cli.data_dir.join("pool-ledger"));
+            config.max_connections = pool_max_connections;
+            config.max_connections_per_source = pool_max_connections_per_source;
+            config.max_concurrent_share_verifications = pool_max_concurrent_share_verifications;
+            config.max_queued_share_verifications = pool_max_queued_share_verifications;
+            config.share_batch_size = pool_share_batch_size;
+            config.share_batch_wait = Duration::from_millis(pool_share_batch_wait_ms);
+            config.ledger_max_bytes = pool_ledger_max_bytes;
+            config.allow_public_clients = allow_public_pool_clients;
+            config.allow_address_only_payouts = allow_address_only_payouts;
+            config.pplns_policy = Some(PoolPplnsPolicy {
+                operator_fee_bps: pool_operator_fee_bps,
+                window_shares: pool_pplns_window_shares,
+            });
+            config.bonus_policy = bonus_policy;
+            if automatic_payouts {
+                config.payout_policy = Some(PoolPayoutPolicy {
+                    minimum_payout_atoms: pool_minimum_payout_atoms,
+                    fee_atoms: pool_payout_fee_atoms,
+                });
+            }
+            // Until the replay workers run and the engines are installed,
+            // every block above the release checkpoint is answered as busy;
+            // no known answer or stored-block check runs before then.
+            let replay_workers = configure_production_v4_pool_verifier(
+                &mut config,
+                production_v4_artifacts.as_ref(),
+                production_v4_pool_replay_worker.as_ref(),
+                &production_v4_pool_replay_gpus,
+                production_v4_pool_proof_gpu.as_deref(),
+                production_v4_pool_proof_worker.as_ref(),
+                production_v4_pool_scratch.as_ref(),
+                production_v4_pool_wsl_distribution.as_deref(),
+            )?;
+            // Whether block work checks use the release replay worker; the
+            // startup report shows it next to the worker options.
+            let work_checks_use_replay_workers = (COMPILED_NETWORK_PROFILE.proof
+                == ProofProfile::ProductionV4)
+                .then_some(replay_workers.is_some() && work_engine == PoolWorkEngine::Auto);
+            install_work_engines(
+                &mut node_instance,
+                work_threads,
+                work_priority,
+                work_bank,
+                replay_workers.filter(|_| work_engine == PoolWorkEngine::Auto),
+            )?;
+            if prune_keep_blocks.is_some()
+                && let Some(report) = node_instance.prune_block_log()?
+            {
+                eprintln!("{}", serde_json::to_string(&prune_report_json(&report))?);
+            }
+            let discovery_hello = node_instance.peer_hello();
             let node = Arc::new(Mutex::new(node_instance));
+            let Some((work_backlog, halted_at_start)) =
+                start_work_backlog(&node, &shutdown, backlog_mode, Some("pool"))?
+            else {
+                if let Ok(node) = node.lock() {
+                    node.shutdown_proof_verifier();
+                }
+                return Ok(());
+            };
             // The startup prune above already ran; the next check is one
             // interval later.
             let pruner = prune_keep_blocks
@@ -2193,40 +2581,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Duration::from_secs(2),
                 discovery,
             )?);
-            let mut config =
-                PoolServerConfig::devnet(bind, certificate_der, private_key_der, miner_destination);
-            config.share_target = target_with_leading_zero_bits(share_leading_zero_bits);
-            config.ledger_directory = Some(cli.data_dir.join("pool-ledger"));
-            config.max_connections = pool_max_connections;
-            config.max_connections_per_source = pool_max_connections_per_source;
-            config.max_concurrent_share_verifications = pool_max_concurrent_share_verifications;
-            config.max_queued_share_verifications = pool_max_queued_share_verifications;
-            config.share_batch_size = pool_share_batch_size;
-            config.share_batch_wait = Duration::from_millis(pool_share_batch_wait_ms);
-            config.ledger_max_bytes = pool_ledger_max_bytes;
-            config.allow_public_clients = allow_public_pool_clients;
-            config.allow_address_only_payouts = allow_address_only_payouts;
-            config.pplns_policy = Some(PoolPplnsPolicy {
-                operator_fee_bps: pool_operator_fee_bps,
-                window_shares: pool_pplns_window_shares,
-            });
-            config.bonus_policy = bonus_policy;
-            if automatic_payouts {
-                config.payout_policy = Some(PoolPayoutPolicy {
-                    minimum_payout_atoms: pool_minimum_payout_atoms,
-                    fee_atoms: pool_payout_fee_atoms,
-                });
+            // The node follows its peers meanwhile, so a heavier branch can
+            // replace a stored block that does not check here.
+            let services_exited = || {
+                if inbound.is_finished() {
+                    Some("inbound P2P")
+                } else if poller.as_ref().is_some_and(|poller| poller.is_finished()) {
+                    Some("static-peer polling")
+                } else {
+                    None
+                }
+            };
+            let waited = wait_for_validated_tip(&node, &shutdown, services_exited)?;
+            if waited != ValidatedTipWait::Validated {
+                let halt_exit = match waited {
+                    ValidatedTipWait::Stopped(service) => work_halt_exit(Some(service), &node),
+                    _ => None,
+                };
+                // The work lane closes first: a remote check the background
+                // thread may be waiting behind then ends.
+                if let Ok(node) = node.lock() {
+                    node.shutdown_proof_verifier();
+                }
+                if let Some(work_backlog) = work_backlog {
+                    work_backlog.stop();
+                }
+                if let Ok(node) = node.lock() {
+                    if let Err(error) = node.persist_startup_snapshot() {
+                        eprintln!("startup checkpoint not written: {error}");
+                    }
+                    if let Err(error) = node.persist_index_cache() {
+                        eprintln!("startup index cache not written: {error}");
+                    }
+                }
+                let poll_result = match poller {
+                    Some(poller) => poller.stop(),
+                    None => Ok(()),
+                };
+                let inbound_result = inbound.stop();
+                if let Some(pruner) = pruner {
+                    pruner.stop();
+                }
+                poll_result?;
+                inbound_result?;
+                if let Some(halt_exit) = halt_exit {
+                    return Err(halt_exit.into());
+                }
+                if let ValidatedTipWait::Stopped(service) = waited {
+                    return Err(format!("{service} service exited unexpectedly").into());
+                }
+                return Ok(());
             }
-            configure_production_v4_pool_verifier(
-                &mut config,
-                production_v4_artifacts.as_ref(),
-                production_v4_pool_replay_worker.as_ref(),
-                &production_v4_pool_replay_gpus,
-                production_v4_pool_proof_gpu.as_deref(),
-                production_v4_pool_proof_worker.as_ref(),
-                production_v4_pool_scratch.as_ref(),
-                production_v4_pool_wsl_distribution.as_deref(),
-            )?;
             let pool = spawn_pool_server(Arc::clone(&node), config)?;
             let dashboard = match dashboard_request {
                 Some((assets_directory, public_pool_url)) => Some(spawn_pool_dashboard(
@@ -2272,6 +2677,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "share_batch_wait_ms": pool_share_batch_wait_ms,
                     "replay_gpus": production_v4_pool_replay_gpus,
                     "proof_gpu": production_v4_pool_proof_gpu,
+                    "work_checks_use_replay_workers": work_checks_use_replay_workers,
                     "ledger_max_bytes": pool_ledger_max_bytes,
                     "dashboard": dashboard.as_ref().map(|dashboard| format!("http://{}", dashboard.local_addr())),
                     "used_insecure_default_miner": used_insecure_default_miner,
@@ -2281,8 +2687,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "accounting": cmfd_node::pool::POOL_ACCOUNTING_SEMANTICS
                 }))?
             );
+            let halted_while_running = work_halt_watch(
+                node.lock()
+                    .map_err(|_| cmfd_node::NodeError::SharedNodePoisoned)?
+                    .work_rule_halt_flag(),
+                halted_at_start,
+            );
             let service_exit = shutdown.wait_for_service_exit(|| {
-                if pool.is_finished() {
+                if halted_while_running() {
+                    Some(WORK_HALT_SERVICE)
+                } else if pool.is_finished() {
                     Some("pool")
                 } else if dashboard
                     .as_ref()
@@ -2297,6 +2711,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     None
                 }
             })?;
+            let halt_exit = work_halt_exit(service_exit, &node);
+            // The work lane closes first: a remote check the background
+            // thread may be waiting behind then ends.
+            if let Ok(node) = node.lock() {
+                node.shutdown_proof_verifier();
+            }
+            if let Some(work_backlog) = work_backlog {
+                work_backlog.stop();
+            }
             let dashboard_result = match dashboard {
                 Some(dashboard) => dashboard.stop().map(Some),
                 None => Ok(None),
@@ -2308,7 +2731,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Err(error) = node.persist_index_cache() {
                     eprintln!("startup index cache not written: {error}");
                 }
-                node.shutdown_proof_verifier();
             }
             let pool_result = pool.stop();
             let poll_result = match poller {
@@ -2323,6 +2745,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             pool_result?;
             poll_result?;
             inbound_result?;
+            if let Some(halt_exit) = halt_exit {
+                return Err(halt_exit.into());
+            }
             if let Some(service) = service_exit {
                 return Err(format!("{service} service exited unexpectedly").into());
             }
@@ -2403,6 +2828,36 @@ impl ShutdownSignal {
         Ok(true)
     }
 
+    /// Waits until `done` returns true or a shutdown is requested, and
+    /// returns whether one was. The signal stays usable afterwards.
+    fn wait_unless_shutdown(
+        &self,
+        mut done: impl FnMut() -> bool,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        loop {
+            match self.receiver.try_recv() {
+                Ok(()) => return Ok(true),
+                Err(TryRecvError::Disconnected) => {
+                    return Err("shutdown signal channel disconnected".into());
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+            if self.request_file_exists()? {
+                return Ok(true);
+            }
+            if done() {
+                return Ok(false);
+            }
+            match self.receiver.recv_timeout(SERVICE_SUPERVISION_POLL) {
+                Ok(()) => return Ok(true),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err("shutdown signal channel disconnected".into());
+                }
+            }
+        }
+    }
+
     fn wait_for_service_exit(
         self,
         mut exited: impl FnMut() -> Option<&'static str>,
@@ -2440,6 +2895,425 @@ fn prune_report_json(report: &cmfd_node::PruneReport) -> serde_json::Value {
         "log_bytes_before": report.log_bytes_before,
         "log_bytes_after": report.log_bytes_after,
     })
+}
+
+/// Installs the CPU work engine when this node's network has a work rule,
+/// and qualifies it against the known answers before anything uses it. A
+/// failed qualification is reported and leaves every block above the
+/// checkpoint retryable, never refused. A node whose rule has no engine, or
+/// whose stored chain differs from the pinned checkpoint list, does not
+/// start.
+fn install_work_engines(
+    node: &mut Node,
+    threads: Option<u16>,
+    priority: cmfd_node::honest_work::WorkThreadPriority,
+    bank: WorkBank,
+    replay_workers: Option<Arc<dyn cmfd_node::honest_work::GpuReplayWorkers>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "production-v4")]
+    {
+        use cmfd_node::honest_work::WorkEngineHealth;
+        let threads = threads.map_or_else(cmfd_node::work_gate::default_work_threads, usize::from);
+        let gpu = replay_workers.is_some();
+        let install_started = std::time::Instant::now();
+        let installed =
+            match node.install_work_engines(threads, priority, bank.into(), replay_workers) {
+                Ok(installed) => installed,
+                Err(error @ cmfd_node::NodeError::WorkCheckpointConflict { block_id, .. }) => {
+                    return Err(Box::new(StartupRefusal(format!(
+                        "{error}; stop the node and remove that block and the blocks stored after \
+                     it with `cmfd-node storage-quarantine-block --block-id {} \
+                     --quarantine-output <new file>`",
+                        hex::encode(block_id)
+                    ))));
+                }
+                Err(error) => return Err(error.into()),
+            };
+        let install_seconds = install_started.elapsed().as_secs_f64();
+        if let Some((checker, load)) = installed {
+            let bank = node.work_rule_status().and_then(|status| status.bank);
+            let started = std::time::Instant::now();
+            let report = checker.run_known_answer_tests();
+            let ready = report.cpu == Some(WorkEngineHealth::Ready);
+            let gpu_ready = report.gpu.map(|health| health == WorkEngineHealth::Ready);
+            eprintln!(
+                "{}",
+                serde_json::to_string(&json!({
+                    "work_rule": {
+                        "engine": if gpu { "cpu+gpu" } else { "cpu" },
+                        "threads": threads,
+                        "bank": bank,
+                        "install_seconds": install_seconds,
+                        "qualified": ready,
+                        "gpu_qualified": gpu_ready,
+                        "qualification_seconds": started.elapsed().as_secs_f64(),
+                        "store_started_empty": load.started_empty,
+                        "store_damaged_records": load.damaged_records,
+                        "store_torn_bytes": load.torn_bytes,
+                    }
+                }))?
+            );
+            if !ready {
+                eprintln!(
+                    "warning: the CPU work engine did not reproduce its known answer; blocks above \
+                     the release checkpoint are not admitted until it does"
+                );
+            }
+            if gpu_ready == Some(false) {
+                eprintln!(
+                    "warning: the GPU work engine did not reproduce its known answers; blocks are \
+                     checked on the CPU until it does"
+                );
+            }
+        }
+    }
+    #[cfg(not(feature = "production-v4"))]
+    let _ = (threads, priority, bank, replay_workers);
+    if node.work_checker_missing() {
+        return Err(
+            "this network enforces the release work rule, but this build has no work engine".into(),
+        );
+    }
+    if node.work_rule_halted() {
+        eprintln!(
+            "warning: {}",
+            work_halt_instructions(node.work_halted_block())
+        );
+    }
+    Ok(())
+}
+
+/// What an operator does about a work-rule halt on `block`.
+fn work_halt_instructions(block: Option<[u8; 32]>) -> String {
+    let block_hex = block.map_or_else(|| "<block id>".to_owned(), hex::encode);
+    let block = block.map_or_else(String::new, |block| {
+        format!("--block-id {} ", hex::encode(block))
+    });
+    format!(
+        "block admission is halted: two independent work engines found that a block on this \
+         node's active chain does not match its work. Check the block against another node or \
+         the explorer, then stop this node and remove it and the blocks stored after it with \
+         `cmfd-node storage-quarantine-block {block}--quarantine-output <new file>`; the removed \
+         bytes are kept in that file. If the block matches there, `cmfd-node work-reconsider \
+         {block_hex}` on the stopped node clears the halt instead, but it only makes the next \
+         start check the block again: if this node's engines find the same, it needs a release \
+         that moves the checkpoint past the block, so report it to the release maintainers."
+    )
+}
+
+/// The service name a supervisor reports when block admission halts while
+/// the node runs.
+const WORK_HALT_SERVICE: &str = "work rule";
+
+/// Whether block admission has halted since the startup work check ended,
+/// read from the node's halt flag without the node lock. A halt already in
+/// place then (`halted_at_start`) was reported there instead.
+fn work_halt_watch(
+    flag: Option<Arc<AtomicBool>>,
+    halted_at_start: bool,
+) -> impl Fn() -> bool + use<> {
+    move || {
+        !halted_at_start
+            && flag
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Acquire))
+    }
+}
+
+/// The error a node stops with when block admission halted while it ran, so
+/// that a service manager sees a failure and an operator the instructions.
+fn work_halt_exit(service_exit: Option<&'static str>, shared: &Mutex<Node>) -> Option<String> {
+    (service_exit == Some(WORK_HALT_SERVICE)).then(|| {
+        let block = shared.lock().ok().and_then(|node| node.work_halted_block());
+        work_halt_instructions(block)
+    })
+}
+
+/// The background work check's handle, if the node has a work rule, and
+/// whether block admission was halted when the startup check ended.
+type StartupWork = (Option<cmfd_node::work_gate::WorkBacklogHandle>, bool);
+
+/// How a command checks the blocks stored above the release checkpoint
+/// before it opens its services.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartupBacklogMode {
+    /// With the work lane to itself, before its services open; a pool must
+    /// not hand out work on blocks it has not checked.
+    Exclusive,
+    /// In the background, with its services open, active blocks first.
+    Background,
+}
+
+/// `run` opens its services at once: an exclusive startup check would take
+/// as long overall, and only keep them closed meanwhile. A pool keeps the
+/// exclusive check.
+fn startup_backlog_mode(command: &Command) -> StartupBacklogMode {
+    match command {
+        Command::Run { .. } => StartupBacklogMode::Background,
+        _ => StartupBacklogMode::Exclusive,
+    }
+}
+
+/// How the CPU work engine's threads are scheduled for a command. `run`
+/// gives way to the machine's other work, as a desktop wallet does; a pool
+/// keeps normal priority, since a block check that falls back to the CPU
+/// delays its next template.
+fn work_thread_priority(command: &Command) -> cmfd_node::honest_work::WorkThreadPriority {
+    match command {
+        Command::Run { .. } => cmfd_node::honest_work::WorkThreadPriority::BelowNormal,
+        _ => cmfd_node::honest_work::WorkThreadPriority::Normal,
+    }
+}
+
+/// Starts the work check of the blocks stored above the release checkpoint
+/// as `mode` says; see [`run_startup_work_backlog`] and
+/// [`start_background_work_backlog`].
+fn start_work_backlog(
+    shared: &Arc<Mutex<Node>>,
+    shutdown: &ShutdownSignal,
+    mode: StartupBacklogMode,
+    refuse_halted: Option<&str>,
+) -> Result<Option<StartupWork>, Box<dyn std::error::Error>> {
+    match mode {
+        StartupBacklogMode::Exclusive => run_startup_work_backlog(shared, shutdown, refuse_halted),
+        StartupBacklogMode::Background => start_background_work_backlog(shared).map(Some),
+    }
+}
+
+/// Starts the background work check for a node that opens its services
+/// without waiting for it: the stored active blocks above the validated
+/// height go first. Prints where it starts. A halted node starts halted,
+/// with the operator's instructions printed.
+fn start_background_work_backlog(
+    shared: &Arc<Mutex<Node>>,
+) -> Result<StartupWork, Box<dyn std::error::Error>> {
+    let (heights, halted, halted_block) = {
+        let node = shared
+            .lock()
+            .map_err(|_| cmfd_node::NodeError::SharedNodePoisoned)?;
+        (
+            cmfd_node::work_gate::work_backlog_heights(&node),
+            node.work_rule_halted(),
+            node.work_halted_block(),
+        )
+    };
+    let Some((validated, tip)) = heights else {
+        return Ok((None, false));
+    };
+    eprintln!(
+        "{}",
+        serde_json::to_string(&json!({
+            "work_backlog": {
+                "mode": "background",
+                "blocks_left": tip.saturating_sub(validated),
+                "validated_height": validated,
+                "tip_height": tip,
+                "halted": halted,
+            }
+        }))?
+    );
+    if halted {
+        eprintln!("warning: {}", work_halt_instructions(halted_block));
+    }
+    Ok((
+        Some(cmfd_node::work_gate::spawn_startup_work_backlog(
+            Arc::clone(shared),
+        )?),
+        halted,
+    ))
+}
+
+/// Checks stored blocks with the work lane to itself before the node opens
+/// its network services, then starts the background check for the rest.
+/// Returns `None` if a shutdown was requested meanwhile. A halted node fails
+/// with the operator's instructions ([`WorkHaltRefusal`]) if `refuse_halted`
+/// names a service that must not run on a halted chain (a pool must not hand
+/// out work on a chain it cannot extend); otherwise it starts halted, so its
+/// status can still be read.
+fn run_startup_work_backlog(
+    shared: &Arc<Mutex<Node>>,
+    shutdown: &ShutdownSignal,
+    refuse_halted: Option<&str>,
+) -> Result<Option<StartupWork>, Box<dyn std::error::Error>> {
+    let enforced = shared
+        .lock()
+        .map_err(|_| cmfd_node::NodeError::SharedNodePoisoned)?
+        .work_validated_height()
+        .is_some();
+    if !enforced {
+        return Ok(Some((None, false)));
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker = {
+        let (shared, stop) = (Arc::clone(shared), Arc::clone(&stop));
+        std::thread::Builder::new()
+            .name("cmfd-work-startup".to_owned())
+            .spawn(move || cmfd_node::work_gate::run_work_backlog_exclusive(&shared, &stop))?
+    };
+    let interrupted = shutdown.wait_unless_shutdown(|| worker.is_finished());
+    stop.store(true, Ordering::Release);
+    let report = worker
+        .join()
+        .map_err(|_| "the startup work check stopped unexpectedly")??;
+    if interrupted? {
+        return Ok(None);
+    }
+    eprintln!(
+        "{}",
+        serde_json::to_string(&json!({
+            "work_backlog": {
+                "checked": report.checked,
+                "validated_height": report.validated_height,
+                "tip_height": report.tip_height,
+                "halted": report.halted,
+            }
+        }))?
+    );
+    if report.halted {
+        let instructions = work_halt_instructions(
+            shared
+                .lock()
+                .map_err(|_| cmfd_node::NodeError::SharedNodePoisoned)?
+                .work_halted_block(),
+        );
+        if let Some(service) = refuse_halted {
+            return Err(Box::new(work_halt_refusal(service, &instructions)));
+        }
+        eprintln!("warning: {instructions}");
+    }
+    // Nothing can halt the node between the report and here: admission is
+    // not open yet and the background check starts below.
+    Ok(Some((
+        Some(cmfd_node::work_gate::spawn_work_backlog(Arc::clone(
+            shared,
+        ))?),
+        report.halted,
+    )))
+}
+
+/// How often a pool waiting for its validated tip reports its progress.
+const VALIDATED_TIP_REPORT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How a pool's wait for its validated tip ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ValidatedTipWait {
+    /// Every stored active block is checked: the pool may start.
+    Validated,
+    /// Shutdown was requested.
+    Shutdown,
+    /// A service exited, or block admission halted ([`WORK_HALT_SERVICE`]):
+    /// the pool does not start.
+    Stopped(&'static str),
+}
+
+/// Where a pool's wait for its validated tip stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ValidatedTipProgress {
+    /// The validated height, the tip height and the engine state.
+    Lagging(u64, u64, &'static str),
+    Validated,
+    Halted,
+}
+
+/// Waits, before a pool hands out work, until every stored active block has
+/// had its work checked here: a pool must not mine on a block it has not
+/// checked. Its P2P services are already open, so the node keeps following
+/// its peers meanwhile. Blocks admitted later are checked before they are
+/// stored. A halt, or a service that `services_exited` names, ends the wait
+/// and the pool does not start. Reports its progress every
+/// [`VALIDATED_TIP_REPORT_INTERVAL`].
+fn wait_for_validated_tip(
+    shared: &Mutex<Node>,
+    shutdown: &ShutdownSignal,
+    services_exited: impl Fn() -> Option<&'static str>,
+) -> Result<ValidatedTipWait, Box<dyn std::error::Error>> {
+    let progress = || {
+        let node = shared
+            .lock()
+            .map_err(|_| cmfd_node::NodeError::SharedNodePoisoned)?;
+        if node.work_rule_halted() {
+            return Ok(ValidatedTipProgress::Halted);
+        }
+        let tip = node.peer_hello().height;
+        Ok(match node.work_validated_height() {
+            Some(validated) if validated < tip => ValidatedTipProgress::Lagging(
+                validated,
+                tip,
+                node.work_rule_status()
+                    .map_or("pending", |status| status.engine_state),
+            ),
+            _ => ValidatedTipProgress::Validated,
+        })
+    };
+    wait_for_validated_tip_with(
+        shutdown,
+        progress,
+        services_exited,
+        VALIDATED_TIP_REPORT_INTERVAL,
+    )
+}
+
+/// [`wait_for_validated_tip`] over its parts: `progress` reads the node, and
+/// a lagging node is reported every `report_interval`.
+fn wait_for_validated_tip_with(
+    shutdown: &ShutdownSignal,
+    progress: impl Fn() -> Result<ValidatedTipProgress, cmfd_node::NodeError>,
+    services_exited: impl Fn() -> Option<&'static str>,
+    report_interval: Duration,
+) -> Result<ValidatedTipWait, Box<dyn std::error::Error>> {
+    let report = |validated: u64, tip: u64, engine_state: &str| {
+        eprintln!(
+            "{}",
+            json!({
+                "work_rule": {
+                    "waiting_for_validated_tip": true,
+                    "validated_height": validated,
+                    "tip_height": tip,
+                    "engine_state": engine_state,
+                }
+            })
+        );
+        if engine_state == "failed" {
+            eprintln!(
+                "warning: the work engines failed their known answers and are tried again; \
+                 the pool hands out no work until they pass and every stored block is checked"
+            );
+        }
+    };
+    let mut reported: Option<Instant> = None;
+    let mut ended = None;
+    let shutdown_requested = shutdown.wait_unless_shutdown(|| {
+        let outcome = match services_exited() {
+            Some(service) => Ok(ValidatedTipWait::Stopped(service)),
+            None => match progress() {
+                Ok(ValidatedTipProgress::Lagging(validated, tip, engine_state)) => {
+                    if reported.is_none_or(|at| at.elapsed() >= report_interval) {
+                        reported = Some(Instant::now());
+                        report(validated, tip, engine_state);
+                    }
+                    return false;
+                }
+                Ok(ValidatedTipProgress::Validated) => Ok(ValidatedTipWait::Validated),
+                Ok(ValidatedTipProgress::Halted) => {
+                    Ok(ValidatedTipWait::Stopped(WORK_HALT_SERVICE))
+                }
+                Err(error) => Err(error),
+            },
+        };
+        ended = Some(outcome);
+        true
+    })?;
+    if shutdown_requested {
+        return Ok(ValidatedTipWait::Shutdown);
+    }
+    Ok(ended.expect("the wait ends with an outcome unless shutdown was requested")?)
+}
+
+/// Why a node with `service` does not start while block admission is halted.
+fn work_halt_refusal(service: &str, instructions: &str) -> WorkHaltRefusal {
+    WorkHaltRefusal(format!(
+        "this node does not start its {service} while block admission is halted; {instructions}"
+    ))
 }
 
 fn install_shutdown_handler() -> Result<ShutdownSignal, ctrlc::Error> {
@@ -2588,7 +3462,7 @@ fn configure_production_v4_pool_verifier(
     proof_worker: Option<&PathBuf>,
     scratch_directory: Option<&PathBuf>,
     wsl_distribution: Option<&str>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Option<Arc<dyn cmfd_node::honest_work::GpuReplayWorkers>>, Box<dyn std::error::Error>> {
     let supplied = replay_worker.is_some()
         || !replay_gpus.is_empty()
         || proof_gpu.is_some()
@@ -2602,7 +3476,7 @@ fn configure_production_v4_pool_verifier(
                     .into(),
             );
         }
-        return Ok(());
+        return Ok(None);
     }
     let (Some(replay_worker), Some(proof_worker), Some(scratch_directory), Some(artifacts)) =
         (replay_worker, proof_worker, scratch_directory, artifacts)
@@ -2614,6 +3488,12 @@ fn configure_production_v4_pool_verifier(
     {
         let replay_worker =
             canonical_regular_file(replay_worker, "ProductionV4 pool replay worker")?;
+        // Block work checks use the replay workers only when they run the
+        // release's replay worker; shares use whichever worker is given.
+        let (work_check_pin, warning) = release_work_check_pin(&replay_worker)?;
+        if let Some(warning) = warning {
+            eprintln!("{warning}");
+        }
         let proof_worker = canonical_regular_file(proof_worker, "ProductionV4 pool proof worker")?;
         if !scratch_directory.is_absolute() {
             return Err("ProductionV4 pool scratch directory must be absolute".into());
@@ -2699,15 +3579,19 @@ fn configure_production_v4_pool_verifier(
                     .to_owned(),
             ),
         };
-        let verifier = ProductionV4PersistentPoolVerifier::start(ProductionV4PoolVerifierConfig {
-            replay,
-            extra_replays,
-            proof,
-            scratch_directory,
-            worker_scratch_directory,
-        })?;
-        config.production_v4_share_verifier = Some(Arc::new(verifier));
-        Ok(())
+        let pinned = work_check_pin.is_some();
+        let verifier = Arc::new(ProductionV4PersistentPoolVerifier::start(
+            ProductionV4PoolVerifierConfig {
+                replay,
+                extra_replays,
+                proof,
+                scratch_directory,
+                worker_scratch_directory,
+                work_check_pin,
+            },
+        )?);
+        config.production_v4_share_verifier = Some(Arc::clone(&verifier) as _);
+        Ok(pinned.then_some(verifier as _))
     }
     #[cfg(not(feature = "production-v4"))]
     {
@@ -2720,6 +3604,32 @@ fn configure_production_v4_pool_verifier(
         );
         Err("ProductionV4 pool support is not compiled into this binary".into())
     }
+}
+
+/// The pin block work checks use for `replay_worker`, or, when that file is
+/// not the release's replay worker, none and the warning that names both
+/// hashes.
+#[cfg(feature = "production-v4")]
+fn release_work_check_pin(
+    replay_worker: &Path,
+) -> Result<(Option<ReplayWorkerPin>, Option<String>), Box<dyn std::error::Error>> {
+    Ok(
+        match ReplayWorkerPin::release(replay_worker.to_path_buf())? {
+            Ok(pin) => (Some(pin), None),
+            Err(sha256) => (
+                None,
+                Some(format!(
+                    "warning: the replay worker {} (SHA-256 {}) is not the release build (SHA-256 \
+                     {}); shares use it, but block work checks run on the CPU engine only",
+                    replay_worker.display(),
+                    hex::encode(sha256),
+                    hex::encode(
+                        cmfd_node::production_v4_pool::production_v4_release_replay_worker_sha256()
+                    ),
+                )),
+            ),
+        },
+    )
 }
 
 #[cfg(feature = "production-v4")]
@@ -2871,6 +3781,13 @@ fn canonical_regular_file(
         return Err(format!("{component} path is not a regular file").into());
     }
     Ok(canonical)
+}
+
+fn parse_block_id_hex(value: &str) -> Result<[u8; 32], String> {
+    let mut block_id = [0_u8; 32];
+    hex::decode_to_slice(value, &mut block_id)
+        .map_err(|_| "a block id is exactly 64 hex characters".to_owned())?;
+    Ok(block_id)
 }
 
 fn parse_worker_sha256(value: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
@@ -3241,7 +4158,9 @@ fn pool_bonus_policy(
             return Err("pool-bonus-rate-bps above zero requires --pool-bonus-sponsor".into());
         }
         (_, Some(sponsor)) => parse_miner_destination(sponsor)
-            .map_err(|_| "pool-bonus-sponsor must be a 64-hex-character x-only public key")?,
+            .map_err(|_| {
+                "pool-bonus-sponsor must be a checksummed address or a 64-hex-character x-only public key"
+            })?,
     };
     if sponsor == miner_destination {
         return Err("pool-bonus-sponsor must differ from the pool block-reward destination".into());
@@ -3274,6 +4193,31 @@ fn peer_warning(allow_public_peers: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "production-v4")]
+    #[test]
+    fn a_replay_worker_that_is_not_the_release_build_gets_no_work_check_pin() {
+        let path = std::env::temp_dir().join(format!(
+            "cmfd-node-replay-worker-pin-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"abc").unwrap();
+        let (pin, warning) = release_work_check_pin(&path).unwrap();
+        assert!(pin.is_none());
+        let warning = warning.unwrap();
+        assert!(
+            warning.contains("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+        assert!(warning.contains(&hex::encode(
+            cmfd_node::production_v4_pool::production_v4_release_replay_worker_sha256()
+        )));
+        assert!(warning.contains("CPU engine only"));
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            release_work_check_pin(&path).is_err(),
+            "a missing file is an error"
+        );
+    }
 
     #[cfg(feature = "production-v4")]
     fn distinct_frame(steward: &[u8], community: &[u8]) -> Vec<u8> {
@@ -3991,6 +4935,57 @@ mod tests {
     }
 
     #[test]
+    fn work_checkpoint_export_requires_height_and_output() {
+        let cli = Cli::try_parse_from([
+            "cmfd-node",
+            "work-checkpoint",
+            "export",
+            "--height",
+            "12",
+            "--out",
+            "checkpoint.ids",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::WorkCheckpoint {
+                action: WorkCheckpointCommand::Export {
+                    height: 12,
+                    ref out,
+                    allow_shallow: false,
+                },
+            } if out == &PathBuf::from("checkpoint.ids")
+        ));
+        let cli = Cli::try_parse_from([
+            "cmfd-node",
+            "work-checkpoint",
+            "export",
+            "--height",
+            "12",
+            "--out",
+            "checkpoint.ids",
+            "--allow-shallow",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::WorkCheckpoint {
+                action: WorkCheckpointCommand::Export {
+                    allow_shallow: true,
+                    ..
+                },
+            }
+        ));
+        for args in [
+            &["cmfd-node", "work-checkpoint", "export", "--height", "12"][..],
+            &["cmfd-node", "work-checkpoint", "export", "--out", "x.ids"][..],
+            &["cmfd-node", "work-checkpoint"][..],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
     fn live_wallet_passphrase_file_is_a_global_option() {
         let cli = Cli::try_parse_from([
             "cmfd-node",
@@ -4329,6 +5324,251 @@ mod tests {
                 if quarantine_output == Path::new("blocks.tail.quarantine")
         ));
         assert!(Cli::try_parse_from(["cmfd-node", "storage-repair-tail"]).is_err());
+
+        let quarantine = Cli::try_parse_from([
+            "cmfd-node",
+            "storage-quarantine-block",
+            "--quarantine-output",
+            "blocks.quarantine",
+        ])
+        .unwrap();
+        assert!(matches!(
+            quarantine.command,
+            Command::StorageQuarantineBlock { quarantine_output, block_id: None }
+                if quarantine_output == Path::new("blocks.quarantine")
+        ));
+        let id = "ab".repeat(32);
+        let quarantine = Cli::try_parse_from([
+            "cmfd-node",
+            "storage-quarantine-block",
+            "--quarantine-output",
+            "blocks.quarantine",
+            "--block-id",
+            &id,
+        ])
+        .unwrap();
+        assert!(matches!(
+            quarantine.command,
+            Command::StorageQuarantineBlock { block_id: Some(id), .. } if id == [0xab; 32]
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "cmfd-node",
+                "storage-quarantine-block",
+                "--quarantine-output",
+                "blocks.quarantine",
+                "--block-id",
+                "abcd",
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["cmfd-node", "storage-quarantine-block"]).is_err());
+
+        let reconsider = Cli::try_parse_from(["cmfd-node", "work-reconsider", &id]).unwrap();
+        assert!(matches!(
+            reconsider.command,
+            Command::WorkReconsider { block_id } if block_id == [0xab; 32]
+        ));
+        assert!(Cli::try_parse_from(["cmfd-node", "work-reconsider"]).is_err());
+        assert!(Cli::try_parse_from(["cmfd-node", "work-reconsider", "abcd"]).is_err());
+    }
+
+    #[test]
+    fn run_checks_stored_blocks_in_the_background_and_a_pool_before_it_starts() {
+        let mode = |arguments: &[&str]| {
+            startup_backlog_mode(&Cli::try_parse_from(arguments).unwrap().command)
+        };
+        assert_eq!(mode(&["cmfd-node", "run"]), StartupBacklogMode::Background);
+        assert_eq!(
+            mode(&[
+                "cmfd-node",
+                "pool-serve",
+                "--certificate",
+                "certificate.der",
+                "--private-key",
+                "private-key.der",
+            ]),
+            StartupBacklogMode::Exclusive
+        );
+    }
+
+    #[test]
+    fn run_engine_threads_give_way_and_a_pool_keeps_normal_priority() {
+        use cmfd_node::honest_work::WorkThreadPriority;
+
+        let priority = |arguments: &[&str]| {
+            work_thread_priority(&Cli::try_parse_from(arguments).unwrap().command)
+        };
+        assert_eq!(
+            priority(&["cmfd-node", "run"]),
+            WorkThreadPriority::BelowNormal
+        );
+        assert_eq!(
+            priority(&[
+                "cmfd-node",
+                "pool-serve",
+                "--certificate",
+                "certificate.der",
+                "--private-key",
+                "private-key.der",
+            ]),
+            WorkThreadPriority::Normal
+        );
+    }
+
+    #[test]
+    fn pool_serve_work_engine_defaults_to_auto_and_accepts_cpu() {
+        let engine = |extra: &[&str]| {
+            let mut arguments = vec![
+                "cmfd-node",
+                "pool-serve",
+                "--certificate",
+                "certificate.der",
+                "--private-key",
+                "private-key.der",
+            ];
+            arguments.extend_from_slice(extra);
+            match Cli::try_parse_from(arguments).map(|cli| cli.command) {
+                Ok(Command::PoolServe { work_engine, .. }) => Ok(work_engine),
+                Ok(_) => unreachable!(),
+                Err(error) => Err(error),
+            }
+        };
+        assert_eq!(engine(&[]).unwrap(), PoolWorkEngine::Auto);
+        assert_eq!(
+            engine(&["--work-engine", "cpu"]).unwrap(),
+            PoolWorkEngine::Cpu
+        );
+        assert!(engine(&["--work-engine", "gpu"]).is_err());
+    }
+
+    #[test]
+    fn run_holds_the_work_bank_resident_when_it_fits_and_pool_serve_streams_it() {
+        let bank = |command: &str, extra: &[&str]| {
+            let mut arguments = vec!["cmfd-node", command];
+            if command == "pool-serve" {
+                arguments.extend([
+                    "--certificate",
+                    "certificate.der",
+                    "--private-key",
+                    "private-key.der",
+                ]);
+            }
+            arguments.extend_from_slice(extra);
+            match Cli::try_parse_from(arguments).map(|cli| cli.command) {
+                Ok(Command::Run { work_bank, .. } | Command::PoolServe { work_bank, .. }) => {
+                    Ok(work_bank)
+                }
+                Ok(_) => unreachable!(),
+                Err(error) => Err(error),
+            }
+        };
+        assert_eq!(bank("run", &[]).unwrap(), WorkBank::Auto);
+        assert_eq!(bank("pool-serve", &[]).unwrap(), WorkBank::Streamed);
+        for command in ["run", "pool-serve"] {
+            for (name, expected) in [
+                ("auto", WorkBank::Auto),
+                ("resident", WorkBank::Resident),
+                ("streamed", WorkBank::Streamed),
+            ] {
+                assert_eq!(bank(command, &["--work-bank", name]).unwrap(), expected);
+            }
+            assert!(bank(command, &["--work-bank", "cached"]).is_err());
+        }
+    }
+
+    #[test]
+    fn a_halt_while_running_is_reported_once_the_startup_check_ended_unhalted() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let watch = work_halt_watch(Some(Arc::clone(&flag)), false);
+        assert!(!watch());
+        flag.store(true, Ordering::Release);
+        assert!(watch(), "a halt after the startup check stops the services");
+        // A node that started halted keeps running for its status.
+        assert!(!work_halt_watch(Some(Arc::clone(&flag)), true)());
+        // No work rule, no halt.
+        assert!(!work_halt_watch(None, false)());
+    }
+
+    #[test]
+    fn a_service_refused_while_halted_exits_with_its_own_status() {
+        let refusal = work_halt_refusal("pool", "block admission is halted: ...");
+        let message = refusal.to_string();
+        assert!(message.contains("does not start its pool"), "{message}");
+        assert!(
+            message.ends_with("block admission is halted: ..."),
+            "{message}"
+        );
+        let error: Box<dyn std::error::Error> = Box::new(refusal);
+        assert_eq!(exit_status_for(error.as_ref()), Some(WORK_HALT_EXIT_STATUS));
+        // Other failures keep the default status, which a service manager
+        // restarts on.
+        let other: Box<dyn std::error::Error> = "work rule halted while running".into();
+        assert_eq!(exit_status_for(other.as_ref()), None);
+        assert_ne!(WORK_HALT_EXIT_STATUS, 1);
+        assert_ne!(WORK_HALT_EXIT_STATUS, 2, "clap's usage errors exit with 2");
+
+        // A start that a restart cannot change has a status of its own.
+        let lasting: [Box<dyn std::error::Error>; 5] = [
+            Box::new(StartupRefusal("conflict; quarantine the block".to_owned())),
+            Box::new(cmfd_node::NodeError::WorkCheckpointConflict {
+                block_id: [1; 32],
+                height: 5,
+                checkpoint_height: 9,
+            }),
+            Box::new(cmfd_node::NodeError::WorkRuleResyncRequired([2; 32])),
+            Box::new(cmfd_node::NodeError::ProductionV4ArtifactIdentityMismatch(
+                "model bank",
+            )),
+            Box::new(cmfd_node::NodeError::Io {
+                operation: "open the work-status store",
+                path: PathBuf::from("work-status.v1"),
+                source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            }),
+        ];
+        for error in &lasting {
+            assert_eq!(
+                exit_status_for(error.as_ref()),
+                Some(STARTUP_REFUSAL_EXIT_STATUS),
+                "{error}"
+            );
+        }
+        // A failure that may pass keeps the default status, so the service
+        // manager restarts the node.
+        let passing: [Box<dyn std::error::Error>; 3] = [
+            Box::new(cmfd_node::NodeError::Io {
+                operation: "read the model bank for the work engine",
+                path: PathBuf::from("MODEL-V2.bank"),
+                source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            }),
+            Box::new(cmfd_node::NodeError::Io {
+                operation: "open the work-status store",
+                path: PathBuf::from("work-status.v1"),
+                source: std::io::Error::from(std::io::ErrorKind::StorageFull),
+            }),
+            Box::new(cmfd_node::NodeError::Io {
+                operation: "open the work-status store",
+                path: PathBuf::from("work-status.v1"),
+                source: std::io::Error::other("read failed"),
+            }),
+        ];
+        for error in &passing {
+            assert_eq!(exit_status_for(error.as_ref()), None, "{error}");
+        }
+        for status in [1, 2, WORK_HALT_EXIT_STATUS] {
+            assert_ne!(STARTUP_REFUSAL_EXIT_STATUS, status);
+        }
+
+        // The instructions name both ways out for the halted block.
+        let block = "ab".repeat(32);
+        let instructions = work_halt_instructions(Some([0xab; 32]));
+        assert!(instructions.contains(&format!("storage-quarantine-block --block-id {block} ")));
+        assert!(instructions.contains(&format!("work-reconsider {block}`")));
+        assert!(work_halt_instructions(None).contains("work-reconsider <block id>`"));
+        // Reconsider only has the block checked again; a block this node's
+        // engines keep refusing needs a release that moves the checkpoint.
+        assert!(instructions.contains("only makes the next start check the block again"));
+        assert!(instructions.contains("a release that moves the checkpoint past the block"));
     }
 
     #[test]
@@ -4429,6 +5669,67 @@ mod tests {
         .wait_for_service_exit(|| Some("RPC"))
         .unwrap();
         assert_eq!(reason, Some("RPC"));
+    }
+
+    #[test]
+    fn a_pool_waiting_for_its_validated_tip_does_not_start_after_a_service_exit_or_a_halt() {
+        let wait = |progress: &dyn Fn() -> ValidatedTipProgress,
+                    exited: &dyn Fn() -> Option<&'static str>| {
+            let (_sender, receiver) = sync_channel(1);
+            wait_for_validated_tip_with(
+                &ShutdownSignal {
+                    receiver,
+                    request_file: None,
+                },
+                || Ok(progress()),
+                exited,
+                Duration::from_secs(60),
+            )
+            .unwrap()
+        };
+        let lagging = || ValidatedTipProgress::Lagging(3, 9, "ready");
+        // The first poll finds the node lagging; later ones find `then`.
+        let after_first = |then: ValidatedTipProgress| {
+            let polls = std::cell::Cell::new(0);
+            move || {
+                polls.set(polls.get() + 1);
+                if polls.get() > 1 { then } else { lagging() }
+            }
+        };
+        assert_eq!(
+            wait(&after_first(ValidatedTipProgress::Validated), &|| None),
+            ValidatedTipWait::Validated
+        );
+        assert_eq!(
+            wait(&after_first(ValidatedTipProgress::Halted), &|| None),
+            ValidatedTipWait::Stopped(WORK_HALT_SERVICE)
+        );
+        let exits = std::cell::Cell::new(0);
+        let exited = || {
+            exits.set(exits.get() + 1);
+            (exits.get() > 1).then_some("inbound P2P")
+        };
+        assert_eq!(
+            wait(&lagging, &exited),
+            ValidatedTipWait::Stopped("inbound P2P")
+        );
+    }
+
+    #[test]
+    fn a_shutdown_ends_the_validated_tip_wait() {
+        let (sender, receiver) = sync_channel(1);
+        sender.send(()).unwrap();
+        let waited = wait_for_validated_tip_with(
+            &ShutdownSignal {
+                receiver,
+                request_file: None,
+            },
+            || Ok(ValidatedTipProgress::Lagging(3, 9, "ready")),
+            || None,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        assert_eq!(waited, ValidatedTipWait::Shutdown);
     }
 
     #[test]

@@ -107,6 +107,8 @@ pub mod forgematrix_v4;
 pub mod forgematrix_v4_basefold;
 #[cfg(feature = "forgematrix-v4-verifier")]
 pub mod forgematrix_v4_basefold_codec;
+#[cfg(feature = "forgematrix-v4-executor")]
+pub mod forgematrix_v4_execution;
 #[cfg(feature = "forgematrix-v4-verifier")]
 pub mod forgematrix_v4_fixed_artifact;
 #[cfg(feature = "forgematrix-v4-verifier")]
@@ -143,6 +145,7 @@ pub mod sumcheck;
 #[cfg(feature = "whir-prototype")]
 pub mod whir_proof;
 pub mod wire;
+pub mod work_rule;
 
 pub use chain::{
     BLOCK_VERSION, Block, COINBASE_MATURITY, ChainError, ChainState, ChainStateSnapshotError,
@@ -202,6 +205,14 @@ pub use forgematrix_v4::{
     forgematrix_v4_challenge_digest, forgematrix_v4_dynamic_index,
     forgematrix_v4_proof_system_digest, forgematrix_v4_weight_index, forgematrix_v4_work_digest,
 };
+#[cfg(feature = "forgematrix-v4-executor")]
+pub use forgematrix_v4_execution::{
+    FORGEMATRIX_V4_MASK_COEFFICIENTS, FORGEMATRIX_V4_REPLAY_COEFFICIENT_BYTES,
+    ForgeMatrixV4Execution, ForgeMatrixV4ExecutionError, ForgeMatrixV4ExecutionShape,
+    ForgeMatrixV4FileLayerSource, ForgeMatrixV4LayerSource, ForgeMatrixV4ResidentLayerSource,
+    forgematrix_v4_execute, forgematrix_v4_execute_challenge,
+    forgematrix_v4_final_activation_digest_from_le_bytes, forgematrix_v4_replay_coefficients,
+};
 #[cfg(feature = "forgematrix-v4-verifier")]
 pub use forgematrix_v4_fixed_artifact::{
     FORGEMATRIX_V4_FIXED_ARTIFACT_FORMAT, FORGEMATRIX_V4_FIXED_ARTIFACT_FORMAT_DOMAIN,
@@ -221,7 +232,9 @@ pub use model_bank::{
     ModelBankError, ModelBankFieldStreamError, ModelBankManifest, ModelFieldChunk,
     ModelPcsIdentity, ModelPcsRole, ModelPcsRoleLayout, SmallModelBankFixture,
     StagedModelFieldSink, VerifiedModelBankReceipt, build_small_model_bank, verify_model_bank,
-    verify_model_bank_and_retain_base_input, verify_model_bank_into_staged_field_sink,
+    verify_model_bank_and_retain_base_input,
+    verify_model_bank_and_retain_base_input_and_layer_roots,
+    verify_model_bank_into_staged_field_sink,
 };
 #[cfg(feature = "gpu-proof-prover")]
 pub use model_whir_sources::{
@@ -249,7 +262,9 @@ pub use pow::{
     MAX_PRODUCTION_V3_NATIVE_BLOCK_ROWS, PreparedForgeMatrixV3Model,
 };
 #[cfg(feature = "forgematrix-v4-verifier")]
-pub use pow::{ForgeMatrixV4CandidateParameters, ForgeMatrixV4ConsensusVerifier};
+pub use pow::{
+    ForgeMatrixV4BankIdentity, ForgeMatrixV4CandidateParameters, ForgeMatrixV4ConsensusVerifier,
+};
 #[cfg(feature = "remainder-prototype")]
 pub use remainder_proof::{
     ForgeMatrixV2RemainderProof, MAX_REMAINDER_PROTOTYPE_PROOF_BYTES, REMAINDER_BACKEND_REVISION,
@@ -420,4 +435,8 @@ pub use wire::{
     decode_block, decode_forgematrix_proof, decode_transaction, encode_block,
     encode_forgematrix_proof, encode_transaction, max_block_bytes_for_network,
     max_proof_bytes_for_network, network_magic,
+};
+pub use work_rule::{
+    ForgeMatrixV4WorkRule, WorkCheckpointPin, WorkRuleError, forgematrix_v4_work_rule,
+    forgematrix_v4_work_rule_checked,
 };

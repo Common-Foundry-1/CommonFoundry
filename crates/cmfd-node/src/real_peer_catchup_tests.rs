@@ -4,6 +4,7 @@
 //! public listeners, miners, operator wallets, or GPU workers are used.
 
 use super::*;
+use crate::honest_work::HonestWorkChecker;
 use crate::{
     ProductionV4VerifierArtifacts, ProofProfile, add_chain_work, mainnet_runtime, network_profile,
     release_gate,
@@ -150,13 +151,17 @@ fn open_node(
     path: &Path,
     launch: &mainnet_runtime::AuthenticatedMainnetRuntime,
     artifacts: &ProductionV4VerifierArtifacts,
-) -> Arc<Mutex<Node>> {
-    let node =
+    checker: Option<&Arc<HonestWorkChecker>>,
+) -> (Arc<Mutex<Node>>, Arc<HonestWorkChecker>) {
+    let mut node =
         Node::open_with_authenticated_mainnet(path, launch, artifacts, Some(PASSPHRASE)).unwrap();
     assert_eq!(node.network_profile(), launch.profile());
     assert_eq!(node.profile.proof, ProofProfile::ProductionV4);
+    // Every block above genesis has its work re-executed on the CPU,
+    // whatever checkpoint the release pins.
+    let checker = crate::work_gate::test_support::check_work_from_genesis(&mut node, checker);
     check_memory();
-    Arc::new(Mutex::new(node))
+    (Arc::new(Mutex::new(node)), checker)
 }
 
 #[derive(Default, serde::Serialize)]
@@ -331,7 +336,7 @@ fn serve_fixture_connection(
 }
 
 #[test]
-#[ignore = "requires production-mainnet, six public mainnet blocks and pinned models; isolated loopback; run alone"]
+#[ignore = "requires production-mainnet (with the release work checkpoint pinned), six public mainnet blocks and pinned models; isolated loopback; run alone"]
 fn real_mainnet_peer_backlog_catches_moving_head_without_poll_sleep() {
     assert_eq!(
         std::env::var("CMFD_RUN_REAL_PEER_CATCHUP").as_deref(),
@@ -387,7 +392,8 @@ fn real_mainnet_peer_backlog_catches_moving_head_without_poll_sleep() {
     fs::create_dir(&output).unwrap();
 
     println!("REAL_PEER_STAGE three ordinary one-block sessions with full real proofs");
-    let baseline = open_node(&output.join("ordinary-sessions"), &launch, &artifacts);
+    let (baseline, checker) =
+        open_node(&output.join("ordinary-sessions"), &launch, &artifacts, None);
     let fixture_peer =
         FixturePeer::start(baseline.lock().unwrap().peer_hello(), Arc::clone(&b), false);
     let dispatches = Arc::clone(&baseline.lock().unwrap().block_preverifier.worker_dispatches);
@@ -421,7 +427,14 @@ fn real_mainnet_peer_backlog_catches_moving_head_without_poll_sleep() {
     drop(baseline);
 
     println!("REAL_PEER_STAGE production poller; peer advances B2 to B3; interval 60 seconds");
-    let target = open_node(&output.join("moving-peer-poller"), &launch, &artifacts);
+    // The same work checker, so the deadline below times catch-up, not the
+    // work the ordinary sessions already re-executed.
+    let (target, _) = open_node(
+        &output.join("moving-peer-poller"),
+        &launch,
+        &artifacts,
+        Some(&checker),
+    );
     let fixture_peer =
         FixturePeer::start(target.lock().unwrap().peer_hello(), Arc::clone(&b), true);
     let dispatches = Arc::clone(&target.lock().unwrap().block_preverifier.worker_dispatches);

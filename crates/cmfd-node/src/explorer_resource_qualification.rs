@@ -131,9 +131,12 @@ fn preserved_full_v4_explorer_read_cost() {
         "FULL_V4_RESOURCE_STAGE submitting preserved block through normal CPU consensus validation"
     );
     let admission = Instant::now();
-    node.submit_block(block.clone(), block.challenge.timestamp)
-        .unwrap();
+    // The shared submission runs the work check before the commit; the
+    // direct one refuses a block above the checkpoint without a verdict.
+    let shared = Arc::new(Mutex::new(node));
+    submit_shared_block(&shared, block.clone(), block.challenge.timestamp).unwrap();
     let admission_ms = admission.elapsed().as_millis();
+    let mut node = Arc::try_unwrap(shared).ok().unwrap().into_inner().unwrap();
     let block_id = block.block_id();
     let encoded_bytes = encode_block(&block).unwrap().len();
     let OutputLock::Key(address) = block.coinbase.outputs[0].lock else {

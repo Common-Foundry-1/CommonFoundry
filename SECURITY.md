@@ -304,16 +304,19 @@ bounded modular quotients, and signed carries, so every BLS12-381 reduction is
 an integer equality below the Goldilocks modulus rather than an assumed
 cross-field conversion. A real composed fixture rejects altered activation
 bytes, challenge, digest, transcript binding, point, proof framing, and replay.
-The 32-byte, 256-row checkpoint has main width 393. Parallel proof-of-work
-witness selection produced 222,256- to 222,384-byte native frames in release
-runs. The bridge now wraps that frame in a bounded canonical best-zlib codec:
-the decoder caps expansion, checks the declared native length and inner proof
-identity, and requires byte-identical recompression. Release runs measured
-156,500 to 156,650 wire bytes, with a 157,000-byte regression ceiling. Together
-with the current 133,409-byte production Dory projection and 18-byte candidate
-envelope, that cross-shape checkpoint projects to 289,927 through 290,077 bytes,
-27,980 through 28,130 bytes above the 261,947-byte V3 structured-proof
-allowance.
+The 32-byte, 256-row checkpoint has main width 393. Its native frame is a fixed
+176,464 bytes plus 32 bytes per distinct Merkle digest. Parallel proof-of-work
+witness selection changes the query positions and with them the digest count:
+148 measured proofs produced 221,744- to 223,024-byte native frames. The bridge
+now wraps that frame in a bounded canonical best-zlib codec: the decoder caps
+expansion, checks the declared native length and inner proof identity, and
+requires byte-identical recompression. The same proofs measured 156,063 to
+157,455 wire bytes. The regression test bounds the native frame by its
+225,584-byte worst case, with every digest distinct, and the wire frame by
+161,000 bytes. Together with the current 133,409-byte production Dory
+projection and 18-byte candidate envelope, that cross-shape checkpoint projects
+to 289,490 through 290,882 bytes, 27,543 through 28,935 bytes above the
+261,947-byte V3 structured-proof allowance.
 
 An executable parameter sweep also rejects FRI tuning as a disguised fix. At
 18 query-grinding bits, the production security calculation needs 32 queries
@@ -471,7 +474,12 @@ valueless testing. The P2P runtime adds connect-back-verified peer discovery,
 per-source connection fairness, bounded reputation scoring, reconnect-rate
 limits, and temporary automatic bans for objective protocol and resource-limit
 violations. RPC remains loopback-only, `0.0.0.0` remains invalid, and operators
-should expose only the active profile's TCP P2P port.
+should expose only the active profile's TCP P2P port. Because a web page can
+reach a loopback listener by re-resolving its own hostname to 127.0.0.1 (DNS
+rebinding), the wallet, `/v1/mine`, `/v1/transaction` and `/v1/block` routes
+also require a loopback `Host` header and refuse foreign browser `Origin` or
+`Sec-Fetch-Site: cross-site` requests with `403`; see the Devnet guide's
+Loopback RPC section.
 
 Before any public-value or broadly advertised public testnet, the networking and storage design needs
 explicit abuse, latency, and crash-recovery bounds. Static and discovered peers

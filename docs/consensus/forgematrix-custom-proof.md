@@ -986,15 +986,19 @@ and rejects byte substitution, point, challenge, digest, transcript-binding,
 codec, and replay changes.
 
 This correctness checkpoint does not yet fit the block proof budget. At the
-smallest supported 32-byte activation, its 256-row trace has width 393 and
-release runs produced 222,256- to 222,384-byte native frames. A canonical
-best-zlib outer frame now caps decompression, binds the declared native length,
-retains the inner proof identity, rejects trailing data, and requires
-byte-identical recompression. The resulting wire frames measured 156,500 to
-156,650 bytes under a 157,000-byte regression ceiling. Combining those measured
+smallest supported 32-byte activation, its 256-row trace has width 393. Its
+native frame is a fixed 176,464 bytes plus 32 bytes per distinct Merkle digest,
+and the parallel query proof-of-work witness changes the query positions and
+with them the digest count: 148 measured proofs produced 221,744- to
+223,024-byte native frames. A canonical best-zlib outer frame now caps
+decompression, binds the declared native length, retains the inner proof
+identity, rejects trailing data, and requires byte-identical recompression. The
+resulting wire frames measured 156,063 to 157,455 bytes. The regression test
+bounds native frames by their 225,584-byte worst case, with every digest
+distinct, and wire frames by 161,000 bytes. Combining those measured
 checkpoints with the current 133,409-byte production Dory projection and the
-18-byte two-proof envelope gives 289,927 to 290,077 bytes, which remains 27,980
-to 28,130 bytes above the 261,947-byte V3 structured payload allowance.
+18-byte two-proof envelope gives 289,490 to 290,882 bytes, which remains 27,543
+to 28,935 bytes above the 261,947-byte V3 structured payload allowance.
 
 The parameter boundary is executable as well. With 18 query-grinding bits, the
 production bridge requires at least 32, 28, 25, and 23 queries at log blowups 7,

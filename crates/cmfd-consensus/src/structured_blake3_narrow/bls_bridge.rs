@@ -648,15 +648,31 @@ mod tests {
             256
         );
         assert_eq!(BRIDGE_WIDTH, 393);
+        // The proof size varies between runs. The query proof-of-work witness
+        // comes from a parallel search that keeps whichever valid witness a
+        // worker thread finds first, so the 33 query positions, and with them
+        // how many Merkle path digests the path archive can share, change.
+        // The native proof is 176,464 fixed bytes plus 32 bytes per distinct
+        // digest; these trees (depths 15, 15, 15 and 14) allow at most 1,535
+        // digests, so it never exceeds 225,584 bytes. Over 148 proofs with 2,
+        // 4 and all available worker threads: 1,415-1,455 digests, native
+        // 221,744-223,024 bytes, compressed 156,063-157,455 bytes (with four
+        // threads, as on CI, 68 of 100 exceeded the old 157,000-byte ceiling;
+        // CI saw 157,343). Each digest adds at most about 37 compressed bytes,
+        // which puts the compressed worst case near 160,400 bytes; that
+        // 161,000-byte bound is an extrapolation, not an exact worst case.
+        // The native bound is exact and is the guard against a change of
+        // proof shape (an extra query can stay under the compressed bound),
+        // so keep it even though it looks redundant.
         assert!(
-            proof.len() <= 157_000,
+            proof.len() <= 161_000,
             "compressed bridge proof is {} bytes",
             proof.len()
         );
         let native = decompress_bridge_proof(&proof).unwrap();
         assert!(
-            native.len() <= 222_500,
-            "native bridge proof exceeded its measured regression ceiling"
+            native.len() <= 225_584,
+            "native bridge proof exceeded its worst-case size"
         );
         verify_bls_dory_narrow_blake3(&bridge_statement, &proof).unwrap();
 

@@ -33,6 +33,7 @@ describe("Tauri node transport", () => {
     await transport.backupWallet("C:\\offline\\wallet.cmfd-backup", "correct horse battery staple");
     await transport.migrateWalletEncryption("C:\\offline\\wallet.cmfd-backup", "correct horse battery staple");
     await transport.restoreWallet("C:\\offline\\wallet.cmfd-backup", "correct horse battery staple");
+    await transport.resyncChain();
 
     expect(invokeMock.mock.calls).toEqual([
       ["get_node_status", undefined],
@@ -50,6 +51,7 @@ describe("Tauri node transport", () => {
       ["backup_wallet", { request: { path: "C:\\offline\\wallet.cmfd-backup", passphrase: "correct horse battery staple" } }],
       ["migrate_wallet_encryption", { request: { path: "C:\\offline\\wallet.cmfd-backup", passphrase: "correct horse battery staple" } }],
       ["restore_wallet", { request: { path: "C:\\offline\\wallet.cmfd-backup", passphrase: "correct horse battery staple" } }],
+      ["resync_chain", undefined],
     ]);
   });
 

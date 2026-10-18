@@ -43,4 +43,19 @@ describe("TransactionList", () => {
     expect(icon).not.toHaveClass("kind-maintenance");
     expect(icon?.querySelector(".lucide-arrow-up-right")).toBeInTheDocument();
   });
+
+  it("marks an entry whose block is not checked yet", () => {
+    render(<TransactionList entries={[sentEntry({
+      kind: "received",
+      status: "verifying",
+      confirmations: 1,
+      net_amount_atoms: "2000",
+      fee_burned_atoms: "0",
+      counterparty: "cd".repeat(32),
+    })]} />);
+
+    const status = screen.getByText("1 confirmation · block check pending");
+    expect(status).toHaveClass("status-verifying");
+    expect(status.closest("article")?.querySelector(".lucide-hourglass")).toBeInTheDocument();
+  });
 });

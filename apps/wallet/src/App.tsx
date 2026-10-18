@@ -8,11 +8,14 @@ import { NetworkView } from "./components/NetworkView";
 import { Overview } from "./components/Overview";
 import { PrelaunchWallet } from "./components/PrelaunchWallet";
 import { ReceiveDialog } from "./components/ReceiveDialog";
+import { ResyncDialog } from "./components/ResyncDialog";
 import { SendDialog } from "./components/SendDialog";
 import { Sidebar, type ViewName } from "./components/Sidebar";
 import { StartupScreen } from "./components/StartupScreen";
 import { TransactionsView } from "./components/TransactionsView";
+import { UpdateBanner } from "./components/UpdateBanner";
 import { WalletSecurityDialog } from "./components/WalletSecurityDialog";
+import { WorkCheckNotice } from "./components/WorkCheckNotice";
 import { useWalletData } from "./hooks/useWalletData";
 import type { WalletCustodyStatus } from "./types";
 
@@ -29,9 +32,13 @@ export function App() {
   const [receiveOpen, setReceiveOpen] = useState(false);
   const [consolidateOpen, setConsolidateOpen] = useState(false);
   const [securityOpen, setSecurityOpen] = useState(false);
+  const [resyncOpen, setResyncOpen] = useState(false);
   const [custody, setCustody] = useState<WalletCustodyStatus | null>(null);
   const [custodyError, setCustodyError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  // Where a resync put the old chain. A resync leaves an encrypted wallet
+  // locked, so this must still show on the launch screen that follows.
+  const [resyncNotice, setResyncNotice] = useState<string | null>(null);
   const data = useWalletData();
   const networkShortName = data.status?.network_short_name ?? "Network";
   const heading = view === "network"
@@ -65,7 +72,21 @@ export function App() {
     if (!data.starting) void refreshCustody();
   }, [data.starting, refreshCustody]);
 
-  const preparingLaunch = Boolean(custody?.launch && !custody.unlocked);
+  // A newer version failed after it opened the wallet data: the update
+  // banner asks Retry or Run anyway, and unlocking waits for that choice.
+  // A mainnet wallet always reports its launch, so a held wallet must not get
+  // the launch unlock screen, which has no update banner.
+  const updateHeld = data.errorCode === "update_fallback_held";
+  // A stored chain the node refused is resynced first; unlocking cannot start
+  // the node until then. The launch screen has no resync either, so a
+  // mainnet wallet that needs one gets the main layout too.
+  const resyncRequired = data.errorCode === "chain_resync_required";
+  const preparingLaunch = Boolean(custody?.launch && !custody.unlocked) && !updateHeld && !resyncRequired;
+  // Once the wallet runs again, the resync notice has done its job.
+  useEffect(() => {
+    if (custody?.unlocked) setResyncNotice(null);
+  }, [custody?.unlocked]);
+
   useEffect(() => {
     if (!preparingLaunch) return;
     let cancelled = false;
@@ -78,12 +99,16 @@ export function App() {
     return () => { cancelled = true; clearTimeout(timer); };
   }, [preparingLaunch, refreshCustody]);
 
-  const custodyRequired = usesEmbeddedNode && custody !== null && !custody.unlocked;
+  const custodyRequired = usesEmbeddedNode && custody !== null && !custody.unlocked && !resyncRequired && !updateHeld;
   const custodyNeedsAttention = usesEmbeddedNode && (custody?.requires_migration || custodyRequired);
 
+  // The launch screen shows update notices too: a mainnet wallet always
+  // starts locked, and why a newer version could not start belongs on the
+  // first screen.
   if (preparingLaunch && custody) {
     return <PrelaunchWallet status={custody} statusError={custodyError} onStatusChange={setCustody}
-      onRefresh={async () => { await Promise.allSettled([data.refresh(), refreshCustody()]); }} />;
+      onRefresh={async () => { await Promise.allSettled([data.refresh(), refreshCustody()]); }}
+      updateNotice={<UpdateBanner />} notice={resyncNotice} />;
   }
 
   if (data.starting || (data.loading && data.status === null && data.error === null)) {
@@ -143,18 +168,31 @@ export function App() {
           </button>
         ) : null}
 
-        {data.error ? (
+        {usesEmbeddedNode ? (
+          <UpdateBanner heldMessage={updateHeld ? data.error : null} onRunAnyway={() => void data.refresh()} />
+        ) : null}
+
+        {updateHeld ? null : data.error ? (
           <div className="offline-banner" role="alert">
             <div>
-              <strong>Local node unavailable</strong>
+              <strong>{resyncRequired ? "Stored chain needs a resync" : "Local node unavailable"}</strong>
               <span>{data.error}</span>
             </div>
-            <button className="button-secondary compact" type="button" onClick={() => void data.refresh()}>
-              <RefreshCw aria-hidden="true" size={16} />
-              Retry
-            </button>
+            {resyncRequired ? (
+              <button className="button-secondary compact" type="button" onClick={() => setResyncOpen(true)}>
+                <RefreshCw aria-hidden="true" size={16} />
+                Resync chain
+              </button>
+            ) : (
+              <button className="button-secondary compact" type="button" onClick={() => void data.refresh()}>
+                <RefreshCw aria-hidden="true" size={16} />
+                Retry
+              </button>
+            )}
           </div>
-        ) : null}
+        ) : (
+          <WorkCheckNotice status={data.status} onResync={() => setResyncOpen(true)} />
+        )}
 
         <div className={`workspace-content${data.loading ? " is-loading" : ""}`} aria-busy={data.loading}>
           {view === "overview" ? (
@@ -225,6 +263,21 @@ export function App() {
         onClose={closeConsolidation}
         onCompleted={showNotice}
         onRefresh={data.refresh}
+      />
+      <ResyncDialog
+        open={resyncOpen}
+        onClose={() => setResyncOpen(false)}
+        onStatusChange={(next) => {
+          setCustody(next);
+          setCustodyError(null);
+        }}
+        onCompleted={(message) => {
+          setResyncNotice(message);
+          showNotice(message);
+        }}
+        onRefresh={async () => {
+          await Promise.allSettled([data.refresh(), refreshCustody()]);
+        }}
       />
       <WalletSecurityDialog
         open={securityOpen || custodyRequired}

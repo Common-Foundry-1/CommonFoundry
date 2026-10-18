@@ -109,4 +109,22 @@ describe("useWalletData", () => {
     expect(result.current.starting).toBe(false);
     expect(result.current.status).toBe(status);
   });
+
+  it("keeps the node's error code until a refresh succeeds", async () => {
+    const refused = Object.assign(new Error("Resync the chain"), { code: "chain_resync_required" });
+    apiMocks.getNodeStatus.mockRejectedValueOnce(refused).mockResolvedValue(status);
+    apiMocks.getWalletSnapshot.mockResolvedValue(wallet);
+    apiMocks.getMempool.mockResolvedValue(mempool);
+
+    const { result } = renderHook(() => useWalletData(4_000));
+    await act(async () => Promise.resolve());
+    expect(result.current.error).toBe("Resync the chain");
+    expect(result.current.errorCode).toBe("chain_resync_required");
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(4_000);
+    });
+    expect(result.current.error).toBeNull();
+    expect(result.current.errorCode).toBeNull();
+  });
 });

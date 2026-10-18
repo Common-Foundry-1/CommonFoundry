@@ -38,6 +38,7 @@ impl TransactionIndex {
             .flat_map(|(txid, locations)| locations.iter().map(move |location| (*txid, *location)))
     }
 
+    #[cfg(test)]
     pub fn entry_count(&self) -> usize {
         self.locations.values().map(Vec::len).sum()
     }
@@ -63,6 +64,22 @@ impl TransactionIndex {
                     transaction_position,
                 });
         }
+    }
+
+    /// Keeps only the locations in blocks `keep` accepts, for a prune that
+    /// dropped blocks from the fork index.
+    pub fn retain_blocks(&mut self, keep: impl Fn(&[u8; 32]) -> bool) {
+        self.locations.retain(|_, locations| {
+            locations.retain(|location| keep(&location.block_id));
+            !locations.is_empty()
+        });
+    }
+
+    /// Whether `txid` was indexed at exactly this location.
+    pub fn has_location(&self, txid: &[u8; 32], location: TransactionLocation) -> bool {
+        self.locations
+            .get(txid)
+            .is_some_and(|locations| locations.contains(&location))
     }
 
     pub fn active_location(
@@ -120,5 +137,25 @@ mod tests {
             ]
         );
         assert_eq!(index.locations[&second].len(), 2);
+    }
+
+    #[test]
+    fn retaining_blocks_drops_only_the_other_blocks_locations() {
+        let (first, second) = ([1; 32], [2; 32]);
+        let mut index = TransactionIndex::default();
+        index.insert_block([0x11; 32], [first, second]);
+        index.insert_block([0x22; 32], [second]);
+        index.retain_blocks(|block_id| *block_id == [0x22; 32]);
+        assert!(!index.locations.contains_key(&first));
+        assert_eq!(
+            index.entries().collect::<Vec<_>>(),
+            vec![(
+                second,
+                TransactionLocation {
+                    block_id: [0x22; 32],
+                    transaction_position: 0
+                }
+            )]
+        );
     }
 }

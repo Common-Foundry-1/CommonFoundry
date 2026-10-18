@@ -21,6 +21,13 @@ export interface PeerSettings {
   max_peers: number;
 }
 
+/** What a resync did: where the stored chain was moved, and its size. */
+export interface ChainResyncReport {
+  custody: WalletCustodyStatus;
+  moved_to: string;
+  moved_bytes: number;
+}
+
 export interface WalletCustodyStatus {
   network: string;
   storage: "missing" | "plaintext" | "encrypted";
@@ -38,6 +45,67 @@ export interface ProofAdmissionClassTelemetry {
   wait_events: number;
   rejections: number;
   proof_failures: number;
+}
+
+export interface WorkRuleAlarms {
+  engine_divergence: number;
+  own_engine_mismatches: number;
+  engine_failures: number;
+  store_conflicts: number;
+  peers_on_invalid_chain: number;
+}
+
+/**
+ * Where a desktop wallet catching up stands. Present only on a desktop wallet
+ * started with `--work-check standard` (the default) where the catch-up is on.
+ */
+export interface WalletCatchUpStatus {
+  state:
+    | "release_stale"
+    | "single_source"
+    | "caught_up"
+    | "catching_up"
+    | "checking_newest"
+    | "waiting_for_check";
+  /** With `waiting_for_check`: why the coins still wait. */
+  reason: "earlier_blocks" | "difficulty" | "other" | null;
+  /** Coins in blocks up to this height are available. */
+  available_height: number;
+  /** How many blocks the state still waits for; the wallet shows this number as is. */
+  blocks_left: number;
+  /** The newest blocks checked on this computer, up to `newest_needed`. */
+  newest_checked: number;
+  newest_needed: number;
+  /** Relays that reported their height recently. */
+  sources_answering: number;
+  /** A block taken without a check here lies above the available height: Solo mining waits. */
+  granted_above_available: boolean;
+}
+
+/** How the node re-executes block work, on a network with that rule. */
+export interface WorkRuleStatus {
+  enforced: boolean;
+  engines: string | null;
+  /** Whether the CPU engine holds the model bank in memory or reads it for each block; absent from nodes older than 1.0.16. */
+  bank?: "resident" | "streamed" | null;
+  engine_state: "pending" | "qualifying" | "ready" | "failed";
+  engine_ready: boolean;
+  independent_engines: boolean;
+  halted: boolean;
+  checkpoint_height: number;
+  checkpoint_hash: string;
+  activation_height: number;
+  validated_height: number;
+  pending_side_blocks: number;
+  /** The lowest unchecked active block, when one engine found its work does not match and nothing has settled it. */
+  unsettled_height: number | null;
+  /** The id of that block, in hex. */
+  unsettled_block_id: string | null;
+  /** The check of stored blocks is paused (on battery). */
+  backlog_paused: boolean;
+  alarms: WorkRuleAlarms;
+  /** Only on a desktop wallet with the catch-up on. */
+  wallet_catch_up?: WalletCatchUpStatus | null;
 }
 
 export interface NodeStatus {
@@ -80,12 +148,15 @@ export interface NodeStatus {
   storage_healthy: boolean;
   public_peer_mode: boolean;
   peers: PeerObservation[];
+  work_rule?: WorkRuleStatus | null;
 }
 
 export interface WalletBalances {
   spendable_atoms: string;
   immature_atoms: string;
   pending_atoms: string;
+  /** Coins in blocks whose work the node has not re-executed yet. */
+  verifying_atoms?: string;
 }
 
 export interface WalletHistoryEntry {
@@ -94,7 +165,7 @@ export interface WalletHistoryEntry {
   height: number | null;
   timestamp: number | null;
   confirmations: number;
-  status: "confirmed" | "immature" | "pending";
+  status: "confirmed" | "immature" | "pending" | "verifying";
   net_amount_atoms: string;
   fee_burned_atoms: string;
   counterparty: string | null;
@@ -112,6 +183,10 @@ export interface WalletSnapshot {
   spendable_utxo_count: number;
   immature_utxo_count: number;
   reserved_utxo_count: number;
+  verifying_utxo_count?: number;
+  validated_height?: number | null;
+  /** Coins in blocks up to this height are available; only on a desktop wallet with the catch-up on. */
+  available_height?: number | null;
   mempool: {
     transactions: number;
     bytes: number;

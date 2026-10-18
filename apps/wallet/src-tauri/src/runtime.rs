@@ -1,5 +1,6 @@
 use std::fs;
-use std::net::TcpListener;
+use std::io::Write as _;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 #[cfg(all(feature = "production-rc", target_os = "windows"))]
@@ -7,7 +8,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 #[cfg(all(feature = "production-rc", target_os = "windows"))]
 use std::{io, os::windows::process::CommandExt};
 
@@ -18,6 +19,7 @@ use cmfd_node::wallet_backup::{
     create_encrypted_wallet_backup, inspect_wallet_key_storage, migrate_plaintext_wallet_key,
     read_wallet_passphrase_file, restore_encrypted_wallet_backup,
 };
+use cmfd_node::work_gate::CatchUpSource;
 use cmfd_node::{
     COMPILED_NETWORK_PROFILE, NetworkProfile, Node, NodeClientError, NodeError,
     ProductionV3VerifierRecord, ProductionV4VerifierArtifacts, ProofProfile, PrunerHandle,
@@ -27,18 +29,20 @@ use cmfd_node::{
 use cmfd_proof_worker::{ProofWorkerError, VerifierWorkerConfig, VerifierWorkerError};
 use tauri::{App, Manager, Runtime};
 
-use crate::mining::MiningManager;
 #[cfg(feature = "production-v4")]
 use crate::mining::ProductionV4PoolSearchAssets;
+use crate::mining::{MiningLifecycle, MiningManager};
+use crate::updater::lifecycle::{self, ExitStarted, NodeOperation, NodePhase, RestartGuard};
 
 mod config;
 mod launch;
 mod peers;
+mod power;
 
 pub(crate) use config::{ConfigError, NodeRuntimeConfig, ProcessCommand};
 use config::{
     DEFAULT_PROOF_VERIFIER_MEMORY_BYTES, DEFAULT_PROOF_VERIFIER_STARTUP_TIMEOUT_MS,
-    DEFAULT_PROOF_VERIFIER_TIMEOUT_MS,
+    DEFAULT_PROOF_VERIFIER_TIMEOUT_MS, WorkCheck,
 };
 pub(crate) use peers::{PeerManager, PeerSettings, UpdatePeerSettingsRequest};
 
@@ -46,6 +50,9 @@ const STATIC_PEER_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Lets startup and the first sync settle before the first proof-pruning
 /// check; later checks follow `cmfd_node::PRUNE_CHECK_INTERVAL`.
 const FIRST_PRUNE_CHECK_DELAY: Duration = Duration::from_secs(120);
+/// The startup error code for a stored chain that cannot be kept and must be
+/// synced again; the wallet offers [`RuntimeHandle::resync_chain`] for it.
+pub(crate) const CHAIN_RESYNC_REQUIRED: &str = "chain_resync_required";
 
 #[derive(Clone)]
 enum NodeAvailability {
@@ -59,6 +66,9 @@ struct ServiceHandles {
     pruner: Option<PrunerHandle>,
     /// Background check of the block history a fast start did not re-read.
     history_scrub: Option<cmfd_node::HistoryScrub>,
+    /// Background work check of stored blocks, for a network with the
+    /// release work rule.
+    work_backlog: Option<cmfd_node::work_gate::WorkBacklogHandle>,
 }
 
 struct EmbeddedNode {
@@ -89,6 +99,8 @@ pub(crate) struct RuntimeHandle {
     inner: Arc<Mutex<RuntimeParts>>,
     operation: Arc<Mutex<()>>,
     stopping: Arc<AtomicBool>,
+    /// "Restart to update" waits for sends and custody operations.
+    update: Arc<RestartGuard>,
     config: NodeRuntimeConfig,
     data_dir: Result<PathBuf, NodeClientError>,
     launch: Arc<launch::LaunchPreparation>,
@@ -99,6 +111,16 @@ pub struct RuntimeState {
     // Held for the life of the process: dropping it stops the non-blocking
     // file writer from flushing buffered log lines.
     _log_guard: Option<cmfd_node::logging::WorkerGuard>,
+}
+
+/// What a resync did: the stored chain was moved to `moved_to`, a folder
+/// inside the data directory that can be deleted once the wallet has synced
+/// again.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct ChainResyncReport {
+    pub custody: WalletCustodyStatus,
+    pub moved_to: String,
+    pub moved_bytes: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -155,7 +177,15 @@ impl RuntimeParts {
 }
 
 impl RuntimeState {
-    pub fn start<R: Runtime>(app: &App<R>, config: NodeRuntimeConfig) -> Self {
+    /// `held`: a newer version failed after it had opened this wallet's
+    /// data, so the node does not open them until the user chooses "Run
+    /// anyway" ([`RuntimeHandle::run_held_start`]); the node shows `held`
+    /// meanwhile.
+    pub fn start<R: Runtime>(
+        app: &App<R>,
+        config: NodeRuntimeConfig,
+        held: Option<NodeClientError>,
+    ) -> Self {
         let allow = config.allow_public_peers;
         let peers = config.peers.len();
         eprintln!(
@@ -192,68 +222,20 @@ impl RuntimeState {
             })),
             operation: Arc::new(Mutex::new(())),
             stopping,
+            update: Arc::default(),
             launch,
             config: config.clone(),
             data_dir: data_dir.clone(),
         };
-        if let Ok(startup_data_dir) = data_dir {
-            let startup_inner = Arc::clone(&handle.inner);
-            let startup_stopping = Arc::clone(&handle.stopping);
-            let spawn = thread::Builder::new()
-                .name("cmfd-wallet-startup".to_owned())
-                .spawn(move || {
-                    let started = catch_unwind(AssertUnwindSafe(|| {
-                        let wallet_passphrase = config
-                            .wallet_passphrase_file
-                            .as_deref()
-                            .map(read_wallet_passphrase_file)
-                            .transpose()
-                            .map_err(|error| {
-                                startup_error(
-                                    "wallet_passphrase_file",
-                                    format!(
-                                        "The wallet passphrase file could not be used: {error}"
-                                    ),
-                                    false,
-                                )
-                            })?;
-                        start_embedded_node(
-                            &startup_data_dir,
-                            &config,
-                            wallet_passphrase.as_ref().map(|value| value.as_slice()),
-                        )
-                    }))
-                    .unwrap_or_else(|_| {
-                        Err(startup_error(
-                            "node_startup_panicked",
-                            "The embedded node stopped unexpectedly during startup. Reopen the wallet and inspect its log if this repeats.",
-                            true,
-                        ))
-                    });
-
-                    if let Ok(mut runtime) = startup_inner.lock() {
-                        if startup_stopping.load(Ordering::Acquire) {
-                            if let Ok(started) = started {
-                                let mut stopped = RuntimeParts::ready(started);
-                                stop_runtime_parts(&mut stopped);
-                            }
-                        } else {
-                            *runtime = match started {
-                                Ok(started) => RuntimeParts::ready(started),
-                                Err(error) => RuntimeParts::failed(error),
-                            };
-                        }
-                    }
-                });
-            if spawn.is_err()
-                && let Ok(mut runtime) = handle.inner.lock()
-            {
-                *runtime = RuntimeParts::failed(startup_error(
-                    "node_startup_unavailable",
-                    "The embedded node startup worker could not be created. Reopen the wallet and try again.",
-                    true,
-                ));
+        match (&data_dir, held) {
+            (Ok(_), Some(held)) => {
+                handle.update.hold(held.clone());
+                if let Ok(mut runtime) = handle.inner.lock() {
+                    *runtime = RuntimeParts::failed(held);
+                }
             }
+            (Ok(startup_data_dir), None) => handle.spawn_startup(startup_data_dir.clone()),
+            (Err(_), _) => {}
         }
         Self {
             handle,
@@ -321,12 +303,18 @@ impl RuntimeState {
     }
 
     #[cfg(test)]
+    pub(crate) fn locked_for_test() -> Self {
+        Self::failed_for_test(wallet_locked_error())
+    }
+
+    #[cfg(test)]
     fn failed_for_test(error: NodeClientError) -> Self {
         Self {
             handle: RuntimeHandle {
                 inner: Arc::new(Mutex::new(RuntimeParts::failed(error))),
                 operation: Arc::new(Mutex::new(())),
                 stopping: Arc::new(AtomicBool::new(false)),
+                update: Arc::default(),
                 config: NodeRuntimeConfig::default_for_test(),
                 launch: Arc::default(),
                 data_dir: Err(startup_error(
@@ -340,18 +328,106 @@ impl RuntimeState {
     }
 
     #[cfg(test)]
-    fn starting_for_test() -> Self {
+    pub(crate) fn starting_for_test() -> Self {
         Self {
             handle: RuntimeHandle {
                 inner: Arc::new(Mutex::new(RuntimeParts::starting())),
                 operation: Arc::new(Mutex::new(())),
                 stopping: Arc::new(AtomicBool::new(false)),
+                update: Arc::default(),
                 config: NodeRuntimeConfig::default_for_test(),
                 launch: Arc::default(),
                 data_dir: Ok(PathBuf::from("test-wallet-data")),
             },
             _log_guard: None,
         }
+    }
+}
+
+impl RuntimeHandle {
+    /// Starts the node in the background, as at launch.
+    fn spawn_startup(&self, startup_data_dir: PathBuf) {
+        let config = self.config.clone();
+        let startup_inner = Arc::clone(&self.inner);
+        let startup_stopping = Arc::clone(&self.stopping);
+        let startup_update = Arc::clone(&self.update);
+        let spawn = thread::Builder::new()
+            .name("cmfd-wallet-startup".to_owned())
+            .spawn(move || {
+                let started = catch_unwind(AssertUnwindSafe(|| {
+                    let wallet_passphrase = config
+                        .wallet_passphrase_file
+                        .as_deref()
+                        .map(read_wallet_passphrase_file)
+                        .transpose()
+                        .map_err(|error| {
+                            startup_error(
+                                "wallet_passphrase_file",
+                                format!(
+                                    "The wallet passphrase file could not be used: {error}"
+                                ),
+                                false,
+                            )
+                        })?;
+                    start_embedded_node(
+                        &startup_data_dir,
+                        &config,
+                        wallet_passphrase.as_ref().map(|value| value.as_slice()),
+                        lifecycle::startup_data_dir_wait(),
+                        &startup_stopping,
+                        &startup_update,
+                    )
+                }))
+                .unwrap_or_else(|_| {
+                    Err(startup_error(
+                        "node_startup_panicked",
+                        "The embedded node stopped unexpectedly during startup. Reopen the wallet and inspect its log if this repeats.",
+                        true,
+                    ))
+                });
+
+                if let Ok(mut runtime) = startup_inner.lock() {
+                    if startup_stopping.load(Ordering::Acquire) {
+                        if let Ok(started) = started {
+                            let mut stopped = RuntimeParts::ready(started);
+                            stop_runtime_parts(&mut stopped);
+                        }
+                    } else {
+                        *runtime = match started {
+                            Ok(started) => RuntimeParts::ready(started),
+                            Err(error) => RuntimeParts::failed(error),
+                        };
+                    }
+                }
+            });
+        if spawn.is_err()
+            && let Ok(mut runtime) = self.inner.lock()
+        {
+            *runtime = RuntimeParts::failed(startup_error(
+                "node_startup_unavailable",
+                "The embedded node startup worker could not be created. Reopen the wallet and try again.",
+                true,
+            ));
+        }
+    }
+
+    /// "Run anyway" after a newer version failed once it had opened the
+    /// wallet data: ends the hold and starts the node. Refused when there
+    /// is no hold.
+    pub(crate) fn run_held_start(&self) -> Result<(), NodeClientError> {
+        let _operation = self.operation.lock().map_err(|_| runtime_state_error())?;
+        self.update.refuse_if_exiting()?;
+        if !self.update.release_hold() {
+            return Err(startup_error(
+                "update_not_held",
+                "This wallet is not waiting for a choice about a failed update.",
+                false,
+            ));
+        }
+        let data_dir = self.data_dir.clone()?;
+        *self.inner.lock().map_err(|_| runtime_state_error())? = RuntimeParts::starting();
+        self.spawn_startup(data_dir);
+        Ok(())
     }
 }
 
@@ -393,6 +469,12 @@ impl RuntimeHandle {
 
     pub(crate) fn unlock(&self, passphrase: &[u8]) -> Result<WalletCustodyStatus, NodeClientError> {
         let _operation = self.operation.lock().map_err(|_| runtime_state_error())?;
+        let started_at = Instant::now();
+        tracing::info!("unlock received");
+        self.update.refuse_if_exiting()?;
+        // Before the node open refuses it, which would be kept as an unlock
+        // failure and show the hold again after "Run anyway".
+        self.update.refuse_if_held()?;
         let data_dir = self.data_dir.as_ref().map_err(Clone::clone)?;
         let already_unlocked = matches!(
             &self.inner.lock().map_err(|_| runtime_state_error())?.node,
@@ -426,22 +508,77 @@ impl RuntimeHandle {
                 COMPILED_NETWORK_PROFILE.network_id,
                 passphrase,
             )
-            .map_err(custody_error)?;
+            .map_err(unlock_error)?;
             self.inner
                 .lock()
                 .map_err(|_| runtime_state_error())?
                 .prepared_destination = Some(destination);
             return self.custody_status_inner();
         }
-        let started = start_embedded_node(data_dir, &self.config, Some(passphrase))?;
+        // A wrong passphrase is refused here, in the time the key derivation
+        // takes, not after the node open authenticated the whole model bank.
+        // It is no unlock failure for the start check. Anything else (the
+        // data dir still held during a restart to update, an unreadable key)
+        // is left to the open, which reports it as before.
+        match authenticate_encrypted_wallet(
+            data_dir,
+            COMPILED_NETWORK_PROFILE.network_id,
+            passphrase,
+        ) {
+            Ok(_) => tracing::info!(
+                elapsed_ms = elapsed_ms(started_at),
+                "unlock: passphrase accepted"
+            ),
+            Err(
+                error @ (WalletBackupError::AuthenticationFailed
+                | WalletBackupError::InvalidPassphrase),
+            ) => {
+                tracing::info!(
+                    elapsed_ms = elapsed_ms(started_at),
+                    "unlock: passphrase refused"
+                );
+                return Err(unlock_error(error));
+            }
+            Err(_) => {}
+        }
+        let started = match start_embedded_node(
+            data_dir,
+            &self.config,
+            Some(passphrase),
+            Duration::ZERO,
+            &self.stopping,
+            &self.update,
+        ) {
+            Ok(started) => started,
+            // An encrypted wallet's node first opens its stored chain here:
+            // keep the refusal, so the wallet offers the resync.
+            Err(error) if error.code == CHAIN_RESYNC_REQUIRED => {
+                *self.inner.lock().map_err(|_| runtime_state_error())? =
+                    RuntimeParts::failed(error.clone());
+                return Err(error);
+            }
+            // The wallet stays locked, but the start check of an updated
+            // version sees why the node could not open.
+            Err(error) => {
+                self.update.record_unlock_failure(&error);
+                return Err(error);
+            }
+        };
         let mut runtime = self.inner.lock().map_err(|_| runtime_state_error())?;
         *runtime = RuntimeParts::ready(started);
         drop(runtime);
+        tracing::info!(
+            elapsed_ms = elapsed_ms(started_at),
+            "unlock: wallet unlocked and node ready"
+        );
         self.custody_status_inner()
     }
 
     pub(crate) fn lock(&self) -> Result<WalletCustodyStatus, NodeClientError> {
         let _operation = self.operation.lock().map_err(|_| runtime_state_error())?;
+        self.update.refuse_if_exiting()?;
+        // A held wallet has no node to lock; locking would hide the hold.
+        self.update.refuse_if_held()?;
         let data_dir = self.data_dir.as_ref().map_err(Clone::clone)?;
         if inspect_wallet_key_storage(data_dir).map_err(custody_error)?
             != WalletKeyStorage::Encrypted
@@ -463,8 +600,14 @@ impl RuntimeHandle {
     ) -> Result<WalletCustodyStatus, NodeClientError> {
         require_absolute_custody_path(output)?;
         let _operation = self.operation.lock().map_err(|_| runtime_state_error())?;
+        self.update.refuse_if_exiting()?;
         let data_dir = self.data_dir.as_ref().map_err(Clone::clone)?;
-        self.stop_and_mark_locked()?;
+        // A backup only reads the wallet data. A held wallet runs no node
+        // and keeps showing the hold, so it may still be backed up before
+        // "Run anyway".
+        if !self.update.is_held() {
+            self.stop_and_mark_locked()?;
+        }
         create_encrypted_wallet_backup(
             data_dir,
             output,
@@ -482,6 +625,8 @@ impl RuntimeHandle {
     ) -> Result<WalletCustodyStatus, NodeClientError> {
         require_absolute_custody_path(backup_output)?;
         let _operation = self.operation.lock().map_err(|_| runtime_state_error())?;
+        self.update.refuse_if_exiting()?;
+        self.update.refuse_if_held()?;
         self.launch.status()?;
         let data_dir = self.data_dir.as_ref().map_err(Clone::clone)?;
         self.stop_and_mark_locked()?;
@@ -506,6 +651,8 @@ impl RuntimeHandle {
     ) -> Result<WalletCustodyStatus, NodeClientError> {
         require_absolute_custody_path(backup_output)?;
         let _operation = self.operation.lock().map_err(|_| runtime_state_error())?;
+        self.update.refuse_if_exiting()?;
+        self.update.refuse_if_held()?;
         let data_dir = self.data_dir.as_ref().map_err(Clone::clone)?;
         self.stop_and_mark_locked()?;
         migrate_plaintext_wallet_key(
@@ -525,6 +672,8 @@ impl RuntimeHandle {
     ) -> Result<WalletCustodyStatus, NodeClientError> {
         require_absolute_custody_path(input)?;
         let _operation = self.operation.lock().map_err(|_| runtime_state_error())?;
+        self.update.refuse_if_exiting()?;
+        self.update.refuse_if_held()?;
         let data_dir = self.data_dir.as_ref().map_err(Clone::clone)?;
         self.stop_and_mark_locked()?;
         self.launch.status()?;
@@ -551,13 +700,268 @@ impl RuntimeHandle {
         *runtime = RuntimeParts::failed(wallet_locked_error());
         Ok(())
     }
+
+    /// Moves the stored chain aside and starts the node again, which then
+    /// syncs the chain from its peers. Only when the stored chain cannot be
+    /// kept: startup refused it, block admission is halted, or the validated
+    /// height is held below the tip by a stored block this computer's check
+    /// found not to match (with one kind of engine nothing else settles it).
+    /// The wallet key stays, and nothing is deleted
+    /// ([`cmfd_node::storage::set_chain_data_aside`]). An encrypted wallet is
+    /// locked afterwards unless a passphrase file is configured.
+    pub(crate) fn resync_chain(&self) -> Result<ChainResyncReport, NodeClientError> {
+        let _operation = self.operation.lock().map_err(|_| runtime_state_error())?;
+        self.update.refuse_if_exiting()?;
+        let data_dir = self.data_dir.as_ref().map_err(Clone::clone)?;
+        if self.stopping.load(Ordering::Acquire) {
+            return Err(runtime_state_error());
+        }
+        {
+            let mut runtime = self.inner.lock().map_err(|_| runtime_state_error())?;
+            let needed = match &runtime.node {
+                NodeAvailability::Starting => return Err(node_starting_error()),
+                NodeAvailability::Failed(error) => error.code == CHAIN_RESYNC_REQUIRED,
+                NodeAvailability::Ready(node) => {
+                    let node = node.lock().map_err(|_| runtime_state_error())?;
+                    node.work_rule_halted() || node.work_validated_height_held_by_unsettled_block()
+                }
+            };
+            if !needed {
+                return Err(startup_error(
+                    "chain_resync_not_needed",
+                    "This wallet's stored chain does not need a resync.",
+                    false,
+                ));
+            }
+            // Releases the node, and with it the data directory.
+            stop_runtime_parts(&mut runtime);
+            *runtime = RuntimeParts::failed(chain_resync_required_error());
+        }
+        let report = set_chain_data_aside_when_released(data_dir).map_err(|error| {
+            eprintln!("Common Foundry Wallet could not set the stored chain aside: {error}");
+            startup_error(
+                "chain_resync_failed",
+                "The stored chain could not be moved aside. Close and reopen the wallet, then try again.",
+                true,
+            )
+        })?;
+        eprintln!(
+            "Common Foundry Wallet moved its stored chain ({}) to {}; the node syncs it again",
+            report.moved.join(", "),
+            report.folder.display()
+        );
+        // Without the configured passphrase file the wallet stays locked,
+        // and unlocking starts the node.
+        let passphrase = match self
+            .config
+            .wallet_passphrase_file
+            .as_deref()
+            .map(read_wallet_passphrase_file)
+            .transpose()
+        {
+            Ok(passphrase) => passphrase,
+            Err(error) => {
+                eprintln!(
+                    "Common Foundry Wallet could not read its passphrase file after the resync; unlock the wallet to continue: {error}"
+                );
+                None
+            }
+        };
+        let started = start_embedded_node(
+            data_dir,
+            &self.config,
+            passphrase.as_ref().map(|value| value.as_slice()),
+            Duration::ZERO,
+            &self.stopping,
+            &self.update,
+        );
+        *self.inner.lock().map_err(|_| runtime_state_error())? = match started {
+            Ok(started) => RuntimeParts::ready(started),
+            Err(error) => RuntimeParts::failed(error),
+        };
+        Ok(ChainResyncReport {
+            custody: self.custody_status_inner()?,
+            moved_to: report.folder.display().to_string(),
+            moved_bytes: report.moved_bytes,
+        })
+    }
 }
 
+/// The hooks of "Restart to update" and of the start check
+/// (UPDATER-DESIGN.md sections 2.7 and 2.9).
+impl RuntimeHandle {
+    /// The wallet data dir, if it could be resolved.
+    pub(crate) fn data_dir(&self) -> Option<&Path> {
+        self.data_dir.as_deref().ok()
+    }
+
+    /// `--no-auto-update` was given.
+    pub(crate) fn no_auto_update(&self) -> bool {
+        self.config.no_auto_update()
+    }
+
+    /// The node waits for "Run anyway" or "Retry" after a newer version
+    /// failed once it had opened the wallet data.
+    pub(crate) fn is_held(&self) -> bool {
+        self.update.is_held()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_for_test(&self, error: NodeClientError) {
+        self.update.hold(error);
+    }
+
+    /// Whether mining is starting, running or stopping. Without a mining
+    /// service nothing mines.
+    pub(crate) fn mining_active(&self) -> Result<bool, NodeClientError> {
+        let mining = self
+            .inner
+            .lock()
+            .map_err(|_| runtime_state_error())?
+            .mining
+            .clone();
+        let Some(mining) = mining else {
+            return Ok(false);
+        };
+        Ok(matches!(
+            mining.status()?.lifecycle,
+            MiningLifecycle::Starting | MiningLifecycle::Running | MiningLifecycle::Stopping
+        ))
+    }
+
+    /// For a send, a consolidation, a peer-settings change or a mining
+    /// start: refused once a restart to update began, and counted until the
+    /// returned guard drops.
+    pub(crate) fn begin_node_operation(&self) -> Result<NodeOperation, NodeClientError> {
+        self.update.begin_node_operation()
+    }
+
+    /// Begins closing the wallet for a restart to update; refused during a
+    /// send, a consolidation or a custody operation.
+    pub(crate) fn try_begin_exit(&self) -> Result<ExitStarted, NodeClientError> {
+        self.update.try_begin_exit(&self.operation)
+    }
+
+    /// Remembers a send the node accepted just now.
+    pub(crate) fn record_send(&self, txid: &str) {
+        self.update.record_send(txid, lifecycle::unix_now());
+    }
+
+    /// This session's sends that are still in the mempool. Without a running
+    /// node the mempool is gone, so there are none.
+    pub(crate) fn unrelayed_sends(&self) -> Result<lifecycle::UnrelayedSends, NodeClientError> {
+        let node = match &self.inner.lock().map_err(|_| runtime_state_error())?.node {
+            NodeAvailability::Ready(node) => Arc::clone(node),
+            _ => return Ok(lifecycle::UnrelayedSends::default()),
+        };
+        let node = node.lock().map_err(|_| runtime_state_error())?;
+        let mempool = node.mempool_snapshot();
+        // Peers that cannot be listed count as none.
+        let connected = node
+            .status()
+            .map(|status| {
+                status
+                    .peers
+                    .iter()
+                    .filter(|peer| peer.active_connections > 0)
+                    .count()
+            })
+            .unwrap_or(0);
+        Ok(lifecycle::unrelayed_sends(
+            &self.update.recent_sends(),
+            mempool.entries.iter().map(|entry| entry.txid.as_str()),
+            connected,
+            lifecycle::unix_now(),
+        ))
+    }
+
+    pub(crate) fn node_phase(&self) -> NodePhase {
+        self.node_phase_at(lifecycle::unix_now())
+    }
+
+    fn node_phase_at(&self, now: u64) -> NodePhase {
+        lifecycle::with_launch_passed(
+            lifecycle::with_unlock_failure(self.stored_node_phase(), self.update.unlock_failure()),
+            self.launch.failure(),
+            now,
+        )
+    }
+
+    fn stored_node_phase(&self) -> NodePhase {
+        match self.inner.lock() {
+            Ok(runtime) => match &runtime.node {
+                NodeAvailability::Starting => NodePhase::Starting,
+                NodeAvailability::Ready(_) => NodePhase::Ready,
+                NodeAvailability::Failed(error) => NodePhase::Failed {
+                    code: error.code,
+                    retryable: error.retryable,
+                    message: error.message.clone(),
+                },
+            },
+            Err(_) => {
+                let error = runtime_state_error();
+                NodePhase::Failed {
+                    code: error.code,
+                    retryable: error.retryable,
+                    message: error.message,
+                }
+            }
+        }
+    }
+
+    /// For a version the updater installed: records `started_ok` once its
+    /// start is known to work, and hands `on_failed` the reason of a start
+    /// that failed. Call once setup completed and the main window was built.
+    pub(crate) fn spawn_start_watch(&self, on_failed: impl FnOnce(String) + Send + 'static) {
+        let handle = self.clone();
+        let stopping = Arc::clone(&self.stopping);
+        let update = Arc::clone(&self.update);
+        lifecycle::spawn_start_watch(
+            move || handle.node_phase(),
+            move || stopping.load(Ordering::Acquire),
+            move || update.data_opened_for(),
+            on_failed,
+        );
+    }
+}
+
+/// How long a resync waits for the stopped node's last holders (a command
+/// still running, a peer thread finishing its exchange) to release the data
+/// directory.
+const DATA_DIR_RELEASE_WAIT: Duration = Duration::from_secs(10);
+
+/// Sets the stored chain aside once the data directory is released.
+fn set_chain_data_aside_when_released(
+    data_dir: &Path,
+) -> Result<cmfd_node::storage::ChainSetAsideReport, NodeError> {
+    let deadline = std::time::Instant::now() + DATA_DIR_RELEASE_WAIT;
+    loop {
+        match cmfd_node::storage::set_chain_data_aside(data_dir) {
+            Err(NodeError::DataDirLocked(_)) if std::time::Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(200));
+            }
+            result => return result,
+        }
+    }
+}
+
+/// `data_dir_wait` is how long opening the node waits for a data dir that
+/// another process still holds (a wallet closing for a restart to update);
+/// only the open itself is tried again, and not while the lock is seen
+/// held. `stopping` (the wallet is closing) ends that wait. `update` learns
+/// when the open returned, for the start check.
 fn start_embedded_node(
     data_dir: &Path,
     config: &NodeRuntimeConfig,
     wallet_passphrase: Option<&[u8]>,
+    data_dir_wait: Duration,
+    stopping: &AtomicBool,
+    update: &RestartGuard,
 ) -> Result<EmbeddedNode, NodeClientError> {
+    let started_at = Instant::now();
+    // Not while a newer version that failed after opening the wallet data
+    // waits for the user's choice.
+    update.refuse_if_held()?;
     // Resolve launch authority before expensive artifact loading or any node I/O.
     cmfd_node::mainnet_runtime::ensure_compiled_launch_ready()
         .map_err(|error| error.client_error())?;
@@ -567,16 +971,53 @@ fn start_embedded_node(
         production_v4_artifacts,
         verifier_worker,
     } = security;
-    let mut node = Node::open_with_runtime_security_and_wallet_passphrase(
-        data_dir,
-        production_v3_record.as_ref(),
-        production_v4_artifacts.as_ref(),
-        verifier_worker.as_ref(),
-        wallet_passphrase,
+    // From here on a failed start of an updated version is one after
+    // opening the wallet data.
+    lifecycle::before_node_open().map_err(|error| {
+        // Not eprintln!, which panics when stderr is a closed pipe; inside
+        // the startup's catch_unwind that would count as a failed start.
+        let _ = writeln!(
+            std::io::stderr(),
+            "Common Foundry Wallet could not record its start before opening its data: {error}"
+        );
+        startup_error(
+            "update_state_unwritable",
+            "This updated wallet could not read or write its update state in its own folder, so it did not open the wallet data. Check that the folder is writable and has free space, then reopen the wallet.",
+            // A file held for a moment, not a fault of this version.
+            true,
+        )
+    })?;
+    let mut node = lifecycle::open_retrying_while_locked(
+        data_dir_wait,
+        || lifecycle::data_dir_lock_held(data_dir),
+        || {
+            if opens_as_locked(data_dir, wallet_passphrase) {
+                tracing::info!(
+                    "wallet.key is encrypted and no passphrase file is set; the node opens once the wallet is unlocked"
+                );
+                return Err(NodeError::WalletLocked);
+            }
+            Node::open_with_runtime_security_and_wallet_passphrase(
+                data_dir,
+                production_v3_record.as_ref(),
+                production_v4_artifacts.as_ref(),
+                verifier_worker.as_ref(),
+                wallet_passphrase,
+            )
+        },
+        || stopping.load(Ordering::Acquire),
+        std::time::Instant::now,
+        thread::sleep,
     )
     .map_err(|error| sanitize_node_startup_error(COMPILED_NETWORK_PROFILE, error))?;
+    // The stored blocks were replayed inside the open.
+    update.mark_data_opened();
     node.configure_pruning(config.prune_keep_blocks)
         .map_err(|error| startup_error("prune_setting_invalid", error.to_string(), false))?;
+    install_work_engine(&mut node, config.work_threads)?;
+    apply_work_check(config.work_check, catch_up_sources, |sources| {
+        node.enable_wallet_catch_up(sources)
+    });
     #[cfg(feature = "production-v4")]
     let production_v4_pool_search =
         production_v4_artifacts
@@ -596,7 +1037,25 @@ fn start_embedded_node(
                 },
             });
     let discovery_hello = node.peer_hello();
+    let enforces_work_rule = node.work_validated_height().is_some();
     let shared = Arc::new(Mutex::new(node));
+    // Dropping the handle on any later startup error stops the thread. It
+    // runs the engine's known answers first, then checks stored blocks.
+    let work_backlog = enforces_work_rule
+        .then(|| {
+            cmfd_node::work_gate::spawn_work_backlog_with_pause(
+                Arc::clone(&shared),
+                power::on_battery,
+            )
+        })
+        .transpose()
+        .map_err(|_| {
+            startup_error(
+                "work_check_start_failed",
+                "The embedded node could not start checking blocks. Reopen the wallet and try again.",
+                true,
+            )
+        })?;
     // Dropping the handle on any later startup error stops the thread.
     let pruner = config
         .prune_keep_blocks
@@ -669,6 +1128,7 @@ fn start_embedded_node(
         }
     };
     let history_scrub = cmfd_node::spawn_history_scrub(Arc::clone(&shared)).ok();
+    tracing::info!(elapsed_ms = elapsed_ms(started_at), "embedded node ready");
     Ok(EmbeddedNode {
         node: shared,
         peers,
@@ -676,10 +1136,189 @@ fn start_embedded_node(
             inbound,
             pruner,
             history_scrub,
+            work_backlog,
         },
         #[cfg(feature = "production-v4")]
         production_v4_pool_search,
     })
+}
+
+/// Installs the CPU work engine on a network with the release work rule.
+///
+/// The embedded node listens on a local address only, so other nodes do not
+/// connect to it: it reaches the chain by syncing from the peers it connects
+/// to. It still re-executes the work of every block above the release
+/// checkpoint before it accepts it, because it follows the heaviest branch
+/// those peers serve. Unlike a server node it does not check its stored
+/// blocks before it starts its services: the engine's known answers run in
+/// the background (blocks wait meanwhile and are fetched again), and so does
+/// the check of stored blocks, which pauses on battery. The engine uses half
+/// the logical processors, at most eight, below normal priority, unless
+/// `--work-threads` sets the count (a wallet that runs all day beside a miner
+/// can use fewer). It streams the model bank from disk rather than holding it
+/// in memory.
+fn install_work_engine(node: &mut Node, work_threads: Option<u64>) -> Result<(), NodeClientError> {
+    #[cfg(feature = "production-v4")]
+    {
+        // Never more threads than logical processors, or than the default's
+        // eight when their count is unknown.
+        let threads = work_threads
+            .and_then(|threads| usize::try_from(threads).ok())
+            .map(|threads| {
+                threads.min(std::thread::available_parallelism().map_or(8, |logical| logical.get()))
+            })
+            .unwrap_or_else(cmfd_node::work_gate::default_work_threads);
+        node.install_work_engines(
+            threads,
+            cmfd_node::honest_work::WorkThreadPriority::BelowNormal,
+            cmfd_node::work_gate::WorkBankMode::Streamed,
+            None,
+        )
+        .map_err(work_engine_error)?;
+    }
+    #[cfg(not(feature = "production-v4"))]
+    let _ = work_threads;
+    if node.work_checker_missing() {
+        return Err(startup_error(
+            "work_engine_unavailable",
+            "This wallet build cannot check the blocks of this network. Install the matching wallet package.",
+            false,
+        ));
+    }
+    Ok(())
+}
+
+/// The SG relay. By design it is not a catch-up source. It stays in the
+/// dial list ([`config::default_bootstrap_peers`]) for the mempool and relay.
+const NOT_A_CATCH_UP_SOURCE: IpAddr = IpAddr::V4(Ipv4Addr::new(13, 140, 66, 6));
+
+/// The hosting provider of each compiled relay, by IP. Sources in one group
+/// count as one: a block is taken without a check here only if sources in two
+/// groups list it. Any other IP is a group of its own.
+const CATCH_UP_PROVIDER_GROUPS: [(Ipv4Addr, u8); 3] = [
+    // The seed and St. Louis: Contabo.
+    (Ipv4Addr::new(173, 249, 35, 251), 0),
+    (Ipv4Addr::new(209, 145, 48, 36), 0),
+    // Falkenstein: Hetzner.
+    (Ipv4Addr::new(88, 198, 110, 195), 1),
+];
+
+/// The compiled relays the wallet catches up from: the release's bootstrap
+/// peers, never the peers the user configured.
+fn catch_up_sources() -> Vec<CatchUpSource> {
+    catch_up_sources_from(&COMPILED_NETWORK_PROFILE.bootstrap_peers())
+}
+
+/// `peers` without [`NOT_A_CATCH_UP_SOURCE`], each with its provider group.
+fn catch_up_sources_from(peers: &[SocketAddr]) -> Vec<CatchUpSource> {
+    let mut own_groups: Vec<IpAddr> = Vec::new();
+    let first_own_group = CATCH_UP_PROVIDER_GROUPS
+        .iter()
+        .map(|(_, group)| group + 1)
+        .max()
+        .unwrap_or(0);
+    peers
+        .iter()
+        .filter(|addr| addr.ip() != NOT_A_CATCH_UP_SOURCE)
+        .map(|&addr| {
+            let group = CATCH_UP_PROVIDER_GROUPS
+                .iter()
+                .find(|(ip, _)| IpAddr::V4(*ip) == addr.ip())
+                .map(|(_, group)| *group)
+                .unwrap_or_else(|| {
+                    let position = own_groups
+                        .iter()
+                        .position(|ip| *ip == addr.ip())
+                        .unwrap_or_else(|| {
+                            own_groups.push(addr.ip());
+                            own_groups.len() - 1
+                        });
+                    first_own_group.saturating_add(u8::try_from(position).unwrap_or(u8::MAX))
+                });
+            CatchUpSource { addr, group }
+        })
+        .collect()
+}
+
+/// Turns the wallet catch-up on with `--work-check standard`, through
+/// `enable`, and reports whether it is on. With `full`, or when it cannot be
+/// turned on (fewer than two sources in different groups, as on every network
+/// but mainnet), every block is checked before it is accepted. Startup never
+/// fails because of it.
+fn apply_work_check(
+    work_check: WorkCheck,
+    sources: impl FnOnce() -> Vec<CatchUpSource>,
+    enable: impl FnOnce(Vec<CatchUpSource>) -> Result<bool, NodeError>,
+) -> bool {
+    if work_check == WorkCheck::Full {
+        tracing::info!(
+            target: "work_rule::catch_up",
+            "--work-check full: every block is checked before it is accepted"
+        );
+        return false;
+    }
+    let sources = sources();
+    let count = sources.len();
+    match enable(sources) {
+        Ok(true) => {
+            tracing::info!(
+                target: "work_rule::catch_up",
+                sources = count,
+                "catch-up is on: recent blocks two relays list are checked in the background"
+            );
+            true
+        }
+        Ok(false) => {
+            tracing::info!(
+                target: "work_rule::catch_up",
+                sources = count,
+                "catch-up is off on this network or data directory; every block is checked before it is accepted"
+            );
+            false
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "work_rule::catch_up",
+                %error,
+                "catch-up could not be turned on; every block is checked before it is accepted"
+            );
+            false
+        }
+    }
+}
+
+/// Whether opening the node could only refuse a locked wallet: `wallet.key`
+/// is encrypted and no passphrase was given. The open authenticates the
+/// whole model bank before it reads the key, so it is not tried then. A data
+/// dir another process holds still goes to the open, which reports that.
+fn opens_as_locked(data_dir: &Path, wallet_passphrase: Option<&[u8]>) -> bool {
+    wallet_passphrase.is_none()
+        && matches!(
+            inspect_wallet_key_storage(data_dir),
+            Ok(WalletKeyStorage::Encrypted)
+        )
+        && !lifecycle::data_dir_lock_held(data_dir)
+}
+
+/// The startup error for a failed work-engine installation. A stored chain
+/// that differs from the one the release pins is set aside and synced again
+/// ([`RuntimeHandle::resync_chain`]).
+#[cfg(feature = "production-v4")]
+fn work_engine_error(error: NodeError) -> NodeClientError {
+    match error {
+        NodeError::WorkCheckpointConflict { .. } | NodeError::WorkRuleResyncRequired(_) => {
+            chain_resync_required_error()
+        }
+        error => sanitize_node_startup_error(COMPILED_NETWORK_PROFILE, error),
+    }
+}
+
+fn chain_resync_required_error() -> NodeClientError {
+    startup_error(
+        CHAIN_RESYNC_REQUIRED,
+        "The blocks this wallet stored differ from the chain this release pins. Resync the chain: the stored blocks are moved aside and downloaded again, and the wallet key stays.",
+        false,
+    )
 }
 
 fn stop_runtime_parts(runtime: &mut RuntimeParts) {
@@ -697,12 +1336,40 @@ fn stop_runtime_parts(runtime: &mut RuntimeParts) {
         if let Some(history_scrub) = services.history_scrub {
             history_scrub.stop();
         }
+        if let Some(work_backlog) = services.work_backlog {
+            work_backlog.stop();
+        }
     }
     if let NodeAvailability::Ready(node) = &runtime.node
         && let Ok(node) = node.lock()
     {
+        // The pruner and the scrub are joined above, so no prune swap is
+        // under way. The cache refuses to write for a faulted node or one
+        // whose log and index disagree, which leaves the last one in place.
+        // Saving it here spares the next start reading the records appended
+        // since the last refresh.
+        let _ = node.persist_index_cache();
         node.shutdown_proof_verifier();
     }
+}
+
+/// An unlock's passphrase check failed. A passphrase that does not decrypt
+/// `wallet.key` gets its own code and words, not the lock screen's.
+fn unlock_error(error: WalletBackupError) -> NodeClientError {
+    match error {
+        WalletBackupError::AuthenticationFailed => NodeClientError {
+            code: "wallet_authentication_failed",
+            status: 401,
+            retryable: false,
+            message: "That passphrase does not unlock this wallet. Check it and try again."
+                .to_owned(),
+        },
+        error => custody_error(error),
+    }
+}
+
+fn elapsed_ms(since: Instant) -> u64 {
+    u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 fn wallet_locked_error() -> NodeClientError {
@@ -1185,7 +1852,7 @@ fn command_help_text_for_profile(profile: NetworkProfile) -> String {
         concat!(
             "Common Foundry Wallet\n",
             "Compiled network: {} ({})\n",
-            "Usage: common-foundry-wallet [runtime-identity|--help|--version] [--data-dir <absolute-path>] [--p2p-bind <addr>] [--peer <addr> ...] [--allow-public-peers] [--wallet-passphrase-file <path>] [--prune-keep-blocks <n>|--no-prune] [-v...]\n",
+            "Usage: common-foundry-wallet [runtime-identity|--help|--version] [--data-dir <absolute-path>] [--p2p-bind <addr>] [--peer <addr> ...] [--allow-public-peers] [--wallet-passphrase-file <path>] [--prune-keep-blocks <n>|--no-prune] [--work-threads <n>] [--work-check standard|full] [--no-auto-update] [-v...]\n",
             "Arguments:\n",
             "  --help (-h)             Show this help\n",
             "  --version (-V)          Print version\n",
@@ -1200,6 +1867,12 @@ fn command_help_text_for_profile(profile: NetworkProfile) -> String {
             "  --prune-keep-blocks <n>  Keep proofs for the newest n blocks (default {}, minimum {});\n",
             "                          older blocks keep their header and transactions\n",
             "  --no-prune              Keep every block proof\n",
+            "  --work-threads <n>      Threads for the block check (default: half the logical\n",
+            "                          processors, at most 8; fewer keep the computer cooler)\n",
+            "  --work-check <mode>     standard (default): after time offline, take recent blocks that two\n",
+            "                          Common Foundry relays list, then check the newest here and the rest\n",
+            "                          in the background; full: check every block before it is accepted\n",
+            "  --no-auto-update        Do not check for, download or switch to wallet updates this run (mainnet only)\n",
         ),
         profile.name,
         profile.proof.profile_name(),
@@ -1294,7 +1967,10 @@ mod tests {
             data_dir: None,
             wallet_passphrase_file: None,
             prune_keep_blocks: Some(config::DEFAULT_PRUNE_KEEP_BLOCKS),
+            work_threads: None,
+            work_check: WorkCheck::Standard,
             production_v3: config::ProductionV3RuntimeOptions::default(),
+            no_auto_update: false,
         }
     }
 
@@ -1478,6 +2154,395 @@ mod tests {
     }
 
     #[test]
+    fn custody_operations_are_refused_once_a_restart_to_update_began() {
+        let files = TestFiles::new();
+        let path = files.root.join("wallet.backup");
+        let handle = RuntimeState::starting_for_test().handle();
+        handle.try_begin_exit().unwrap().commit();
+        type Operation<'a> = Box<dyn Fn(&RuntimeHandle) -> Option<NodeClientError> + 'a>;
+        let operations: [(&str, Operation); 7] = [
+            ("unlock", Box::new(|h| h.unlock(b"passphrase").err())),
+            ("lock", Box::new(|h| h.lock().err())),
+            ("backup", Box::new(|h| h.backup(&path, b"passphrase").err())),
+            ("create", Box::new(|h| h.create(&path, b"passphrase").err())),
+            (
+                "migrate",
+                Box::new(|h| h.migrate(&path, b"passphrase").err()),
+            ),
+            (
+                "restore",
+                Box::new(|h| h.restore(&path, b"passphrase").err()),
+            ),
+            ("resync", Box::new(|h| h.resync_chain().err())),
+        ];
+        for (name, operation) in operations {
+            let error = operation(&handle).unwrap_or_else(|| panic!("{name} ran"));
+            assert_eq!(error.code, "update_restarting", "{name}");
+        }
+        assert_eq!(
+            handle.begin_node_operation().unwrap_err().code,
+            "update_restarting"
+        );
+        // Status polling is not refused.
+        assert_ne!(
+            handle.custody_status().err().map(|error| error.code),
+            Some("update_restarting")
+        );
+        assert_eq!(fs::read_dir(&files.root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_restart_to_update_waits_for_sends_and_custody_operations() {
+        let handle = RuntimeState::starting_for_test().handle();
+        let send = handle.begin_node_operation().unwrap();
+        assert_eq!(handle.try_begin_exit().unwrap_err().code, "update_busy");
+        drop(send);
+        let backup = handle.operation.lock().unwrap();
+        assert_eq!(handle.try_begin_exit().unwrap_err().code, "update_busy");
+        drop(backup);
+        // A refused restart leaves the wallet usable.
+        drop(handle.begin_node_operation().unwrap());
+        // Clones share the guard.
+        let exit = handle.clone().try_begin_exit().unwrap();
+        assert!(handle.begin_node_operation().is_err());
+        drop(exit);
+        assert!(handle.begin_node_operation().is_ok());
+    }
+
+    #[test]
+    fn without_a_running_node_no_send_waits_for_relay() {
+        let handle = RuntimeState::starting_for_test().handle();
+        handle.record_send(&"ab".repeat(32));
+        assert_eq!(
+            handle.unrelayed_sends().unwrap(),
+            lifecycle::UnrelayedSends::default()
+        );
+    }
+
+    #[test]
+    fn a_held_wallet_refuses_every_write_to_its_data_until_run_anyway() {
+        let files = TestFiles::new();
+        let path = files.root.join("wallet.backup");
+        let held = startup_error(lifecycle::FALLBACK_HELD_CODE, "held", false);
+        let handle = RuntimeState::failed_for_test(held.clone()).handle();
+        handle.update.hold(held.clone());
+        type Operation<'a> = Box<dyn Fn(&RuntimeHandle) -> Option<NodeClientError> + 'a>;
+        let operations: [(&str, Operation); 5] = [
+            ("unlock", Box::new(|h| h.unlock(b"passphrase").err())),
+            ("lock", Box::new(|h| h.lock().err())),
+            ("create", Box::new(|h| h.create(&path, b"passphrase").err())),
+            (
+                "migrate",
+                Box::new(|h| h.migrate(&path, b"passphrase").err()),
+            ),
+            (
+                "restore",
+                Box::new(|h| h.restore(&path, b"passphrase").err()),
+            ),
+        ];
+        for (name, operation) in &operations {
+            assert_eq!(operation(&handle), Some(held.clone()), "{name}");
+        }
+        assert_eq!(fs::read_dir(&files.root).unwrap().count(), 0);
+        // A refused unlock is no unlock failure, which would show as the
+        // node's phase once the hold ended.
+        assert_eq!(handle.update.unlock_failure(), None);
+
+        // After "Run anyway" they are no longer refused for the hold (here
+        // the test state's missing data dir stops them).
+        assert_eq!(
+            handle.run_held_start().unwrap_err().code,
+            "data_directory_unavailable"
+        );
+        for (name, operation) in &operations {
+            assert_ne!(
+                operation(&handle).map(|error| error.code),
+                Some(lifecycle::FALLBACK_HELD_CODE),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_held_wallet_may_be_backed_up_and_keeps_its_hold() {
+        let files = TestFiles::new();
+        let output = files.root.join("wallet.backup");
+        let held = startup_error(lifecycle::FALLBACK_HELD_CODE, "held", false);
+        let mut state = RuntimeState::failed_for_test(held.clone());
+        state.handle.data_dir = Ok(files.root.join("no-wallet-here"));
+        let handle = state.handle();
+        handle.update.hold(held.clone());
+        // No wallet key to read here, so the backup itself fails.
+        assert!(handle.backup(&output, b"passphrase").is_err());
+        assert!(!output.exists());
+        assert!(handle.is_held());
+        assert_eq!(
+            handle.stored_node_phase(),
+            NodePhase::Failed {
+                code: held.code,
+                retryable: held.retryable,
+                message: held.message,
+            }
+        );
+    }
+
+    #[test]
+    fn a_held_wallet_opens_no_node_until_run_anyway() {
+        let held = startup_error(lifecycle::FALLBACK_HELD_CODE, "held", false);
+        let guard = RestartGuard::default();
+        guard.hold(held.clone());
+        let data_dir = Path::new("held-wallet-data-never-created");
+        let refused = start_embedded_node(
+            data_dir,
+            &NodeRuntimeConfig::default_for_test(),
+            None,
+            Duration::ZERO,
+            &AtomicBool::new(false),
+            &guard,
+        )
+        .err();
+        assert_eq!(refused, Some(held.clone()));
+        assert!(!data_dir.exists());
+
+        let handle = RuntimeState::failed_for_test(held.clone()).handle();
+        assert_eq!(handle.run_held_start().unwrap_err().code, "update_not_held");
+        handle.update.hold(held);
+        assert!(handle.is_held());
+        // Released, then the missing data dir of this test state stops it.
+        assert_eq!(
+            handle.run_held_start().unwrap_err().code,
+            "data_directory_unavailable"
+        );
+        assert!(!handle.is_held());
+    }
+
+    const PASSPHRASE: &[u8] = b"correct horse battery staple";
+
+    fn encrypted_wallet(files: &TestFiles) -> PathBuf {
+        let data_dir = files.root.join("wallet");
+        cmfd_node::wallet_backup::create_encrypted_wallet(
+            &data_dir,
+            &files.root.join("wallet.cmfd-backup"),
+            COMPILED_NETWORK_PROFILE.network_id,
+            PASSPHRASE,
+        )
+        .unwrap();
+        data_dir
+    }
+
+    #[test]
+    fn only_an_encrypted_key_without_a_passphrase_skips_the_node_open() {
+        let files = TestFiles::new();
+        let data_dir = files.root.join("plain");
+        fs::create_dir(&data_dir).unwrap();
+        assert!(!opens_as_locked(&data_dir, None), "missing key");
+        fs::write(data_dir.join("wallet.key"), [7; 32]).unwrap();
+        assert!(!opens_as_locked(&data_dir, None), "plaintext key");
+
+        let data_dir = encrypted_wallet(&files);
+        assert!(opens_as_locked(&data_dir, None));
+        assert!(
+            !opens_as_locked(&data_dir, Some(PASSPHRASE)),
+            "passphrase file"
+        );
+        // Another process holds the data dir: the open reports that.
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(data_dir.join("node.lock"))
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+        assert!(!opens_as_locked(&data_dir, None), "data dir held");
+        fs2::FileExt::unlock(&lock).unwrap();
+        assert!(opens_as_locked(&data_dir, None));
+    }
+
+    #[cfg(not(feature = "production-mainnet"))]
+    #[test]
+    fn an_encrypted_wallet_without_a_passphrase_file_waits_for_unlock_without_opening_the_node() {
+        let files = TestFiles::new();
+        let data_dir = encrypted_wallet(&files);
+        let refused = start_embedded_node(
+            &data_dir,
+            &NodeRuntimeConfig::default_for_test(),
+            None,
+            Duration::ZERO,
+            &AtomicBool::new(false),
+            &RestartGuard::default(),
+        )
+        .err()
+        .expect("a locked wallet does not start its node");
+        assert_eq!(refused, NodeError::WalletLocked.client_error());
+        // The node open, and with it the model bank pass, never ran.
+        assert!(!data_dir.join("blocks.log").exists());
+    }
+
+    #[cfg(not(feature = "production-mainnet"))]
+    #[test]
+    fn a_wrong_passphrase_is_refused_before_the_node_opens() {
+        let files = TestFiles::new();
+        let mut state = RuntimeState::failed_for_test(wallet_locked_error());
+        state.handle.data_dir = Ok(encrypted_wallet(&files));
+        let handle = state.handle();
+        let refused = handle.unlock(b"wrong horse battery staple").unwrap_err();
+        assert_eq!(refused.code, "wallet_authentication_failed");
+        assert_eq!(refused.status, 401);
+        // Not the node's failure: the start check still sees a locked wallet.
+        assert_eq!(handle.update.unlock_failure(), None);
+        assert_eq!(handle.node_phase(), handle.stored_node_phase());
+        assert!(matches!(
+            handle.stored_node_phase(),
+            NodePhase::Failed {
+                code: "wallet_locked",
+                ..
+            }
+        ));
+        assert!(!files.root.join("wallet/blocks.log").exists());
+        // Too short a passphrase is refused the same way, as invalid.
+        assert_eq!(
+            handle.unlock(b"short").unwrap_err().code,
+            "wallet_passphrase_invalid"
+        );
+    }
+
+    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4")))]
+    #[test]
+    fn stopping_the_node_saves_its_index_cache() {
+        let files = TestFiles::new();
+        let data_dir = files.root.join("node");
+        let mut node = Node::open(&data_dir).unwrap();
+        let cache = data_dir.join("startup-index.bin");
+        let opened = fs::read(&cache).unwrap();
+        node.mine_once(
+            node.wallet_destination(),
+            cmfd_node::unix_time_seconds().unwrap(),
+            cmfd_node::DEFAULT_MINING_ATTEMPTS,
+        )
+        .unwrap();
+        // One new record does not refresh the cache yet.
+        assert_eq!(fs::read(&cache).unwrap(), opened);
+        let mut runtime = RuntimeParts {
+            node: NodeAvailability::Ready(Arc::new(Mutex::new(node))),
+            ..RuntimeParts::starting()
+        };
+        stop_runtime_parts(&mut runtime);
+        assert_ne!(fs::read(&cache).unwrap(), opened);
+        drop(runtime);
+        let reopened = Node::open(&data_dir).unwrap();
+        let status = reopened.status().unwrap();
+        assert!(status.startup_snapshot_used);
+        assert!(status.storage_healthy);
+        assert_eq!(status.accepted_height, 1);
+    }
+
+    #[test]
+    fn the_start_check_sees_the_node_phase() {
+        assert_eq!(
+            RuntimeState::starting_for_test().handle().node_phase(),
+            NodePhase::Starting
+        );
+        let failed = RuntimeState::failed_for_test(wallet_locked_error());
+        assert_eq!(
+            failed.handle().node_phase(),
+            NodePhase::Failed {
+                code: "wallet_locked",
+                retryable: false,
+                message: wallet_locked_error().message,
+            }
+        );
+        // A missing launch file counts after the launch time only once the
+        // launch preparation gave up on it.
+        let after_launch = cmfd_launch::MAINNET_LAUNCH_UNIX_SECONDS;
+        let mut missing =
+            RuntimeState::failed_for_test(NodeError::MainnetLaunchRequired.client_error());
+        assert!(matches!(
+            missing.handle().node_phase_at(after_launch),
+            NodePhase::Failed {
+                code: "mainnet_launch_required",
+                retryable: true,
+                ..
+            }
+        ));
+        missing.handle.launch =
+            Arc::new(launch::LaunchPreparation::failed_for_test("plan is absent"));
+        assert!(matches!(
+            missing.handle().node_phase_at(after_launch),
+            NodePhase::Failed {
+                code: "mainnet_launch_required",
+                retryable: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn the_start_check_sees_why_an_unlock_could_not_open_the_node() {
+        let locked = RuntimeState::failed_for_test(wallet_locked_error()).handle();
+        let error = startup_error("corrupt_block_log", "The block log is damaged.", false);
+        locked.update.record_unlock_failure(&error);
+        assert_eq!(
+            locked.node_phase(),
+            NodePhase::Failed {
+                code: "corrupt_block_log",
+                retryable: false,
+                message: error.message.clone(),
+            }
+        );
+        // The wallet itself still shows the lock screen.
+        assert_eq!(
+            locked.stored_node_phase(),
+            NodePhase::Failed {
+                code: "wallet_locked",
+                retryable: false,
+                message: wallet_locked_error().message,
+            }
+        );
+    }
+
+    #[test]
+    fn a_resync_is_refused_unless_the_stored_chain_cannot_be_kept() {
+        let files = TestFiles::new();
+        let log = files.write("blocks.log", b"stored chain");
+        let handle = |node| RuntimeHandle {
+            inner: Arc::new(Mutex::new(RuntimeParts {
+                node,
+                ..RuntimeParts::starting()
+            })),
+            operation: Arc::new(Mutex::new(())),
+            stopping: Arc::new(AtomicBool::new(false)),
+            update: Arc::default(),
+            config: NodeRuntimeConfig::default_for_test(),
+            launch: Arc::default(),
+            data_dir: Ok(files.root.clone()),
+        };
+        let other = startup_error("startup_failed", "embedded node unavailable", true);
+        let refused = handle(NodeAvailability::Failed(other))
+            .resync_chain()
+            .unwrap_err();
+        assert_eq!(refused.code, "chain_resync_not_needed");
+        let starting = handle(NodeAvailability::Starting)
+            .resync_chain()
+            .unwrap_err();
+        assert_eq!(starting.code, "node_starting");
+        let stopping = handle(NodeAvailability::Failed(chain_resync_required_error()));
+        stopping.stopping.store(true, Ordering::Release);
+        assert!(stopping.resync_chain().is_err());
+        // Nothing was moved.
+        assert_eq!(fs::read(&log).unwrap(), b"stored chain");
+        assert_eq!(fs::read_dir(&files.root).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn the_resync_error_is_stable_and_not_retryable() {
+        let error = chain_resync_required_error();
+        assert_eq!(error.code, CHAIN_RESYNC_REQUIRED);
+        assert!(!error.retryable);
+        assert!(error.message.contains("wallet key stays"));
+    }
+
+    #[test]
     fn startup_in_progress_is_retryable_and_shutdown_is_idempotent() {
         let state = RuntimeState::starting_for_test();
 
@@ -1505,6 +2570,114 @@ mod tests {
         assert_eq!(error.status, 400);
         assert!(!error.retryable);
         assert!(error.message.contains("--public-peer"));
+    }
+
+    #[test]
+    fn catch_up_sources_are_the_compiled_relays_but_sg_each_with_its_provider() {
+        use cmfd_node::NetworkProfileKind;
+        use cmfd_node::network_profile::{MAINNET_BOOTSTRAP_RELAYS_IPV4, PRODUCTION_RC_SEED_IPV4};
+
+        let source = |addr: &str, group| CatchUpSource {
+            addr: addr.parse().unwrap(),
+            group,
+        };
+        let expected = vec![
+            source("173.249.35.251:29444", 0),
+            source("209.145.48.36:29444", 0),
+            source("88.198.110.195:29444", 1),
+        ];
+        let mainnet = NetworkProfile {
+            kind: NetworkProfileKind::Mainnet,
+            p2p_port: 29_444,
+            ..RCNET1_PROFILE
+        };
+        assert_eq!(catch_up_sources_from(&mainnet.bootstrap_peers()), expected);
+        let mut compiled = vec![SocketAddr::new(IpAddr::V4(PRODUCTION_RC_SEED_IPV4), 29_444)];
+        compiled.extend(
+            MAINNET_BOOTSTRAP_RELAYS_IPV4
+                .iter()
+                .map(|relay| SocketAddr::new(IpAddr::V4(*relay), 29_444)),
+        );
+        assert_eq!(catch_up_sources_from(&compiled), expected);
+        // SG is still dialled, but it is no source, on any port.
+        let sg = SocketAddr::new(NOT_A_CATCH_UP_SOURCE, 29_444);
+        assert!(mainnet.bootstrap_peers().contains(&sg));
+        assert!(catch_up_sources_from(&[sg, SocketAddr::new(NOT_A_CATCH_UP_SOURCE, 1)]).is_empty());
+
+        // Any other IP is a group of its own, one group per IP.
+        let groups = catch_up_sources_from(&[
+            "10.0.0.1:1".parse().unwrap(),
+            "10.0.0.2:1".parse().unwrap(),
+            "10.0.0.1:2".parse().unwrap(),
+            "88.198.110.195:1".parse().unwrap(),
+        ])
+        .iter()
+        .map(|source| source.group)
+        .collect::<Vec<_>>();
+        assert_eq!(groups, [2, 3, 2, 1]);
+
+        // Other networks dial the seed alone, which cannot turn the catch-up
+        // on. The wallet reads the compiled peers, never the configured ones.
+        assert_eq!(
+            catch_up_sources_from(&RCNET1_PROFILE.bootstrap_peers()).len(),
+            1
+        );
+        assert_eq!(
+            catch_up_sources_from(&DEVNET_PROFILE.bootstrap_peers()).len(),
+            1
+        );
+        assert_eq!(
+            catch_up_sources(),
+            catch_up_sources_from(&COMPILED_NETWORK_PROFILE.bootstrap_peers())
+        );
+    }
+
+    #[test]
+    fn full_never_turns_the_catch_up_on_and_standard_never_fails_startup() {
+        assert!(!apply_work_check(
+            WorkCheck::Full,
+            || panic!("full reads no sources"),
+            |_| panic!("full never calls the setter"),
+        ));
+        let mut given = None;
+        assert!(apply_work_check(
+            WorkCheck::Standard,
+            catch_up_sources,
+            |sources| {
+                given = Some(sources);
+                Ok(true)
+            },
+        ));
+        assert_eq!(given, Some(catch_up_sources()));
+        assert!(!apply_work_check(
+            WorkCheck::Standard,
+            catch_up_sources,
+            |_| Ok(false)
+        ));
+        assert!(!apply_work_check(
+            WorkCheck::Standard,
+            catch_up_sources,
+            |_| Err(NodeError::SharedNodePoisoned)
+        ));
+    }
+
+    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4")))]
+    #[test]
+    fn a_one_peer_build_runs_strict() {
+        let files = TestFiles::new();
+        let mut node = Node::open(files.root.join("node")).unwrap();
+        assert_eq!(catch_up_sources().len(), 1);
+        assert!(!node.enable_wallet_catch_up(catch_up_sources()).unwrap());
+        assert!(!apply_work_check(
+            WorkCheck::Standard,
+            catch_up_sources,
+            |sources| { node.enable_wallet_catch_up(sources) }
+        ));
+        let status = serde_json::to_value(node.status().unwrap()).unwrap();
+        assert!(
+            status["work_rule"].is_null() || status["work_rule"].get("wallet_catch_up").is_none(),
+            "{status}"
+        );
     }
 
     #[test]
@@ -1720,6 +2893,8 @@ mod tests {
         assert!(security.production_v4_artifacts.is_none());
         assert!(security.verifier_worker.is_none());
         assert!(!command_help_text_for_profile(DEVNET_PROFILE).contains("ProductionV3 startup"));
+        assert!(command_help_text_for_profile(DEVNET_PROFILE).contains("[--no-auto-update]"));
+        assert!(command_help_text_for_profile(DEVNET_PROFILE).contains("  --no-auto-update  "));
         assert!(command_help_text_for_profile(RCNET1_PROFILE).contains("ProductionV4 startup"));
 
         let result = open_with_record_gate(

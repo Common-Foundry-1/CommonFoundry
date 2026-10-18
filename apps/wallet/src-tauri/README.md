@@ -18,6 +18,47 @@ still apply; this option cannot switch networks or activate mainnet early.
 Close any running wallet before using it: a second launch still only focuses
 the existing single-instance window and does not change its data directory.
 
+## Block checks
+
+On networks with the release work rule, the embedded node re-executes the
+ForgeMatrix work of every block above the release checkpoint from the block's
+header and nonce before it accepts the block. The wallet's P2P listener binds a
+local address only, so other nodes do not connect to it; the wallet reaches the
+chain by syncing from the peers it connects to. It still checks every block,
+because it follows the heaviest branch those peers serve.
+
+- The check runs on the CPU with half the logical processors, at most eight,
+  below normal priority. Below normal priority still uses idle processors
+  fully, so a wallet that runs all day beside a miner or other heavy work
+  should be started with fewer threads, for example `--work-threads 2`. It
+  qualifies itself against known answers in the background after startup;
+  until then new blocks wait and are fetched again.
+- Blocks stored before the upgrade are checked in the background, lowest first.
+  That check pauses while the computer runs on battery, and the wallet says so;
+  new blocks are still checked as they arrive.
+- Faster catch-up (`--work-check standard`, the default): after time offline,
+  the wallet downloads recent blocks that at least two Common Foundry relays
+  run by different providers list, checks the newest blocks on this computer,
+  and keeps checking the rest in the background. Coins in blocks that are
+  still being checked show as **Verifying** and can be sent once the check
+  reaches them, and Solo mining waits until the newest blocks are checked. If
+  fewer than two relays can be reached, the wallet checks every block itself,
+  which takes longer. Start the wallet with `--work-check full` to check every
+  block before any coin shows as available. The newest blocks are still
+  checked on battery; only older blocks wait for mains power.
+- Coins in blocks that are not checked yet show as **Verifying**. They count in
+  the total balance but cannot be sent or consolidated until those blocks are
+  checked. The wallet's own change is not held back.
+- If the wallet's stored chain differs from the chain the release pins, block
+  checks stop because a block on the chain does not match its work, or a stored
+  block this computer's check found not to match holds the check back, the
+  wallet offers **Resync chain**. It moves the stored blocks into a new
+  `resync-<time>` folder inside the data directory and downloads the whole chain
+  again. Nothing is deleted, and the wallet key stays where it is. Until that
+  folder is deleted the chain takes about twice its disk space; the wallet
+  shows the folder and its size, and the folder can be deleted once the wallet
+  has synced again.
+
 ## Historical Devnet-0 peer examples
 
 The examples below are for the original Devnet-0 profile. For a mainnet package,

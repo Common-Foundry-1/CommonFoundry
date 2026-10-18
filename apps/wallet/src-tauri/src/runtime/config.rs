@@ -34,7 +34,28 @@ pub(crate) struct NodeRuntimeConfig {
     /// Newest active blocks that keep their proofs; older blocks keep their
     /// header and transactions only. `None` (`--no-prune`) keeps every proof.
     pub(super) prune_keep_blocks: Option<u64>,
+    /// Threads the block check uses; `None` for half the logical
+    /// processors, at most eight.
+    pub(super) work_threads: Option<u64>,
+    /// How much of the chain the wallet re-executes before it shows coins as
+    /// available (`--work-check`).
+    pub(super) work_check: WorkCheck,
     pub(super) production_v3: ProductionV3RuntimeOptions,
+    /// `--no-auto-update`: no update checks or downloads in this run, whatever
+    /// the saved "Update automatically" setting says. Parsed in every build so
+    /// one launcher works for any wallet; only mainnet builds have an updater.
+    pub(super) no_auto_update: bool,
+}
+
+/// `--work-check`: `standard` (the default) lets a wallet that is far behind
+/// take blocks that two Common Foundry relays run by different providers both
+/// list, and checks the newest blocks and then the rest in the background;
+/// `full` checks every block before it is accepted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum WorkCheck {
+    #[default]
+    Standard,
+    Full,
 }
 
 /// About twelve hours of blocks. The wallet keeps every transaction, so only
@@ -84,6 +105,12 @@ impl NodeRuntimeConfig {
             .map(|directory| directory.join("webview-profile"))
     }
 
+    /// `--no-auto-update`: no update checks, downloads or forwarding in this
+    /// run.
+    pub(crate) fn no_auto_update(&self) -> bool {
+        self.no_auto_update
+    }
+
     #[cfg(test)]
     pub(super) fn default_for_test() -> Self {
         Self {
@@ -95,7 +122,10 @@ impl NodeRuntimeConfig {
             data_dir: None,
             wallet_passphrase_file: None,
             prune_keep_blocks: Some(DEFAULT_PRUNE_KEEP_BLOCKS),
+            work_threads: None,
+            work_check: WorkCheck::Standard,
             production_v3: ProductionV3RuntimeOptions::default(),
+            no_auto_update: false,
         }
     }
 
@@ -130,7 +160,10 @@ impl NodeRuntimeConfig {
         let mut data_dir = None;
         let mut wallet_passphrase_file = None;
         let mut prune_keep_blocks = None;
+        let mut work_threads = None;
+        let mut work_check = None;
         let mut production_v3 = ProductionV3RuntimeOptions::default();
+        let mut no_auto_update = false;
         let mut arguments = arguments.into_iter().map(Into::into);
 
         while let Some(argument) = arguments.next() {
@@ -220,12 +253,41 @@ impl NodeRuntimeConfig {
                         .ok_or(ConfigError::InvalidPruneKeepBlocks)?;
                     prune_keep_blocks = Some(Some(keep));
                 }
+                "--work-threads" => {
+                    has_control_arg = true;
+                    set_positive_integer_option(
+                        &mut work_threads,
+                        "--work-threads",
+                        arguments.next(),
+                    )?;
+                }
+                "--work-check" => {
+                    has_control_arg = true;
+                    if work_check.is_some() {
+                        return Err(ConfigError::DuplicateOption("--work-check"));
+                    }
+                    let value = arguments
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--work-check"))?;
+                    work_check = Some(match value.as_str() {
+                        "standard" => WorkCheck::Standard,
+                        "full" => WorkCheck::Full,
+                        _ => return Err(ConfigError::InvalidWorkCheck),
+                    });
+                }
                 "--no-prune" => {
                     has_control_arg = true;
                     if prune_keep_blocks.is_some() {
                         return Err(ConfigError::ConflictingPruneOptions);
                     }
                     prune_keep_blocks = Some(None);
+                }
+                "--no-auto-update" => {
+                    has_control_arg = true;
+                    if no_auto_update {
+                        return Err(ConfigError::DuplicateOption("--no-auto-update"));
+                    }
+                    no_auto_update = true;
                 }
                 "--production-v3-bank" => {
                     has_control_arg = true;
@@ -389,7 +451,10 @@ impl NodeRuntimeConfig {
             data_dir,
             wallet_passphrase_file,
             prune_keep_blocks: prune_keep_blocks.unwrap_or(Some(DEFAULT_PRUNE_KEEP_BLOCKS)),
+            work_threads,
+            work_check: work_check.unwrap_or_default(),
             production_v3,
+            no_auto_update,
         }
         .with_default_bootstrap();
         // The desktop wallet keeps its embedded node on a concrete local
@@ -561,6 +626,7 @@ pub(crate) enum ConfigError {
     InvalidPositiveInteger(&'static str),
     InvalidDataDirectory,
     InvalidPruneKeepBlocks,
+    InvalidWorkCheck,
     ConflictingPruneOptions,
     MalformedProductionV3Argument,
     InvalidPeerConfiguration(String),
@@ -611,6 +677,7 @@ impl fmt::Display for ConfigError {
                 "--prune-keep-blocks requires a whole number of at least {}",
                 cmfd_node::MIN_PRUNE_KEEP_BLOCKS
             ),
+            Self::InvalidWorkCheck => formatter.write_str("--work-check requires standard or full"),
             Self::ConflictingPruneOptions => formatter
                 .write_str("give --prune-keep-blocks or --no-prune once, not both or twice"),
             Self::MalformedProductionV3Argument => formatter.write_str(
@@ -666,7 +733,52 @@ mod tests {
         assert_eq!(config.webview_data_directory(), None);
         assert_eq!(config.wallet_passphrase_file, None);
         assert_eq!(config.prune_keep_blocks, Some(DEFAULT_PRUNE_KEEP_BLOCKS));
+        assert_eq!(config.work_check, WorkCheck::Standard);
         assert!(!config.production_v3.is_configured());
+    }
+
+    #[test]
+    fn the_work_check_is_standard_unless_full_is_asked_for() {
+        assert_eq!(parsed_run_config([]).work_check, WorkCheck::Standard);
+        assert_eq!(
+            parsed_run_config(["--work-check", "standard"]).work_check,
+            WorkCheck::Standard
+        );
+        assert_eq!(
+            parsed_run_config(["--work-check", "full"]).work_check,
+            WorkCheck::Full
+        );
+        for value in ["", "Full", "strict", "fast", "--no-prune"] {
+            assert!(matches!(
+                NodeRuntimeConfig::parse(["--work-check", value]),
+                Err(ConfigError::InvalidWorkCheck)
+            ));
+        }
+        assert!(matches!(
+            NodeRuntimeConfig::parse(["--work-check"]),
+            Err(ConfigError::MissingValue("--work-check"))
+        ));
+        for arguments in [
+            ["--work-check", "full", "--work-check", "full"],
+            ["--work-check", "full", "--work-check", "standard"],
+        ] {
+            assert!(matches!(
+                NodeRuntimeConfig::parse(arguments),
+                Err(ConfigError::DuplicateOption("--work-check"))
+            ));
+        }
+        assert!(matches!(
+            NodeRuntimeConfig::parse(["--work-check=full"]),
+            Err(ConfigError::UnknownArgument(_))
+        ));
+        assert!(matches!(
+            NodeRuntimeConfig::parse(["--help", "--work-check", "full"]),
+            Err(ConfigError::HelpWithArguments)
+        ));
+        assert_eq!(
+            ConfigError::InvalidWorkCheck.to_string(),
+            "--work-check requires standard or full"
+        );
     }
 
     #[test]
@@ -680,6 +792,21 @@ mod tests {
             Some(cmfd_node::MIN_PRUNE_KEEP_BLOCKS)
         );
         assert_eq!(parsed_run_config(["--no-prune"]).prune_keep_blocks, None);
+        assert_eq!(parsed_run_config([]).work_threads, None);
+        assert_eq!(
+            parsed_run_config(["--work-threads", "2"]).work_threads,
+            Some(2)
+        );
+        for value in ["0", "-1", "two"] {
+            assert!(matches!(
+                NodeRuntimeConfig::parse(["--work-threads", value]),
+                Err(ConfigError::InvalidPositiveInteger("--work-threads"))
+            ));
+        }
+        assert!(matches!(
+            NodeRuntimeConfig::parse(["--work-threads", "2", "--work-threads", "3"]),
+            Err(ConfigError::DuplicateOption("--work-threads"))
+        ));
         for value in ["287", "0", "-1", "twelve", ""] {
             assert!(matches!(
                 NodeRuntimeConfig::parse(["--prune-keep-blocks", value]),
@@ -705,6 +832,66 @@ mod tests {
             NodeRuntimeConfig::parse(["--help", "--no-prune"]),
             Err(ConfigError::HelpWithArguments)
         ));
+    }
+
+    #[test]
+    fn no_auto_update_is_off_by_default_and_given_at_most_once() {
+        assert!(!parsed_run_config(Vec::<&str>::new()).no_auto_update);
+        let mut expected = parsed_run_config(["--verbose"]);
+        expected.no_auto_update = true;
+        assert_eq!(
+            parsed_run_config(["--no-auto-update", "--verbose"]),
+            expected
+        );
+        assert_eq!(
+            parsed_run_config(["--verbose", "--no-auto-update"]),
+            expected
+        );
+        assert!(matches!(
+            NodeRuntimeConfig::parse(["--no-auto-update", "--no-auto-update"]),
+            Err(ConfigError::DuplicateOption("--no-auto-update"))
+        ));
+        assert_eq!(
+            ConfigError::DuplicateOption("--no-auto-update").to_string(),
+            "--no-auto-update may only be specified once"
+        );
+        for invalid in ["--no-auto-update=1", "--no-auto-updates", "--auto-update"] {
+            assert!(matches!(
+                NodeRuntimeConfig::parse([invalid]),
+                Err(ConfigError::UnknownArgument(argument)) if argument == invalid
+            ));
+        }
+    }
+
+    #[test]
+    fn no_auto_update_cannot_be_combined_with_command_flags() {
+        for arguments in [
+            ["--help", "--no-auto-update"],
+            ["--no-auto-update", "--help"],
+        ] {
+            assert!(matches!(
+                NodeRuntimeConfig::parse(arguments),
+                Err(ConfigError::HelpWithArguments)
+            ));
+        }
+        for arguments in [
+            ["--version", "--no-auto-update"],
+            ["--no-auto-update", "--version"],
+        ] {
+            assert!(matches!(
+                NodeRuntimeConfig::parse(arguments),
+                Err(ConfigError::VersionWithArguments)
+            ));
+        }
+        for arguments in [
+            ["runtime-identity", "--no-auto-update"],
+            ["--no-auto-update", "runtime-identity"],
+        ] {
+            assert!(matches!(
+                NodeRuntimeConfig::parse(arguments),
+                Err(ConfigError::RuntimeIdentityWithArguments)
+            ));
+        }
     }
 
     #[test]

@@ -11,6 +11,7 @@ import {
 import { useEffect, useState } from "react";
 import { useMiningData } from "../hooks/useMiningData";
 import { shortenHash } from "../lib/amount";
+import { soloHoldLine } from "../lib/workCheck";
 import type { MiningLifecycle, MiningMode } from "../mining/types";
 import {
   poolUrlError,
@@ -60,6 +61,8 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
 
   const lifecycle = mining.status?.lifecycle ?? "stopped";
   const isActive = lifecycle === "starting" || lifecycle === "running";
+  // Solo waits while a block taken without a check here lies above the available height.
+  const soloHold = isActive && mining.status?.mode === "solo" ? soloHoldLine(nodeStatus) : null;
   const isBusy = mining.action !== null || lifecycle === "stopping";
   const configLocked = isActive || isBusy;
   const metricsStatus = (mining.status?.mode ?? sessionMode) === mode
@@ -406,7 +409,9 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
           </>
         )}
 
-        {mining.status?.stage ? <p role="status">{mining.status.stage}</p> : null}
+        {soloHold
+          ? <p role="status">{soloHold}</p>
+          : mining.status?.stage ? <p role="status">{mining.status.stage}</p> : null}
         {lifecycle === "stopping" ? <p role="status">Finishing the current GPU operation; no further work will be submitted.</p> : null}
         {mining.error ? (
           <div className="form-error mining-error" role="alert">

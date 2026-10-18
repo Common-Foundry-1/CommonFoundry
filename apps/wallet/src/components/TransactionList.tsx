@@ -30,7 +30,9 @@ function transactionLabel(entry: WalletHistoryEntry) {
 
 function TransactionIcon({ entry }: { entry: WalletHistoryEntry }) {
   if (isWalletMaintenance(entry)) return <Wrench aria-hidden="true" size={18} />;
-  if (entry.status === "immature") return <Hourglass aria-hidden="true" size={18} />;
+  if (entry.status === "immature" || entry.status === "verifying") {
+    return <Hourglass aria-hidden="true" size={18} />;
+  }
   if (entry.kind === "mined") return <Hammer aria-hidden="true" size={18} />;
   if (entry.kind === "sent") return <ArrowUpRight aria-hidden="true" size={18} />;
   if (entry.kind === "received") return <ArrowDownLeft aria-hidden="true" size={18} />;
@@ -70,7 +72,9 @@ export function TransactionList({ entries, compact = false }: TransactionListPro
                     ? "Pending"
                     : entry.status === "immature"
                       ? `${entry.confirmations}/100 confirmations`
-                      : `${entry.confirmations} confirmation${entry.confirmations === 1 ? "" : "s"}`}
+                      : entry.status === "verifying"
+                        ? `${entry.confirmations} confirmation${entry.confirmations === 1 ? "" : "s"} · block check pending`
+                        : `${entry.confirmations} confirmation${entry.confirmations === 1 ? "" : "s"}`}
                 </span>
               </div>
               <span className="transaction-meta">

@@ -10,6 +10,8 @@ interface WalletDataState {
   starting: boolean;
   refreshing: boolean;
   error: string | null;
+  /** The node's error code with `error`, when it gave one. */
+  errorCode: string | null;
   lastUpdated: Date | null;
 }
 
@@ -21,6 +23,7 @@ const INITIAL_STATE: WalletDataState = {
   starting: true,
   refreshing: false,
   error: null,
+  errorCode: null,
   lastUpdated: null,
 };
 
@@ -52,14 +55,18 @@ export function useWalletData(refreshInterval = 4_000) {
           starting: false,
           refreshing: false,
           error: null,
+          errorCode: null,
           lastUpdated: new Date(),
         });
       } catch (error) {
         if (controller.signal.aborted) return;
-        const starting = error !== null
+        const code = error !== null
           && typeof error === "object"
           && "code" in error
-          && error.code === "node_starting";
+          && typeof error.code === "string"
+          ? error.code
+          : null;
+        const starting = code === "node_starting";
         setState((current) => ({
           ...current,
           loading: starting,
@@ -70,6 +77,7 @@ export function useWalletData(refreshInterval = 4_000) {
             : error instanceof Error
               ? error.message
               : "Unable to reach the local node",
+          errorCode: starting ? null : code,
         }));
       } finally {
         if (requestRef.current === controller) {

@@ -2,7 +2,7 @@ import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MiningStatus } from "../mining/types";
-import type { NodeStatus, WalletSnapshot } from "../types";
+import type { NodeStatus, WalletCatchUpStatus, WalletSnapshot, WorkRuleStatus } from "../types";
 import { MiningView } from "./MiningView";
 
 const apiMocks = vi.hoisted(() => ({
@@ -249,5 +249,70 @@ describe("MiningView", () => {
     expect(await screen.findByText("CPU reference engine")).toBeInTheDocument();
     expect(screen.getByText("100-block maturity")).toBeInTheDocument();
     expect(screen.getByText("Transaction fees are burned")).toBeInTheDocument();
+  });
+
+  it("says why Solo waits while the newest blocks are checked, with the node's count", async () => {
+    const catchUp = (overrides: Partial<WalletCatchUpStatus>): WalletCatchUpStatus => ({
+      state: "catching_up",
+      reason: null,
+      available_height: 100,
+      blocks_left: 0,
+      newest_checked: 0,
+      newest_needed: 60,
+      sources_answering: 2,
+      granted_above_available: true,
+      ...overrides,
+    });
+    const withCatchUp = (overrides: Partial<WalletCatchUpStatus>) => ({
+      ...nodeStatus,
+      work_rule: { validated_height: 100, wallet_catch_up: catchUp(overrides) } as WorkRuleStatus,
+    }) as NodeStatus;
+    apiMocks.getMiningStatus.mockResolvedValue({ ...runningStatus, stage: "Searching nonces" });
+
+    const { rerender } = render(<MiningView wallet={wallet} nodeStatus={withCatchUp({})} />);
+    expect(await screen.findByText("Solo mining waits until the newest blocks are checked.")).toBeInTheDocument();
+    expect(screen.queryByText("Searching nonces")).not.toBeInTheDocument();
+
+    rerender(<MiningView wallet={wallet} nodeStatus={withCatchUp({
+      state: "waiting_for_check",
+      reason: "other",
+      blocks_left: 42,
+    })} />);
+    expect(screen.getByText("Solo mining waits until the newest blocks are checked: 42 left.")).toBeInTheDocument();
+
+    // Nothing taken unchecked above the available height: no hold line.
+    rerender(<MiningView wallet={wallet} nodeStatus={withCatchUp({
+      state: "waiting_for_check",
+      reason: "earlier_blocks",
+      blocks_left: 9,
+      granted_above_available: false,
+    })} />);
+    expect(screen.queryByText(/Solo mining waits/)).not.toBeInTheDocument();
+    expect(screen.getByText("Searching nonces")).toBeInTheDocument();
+  });
+
+  it("shows no Solo hold line while Pool mining", async () => {
+    apiMocks.getMiningStatus.mockResolvedValue(runningPoolStatus);
+    render(<MiningView
+      wallet={wallet}
+      nodeStatus={{
+        ...nodeStatus,
+        work_rule: {
+          validated_height: 100,
+          wallet_catch_up: {
+            state: "catching_up",
+            reason: null,
+            available_height: 100,
+            blocks_left: 0,
+            newest_checked: 0,
+            newest_needed: 60,
+            sources_answering: 2,
+            granted_above_available: true,
+          },
+        } as WorkRuleStatus,
+      } as NodeStatus}
+    />);
+    expect(await screen.findByRole("button", { name: "Stop Mining" })).toBeEnabled();
+    expect(screen.queryByText(/Solo mining waits/)).not.toBeInTheDocument();
   });
 });

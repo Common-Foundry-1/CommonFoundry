@@ -11,12 +11,14 @@ use cmfd_node::pool::{PoolClient, PoolClientConfig, PoolError, PoolWorkSearchRes
 use cmfd_node::production_v4_pool::{
     ProductionV4PersistentPoolSearcher, production_v4_pool_searcher_config,
 };
+use cmfd_node::work_gate::WalletCatchUpStatus;
 use cmfd_node::{
     COMPILED_NETWORK_PROFILE, MiningSearchResult, MiningShareSearchResult, Node, NodeClientError,
-    NodeError, ProofProfile, parse_miner_destination, submit_shared_tip_block,
+    NodeError, NodeStatus, ProofProfile, submit_shared_tip_block,
 };
 use serde::{Deserialize, Serialize};
 
+use crate::address::read_address;
 use crate::cuda::CudaMiner;
 
 #[cfg(feature = "production-v4")]
@@ -28,6 +30,11 @@ const POOL_RECONNECT_MAX: Duration = Duration::from_secs(4);
 const POOL_RECONNECT_POLL: Duration = Duration::from_millis(25);
 #[cfg(feature = "production-v4")]
 const PRODUCTION_V4_POOL_SEARCH_BATCH_SIZE: u32 = 32;
+/// How often a held Solo miner reads the node status again.
+#[cfg(not(test))]
+const SOLO_HOLD_RECHECK: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const SOLO_HOLD_RECHECK: Duration = Duration::from_millis(20);
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -105,6 +112,7 @@ pub struct MiningManager {
     node: Arc<Mutex<Node>>,
     status: Arc<Mutex<MiningStatus>>,
     control: Mutex<MinerControl>,
+    solo_hold: SoloHold,
     #[cfg(feature = "production-v4")]
     production_v4_pool_search: Option<ProductionV4PoolSearchAssets>,
 }
@@ -168,6 +176,7 @@ impl MiningManager {
                 worker: None,
                 shutting_down: false,
             }),
+            solo_hold: SoloHold::default(),
             #[cfg(feature = "production-v4")]
             production_v4_pool_search: None,
         }
@@ -184,16 +193,21 @@ impl MiningManager {
     }
 
     pub fn status(&self) -> Result<MiningStatus, NodeClientError> {
+        // Checked before the status lock: the check may link prepared files
+        // in from other folders, which must not hold up the workers' updates.
+        #[cfg(feature = "production-v4")]
+        let setup = (COMPILED_NETWORK_PROFILE.proof == ProofProfile::ProductionV4).then(|| {
+            self.production_v4_pool_search.as_ref().map_or_else(
+                || Some("ProductionV4 mining runtime is missing.".to_owned()),
+                |assets| production_solo::check_assets(assets).err(),
+            )
+        });
         self.status
             .lock()
             .map(|status| {
                 let snapshot = status.clone();
                 #[cfg(feature = "production-v4")]
-                if COMPILED_NETWORK_PROFILE.proof == ProofProfile::ProductionV4 {
-                    let setup = self.production_v4_pool_search.as_ref().map_or_else(
-                        || Some("ProductionV4 mining runtime is missing.".to_owned()),
-                        |assets| production_solo::check_assets(assets).err(),
-                    );
+                if let Some(setup) = setup {
                     return MiningStatus {
                         production_solo_available: setup.is_none(),
                         production_solo_setup: setup,
@@ -224,6 +238,18 @@ impl MiningManager {
             })?
             .status()
             .map_err(|error| error.client_error())?;
+        if request.mode == MiningMode::Solo
+            && node_status
+                .work_rule
+                .as_ref()
+                .is_some_and(|rule| rule.halted)
+        {
+            return Err(manager_error(
+                "mining_chain_halted",
+                "Solo mining is unavailable while block checks are stopped. Resync the chain first.",
+                false,
+            ));
+        }
         let production_v4_pool = request.mode == MiningMode::Pool
             && COMPILED_NETWORK_PROFILE.proof == ProofProfile::ProductionV4;
         let production_v4_solo = request.mode == MiningMode::Solo
@@ -353,7 +379,7 @@ impl MiningManager {
             *status = MiningStatus {
                 lifecycle: MiningLifecycle::Starting,
                 mode: Some(request.mode),
-                payout: Some(request.payout.clone()),
+                payout: Some(hex::encode(payout)),
                 pool_url: request.pool_url.clone(),
                 worker_name: request.worker_name.clone(),
                 engine: MiningEngine::Cpu,
@@ -379,6 +405,7 @@ impl MiningManager {
         let thread_stop = Arc::clone(&stop);
         let node = Arc::clone(&self.node);
         let status = Arc::clone(&self.status);
+        let solo_hold = self.solo_hold.clone();
         #[cfg(feature = "production-v4")]
         let production_v4_pool_search = self.production_v4_pool_search.clone();
         let worker_name = match request.mode {
@@ -399,11 +426,18 @@ impl MiningManager {
                     #[cfg(feature = "production-v4")]
                     if production_v4_solo {
                         if let Some(assets) = production_v4_pool_search {
-                            production_solo::run(node, status, thread_stop, payout, assets);
+                            production_solo::run(
+                                node,
+                                status,
+                                thread_stop,
+                                payout,
+                                assets,
+                                solo_hold,
+                            );
                         }
                         return;
                     }
-                    mining_loop(node, status, thread_stop, payout);
+                    mining_loop(node, status, thread_stop, payout, solo_hold);
                 }
             })
             .map_err(|_| {
@@ -489,17 +523,96 @@ impl MiningManager {
     }
 }
 
+/// Whether Solo mining waits: a block the wallet took without checking its
+/// work here lies above the height its coins are available at. Blocks the
+/// wallet mines on top of it would count toward the checked blocks that make
+/// it available, so Solo adds none until the newest blocks are checked.
+fn solo_waits(catch_up: Option<&WalletCatchUpStatus>) -> bool {
+    catch_up.is_some_and(|catch_up| catch_up.granted_above_available)
+}
+
+/// Where the Solo miner reads [`solo_waits`]: the node status, or under test a
+/// catch-up status the test sets.
+#[derive(Clone, Default)]
+struct SoloHold {
+    #[cfg(test)]
+    forced: Option<Arc<Mutex<Option<WalletCatchUpStatus>>>>,
+    #[cfg(test)]
+    reads: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl SoloHold {
+    fn waits_in(&self, node_status: &NodeStatus) -> bool {
+        #[cfg(test)]
+        if let Some(forced) = &self.forced {
+            self.reads.fetch_add(1, Ordering::AcqRel);
+            return solo_waits(forced.lock().unwrap().as_ref());
+        }
+        solo_waits(
+            node_status
+                .work_rule
+                .as_ref()
+                .and_then(|rule| rule.wallet_catch_up.as_ref()),
+        )
+    }
+
+    /// Returns the node status once Solo may request a template, reading it
+    /// every [`SOLO_HOLD_RECHECK`] meanwhile; `None` once stopped. While it
+    /// waits the miner requests no template, runs no search and submits
+    /// nothing; the wallet says why.
+    fn wait(
+        &self,
+        node: &Mutex<Node>,
+        status: &Mutex<MiningStatus>,
+        stop: &AtomicBool,
+    ) -> Result<Option<NodeStatus>, NodeError> {
+        let mut shown = false;
+        loop {
+            if stop.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            let node_status = node
+                .lock()
+                .map_err(|_| NodeError::SharedNodePoisoned)?
+                .status()?;
+            if !self.waits_in(&node_status) {
+                return Ok(Some(node_status));
+            }
+            if !shown {
+                shown = true;
+                if let Ok(mut current) = status.lock() {
+                    current.lifecycle = MiningLifecycle::Running;
+                    current.matrix_attempts_per_second = 0.0;
+                    current.stage = None;
+                }
+            }
+            if !interruptible_backoff(stop, SOLO_HOLD_RECHECK) {
+                return Ok(None);
+            }
+        }
+    }
+}
+
 fn mining_loop(
     node: Arc<Mutex<Node>>,
     status: Arc<Mutex<MiningStatus>>,
     stop: Arc<AtomicBool>,
     payout: [u8; 32],
+    solo_hold: SoloHold,
 ) {
     let mut next_nonce = 0_u64;
     let mut cuda = None;
     let mut cuda_initialized = false;
 
     'jobs: while !stop.load(Ordering::Acquire) {
+        match solo_hold.wait(&node, &status, &stop) {
+            Ok(Some(_)) => {}
+            Ok(None) => break 'jobs,
+            Err(error) => {
+                fail_worker(&status, solo_error_message(&error));
+                return;
+            }
+        }
         let job = match node
             .lock()
             .map_err(|_| NodeError::SharedNodePoisoned)
@@ -507,7 +620,7 @@ fn mining_loop(
         {
             Ok(job) => job,
             Err(error) => {
-                fail_worker(&status, error.client_error().message);
+                fail_worker(&status, solo_error_message(&error));
                 return;
             }
         };
@@ -542,7 +655,7 @@ fn mining_loop(
             let result = match result {
                 Ok(result) => result,
                 Err(error) => {
-                    fail_worker(&status, error.client_error().message);
+                    fail_worker(&status, solo_error_message(&error));
                     return;
                 }
             };
@@ -581,7 +694,9 @@ fn mining_loop(
                         .lock()
                         .ok()
                         .and_then(|node| node.status().ok())
-                        .is_some_and(|node_status| node_status.tip == expected_parent);
+                        .is_some_and(|node_status| {
+                            node_status.tip == expected_parent && !solo_hold.waits_in(&node_status)
+                        });
                     if !still_current {
                         next_nonce = 0;
                         continue 'jobs;
@@ -595,12 +710,16 @@ fn mining_loop(
                     let parent_is_current = node
                         .lock()
                         .map_err(|_| NodeError::SharedNodePoisoned)
-                        .and_then(|node| Ok(node.status()?.tip == expected_parent));
+                        .and_then(|node| {
+                            let node_status = node.status()?;
+                            Ok(node_status.tip == expected_parent
+                                && !solo_hold.waits_in(&node_status))
+                        });
                     let submission = parent_is_current.and_then(|parent_is_current| {
                         if !parent_is_current {
                             return Ok(None);
                         }
-                        submit_solo_candidate(&node, block.as_ref(), stop.as_ref())
+                        submit_solo_candidate(&node, block.as_ref(), stop.as_ref(), &solo_hold)
                     });
                     match submission {
                         Ok(Some(node_status)) => {
@@ -615,7 +734,7 @@ fn mining_loop(
                         }
                         Ok(None) => {}
                         Err(error) => {
-                            fail_worker(&status, error.client_error().message);
+                            fail_worker(&status, solo_error_message(&error));
                             return;
                         }
                     }
@@ -635,10 +754,14 @@ fn mining_loop(
     }
 }
 
+/// Submits a Solo block, retrying while the error is retryable. Each attempt,
+/// retries included, first re-reads the node status and gives up while Solo
+/// waits for the newest blocks to be checked.
 fn submit_solo_candidate(
     node: &Arc<Mutex<Node>>,
     block: &cmfd_consensus::Block,
     stop: &AtomicBool,
+    solo_hold: &SoloHold,
 ) -> Result<Option<cmfd_node::NodeStatus>, NodeError> {
     while !stop.load(Ordering::Acquire) {
         let node_status = node
@@ -650,6 +773,9 @@ fn submit_solo_candidate(
         if node_status.tip != parent {
             return Ok((node_status.tip == block_id).then_some(node_status));
         }
+        if solo_hold.waits_in(&node_status) {
+            return Ok(None);
+        }
         match submit_shared_tip_block(node, block.clone(), unix_time_seconds()) {
             Ok(_) | Err(NodeError::DuplicateBlock(_)) => {
                 let node_status = node
@@ -660,6 +786,9 @@ fn submit_solo_candidate(
             }
             Err(NodeError::StaleBlockAdmission | NodeError::UnknownParent(_)) => return Ok(None),
             Err(NodeError::ProofVerifierShuttingDown) => return Ok(None),
+            // The tip cannot move while admission is halted, so waiting
+            // would never end: stop and say why.
+            Err(error @ NodeError::WorkRuleHalted) => return Err(error),
             Err(error) if error.client_error().retryable => {
                 if !interruptible_backoff(stop, Duration::from_millis(100)) {
                     return Ok(None);
@@ -1385,13 +1514,26 @@ fn worker_name_requirement() -> &'static str {
 }
 
 fn decode_payout(value: &str) -> Result<[u8; 32], NodeClientError> {
-    parse_miner_destination(value).map_err(|_| {
+    read_address(value).map_err(|error| {
         manager_error(
             "invalid_mining_payout",
-            "The mining payout destination must be a 64-character x-only public key.",
+            format!("The mining payout destination is not a valid address: {error}."),
             false,
         )
     })
+}
+
+/// Why Solo mining stopped, in the words of a wallet user. A halted node
+/// gives operator wording ("until an operator reviews this node's work
+/// checks"); the wallet's way out is a resync, as at the start of Solo.
+fn solo_error_message(error: &NodeError) -> String {
+    match error {
+        NodeError::WorkRuleHalted => {
+            "Solo mining stopped because block checks are stopped. Resync the chain, then start Solo mining again."
+                .to_owned()
+        }
+        error => error.client_error().message,
+    }
 }
 
 fn fail_worker(status: &Mutex<MiningStatus>, message: String) {
@@ -1474,6 +1616,177 @@ mod tests {
         }
     }
 
+    fn catch_up(state: &'static str, granted_above_available: bool) -> WalletCatchUpStatus {
+        WalletCatchUpStatus {
+            state,
+            reason: (state == "waiting_for_check").then_some("earlier_blocks"),
+            available_height: 10,
+            blocks_left: 7,
+            newest_checked: 0,
+            newest_needed: 60,
+            sources_answering: 2,
+            granted_above_available,
+        }
+    }
+
+    #[test]
+    fn solo_waits_only_while_a_block_taken_without_a_check_lies_above_the_available_height() {
+        assert!(!solo_waits(None));
+        assert!(solo_waits(Some(&catch_up("catching_up", true))));
+        assert!(solo_waits(Some(&catch_up("checking_newest", true))));
+        assert!(solo_waits(Some(&catch_up("waiting_for_check", true))));
+        // Blocks stored before the upgrade with nothing taken unchecked on
+        // top: the wallet keeps mining.
+        assert!(!solo_waits(Some(&catch_up("waiting_for_check", false))));
+        assert!(!solo_waits(Some(&catch_up("caught_up", false))));
+    }
+
+    #[test]
+    fn solo_stopping_on_a_halted_node_says_what_the_user_can_do() {
+        let message = solo_error_message(&NodeError::WorkRuleHalted);
+        assert!(message.contains("Resync the chain"), "{message}");
+        assert!(!message.contains("operator"), "{message}");
+        // Anything else keeps the node's own words.
+        assert_eq!(
+            solo_error_message(&NodeError::StaleBlockAdmission),
+            NodeError::StaleBlockAdmission.client_error().message
+        );
+    }
+
+    /// While a block taken without a check lies above the available height
+    /// the Solo loop requests no template, searches nothing and submits
+    /// nothing, and it resumes once that clears. A wallet whose
+    /// stored blocks wait for the check with nothing taken unchecked keeps
+    /// mining.
+    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4")))]
+    #[test]
+    fn solo_waits_while_the_newest_blocks_are_checked_and_then_mines() {
+        let path = test_dir("solo-hold");
+        let node = Arc::new(Mutex::new(Node::open(&path).unwrap()));
+        let height = |node: &Mutex<Node>| node.lock().unwrap().status().unwrap().accepted_height;
+        let start_height = height(&node);
+        let forced = Arc::new(Mutex::new(Some(catch_up("catching_up", true))));
+        let mut manager = MiningManager::new(Arc::clone(&node));
+        manager.solo_hold.forced = Some(Arc::clone(&forced));
+        let reads = Arc::clone(&manager.solo_hold.reads);
+
+        manager.start(request(MiningMode::Solo)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while reads.load(Ordering::Acquire) < 10 {
+            assert!(
+                Instant::now() < deadline,
+                "the held miner stopped reading the status"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let held = manager.status().unwrap();
+        assert_eq!(held.lifecycle, MiningLifecycle::Running);
+        assert_eq!(held.mode, Some(MiningMode::Solo));
+        assert_eq!(held.session_attempts, 0, "a held miner searches nothing");
+        assert_eq!(held.blocks_found, 0);
+        assert_eq!(held.current_height, start_height);
+        assert_eq!(held.stage, None);
+        assert_eq!(height(&node), start_height, "a held miner submits nothing");
+
+        // Only stored blocks wait for the check: Solo mines.
+        *forced.lock().unwrap() = Some(catch_up("waiting_for_check", false));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let current = manager.status().unwrap();
+            if current.blocks_found > 0 {
+                assert!(current.session_attempts > 0);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the released miner did not find Devnet work"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(height(&node) > start_height);
+
+        // Held again: no block is added while it holds.
+        *forced.lock().unwrap() = Some(catch_up("checking_newest", true));
+        let reads_before = reads.load(Ordering::Acquire);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while reads.load(Ordering::Acquire) < reads_before + 10 {
+            assert!(
+                Instant::now() < deadline,
+                "the held miner stopped reading the status"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let held_height = height(&node);
+        let held_found = manager.status().unwrap().blocks_found;
+        let attempts = manager.status().unwrap().session_attempts;
+        let reads_before = reads.load(Ordering::Acquire);
+        while reads.load(Ordering::Acquire) < reads_before + 5 {
+            assert!(
+                Instant::now() < deadline,
+                "the held miner stopped reading the status"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(height(&node), held_height);
+        assert_eq!(manager.status().unwrap().blocks_found, held_found);
+        assert_eq!(manager.status().unwrap().session_attempts, attempts);
+
+        let stopped = manager.stop().unwrap();
+        assert_eq!(stopped.lifecycle, MiningLifecycle::Stopped);
+        drop((manager, node));
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    /// The submit step, retries included, re-reads the hold before each
+    /// attempt: a block found before the hold turned on is not added while
+    /// it holds.
+    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4")))]
+    #[test]
+    fn solo_submit_adds_nothing_while_the_newest_blocks_are_checked() {
+        let path = test_dir("solo-hold-submit");
+        let node = Arc::new(Mutex::new(Node::open(&path).unwrap()));
+        let height = |node: &Mutex<Node>| node.lock().unwrap().status().unwrap().accepted_height;
+        let start_height = height(&node);
+        let job = node
+            .lock()
+            .unwrap()
+            .build_mining_job(default_miner_destination(), unix_time_seconds())
+            .unwrap();
+        let mut nonce = 0;
+        let block = loop {
+            match job
+                .search_range(nonce, SEARCH_BATCH_ATTEMPTS, || false)
+                .unwrap()
+            {
+                MiningSearchResult::Found { block, .. } => break block,
+                MiningSearchResult::Exhausted { next_nonce, .. } => nonce = next_nonce,
+                MiningSearchResult::Cancelled { .. } => unreachable!(),
+            }
+        };
+        let stop = AtomicBool::new(false);
+        let forced = Arc::new(Mutex::new(Some(catch_up("checking_newest", true))));
+        let hold = SoloHold {
+            forced: Some(Arc::clone(&forced)),
+            ..SoloHold::default()
+        };
+
+        assert!(
+            submit_solo_candidate(&node, block.as_ref(), &stop, &hold)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(height(&node), start_height, "a held miner submits nothing");
+
+        *forced.lock().unwrap() = Some(catch_up("waiting_for_check", false));
+        let accepted = submit_solo_candidate(&node, block.as_ref(), &stop, &hold)
+            .unwrap()
+            .expect("the released miner submits its block");
+        assert_eq!(accepted.accepted_height, start_height + 1);
+        assert_eq!(height(&node), start_height + 1);
+        drop(node);
+        fs::remove_dir_all(path).unwrap();
+    }
+
     #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4")))]
     #[test]
     fn continuous_solo_mining_starts_finds_work_and_stops() {
@@ -1528,6 +1841,14 @@ mod tests {
     fn mining_payout_requires_a_valid_x_only_schnorr_key() {
         assert_eq!(
             decode_payout(&hex::encode(default_miner_destination())).unwrap(),
+            default_miner_destination()
+        );
+        let checksummed = cmfd_node::address::encode(
+            cmfd_node::address::hrp_for_network(COMPILED_NETWORK_PROFILE.short_name()),
+            &default_miner_destination(),
+        );
+        assert_eq!(
+            decode_payout(&checksummed).unwrap(),
             default_miner_destination()
         );
         for invalid in ["00".to_owned(), "ff".repeat(32), "gg".repeat(32)] {

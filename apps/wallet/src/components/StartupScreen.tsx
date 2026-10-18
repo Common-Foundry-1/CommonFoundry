@@ -18,9 +18,6 @@ export function StartupScreen() {
         >
           <span />
         </div>
-        <p className="startup-note">
-          Your wallet is working. A larger testnet history can take a few minutes on its first load.
-        </p>
       </section>
     </main>
   );

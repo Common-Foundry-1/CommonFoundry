@@ -268,6 +268,7 @@ export function ConsolidationDialog({
               ) : (
                 <p className="form-help" id="consolidation-inputs-help">
                   Only mature, unreserved outputs are eligible. {wallet?.immature_utxo_count ?? 0} immature and {wallet?.reserved_utxo_count ?? 0} reserved excluded.
+                  {wallet?.verifying_utxo_count ? ` ${wallet.verifying_utxo_count} still being verified excluded.` : null}
                 </p>
               )}
             </div>

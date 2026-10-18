@@ -33,8 +33,11 @@ export function Overview({
   onRefresh,
 }: OverviewProps) {
   const balances = wallet?.balances;
+  const verifying = BigInt(balances?.verifying_atoms ?? "0");
+  // A catching-up wallet reports its available height; its Verifying coins wait for the newest blocks.
+  const catchingUp = wallet?.available_height !== null && wallet?.available_height !== undefined;
   const total = balances
-    ? sumAtoms(balances.spendable_atoms, balances.pending_atoms, balances.immature_atoms)
+    ? sumAtoms(balances.spendable_atoms, balances.pending_atoms, balances.immature_atoms) + verifying
     : 0n;
 
   return (
@@ -49,7 +52,7 @@ export function Overview({
           <strong>{wallet ? formatBalanceAtoms(total) : "—"}</strong>
           <em>CMFD</em>
         </div>
-        <div className="balance-breakdown">
+        <div className={`balance-breakdown${verifying > 0n ? " has-verifying" : ""}`}>
           <div>
             <span>Available</span>
             <strong>{balances ? formatBalanceAtoms(balances.spendable_atoms) : "—"}</strong>
@@ -62,6 +65,14 @@ export function Overview({
             <span>Immature</span>
             <strong>{balances ? formatBalanceAtoms(balances.immature_atoms) : "—"}</strong>
           </div>
+          {verifying > 0n ? (
+            <div title={catchingUp
+              ? "Coins in recent blocks. They can be sent once the newest blocks are checked."
+              : "Coins in blocks the wallet has not checked yet. They can be sent once those blocks are checked."}>
+              <span>Verifying</span>
+              <strong>{formatBalanceAtoms(verifying)}</strong>
+            </div>
+          ) : null}
         </div>
         <div className="balance-actions">
           <button className="button-primary" type="button" onClick={onSend} disabled={!wallet}>

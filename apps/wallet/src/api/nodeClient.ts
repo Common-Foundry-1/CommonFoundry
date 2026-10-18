@@ -1,4 +1,5 @@
 import type {
+  ChainResyncReport,
   ConsolidationRequest,
   ConsolidationResult,
   MempoolSnapshot,
@@ -57,6 +58,7 @@ export interface NodeTransport {
   chooseWalletBackupPath(restore: boolean): Promise<string | null>;
   migrateWalletEncryption(path: string, passphrase: string): Promise<WalletCustodyStatus>;
   restoreWallet(path: string, passphrase: string): Promise<WalletCustodyStatus>;
+  resyncChain(): Promise<ChainResyncReport>;
 }
 
 export type NativeInvoke = <T>(
@@ -129,6 +131,11 @@ export const httpNodeTransport: NodeTransport = {
   chooseWalletBackupPath: () => custodyUnavailable(),
   migrateWalletEncryption: () => custodyUnavailable(),
   restoreWallet: () => custodyUnavailable(),
+  resyncChain: () => Promise.reject(new NodeApiError(
+    "Resyncing the chain is available in the desktop wallet.",
+    501,
+    "chain_resync_unavailable",
+  )),
 };
 
 function custodyUnavailable<T>(): Promise<T> {
@@ -276,6 +283,7 @@ export function createTauriNodeTransport(invoke: NativeInvoke): NodeTransport {
       "restore_wallet",
       { request: { path, passphrase } },
     ),
+    resyncChain: () => nativeCall<ChainResyncReport>(invoke, "resync_chain"),
   };
 }
 
@@ -355,4 +363,8 @@ export function migrateWalletEncryption(
 
 export function restoreWallet(path: string, passphrase: string): Promise<WalletCustodyStatus> {
   return transport.restoreWallet(path, passphrase);
+}
+
+export function resyncChain(): Promise<ChainResyncReport> {
+  return transport.resyncChain();
 }

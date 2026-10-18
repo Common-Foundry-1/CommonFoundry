@@ -120,7 +120,7 @@ describe("Common Foundry wallet", () => {
       "aria-valuetext",
       "Authenticating and loading",
     );
-    expect(screen.getByText(/Your wallet is working/)).toBeInTheDocument();
+    expect(screen.queryByText(/testnet/i)).not.toBeInTheDocument();
   });
 
   it("renders live wallet and node values without inventing market data", async () => {
@@ -192,6 +192,97 @@ describe("Common Foundry wallet", () => {
     const reviewDialog = screen.getByRole("dialog", { name: "Review transaction" });
     expect(within(reviewDialog).queryByRole("alert")).not.toBeInTheDocument();
     expect(within(reviewDialog).getByText(secureWallet.warning)).toHaveClass("wallet-message");
+  });
+
+  it("shows coins waiting for the block check and the blocks left", async () => {
+    const workRule = {
+      enforced: true,
+      engines: "cpu",
+      engine_state: "ready",
+      engine_ready: true,
+      independent_engines: false,
+      halted: false,
+      checkpoint_height: 100,
+      checkpoint_hash: "aa".repeat(32),
+      activation_height: 101,
+      validated_height: 120,
+      pending_side_blocks: 0,
+      unsettled_height: null,
+      unsettled_block_id: null,
+      backlog_paused: false,
+      alarms: {
+        engine_divergence: 0,
+        own_engine_mismatches: 0,
+        engine_failures: 0,
+        store_conflicts: 0,
+        peers_on_invalid_chain: 0,
+      },
+    };
+    const verifyingWallet = {
+      ...wallet,
+      balances: { ...wallet.balances, verifying_atoms: "250000000" },
+      verifying_utxo_count: 1,
+      validated_height: 120,
+    };
+    vi.mocked(fetch).mockImplementation((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url.endsWith("/v1/status")) return jsonResponse({ ...status, work_rule: workRule });
+      if (url.endsWith("/v1/wallet")) return jsonResponse(verifyingWallet);
+      if (url.endsWith("/v1/mempool")) return jsonResponse(mempool);
+      return jsonResponse({ error: "not found" }, 404);
+    });
+    render(<App />);
+
+    // 177.50 plus the 2.50 still being verified.
+    expect(await screen.findByText("180.00")).toBeInTheDocument();
+    expect(screen.getByText("Verifying").nextElementSibling).toHaveTextContent("2.50");
+    expect(screen.getByText("Checking blocks · 8 left")).toBeInTheDocument();
+  });
+
+  it("offers a resync when block checks are stopped", async () => {
+    const halted = {
+      enforced: true,
+      engines: "cpu",
+      engine_state: "ready",
+      engine_ready: true,
+      independent_engines: false,
+      halted: true,
+      checkpoint_height: 100,
+      checkpoint_hash: "aa".repeat(32),
+      activation_height: 101,
+      validated_height: 127,
+      pending_side_blocks: 0,
+      unsettled_height: null,
+      unsettled_block_id: null,
+      backlog_paused: false,
+      alarms: {
+        engine_divergence: 1,
+        own_engine_mismatches: 0,
+        engine_failures: 0,
+        store_conflicts: 0,
+        peers_on_invalid_chain: 0,
+      },
+    };
+    vi.mocked(fetch).mockImplementation((input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url.endsWith("/v1/status")) return jsonResponse({ ...status, work_rule: halted });
+      if (url.endsWith("/v1/wallet")) return jsonResponse(wallet);
+      if (url.endsWith("/v1/mempool")) return jsonResponse(mempool);
+      return jsonResponse({ error: "not found" }, 404);
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    const banner = (await screen.findByText("Block checks are stopped")).closest("[role=alert]");
+    expect(banner).toHaveTextContent("Your keys stay safe");
+    await user.click(within(banner as HTMLElement).getByRole("button", { name: "Resync chain" }));
+    const dialog = screen.getByRole("dialog", { name: "Resync the chain" });
+    expect(dialog).toHaveTextContent("Nothing is deleted");
+    // Outside the desktop wallet the command is unavailable, and says so.
+    await user.click(within(dialog).getByRole("button", { name: "Resync chain" }));
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent("available in the desktop wallet");
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("dialog", { name: "Resync the chain" })).not.toBeInTheDocument();
   });
 
   it("surfaces node errors and can retry", async () => {

@@ -30,3 +30,4 @@ tools/production-v4-prover/patches/*.patch text eol=lf
 packaging/mainnet/windows/*.ps1 text eol=lf
 packaging/mainnet/windows/*.bat text eol=crlf
 apps/wallet/src-tauri/tests/fixtures/updater/** -text
+crates/cmfd-consensus/data/*.ids binary

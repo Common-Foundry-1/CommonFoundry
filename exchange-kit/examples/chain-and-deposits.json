@@ -32,7 +32,7 @@
           "encodings": {
             "amounts": "canonical unsigned decimal atom strings",
             "destination": "64 lowercase hexadecimal characters encoding a 32-byte x-only secp256k1 public key",
-            "checksummed_address_available": false
+            "checksummed_address_available": true
           },
           "methods": {
             "integration": [

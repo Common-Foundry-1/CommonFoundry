@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 
 import { sendWalletTransaction } from "../api/nodeClient";
+import { addressErrorSentence, decode, type DecodedAddress } from "../lib/addressCodec";
 import { formatAtoms, parseCmfd, shortenHash } from "../lib/amount";
 import { DEFAULT_TRANSACTION_FEE, MIN_TRANSACTION_FEE_ATOMS, MINIMUM_FEE_MESSAGE } from "../lib/fees";
+import { walletAddressHrp } from "../lib/walletAddress";
 import type { WalletSendResult, WalletSnapshot } from "../types";
 
 interface SendDialogProps {
@@ -23,10 +25,28 @@ interface SendErrors {
 type SendPhase = "edit" | "review" | "complete";
 
 const DEFAULT_FEE = DEFAULT_TRANSACTION_FEE;
-const PUBLIC_KEY_PATTERN = /^[0-9a-fA-F]{64}$/;
+
+/** The recipient in either address form, or why it cannot be read. */
+function readRecipient(hrp: string, text: string): DecodedAddress | string {
+  try {
+    // Send always took hex in either case; keep that.
+    return decode(hrp, /^[0-9a-fA-F]{64}$/.test(text) ? text.toLowerCase() : text);
+  } catch (error) {
+    return addressErrorSentence(error);
+  }
+}
 
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "The transaction could not be submitted.";
+}
+
+/** Coins in blocks the wallet has not checked yet; zero if unknown. */
+function walletVerifyingAtoms(wallet: WalletSnapshot | null): bigint {
+  try {
+    return BigInt(wallet?.balances.verifying_atoms ?? "0");
+  } catch {
+    return 0n;
+  }
 }
 
 function walletSpendableAtoms(wallet: WalletSnapshot | null): bigint | null {
@@ -112,13 +132,15 @@ export function SendDialog({
     ? amountAtoms + feeAtoms
     : null;
   const spendableAtoms = walletSpendableAtoms(wallet);
+  const addressHrp = walletAddressHrp(wallet?.network);
+  const recipientText = recipient.trim();
+  const recipientAddress = readRecipient(addressHrp, recipientText);
   const closeIfIdle = () => {
     if (!submittingRef.current) onClose();
   };
 
   const validate = (): boolean => {
     const nextErrors: SendErrors = {};
-    const normalizedRecipient = recipient.trim();
     const parsedAmount = parseCmfd(amount);
     const parsedFee = parseCmfd(fee);
     const available = walletSpendableAtoms(wallet);
@@ -126,8 +148,8 @@ export function SendDialog({
     if (!wallet || available === null) {
       nextErrors.form = "Wallet data is unavailable. Reconnect to the node and try again.";
     }
-    if (!PUBLIC_KEY_PATTERN.test(normalizedRecipient)) {
-      nextErrors.recipient = "Enter a 64-character hexadecimal public key.";
+    if (typeof recipientAddress === "string") {
+      nextErrors.recipient = recipientAddress;
     }
     if (parsedAmount === null || parsedAmount <= 0n) {
       nextErrors.amount = "Enter an amount greater than zero with no more than 8 decimals.";
@@ -141,7 +163,14 @@ export function SendDialog({
       && parsedFee !== null
       && parsedAmount + parsedFee > available
     ) {
-      nextErrors.form = "The amount and burned fee exceed the spendable balance.";
+      const verifying = walletVerifyingAtoms(wallet);
+      // A catching-up wallet reports its available height; its Verifying coins wait for the newest blocks.
+      const catchingUp = wallet?.available_height !== null && wallet?.available_height !== undefined;
+      nextErrors.form = verifying > 0n && parsedAmount + parsedFee <= available + verifying
+        ? catchingUp
+          ? `The amount and burned fee exceed the spendable balance. ${formatAtoms(verifying)} CMFD is Verifying. These coins can be sent once the newest blocks are checked.`
+          : `The amount and burned fee exceed the spendable balance. ${formatAtoms(verifying)} CMFD is still being verified and can be sent once the blocks that hold it are checked.`
+        : "The amount and burned fee exceed the spendable balance.";
     }
 
     setErrors(nextErrors);
@@ -157,7 +186,7 @@ export function SendDialog({
 
   const submitTransaction = async () => {
     if (submittingRef.current) return;
-    if (!validate()) {
+    if (!validate() || typeof recipientAddress === "string") {
       setPhase("edit");
       return;
     }
@@ -167,7 +196,7 @@ export function SendDialog({
     setErrors({});
     try {
       const submitted = await sendWalletTransaction({
-        recipient: recipient.trim(),
+        recipient: recipientAddress.hex,
         amount: amount.trim(),
         fee: fee.trim(),
       });
@@ -231,7 +260,7 @@ export function SendDialog({
                 }}
                 aria-invalid={Boolean(errors.recipient)}
                 aria-describedby={errors.recipient ? "send-recipient-error" : undefined}
-                placeholder="64-character x-only public key"
+                placeholder={`${addressHrp}1… address or 64-character hex key`}
                 autoComplete="off"
                 spellCheck={false}
               />
@@ -337,9 +366,17 @@ export function SendDialog({
               <div className="review-row review-row-block">
                 <span className="review-label">Recipient</span>
                 <output className="review-value review-value-address" aria-label="Full recipient public key">
-                  {recipient.trim()}
+                  {typeof recipientAddress === "string" ? recipientText : recipientAddress.hex}
                 </output>
               </div>
+              {typeof recipientAddress !== "string" && recipientAddress.format === "bech32m" && (
+                <div className="review-row review-row-block">
+                  <span className="review-label">Entered as checksummed address</span>
+                  <output className="review-value review-value-address" aria-label="Checksummed recipient address">
+                    {recipientText.toLowerCase()}
+                  </output>
+                </div>
+              )}
               <div className="review-row">
                 <span className="review-label">Recipient receives</span>
                 <strong className="review-value">{formatAtoms(amountAtoms ?? 0n)} CMFD</strong>

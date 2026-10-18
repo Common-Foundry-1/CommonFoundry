@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { QRCodeSVG } from "qrcode.react";
 
+import { encode } from "../lib/addressCodec";
+import { walletAddressHrp } from "../lib/walletAddress";
 import type { WalletSnapshot } from "../types";
 
 interface ReceiveDialogProps {
@@ -9,9 +11,20 @@ interface ReceiveDialogProps {
   onClose: () => void;
 }
 
+type CopyTarget = "hex" | "checksummed";
+
+function checksummedAddress(hrp: string, hex: string): string | null {
+  try {
+    return hex ? encode(hrp, hex) : null;
+  } catch {
+    return null;
+  }
+}
+
 export function ReceiveDialog({ open, wallet, onClose }: ReceiveDialogProps) {
   const dialogRef = useRef<HTMLDivElement>(null);
   const [copyState, setCopyState] = useState<"idle" | "copying" | "copied" | "error">("idle");
+  const [copyTarget, setCopyTarget] = useState<CopyTarget>("hex");
 
   useEffect(() => {
     if (!open) return;
@@ -59,23 +72,29 @@ export function ReceiveDialog({ open, wallet, onClose }: ReceiveDialogProps) {
   if (!open) return null;
 
   const address = wallet?.destination ?? "";
+  const addressHrp = walletAddressHrp(wallet?.network);
+  const checksummed = checksummedAddress(addressHrp, address);
 
-  const copyAddress = async () => {
-    if (!address) return;
+  const copyAddress = async (target: CopyTarget) => {
+    const text = target === "hex" ? address : checksummed;
+    if (!text) return;
+    setCopyTarget(target);
     setCopyState("copying");
     try {
-      await navigator.clipboard.writeText(address);
+      await navigator.clipboard.writeText(text);
       setCopyState("copied");
     } catch {
       setCopyState("error");
     }
   };
 
-  const copyLabel = copyState === "copying"
-    ? "Copying…"
-    : copyState === "copied"
-      ? "Address copied"
-      : "Copy address";
+  const copyLabel = (target: CopyTarget, idle: string, copied: string) => copyTarget !== target
+    ? idle
+    : copyState === "copying"
+      ? "Copying…"
+      : copyState === "copied"
+        ? copied
+        : idle;
 
   return (
     <div className="dialog-backdrop">
@@ -112,11 +131,28 @@ export function ReceiveDialog({ open, wallet, onClose }: ReceiveDialogProps) {
             <button
               className="button-secondary button-copy"
               type="button"
-              onClick={copyAddress}
+              onClick={() => void copyAddress("hex")}
               disabled={copyState === "copying"}
             >
-              {copyLabel}
+              {copyLabel("hex", "Copy address", "Address copied")}
             </button>
+            {checksummed ? (
+              <>
+                <p className="dialog-address-label dialog-address-label-secondary">Checksummed address · detects typos</p>
+                <output className="dialog-address" aria-label="Checksummed wallet address">{checksummed}</output>
+                <button
+                  className="button-secondary button-copy"
+                  type="button"
+                  onClick={() => void copyAddress("checksummed")}
+                  disabled={copyState === "copying"}
+                >
+                  {copyLabel("checksummed", "Copy checksummed address", "Checksummed address copied")}
+                </button>
+                <p className="form-help dialog-address-note">
+                  The same key as the address above. Give the hex address to services that do not accept {addressHrp}1… addresses yet.
+                </p>
+              </>
+            ) : null}
             <p className="form-status" aria-live="polite">
               {copyState === "error" ? "Clipboard access failed. Select and copy the address manually." : ""}
             </p>

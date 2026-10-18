@@ -138,6 +138,28 @@ Add-Type -TypeDefinition $source -OutputAssembly (Join-Path $PSScriptRoot 'miner
         self.assertNotIn("--gpu", self.log.read_text().splitlines()[-1])
         self.assertIn("pool-search", self.log.read_text().splitlines()[-1])
 
+    def test_checksummed_addresses_pass_through_to_the_miner(self):
+        # The secp256k1 generator's x-coordinate as a mainnet and an RCNet address.
+        mainnet = "cmfd10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vq4yhywr"
+        rcnet = "tcmfd10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vq236tfw"
+        pool = "cmfd+tls://8.8.8.8:29445?pin=" + "cd" * 32
+        for wallet in (mainnet, mainnet.upper()):
+            self.log.unlink(missing_ok=True)
+            result, calls = self.invoke("start-miner.sh", wallet, pool)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("--miner " + wallet, calls[-1])
+        self.log.unlink(missing_ok=True)
+        result, calls = self.invoke("start-miner.sh", rcnet, pool)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(calls, [])
+        shutil.copyfile(
+            self.repo / "packaging/production-rc/miner/linux/start-miner.sh",
+            self.root / "rc-start-miner.sh",
+        )
+        result, calls = self.invoke("rc-start-miner.sh", rcnet, pool)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--miner " + rcnet, calls[-1])
+
     def test_miner_does_not_start_after_failed_beacon_or_invalid_address(self):
         pool = "cmfd+tls://8.8.8.8:29445?pin=" + "cd" * 32
         result, calls = self.invoke("start-miner.sh", "bad-address", pool)

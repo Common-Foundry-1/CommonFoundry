@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AlertTriangle, LoaderCircle } from "lucide-react";
 import { ExplorerRequestError, loadAddress, loadBlock, loadExplorer, loadTransaction, MAINNET_MODE } from "./api";
-import { ADDRESS_HASH } from "../shared/address";
+import { ADDRESS_HASH, CHECKSUMMED_ADDRESS } from "../shared/address";
+import { addressErrorSentence, decode, hrpForNetwork } from "./lib/addressCodec";
 import { demoBlock } from "./demoData";
 import type { ExplorerBlock, ExplorerSearchKind, ExplorerSnapshot, ExplorerTransaction, ExplorerView } from "./types";
 import { AddressDetail } from "./components/AddressDetail";
@@ -68,13 +69,25 @@ export default function App() {
   const openBlock = (block: ExplorerBlock | string) => navigate(async () => ({
     kind: "block", block: preview && typeof block !== "string" ? demoBlock(block) : await loadBlock(typeof block === "string" ? block : block.block_id, preview),
   }));
-  const openTransaction = (transaction: ExplorerTransaction | string) => navigate(async () => ({
-    kind: "transaction", transaction: typeof transaction === "string" ? await loadTransaction(transaction, preview) : transaction,
+  // A transaction opened from a list keeps the validated height that list was read with.
+  const openTransaction = (transaction: ExplorerTransaction | string, validated?: number | null) => navigate(async () => ({
+    kind: "transaction", transaction: typeof transaction === "string" ? await loadTransaction(transaction, preview) : { ...transaction, validated_height: validated },
   }));
 
+  const addressPrefix = hrpForNetwork(snapshot?.network_short_name ?? "");
+
   const search = async (query: string, kind: ExplorerSearchKind) => {
-    if (kind === "address" && ADDRESS_HASH.test(query)) {
-      await navigate(async () => ({ kind: "address", address: await loadAddress(query, null, preview) }));
+    if (kind === "address" || CHECKSUMMED_ADDRESS.test(query)) {
+      let address: string;
+      try {
+        // Address search always took hex in either case; keep that.
+        address = decode(addressPrefix, ADDRESS_HASH.test(query) ? query.toLowerCase() : query).hex;
+      } catch (reason) {
+        navigationVersion.current += 1; setNavigating(false); setView({ kind: "overview" });
+        setError(addressErrorSentence(reason));
+        return;
+      }
+      await navigate(async () => ({ kind: "address", address: await loadAddress(address, null, preview) }));
       return;
     }
     if (kind === "chain" && /^\d{1,20}$/.test(query) && BigInt(query) <= 18_446_744_073_709_551_615n) {
@@ -92,7 +105,7 @@ export default function App() {
       return;
     }
     navigationVersion.current += 1; setNavigating(false); setView({ kind: "overview" });
-    setError(kind === "address" ? "Enter a 64-character wallet address." : "Enter a block height or a 64-character block/transaction hash. Choose Address to look up a wallet.");
+    setError("Enter a block height or a 64-character block/transaction hash. Choose Address to look up a wallet.");
   };
 
   const home = () => {
@@ -107,10 +120,10 @@ export default function App() {
     <Header network={snapshot.network_short_name} connected={!preview} onHome={home} onSearch={(query, kind) => void search(query, kind)} />
     {error && <div className="error-banner" role="alert"><AlertTriangle size={15} />{error}<button type="button" onClick={() => setError(null)}>Dismiss</button></div>}
     {navigating ? <main className="detail-loading" role="status"><LoaderCircle className="spin" /> Looking up chain data…</main> : <>
-      {view.kind === "overview" && <Overview snapshot={snapshot} preview={preview} onBlock={(block) => void openBlock(block)} onTransaction={(tx) => void openTransaction(tx)} />}
-      {view.kind === "block" && <BlockDetail block={view.block} onBack={home} onTransaction={(tx) => void openTransaction(tx)} />}
+      {view.kind === "overview" && <Overview snapshot={snapshot} preview={preview} onBlock={(block) => void openBlock(block)} onTransaction={(tx) => void openTransaction(tx, snapshot.validated_height)} />}
+      {view.kind === "block" && <BlockDetail block={view.block} onBack={home} onTransaction={(tx) => void openTransaction(tx, view.block.validated_height)} />}
       {view.kind === "transaction" && <TransactionDetail transaction={view.transaction} onBack={home} />}
-      {view.kind === "address" && <AddressDetail initial={view.address} liveTip={snapshot.tip} onBack={home} onBlock={(id) => void openBlock(id)} onTransaction={(id) => void openTransaction(id)} />}
+      {view.kind === "address" && <AddressDetail initial={view.address} addressPrefix={addressPrefix} liveTip={snapshot.tip} onBack={home} onBlock={(id) => void openBlock(id)} onTransaction={(id) => void openTransaction(id)} />}
     </>}
     <footer><span>Common Foundry Explorer</span><code>{snapshot.network_id.slice(0, 16)}…</code><span>Built for independently verifiable compute.</span></footer>
   </div>;

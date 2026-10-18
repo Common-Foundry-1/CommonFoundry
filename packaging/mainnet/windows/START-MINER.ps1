@@ -10,8 +10,9 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 Set-Location -LiteralPath $PSScriptRoot
-if ([string]::IsNullOrWhiteSpace($WalletAddress)) { $WalletAddress = (Read-Host 'Mainnet wallet receive address (64 hex characters)').Trim() }
-if ($WalletAddress -cnotmatch '^[0-9a-fA-F]{64}$') { throw 'WalletAddress must be exactly 64 hexadecimal characters.' }
+if ([string]::IsNullOrWhiteSpace($WalletAddress)) { $WalletAddress = (Read-Host 'Mainnet wallet receive address (cmfd1... or 64 hex characters)').Trim() }
+# The miner checks the address checksum and key; this only catches the wrong kind of value.
+if ($WalletAddress -cnotmatch '^(?:[0-9a-fA-F]{64}|(?:cmfd1|CMFD1)[0-9A-Za-z]{58})$') { throw 'WalletAddress must be a cmfd1... address or exactly 64 hexadecimal characters.' }
 if ([string]::IsNullOrWhiteSpace($PoolUrl)) { $PoolUrl = (Read-Host 'Mainnet pool URL (cmfd+tls://IP:PORT?pin=...)').Trim() }
 if ($PoolUrl -cnotmatch '^cmfd\+tls://(?:[0-9]{1,3}(?:\.[0-9]{1,3}){3}|\[[0-9A-Fa-f:]+\]):[0-9]{1,5}\?pin=[0-9a-fA-F]{64}$') { throw 'Use a complete certificate-pinned pool URL.' }
 if ([string]::IsNullOrWhiteSpace($WorkerName)) { $WorkerName = 'cmfd-miner' }

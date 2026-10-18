@@ -8,10 +8,11 @@ WORKER_NAME="${CMFD_WORKER_NAME:-$(hostname -s)}"
 GPU_SELECTOR="${CMFD_GPU:-${3:-${CUDA_VISIBLE_DEVICES:-}}}"
 
 if [[ -z "$WALLET_ADDRESS" ]]; then
-  read -r -p "RCNet-1 wallet receive address (64 hex characters): " WALLET_ADDRESS
+  read -r -p "RCNet-1 wallet receive address (tcmfd1... or 64 hex characters): " WALLET_ADDRESS
 fi
-if [[ ! "$WALLET_ADDRESS" =~ ^[0-9a-fA-F]{64}$ ]]; then
-  echo "ERROR: wallet address must be exactly 64 hexadecimal characters." >&2
+# cmfd-miner checks the address checksum and key; this only catches the wrong kind of value.
+if [[ ! "$WALLET_ADDRESS" =~ ^([0-9a-fA-F]{64}|(tcmfd1|TCMFD1)[[:alnum:]]{58})$ ]]; then
+  echo "ERROR: wallet address must be a tcmfd1... address or exactly 64 hexadecimal characters." >&2
   exit 2
 fi
 if [[ -z "$POOL_URL" ]]; then

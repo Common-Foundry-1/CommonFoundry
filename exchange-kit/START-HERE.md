@@ -157,8 +157,9 @@ trusted multi-node readiness rule.
 
 ### 2. Integrate deposits
 
-1. Supply unique exchange labels and valid raw 32-byte x-only Schnorr public
-   keys to `registerwatchdestinations`. Each atomic batch contains 1-1,000
+1. Supply unique exchange labels and valid 32-byte x-only Schnorr public
+   keys to `registerwatchdestinations`, as 64 lowercase hex characters or as
+   checksummed `cmfd1...` addresses. Each atomic batch contains 1-1,000
    exact `{label,destination_hex}` objects. Use `registerwatchdestination` for
    one-at-a-time compatibility.
 2. Persist the returned immutable label/destination mapping.
@@ -167,12 +168,17 @@ trusted multi-node readiness rule.
 4. Process `deposit_added` and `deposit_removed` as an event stream. A removed
    event refers to its original addition through `added_cursor`.
 5. Apply the exchange's independent confirmation and spendability policy.
+   From 1.0.16, heights and confirmations stop at the node's validated height
+   (`getblockchaininfo` → `work_rule.validated_height`), and new deposit events
+   are added only up to it; see the [integration guide](INTEGRATION-GUIDE.md).
 
 Registration completes only after the active-chain history has been scanned.
 The batch is ordered, atomic, and exact-retry idempotent; duplicate labels or
 destinations inside one batch are rejected. Labels are visible ASCII
-identifiers, not secrets. `destination_hex` is a raw key, not a checksummed
-user-facing address. Watch registrations are immutable.
+identifiers, not secrets. Responses always carry `destination_hex` as the raw
+key in hex, whichever form was registered; a `cmfd1...` address is the
+checksummed form of the same key, so registering it again in the other form is
+the same registration. Watch registrations are immutable.
 
 ### 3. Integrate withdrawals with custody v0.5
 
@@ -212,8 +218,10 @@ recovery contracts remain normative in
 
 - Bitcoin Core RPC compatibility, JSON-RPC batches, notifications, or named parameters
 - public/non-loopback exposure or built-in TLS
-- checksummed display addresses, or deposit keys generated through the RPC
-  (generate them offline with `cmfd-node exchange-key-new`)
+- checksummed addresses in responses (every destination parameter accepts
+  them; responses are hex), or deposit keys generated through the RPC
+  (generate them offline with `cmfd-node exchange-key-new`, which prints both
+  forms)
 - watch deletion or reassignment
 - `sendtoaddress`, `sendmany`, fee estimation, or an exchange payout scheduler
   (sign offline with `cmfd-node exchange-tx-sign` and broadcast with

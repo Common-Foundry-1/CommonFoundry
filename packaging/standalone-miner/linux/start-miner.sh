@@ -8,7 +8,8 @@ BOOTSTRAP_PEER="107.214.187.2:18444"
 # Use auto for NVIDIA, or opencl for Intel Arc.
 GPU_BACKEND="auto"
 GPU_INDEXES=""
-# PAYOUT_ADDRESS is your wallet's 64-character receive address.
+# PAYOUT_ADDRESS is your wallet's receive address: 64 hex characters or a
+# checksummed cmfd1... address.
 PAYOUT_ADDRESS=""
 BATCH_SIZE="8192"
 # 0 automatically divides host CPU threads across the selected GPUs (maximum 16 each).
@@ -18,7 +19,7 @@ PRODUCTION_V3_MAX_ROWS="131072"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
 if [[ -z "$PAYOUT_ADDRESS" ]]; then
-  echo "ERROR: Set PAYOUT_ADDRESS to the 64-character receive address shown by your wallet." >&2
+  echo "ERROR: Set PAYOUT_ADDRESS to the receive address shown by your wallet." >&2
   exit 1
 fi
 

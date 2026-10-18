@@ -2,7 +2,8 @@ COMMON FOUNDRY STANDALONE GPU MINER
 
 1. NVIDIA: leave GPU_BACKEND=auto. Intel Arc: set GPU_BACKEND=opencl.
 2. Double-click LIST-GPUS.bat and confirm every intended GPU appears.
-3. Open your wallet's Receive page and copy its 64-character address.
+3. Open your wallet's Receive page and copy its address (64 hex characters,
+   or a checksummed cmfd1... address).
 4. Right-click START-MINER.bat, choose Edit, and paste that address into
    PAYOUT_ADDRESS near the top. The node addresses normally need no changes.
 5. Double-click START-MINER.bat.

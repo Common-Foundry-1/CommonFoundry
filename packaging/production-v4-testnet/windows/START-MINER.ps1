@@ -10,11 +10,11 @@ param(
 
 $ErrorActionPreference = 'Stop'
 if ([string]::IsNullOrWhiteSpace($Miner)) {
-    Write-Host 'Paste the 64-character receive address shown by your RCNet-1 wallet.'
+    Write-Host 'Paste the receive address shown by your RCNet-1 wallet (tcmfd1... or 64 hex characters).'
     $Miner = (Read-Host 'Mining address').Trim()
 }
-if ($Miner -cnotmatch '^[0-9a-fA-F]{64}$') {
-    throw 'Mining address must be exactly 64 hexadecimal characters.'
+if ($Miner -cnotmatch '^(?:[0-9a-fA-F]{64}|(?:tcmfd1|TCMFD1)[0-9A-Za-z]{58})$') {
+    throw 'Mining address must be a tcmfd1... address or exactly 64 hexadecimal characters.'
 }
 & (Join-Path $PSScriptRoot 'PREPARE-V4-INPUTS.ps1') -Role Miner
 $inputs = Join-Path $PSScriptRoot 'inputs'

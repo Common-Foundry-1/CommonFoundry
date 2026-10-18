@@ -50,7 +50,8 @@ Storage corruption is reported and faults the node's storage health.
 
 `getaddressbalance [destination_hex]` and `getbalance [destination_hex]` are
 aliases returning the same structured object. A destination is a valid x-only
-secp256k1 public key encoded as 64 hexadecimal characters. The argument is
+secp256k1 public key encoded as 64 lowercase hexadecimal characters or as a
+checksummed `cmfd1...` address of the node's network. The argument is
 required; it is never a wallet account name, label, or implicit node wallet.
 
 All amounts are decimal **atom strings**. One CMFD is 100,000,000 atoms.
@@ -82,7 +83,7 @@ local mempool transactions, and withdrawal reservations are excluded. Pending
 incoming outputs are not included. Calling this method does not reserve coins.
 
 ```json
-{"jsonrpc":"2.0","id":1,"method":"getaddressutxos","params":["<64-character-destination-public-key>"]}
+{"jsonrpc":"2.0","id":1,"method":"getaddressutxos","params":["<64-character-hex-or-cmfd1-destination>"]}
 ```
 
 The `utxos` array contains `txid`, `vout`, `value_atoms`, `spendable_height`,

@@ -5,7 +5,8 @@ param(
     [string]$Peer,
 
     [Parameter(Mandatory)]
-    [ValidatePattern('^[0-9a-fA-F]{64}$')]
+    # tcmfd1... or 64 hex characters; cmfd-miner checks the checksum and key.
+    [ValidatePattern('^(?:[0-9a-fA-F]{64}|(?:tcmfd1|TCMFD1)[0-9A-Za-z]{58})$')]
     [string]$Miner,
 
     [Parameter(Mandatory)]

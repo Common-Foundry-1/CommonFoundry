@@ -19,6 +19,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { fetchPoolDashboard } from "./api";
+import { addressErrorSentence, decode, hrpForNetwork } from "./lib/addressCodec";
 import mark from "./assets/common-foundry-mark.png";
 import type { DashboardDocument, PoolWorker } from "./types";
 
@@ -36,6 +37,15 @@ type WorkerSort =
 type Platform = "windows" | "linux";
 
 const REFRESH_FALLBACK_SECONDS = 10;
+
+/** A payout address in either form as hex, or why it cannot be read. */
+function readPayoutAddress(hrp: string, text: string): { hex: string } | { error: string } {
+  try {
+    return { hex: decode(hrp, /^[0-9a-fA-F]{64}$/.test(text) ? text.toLowerCase() : text).hex };
+  } catch (error) {
+    return { error: addressErrorSentence(error) };
+  }
+}
 const ATOMS_PER_CMFD = 100_000_000;
 const COINBASE_MATURITY = 100;
 
@@ -168,6 +178,13 @@ export function App() {
   useEffect(() => {
     const controller = new AbortController();
     void load(controller.signal);
+    return () => controller.abort();
+  }, [load]);
+
+  // Only the timer follows the snapshot's interval: the first snapshot sets
+  // it, and that must not fetch again at once.
+  useEffect(() => {
+    const controller = new AbortController();
     const seconds = document?.refresh_interval_seconds ?? REFRESH_FALLBACK_SECONDS;
     const timer = window.setInterval(() => void load(controller.signal), seconds * 1000);
     return () => {
@@ -244,11 +261,13 @@ export function App() {
   const bonusRateBps = typeof pool.bonus_rate_bps === "number" && pool.bonus_rate_bps > 0 ? pool.bonus_rate_bps : null;
   const showBonus = bonusRateBps !== null || ledger.blocks.some((block) => (block.bonus_atoms ?? 0) > 0);
   const pin = document.certificate_sha256;
+  const addressPrefix = hrpForNetwork(pool.network_short_name);
+  const payout = payoutAddress ? readPayoutAddress(addressPrefix, payoutAddress) : null;
   const connectConfig = [
     `Pool URL: ${document.public_pool_url}`,
     `Certificate pin: ${pin}`,
     `Worker: ${workerName.trim() || "rig-01"}`,
-    `Payout address: ${payoutAddress.trim() || "PASTE_YOUR_64_CHARACTER_WALLET_ADDRESS"}`,
+    `Payout address: ${payout && "hex" in payout ? payout.hex : "PASTE_YOUR_64_CHARACTER_WALLET_ADDRESS"}`,
   ].join("\n");
 
   return (
@@ -413,12 +432,19 @@ export function App() {
               Payout address
               <input
                 value={payoutAddress}
-                maxLength={64}
+                maxLength={90}
                 spellCheck={false}
-                placeholder="64-character wallet receive address"
+                placeholder={`Hex or ${addressPrefix}1… wallet receive address`}
+                aria-invalid={payout !== null && "error" in payout}
+                aria-describedby={payout ? "payout-address-status" : undefined}
                 onChange={(event) => setPayoutAddress(event.target.value.trim())}
               />
             </label>
+            {payout && (
+              <p id="payout-address-status" className={"error" in payout ? "connect-field-error" : "connect-note"}>
+                {"error" in payout ? payout.error : `Copied as the hex key ${shortHex(payout.hex, 10, 8)}.`}
+              </p>
+            )}
             <button className="primary-button full-width" type="button" onClick={() => void copy("connection config", connectConfig)}>
               {copied === "connection config" ? <Check size={17} aria-hidden="true" /> : <Copy size={17} aria-hidden="true" />}
               {copied === "connection config" ? "Configuration copied" : "Copy connection details"}

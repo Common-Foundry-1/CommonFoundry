@@ -6,8 +6,9 @@ WALLET_ADDRESS="${CMFD_WALLET_ADDRESS:-${1:-}}"
 POOL_URL="${CMFD_POOL_URL:-${2:-}}"
 WORKER_NAME="${CMFD_WORKER_NAME:-$(hostname -s)}"
 GPU_SELECTOR="${CMFD_GPU:-${3:-${CUDA_VISIBLE_DEVICES:-}}}"
-[[ -n "$WALLET_ADDRESS" ]] || read -r -p 'Mainnet wallet receive address (64 hex characters): ' WALLET_ADDRESS
-[[ "$WALLET_ADDRESS" =~ ^[0-9a-fA-F]{64}$ ]] || { echo 'ERROR: wallet address must be 64 hex characters.' >&2; exit 2; }
+[[ -n "$WALLET_ADDRESS" ]] || read -r -p 'Mainnet wallet receive address (cmfd1... or 64 hex characters): ' WALLET_ADDRESS
+# cmfd-miner checks the address checksum and key; this only catches the wrong kind of value.
+[[ "$WALLET_ADDRESS" =~ ^([0-9a-fA-F]{64}|(cmfd1|CMFD1)[[:alnum:]]{58})$ ]] || { echo 'ERROR: wallet address must be a cmfd1... address or 64 hex characters.' >&2; exit 2; }
 [[ -n "$POOL_URL" ]] || read -r -p 'Mainnet pool URL (cmfd+tls://IP:PORT?pin=...): ' POOL_URL
 [[ "$POOL_URL" =~ ^cmfd\+tls://([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{1,5}\?pin=[0-9a-fA-F]{64}$ ]] || { echo 'ERROR: use a complete certificate-pinned numeric IPv4 pool URL.' >&2; exit 2; }
 [[ "$WORKER_NAME" =~ ^[A-Za-z0-9._-]{1,32}$ ]] || { echo 'ERROR: worker name must be 1-32 letters, numbers, dots, underscores or hyphens.' >&2; exit 2; }

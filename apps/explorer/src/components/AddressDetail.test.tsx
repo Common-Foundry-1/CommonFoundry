@@ -3,12 +3,13 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, expect, test, vi } from "vitest";
 import { AddressDetail } from "./AddressDetail";
 import { ExplorerRequestError, loadAddress } from "../api";
+import { encode } from "../lib/addressCodec";
 import { addressFixture, fixtureAddress, fixtureTip } from "../test/addressFixture";
 import type { ExplorerAddress } from "../types";
 
 vi.mock("../api", async (original) => ({ ...await original<typeof import("../api")>(), loadAddress: vi.fn() }));
 beforeEach(() => vi.mocked(loadAddress).mockReset());
-const props = () => ({ initial: addressFixture(), liveTip: fixtureTip, onBack: vi.fn(), onBlock: vi.fn(), onTransaction: vi.fn() });
+const props = () => ({ initial: addressFixture(), addressPrefix: "tcmfd", liveTip: fixtureTip, onBack: vi.fn(), onBlock: vi.fn(), onTransaction: vi.fn() });
 
 test("shows exact balances and explains change and pending-transfer scope", () => {
   render(<AddressDetail {...props()} />);
@@ -89,4 +90,30 @@ test("reward records link to their blocks, while transfers link to transactions"
   expect(initialProps.onTransaction).not.toHaveBeenCalled();
   await user.click(screen.getAllByRole("button", { name: /^Open transaction/ })[0]);
   expect(initialProps.onTransaction).toHaveBeenCalledWith(initialProps.initial.history[1].txid);
+});
+
+test("shows the checksummed form as a labeled second line with its own copy button", async () => {
+  render(<AddressDetail {...props()} addressPrefix="cmfd" />);
+  const user = userEvent.setup();
+  expect(screen.getByText("Checksummed address · detects typos")).toBeInTheDocument();
+  expect(screen.getByLabelText("Checksummed address")).toHaveTextContent(encode("cmfd", fixtureAddress));
+  await user.click(screen.getByRole("button", { name: "Copy checksummed address" }));
+  expect(await navigator.clipboard.readText()).toBe(encode("cmfd", fixtureAddress));
+  expect(screen.getByText("Checksummed address copied.")).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "Copy address" }));
+  expect(await navigator.clipboard.readText()).toBe(fixtureAddress);
+  expect(screen.getByText("Address copied.")).toBeInTheDocument();
+});
+
+test("marks activity above the validated height and notes it in the balances", () => {
+  const view = render(<AddressDetail {...props()} initial={{ ...addressFixture(), validated_height: 98 }} />);
+  expect(screen.getByText(/balances include blocks above #98 that this node is still checking/)).toBeInTheDocument();
+  const entries = screen.getAllByRole("article");
+  // Newest first: blocks 100 and 99 are above it, 98 is not.
+  expect(entries.slice(0, 3).map((entry) => entry.textContent?.includes("Verifying"))).toEqual([true, true, false]);
+  expect(entries[2]).toHaveTextContent("3 confirmations");
+  view.unmount();
+  render(<AddressDetail {...props()} initial={{ ...addressFixture(), validated_height: 100 }} />);
+  expect(screen.queryByText(/still checking/)).not.toBeInTheDocument();
+  expect(screen.queryByText("Verifying")).not.toBeInTheDocument();
 });

@@ -9,10 +9,11 @@ use cmfd_node::{
 use tauri::State;
 use zeroize::Zeroizing;
 
+use crate::address::read_address;
 use crate::mining::{MiningStartRequest, MiningStatus};
 use crate::runtime::{
-    PeerSettings, RuntimeHandle, RuntimeState, UpdatePeerSettingsRequest, WalletCustodyStatus,
-    startup_error,
+    ChainResyncReport, PeerSettings, RuntimeHandle, RuntimeState, UpdatePeerSettingsRequest,
+    WalletCustodyStatus, startup_error,
 };
 
 #[derive(serde::Deserialize)]
@@ -80,6 +81,19 @@ where
     .map_err(|error| error.client_error())
 }
 
+/// Re-encodes an address typed in either form as the hex the node's request
+/// parsers take, or explains why it cannot be read.
+fn address_as_hex(text: &str, code: &'static str, field: &str) -> Result<String, NodeClientError> {
+    read_address(text)
+        .map(hex::encode)
+        .map_err(|error| NodeClientError {
+            code,
+            status: 400,
+            retryable: false,
+            message: format!("invalid {field}: {error}"),
+        })
+}
+
 #[tauri::command]
 pub async fn get_node_status(
     state: State<'_, RuntimeState>,
@@ -100,6 +114,8 @@ pub async fn update_peer_settings(
     state: State<'_, RuntimeState>,
     request: UpdatePeerSettingsRequest,
 ) -> Result<PeerSettings, NodeClientError> {
+    // Held until the settings are written, so "Restart to update" waits.
+    let _operation = state.handle().begin_node_operation()?;
     let peers = state.peers()?;
     tauri::async_runtime::spawn_blocking(move || peers.update(request))
         .await
@@ -131,10 +147,20 @@ pub async fn get_mempool_snapshot(
 #[tauri::command]
 pub async fn send_wallet_transaction(
     state: State<'_, RuntimeState>,
-    request: WalletSendRequest,
+    mut request: WalletSendRequest,
 ) -> Result<WalletSendResponse, NodeClientError> {
+    let handle = state.handle();
+    // Held until the send is over, so "Restart to update" waits for it.
+    let _operation = handle.begin_node_operation()?;
+    request.recipient = address_as_hex(
+        &request.recipient,
+        "invalid_wallet_recipient",
+        "wallet recipient",
+    )?;
     let node = state.node()?;
-    with_node(node, move |node| node.send_from_dev_wallet_request(request)).await
+    let response = with_node(node, move |node| node.send_from_dev_wallet_request(request)).await?;
+    handle.record_send(&response.txid);
+    Ok(response)
 }
 
 #[tauri::command]
@@ -142,18 +168,28 @@ pub async fn consolidate_wallet(
     state: State<'_, RuntimeState>,
     request: WalletConsolidateRequest,
 ) -> Result<WalletConsolidateResponse, NodeClientError> {
+    let handle = state.handle();
+    // Held until the consolidation is over, so "Restart to update" waits.
+    let _operation = handle.begin_node_operation()?;
     let node = state.node()?;
-    with_node(node, move |node| {
+    let response = with_node(node, move |node| {
         node.consolidate_dev_wallet_request(request)
     })
-    .await
+    .await?;
+    handle.record_send(&response.txid);
+    Ok(response)
 }
 
 #[tauri::command]
 pub async fn mine_devnet_block(
     state: State<'_, RuntimeState>,
-    request: DevMineRequest,
+    mut request: DevMineRequest,
 ) -> Result<DevMineResult, NodeClientError> {
+    request.miner = address_as_hex(
+        &request.miner,
+        "invalid_miner_destination",
+        "miner destination",
+    )?;
     let node = state.node()?;
     with_node(node, move |node| node.mine_devnet_request(request)).await
 }
@@ -170,6 +206,9 @@ pub async fn start_mining(
     state: State<'_, RuntimeState>,
     request: MiningStartRequest,
 ) -> Result<MiningStatus, NodeClientError> {
+    // Held until mining started, so "Restart to update" checks for mining
+    // only once no start can still be under way.
+    let _operation = state.handle().begin_node_operation()?;
     state.mining()?.start(request)
 }
 
@@ -201,6 +240,13 @@ pub async fn unlock_wallet(
 ) -> Result<WalletCustodyStatus, NodeClientError> {
     let passphrase = request_passphrase(request.passphrase)?;
     with_runtime(state.handle(), move |runtime| runtime.unlock(&passphrase)).await
+}
+
+#[tauri::command]
+pub async fn resync_chain(
+    state: State<'_, RuntimeState>,
+) -> Result<ChainResyncReport, NodeClientError> {
+    with_runtime(state.handle(), |runtime| runtime.resync_chain()).await
 }
 
 #[tauri::command]
@@ -296,7 +342,52 @@ pub async fn restore_wallet(
 
 #[cfg(test)]
 mod tests {
-    use super::request_passphrase;
+    use cmfd_node::address::{MAINNET_HRP, TEST_NETWORK_HRP, encode, hrp_for_network};
+    use cmfd_node::{COMPILED_NETWORK_PROFILE, default_miner_destination};
+
+    use super::{address_as_hex, request_passphrase};
+
+    #[test]
+    fn typed_addresses_reach_the_node_as_hex() {
+        let key = default_miner_destination();
+        let own = hrp_for_network(COMPILED_NETWORK_PROFILE.short_name());
+        assert_eq!(
+            address_as_hex(
+                &encode(own, &key),
+                "invalid_wallet_recipient",
+                "wallet recipient"
+            ),
+            Ok(hex::encode(key))
+        );
+        assert_eq!(
+            address_as_hex(
+                &hex::encode(key),
+                "invalid_wallet_recipient",
+                "wallet recipient"
+            ),
+            Ok(hex::encode(key))
+        );
+        let other = if own == TEST_NETWORK_HRP {
+            MAINNET_HRP
+        } else {
+            TEST_NETWORK_HRP
+        };
+        let error = address_as_hex(
+            &encode(other, &key),
+            "invalid_wallet_recipient",
+            "wallet recipient",
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "invalid_wallet_recipient");
+        assert_eq!(error.status, 400);
+        assert!(
+            error
+                .message
+                .starts_with("invalid wallet recipient: address is for another network"),
+            "{}",
+            error.message
+        );
+    }
 
     #[test]
     fn wallet_passphrase_minimum_counts_characters() {

@@ -7,7 +7,7 @@ Starting it early prepares the model and waits for the authenticated launch.
 In your flight sheet, choose **Custom** and use the installation URL for
 `commonfoundry-mainnet-hiveos-1.0.15.tar.gz` from the official release.
 
-- **Wallet template:** `%WAL%` (your 64-character CMFD destination public key)
+- **Wallet template:** `%WAL%` (your CMFD receive address: a checksummed `cmfd1...` address or the 64-character destination public key)
 - **Pool URL:** the complete `cmfd+tls://IP:PORT?pin=...` URL supplied by the pool
 - **Hash algorithm:** `forgematrix_v4`
 - **Extra config:** optional JSON, for example `{"gpus":[0,2]}`

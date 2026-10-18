@@ -1,4 +1,7 @@
 export const ADDRESS_HASH = /^[0-9a-fA-F]{64}$/;
+// A checksummed (bech32m) address of any CMFD network: cmfd1... or tcmfd1....
+// Separate from ADDRESS_HASH, which also matches block and transaction hashes.
+export const CHECKSUMMED_ADDRESS = /^t?cmfd1/i;
 export const ADDRESS_PAGE_SIZE = 20;
 const CURSOR = /^([0-9a-fA-F]{64})\.([1-9][0-9]{0,19})\.(0|[1-9][0-9]{0,3})$/;
 

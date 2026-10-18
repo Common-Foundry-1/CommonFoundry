@@ -2,6 +2,7 @@ import { cleanup, render, screen, waitFor, within } from "@testing-library/react
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
+import { MAINNET_HRP, TEST_NETWORK_HRP, encode } from "./lib/addressCodec";
 import type { DashboardDocument } from "./types";
 
 const fixture: DashboardDocument = {
@@ -124,12 +125,15 @@ describe("pool dashboard", () => {
     held.pool.ledger.payout_protection = { requires_reconciliation: true, all_payouts_paused: global, affected_payouts: [recipient], unresolved_incidents: [], resolved_incidents: 0 };
     held.pool.ledger.payouts = [{ payout: recipient, accepted_shares: 1, rejected_shares: 0, stale_shares: 0, pool_blocks: 1, credited_devnet_atoms: 200_000_000, reserved_payout_atoms: 100_000_000, confirmed_payout_atoms: 0, available_payout_atoms: 0, payout_on_hold: true, held_payout_atoms: 100_000_000 }];
     held.pool.ledger.payout_transactions = [{ txid: "99".repeat(32), payout: recipient, amount_atoms: 100_000_000, fee_atoms: 1_000, state: "prepared", confirmations: 0 }];
-    vi.stubGlobal("fetch", vi.fn()
+    const fetchSnapshot = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify(held), { status: 200 }))
-      .mockImplementation(() => Promise.resolve(new Response(JSON.stringify(fixture), { status: 200 }))));
+      .mockImplementation(() => Promise.resolve(new Response(JSON.stringify(fixture), { status: 200 })));
+    vi.stubGlobal("fetch", fetchSnapshot);
     const user = userEvent.setup();
     render(<App />);
     expect(await screen.findByRole("alert", { name: "Payout protection" })).toHaveTextContent(global ? "Automatic payouts paused" : "Affected payouts on hold");
+    // The first snapshot's refresh interval does not fetch again at once.
+    expect(fetchSnapshot).toHaveBeenCalledTimes(1);
     expect(screen.queryByText("automatic settlement on")).not.toBeInTheDocument();
     expect(screen.getByRole("table", { name: "Held payout accounts" })).toHaveTextContent("Held unreserved credit");
     expect(screen.getByText("Prepared")).toBeVisible();
@@ -278,6 +282,43 @@ describe("pool dashboard", () => {
     expect(await screen.findByText("settlement paused")).toBeVisible();
     expect(screen.getByText(/clear payout tracking/)).toBeVisible();
     expect(screen.queryByText(/automatic Devnet payouts|automatic settlement on/)).not.toBeInTheDocument();
+  });
+
+  const payoutKey = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+
+  async function copyConfigWithPayout(payout: string, network = fixture.pool.network_short_name) {
+    const snapshot = structuredClone(fixture);
+    snapshot.pool.network_short_name = network;
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(() => Promise.resolve(new Response(JSON.stringify(snapshot), { status: 200 }))));
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByRole("heading", { name: "ForgeMatrix Pool" });
+    await user.type(screen.getByLabelText("Payout address"), payout);
+    await user.click(screen.getByRole("button", { name: "Copy connection details" }));
+    return navigator.clipboard.readText();
+  }
+
+  it.each([
+    ["RCNet-1", encode(TEST_NETWORK_HRP, payoutKey)],
+    ["RCNet-1", encode(TEST_NETWORK_HRP, payoutKey).toUpperCase()],
+    ["RCNet-1", payoutKey],
+    ["RCNet-1", payoutKey.toUpperCase()],
+    ["Mainnet", encode(MAINNET_HRP, payoutKey)],
+  ])("copies a %s payout address %s as its hex key", async (network, payout) => {
+    const config = await copyConfigWithPayout(payout, network);
+    expect(config).toContain(`Payout address: ${payoutKey}`);
+    expect(screen.getByLabelText("Payout address")).toHaveAttribute("aria-invalid", "false");
+    expect(screen.getByText(/Copied as the hex key 79be667ef9/)).toBeInTheDocument();
+  });
+
+  it.each([
+    ["Mainnet", encode(TEST_NETWORK_HRP, payoutKey), "Address is for another network: expected cmfd1..., found tcmfd1..."],
+    ["RCNet-1", encode(TEST_NETWORK_HRP, payoutKey).slice(0, -1) + "q", "Address checksum does not match: the address is mistyped or incomplete."],
+  ])("explains a bad %s payout address and leaves it out of the config", async (network, payout, message) => {
+    const config = await copyConfigWithPayout(payout, network);
+    expect(screen.getByText(message)).toHaveAttribute("id", "payout-address-status");
+    expect(screen.getByLabelText("Payout address")).toHaveAttribute("aria-invalid", "true");
+    expect(config).toContain("Payout address: PASTE_YOUR_64_CHARACTER_WALLET_ADDRESS");
   });
 
   it("offers a retry when the pool API is unavailable", async () => {

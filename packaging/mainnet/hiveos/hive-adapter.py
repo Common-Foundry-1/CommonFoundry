@@ -29,8 +29,9 @@ MAX_SAMPLE_AGE=45
 def validate_config(value,root):
     required={'wallet','pool','worker','gpus','model_dir','state_dir'}
     if not isinstance(value,dict) or set(value)!=required: raise ValueError('invalid miner config')
-    if not isinstance(value['wallet'],str) or not re.fullmatch(r'[0-9a-fA-F]{64}',value['wallet']):
-        raise ValueError('wallet template must contain the 64-character destination public key')
+    # cmfd-miner checks the address checksum and key; this only catches the wrong kind of value.
+    if not isinstance(value['wallet'],str) or not re.fullmatch(r'[0-9a-fA-F]{64}|(?:cmfd1|CMFD1)[0-9A-Za-z]{58}',value['wallet']):
+        raise ValueError('wallet template must contain your cmfd1... address or the 64-character destination public key')
     pool=urlsplit(value['pool'])
     query=parse_qsl(pool.query,keep_blank_values=True)
     if pool.scheme!='cmfd+tls' or pool.username or pool.password or pool.path or pool.fragment:

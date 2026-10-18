@@ -32,8 +32,11 @@ machine-readable `cmfd-node network-info` output.
   watch-only deposit registrations, reorg-aware deposit additions/removals,
   and explicit v0.5 custody workflow.
 - Amounts that can exceed JavaScript's exact integer range are canonical decimal
-  atom strings. Destinations are currently 64 lowercase hexadecimal characters
-  encoding 32-byte x-only secp256k1 keys; no checksummed address exists yet.
+  atom strings. Destinations are 32-byte x-only secp256k1 keys, returned as 64
+  lowercase hexadecimal characters. From 1.0.16 every destination parameter
+  also accepts the same key as a checksummed bech32m address (`cmfd1...`,
+  BIP-350), and `getexchangeinfo` reports `checksummed_address_available:
+  true`.
 - Deposit consumption is cursor-based and at-least-once. Exchanges must persist
   and idempotently apply both addition and removal events.
 - Withdrawal custody uses durable intent/prepared/release-authorized/released or
@@ -47,7 +50,7 @@ deterministic software crash matrix, Windows/Linux ACL qualification tooling, a
 reference coordinator, a conformance tool, and an audit-candidate bundle.
 
 Open production gates include scalable spending-key enrollment for per-customer
-deposit keys, a project-wide checksummed address, released-record rollover,
-vendor HSM/threshold-provider qualification, installed-host ACL evidence,
-representative live migration and physical power-loss rehearsal, independent
-external audit, and venue acceptance.
+deposit keys, released-record rollover, vendor HSM/threshold-provider
+qualification, installed-host ACL evidence, representative live migration and
+physical power-loss rehearsal, independent external audit, and venue
+acceptance. The checksummed address form is released in 1.0.16.

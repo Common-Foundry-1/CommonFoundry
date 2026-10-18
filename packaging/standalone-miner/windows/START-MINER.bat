@@ -11,7 +11,8 @@ set "BOOTSTRAP_PEER=107.214.187.2:18444"
 rem Use auto for NVIDIA, or opencl for Intel Arc.
 set "GPU_BACKEND=auto"
 set "GPU_INDEXES="
-rem PAYOUT_ADDRESS is your wallet's 64-character receive address.
+rem PAYOUT_ADDRESS is your wallet's receive address: 64 hex characters or a
+rem checksummed cmfd1... address.
 set "PAYOUT_ADDRESS="
 set "BATCH_SIZE=8192"
 rem 0 automatically divides host CPU threads across the selected GPUs (maximum 16 each).
@@ -34,7 +35,7 @@ if not exist "%~dp0cmfd-miner.exe" (
 )
 
 if not defined PAYOUT_ADDRESS (
-  echo ERROR: Set PAYOUT_ADDRESS to the 64-character receive address shown by your wallet.
+  echo ERROR: Set PAYOUT_ADDRESS to the receive address shown by your wallet.
   echo Right-click START-MINER.bat, choose Edit, and fill in PAYOUT_ADDRESS near the top.
   pause
   exit /b 1

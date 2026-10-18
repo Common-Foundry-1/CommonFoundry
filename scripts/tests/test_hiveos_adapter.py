@@ -57,6 +57,13 @@ class HiveAdapterTests(unittest.TestCase):
         self.assertTrue(self.args.config.with_suffix('.json.invalid').exists())
         with self.assertRaisesRegex(ValueError,'latest flight-sheet'):self.adapter.run(self.args)
 
+    def test_wallet_may_be_hex_or_a_mainnet_address(self):
+        address="cmfd10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vq4yhywr"
+        for wallet in ['11'*32,'AB'*32,address,address.upper()]:
+            with self.subTest(wallet=wallet):self.adapter.validate_config(dict(self.config,wallet=wallet),self.install)
+        for wallet in ['11'*31,'t'+address,address[:-1],'bc1'+address[5:]]:
+            with self.subTest(wallet=wallet),self.assertRaises(ValueError):self.adapter.validate_config(dict(self.config,wallet=wallet),self.install)
+
     def test_model_directory_inside_reinstalled_folder_is_rejected(self):
         self.config['model_dir']=str(self.install/'models')
         with self.assertRaisesRegex(ValueError,'outside'):self.adapter.validate_config(self.config,self.install)

@@ -12,7 +12,7 @@ ProductionV4 proof only for chain-winning work.
   assembled authenticated model bank coexist; about 8 GB after setup
 - Windows: WSL2 with Ubuntu 22.04 and NVIDIA CUDA support
 - the pool operator's complete `cmfd+tls://IP:PORT?pin=...` URL
-- a 64-character RCNet-1 wallet receive address
+- an RCNet-1 wallet receive address (64 hex characters or `tcmfd1...`)
 
 On Windows, double-click `START-MINER.bat`. On Linux, run `./start-miner.sh`.
 The first run downloads four authenticated model-bank parts, reconstructs the

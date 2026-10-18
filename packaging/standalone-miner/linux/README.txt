@@ -1,7 +1,8 @@
 COMMON FOUNDRY STANDALONE GPU MINER
 
 1. NVIDIA: leave GPU_BACKEND=auto. Intel Arc: set GPU_BACKEND=opencl.
-2. Open your wallet's Receive page and copy its 64-character address.
+2. Open your wallet's Receive page and copy its address (64 hex characters,
+   or a checksummed cmfd1... address).
 3. Edit start-miner.sh and paste that address into PAYOUT_ADDRESS.
 4. Run: chmod +x start-miner.sh && ./start-miner.sh
 5. Leave GPU_INDEXES empty to use every GPU exposed by that backend.

@@ -228,6 +228,7 @@ td code { color: var(--ink-500); font-size: 0.66rem; }
 .primary-button:hover { background: #b9430e; border-color: #b9430e; }
 .full-width { width: 100%; margin-top: 17px; }
 .connect-note { margin: 12px 0 0; color: var(--ink-500); font-size: 0.68rem; line-height: 1.5; }
+.connect-field-error { margin: 8px 0 0; color: var(--red-600); font-size: 0.68rem; line-height: 1.5; }
 
 .lower-section { margin-top: 22px; }
 footer { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 22px; padding: 27px 2px 0; color: var(--ink-500); font-size: 0.67rem; }

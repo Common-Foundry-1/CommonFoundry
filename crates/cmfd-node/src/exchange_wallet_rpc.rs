@@ -20,11 +20,12 @@ use serde_json::value::RawValue;
 use serde_json::{Map, Value, json};
 use zeroize::Zeroizing;
 
+use crate::address::{AddressCodec, AddressFormat, hrp_for_network};
 use crate::exchange_wallet::{
-    BroadcastError, ChainSource, KeyChain, Wallet, WalletError, WalletTx, format_amount,
-    parse_address, parse_h32, sync_with,
+    BroadcastError, ChainSource, KeyChain, Wallet, WalletError, WalletTx, format_amount, parse_h32,
+    sync_with,
 };
-use crate::exchange_wallet_upstream::{CallError, Endpoint, Upstream};
+use crate::exchange_wallet_upstream::{CallError, Endpoint, FollowedEndpoint, Upstream, Upstreams};
 
 pub const CONFIG_FILE: &str = "cmfd-wallet.conf";
 pub const DEFAULT_RPC_PORT: u16 = 39_120;
@@ -39,6 +40,9 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const RETRY_INTERVAL: Duration = Duration::from_secs(10);
 const REBROADCAST_INTERVAL: Duration = Duration::from_secs(120);
 const CONNECTED_WITHIN: Duration = Duration::from_secs(120);
+/// How long the wallet follows the second endpoint before it tries the
+/// primary again.
+const PRIMARY_RETRY_INTERVAL: Duration = Duration::from_secs(300);
 
 // Bitcoin Core RPC error codes.
 const RPC_MISC_ERROR: i64 = -1;
@@ -72,7 +76,13 @@ pub struct WalletConfig {
     upstream: String,
     upstream_user: String,
     upstream_password: Zeroizing<String>,
+    /// A second endpoint (`fallbackupstream`, with its own user and
+    /// password), used while the first fails.
+    fallback_upstream: Option<(String, String, Zeroizing<String>)>,
     consolidate_threshold: usize,
+    /// The one form every method prints addresses in (`addressformat`).
+    /// Both forms are always accepted.
+    address_format: AddressFormat,
 }
 
 impl WalletConfig {
@@ -109,7 +119,11 @@ impl WalletConfig {
                 | "upstream"
                 | "upstreamuser"
                 | "upstreampassword"
-                | "consolidatethreshold" => {
+                | "fallbackupstream"
+                | "fallbackupstreamuser"
+                | "fallbackupstreampassword"
+                | "consolidatethreshold"
+                | "addressformat" => {
                     if settings
                         .insert(key, Zeroizing::new(value.to_owned()))
                         .is_some()
@@ -131,6 +145,23 @@ impl WalletConfig {
         let upstream = required("upstream")?.to_string();
         let upstream_user = required("upstreamuser")?.to_string();
         let upstream_password = required("upstreampassword")?;
+        let fallback_upstream = match (
+            settings.remove("fallbackupstream"),
+            settings.remove("fallbackupstreamuser"),
+            settings.remove("fallbackupstreampassword"),
+        ) {
+            (None, None, None) => None,
+            (Some(url), Some(user), Some(password))
+                if !url.is_empty() && !user.is_empty() && !password.is_empty() =>
+            {
+                Some((url.to_string(), user.to_string(), password))
+            }
+            _ => {
+                return Err(
+                    "fallbackupstream, fallbackupstreamuser and fallbackupstreampassword are set together or not at all".to_owned(),
+                );
+            }
+        };
         if rpc_user.contains(':') {
             return Err("rpcuser cannot contain `:`".to_owned());
         }
@@ -157,6 +188,17 @@ impl WalletConfig {
                 .map_err(|_| format!("consolidatethreshold `{}` is invalid", value.as_str()))?,
             None => DEFAULT_CONSOLIDATE_THRESHOLD,
         };
+        // Hex stays the default so integrations built before checksummed
+        // addresses see the same strings after an upgrade.
+        let address_format = match settings.remove("addressformat") {
+            Some(value) => AddressFormat::from_name(&value).ok_or_else(|| {
+                format!(
+                    "addressformat `{}` is invalid; use hex or bech32m",
+                    value.as_str()
+                )
+            })?,
+            None => AddressFormat::Hex,
+        };
         if !rpc_bind.is_loopback() && rpc_allow.is_empty() {
             return Err(
                 "rpcbind is not a loopback address; add rpcallowip=<address or network> for each host that may connect".to_owned(),
@@ -171,8 +213,27 @@ impl WalletConfig {
             upstream,
             upstream_user,
             upstream_password,
+            fallback_upstream,
             consolidate_threshold,
+            address_format,
         })
+    }
+
+    /// The configured endpoints, the primary first.
+    fn endpoints(&self, network_id: [u8; 32]) -> Result<Vec<Endpoint>, String> {
+        let mut endpoints = vec![Endpoint::new(
+            &self.upstream,
+            &self.upstream_user,
+            &self.upstream_password,
+            network_id,
+        )?];
+        if let Some((url, user, password)) = &self.fallback_upstream {
+            endpoints.push(
+                Endpoint::new(url, user, password, network_id)
+                    .map_err(|error| format!("fallbackupstream: {error}"))?,
+            );
+        }
+        Ok(endpoints)
     }
 
     fn allows(&self, address: IpAddr) -> bool {
@@ -624,9 +685,11 @@ setlabel \"address\" \"label\", settxfee amount, validateaddress \"address\",
 walletlock, walletpassphrase \"passphrase\" timeout,
 walletpassphrasechange \"oldpassphrase\" \"newpassphrase\"
 
-Addresses are 64 lowercase hexadecimal characters. Amounts are CMFD with eight
-decimals. Every transaction pays the network's minimum fee; fee settings are
-accepted and ignored. Outputs spend once confirmed (1 block).";
+Addresses are accepted as checksummed bech32m (cmfd1... on mainnet) or as 64
+lowercase hexadecimal characters, and printed in the addressformat setting's
+form (hex unless set). Amounts are CMFD with eight decimals. Every transaction
+pays the network's minimum fee; fee settings are accepted and ignored. Outputs
+spend once confirmed (1 block).";
 
 // ---------------------------------------------------------------------------
 // Daemon state.
@@ -644,13 +707,19 @@ struct SyncStatus {
 
 struct Context {
     wallet: Mutex<Wallet>,
-    source: Mutex<Upstream>,
-    endpoint: Endpoint,
+    source: Mutex<Upstreams>,
+    /// The endpoint chain synchronization follows, or why none is (it does
+    /// not meet the work rule), as its last `tip` decided. RPC chain reads go
+    /// only to that endpoint, and while it is refused the wallet reports
+    /// initial block download.
+    followed: Arc<Mutex<FollowedEndpoint>>,
+    endpoints: Vec<Endpoint>,
     status: Mutex<SyncStatus>,
     stop: AtomicBool,
     started: Instant,
     config: WalletConfig,
     chain: String,
+    addresses: AddressCodec,
     pay_tx_fee: Mutex<u64>,
 }
 
@@ -666,11 +735,11 @@ impl Context {
     }
 
     fn connections(&self) -> u32 {
-        u32::from(
-            self.endpoint
+        u32::from(self.endpoints.iter().any(|endpoint| {
+            endpoint
                 .last_success()
-                .is_some_and(|at| at.elapsed() < CONNECTED_WITHIN),
-        )
+                .is_some_and(|at| at.elapsed() < CONNECTED_WITHIN)
+        }))
     }
 
     fn minimum_fee(&self) -> u64 {
@@ -686,13 +755,13 @@ pub fn run(
     network_name: &str,
 ) -> Result<(), String> {
     let config = WalletConfig::read(config_path)?;
-    let endpoint = Endpoint::new(
-        &config.upstream,
-        &config.upstream_user,
-        &config.upstream_password,
-        network_id,
-    )?;
-    let mut sync_source = Upstream::new(endpoint.clone());
+    let endpoints = config.endpoints(network_id)?;
+    // Each upstream reads the compiled work checkpoint: refuse to start if
+    // it is inconsistent, rather than panic when the first one is built.
+    cmfd_consensus::forgematrix_v4_work_rule_checked(network_id)
+        .map_err(|error| format!("the compiled work checkpoint is inconsistent: {error}"))?;
+    let upstreams = || Upstreams::new(endpoints.iter().cloned().map(Upstream::new).collect());
+    let mut sync_source = upstreams();
     let wallet = if Wallet::exists(wallet_dir) {
         let wallet = Wallet::open(wallet_dir, network_id).map_err(|error| error.to_string())?;
         tracing::info!(
@@ -727,15 +796,21 @@ pub fn run(
     } else {
         network_name.to_ascii_lowercase()
     };
+    let addresses = AddressCodec {
+        hrp: hrp_for_network(network_name),
+        output: config.address_format,
+    };
     let context = Arc::new(Context {
         wallet: Mutex::new(wallet),
-        source: Mutex::new(Upstream::new(endpoint.clone())),
-        endpoint,
+        source: Mutex::new(upstreams()),
+        followed: sync_source.followed(),
+        endpoints: endpoints.clone(),
         status: Mutex::new(SyncStatus::default()),
         stop: AtomicBool::new(false),
         started: Instant::now(),
         config,
         chain,
+        addresses,
         pay_tx_fee: Mutex::new(0),
     });
     {
@@ -747,6 +822,12 @@ pub fn run(
         bind = %context.config.rpc_bind,
         port = context.config.rpc_port,
         upstream = %context.config.upstream,
+        fallback_upstream = context
+            .config
+            .fallback_upstream
+            .as_ref()
+            .map_or("", |(url, _, _)| url.as_str()),
+        address_format = context.addresses.output.name(),
         "exchange wallet RPC is listening"
     );
     let server = {
@@ -784,11 +865,25 @@ fn sleep_unless_stopped(context: &Context, duration: Duration) {
     }
 }
 
-fn sync_loop(context: &Context, mut source: Upstream) {
+fn sync_loop(context: &Context, mut source: Upstreams) {
     let mut expected_next = None;
     let mut rebroadcast_at = HashMap::new();
     let mut last_logged: Option<Instant> = None;
+    let mut primary_retry_at: Option<Instant> = None;
     while !context.stopping() {
+        // Now and then go back to the primary endpoint, once it passes the
+        // checks and has reached the wallet's tip.
+        if source.on_fallback() {
+            let at =
+                *primary_retry_at.get_or_insert_with(|| Instant::now() + PRIMARY_RETRY_INTERVAL);
+            if Instant::now() >= at {
+                let wallet_height = lock(&context.wallet).tip().0;
+                source.retry_primary(wallet_height);
+                primary_retry_at = None;
+            }
+        } else {
+            primary_retry_at = None;
+        }
         let outcome = sync_round(context, &mut source, &mut expected_next);
         let caught_up = matches!(outcome, Ok(true));
         let pause = match outcome {
@@ -1241,7 +1336,15 @@ fn call(context: &Context, method: &str, raw: Option<&RawValue>) -> Result<Value
             if let Some(hash) = wallet().hash_at(height) {
                 return Ok(json!(hex::encode(hash)));
             }
-            match lock(&context.source).block_hash(height) {
+            // Above its tip the wallet answers like a node at that height;
+            // below its own records it asks the endpoint it follows.
+            if height > wallet().tip().0 {
+                return Err(RpcError::new(
+                    RPC_INVALID_PARAMETER,
+                    "Block height out of range",
+                ));
+            }
+            match followed_source(context)?.block_hash(height) {
                 Ok(Some(hash)) => Ok(json!(hex::encode(hash))),
                 Ok(None) => Err(RpcError::new(
                     RPC_INVALID_PARAMETER,
@@ -1370,40 +1473,44 @@ fn call(context: &Context, method: &str, raw: Option<&RawValue>) -> Result<Value
         "getnewaddress" => {
             let label = params.string(0, "label")?.unwrap_or_default();
             check_label(&label)?;
-            Ok(json!(hex::encode(
-                wallet().new_address(KeyChain::Receive, &label)?
-            )))
+            let address = wallet().new_address(KeyChain::Receive, &label)?;
+            Ok(json!(context.addresses.render(&address)))
         }
-        "getrawchangeaddress" => Ok(json!(hex::encode(
-            wallet().new_address(KeyChain::Change, "")?
-        ))),
+        "getrawchangeaddress" => {
+            let address = wallet().new_address(KeyChain::Change, "")?;
+            Ok(json!(context.addresses.render(&address)))
+        }
         "keypoolrefill" => Ok(Value::Null),
         "validateaddress" => {
             let text = params.required_string(0, "address")?;
-            Ok(match parse_address(&text) {
-                Some(address) => json!({
+            Ok(match context.addresses.decode(&text) {
+                // `address` is canonical (the configured form, lowercase);
+                // `format` is the form the caller passed, so a venue can
+                // tell a checksummed address from unprotected hex.
+                Ok((address, format)) => json!({
                     "isvalid": true,
-                    "address": text,
+                    "address": context.addresses.render(&address),
                     "isscript": false,
                     "iswitness": false,
                     "ismine": wallet().owner(address).is_some(),
                     "iswatchonly": false,
+                    "pubkey": hex::encode(address),
+                    "format": format.name(),
                 }),
-                None => json!({
+                Err(error) => json!({
                     "isvalid": false,
-                    "error": "Invalid address: expected 64 lowercase hexadecimal characters encoding an x-only public key",
+                    "error": format!("Invalid address: {error}"),
                 }),
             })
         }
         "getaddressinfo" => {
             let text = params.required_string(0, "address")?;
-            let address = parse_address(&text)
-                .ok_or_else(|| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address"))?;
+            let address = read_address(context.addresses, &text)?;
             let wallet = wallet();
             let owner = wallet.owner(address);
             let mut info = json!({
-                "address": text,
-                "pubkey": text,
+                "address": context.addresses.render(&address),
+                "pubkey": hex::encode(address),
                 "ismine": owner.is_some(),
                 "solvable": owner.is_some(),
                 "iswatchonly": false,
@@ -1425,7 +1532,7 @@ fn call(context: &Context, method: &str, raw: Option<&RawValue>) -> Result<Value
             Ok(info)
         }
         "setlabel" => {
-            let address = address_param(&params, 0)?;
+            let address = address_param(context, &params, 0)?;
             let label = params.required_string(1, "label")?;
             check_label(&label)?;
             wallet()
@@ -1445,7 +1552,12 @@ fn call(context: &Context, method: &str, raw: Option<&RawValue>) -> Result<Value
                 .receive_addresses()
                 .into_iter()
                 .filter(|(_, address_label)| *address_label == label)
-                .map(|(address, _)| (hex::encode(address), json!({ "purpose": "receive" })))
+                .map(|(address, _)| {
+                    (
+                        context.addresses.render(&address),
+                        json!({ "purpose": "receive" }),
+                    )
+                })
                 .collect::<Map<_, _>>();
             if addresses.is_empty() {
                 return Err(RpcError::new(
@@ -1469,7 +1581,7 @@ fn call(context: &Context, method: &str, raw: Option<&RawValue>) -> Result<Value
         "listsinceblock" => list_since_block(context, &params),
         "gettransaction" => get_transaction(context, &params),
         "getreceivedbyaddress" => {
-            let address = address_param(&params, 0)?;
+            let address = address_param(context, &params, 0)?;
             let minimum = params.count(1, "minconf", 1)?;
             let wallet = wallet();
             if !matches!(wallet.owner(address), Some((KeyChain::Receive, _))) {
@@ -1487,9 +1599,15 @@ fn call(context: &Context, method: &str, raw: Option<&RawValue>) -> Result<Value
             let minimum = params.count(0, "minconf", 1)?;
             let include_empty = params.boolean(1, "include_empty")?.unwrap_or(false);
             let filter = match params.string(3, "address_filter")? {
-                Some(text) => Some(parse_address(&text).ok_or_else(|| {
-                    RpcError::new(RPC_WALLET_ERROR, "address_filter parameter was invalid")
-                })?),
+                Some(text) => Some(
+                    context
+                        .addresses
+                        .decode(&text)
+                        .map(|(address, _)| address)
+                        .map_err(|_| {
+                            RpcError::new(RPC_WALLET_ERROR, "address_filter parameter was invalid")
+                        })?,
+                ),
                 None => None,
             };
             let wallet = wallet();
@@ -1503,7 +1621,7 @@ fn call(context: &Context, method: &str, raw: Option<&RawValue>) -> Result<Value
                         received.remove(&address).unwrap_or((0, 0, Vec::new()));
                     (total > 0 || include_empty).then(|| {
                         json!({
-                            "address": hex::encode(address),
+                            "address": context.addresses.render(&address),
                             "amount": amount(total),
                             "confirmations": confirmations,
                             "label": label,
@@ -1515,7 +1633,7 @@ fn call(context: &Context, method: &str, raw: Option<&RawValue>) -> Result<Value
             Ok(json!(rows))
         }
         "sendtoaddress" => {
-            let address = address_param(&params, 0)?;
+            let address = address_param(context, &params, 0)?;
             let value = params.amount(1)?.ok_or_else(|| missing("amount"))?;
             if value == 0 {
                 return Err(RpcError::new(RPC_TYPE_ERROR, "Invalid amount for send"));
@@ -1556,12 +1674,14 @@ fn call(context: &Context, method: &str, raw: Option<&RawValue>) -> Result<Value
             }
             let mut payments = Vec::with_capacity(amounts.len());
             for (text, raw) in &amounts {
-                let address = parse_address(text).ok_or_else(|| {
-                    RpcError::new(
-                        RPC_INVALID_ADDRESS_OR_KEY,
-                        format!("Invalid Common Foundry address: {text}"),
-                    )
-                })?;
+                let address = read_address(context.addresses, text)?;
+                // Hex and bech32m spellings of one key are different JSON keys.
+                if payments.iter().any(|(paid, _)| *paid == address) {
+                    return Err(RpcError::new(
+                        RPC_INVALID_PARAMETER,
+                        format!("Invalid parameter, duplicated address: {text}"),
+                    ));
+                }
                 let value = parse_amount(raw.get())?;
                 if value == 0 {
                     return Err(RpcError::new(RPC_TYPE_ERROR, "Invalid amount for send"));
@@ -1575,7 +1695,11 @@ fn call(context: &Context, method: &str, raw: Option<&RawValue>) -> Result<Value
                 .unwrap_or_default()
                 .into_iter()
                 .map(|text| {
-                    amounts.keys().position(|key| *key == text).ok_or_else(|| {
+                    let address = context.addresses.decode(&text).ok().map(|(key, _)| key);
+                    payments
+                        .iter()
+                        .position(|(paid, _)| Some(*paid) == address)
+                        .ok_or_else(|| {
                         RpcError::new(
                             RPC_INVALID_PARAMETER,
                             format!("Invalid parameter for 'subtract fee from output', address not among the recipients: {text}"),
@@ -1591,6 +1715,9 @@ fn call(context: &Context, method: &str, raw: Option<&RawValue>) -> Result<Value
         }
         "abandontransaction" => {
             let txid = params.hash(0, "txid")?;
+            // The followed endpoint's mempool decides; a refused one's does
+            // not.
+            drop(followed_source(context)?);
             {
                 let wallet = wallet();
                 let tx = wallet.tx(txid).ok_or_else(|| {
@@ -1606,7 +1733,7 @@ fn call(context: &Context, method: &str, raw: Option<&RawValue>) -> Result<Value
                     ));
                 }
             }
-            let in_mempool = lock(&context.source)
+            let in_mempool = followed_source(context)?
                 .mempool_contains(txid)
                 .map_err(|error| RpcError::new(RPC_CLIENT_NOT_CONNECTED, error.to_string()))?;
             if in_mempool {
@@ -1697,10 +1824,23 @@ fn comment_param(params: &Params, index: usize, name: &str) -> Result<Option<Str
     Ok(comment)
 }
 
-fn address_param(params: &Params, index: usize) -> Result<[u8; 32], RpcError> {
+fn address_param(context: &Context, params: &Params, index: usize) -> Result<[u8; 32], RpcError> {
     let text = params.required_string(index, "address")?;
-    parse_address(&text)
-        .ok_or_else(|| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid Common Foundry address"))
+    read_address(context.addresses, &text)
+}
+
+/// Reads an address in either form (bech32m or hex), or fails with -5
+/// saying what is wrong with it.
+fn read_address(addresses: AddressCodec, text: &str) -> Result<[u8; 32], RpcError> {
+    addresses
+        .decode(text)
+        .map(|(address, _)| address)
+        .map_err(|error| {
+            RpcError::new(
+                RPC_INVALID_ADDRESS_OR_KEY,
+                format!("Invalid Common Foundry address: {text} ({error})"),
+            )
+        })
 }
 
 fn sent(txid: [u8; 32], verbose: bool) -> Value {
@@ -1749,14 +1889,38 @@ fn send(
     }
 }
 
+/// The RPC connections, set to read from the endpoint chain synchronization
+/// follows. Fails while no endpoint is followed (none has passed the checks
+/// yet, or the active one does not meet the work rule), so chain reads are
+/// never answered by an endpoint that has not passed the checks.
+fn followed_source(context: &Context) -> Result<MutexGuard<'_, Upstreams>, RpcError> {
+    let followed = lock(&context.followed).clone();
+    if let Some(reason) = followed.refusal {
+        return Err(RpcError::new(
+            RPC_CLIENT_NOT_CONNECTED,
+            format!("the chain endpoint is not followed: {reason}"),
+        ));
+    }
+    let Some(index) = followed.index else {
+        return Err(RpcError::new(
+            RPC_CLIENT_NOT_CONNECTED,
+            "the chain endpoint has not passed the work-rule checks yet",
+        ));
+    };
+    let mut source = lock(&context.source);
+    source.use_endpoint(index);
+    Ok(source)
+}
+
+/// A chain read from the endpoint the wallet follows.
 fn forward(
     context: &Context,
     method: &str,
     params: Value,
     not_found: &str,
 ) -> Result<Value, RpcError> {
-    lock(&context.source)
-        .call(method, params)
+    followed_source(context)?
+        .read(method, params)
         .map_err(|error| match error {
             CallError::Rpc { code: -32001, .. } => {
                 RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, not_found)
@@ -1803,6 +1967,9 @@ fn blockchain_info(context: &Context) -> Value {
     let status = lock(&context.status);
     let headers = status.headers.max(height);
     let (progress, initial_download) = sync_view(height, headers, status.synced);
+    // While the endpoint is refused, the wallet does not follow the chain
+    // and says so, as during initial download.
+    let initial_download = initial_download || lock(&context.followed).refusal.is_some();
     json!({
         "chain": context.chain,
         "blocks": height,
@@ -1956,6 +2123,7 @@ fn add_common(wallet: &Wallet, tx: &WalletTx, entry: &mut Map<String, Value>) {
 /// Bitcoin Core's `send` / `receive` / `generate` entries for one transaction.
 fn tx_entries(
     wallet: &Wallet,
+    addresses: AddressCodec,
     tx: &WalletTx,
     common: bool,
     include_change: bool,
@@ -1969,7 +2137,7 @@ fn tx_entries(
             let mut entry = Map::new();
             entry.insert(
                 "address".to_owned(),
-                json!(payment.address.map(|address| address.to_string())),
+                json!(payment.address.map(|address| addresses.render(&address.0))),
             );
             entry.insert("category".to_owned(), json!("send"));
             entry.insert(
@@ -2002,7 +2170,10 @@ fn tx_entries(
             "generate"
         };
         let mut entry = Map::new();
-        entry.insert("address".to_owned(), json!(credit.address.to_string()));
+        entry.insert(
+            "address".to_owned(),
+            json!(addresses.render(&credit.address.0)),
+        );
         entry.insert("category".to_owned(), json!(category));
         entry.insert("amount".to_owned(), amount(credit.value));
         if credit.chain == KeyChain::Receive {
@@ -2029,12 +2200,7 @@ fn list_unspent(context: &Context, params: &Params) -> Result<Value, RpcError> {
         Some(texts) => {
             let mut wanted = BTreeSet::new();
             for text in texts {
-                let address = parse_address(&text).ok_or_else(|| {
-                    RpcError::new(
-                        RPC_INVALID_ADDRESS_OR_KEY,
-                        format!("Invalid Common Foundry address: {text}"),
-                    )
-                })?;
+                let address = read_address(context.addresses, &text)?;
                 if !wanted.insert(address) {
                     return Err(RpcError::new(
                         RPC_INVALID_PARAMETER,
@@ -2063,7 +2229,7 @@ fn list_unspent(context: &Context, params: &Params) -> Result<Value, RpcError> {
             let mut row = json!({
                 "txid": coin.txid.to_string(),
                 "vout": coin.vout,
-                "address": coin.address.to_string(),
+                "address": context.addresses.render(&coin.address.0),
                 "amount": amount(coin.value),
                 "confirmations": wallet.confirmations_at(coin.height),
                 "spendable": true,
@@ -2088,7 +2254,7 @@ fn list_transactions(context: &Context, params: &Params) -> Result<Value, RpcErr
     let entries = wallet
         .transactions()
         .into_iter()
-        .flat_map(|tx| tx_entries(&wallet, tx, true, false, label))
+        .flat_map(|tx| tx_entries(&wallet, context.addresses, tx, true, false, label))
         .collect::<Vec<_>>();
     let end = entries.len().saturating_sub(skip);
     let start = end.saturating_sub(count);
@@ -2163,7 +2329,16 @@ fn list_since_block(context: &Context, params: &Params) -> Result<Value, RpcErro
             (Some(block), Some(since)) => block.height > since,
             _ => true,
         })
-        .flat_map(|tx| tx_entries(&wallet, tx, true, include_change, label.as_deref()))
+        .flat_map(|tx| {
+            tx_entries(
+                &wallet,
+                context.addresses,
+                tx,
+                true,
+                include_change,
+                label.as_deref(),
+            )
+        })
         .collect::<Vec<_>>();
     let (tip, _) = wallet.tip();
     let last_height = tip
@@ -2179,7 +2354,16 @@ fn list_since_block(context: &Context, params: &Params) -> Result<Value, RpcErro
         let removed = removed_txids
             .iter()
             .filter_map(|txid| wallet.tx(*txid))
-            .flat_map(|tx| tx_entries(&wallet, tx, true, include_change, label.as_deref()))
+            .flat_map(|tx| {
+                tx_entries(
+                    &wallet,
+                    context.addresses,
+                    tx,
+                    true,
+                    include_change,
+                    label.as_deref(),
+                )
+            })
             .collect::<Vec<_>>();
         result["removed"] = json!(removed);
     }
@@ -2213,7 +2397,14 @@ fn get_transaction(context: &Context, params: &Params) -> Result<Value, RpcError
     add_common(&wallet, tx, &mut document);
     document.insert(
         "details".to_owned(),
-        json!(tx_entries(&wallet, tx, false, false, None)),
+        json!(tx_entries(
+            &wallet,
+            context.addresses,
+            tx,
+            false,
+            false,
+            None
+        )),
     );
     document.insert("hex".to_owned(), json!(tx.hex.clone().unwrap_or_default()));
     if tx.ours || tx.from_me() {
@@ -2352,5 +2543,254 @@ mod tests {
         assert!(open.allows("10.1.2.3".parse().unwrap()));
         assert!(!open.allows("11.1.2.3".parse().unwrap()));
         assert!(WalletConfig::parse(&format!("{base}bogus=1\n")).is_err());
+    }
+
+    const CONFIG_BASE: &str = "rpcuser=exchange\nrpcpassword=0123456789abcdef\nupstream=http://127.0.0.1:9/\nupstreamuser=x\nupstreampassword=y\n";
+
+    #[test]
+    fn address_format_defaults_to_hex_and_is_validated() {
+        let config = WalletConfig::parse(CONFIG_BASE).unwrap();
+        assert_eq!(config.address_format, AddressFormat::Hex);
+        let config = WalletConfig::parse(&format!("{CONFIG_BASE}addressformat=bech32m\n")).unwrap();
+        assert_eq!(config.address_format, AddressFormat::Bech32m);
+        assert!(WalletConfig::parse(&format!("{CONFIG_BASE}addressformat=bech32\n")).is_err());
+        assert!(
+            WalletConfig::parse(&format!(
+                "{CONFIG_BASE}addressformat=hex\naddressformat=bech32m\n"
+            ))
+            .is_err()
+        );
+    }
+
+    /// A daemon over a fresh mainnet wallet whose upstream is never called.
+    fn offline_context(dir: &Path, settings: &str) -> Context {
+        let config = WalletConfig::parse(&format!("{CONFIG_BASE}{settings}")).unwrap();
+        let network_id = [7; 32];
+        let endpoint = Endpoint::new(&config.upstream, "x", "y", network_id).unwrap();
+        let tip = crate::exchange_wallet::ChainTip {
+            height: 0,
+            hash: [0; 32],
+        };
+        let wallet = Wallet::create(dir, network_id, &tip).unwrap();
+        Context {
+            wallet: Mutex::new(wallet),
+            source: Mutex::new(Upstreams::new(vec![Upstream::new(endpoint.clone())])),
+            followed: Arc::default(),
+            endpoints: vec![endpoint],
+            status: Mutex::new(SyncStatus::default()),
+            stop: AtomicBool::new(false),
+            started: Instant::now(),
+            addresses: AddressCodec {
+                hrp: hrp_for_network("Mainnet"),
+                output: config.address_format,
+            },
+            config,
+            chain: "main".to_owned(),
+            pay_tx_fee: Mutex::new(0),
+        }
+    }
+
+    #[test]
+    fn addresses_print_in_the_configured_form_and_parse_in_both() {
+        use crate::address::{MAINNET_HRP, TEST_NETWORK_HRP, encode};
+
+        for (setting, format) in [
+            ("", AddressFormat::Hex),
+            ("addressformat=bech32m\n", AddressFormat::Bech32m),
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "cmfd-wallet-rpc-addresses-{}-{}",
+                std::process::id(),
+                format.name()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let context = offline_context(&dir, setting);
+            let rpc = |method: &str, params: Value| {
+                let raw = RawValue::from_string(params.to_string()).unwrap();
+                call(&context, method, Some(&raw))
+            };
+
+            let printed = rpc("getnewaddress", json!(["deposit"])).unwrap();
+            let printed = printed.as_str().unwrap().to_owned();
+            let (key, printed_format) = context.addresses.decode(&printed).unwrap();
+            assert_eq!(printed_format, format);
+            let change = rpc("getrawchangeaddress", json!([])).unwrap();
+            assert_eq!(
+                context
+                    .addresses
+                    .decode(change.as_str().unwrap())
+                    .unwrap()
+                    .1,
+                format
+            );
+            let hex_form = hex::encode(key);
+            let bech32m = encode(MAINNET_HRP, &key);
+
+            // Every spelling of the key validates to the one printed form.
+            for (input, input_format) in [
+                (hex_form.clone(), "hex"),
+                (bech32m.clone(), "bech32m"),
+                (bech32m.to_ascii_uppercase(), "bech32m"),
+            ] {
+                let info = rpc("validateaddress", json!([input])).unwrap();
+                assert_eq!(info["isvalid"], true, "{input}");
+                assert_eq!(info["address"], printed.as_str());
+                assert_eq!(info["pubkey"], hex_form.as_str());
+                assert_eq!(info["format"], input_format);
+                assert_eq!(info["ismine"], true);
+                let details = rpc("getaddressinfo", json!([input])).unwrap();
+                assert_eq!(details["address"], printed.as_str());
+                assert_eq!(details["pubkey"], hex_form.as_str());
+                assert_eq!(details["label"], "deposit");
+            }
+            let by_label = rpc("getaddressesbylabel", json!(["deposit"])).unwrap();
+            assert!(by_label.get(&printed).is_some());
+            let received = rpc("listreceivedbyaddress", json!([0, true, false, bech32m])).unwrap();
+            assert_eq!(received[0]["address"], printed.as_str());
+
+            // A one-character typo is caught, and says so.
+            let mut typo = bech32m.clone().into_bytes();
+            typo[20] = if typo[20] == b'q' { b'p' } else { b'q' };
+            let typo = String::from_utf8(typo).unwrap();
+            let info = rpc("validateaddress", json!([typo])).unwrap();
+            assert_eq!(info["isvalid"], false);
+            assert!(info["error"].as_str().unwrap().contains("checksum"));
+            let error = rpc("sendtoaddress", json!([typo, 1])).unwrap_err();
+            assert_eq!(error.code, RPC_INVALID_ADDRESS_OR_KEY);
+            assert!(error.message.contains("checksum"));
+            let info = rpc("validateaddress", json!([encode(TEST_NETWORK_HRP, &key)])).unwrap();
+            assert_eq!(info["isvalid"], false);
+            assert!(info["error"].as_str().unwrap().contains("another network"));
+
+            // One key spelled two ways is one recipient, not two.
+            let mut amounts = Map::new();
+            amounts.insert(hex_form.clone(), json!(1));
+            amounts.insert(bech32m.clone(), json!(2));
+            let error = rpc("sendmany", json!(["", amounts])).unwrap_err();
+            assert_eq!(error.code, RPC_INVALID_PARAMETER);
+            assert!(error.message.contains("duplicated address"));
+            let error = rpc(
+                "listunspent",
+                json!([1, 9_999_999, [hex_form, bech32m.to_ascii_uppercase()]]),
+            )
+            .unwrap_err();
+            assert!(error.message.contains("duplicated address"));
+
+            drop(context);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn a_fallback_upstream_is_configured_completely_or_not_at_all() {
+        let config = WalletConfig::parse(CONFIG_BASE).unwrap();
+        assert!(config.fallback_upstream.is_none());
+        assert_eq!(config.endpoints([7; 32]).unwrap().len(), 1);
+        let fallback = "fallbackupstream=http://127.0.0.1:10/
+fallbackupstreamuser=u
+fallbackupstreampassword=p
+";
+        let config = WalletConfig::parse(&format!("{CONFIG_BASE}{fallback}")).unwrap();
+        let endpoints = config.endpoints([7; 32]).unwrap();
+        assert_eq!(endpoints.len(), 2);
+        for partial in [
+            "fallbackupstream=http://127.0.0.1:10/
+",
+            "fallbackupstream=http://127.0.0.1:10/
+fallbackupstreamuser=u
+",
+            "fallbackupstreamuser=u
+fallbackupstreampassword=p
+",
+            "fallbackupstream=
+fallbackupstreamuser=u
+fallbackupstreampassword=p
+",
+        ] {
+            assert!(
+                WalletConfig::parse(&format!("{CONFIG_BASE}{partial}")).is_err(),
+                "{partial}"
+            );
+        }
+        // The second endpoint meets the same transport rules as the first.
+        let remote = fallback.replace("http://127.0.0.1:10/", "http://example.com/");
+        let error = WalletConfig::parse(&format!("{CONFIG_BASE}{remote}"))
+            .unwrap()
+            .endpoints([7; 32])
+            .err()
+            .expect("plain http to another host is refused");
+        assert!(error.starts_with("fallbackupstream: "), "{error}");
+    }
+
+    #[test]
+    fn a_refused_upstream_reads_as_initial_download() {
+        let dir =
+            std::env::temp_dir().join(format!("cmfd-wallet-rpc-refused-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let context = offline_context(&dir, "");
+        {
+            let mut status = lock(&context.status);
+            status.synced = true;
+        }
+        assert_eq!(blockchain_info(&context)["initialblockdownload"], false);
+        // Before chain synchronization accepts an endpoint, chain reads wait.
+        let error = call(
+            &context,
+            "getrawmempool",
+            Some(&RawValue::from_string("[]".to_owned()).unwrap()),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, RPC_CLIENT_NOT_CONNECTED);
+        assert!(error.message.contains("not passed"), "{}", error.message);
+        {
+            let reason = "the upstream node has halted block admission".to_owned();
+            lock(&context.followed).refusal = Some(reason.clone());
+            lock(&context.status).last_error = Some(reason);
+        }
+        let info = blockchain_info(&context);
+        assert_eq!(info["initialblockdownload"], true);
+        assert_eq!(
+            info["warnings"],
+            "the upstream node has halted block admission"
+        );
+
+        // Chain reads are not passed to a refused endpoint, and heights above
+        // the wallet's tip are out of range like on a node at that height.
+        let request = |method: &str, params: &str| {
+            let raw = RawValue::from_string(params.to_owned()).unwrap();
+            call(&context, method, Some(&raw)).unwrap_err()
+        };
+        let block = format!("[\"{}\", 1]", hex::encode([3_u8; 32]));
+        let txid = format!("[\"{}\"]", hex::encode([4_u8; 32]));
+        for (method, params) in [
+            ("getblock", block.as_str()),
+            ("getrawmempool", "[]"),
+            ("gettxoutsetinfo", "[]"),
+            ("abandontransaction", txid.as_str()),
+        ] {
+            let error = request(method, params);
+            assert_eq!(error.code, RPC_CLIENT_NOT_CONNECTED, "{method}");
+            assert!(
+                error.message.contains("halted"),
+                "{method}: {}",
+                error.message
+            );
+        }
+        let error = request("getblockhash", "[1]");
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (RPC_INVALID_PARAMETER, "Block height out of range")
+        );
+        assert_eq!(
+            call(
+                &context,
+                "getblockhash",
+                Some(&RawValue::from_string("[0]".to_owned()).unwrap())
+            )
+            .unwrap(),
+            json!(hex::encode([0_u8; 32]))
+        );
+        drop(context);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

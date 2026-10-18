@@ -42,8 +42,8 @@ while (($#)); do
   esac
 done
 
-if [[ ! "$MINER" =~ ^[0-9a-fA-F]{64}$ ]]; then
-  echo "ERROR: --miner must be the wallet's 64-character receive address." >&2
+if [[ ! "$MINER" =~ ^([0-9a-fA-F]{64}|(tcmfd1|TCMFD1)[[:alnum:]]{58})$ ]]; then
+  echo "ERROR: --miner must be the wallet's receive address (tcmfd1... or 64 hex characters)." >&2
   exit 2
 fi
 if [[ ! "$BLOCKS" =~ ^[0-9]+$ || ! "$CUDA_DEVICE" =~ ^[0-9]+$ || ! "$NONCE" =~ ^[0-9]+$ ||

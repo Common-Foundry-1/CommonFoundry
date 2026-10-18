@@ -2,7 +2,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ArrowLeft, ArrowRight, Copy, LoaderCircle, RefreshCw, Wallet } from "lucide-react";
 import { ExplorerRequestError, loadAddress } from "../api";
 import { formatAge, formatAtoms, shortHash } from "../format";
+import { encode } from "../lib/addressCodec";
 import type { ExplorerAddress, ExplorerAddressActivity } from "../types";
+import { isAboveValidated } from "../validation";
 
 const activityLabels: Record<ExplorerAddressActivity["kind"], string> = {
   coinbase: "Block reward", received: "Received", sent: "Sent", self: "Self transfer",
@@ -10,14 +12,21 @@ const activityLabels: Record<ExplorerAddressActivity["kind"], string> = {
 
 type Props = {
   initial: ExplorerAddress;
+  /** The network's checksummed-address prefix (cmfd or tcmfd). */
+  addressPrefix: string;
   liveTip: string;
   onBack: () => void;
   onBlock: (id: string) => void;
   onTransaction: (id: string) => void;
 };
 
-export function AddressDetail({ initial, liveTip, onBack, onBlock, onTransaction }: Props) {
+function checksummedAddress(prefix: string, hex: string): string | null {
+  try { return encode(prefix, hex); } catch { return null; }
+}
+
+export function AddressDetail({ initial, addressPrefix, liveTip, onBack, onBlock, onTransaction }: Props) {
   const address = initial.address;
+  const checksummed = checksummedAddress(addressPrefix, address);
   const [page, setPage] = useState<ExplorerAddress | null>(initial);
   const [cursor, setCursor] = useState<string | null>(null);
   const [trail, setTrail] = useState<(string | null)[]>([]);
@@ -66,15 +75,19 @@ export function AddressDetail({ initial, liveTip, onBack, onBlock, onTransaction
     if (liveTip !== pageTip.current) void requestPage(null, [], "The chain changed. Showing the newest activity.");
   }, [liveTip, requestPage]);
 
-  const copyAddress = async () => {
-    try { await navigator.clipboard.writeText(address); setCopyStatus("Address copied."); }
+  const copyAddress = async (text: string, copied: string) => {
+    try { await navigator.clipboard.writeText(text); setCopyStatus(copied); }
     catch { setCopyStatus("Copy unavailable. Select the address text to copy it."); }
   };
 
   return <main className="detail-main address-main">
     <button className="back-button" type="button" onClick={onBack}><ArrowLeft size={15} /> Explorer overview</button>
     <section className="detail-hero"><div><p className="eyebrow">Public chain lookup</p><h1>Address</h1><p>Confirmed balances and canonical activity.</p></div><span className="verified"><Wallet size={16} /> Read-only</span></section>
-    <div className="address-identity"><code>{address}</code><button type="button" onClick={() => void copyAddress()} aria-label="Copy address"><Copy size={17} /> Copy</button></div>
+    <div className="address-identity"><code>{address}</code><button type="button" onClick={() => void copyAddress(address, "Address copied.")} aria-label="Copy address"><Copy size={17} /> Copy</button></div>
+    {checksummed && <div className="address-identity address-identity-checksummed">
+      <div><small>Checksummed address · detects typos</small><code aria-label="Checksummed address">{checksummed}</code></div>
+      <button type="button" onClick={() => void copyAddress(checksummed, "Checksummed address copied.")} aria-label="Copy checksummed address"><Copy size={17} /> Copy</button>
+    </div>}
     <div className="address-notices" aria-live="polite">{copyStatus && <p>{copyStatus}</p>}{message && <p>{message}</p>}{busy && <p><LoaderCircle size={15} className="spin" /> Loading address activity…</p>}</div>
     {error && <section className="address-unavailable" role="alert"><h2>Address lookup unavailable</h2><p>{error}</p><button type="button" disabled={busy} onClick={() => void requestPage(null, [])}>Retry latest activity</button></section>}
     {page && <>
@@ -84,11 +97,12 @@ export function AddressDetail({ initial, liveTip, onBack, onBlock, onTransaction
         <Balance label="Immature balance" amount={page.immature_atoms} note="Waiting for protocol maturity" />
       </div>
       <p className="address-scope">{page.utxo_count.toLocaleString()} unspent key output{page.utxo_count === 1 ? "" : "s"} · As of block #{page.accepted_height.toLocaleString()}. Pending transfers and channel escrow are excluded.</p>
+      {isAboveValidated(page.accepted_height, page.validated_height) && <p className="address-scope" role="status">These balances include blocks above #{page.validated_height?.toLocaleString()} that this node is still checking. Activity in those blocks is marked Verifying.</p>}
       <section className="data-section address-history" aria-label="Address activity">
         <div className="section-heading"><div><p className="eyebrow">Canonical history</p><h2>Address activity</h2></div><span>Page {trail.length + 1} · newest first</span></div>
         <div className="address-activity-list">{page.history.length ? page.history.map((entry) => <article key={`${entry.block_id}:${entry.txid}`}>
           <div><strong>{activityLabels[entry.kind]}</strong><small><button type="button" onClick={() => onBlock(entry.block_id)}>Block #{entry.block_height.toLocaleString()}</button> · {formatAge(entry.timestamp)}</small></div>
-          <div><button type="button" className="address-record-link" onClick={() => entry.kind === "coinbase" ? onBlock(entry.block_id) : onTransaction(entry.txid)} aria-label={`${entry.kind === "coinbase" ? "Open reward block" : "Open transaction"} ${entry.txid}`}><code>{shortHash(entry.txid, 14, 10)}</code></button><small>{entry.confirmations.toLocaleString()} confirmation{entry.confirmations === 1 ? "" : "s"}{entry.spent_inputs ? ` · ${entry.spent_inputs} input${entry.spent_inputs === 1 ? "" : "s"} spent` : ""}</small></div>
+          <div><button type="button" className="address-record-link" onClick={() => entry.kind === "coinbase" ? onBlock(entry.block_id) : onTransaction(entry.txid)} aria-label={`${entry.kind === "coinbase" ? "Open reward block" : "Open transaction"} ${entry.txid}`}><code>{shortHash(entry.txid, 14, 10)}</code></button><small>{isAboveValidated(entry.block_height, page.validated_height) ? "Verifying" : `${entry.confirmations.toLocaleString()} confirmation${entry.confirmations === 1 ? "" : "s"}`}{entry.spent_inputs ? ` · ${entry.spent_inputs} input${entry.spent_inputs === 1 ? "" : "s"} spent` : ""}</small></div>
           <div className="address-credited"><strong>{entry.received_outputs ? formatAtoms(entry.received_atoms) : "—"}</strong><small>Outputs to this address</small></div>
         </article>) : <p className="empty-state">No confirmed activity for this address.</p>}</div>
         <div className="address-pagination">

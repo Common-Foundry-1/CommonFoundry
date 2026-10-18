@@ -21,8 +21,8 @@
     },
     {
       "id": "checksummed_network_address",
-      "status": "not_implemented",
-      "evidence": "current destination format remains a raw 32-byte x-only key in lowercase hex"
+      "status": "implemented_candidate",
+      "evidence": "bech32m (BIP-350) addresses wrapping the same x-only key (cmfd1 on mainnet, tcmfd1 on test networks) are accepted wherever a destination is an input: exchange RPC parameters, the exchange wallet (validateaddress, sends; addressformat=hex|bech32m output, default hex) and exchange-tx-sign; responses keep hex destination_hex; Rust and conformance tests; released in 1.0.16"
     },
     {
       "id": "multi_deposit_key_custody_lifecycle",

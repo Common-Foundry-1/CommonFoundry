@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 MINER_ADDRESS="${1:-}"
 if [[ -z "$MINER_ADDRESS" ]]; then
-  echo "Paste the 64-character receive address shown by your RCNet-1 wallet."
+  echo "Paste the receive address shown by your RCNet-1 wallet (tcmfd1... or 64 hex characters)."
   read -r -p "Mining address: " MINER_ADDRESS
 fi
 

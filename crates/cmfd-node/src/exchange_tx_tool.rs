@@ -294,8 +294,15 @@ fn hex32(value: &str, field: &str) -> Result<[u8; 32], ExchangeTxError> {
     Ok(bytes)
 }
 
+/// A key destination: 64 lowercase hex characters or a checksummed address of
+/// the network this binary was built for.
 fn destination(value: &str, field: &str) -> Result<[u8; 32], ExchangeTxError> {
-    let bytes = hex32(value, field)?;
+    let hrp = crate::address_hrp();
+    let (bytes, _) = crate::address::decode_payload(hrp, value).map_err(|error| {
+        invalid(format!(
+            "{field} must be 64 lowercase hexadecimal characters or a {hrp}1... address ({error})"
+        ))
+    })?;
     VerifyingKey::from_bytes(&bytes)
         .map_err(|_| invalid(format!("{field} is not a valid x-only public key")))?;
     Ok(bytes)
@@ -534,5 +541,74 @@ mod tests {
             network,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn checksummed_destinations_build_the_same_withdrawal() {
+        use crate::address::{MAINNET_HRP, TEST_NETWORK_HRP, encode};
+
+        let keys = TestDirectory::new("checksummed");
+        let owner_key = keys.0.join("owner.key");
+        let owner = create_key_file(&owner_key).unwrap();
+        let recipient = create_key_file(&keys.0.join("recipient.key")).unwrap();
+        let network = DEVNET_PROFILE.network_id;
+        let hrp = crate::address_hrp();
+        let sign = |owner_text: String, recipient_text: String| {
+            sign_request(
+                &SignRequest {
+                    network_id: hex::encode(network),
+                    inputs: vec![SignInput {
+                        txid: hex::encode([7_u8; 32]),
+                        vout: 0,
+                        value_atoms: "10000".to_owned(),
+                        destination_hex: owner_text.clone(),
+                        key_file: owner_key.clone(),
+                    }],
+                    outputs: vec![SignOutput {
+                        destination_hex: recipient_text,
+                        value_atoms: "5000".to_owned(),
+                    }],
+                    change_destination_hex: Some(owner_text),
+                    fee_atoms: "100".to_owned(),
+                },
+                network,
+            )
+        };
+        let outputs = |signed: SignedWithdrawal| {
+            let transaction =
+                decode_transaction(&hex::decode(&signed.transaction_hex).unwrap(), network)
+                    .unwrap();
+            (transaction.outputs, signed.change_atoms)
+        };
+        let by_hex = outputs(sign(hex::encode(owner), hex::encode(recipient)).unwrap());
+        for (owner_text, recipient_text) in [
+            (encode(hrp, &owner), encode(hrp, &recipient)),
+            (
+                encode(hrp, &owner).to_ascii_uppercase(),
+                encode(hrp, &recipient).to_ascii_uppercase(),
+            ),
+        ] {
+            assert_eq!(outputs(sign(owner_text, recipient_text).unwrap()), by_hex);
+        }
+
+        let other_network = if hrp == MAINNET_HRP {
+            TEST_NETWORK_HRP
+        } else {
+            MAINNET_HRP
+        };
+        let mut typo = encode(hrp, &recipient).into_bytes();
+        typo[15] = if typo[15] == b'q' { b'p' } else { b'q' };
+        for (recipient_text, needle) in [
+            (String::from_utf8(typo).unwrap(), "checksum"),
+            (encode(other_network, &recipient), "another network"),
+            (hex::encode_upper(recipient), "lowercase"),
+        ] {
+            match sign(hex::encode(owner), recipient_text) {
+                Err(ExchangeTxError::Invalid(message)) => {
+                    assert!(message.contains(needle), "{message}")
+                }
+                other => panic!("expected a refusal containing {needle:?}, got {other:?}"),
+            }
+        }
     }
 }

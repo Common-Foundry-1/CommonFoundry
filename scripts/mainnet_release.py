@@ -48,6 +48,13 @@ def archive_names(version: str) -> dict:
             for platform, kind in package.PACKAGE_ROLES}
 
 
+def supplemental_names(version: str) -> set[str]:
+    if version == "1.0.16":
+        return {"common-foundry-amd-hip-v1.0.16-linux-x86_64.tar.gz",
+                "Start-CMFD-AMD-Miner-WSL.cmd"}
+    return set()
+
+
 def plan_material(files: dict, trust: dict, verifier: Path) -> dict:
     result = {"ssh_keygen": verifier, "expected_verifier_sha256": trust["ssh_keygen_sha256"]}
     for role, prefix in ((signatures.PRODUCER_ROLE, "producer"),):
@@ -113,7 +120,7 @@ def validate_base(*, repo: Path, commit: str, version: str, files: dict,
                   verifier: Path, expected_verifier_sha256: str, final: bool) -> dict:
     integrity._assert_clean_exact_repo(repo, commit)
     names = archive_names(version)
-    required = BASE_EVIDENCE | set(names.values())
+    required = BASE_EVIDENCE | set(names.values()) | supplemental_names(version)
     if final:
         required |= {REPRODUCTION, REPRODUCTION_SIGNATURE}
     allowed = required | GENERATED
@@ -172,6 +179,18 @@ def validate_base(*, repo: Path, commit: str, version: str, files: dict,
                  "launch_plan_digest": plan["launch_plan_digest"], "network_id": plan["network_id"],
                  "mainnet_approval_manifest_sha256": approval.digest(snapshots[MANIFEST].data),
                  "packages": inspected["packages"], "review_evidence": evidence}
+    supplemental = {name: package.file_identity(files[name])
+                    for name in sorted(supplemental_names(version))}
+    if supplemental:
+        if any(identity["bytes"] == 0 for identity in supplemental.values()):
+            raise Error("supplemental release assets must not be empty")
+        statement["schema"] = "CMFD_MAINNET_OWNER_INTERNAL_REBUILD_V2"
+        statement["statement"] = (
+            "I performed an internal rebuild of the reviewed source and reproduced the exact five "
+            "package archives identified here. I also assembled matching copies of the supplemental "
+            "assets identified here; this does not claim rebuilding their bundled binaries or "
+            "independent review.")
+        statement["supplemental_assets"] = supplemental
     return {"statement": statement, "trust": trust, "preflight": inspected}
 
 
@@ -197,6 +216,7 @@ def validate_release(*, repo: Path, commit: str, version: str, files: dict,
 def assert_statement_files(statement: dict, files: dict) -> None:
     expected = {row["name"]: {"bytes": row["bytes"], "sha256": row["sha256"]} for row in statement["packages"]}
     expected.update(statement["review_evidence"])
+    expected.update(statement.get("supplemental_assets", {}))
     for name, identity in expected.items():
         if package.file_identity(files[name]) != identity:
             raise Error("mainnet release changed during signature verification or comparison")
@@ -216,9 +236,9 @@ def prepare_reproduction(*, repo: Path, commit: str, version: str,
                            verifier=verifier, expected_verifier_sha256=expected_verifier_sha256, final=False)
     if first["statement"] != second["statement"]:
         raise Error("producer and reproducer package/evidence identities differ")
-    for name in archive_names(version).values():
+    for name in set(archive_names(version).values()) | supplemental_names(version):
         if first_files[name].samefile(second_files[name]):
-            raise Error("the same archive file cannot serve as two reproduced builds")
+            raise Error("the same archive or supplemental file cannot serve as two reproduced builds")
         if package.file_identity(first_files[name]) != package.file_identity(second_files[name]):
             raise Error("reproduced archive bytes differ")
     assert_statement_files(first["statement"], first_files)

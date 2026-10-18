@@ -58,7 +58,7 @@ class MainnetReleaseTests(unittest.TestCase):
             target.write_bytes(blob)
         self.inventory = self.repo / "packaging/releases/mainnet.inventory"
         self.inventory.parent.mkdir(parents=True, exist_ok=True)
-        inventory_names = release.BASE_EVIDENCE | set(release.archive_names("1.0.16").values()) | {release.REPRODUCTION, release.REPRODUCTION_SIGNATURE}
+        inventory_names = release.supplemental_names("1.0.16") | release.BASE_EVIDENCE | set(release.archive_names("1.0.16").values()) | {release.REPRODUCTION, release.REPRODUCTION_SIGNATURE}
         self.inventory.write_bytes(("\n".join(sorted(inventory_names)) + "\n").encode())
         for relative in ("crates/cmfd-node/Cargo.toml", "crates/cmfd-miner/Cargo.toml", "apps/wallet/src-tauri/Cargo.toml"):
             target = self.repo / relative
@@ -134,6 +134,8 @@ class MainnetReleaseTests(unittest.TestCase):
                 evidence[name] = self.material[key]
         for name, path in evidence.items():
             shutil.copyfile(path, self.first / name)
+        for name in release.supplemental_names("1.0.16"):
+            (self.first / name).write_bytes(b"synthetic supplemental asset: " + name.encode())
         shutil.copytree(self.first, self.second)
 
     def git(self, *arguments):
@@ -170,6 +172,73 @@ class MainnetReleaseTests(unittest.TestCase):
         package.integrity.validate_production_rc_artifacts(version="1.0.16", commit=self.commit,
             stage_files=files, repo=self.repo, activation_ssh_keygen=self.plan_fixture.verifier,
             activation_ssh_keygen_sha256=self.plan_fixture.trust["ssh_keygen_sha256"])
+
+    def test_supplemental_assets_are_required_and_unknown_files_are_rejected(self):
+        for name in release.supplemental_names("1.0.16"):
+            path = self.first / name
+            original = path.read_bytes()
+            path.unlink()
+            with self.assertRaisesRegex(package.Error, "inventory"):
+                self.prepare()
+            path.write_bytes(original)
+        (self.first / "unlisted-download.zip").write_bytes(b"unexpected")
+        with self.assertRaisesRegex(package.Error, "inventory"):
+            self.prepare()
+
+    def test_supplemental_assets_are_bound_to_the_owner_statement(self):
+        self.prepare()
+        self.sign_reproduction()
+        checked = release.validate_release(**self.common(), files=package.integrity._stage_files(self.first))
+        statement = checked["statement"]
+        self.assertEqual(statement["schema"], "CMFD_MAINNET_OWNER_INTERNAL_REBUILD_V2")
+        self.assertEqual(statement["supplemental_assets"], {
+            name: package.file_identity(self.first / name) for name in release.supplemental_names("1.0.16")})
+        name = sorted(release.supplemental_names("1.0.16"))[0]
+        (self.first / name).write_bytes(b"changed after signing")
+        with self.assertRaisesRegex(package.Error, "exact staged release"):
+            release.validate_release(**self.common(), files=package.integrity._stage_files(self.first))
+
+    def test_empty_or_different_supplemental_assets_are_rejected(self):
+        name = sorted(release.supplemental_names("1.0.16"))[0]
+        path = self.second / name
+        path.write_bytes(b"")
+        with self.assertRaisesRegex(package.Error, "must not be empty"):
+            self.prepare()
+        path.write_bytes(b"different supplemental bytes")
+        with self.assertRaisesRegex(package.Error, "identities differ"):
+            self.prepare()
+
+    def test_shared_supplemental_file_is_rejected(self):
+        name = sorted(release.supplemental_names("1.0.16"))[0]
+        (self.second / name).unlink()
+        os.link(self.first / name, self.second / name)
+        with self.assertRaisesRegex(package.Error, "same archive or supplemental"):
+            self.prepare()
+
+    def test_late_supplemental_change_is_rejected(self):
+        self.prepare()
+        self.sign_reproduction()
+        original = release.verify_reproduction_signature
+        path = self.first / sorted(release.supplemental_names("1.0.16"))[0]
+        def verify_then_change(**kwargs):
+            original(**kwargs)
+            path.write_bytes(b"changed after signature check")
+        with mock.patch.object(release, "verify_reproduction_signature", side_effect=verify_then_change):
+            with self.assertRaisesRegex(package.Error, "changed during signature"):
+                release.validate_release(**self.common(), files=package.integrity._stage_files(self.first))
+
+    def test_previous_release_keeps_original_inventory_and_statement(self):
+        with mock.patch.object(release, "supplemental_names", return_value=set()):
+            for stage in (self.first, self.second):
+                for name in ("common-foundry-amd-hip-v1.0.16-linux-x86_64.tar.gz", "Start-CMFD-AMD-Miner-WSL.cmd"):
+                    (stage / name).unlink()
+            self.prepare()
+            self.sign_reproduction()
+            checked = release.validate_release(**self.common(), files=package.integrity._stage_files(self.first))
+            self.assertEqual(checked["statement"]["schema"], release.REPRODUCTION_SCHEMA)
+            self.assertEqual(checked["statement"]["statement"], release.REPRODUCTION_STATEMENT)
+            self.assertNotIn("supplemental_assets", checked["statement"])
+        self.assertEqual(release.supplemental_names("1.0.15"), set())
 
     def test_unsigned_reproduction_is_not_release_authorization(self):
         self.prepare()
@@ -239,6 +308,9 @@ class MainnetReleaseTests(unittest.TestCase):
         result = subprocess.run(command, capture_output=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr.decode())
         self.assertTrue((self.first / package.integrity.CHECKSUM_NAME).is_file())
+        sums = (self.first / package.integrity.CHECKSUM_NAME).read_text()
+        for name in release.supplemental_names("1.0.16"):
+            self.assertIn(package.file_identity(self.first / name)["sha256"] + "  " + name, sums)
         self.assertTrue((self.first / package.integrity.SOURCE_SBOM_NAME).is_file())
         self.assertFalse((self.first / package.integrity.CHECKSUM_SIGNATURE_NAME).exists())
         command[2] = "verify"

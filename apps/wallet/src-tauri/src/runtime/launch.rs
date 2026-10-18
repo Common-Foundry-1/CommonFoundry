@@ -37,7 +37,9 @@ impl LaunchPreparation {
                             .map(|_| ())
                             .map_err(|error| error.to_string())
                     })();
+                    // A close cancels the wait: that is not a failure.
                     if let Err(error) = result
+                        && !cancel.load(std::sync::atomic::Ordering::Acquire)
                         && let Ok(mut slot) = error_slot.lock()
                     {
                         *slot = Some(error);
@@ -82,6 +84,21 @@ impl LaunchPreparation {
         // Read the slot in non-mainnet builds too, keeping the same state layout.
         let _ = &self.error;
         Ok(None)
+    }
+
+    /// Why this process's launch preparation ended without a verified
+    /// beacon: it no longer waits for one (a missing or unusable
+    /// MAINNET-PLAN.json ends it at once). None while it still waits, and
+    /// once it succeeded.
+    pub(super) fn failure(&self) -> Option<String> {
+        self.error.lock().ok()?.clone()
+    }
+
+    #[cfg(test)]
+    pub(super) fn failed_for_test(error: &str) -> Self {
+        let preparation = Self::default();
+        *preparation.error.lock().expect("new launch error mutex") = Some(error.to_owned());
+        preparation
     }
 
     pub(super) fn stop(&self) {

@@ -1,9 +1,12 @@
+mod address;
 mod commands;
 mod cuda;
 mod mining;
 mod runtime;
+mod updater;
 
 use std::io::Write as _;
+use std::path::Path;
 
 use base64::Engine as _;
 use tauri::webview::{NewWindowResponse, WebviewWindowBuilder};
@@ -14,8 +17,21 @@ use cmfd_node::{
     production_v4_package_artifacts,
 };
 use runtime::RuntimeState;
+use updater::UpdaterState;
 
+// An `updater-e2e` build reports other schemas, which the packaging and
+// release-integrity scripts refuse: such a build can never be packaged as
+// a release. The updater's own self-check reads only `package_version`.
+#[cfg(not(feature = "updater-e2e"))]
 const WALLET_RUNTIME_IDENTITY_SCHEMA: &str = "CMFD_WALLET_RUNTIME_IDENTITY_V1";
+#[cfg(feature = "updater-e2e")]
+const WALLET_RUNTIME_IDENTITY_SCHEMA: &str =
+    "CMFD_WALLET_RUNTIME_IDENTITY_V1_UPDATER_E2E_TEST_BUILD_NEVER_RELEASE";
+#[cfg(all(any(feature = "production-v4", test), not(feature = "updater-e2e")))]
+const WALLET_PRELAUNCH_IDENTITY_SCHEMA: &str = "CMFD_WALLET_PRELAUNCH_IDENTITY_V1";
+#[cfg(all(any(feature = "production-v4", test), feature = "updater-e2e"))]
+const WALLET_PRELAUNCH_IDENTITY_SCHEMA: &str =
+    "CMFD_WALLET_PRELAUNCH_IDENTITY_V1_UPDATER_E2E_TEST_BUILD_NEVER_RELEASE";
 const WALLET_RUNTIME_ROLE: &str = "common-foundry-wallet";
 
 #[derive(serde::Serialize)]
@@ -51,7 +67,7 @@ fn canonical_runtime_identity_json() -> Result<Vec<u8>, String> {
 fn canonical_prelaunch_identity_json(launch_info: &[u8]) -> Result<Vec<u8>, String> {
     // Separate schema: a prelaunch plan is not an activated network identity.
     let mut encoded = serde_json::to_vec(&serde_json::json!({
-        "schema": "CMFD_WALLET_PRELAUNCH_IDENTITY_V1",
+        "schema": WALLET_PRELAUNCH_IDENTITY_SCHEMA,
         "role": WALLET_RUNTIME_ROLE,
         "package_version": env!("CARGO_PKG_VERSION"),
         "launch_info_base64": base64::engine::general_purpose::STANDARD.encode(launch_info),
@@ -77,6 +93,12 @@ fn canonical_runtime_identity_json_for_network_info(
 }
 
 pub fn run() -> i32 {
+    // Before anything else, on the raw arguments: a newer installed version
+    // runs instead of this one, and this one runs only if none could.
+    let fallback = match updater::forward::at_launch() {
+        updater::forward::Launch::Exit(code) => return code,
+        updater::forward::Launch::RunHere(fallback) => fallback,
+    };
     let command = match runtime::parse_command() {
         Ok(command) => command,
         Err(error) => {
@@ -111,6 +133,10 @@ pub fn run() -> i32 {
         }
         runtime::ProcessCommand::Run(config) => *config,
     };
+    // A start made by "Restart to update" waits for the closing wallet.
+    if let Err(code) = updater::restart::wait_for_handoff(fallback.is_some()) {
+        return code;
+    }
 
     let webview_data_directory = node_config.webview_data_directory();
     let app = match tauri::Builder::default()
@@ -123,7 +149,21 @@ pub fn run() -> i32 {
             }
         }))
         .setup(move |app| {
-            app.manage(RuntimeState::start(app, node_config));
+            // A newer version failed after it had opened the wallet data:
+            // this one opens them only once the user chooses.
+            let held = fallback
+                .as_ref()
+                .filter(|fallback| fallback.after_data)
+                .map(|fallback| {
+                    updater::lifecycle::fallback_held_error(fallback, env!("CARGO_PKG_VERSION"))
+                });
+            app.manage(RuntimeState::start(app, node_config, held));
+            let runtime = app.state::<RuntimeState>().handle();
+            app.manage(UpdaterState::start(
+                runtime.data_dir().map(Path::to_path_buf),
+                runtime.no_auto_update(),
+                fallback,
+            ));
 
             let mut window_config = app
                 .config()
@@ -134,6 +174,10 @@ pub fn run() -> i32 {
                 .ok_or("the main wallet window is missing from tauri.conf.json")?
                 .clone();
             window_config.title = COMPILED_NETWORK_PROFILE.wallet_window_title().to_owned();
+            #[cfg(feature = "updater-e2e")]
+            window_config
+                .title
+                .push_str(" [UPDATER TEST BUILD, NOT A RELEASE]");
             let mut window = WebviewWindowBuilder::from_config(app, &window_config)?;
             if let Some(directory) = webview_data_directory {
                 window = window.data_directory(directory);
@@ -142,6 +186,14 @@ pub fn run() -> i32 {
                 .on_navigation(allow_navigation)
                 .on_new_window(|_, _| NewWindowResponse::Deny)
                 .build()?;
+            // An updated version that fails to start ends here, so its
+            // forwarder runs the previous one.
+            let exit = app.handle().clone();
+            runtime.spawn_start_watch(move |reason| {
+                if updater::lifecycle::end_failed_start(&reason) {
+                    exit.exit(updater::restart::START_FAILED_EXIT_CODE);
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -164,6 +216,15 @@ pub fn run() -> i32 {
             commands::choose_wallet_backup_path,
             commands::migrate_wallet_encryption,
             commands::restore_wallet,
+            commands::resync_chain,
+            updater::commands::get_update_status,
+            updater::commands::set_update_automatic,
+            updater::commands::check_for_updates,
+            updater::commands::download_update,
+            updater::commands::restart_to_update,
+            updater::commands::retry_update,
+            updater::commands::run_older_anyway,
+            updater::commands::remove_old_versions,
         ])
         .build(tauri::generate_context!())
     {
@@ -174,13 +235,20 @@ pub fn run() -> i32 {
         }
     };
 
-    app.run_return(|app, event| {
-        if matches!(event, RunEvent::Exit)
-            && let Some(state) = app.try_state::<RuntimeState>()
-        {
-            state.stop_services();
+    let code = app.run_return(|app, event| {
+        if matches!(event, RunEvent::Exit) {
+            if let Some(state) = app.try_state::<RuntimeState>() {
+                state.stop_services();
+            }
+            if let Some(updater) = app.try_state::<UpdaterState>() {
+                updater.stop();
+            }
         }
-    })
+    });
+    // "Restart to update": the relaunch starts once this wallet released
+    // its data and the single-instance lock.
+    updater::restart::relaunch_if_requested();
+    updater::restart::exit_code(code)
 }
 
 fn allow_navigation(url: &tauri::Url) -> bool {
@@ -203,7 +271,7 @@ mod tests {
         let info = b"{\"format\":\"commonfoundry-mainnet-launch-info\"}\n";
         let bytes = canonical_prelaunch_identity_json(info).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(value["schema"], "CMFD_WALLET_PRELAUNCH_IDENTITY_V1");
+        assert_eq!(value["schema"], WALLET_PRELAUNCH_IDENTITY_SCHEMA);
         assert_eq!(value["role"], WALLET_RUNTIME_ROLE);
         assert!(value.get("network_info_base64").is_none());
         assert_eq!(
@@ -215,6 +283,28 @@ mod tests {
         let mut canonical = serde_json::to_vec(&value).unwrap();
         canonical.push(b'\n');
         assert_eq!(bytes, canonical);
+    }
+
+    /// The schemas the packaging and release-integrity scripts accept
+    /// (`scripts/package_mainnet.py`, `scripts/verify_mainnet_ci_identities.py`),
+    /// which only a build without `updater-e2e` reports.
+    #[test]
+    fn only_a_build_without_updater_e2e_reports_the_release_identity_schemas() {
+        let release = (
+            WALLET_PRELAUNCH_IDENTITY_SCHEMA == "CMFD_WALLET_PRELAUNCH_IDENTITY_V1",
+            WALLET_RUNTIME_IDENTITY_SCHEMA == "CMFD_WALLET_RUNTIME_IDENTITY_V1",
+        );
+        assert_eq!(
+            release,
+            (
+                !cfg!(feature = "updater-e2e"),
+                !cfg!(feature = "updater-e2e")
+            )
+        );
+        assert_eq!(
+            updater::BUILD_IDENTITY == "release",
+            !cfg!(feature = "updater-e2e")
+        );
     }
 
     #[test]

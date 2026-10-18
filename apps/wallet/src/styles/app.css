@@ -78,14 +78,6 @@
   animation: wallet-startup-progress 1.35s ease-in-out infinite;
 }
 
-.startup-note {
-  max-width: 390px;
-  margin: 0;
-  color: #888b88;
-  font-size: 12px;
-  line-height: 1.55;
-}
-
 @keyframes wallet-startup-progress {
   0% { transform: translateX(-105%); }
   55% { transform: translateX(115%); }
@@ -418,6 +410,30 @@
   font-size: 12px;
 }
 
+.work-check-progress {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 24px 34px 0;
+  padding: 11px 15px;
+  color: var(--ink-700);
+  background: var(--mineral-100);
+  border: 1px solid var(--mineral-200);
+  border-radius: 6px;
+}
+
+.work-check-progress > svg {
+  flex: none;
+  margin-top: 1px;
+}
+
+.work-check-progress > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
+}
+
 .workspace-content {
   width: 100%;
   max-width: 1450px;
@@ -501,6 +517,10 @@
   margin-top: 29px;
   border-top: 1px solid var(--mineral-200);
   border-bottom: 1px solid var(--mineral-200);
+}
+
+.balance-breakdown.has-verifying {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
 .balance-breakdown > div {
@@ -766,6 +786,7 @@
 
 .transaction-status.status-pending,
 .transaction-status.status-immature,
+.transaction-status.status-verifying,
 .status-pill {
   color: #89502d;
   background: #fff0e4;
@@ -1224,6 +1245,80 @@
 
 .peer-settings-loading {
   margin: 12px 0 0;
+}
+
+.update-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  color: var(--ink-800);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.update-status-line {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+  color: var(--ink-700);
+  font-size: 12px;
+}
+
+.update-banner {
+  justify-content: space-between;
+}
+
+.update-banner > div:first-child {
+  min-width: 0;
+}
+
+.update-actions {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.update-question,
+.update-run-anyway {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+  font-size: 12px;
+}
+
+.update-run-anyway .form-input {
+  max-width: 260px;
+  height: 34px;
+}
+
+.update-refusal {
+  color: var(--red-600);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.update-old-versions {
+  margin-top: 16px;
+}
+
+.update-old-versions h4 {
+  margin: 0;
+  color: var(--ink-800);
+  font-size: 13px;
+}
+
+.update-old-versions .configured-peer-list {
+  margin-bottom: 10px;
+}
+
+.update-old-versions .configured-peer-list li {
+  grid-template-columns: minmax(0, 1fr) auto;
 }
 
 .sr-only {
@@ -2076,6 +2171,10 @@
   box-shadow: var(--shadow-dialog);
 }
 
+.prelaunch-panel .update-banner {
+  margin: 0 0 20px;
+}
+
 .prelaunch-panel .dialog-title {
   font-size: 30px;
 }
@@ -2480,6 +2579,15 @@
   margin-top: 10px;
 }
 
+.dialog-address-label-secondary {
+  margin-top: 16px;
+}
+
+.dialog-address-note {
+  margin: 6px 23px 0;
+  text-align: left;
+}
+
 .dialog-panel-receive .form-status {
   min-height: 14px;
   margin: 6px 23px 0;
@@ -2710,7 +2818,8 @@
     line-height: 1.4;
   }
 
-  .offline-banner {
+  .offline-banner,
+  .work-check-progress {
     margin: 14px 14px 0;
   }
 

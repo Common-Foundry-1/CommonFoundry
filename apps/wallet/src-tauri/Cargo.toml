@@ -29,6 +29,9 @@ production-v4 = ["cmfd-node/production-v4"]
 production-v4-testnet = ["production-v4", "cmfd-node/production-v4-testnet"]
 production-rc = ["production-v4", "cmfd-node/production-rc"]
 production-mainnet = ["production-v4", "cmfd-node/production-mainnet"]
+# Wallet auto-updater end-to-end tests only: trusts a test key and a file:// release
+# source. Never enable it in a release build.
+updater-e2e = []
 
 [build-dependencies]
 tauri-build = { version = "=2.6.3", features = [] }
@@ -40,13 +43,29 @@ cmfd-cuda = { path = "../../../crates/cmfd-cuda" }
 cmfd-launch = { path = "../../../crates/cmfd-launch" }
 cmfd-node = { path = "../../../crates/cmfd-node" }
 cmfd-proof-worker = { path = "../../../crates/cmfd-proof-worker" }
+fs2.workspace = true
 hex.workspace = true
+ring = "0.17"
 serde.workspace = true
 serde_json.workspace = true
 tauri = { version = "=2.11.5", features = [] }
 tauri-plugin-single-instance = "=2.4.3"
 tauri-plugin-dialog = "=2.7.3"
+tracing.workspace = true
 zeroize.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Power",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 sha2.workspace = true

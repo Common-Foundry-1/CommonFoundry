@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useState, type ReactNode } from "react";
 import { ReceiveDialog } from "./ReceiveDialog";
 import { WalletSecurityDialog } from "./WalletSecurityDialog";
 import type { WalletCustodyStatus } from "../types";
@@ -8,9 +8,13 @@ interface Props {
   statusError: string | null;
   onStatusChange: (status: WalletCustodyStatus) => void;
   onRefresh: () => Promise<void>;
+  /** Update notices, such as why a newer version could not start. */
+  updateNotice?: ReactNode;
+  /** A result the wallet reported before this screen, such as where a resync moved the old chain. */
+  notice?: string | null;
 }
 
-export function PrelaunchWallet({ status, statusError, onStatusChange, onRefresh }: Props) {
+export function PrelaunchWallet({ status, statusError, onStatusChange, onRefresh, updateNotice, notice: earlierNotice = null }: Props) {
   const [securityOpen, setSecurityOpen] = useState(false);
   const [receiveOpen, setReceiveOpen] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
@@ -25,6 +29,7 @@ export function PrelaunchWallet({ status, statusError, onStatusChange, onRefresh
   return (
     <main className="prelaunch-wallet">
       <section className="prelaunch-panel" aria-labelledby="prelaunch-title" inert={securityOpen || receiveOpen}>
+        {updateNotice}
         <p className="dialog-eyebrow">{status.network}</p>
         <h1 className="dialog-title" id="prelaunch-title">{launch.ready ? "Mainnet is ready to connect" : "Get ready for mainnet"}</h1>
         <p className="dialog-description">Mining starts {start}.</p>
@@ -47,6 +52,7 @@ export function PrelaunchWallet({ status, statusError, onStatusChange, onRefresh
           <button className="button-secondary" type="button" onClick={() => void onRefresh()}>Refresh launch status</button>
         </div>
         {launch.error || statusError ? <p className="form-error" role="alert">{statusError ?? launch.error} Reopen the wallet after correcting the problem.</p> : null}
+        {earlierNotice ? <p className="form-status" role="status">{earlierNotice}</p> : null}
         {notice ? <p className="form-status" role="status">{notice}</p> : null}
       </section>
       <WalletSecurityDialog open={securityOpen} required={false} status={status} statusError={statusError}

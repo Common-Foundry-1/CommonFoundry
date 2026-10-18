@@ -52,6 +52,16 @@ MAX_SOURCE_SBOM_BYTES = 32 * 1024 * 1024
 MAX_PROVENANCE_BYTES = 4 * 1024 * 1024
 MAX_CHECKSUM_BYTES = 4 * 1024 * 1024
 MAX_RELEASE_SIGNATURE_BYTES = 64 * 1024
+# The desktop wallet's updater (apps/wallet/src-tauri/src/updater/release.rs
+# and sshsig.rs) is stricter than ssh-keygen and than the checks above; a
+# signed release it refuses reaches no wallet. Every 1.0.16+ wallet keeps
+# these rules, so a release must meet them.
+WALLET_UPDATER_MAX_SUMS_BYTES = 64 * 1024
+WALLET_UPDATER_MAX_BUILDINFO_BYTES = 64 * 1024
+WALLET_UPDATER_MAX_SIGNATURE_BYTES = 4 * 1024
+WALLET_UPDATER_ASSET_NAME_RE = re.compile(r"[A-Za-z0-9._+-]+")
+SSH_SIGNATURE_ARMOR_BEGIN = b"-----BEGIN SSH SIGNATURE-----\n"
+SSH_SIGNATURE_ARMOR_END = b"-----END SSH SIGNATURE-----\n"
 MAX_ALLOWED_SIGNERS_BYTES = 1024 * 1024
 MAX_DEB_BYTES = 512 * 1024 * 1024
 MAX_DEB_MEMBERS = 100_000
@@ -8312,6 +8322,8 @@ def _checksum_manifest(data: bytes) -> dict[str, str]:
         raise IntegrityError("SHA256SUMS.txt is not UTF-8") from error
     if not data or b"\r" in data or not data.endswith(b"\n"):
         raise IntegrityError("SHA256SUMS.txt is not canonical LF-terminated text")
+    if len(data) > WALLET_UPDATER_MAX_SUMS_BYTES:
+        raise IntegrityError("SHA256SUMS.txt exceeds the wallet updater's size limit")
     rows: dict[str, str] = {}
     names = []
     for line in text.splitlines():
@@ -8319,6 +8331,11 @@ def _checksum_manifest(data: bytes) -> dict[str, str]:
         if match is None:
             raise IntegrityError("SHA256SUMS.txt has a malformed row")
         digest, name = match.groups()
+        if not WALLET_UPDATER_ASSET_NAME_RE.fullmatch(name):
+            raise IntegrityError(
+                f"SHA256SUMS.txt names an asset the wallet updater refuses: {name!r} "
+                "(names may use only A-Z, a-z, 0-9, '.', '_', '+' and '-')"
+            )
         safe = _safe_repo_relative(name)
         if safe != name or "/" in safe:
             raise IntegrityError("SHA256SUMS.txt contains a non-flat asset name")
@@ -8329,6 +8346,83 @@ def _checksum_manifest(data: bytes) -> dict[str, str]:
     if names != sorted(names):
         raise IntegrityError("SHA256SUMS.txt rows are not sorted")
     return rows
+
+
+def _check_wallet_updater_signature(signature: bytes) -> None:
+    """Refuse a checksum signature the wallet updater would refuse.
+
+    ssh-keygen accepts CRLF, blank lines, other hash algorithms and any key
+    type; the wallet (apps/wallet/src-tauri/src/updater/sshsig.rs) takes only
+    the exact armor around canonical base64 of an SSHSIG version 1 blob with
+    an Ed25519 key, this namespace, an empty reserved field and sha512.
+    """
+
+    if len(signature) > WALLET_UPDATER_MAX_SIGNATURE_BYTES:
+        raise IntegrityError(
+            "release checksum signature exceeds the wallet updater's size limit"
+        )
+    if b"\r" in signature:
+        raise IntegrityError("release checksum signature contains a carriage return")
+    rest = signature[len(SSH_SIGNATURE_ARMOR_BEGIN) :]
+    if not (
+        signature.startswith(SSH_SIGNATURE_ARMOR_BEGIN)
+        and rest.endswith(b"\n" + SSH_SIGNATURE_ARMOR_END)
+    ):
+        raise IntegrityError(
+            "release checksum signature armor is not the exact SSH signature armor "
+            "with a final newline"
+        )
+    body = rest[: -len(SSH_SIGNATURE_ARMOR_END) - 1]
+    lines = body.split(b"\n")
+    if any(not line for line in lines):
+        raise IntegrityError("release checksum signature armor has a blank line")
+    text = b"".join(lines)
+    try:
+        blob = base64.b64decode(text, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise IntegrityError("release checksum signature is not valid base64") from error
+    if base64.b64encode(blob) != text:
+        raise IntegrityError("release checksum signature base64 is not canonical")
+
+    view = memoryview(blob)
+
+    def take(count: int) -> bytes:
+        nonlocal view
+        if count > len(view):
+            raise IntegrityError("release checksum signature is truncated")
+        head, view = view[:count], view[count:]
+        return bytes(head)
+
+    def string() -> bytes:
+        return take(struct.unpack(">I", take(4))[0])
+
+    def ed25519_field(field: bytes, size: int) -> bool:
+        if len(field) < 4:
+            return False
+        name_length = struct.unpack(">I", field[:4])[0]
+        name, rest = field[4 : 4 + name_length], field[4 + name_length :]
+        return (
+            name == b"ssh-ed25519"
+            and len(rest) == 4 + size
+            and struct.unpack(">I", rest[:4])[0] == size
+        )
+
+    if take(6) != b"SSHSIG":
+        raise IntegrityError("release checksum signature is not an SSHSIG blob")
+    if struct.unpack(">I", take(4))[0] != 1:
+        raise IntegrityError("release checksum signature is not SSHSIG version 1")
+    if not ed25519_field(string(), 32):
+        raise IntegrityError("release checksum signature key is not one Ed25519 key")
+    if string() != RELEASE_SIGNATURE_NAMESPACE.encode("ascii"):
+        raise IntegrityError("release checksum signature namespace is wrong")
+    if string() != b"":
+        raise IntegrityError("release checksum signature reserved field is not empty")
+    if string() != b"sha512":
+        raise IntegrityError("release checksum signature hash algorithm is not sha512")
+    if not ed25519_field(string(), 64):
+        raise IntegrityError("release checksum signature is not one Ed25519 signature")
+    if len(view):
+        raise IntegrityError("release checksum signature has trailing bytes")
 
 
 def _authenticated_download_buildinfo(
@@ -8442,6 +8536,7 @@ def verify_release_signature(
         if signature_stat.st_size > MAX_RELEASE_SIGNATURE_BYTES:
             raise IntegrityError("release checksum signature exceeds its size limit")
         signature_bytes = signature_handle.read(MAX_RELEASE_SIGNATURE_BYTES + 1)
+    _check_wallet_updater_signature(signature_bytes)
     with _stable_regular_handle(allowed, "trusted release signer policy") as (
         _,
         allowed_handle,
@@ -8540,9 +8635,11 @@ def verify_signed_download(
             raise IntegrityError(f"signed release file digest is invalid: {name}")
         file_sizes[name] = size
         file_rows.append({"name": name, "sha256": digest, "size": size})
-    buildinfo, _ = _authenticated_download_buildinfo(
+    buildinfo, buildinfo_bytes = _authenticated_download_buildinfo(
         stage_files=stage_files, checksum_rows=checksum_rows
     )
+    if len(buildinfo_bytes) > WALLET_UPDATER_MAX_BUILDINFO_BYTES:
+        raise IntegrityError("BUILDINFO.json exceeds the wallet updater's size limit")
     for artifact in buildinfo["artifacts"]:
         if file_sizes[artifact["name"]] != artifact["size"]:
             raise IntegrityError("BUILDINFO.json artifact size does not match its file")
@@ -8690,6 +8787,11 @@ def _verify_release(
         raise IntegrityError(
             "SHA256SUMS.txt is noncanonical or does not match the artifacts"
         )
+    # The wallet updater's rules, so a release no wallet can take is never
+    # staged, verified or signed.
+    _checksum_manifest(checksum_bytes)
+    if len(buildinfo_bytes) > WALLET_UPDATER_MAX_BUILDINFO_BYTES:
+        raise IntegrityError("BUILDINFO.json exceeds the wallet updater's size limit")
     return expected_info, _sha256_bytes(checksum_bytes)
 
 

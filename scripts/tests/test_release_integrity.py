@@ -162,6 +162,128 @@ checksum = "1111111111111111111111111111111111111111111111111111111111111111"
         return self.git("rev-parse", "HEAD")
 
 
+def ssh_string(value: bytes) -> bytes:
+    return struct.pack(">I", len(value)) + value
+
+
+def wallet_style_signature(
+    *,
+    namespace: bytes = b"commonfoundry-release",
+    hash_algorithm: bytes = b"sha512",
+    key_type: bytes = b"ssh-ed25519",
+    reserved: bytes = b"",
+    version: int = 1,
+    trailing: bytes = b"",
+) -> bytes:
+    """An SSHSIG in exactly the shape ssh-keygen -Y sign writes, with a
+    stand-in key and signature (the subprocess is mocked where it is used)."""
+
+    blob = (
+        b"SSHSIG"
+        + struct.pack(">I", version)
+        + ssh_string(ssh_string(key_type) + ssh_string(b"\x11" * 32))
+        + ssh_string(namespace)
+        + ssh_string(reserved)
+        + ssh_string(hash_algorithm)
+        + ssh_string(ssh_string(key_type) + ssh_string(b"\x22" * 64))
+        + trailing
+    )
+    text = base64.b64encode(blob)
+    lines = [text[index : index + 70] for index in range(0, len(text), 70)]
+    return (
+        b"-----BEGIN SSH SIGNATURE-----\n"
+        + b"\n".join(lines)
+        + b"\n-----END SSH SIGNATURE-----\n"
+    )
+
+
+WALLET_FIXTURES = (
+    SCRIPT_DIRECTORY.parent / "apps" / "wallet" / "src-tauri" / "tests" / "fixtures" / "updater"
+)
+
+
+class WalletUpdaterRuleTests(unittest.TestCase):
+    """The wallet updater refuses what ssh-keygen and the old checks allow."""
+
+    def test_the_published_signed_files_meet_the_wallet_rules(self) -> None:
+        releases = sorted(WALLET_FIXTURES.glob("v1.0.*"))
+        self.assertGreaterEqual(len(releases), 4)
+        for release in releases:
+            integrity._check_wallet_updater_signature(
+                (release / integrity.CHECKSUM_SIGNATURE_NAME).read_bytes()
+            )
+            rows = integrity._checksum_manifest(
+                (release / integrity.CHECKSUM_NAME).read_bytes()
+            )
+            self.assertIn(integrity.BUILDINFO_NAME, rows)
+
+    def test_asset_names_are_limited_to_the_wallet_charset(self) -> None:
+        digest = "ab" * 32
+        good = (
+            f"{digest}  Start-CMFD-AMD-Miner-WSL.cmd\n"
+            f"{digest}  commonfoundry-mainnet-runtime-windows-x86_64-v1.0.16.zip\n"
+            f"{digest}  libfoo+bar_1.2.tar.gz\n"
+        ).encode()
+        self.assertEqual(len(integrity._checksum_manifest(good)), 3)
+        for name in ("CMFD Miner.zip", "miner(amd).zip", "caf\u00e9.zip", "a,b.zip"):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(integrity.IntegrityError, "wallet updater refuses"):
+                    integrity._checksum_manifest(f"{digest}  {name}\n".encode())
+
+    def test_a_checksum_file_over_the_wallet_limit_is_refused(self) -> None:
+        digest = "ab" * 32
+        rows = "".join(f"{digest}  asset-{index:05d}.zip\n" for index in range(800))
+        self.assertGreater(len(rows), integrity.WALLET_UPDATER_MAX_SUMS_BYTES)
+        with self.assertRaisesRegex(integrity.IntegrityError, "size limit"):
+            integrity._checksum_manifest(rows.encode())
+
+    def test_the_signature_must_have_the_exact_armor_and_contents(self) -> None:
+        good = wallet_style_signature()
+        integrity._check_wallet_updater_signature(good)
+        refused = {
+            "carriage return": good.replace(b"\n", b"\r\n"),
+            "final newline": good[:-1],
+            "blank line": good.replace(b"-----\n", b"-----\n\n", 1),
+            "exact SSH signature armor": (
+                b"-----BEGIN SSH SIGNATURE-----\n-----END SSH SIGNATURE-----\n"
+            ),
+            "size limit": good[:-29] + b"A" * 4096 + good[-29:],
+            "sha512": wallet_style_signature(hash_algorithm=b"sha256"),
+            "namespace": wallet_style_signature(namespace=b"file"),
+            "Ed25519 key": wallet_style_signature(key_type=b"ssh-rsa"),
+            "reserved": wallet_style_signature(reserved=b"x"),
+            "version 1": wallet_style_signature(version=2),
+            "trailing bytes": wallet_style_signature(trailing=b"\0"),
+            "base64": good.replace(b"U1NIU0lH", b"U1NIU0l!", 1),
+        }
+        for reason, signature in refused.items():
+            with self.subTest(reason=reason):
+                with self.assertRaisesRegex(integrity.IntegrityError, reason):
+                    integrity._check_wallet_updater_signature(signature)
+
+    def test_non_canonical_base64_is_refused(self) -> None:
+        good = wallet_style_signature()
+        body = good.split(b"\n")[1:-2]
+        blob = base64.b64decode(b"".join(body))
+        # The same bytes with the unused low bits of the last digit set.
+        text = base64.b64encode(blob)
+        padding = len(text) - len(text.rstrip(b"="))
+        self.assertGreater(padding, 0)
+        alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+        last = text[-padding - 1]
+        changed = alphabet[alphabet.index(last) + 1 : alphabet.index(last) + 2]
+        self.assertEqual(base64.b64decode(text[: -padding - 1] + changed + text[-padding:]), blob)
+        tampered = text[: -padding - 1] + changed + text[-padding:]
+        lines = [tampered[index : index + 70] for index in range(0, len(tampered), 70)]
+        signature = (
+            b"-----BEGIN SSH SIGNATURE-----\n"
+            + b"\n".join(lines)
+            + b"\n-----END SSH SIGNATURE-----\n"
+        )
+        with self.assertRaisesRegex(integrity.IntegrityError, "not canonical"):
+            integrity._check_wallet_updater_signature(signature)
+
+
 class ReleaseSignatureTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -169,7 +291,7 @@ class ReleaseSignatureTests(unittest.TestCase):
         self.stage = self.root / "stage"
         self.stage.mkdir()
         (self.stage / integrity.CHECKSUM_NAME).write_bytes(b"00  artifact.zip\n")
-        (self.stage / integrity.CHECKSUM_SIGNATURE_NAME).write_bytes(b"signature")
+        (self.stage / integrity.CHECKSUM_SIGNATURE_NAME).write_bytes(wallet_style_signature())
         self.allowed = self.root / "allowed_signers"
         self.allowed.write_text(
             "release@example.invalid ssh-ed25519 AAAAfixture\n", encoding="utf-8"
@@ -194,6 +316,21 @@ class ReleaseSignatureTests(unittest.TestCase):
         self.assertIn(integrity.RELEASE_SIGNATURE_NAMESPACE, command)
         self.assertEqual(run.call_args.kwargs["input"], b"00  artifact.zip\n")
         self.assertEqual(receipt["signer_identity"], "release@example.invalid")
+
+    @mock.patch("release_integrity.subprocess.run")
+    def test_a_signature_the_wallet_would_refuse_never_reaches_ssh_keygen(self, run) -> None:
+        run.return_value = subprocess.CompletedProcess([], 0, b"Good signature\n", b"")
+        (self.stage / integrity.CHECKSUM_SIGNATURE_NAME).write_bytes(
+            wallet_style_signature().replace(b"\n", b"\r\n")
+        )
+        with self.assertRaisesRegex(integrity.IntegrityError, "carriage return"):
+            integrity.verify_release_signature(
+                stage=self.stage,
+                allowed_signers=self.allowed,
+                signer_identity="release@example.invalid",
+                ssh_keygen=self.verifier,
+            )
+        run.assert_not_called()
 
     @mock.patch("release_integrity.subprocess.run")
     def test_bad_signature_and_identity_fail_closed(self, run) -> None:

@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import { getPeerSettings, mineDevnetBlock, updatePeerSettings, usesEmbeddedNode } from "../api/nodeClient";
 import { formatBytes, shortenHash } from "../lib/amount";
 import type { MempoolSnapshot, NodeStatus, PeerSettings, WalletSnapshot } from "../types";
+import { UpdatePanel } from "./UpdatePanel";
 
 interface NetworkViewProps {
   status: NodeStatus | null;
@@ -211,6 +212,7 @@ export function NetworkView({ status, wallet, mempool, refreshing, onRefresh, on
               ) : peerError ? null : <p className="peer-settings-loading">Loading peer settings…</p>}
             </div>
           ) : null}
+          {usesEmbeddedNode ? <UpdatePanel /> : null}
 
           <div className="peer-panel-heading">
             <div>

@@ -11,6 +11,11 @@ export type ExplorerTransaction = {
   status: "confirmed" | "mempool";
 };
 
+/** A transaction with the validated height it was read with. */
+export type ExplorerTransactionDetail = ExplorerTransaction & {
+  validated_height?: number | null;
+};
+
 export type ExplorerBlock = {
   height: number;
   block_id: string;
@@ -35,6 +40,12 @@ export type ExplorerSnapshot = {
   proof_of_work: string;
   tip: string;
   accepted_height: number;
+  /**
+   * Every block up to this height is pinned by the release or has had its
+   * work re-executed by the node; blocks above it are still being checked.
+   * Null on a network without that rule; absent from nodes before 1.0.16.
+   */
+  validated_height?: number | null;
   expected_target: string;
   cumulative_work: string;
   utxo_count: number;
@@ -46,6 +57,7 @@ export type ExplorerSnapshot = {
 };
 
 export type ExplorerBlockDetail = ExplorerBlock & {
+  validated_height?: number | null;
   coinbase_outputs: number;
   transactions_detail: ExplorerTransaction[];
 };
@@ -53,7 +65,7 @@ export type ExplorerBlockDetail = ExplorerBlock & {
 export type ExplorerView =
   | { kind: "overview" }
   | { kind: "block"; block: ExplorerBlockDetail }
-  | { kind: "transaction"; transaction: ExplorerTransaction }
+  | { kind: "transaction"; transaction: ExplorerTransactionDetail }
   | { kind: "address"; address: ExplorerAddress };
 
 export type ExplorerSearchKind = "chain" | "address";
@@ -74,6 +86,7 @@ export type ExplorerAddress = {
   address: string;
   tip: string;
   accepted_height: number;
+  validated_height?: number | null;
   balance_scope: "key_outputs";
   includes_mempool: false;
   confirmed_atoms: string;

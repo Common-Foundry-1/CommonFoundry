@@ -34,13 +34,27 @@ the newest record it covers; a restart indexes only newer records, and without a
 rebuilds them during the authenticated block-log startup scan. Locations are hints only: every
 lookup reads and authenticates the block it names before answering.
 
+From 1.0.16, on a network with a work rule, nodes independently re-execute each block's work.
+The snapshot, block-detail, transaction and address responses carry `validated_height`: every
+active block up to it is pinned by the release or has had its work re-executed by the node
+(`null` on a network without the rule). Transaction statuses are unchanged; the explorer marks
+blocks above the validated height, and activity in them, Verifying until the node has checked
+them. Confirmations still count from the tip. Address balances come from the tip's UTXO set, so
+they include those blocks; the address page says so while the validated height is below the tip.
+The field is additive: this frontend accepts responses without it, from older nodes, and an older
+frontend ignores it and shows those blocks as it always has, so the Worker and its origin node
+can be upgraded in either order. A validated height that stops advancing while it is below the
+tip means the node has stopped checking (for example, block admission halted or its work engine
+failed) and needs its operator.
+
 Overview polling keeps a bounded, process-local cache of at most12 checked block summaries and
 24 confirmed transaction summaries, not block/proof bodies. A tip change or30-second expiry
 reauthenticates the retained blocks before replacing that cache. Mempool, peer and status fields
 are always read live. Every poll still checks retained-file identity and log length; known storage
 faults refuse the response. The cache is discarded on restart and never participates in block
-admission, proof verification or fork choice. Individual block/transaction/address detail reads
-continue to authenticate their stored bodies.
+admission, proof verification or fork choice. Individual block/transaction detail reads
+continue to authenticate their stored bodies; address pages answer from indexed activity facts
+(see below).
 
 Each authenticated read also returns immutable query-local identity and wire-size
 metadata. Explorer rows reuse those checked scalars rather than hashing the full
@@ -118,8 +132,11 @@ any tip change (extension or reorganization) returns HTTP 409 with `explorer_cur
 the client must restart pagination. Malformed or unrelated-address cursors return HTTP 400.
 Address errors have a string `error` message plus top-level `code` and `retryable` fields;
 existing non-address RPC error contracts are unchanged.
-Every page reauthenticates its matching stored blocks, reading a shared block only once and
-at most20 block bodies. Empty histories read none. The prepared Worker includes
+Address pages answer from per-entry activity facts derived from validated or authenticated
+blocks when they are indexed and kept in the startup index cache; such pages read no block
+bodies. Entries loaded from an older cache have no facts yet: their blocks are read and
+authenticated on first use and filled by the background history scrub, newest first (see
+`docs/storage-recovery.md`). The prepared Worker includes
 only these address path shapes and checks numeric cursor bounds; it still rejects
 query strings, writes and general RPC. Local Workers-runtime and desktop/mobile
 browser checks use labelled fixtures, not live mainnet data. The live Worker and
@@ -166,6 +183,10 @@ rules. The new origin must expose only these anchored read-only route paths to
 The example allows snapshot, block, transaction and address/cursor paths only.
 It is an ingress-only validation fixture, not a replacement for the deployed
 configuration. The Worker and node additionally enforce numeric cursor limits.
+cloudflared forwards the public origin hostname as `Host`. The explorer read
+paths accept it; the node's wallet, mining and transaction/block submission
+routes refuse any non-loopback `Host` with `403`, so they stay closed even if a
+tunnel rule is too broad.
 
 Validate the complete proposed tunnel configuration with the installed
 `cloudflared tunnel ingress validate` and test both allowed and denied URLs with

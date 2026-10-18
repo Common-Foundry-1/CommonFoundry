@@ -3,7 +3,8 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import App from "./App";
 import { ExplorerRequestError, loadAddress, loadBlock, loadExplorer, loadTransaction, type ExplorerLoad } from "./api";
-import { demoSnapshot } from "./demoData";
+import { demoBlock, demoSnapshot } from "./demoData";
+import { MAINNET_HRP, TEST_NETWORK_HRP, encode } from "./lib/addressCodec";
 import { addressFixture, fixtureAddress } from "./test/addressFixture";
 import type { ExplorerAddress } from "./types";
 
@@ -160,4 +161,89 @@ test("hash search falls back only for not-found, never for an identity failure",
   await user.click(screen.getByRole("button", { name: "Search" }));
   expect(await screen.findByRole("alert")).toHaveTextContent("transaction not found");
   expect(loadTransaction).toHaveBeenCalledWith(fixtureAddress, false);
+});
+
+async function searchAs(kind: "chain" | "address", query: string) {
+  vi.mocked(loadExplorer).mockResolvedValue({ data: demoSnapshot, preview: false });
+  render(<App />);
+  await screen.findByRole("heading", { name: "Latest blocks" });
+  const user = userEvent.setup();
+  if (kind === "address") await user.selectOptions(screen.getByRole("combobox", { name: "Search type" }), "address");
+  await user.type(screen.getByRole("textbox", { name: kind === "address" ? "Search wallet address" : /Search block height/ }), query + "{Enter}");
+}
+
+test.each([
+  ["address", encode(TEST_NETWORK_HRP, fixtureAddress)],
+  ["address", encode(TEST_NETWORK_HRP, fixtureAddress).toUpperCase()],
+  ["chain", encode(TEST_NETWORK_HRP, fixtureAddress)],
+  ["address", fixtureAddress.toUpperCase()],
+] as const)("a checksummed address (%s search) is looked up by its hex key", async (kind, query) => {
+  await searchAs(kind, query);
+  expect(await screen.findByRole("heading", { name: "Address" })).toBeInTheDocument();
+  expect(loadAddress).toHaveBeenCalledWith(fixtureAddress, null, false);
+  expect(loadBlock).not.toHaveBeenCalled(); expect(loadTransaction).not.toHaveBeenCalled();
+  expect(screen.getByLabelText("Checksummed address")).toHaveTextContent(encode(TEST_NETWORK_HRP, fixtureAddress));
+});
+
+test.each([
+  ["address", encode(TEST_NETWORK_HRP, fixtureAddress).slice(0, -1) + "q", "Address checksum does not match: the address is mistyped or incomplete."],
+  ["chain", encode(MAINNET_HRP, fixtureAddress), "Address is for another network: expected tcmfd1..., found cmfd1..."],
+  ["address", fixtureAddress.slice(0, 40), "Expected a tcmfd1... address or 64 lowercase hexadecimal characters encoding an x-only public key."],
+] as const)("a bad address (%s search %s) is explained without a lookup", async (kind, query, message) => {
+  await searchAs(kind, query);
+  expect(await screen.findByRole("alert")).toHaveTextContent(message);
+  expect(loadAddress).not.toHaveBeenCalled(); expect(loadBlock).not.toHaveBeenCalled();
+});
+
+test("labels blocks and activity above the validated height as Verifying", async () => {
+  const user = userEvent.setup();
+  // Statuses stay "confirmed"; the label comes from the validated height alone.
+  const checking = { ...demoSnapshot, validated_height: 158 };
+  vi.mocked(loadExplorer).mockResolvedValue({ data: checking, preview: false });
+  const view = render(<App />);
+  expect(await screen.findByText(/This node is still checking blocks above #158\./)).toBeInTheDocument();
+  const rows = within(view.container.querySelector("#blocks") as HTMLElement).getAllByRole("row").slice(1);
+  expect(rows.map((row) => within(row).queryByText("Verifying") !== null)).toEqual([true, true, false, false, false]);
+  const rail = within(view.container.querySelector("#transactions") as HTMLElement);
+  expect(rail.getAllByText("Verifying")).toHaveLength(2);
+
+  // A transaction opened from the list keeps the snapshot's validated height.
+  const above = checking.recent_transactions.find((tx) => tx.block_height === 160);
+  await user.click(rail.getAllByRole("button").find((button) => button.textContent?.includes(above!.txid.slice(0, 11)))!);
+  expect(await screen.findByText("In a block still being checked")).toBeInTheDocument();
+  expect(screen.queryByText(/Canonical/)).not.toBeInTheDocument();
+  await user.click(view.container.querySelector(".back-button") as HTMLElement);
+
+  const held = { ...demoBlock(checking.latest_blocks[0]), validated_height: 158 };
+  vi.mocked(loadBlock).mockResolvedValueOnce(held);
+  await user.click(within(view.container.querySelector("#blocks") as HTMLElement).getAllByRole("row")[1]);
+  expect(await screen.findByRole("heading", { name: "Block #160" })).toBeInTheDocument();
+  expect(screen.getByText("Verifying")).toBeInTheDocument();
+  expect(screen.getByText(/this node is still re-executing its work/)).toBeInTheDocument();
+  expect(screen.queryByText(/Verified by consensus/)).not.toBeInTheDocument();
+});
+
+test("labels a transaction found by id from the validated height it carries", async () => {
+  const confirmed = demoSnapshot.recent_transactions.find((tx) => tx.block_height === 160)!;
+  for (const [validated_height, label] of [[159, "In a block still being checked"], [160, "Confirmed transaction"], [undefined, "Confirmed transaction"]] as const) {
+    vi.mocked(loadExplorer).mockResolvedValue({ data: demoSnapshot, preview: false });
+    vi.mocked(loadBlock).mockRejectedValueOnce(new ExplorerRequestError("block not found", 404));
+    vi.mocked(loadTransaction).mockResolvedValueOnce({ ...confirmed, validated_height });
+    const view = render(<App />);
+    await screen.findByRole("heading", { name: "Latest blocks" });
+    await userEvent.setup().type(screen.getByRole("textbox", { name: /Search block height/ }), confirmed.txid + "{Enter}");
+    expect(await screen.findByText(label)).toBeInTheDocument();
+    view.unmount();
+  }
+});
+
+test("shows no Verifying label once the validated height reaches the tip, or without it", async () => {
+  for (const validated of [160, null, undefined]) {
+    vi.mocked(loadExplorer).mockResolvedValue({ data: { ...demoSnapshot, validated_height: validated }, preview: false });
+    const view = render(<App />);
+    expect(await within(view.container).findByRole("heading", { name: "Latest blocks" })).toBeInTheDocument();
+    expect(within(view.container).queryByText("Verifying")).not.toBeInTheDocument();
+    expect(within(view.container).queryByText(/still checking/)).not.toBeInTheDocument();
+    view.unmount();
+  }
 });

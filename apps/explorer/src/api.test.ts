@@ -128,3 +128,48 @@ test("supports exact u128 totals without converting them through Number", async 
   const api = await import("./api");
   expect((await api.loadAddress(fixtureAddress)).confirmed_atoms).toBe((large + 1n).toString());
 });
+
+test("accepts a validated height beside unchanged statuses and bounds it by the answer's height", async () => {
+  const upstream = vi.fn(); vi.stubGlobal("fetch", upstream);
+  const api = await import("./api");
+  // demoTransactions: blocks 160 and 159 confirmed, one in the mempool.
+  const checking = { ...mainnetSnapshot, validated_height: 159 };
+  upstream.mockResolvedValueOnce(identified(checking));
+  expect((await api.loadExplorer()).data).toEqual(checking);
+  upstream.mockResolvedValueOnce(identified({ ...mainnetSnapshot, validated_height: null }));
+  expect((await api.loadExplorer()).data.validated_height).toBeNull();
+  for (const data of [
+    { ...mainnetSnapshot, validated_height: 161 },
+    { ...mainnetSnapshot, validated_height: -1 },
+    { ...mainnetSnapshot, validated_height: "159" },
+    // Nodes never send another status; it is rejected as before.
+    { ...checking, recent_transactions: demoTransactions.map((tx) => tx.block_height === 160 ? { ...tx, status: "verifying" } : tx) },
+  ]) {
+    upstream.mockResolvedValueOnce(identified(data));
+    await expect(api.loadExplorer()).rejects.toThrow("invalid data");
+  }
+
+  const block = demoBlock(demoSnapshot.latest_blocks[0]);
+  upstream.mockResolvedValueOnce(identified({ ...block, validated_height: 159 }));
+  expect((await api.loadBlock(block.block_id, false)).validated_height).toBe(159);
+  upstream.mockResolvedValueOnce(identified({ ...block, validated_height: block.height + block.confirmations }));
+  await expect(api.loadBlock(block.block_id, false)).rejects.toThrow("invalid data");
+
+  const found = { ...demoTransactions[0], validated_height: 159 };
+  upstream.mockResolvedValueOnce(identified(found));
+  expect(await api.loadTransaction(found.txid, false)).toEqual(found);
+  upstream.mockResolvedValueOnce(identified(demoTransactions[0]));
+  expect((await api.loadTransaction(found.txid, false)).validated_height).toBeUndefined();
+  for (const validated_height of [-1, 1.5, "159"]) {
+    upstream.mockResolvedValueOnce(identified({ ...found, validated_height }));
+    await expect(api.loadTransaction(found.txid, false)).rejects.toThrow("invalid data");
+  }
+  upstream.mockResolvedValueOnce(identified({ ...found, status: "verifying" }));
+  await expect(api.loadTransaction(found.txid, false)).rejects.toThrow("invalid data");
+
+  const page = { ...addressFixture(), validated_height: 90 };
+  upstream.mockResolvedValueOnce(identified(page));
+  expect(await api.loadAddress(fixtureAddress)).toEqual(page);
+  upstream.mockResolvedValueOnce(identified({ ...page, validated_height: 101 }));
+  await expect(api.loadAddress(fixtureAddress)).rejects.toThrow("invalid data");
+});

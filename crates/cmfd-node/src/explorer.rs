@@ -104,6 +104,15 @@ pub struct ExplorerTransaction {
     pub status: &'static str,
 }
 
+/// A transaction found by id, with the validated height it was read with.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ExplorerTransactionDetail {
+    #[serde(flatten)]
+    pub transaction: ExplorerTransaction,
+    /// As in [`ExplorerSnapshot::validated_height`].
+    pub validated_height: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ExplorerSnapshot {
     pub network: &'static str,
@@ -114,6 +123,10 @@ pub struct ExplorerSnapshot {
     pub proof_of_work: &'static str,
     pub tip: String,
     pub accepted_height: u64,
+    /// Every active block up to this height is pinned by the release or has
+    /// had its work re-executed by this node; blocks above it are still being
+    /// checked. `None` on a network without that rule.
+    pub validated_height: Option<u64>,
     pub expected_target: String,
     pub cumulative_work: String,
     pub utxo_count: usize,
@@ -131,6 +144,8 @@ pub struct ExplorerSnapshot {
 pub struct ExplorerBlockDetail {
     #[serde(flatten)]
     pub block: ExplorerBlock,
+    /// As in [`ExplorerSnapshot::validated_height`], read with this block.
+    pub validated_height: Option<u64>,
     pub coinbase_outputs: usize,
     pub transactions_detail: Vec<ExplorerTransaction>,
 }
@@ -159,6 +174,7 @@ impl Node {
         })();
         self.latch_authenticated_storage_failure(storage)?;
         let status = self.status()?;
+        let validated_height = self.work_validated_height();
         let mut recent_transactions = self
             .mempool
             .values()
@@ -204,6 +220,7 @@ impl Node {
             proof_of_work: status.proof_of_work,
             tip: status.tip,
             accepted_height: status.accepted_height,
+            validated_height,
             expected_target: status.expected_target,
             cumulative_work: status.cumulative_work,
             utxo_count: status.utxo_count,
@@ -282,6 +299,7 @@ impl Node {
         }
         let checked = self.read_explorer_block(block_id)?;
         let block = checked.block();
+        let validated_height = self.work_validated_height();
         let confirmations =
             u64::try_from(self.index.active_chain.len() - position).map_err(|_| {
                 NodeError::CorruptLog("explorer confirmation depth does not fit u64".to_owned())
@@ -302,6 +320,7 @@ impl Node {
             .collect::<Result<Vec<_>, NodeError>>()?;
         Ok(Some(ExplorerBlockDetail {
             block: block_summary(&checked, confirmations)?,
+            validated_height,
             coinbase_outputs: block.coinbase.outputs.len(),
             transactions_detail,
         }))
@@ -353,6 +372,20 @@ impl Node {
             None,
             encode_transaction(transaction)?.len(),
         )?))
+    }
+
+    /// [`explorer_transaction`](Self::explorer_transaction) with the
+    /// validated height, as the transaction route serves it.
+    pub fn explorer_transaction_detail(
+        &mut self,
+        query: &str,
+    ) -> Result<Option<ExplorerTransactionDetail>, NodeError> {
+        let transaction = self.explorer_transaction(query)?;
+        let validated_height = self.work_validated_height();
+        Ok(transaction.map(|transaction| ExplorerTransactionDetail {
+            transaction,
+            validated_height,
+        }))
     }
 
     fn resolve_active_block(&self, query: &str) -> Option<(usize, [u8; 32])> {
@@ -824,6 +857,113 @@ mod tests {
             Err(NodeError::CorruptLog(_))
         ));
         assert!(node.storage_faulted);
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn explorer_responses_carry_the_validated_height() {
+        use crate::work_gate::test_support::{ScriptedEngine, install, mark_verified};
+        use cmfd_consensus::ForgeMatrixV4WorkRule;
+
+        let path = test_dir("explorer-validated-height");
+        let mut node = Node::open(&path).unwrap();
+        let mut blocks: Vec<Block> = (0..3).map(|_| mine(&mut node)).collect();
+        let transaction = spend_coinbase_output(&node, &blocks[0], 1, 0x11, 0x31, 1);
+        let txid = hex::encode(transaction.txid());
+        node.submit_transaction(transaction).unwrap();
+        blocks.push(mine(&mut node));
+        let get_json = |node: &mut Node, target: String| -> serde_json::Value {
+            let response = route_rpc_request(
+                RpcRequest {
+                    method: "GET".to_owned(),
+                    target,
+                    content_type: None,
+                    body: Vec::new(),
+                },
+                node,
+            );
+            assert_eq!(response.status, 200);
+            serde_json::from_slice(&response.body).unwrap()
+        };
+        let transaction_target = format!("/v1/explorer/transaction/{txid}");
+        let status_of = |transactions: &[ExplorerTransaction]| {
+            transactions
+                .iter()
+                .find(|transaction| transaction.txid == txid)
+                .map(|transaction| transaction.status)
+        };
+        let address = hex::encode(crate::default_miner_destination());
+
+        // Without the rule there is no validated height.
+        let snapshot = node.explorer_snapshot().unwrap();
+        assert_eq!(snapshot.validated_height, None);
+        assert_eq!(status_of(&snapshot.recent_transactions), Some("confirmed"));
+        assert!(get_json(&mut node, "/v1/explorer".to_owned())["validated_height"].is_null());
+        let found = get_json(&mut node, transaction_target.clone());
+        assert!(found["validated_height"].is_null());
+        assert_eq!(found["status"], "confirmed");
+
+        // The rule arrives with the checkpoint at block 1, so blocks 2..=4
+        // are stored but not yet checked. Statuses stay as they were; the
+        // validated height alone tells a reader which blocks wait.
+        let rule = ForgeMatrixV4WorkRule::with_pinned_heights(1, blocks[0].block_id(), []).unwrap();
+        install(
+            &mut node,
+            Some(rule),
+            Some(ScriptedEngine::new(crate::honest_work::WorkEngineKind::Cpu)),
+            None,
+        );
+        // The summaries cached before the rule are reused as they are.
+        let reads = node.explorer_block_reads;
+        let snapshot = node.explorer_snapshot().unwrap();
+        assert_eq!(node.explorer_block_reads, reads);
+        assert_eq!(snapshot.accepted_height, 4);
+        assert_eq!(snapshot.validated_height, Some(1));
+        assert_eq!(status_of(&snapshot.recent_transactions), Some("confirmed"));
+        assert_eq!(
+            get_json(&mut node, "/v1/explorer".to_owned())["validated_height"],
+            1
+        );
+        let detail = node.explorer_block("4").unwrap().unwrap();
+        assert_eq!(detail.validated_height, Some(1));
+        assert_eq!(detail.block.confirmations, 1);
+        assert_eq!(status_of(&detail.transactions_detail), Some("confirmed"));
+        assert_eq!(
+            get_json(&mut node, "/v1/explorer/block/4".to_owned())["validated_height"],
+            1
+        );
+        let found = get_json(&mut node, transaction_target.clone());
+        assert_eq!(found["validated_height"], 1);
+        assert_eq!(found["status"], "confirmed");
+        assert_eq!(found["block_height"], 4);
+        let history = node.explorer_address(&address, None).unwrap();
+        assert_eq!(history.validated_height, Some(1));
+
+        // Once blocks 2..=4 are checked the same tip reports 4.
+        let tip = node.state.tip();
+        let reads_before = node.explorer_block_reads;
+        for height in 2..=4 {
+            let block_id = node.index.active_chain[height];
+            mark_verified(&node, height as u64, block_id);
+        }
+        let snapshot = node.explorer_snapshot().unwrap();
+        assert_eq!(node.state.tip(), tip);
+        assert_eq!(snapshot.validated_height, Some(4));
+        // The cached summaries were reused: the height is not cached.
+        assert_eq!(node.explorer_block_reads, reads_before);
+        let detail = node.explorer_block("4").unwrap().unwrap();
+        assert_eq!(detail.validated_height, Some(4));
+        assert_eq!(
+            get_json(&mut node, transaction_target)["validated_height"],
+            4
+        );
+        assert_eq!(
+            node.explorer_address(&address, None)
+                .unwrap()
+                .validated_height,
+            Some(4)
+        );
         drop(node);
         clean_test_dir(&path);
     }

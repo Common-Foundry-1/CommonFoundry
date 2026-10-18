@@ -40,6 +40,20 @@ but exclude the authoritative consensus UTXO set, proof bodies, disk history,
 verifier/model startup, HTTP service and other node state. They are not a
 promise of production node memory usage. Repeat measurements can vary.
 
+Since 1.0.16 each address-history entry also carries its activity facts
+(a 64-byte slot beside the 48-byte location), so address pages read no block
+bodies. The figures above predate that layout and were not re-measured. At
+this shape the facts add at least 2,473,360 x 64 bytes, about 151 MiB, before
+B-tree node slack, on every node, including wallets and pool nodes that do not
+serve explorer pages.
+
+After an upgrade from a format 1 index cache, the entries it held load as
+hints, and the history scrub's first pass also holds a copy of each hint (80
+bytes: address and location) grouped by block, plus vector and hash-map
+overhead. That is about 14 MiB at 181,000 entries and about 189 MiB at this
+shape before overhead. The copy shrinks as the pass fills blocks and is gone
+when the pass ends; later passes find no hints.
+
 The heavy fork-tail case still filters retained side-branch entries: 20 hot
 address-page lookups took 1.26-1.53 seconds total in the updated debug samples;
 100 transaction lookups across the fork tail took 0.27-0.33 seconds. This
@@ -135,6 +149,14 @@ block scanned/restored matching checkpoint state in 39 ms using the already
 initialized verifier. Verifier/model opening took 114.16 seconds and CPU block
 admission 9.48 seconds in that debug run. This verifies one genuine full-size
 block; 39 ms is not process startup or full-size fork-history performance.
+
+With 1.0.16's address facts, `preserved_full_v4_explorer_read_cost` (see
+`apps/explorer/README.md`) asserts that address pages read no blocks. It
+passed on 2026-10-17 at commit 6d8b4e9d (Windows debug, CPU only): ten pages
+for the key of the block's first coinbase output took 292 microseconds in
+total and read no blocks, while ten authenticated detail reads of the same 12,025,864-byte
+block took 0.89 seconds. Verifier opening took 95.9 seconds and CPU admission
+7.7 seconds. One block and method calls only, not HTTP throughput.
 
 ## What remains outside this evidence
 

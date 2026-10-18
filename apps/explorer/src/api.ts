@@ -1,7 +1,7 @@
 import { demoBlock, demoSnapshot, demoTransactions } from "./demoData";
-import type { ExplorerAddress, ExplorerBlockDetail, ExplorerSnapshot, ExplorerTransaction } from "./types";
+import type { ExplorerAddress, ExplorerBlockDetail, ExplorerSnapshot, ExplorerTransactionDetail } from "./types";
 import { MAINNET_NETWORK_ID, NETWORK_HEADER } from "../shared/network";
-import { isExplorerAddress, isExplorerBlockDetail, isExplorerSnapshot, isExplorerTransaction } from "./validation";
+import { isExplorerAddress, isExplorerBlockDetail, isExplorerSnapshot, isExplorerTransactionDetail } from "./validation";
 import { ADDRESS_HASH, isAddressCursor } from "../shared/address";
 
 export type ExplorerLoad = { data: ExplorerSnapshot; preview: boolean };
@@ -56,8 +56,8 @@ export async function loadBlock(query: string, preview: boolean): Promise<Explor
   return demoBlock(block);
 }
 
-export async function loadTransaction(query: string, preview: boolean): Promise<ExplorerTransaction> {
-  if (!preview) return fetchJson(`/v1/explorer/transaction/${encodeURIComponent(query)}`, isExplorerTransaction);
+export async function loadTransaction(query: string, preview: boolean): Promise<ExplorerTransactionDetail> {
+  if (!preview) return fetchJson(`/v1/explorer/transaction/${encodeURIComponent(query)}`, isExplorerTransactionDetail);
   if (MAINNET_MODE) throw new Error("Mainnet never uses preview transactions.");
   const transaction = demoTransactions.find((item) => item.txid === query);
   if (!transaction) throw new Error("Transaction not found in preview data.");

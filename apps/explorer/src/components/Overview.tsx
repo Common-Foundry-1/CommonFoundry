@@ -1,6 +1,7 @@
 import { Activity, Box, Boxes, Clock3, Database, Network, Pickaxe, Users } from "lucide-react";
 import { formatAge, formatAtoms, formatBytes, shortHash } from "../format";
 import type { ExplorerBlock, ExplorerSnapshot, ExplorerTransaction } from "../types";
+import { isAboveValidated } from "../validation";
 import { ForgeFlow } from "./ForgeFlow";
 
 type OverviewProps = {
@@ -12,9 +13,12 @@ type OverviewProps = {
 
 export function Overview({ snapshot, preview, onBlock, onTransaction }: OverviewProps) {
   const mempool = snapshot.recent_transactions.filter((tx) => tx.status === "mempool");
+  const validated = snapshot.validated_height;
+  const checking = isAboveValidated(snapshot.accepted_height, validated);
   return (
     <main>
       {preview && <div className="preview-banner">Preview data · connect a ProductionV4 node for live chain activity</div>}
+      {checking && <div className="preview-banner" role="status">This node is still checking blocks above #{validated?.toLocaleString()}. They are marked Verifying until it has re-executed their work.</div>}
       <section className="hero">
         <div><p className="eyebrow">ForgeMatrix network intelligence</p><h1>The chain, as it happens.</h1><p>Follow transactions from the mempool to the next forged block.</p></div>
         <div className="hero-mark" aria-hidden="true"><Pickaxe /><span>Proof<br />becomes<br />history.</span></div>
@@ -35,14 +39,14 @@ export function Overview({ snapshot, preview, onBlock, onTransaction }: Overview
           <div className="section-heading"><div><p className="eyebrow">Canonical history</p><h2>Latest blocks</h2></div><Boxes size={21} /></div>
           <div className="table-scroll"><table><thead><tr><th>Height</th><th>Block</th><th>Age</th><th className="numeric">Transactions</th><th className="numeric">Size</th></tr></thead>
             <tbody>{snapshot.latest_blocks.map((block) => <tr key={block.block_id} onClick={() => onBlock(block)} tabIndex={0} onKeyDown={(event) => event.key === "Enter" && onBlock(block)}>
-              <td className="height-cell">#{block.height}</td><td><code>{shortHash(block.block_id, 12, 8)}</code></td><td><Clock3 size={13} /> {formatAge(block.timestamp)}</td><td className="numeric">{block.transactions}</td><td className="numeric">{formatBytes(block.encoded_bytes)}</td>
+              <td className="height-cell">#{block.height}{isAboveValidated(block.height, validated) && <span className="verifying-tag">Verifying</span>}</td><td><code>{shortHash(block.block_id, 12, 8)}</code></td><td><Clock3 size={13} /> {formatAge(block.timestamp)}</td><td className="numeric">{block.transactions}</td><td className="numeric">{formatBytes(block.encoded_bytes)}</td>
             </tr>)}</tbody></table></div>
         </section>
 
         <section className="data-section transaction-rail" id="transactions">
           <div className="section-heading"><div><p className="eyebrow">Network movement</p><h2>Recent transactions</h2></div><Activity size={21} /></div>
           <div className="transaction-list">{snapshot.recent_transactions.map((transaction) => <button type="button" key={transaction.txid} onClick={() => onTransaction(transaction)}>
-            <span className={`status-mark ${transaction.status}`} /><div><code>{shortHash(transaction.txid, 11, 8)}</code><small>{transaction.inputs} inputs → {transaction.outputs} outputs</small></div><span><strong>{formatAtoms(transaction.output_atoms)}</strong><small>{transaction.status === "mempool" ? "In mempool" : transaction.timestamp ? formatAge(transaction.timestamp) : "Confirmed"}</small></span>
+            <span className={`status-mark ${isAboveValidated(transaction.block_height, validated) ? "verifying" : transaction.status}`} /><div><code>{shortHash(transaction.txid, 11, 8)}</code><small>{transaction.inputs} inputs → {transaction.outputs} outputs</small></div><span><strong>{formatAtoms(transaction.output_atoms)}</strong><small>{transaction.status === "mempool" ? "In mempool" : isAboveValidated(transaction.block_height, validated) ? "Verifying" : transaction.timestamp ? formatAge(transaction.timestamp) : "Confirmed"}</small></span>
           </button>)}</div>
         </section>
       </div>

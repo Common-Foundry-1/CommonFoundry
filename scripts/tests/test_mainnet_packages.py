@@ -179,9 +179,11 @@ class MainnetPackageTests(unittest.TestCase):
         self.assertEqual(arguments, ["mainnet-launch-info"])
         return packages.canonical(self.info)
 
-    def assemble(self, args, output=None, sources=None):
+    def assemble(self, args, output=None, sources=None, replay_pin=None):
+        replay_pin = replay_pin or hashlib.sha256(args.replay_worker.read_bytes()).hexdigest()
         with mock.patch.object(packages.integrity, "_require_native_runtime_platform"), \
              mock.patch.object(packages, "validate_review_ancestry"), \
+             mock.patch.object(packages, "release_replay_worker_sha256", return_value=replay_pin), \
              mock.patch.object(packages, "source_snapshot", side_effect=sources or self.sources), \
              mock.patch.object(packages, "native_output", side_effect=output or self.output):
             return packages.assemble(args)
@@ -404,6 +406,22 @@ class MainnetPackageTests(unittest.TestCase):
         args.version = "0.1.0-rc.5"
         with self.assertRaisesRegex(packages.Error, "mainnet version"):
             self.assemble(args)
+
+    def test_replay_worker_must_be_the_build_the_node_pins(self):
+        args = self.args()
+        with self.assertRaisesRegex(packages.Error, "replay worker is not the build pinned"):
+            self.assemble(args, replay_pin="0" * 64)
+        self.assertFalse((args.output / packages.package_names(args.platform, args.kind, args.version)[1]).exists())
+
+    def test_replay_worker_pin_is_read_from_the_node_source(self):
+        source = (self.repo / packages.REPLAY_WORKER_PIN_SOURCE).read_bytes()
+        self.assertEqual(packages.replay_worker_pin(source),
+                         "33ce76f3832e7703d5aa8200ed51acfe3becfcfb2c2b063886aaf1db5ab1f9f0")
+        constant = b"pub const PRODUCTION_V4_REPLAY_WORKER_SHA256: [u8; 32] = ["
+        for broken in (b"", source + source, constant + b"0x01, 0x02];",
+                       constant + b"0x01, " * 31 + b"0x02, x];"):
+            with self.subTest(broken=broken[:80]), self.assertRaises(packages.Error):
+                packages.replay_worker_pin(broken)
 
     def test_distinct_worker_roles_require_distinct_binary_content(self):
         args = self.args()

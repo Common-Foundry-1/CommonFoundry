@@ -665,11 +665,12 @@ fn bonus_scan_mark_restarts_below_a_reorganized_height_without_reversing_funding
         pool_wallet,
     );
     config.ledger_directory = Some(root.path().join("ledger"));
-    config.bonus_policy = Some(PoolBonusPolicy {
+    let policy = PoolBonusPolicy {
         rate_bps: 500,
         sponsor,
         scan_from_height: Some(funding_height),
-    });
+    };
+    config.bonus_policy = Some(policy);
     let server = spawn_pool_server(Arc::clone(&node), config).unwrap();
     for height in funding_height + 1..funding_height + POOL_BONUS_FUNDING_CONFIRMATIONS {
         mine(height);
@@ -721,17 +722,26 @@ fn bonus_scan_mark_restarts_below_a_reorganized_height_without_reversing_funding
             funding_height + POOL_BONUS_FUNDING_CONFIRMATIONS + 1
         );
         assert_ne!(node.active_block_id_at_height(funding_height), Some(marked));
-    }
 
-    // The mark's block is gone: the scan restarts COINBASE_MATURITY lower
-    // and catches up one pass per tick. The registered funding stays.
-    let restarted = server.ledger_snapshot().unwrap();
-    assert_eq!(
-        restarted.bonus_scanned_height,
-        Some(funding_height - COINBASE_MATURITY + POOL_BONUS_SCAN_BLOCKS_PER_PASS - 1)
-    );
-    assert_eq!(restarted.bonus_funding, funding);
-    assert_eq!(restarted.bonus_reserve_atoms, 6_000_000_000);
+        // The mark's block is gone: the scan restarts COINBASE_MATURITY lower
+        // and catches up one pass per tick. The registered funding stays.
+        // The reconcile thread runs its own pass after the tip change, and
+        // every pass holds the node lock, so these passes run under the lock
+        // the reorganization took: exactly one pass separates each check.
+        credit_bonus_funding(&server.shared.ledger, &mut node, policy).unwrap();
+        let restarted = snapshot_ledger(&server.shared.ledger).unwrap();
+        assert_eq!(
+            restarted.bonus_scanned_height,
+            Some(funding_height - COINBASE_MATURITY + POOL_BONUS_SCAN_BLOCKS_PER_PASS - 1)
+        );
+        assert_eq!(restarted.bonus_funding, funding);
+        assert_eq!(restarted.bonus_reserve_atoms, 6_000_000_000);
+        credit_bonus_funding(&server.shared.ledger, &mut node, policy).unwrap();
+        let caught_up = snapshot_ledger(&server.shared.ledger).unwrap();
+        assert_eq!(caught_up.bonus_scanned_height, Some(funding_height + 1));
+    }
+    // Further passes, the reconcile thread's included, leave the caught-up
+    // scan and the funding unchanged.
     let caught_up = server.ledger_snapshot().unwrap();
     assert_eq!(caught_up.bonus_scanned_height, Some(funding_height + 1));
     assert_eq!(caught_up.bonus_funding, funding);

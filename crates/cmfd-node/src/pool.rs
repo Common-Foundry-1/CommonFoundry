@@ -40,6 +40,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::honest_work::PoolReplayResult;
 use crate::{
     COMPILED_NETWORK_PROFILE, MAX_MINING_SEARCH_ATTEMPTS, MiningJob, NetworkProfile, Node,
     NodeError, ProofProfile, TransactionLocation, TransactionLookup, submit_shared_tip_block,
@@ -400,6 +401,10 @@ impl Default for PoolPayoutPolicy {
 pub struct ProductionV4PoolShareEvaluation {
     pub work_digest: [u8; 32],
     pub chain_proof: Option<BlockProof>,
+    /// With a chain proof: the block's final activation as this pool's own
+    /// replay worker produced it, handed to the node's work check. Only this
+    /// crate's replay verifier can fill it in.
+    pub replay: Option<PoolReplayResult>,
 }
 
 /// Pool-local accelerator boundary for ProductionV4 share verification.
@@ -3074,6 +3079,27 @@ struct SharedServer {
     production_v4_share_verifier: Option<Arc<dyn ProductionV4PoolShareVerifier>>,
     tls: Arc<ServerConfig>,
     startup_nonce: [u8; 32],
+    payout_pause: PayoutPause,
+}
+
+/// Whether pool payouts are waiting for coins in blocks this node has not
+/// finished checking, so that the wait is logged at warn once, when it
+/// starts, and at debug while it lasts. It ends when a payment can be
+/// prepared or no payout is due.
+#[derive(Debug, Default)]
+struct PayoutPause(AtomicBool);
+
+impl PayoutPause {
+    /// Records that payouts wait; whether this starts a pause.
+    fn begin(&self) -> bool {
+        !self.0.swap(true, Ordering::AcqRel)
+    }
+
+    /// Records that a payment could be prepared, or that none is due: a
+    /// pause is over.
+    fn end(&self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl SharedServer {
@@ -3717,6 +3743,7 @@ pub fn spawn_pool_server(
         production_v4_share_verifier: config.production_v4_share_verifier,
         tls,
         startup_nonce,
+        payout_pause: PayoutPause::default(),
     });
     reconcile_pool_blocks_with_recovery(&shared, true)?;
     reconcile_pool_payouts(&shared, true)?;
@@ -4465,6 +4492,12 @@ fn process_share(
         shared.pplns_policy,
     )?;
 
+    // The block's work check can use the pool's own replay of it instead of
+    // running it again: that result comes from the evaluation above, never
+    // from the block or the miner.
+    if let Some(replay) = evaluation.replay {
+        node.record_pool_replay(replay);
+    }
     // A ProductionV3 proof and side-branch reconstruction can take seconds.
     // Release the shared node before the bounded verifier worker runs; the
     // revision-bound helper rechecks the authoritative chain on commit.
@@ -4498,8 +4531,16 @@ fn process_share(
                     session,
                 });
             }
+            // A busy verifier, a work check that cannot run yet, and a halted
+            // node are all retried while the block still extends the tip: a
+            // found block is never discarded for those reasons.
             Err(
-                NodeError::ProofVerificationQueueFull | NodeError::ProofVerificationQueueTimeout,
+                error @ (NodeError::ProofVerificationQueueFull
+                | NodeError::ProofVerificationQueueTimeout
+                | NodeError::WorkCheckUnavailable
+                | NodeError::WorkCheckPending
+                | NodeError::WorkCheckRequired
+                | NodeError::WorkRuleHalted),
             ) => {
                 if shared.stop.load(Ordering::Acquire) {
                     if nonce_reserved {
@@ -4521,7 +4562,7 @@ fn process_share(
                     rotate_if_tip_changed(shared)?;
                     return rejected_result(shared, session_id, job_id, nonce, "stale_job");
                 }
-                thread::sleep(Duration::from_millis(10));
+                thread::sleep(pool_block_retry_pause(&error));
             }
             Err(error) if error.client_error().retryable => {
                 log_pool_block(&active, nonce, &format!("verifier_busy: {error}"), None);
@@ -4581,6 +4622,17 @@ fn log_pool_block(active: &ActiveJob, nonce: u64, outcome: &str, node_tip: Optio
         outcome,
         "pool block candidate"
     );
+}
+
+/// How long a found block waits before it is submitted again: briefly for a
+/// busy proof queue, longer while the block's work cannot be checked yet.
+fn pool_block_retry_pause(error: &NodeError) -> Duration {
+    match error {
+        NodeError::ProofVerificationQueueFull | NodeError::ProofVerificationQueueTimeout => {
+            Duration::from_millis(10)
+        }
+        _ => Duration::from_millis(250),
+    }
 }
 
 fn rejected_result(
@@ -5333,6 +5385,8 @@ fn reconcile_pool_payouts(shared: &SharedServer, create_new: bool) -> Result<(),
     for _ in 0..POOL_MAX_PAYOUTS_PER_TIP {
         payout_protection::check_funding(&shared.ledger, &node, policy.fee_atoms)?;
         let Some((payout, amount)) = next_payout_candidate(&shared.ledger, policy)? else {
+            // No payout waits: a pause is over.
+            shared.payout_pause.end();
             break;
         };
         let reserved_inputs = shared
@@ -5351,7 +5405,32 @@ fn reconcile_pool_payouts(shared: &SharedServer, create_new: bool) -> Result<(),
             policy.fee_atoms,
             &reserved_inputs,
         ) {
-            Ok(prepared) => prepared,
+            Ok(prepared) => {
+                shared.payout_pause.end();
+                prepared
+            }
+            Err(NodeError::WalletFundsVerifying {
+                verifying,
+                required,
+            }) => {
+                let validated_height = node.work_validated_height();
+                if shared.payout_pause.begin() {
+                    tracing::warn!(
+                        verifying,
+                        required,
+                        validated_height = ?validated_height,
+                        "pool payouts wait for coins in blocks this node has not finished checking"
+                    );
+                } else {
+                    tracing::debug!(
+                        verifying,
+                        required,
+                        validated_height = ?validated_height,
+                        "pool payouts still wait for coins in blocks this node has not finished checking"
+                    );
+                }
+                break;
+            }
             Err(
                 NodeError::WalletFundsImmature { .. }
                 | NodeError::WalletInsufficientFunds { .. }
@@ -6538,6 +6617,8 @@ impl fmt::Debug for PoolClient {
 struct VerifiedPoolShare {
     work_digest: [u8; 32],
     chain_proof: Option<BlockProof>,
+    /// The pool's own replay result for a chain-winning share.
+    replay: Option<PoolReplayResult>,
 }
 
 fn evaluate_pool_share(
@@ -6550,9 +6631,24 @@ fn evaluate_pool_share(
             let evaluation = active
                 .mining
                 .evaluate_share(nonce, active.wire.share_target)?;
+            // The pool computed this proof itself, so its final activation is
+            // the pool's own result for the block. No GPU worker computed it:
+            // worker 0 is nominal and it carries no known answer, so it is
+            // trusted only where a GPU engine has a ready worker 0 that
+            // reproduces one (the devnet tests' scripted engine). A Devnet
+            // node without a GPU engine never trusts it and runs the block.
+            let replay = match (&evaluation.proof, evaluation.meets_chain_target) {
+                (BlockProof::V2Reference(proof), true) => Some(PoolReplayResult::new(
+                    proof.challenge_digest,
+                    proof.final_activation_digest,
+                    0,
+                )),
+                _ => None,
+            };
             Ok(VerifiedPoolShare {
                 work_digest: evaluation.work_digest,
                 chain_proof: evaluation.meets_chain_target.then_some(evaluation.proof),
+                replay,
             })
         }
         ProofProfile::ProductionV3 => Err(PoolError::ProductionV3Unsupported),
@@ -6588,6 +6684,7 @@ fn verified_production_v4_share(
             Ok(VerifiedPoolShare {
                 work_digest: evaluation.work_digest,
                 chain_proof: Some(proof),
+                replay: evaluation.replay,
             })
         }
         (true, Some(_)) => Err(PoolError::ProductionV4ProofMismatch),
@@ -6596,6 +6693,7 @@ fn verified_production_v4_share(
         (false, None) => Ok(VerifiedPoolShare {
             work_digest: evaluation.work_digest,
             chain_proof: None,
+            replay: None,
         }),
     }
 }
@@ -7284,6 +7382,16 @@ fn decode_hex_32(value: &str) -> Result<[u8; 32], PoolError> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a_payout_pause_is_reported_once_until_a_payment_is_prepared() {
+        let pause = super::PayoutPause::default();
+        assert!(pause.begin(), "the first wait starts a pause");
+        assert!(!pause.begin());
+        assert!(!pause.begin());
+        pause.end();
+        assert!(pause.begin(), "a wait after a payment starts another");
+    }
+
+    #[test]
     fn expected_shares_per_block_is_the_work_ratio_of_the_targets() {
         use super::{expected_shares_per_block, target_with_leading_zero_bits};
         let block = target_with_leading_zero_bits(20);
@@ -7333,6 +7441,7 @@ mod tests {
     include!("pool_lifecycle_tests.rs");
     include!("pool_payout_protection_tests.rs");
     include!("pool_ledger_archive_tests.rs");
+    include!("pool_channel_close_tests.rs");
 
     #[derive(Debug)]
     struct FixedProductionV4ShareVerifier {
@@ -7402,21 +7511,25 @@ mod tests {
             Err(PoolError::ProductionV4Unsupported)
         ));
 
+        let replay = PoolReplayResult::new([4; 32], [5; 32], 2);
         let ordinary = FixedProductionV4ShareVerifier {
             evaluation: ProductionV4PoolShareEvaluation {
                 work_digest: [0xff; 32],
                 chain_proof: None,
+                replay: Some(replay),
             },
         };
         let ordinary =
             evaluate_production_v4_pool_share(Some(&ordinary), &template, 7, [0xff; 32]).unwrap();
         assert_eq!(ordinary.work_digest, [0xff; 32]);
         assert!(ordinary.chain_proof.is_none());
+        assert!(ordinary.replay.is_none(), "only a block's replay is kept");
 
         let missing = FixedProductionV4ShareVerifier {
             evaluation: ProductionV4PoolShareEvaluation {
                 work_digest: [0; 32],
                 chain_proof: None,
+                replay: None,
             },
         };
         assert!(matches!(
@@ -7428,6 +7541,7 @@ mod tests {
             evaluation: ProductionV4PoolShareEvaluation {
                 work_digest: [0; 32],
                 chain_proof: Some(test_proof([1; 32])),
+                replay: None,
             },
         };
         assert!(matches!(
@@ -7439,6 +7553,7 @@ mod tests {
             evaluation: ProductionV4PoolShareEvaluation {
                 work_digest: [0xff; 32],
                 chain_proof: Some(test_proof([0xff; 32])),
+                replay: None,
             },
         };
         assert!(matches!(
@@ -7450,11 +7565,13 @@ mod tests {
             evaluation: ProductionV4PoolShareEvaluation {
                 work_digest: [0; 32],
                 chain_proof: Some(test_proof([0; 32])),
+                replay: Some(replay),
             },
         };
         let winning =
             evaluate_production_v4_pool_share(Some(&winning), &template, 7, [0xff; 32]).unwrap();
         assert_eq!(winning.work_digest, [0; 32]);
+        assert_eq!(winning.replay, Some(replay));
         assert_eq!(winning.chain_proof.unwrap().work_digest(), [0; 32]);
     }
 
@@ -8659,6 +8776,7 @@ mod tests {
         Ok(ProductionV4PoolShareEvaluation {
             work_digest: [nonce as u8; 32],
             chain_proof: None,
+            replay: None,
         })
     }
 
@@ -9492,6 +9610,67 @@ mod tests {
     }
 
     #[test]
+    fn payouts_spend_checked_coins_while_the_pools_newest_block_waits_for_its_check() {
+        use crate::work_gate::test_support::{ScriptedEngine, install};
+        use cmfd_consensus::ForgeMatrixV4WorkRule;
+
+        let root = TestRoot::new("payout-unchecked-tip");
+        let node = Arc::new(Mutex::new(
+            Node::open_with_profile(root.path().join("node"), crate::DEVNET_PROFILE).unwrap(),
+        ));
+        let pool_wallet = node.lock().unwrap().wallet_destination();
+        let now = unix_time_seconds().unwrap();
+        for offset in 0..100 {
+            node.lock()
+                .unwrap()
+                .mine_once(pool_wallet, now + offset, 10_000)
+                .unwrap();
+        }
+        {
+            // Every block up to 99 is checked; block 100, like a stored block
+            // not checked yet after a restart or a catch-up, or while no
+            // engine is ready, waits for the background check.
+            let mut node = node.lock().unwrap();
+            let checkpoint = node.index.active_chain[99];
+            let rule = ForgeMatrixV4WorkRule::with_pinned_heights(99, checkpoint, []).unwrap();
+            install(
+                &mut node,
+                Some(rule),
+                Some(ScriptedEngine::new(crate::honest_work::WorkEngineKind::Cpu)),
+                None,
+            );
+            assert_eq!(node.work_validated_height(), Some(99));
+            assert!(node.wallet_history_cache.is_none());
+        }
+        let (certificate, key, _pin) = certificate(&root);
+        let mut config = PoolServerConfig::devnet(
+            "127.0.0.1:0".parse().unwrap(),
+            fs::read(certificate).unwrap(),
+            fs::read(key).unwrap(),
+            pool_wallet,
+        );
+        config.ledger_directory = Some(root.path().join("ledger"));
+        config.payout_policy = Some(PoolPayoutPolicy {
+            minimum_payout_atoms: 100,
+            fee_atoms: 1,
+        });
+        let server = spawn_pool_server(Arc::clone(&node), config).unwrap();
+        let recipient =
+            PoolPayoutSigner::new(SigningKey::from_bytes(&[0x62; 32]).unwrap()).payout();
+        register_session(&server.shared.ledger, 1, "worker".to_owned(), recipient).unwrap();
+        credit_accepted_share(&server.shared.ledger, 1, 120).unwrap();
+
+        // Block 1's coin, the mature one, is below the validated height, so
+        // the payout spends it although no wallet snapshot was taken.
+        reconcile_pool_payouts(&server.shared, true).unwrap();
+        let broadcast = server.ledger_snapshot().unwrap();
+        assert_eq!(broadcast.payout_transactions.len(), 1);
+        assert_eq!(broadcast.payout_transactions[0].state, "broadcast");
+        assert_eq!(broadcast.payout_transactions[0].amount_atoms, 120);
+        server.stop().unwrap();
+    }
+
+    #[test]
     fn stale_jobs_are_rejected_and_chain_valid_shares_submit_blocks() {
         let (_root, server, node, pin) = server("stale-and-block");
         let mut stale_client = client(server.local_addr(), pin, "stale-worker");
@@ -9524,6 +9703,119 @@ mod tests {
         let address = server.local_addr();
         server.stop().unwrap();
         assert!(TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn a_found_block_is_checked_against_the_pools_own_replay_of_it() {
+        use crate::honest_work::WorkEngineKind;
+        use crate::work_gate::test_support::{ScriptedEngine, install, provisional, recorded};
+
+        let (_root, server, node, pin) = server("work-check-own-replay");
+        let cpu = ScriptedEngine::new(WorkEngineKind::Cpu);
+        let gpu = ScriptedEngine::new(WorkEngineKind::Gpu);
+        install(
+            &mut node.lock().unwrap(),
+            None,
+            Some(cpu.clone()),
+            Some(gpu.clone()),
+        );
+        let known_answers = gpu.known_answer_calls();
+        let mut client = client(server.local_addr(), pin, "own-replay-worker");
+        let work = client.current_work().unwrap();
+        let height = work.job().challenge.height;
+        let nonce = find_share(&work, true);
+        let cmfd_consensus::BlockProof::V2Reference(proof) =
+            work.verifier.mine(&work.job().challenge, nonce, 1).unwrap()
+        else {
+            panic!("Devnet pool work carries a reference proof");
+        };
+        // Either engine would also find the block's work matches.
+        cpu.answer_challenge(proof.challenge_digest, proof.final_activation_digest);
+        gpu.answer_challenge(proof.challenge_digest, proof.final_activation_digest);
+        let accepted = client.submit_share(work.job().job_id, nonce).unwrap();
+        assert!(accepted.block_accepted);
+        // The pool's own result for its block is used: no engine runs the
+        // block, only one known answer on the replay worker that produced it.
+        assert_eq!((cpu.block_calls(), gpu.block_calls()), (0, 0));
+        assert_eq!(gpu.known_answer_calls(), known_answers + 1);
+        let node = node.lock().unwrap();
+        assert_eq!(recorded(&node), (1, 0));
+        // Provisional until this node's own engines run it.
+        assert_eq!(provisional(&node), vec![(height, node.state.tip())]);
+        drop(node);
+        server.stop().unwrap();
+    }
+
+    #[test]
+    fn a_found_block_is_kept_while_its_work_check_is_unavailable() {
+        use crate::honest_work::{WorkEngineError, WorkEngineKind};
+        use crate::work_gate::test_support::{ScriptedEngine, install, recorded};
+
+        let (_root, server, node, pin) = server("work-check-retry");
+        let engine = ScriptedEngine::new(WorkEngineKind::Cpu);
+        install(&mut node.lock().unwrap(), None, Some(engine.clone()), None);
+        let mut client = client(server.local_addr(), pin, "work-check-worker");
+        let work = client.current_work().unwrap();
+        let nonce = find_share(&work, true);
+        let cmfd_consensus::BlockProof::V2Reference(proof) =
+            work.verifier.mine(&work.job().challenge, nonce, 1).unwrap()
+        else {
+            panic!("Devnet pool work carries a reference proof");
+        };
+        assert_eq!(proof.nonce, nonce);
+        engine.answer_challenge(proof.challenge_digest, proof.final_activation_digest);
+        // The first two checks cannot run; the pool retries while the block
+        // still extends the tip instead of discarding it.
+        engine.fail_next(WorkEngineError::Busy);
+        engine.fail_next(WorkEngineError::Busy);
+        let accepted = client.submit_share(work.job().job_id, nonce).unwrap();
+        assert!(accepted.accepted);
+        assert!(accepted.block_accepted);
+        assert_eq!(accepted.code, "block_accepted");
+        assert_eq!(engine.block_calls(), 3);
+        assert_eq!(recorded(&node.lock().unwrap()), (1, 0));
+        assert_eq!(server.ledger_snapshot().unwrap().pool_blocks, 1);
+        server.stop().unwrap();
+    }
+
+    #[test]
+    fn a_found_block_is_kept_while_admission_is_halted() {
+        use crate::honest_work::WorkEngineKind;
+        use crate::work_gate::test_support::{ScriptedEngine, install, recorded, set_halted};
+
+        let (_root, server, node, pin) = server("work-check-halted");
+        let engine = ScriptedEngine::new(WorkEngineKind::Cpu);
+        {
+            let mut node = node.lock().unwrap();
+            install(&mut node, None, Some(engine.clone()), None);
+            set_halted(&node, true);
+        }
+        let mut client = client(server.local_addr(), pin, "work-check-halted-worker");
+        let work = client.current_work().unwrap();
+        let nonce = find_share(&work, true);
+        let cmfd_consensus::BlockProof::V2Reference(proof) =
+            work.verifier.mine(&work.job().challenge, nonce, 1).unwrap()
+        else {
+            panic!("Devnet pool work carries a reference proof");
+        };
+        engine.answer_challenge(proof.challenge_digest, proof.final_activation_digest);
+        let job_id = work.job().job_id;
+        let submission = thread::spawn(move || client.submit_share(job_id, nonce).unwrap());
+        thread::sleep(Duration::from_secs(1));
+        assert!(
+            !submission.is_finished(),
+            "the found block is still retried"
+        );
+        assert_eq!(engine.block_calls(), 0);
+
+        set_halted(&node.lock().unwrap(), false);
+        let accepted = submission.join().unwrap();
+        assert!(accepted.accepted);
+        assert!(accepted.block_accepted);
+        assert_eq!(engine.block_calls(), 1);
+        assert_eq!(recorded(&node.lock().unwrap()), (1, 0));
+        assert_eq!(server.ledger_snapshot().unwrap().pool_blocks, 1);
+        server.stop().unwrap();
     }
 
     #[test]

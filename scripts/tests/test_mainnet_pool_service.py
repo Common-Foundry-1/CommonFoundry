@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -138,15 +139,16 @@ class MainnetPoolServiceTests(unittest.TestCase):
         self.assertNotIn("/var/lib/commonfoundry-pool-public", " ".join(command))
 
     def test_optional_relays_become_additional_static_peers(self):
-        self.config["mainnet_relays"] = ["1.1.1.1:29444", "[2606:4700:4700::1111]:29444"]
+        self.config["mainnet_relays"] = ["1.1.1.1:29444", "[2606:4700:4700::1111]:29444", "8.8.8.8:29454"]
         self.save_config()
         config, _, _ = self.preflight()
         with mock.patch.object(pool, "CONFIG_BASE", self.config_base):
             command = pool.build_command(self.root, self.state, self.credential_base, config)
         peers = [command[index + 1] for index, argument in enumerate(command) if argument == "--peer"]
-        self.assertEqual(peers, ["9.9.9.9:29444", "1.1.1.1:29444", "[2606:4700:4700::1111]:29444"])
+        self.assertEqual(peers, ["9.9.9.9:29444", "1.1.1.1:29444", "[2606:4700:4700::1111]:29444", "8.8.8.8:29454"])
         for bad in (["1.1.1.1:29445"], ["9.9.9.9:29444"], ["1.1.1.1:29444"] * 2,
-                    ["127.0.0.1:29444"], ["203.0.113.5:29444"], "1.1.1.1:29444", []):
+                    ["127.0.0.1:29444"], ["203.0.113.5:29444"], "1.1.1.1:29444", [],
+                    ["1.1.1.1:29446"], ["127.0.0.1:29454"]):
             self.config["mainnet_relays"] = bad
             self.save_config()
             with self.assertRaisesRegex(pool.PreflightError, "mainnet_relays"):
@@ -281,6 +283,15 @@ class MainnetPoolServiceTests(unittest.TestCase):
         self.assertEqual(command[command.index("--pool-bonus-rate-bps") + 1], "1000")
         self.assertEqual(command[command.index("--pool-bonus-sponsor") + 1], sponsor)
         self.assertNotIn("--pool-bonus-scan-from-height", command)
+        # A checksummed mainnet address is passed to cmfd-node, which checks it.
+        checksummed = "cmfd10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vq4yhywr"
+        self.config["bonus_sponsor"] = checksummed
+        self.save_config()
+        config, _, _ = self.preflight()
+        with mock.patch.object(pool, "CONFIG_BASE", self.config_base):
+            command = pool.build_command(self.root, self.state, self.credential_base, config)
+        self.assertEqual(command[command.index("--pool-bonus-sponsor") + 1], checksummed)
+        self.config["bonus_sponsor"] = sponsor
         self.config["bonus_scan_from_height"] = 0
         self.save_config()
         config, _, _ = self.preflight()
@@ -299,7 +310,8 @@ class MainnetPoolServiceTests(unittest.TestCase):
             with self.assertRaisesRegex(pool.PreflightError, "bonus_rate_bps"):
                 self.preflight()
         self.config["bonus_rate_bps"] = 1000
-        for bad in ("AB" * 32, "ab" * 31, "zz" * 32, 1, None):
+        for bad in ("AB" * 32, "ab" * 31, "zz" * 32, 1, None,
+                    "tcmfd10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vq236tfw", "cmfd10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vq4yhyw"):
             self.config["bonus_sponsor"] = bad
             self.save_config()
             with self.assertRaisesRegex(pool.PreflightError, "bonus_sponsor"):
@@ -329,6 +341,175 @@ class MainnetPoolServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(pool.PreflightError, "expected_proof_worker_sha256"):
             self.preflight()
 
+    def fresh_config(self):
+        self.config[pool.PREVIOUS_RC_FIELD] = False
+        for field in pool.RC_FILE_HASH_FIELDS:
+            self.config[field] = None
+        self.save_config()
+
+    def test_fresh_install_preflight_and_restart_without_rc_files(self):
+        self.fresh_config()
+        config, data, _scratch = self.preflight()
+        self.assertIsNone(config["forbidden_rc_private_key_sha256"])
+        self.assertIsNone(config["forbidden_rc_wallet_file_sha256"])
+        with mock.patch.object(pool, "CONFIG_BASE", self.config_base):
+            command = pool.build_command(self.root, self.state, self.credential_base, config)
+        self.assertIn("--enable-mainnet-payouts", command)
+        self.assertNotIn("None", command)
+        pool.write_marker(self.state, config)
+        marker = json.loads((self.state / "mainnet-pool-deployment.json").read_text())
+        self.assertIs(marker[pool.PREVIOUS_RC_FIELD], False)
+        data.mkdir()
+        (data / "wallet.key").write_bytes(b"new encrypted mainnet wallet fixture")
+        self.preflight()
+
+    def test_rc_mode_must_be_an_explicit_boolean_if_present(self):
+        for value in (None, 0, 1, "false", "true", [], {},
+                      "SET_false_IF_YOU_NEVER_RAN_AN_RC_POOL_ELSE_true"):
+            with self.subTest(value=value):
+                config = dict(self.config, has_previous_rc_installation=value)
+                with self.assertRaisesRegex(pool.PreflightError, "must be true or false"):
+                    pool.validate_config(config)
+
+    def test_default_and_explicit_rc_mode_still_require_rc_file_hashes(self):
+        for mode in ("omitted", True):
+            for field in sorted(pool.RC_FILE_HASH_FIELDS):
+                for value in (None, "SET_FROM_EXISTING_RC_KEY_OFFLINE",
+                              "SET_FROM_EXISTING_RC_WALLET_OFFLINE", "", "0" * 64, "AB" * 32):
+                    with self.subTest(mode=mode, field=field, value=value):
+                        config = dict(self.config)
+                        if mode is True:
+                            config[pool.PREVIOUS_RC_FIELD] = True
+                        config[field] = value
+                        # The message points a new operator at the fresh-install setting.
+                        with self.assertRaisesRegex(pool.PreflightError,
+                                                    f"{field} must be a final lowercase SHA-256.*"
+                                                    "set has_previous_rc_installation to false "
+                                                    "if you never ran an RC pool"):
+                            pool.validate_config(config)
+        with self.assertRaises(pool.PreflightError) as refused:
+            pool.validate_config(dict(self.config, forbidden_rc_certificate_sha256=None))
+        self.assertNotIn("has_previous_rc_installation", str(refused.exception))
+        pool.validate_config(dict(self.config, has_previous_rc_installation=True))
+        pool.validate_config(self.config)
+
+    def test_fresh_mode_refuses_rc_file_hashes_it_declares_absent(self):
+        # Declaring "no previous RC installation" while also giving an RC file
+        # hash is contradictory: refuse instead of picking one of the two.
+        self.fresh_config()
+        rc_wallet = digest(b"real encrypted RC wallet")
+        for field in sorted(pool.RC_FILE_HASH_FIELDS):
+            for value in ("3" * 64, rc_wallet, digest(b""), "0" * 64, "",
+                          "SET_FROM_EXISTING_RC_KEY_OFFLINE", "none", "null", False):
+                with self.subTest(field=field, value=value):
+                    config = dict(self.config)
+                    config[field] = value
+                    with self.assertRaisesRegex(pool.PreflightError,
+                                                f"{field} must be null when has_previous_rc_installation is false"):
+                        pool.validate_config(config)
+        self.config["forbidden_rc_wallet_file_sha256"] = rc_wallet
+        self.save_config()
+        with self.assertRaisesRegex(pool.PreflightError, "must be null"):
+            self.preflight()
+
+    def test_fresh_mode_still_requires_every_field_to_be_present(self):
+        self.fresh_config()
+        for field in sorted(pool.RC_FILE_HASH_FIELDS | {"forbidden_rc_certificate_sha256"}):
+            with self.subTest(field=field):
+                config = dict(self.config)
+                del config[field]
+                with self.assertRaisesRegex(pool.PreflightError, "incomplete"):
+                    pool.validate_config(config)
+
+    def test_fresh_mode_keeps_expected_hash_and_known_certificate_checks(self):
+        self.fresh_config()
+        for field in set(pool.HASH_FIELDS) - pool.RC_FILE_HASH_FIELDS:
+            for value in (None, "SET_FROM_SIGNED_MAINNET_PACKAGE"):
+                config = dict(self.config)
+                config[field] = value
+                with self.subTest(field=field, value=value), \
+                        self.assertRaisesRegex(pool.PreflightError, field):
+                    pool.validate_config(config)
+        config = dict(self.config, expected_tls_certificate_sha256=pool.RC_CERTIFICATE_SHA256)
+        with self.assertRaisesRegex(pool.PreflightError, "TLS material|known AI01"):
+            pool.validate_config(config)
+        # The reuse check on its own, apart from the built-in AI01 certificate check.
+        rc_certificate = digest(b"another RC pool certificate")
+        config = dict(self.config, forbidden_rc_certificate_sha256=rc_certificate,
+                      expected_tls_certificate_sha256=rc_certificate)
+        with self.assertRaisesRegex(pool.PreflightError, "TLS material must not reuse RC material"):
+            pool.validate_config(config)
+
+    def test_fresh_mode_still_verifies_new_private_key_and_worker_bytes(self):
+        self.fresh_config()
+        (self.credential_base / "pool-private-key").write_bytes(b"changed key fixture")
+        with self.assertRaisesRegex(pool.PreflightError, "mainnet TLS private key SHA-256"):
+            self.preflight()
+        (self.credential_base / "pool-private-key").write_bytes(b"fresh mainnet private key")
+        (self.root / "production-v4/real_bank0_relations").write_bytes(b"changed worker")
+        with self.assertRaisesRegex(pool.PreflightError, "proof worker SHA-256"):
+            self.preflight()
+
+    def test_fresh_mode_does_not_allow_preexisting_unmarked_data(self):
+        self.fresh_config()
+        data = self.state / "data"
+        data.mkdir()
+        (data / "wallet.key").write_bytes(b"preexisting wallet fixture")
+        with self.assertRaisesRegex(pool.PreflightError, "empty fresh data"):
+            self.preflight()
+
+    def test_existing_migration_marker_cannot_be_downgraded_to_fresh(self):
+        pool.write_marker(self.state, self.config)
+        original = (self.state / "mainnet-pool-deployment.json").read_bytes()
+        self.fresh_config()
+        with self.assertRaisesRegex(pool.PreflightError, "has_previous_rc_installation setting"):
+            self.preflight()
+        self.assertEqual((self.state / "mainnet-pool-deployment.json").read_bytes(), original)
+
+    def test_fresh_marker_cannot_silently_switch_to_migration_mode(self):
+        legacy = dict(self.config)
+        self.fresh_config()
+        pool.write_marker(self.state, self.config)
+        for config in (legacy, dict(legacy, has_previous_rc_installation=True)):
+            with self.subTest(config=config.get(pool.PREVIOUS_RC_FIELD, "omitted")):
+                self.config = config
+                self.save_config()
+                with self.assertRaisesRegex(pool.PreflightError, "has_previous_rc_installation setting"):
+                    self.preflight()
+
+    def test_existing_marker_bytes_are_unchanged_by_the_rc_setting(self):
+        # Pools already running have markers without the new field; an explicit
+        # true (or leaving it out) must keep matching them byte for byte.
+        legacy = (json.dumps({"schema": pool.MARKER_SCHEMA,
+                              "plan_digest": self.config["expected_plan_digest"],
+                              "network_id": self.config["expected_network_id"],
+                              "certificate_sha256": self.config["expected_tls_certificate_sha256"]},
+                             sort_keys=True, separators=(",", ":")) + "\n").encode()
+        marker = self.state / "mainnet-pool-deployment.json"
+        for config in (self.config, dict(self.config, has_previous_rc_installation=True)):
+            with self.subTest(config=config.get(pool.PREVIOUS_RC_FIELD, "omitted")):
+                pool.write_marker(self.state, config)
+                self.assertEqual(marker.read_bytes(), legacy)
+                self.config = config
+                self.save_config()
+                self.preflight()
+                marker.unlink()
+
+    def test_shipped_example_needs_an_explicit_rc_choice(self):
+        example = pool.strict_json((SOURCE / "mainnet-pool.json.example").read_bytes(), "example")
+        self.assertEqual(set(example), pool.CONFIG_FIELDS | {pool.PREVIOUS_RC_FIELD})
+        with self.assertRaises(pool.PreflightError):
+            pool.validate_config(example)
+        # Fill every other placeholder; the RC choice placeholder is still refused.
+        filled = dict(self.config, **{field: example[field] for field in
+                                      (pool.PREVIOUS_RC_FIELD, *pool.RC_FILE_HASH_FIELDS,
+                                       "forbidden_rc_certificate_sha256")})
+        with self.assertRaisesRegex(pool.PreflightError, "must be true or false"):
+            pool.validate_config(filled)
+        pool.validate_config(dict(filled, has_previous_rc_installation=False))
+        with self.assertRaisesRegex(pool.PreflightError, "forbidden_rc_private_key_sha256 must be a final"):
+            pool.validate_config(dict(filled, has_previous_rc_installation=True))
+
     def test_payout_threshold_and_fee_must_match_mainnet_plan(self):
         self.config["minimum_payout_atoms"] = 1
         self.save_config()
@@ -341,25 +522,45 @@ class MainnetPoolServiceTests(unittest.TestCase):
             self.preflight()
 
     def test_reused_rc_certificate_or_private_key_rejected(self):
-        self.config["expected_tls_certificate_sha256"] = pool.RC_CERTIFICATE_SHA256
-        with self.assertRaisesRegex(pool.PreflightError, "TLS material|known AI01"):
-            pool.validate_config(self.config)
-        self.config["expected_tls_certificate_sha256"] = digest(b"fresh mainnet certificate")
-        self.config["forbidden_rc_private_key_sha256"] = self.config["expected_tls_private_key_sha256"]
-        with self.assertRaisesRegex(pool.PreflightError, "TLS material"):
-            pool.validate_config(self.config)
+        # An RC migration now usually says has_previous_rc_installation: true;
+        # it must keep exactly the checks of a configuration without the field.
+        for mode in ("omitted", True):
+            with self.subTest(mode=mode):
+                config = dict(self.config)
+                if mode is True:
+                    config[pool.PREVIOUS_RC_FIELD] = True
+                config["expected_tls_certificate_sha256"] = pool.RC_CERTIFICATE_SHA256
+                with self.assertRaisesRegex(pool.PreflightError, "TLS material|known AI01"):
+                    pool.validate_config(config)
+                rc_certificate = digest(b"another RC pool certificate")
+                config["forbidden_rc_certificate_sha256"] = rc_certificate
+                config["expected_tls_certificate_sha256"] = rc_certificate
+                with self.assertRaisesRegex(pool.PreflightError, "TLS material"):
+                    pool.validate_config(config)
+                config["forbidden_rc_certificate_sha256"] = pool.RC_CERTIFICATE_SHA256
+                config["expected_tls_certificate_sha256"] = digest(b"fresh mainnet certificate")
+                config["forbidden_rc_private_key_sha256"] = config["expected_tls_private_key_sha256"]
+                with self.assertRaisesRegex(pool.PreflightError, "TLS material"):
+                    pool.validate_config(config)
 
     def test_copied_rc_wallet_or_existing_unmarked_data_rejected(self):
         data = self.state / "data"
-        data.mkdir()
-        (data / "wallet.key").write_bytes(b"copied encrypted RC wallet")
-        self.config["forbidden_rc_wallet_file_sha256"] = digest(b"copied encrypted RC wallet")
-        self.save_config()
-        with self.assertRaisesRegex(pool.PreflightError, "empty fresh data"):
-            self.preflight()
-        pool.write_marker(self.state, self.config)
-        with self.assertRaisesRegex(pool.PreflightError, "RC encrypted wallet"):
-            self.preflight()
+        marker = self.state / "mainnet-pool-deployment.json"
+        for mode in ("omitted", True):
+            with self.subTest(mode=mode):
+                shutil.rmtree(data, ignore_errors=True)
+                marker.unlink(missing_ok=True)
+                data.mkdir()
+                (data / "wallet.key").write_bytes(b"copied encrypted RC wallet")
+                self.config["forbidden_rc_wallet_file_sha256"] = digest(b"copied encrypted RC wallet")
+                if mode is True:
+                    self.config[pool.PREVIOUS_RC_FIELD] = True
+                self.save_config()
+                with self.assertRaisesRegex(pool.PreflightError, "empty fresh data"):
+                    self.preflight()
+                pool.write_marker(self.state, self.config)
+                with self.assertRaisesRegex(pool.PreflightError, "RC encrypted wallet"):
+                    self.preflight()
 
     def test_changed_plan_worker_and_model_are_rejected(self):
         self.plan["launch_plan_digest"] = "5" * 64
@@ -515,8 +716,10 @@ class MainnetPoolServiceTests(unittest.TestCase):
         self.assertIn("mainnet-launch-info", unit)
         self.assertIn("LoadCredential=wallet-passphrase:/etc/commonfoundry-mainnet-pool/", unit)
         self.assertIn("RuntimeDirectoryMode=0700", unit)
-        for name in ("wallet-passphrase", "pool-private-key"):
-            copy = (f"ExecStartPre=/usr/bin/install --mode=0600 %d/{name} "
+        self.assertIn("RestartPreventExitStatus=3 4\n", unit)
+        for name, source in (("wallet-passphrase", "wallet-passphrase"), ("pool-private-key", "pool-key.der")):
+            copy = ("ExecStartPre=+/usr/bin/install --mode=0600 --owner=commonfoundry-mainnet-pool "
+                    f"--group=commonfoundry-mainnet-pool /etc/commonfoundry-mainnet-pool/{source} "
                     f"/run/commonfoundry-mainnet-pool/{name}")
             self.assertIn(copy, unit)
             self.assertLess(unit.index("cmfd-node mainnet-launch-info"), unit.index(copy))

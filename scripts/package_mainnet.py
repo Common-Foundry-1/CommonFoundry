@@ -51,6 +51,8 @@ PLAN_DOMAIN = b"CMFD/MAINNET/LAUNCH-PLAN/V2\0"
 NETWORK_DOMAIN = "CMFD/MAINNET/NETWORK-ID/V2"
 DASHBOARD_MANIFEST = "production-mainnet/DASHBOARD-ASSETS.json"
 CUDA_RUNTIME = "lib/libcudart.so.12"
+# The node only checks blocks on a replay worker with this compiled SHA-256.
+REPLAY_WORKER_PIN_SOURCE = "crates/cmfd-node/release_gate.rs"
 MAX_DASHBOARD_FILES = 128
 MAX_DASHBOARD_FILE_BYTES = 16 * 1024 * 1024
 MAX_DASHBOARD_BYTES = 64 * 1024 * 1024
@@ -465,6 +467,21 @@ def source_snapshot(repo: Path, commit: str, sources: dict[str, str], version: s
             int(integrity._run_git(repo, "show", "-s", "--format=%ct", commit)))
 
 
+def replay_worker_pin(source: bytes) -> str:
+    """The replay worker SHA-256 compiled into the node, from release_gate.rs."""
+    found = re.findall(rb"pub const PRODUCTION_V4_REPLAY_WORKER_SHA256: \[u8; 32\] = \[([^\]]*)\];", source)
+    if len(found) != 1:
+        raise Error("the node's release replay worker pin was not found exactly once")
+    values = re.findall(rb"0x([0-9a-fA-F]{2})", found[0])
+    if len(values) != 32 or re.sub(rb"0x[0-9a-fA-F]{2}|[\s,]", b"", found[0]):
+        raise Error("the node's release replay worker pin is not 32 bytes")
+    return bytes(int(value, 16) for value in values).hex()
+
+
+def release_replay_worker_sha256(repo: Path, commit: str) -> str:
+    return replay_worker_pin(integrity._tracked_blob_at(repo, commit, REPLAY_WORKER_PIN_SOURCE))
+
+
 def copy_executable(source: Path, target: Path, platform: str) -> None:
     integrity._regular_file(source, "input executable")
     original = file_identity(source)
@@ -564,6 +581,10 @@ def assemble(args: argparse.Namespace) -> Path:
             copy_executable(source, stage / (role + extension), args.platform)
         worker_root = stage / "production-v4" if args.kind == "runtime" else stage
         copy_executable(args.replay_worker, worker_root / "cmfd-v4-replay", "linux-x86_64")
+        # A pool checks blocks on its replay workers only when they run the
+        # build the node pins; any other worker leaves block checks to the CPU.
+        if file_identity(worker_root / "cmfd-v4-replay")["sha256"] != release_replay_worker_sha256(args.repo, commit):
+            raise Error(f"the replay worker is not the build pinned in {REPLAY_WORKER_PIN_SOURCE}")
         copy_executable(args.relation_worker, worker_root / "real_bank0_relations", "linux-x86_64")
         before = {path.relative_to(stage).as_posix(): file_identity(path) for path in stage.rglob("*") if path.is_file()}
         executable_names = [role + extension for role in binaries] + [

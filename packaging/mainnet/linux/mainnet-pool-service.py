@@ -25,6 +25,8 @@ RUNTIME = Path("/run/commonfoundry-mainnet-pool")
 CONFIG_BASE = Path("/etc/commonfoundry-mainnet-pool")
 RC_CERTIFICATE_SHA256 = "a4868a78e9d4d46bbb3c7867bd43bacbb4e8bb0a0ac61e54444b16250d525dc0"
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
+# Shape of a mainnet checksummed address; cmfd-node checks the checksum and key.
+MAINNET_ADDRESS = re.compile(r"(?:cmfd1|CMFD1)[0-9A-Za-z]{58}\Z")
 GPU_UUID = re.compile(r"GPU-[0-9a-fA-F-]{36}\Z")
 SCHEMA = "CommonFoundry/MainnetPoolService/v1"
 MARKER_SCHEMA = "CommonFoundry/MainnetPoolDeployment/v1"
@@ -40,6 +42,10 @@ HASH_FIELDS = (
     "expected_tls_private_key_sha256", "forbidden_rc_certificate_sha256",
     "forbidden_rc_private_key_sha256", "forbidden_rc_wallet_file_sha256",
 )
+# Hashes of an operator's own RC pool private key and encrypted wallet file. A new
+# operator with no RC installation has none: see PREVIOUS_RC_FIELD.
+RC_FILE_HASH_FIELDS = {"forbidden_rc_private_key_sha256", "forbidden_rc_wallet_file_sha256"}
+PREVIOUS_RC_FIELD = "has_previous_rc_installation"
 NUMBER_FIELDS = {
     "worker_threads": (1, 96), "share_leading_zero_bits": (0, 7),
     "minimum_payout_atoms": (1, 2**64 - 1),
@@ -49,7 +55,8 @@ NUMBER_FIELDS = {
 CONFIG_FIELDS = {"schema", "public_numeric_ip", "private_bind_ip", "mainnet_seed",
                  "gpu_uuid", "automatic_payouts", *HASH_FIELDS, *NUMBER_FIELDS}
 # Optional: relay nodes the pool also treats as static peers (announced to first,
-# compressed block frames). Same numeric IP:29444 form as mainnet_seed.
+# compressed block frames). Numeric IP:29444 for relays, or IP:29454 for another
+# pool's P2P listener.
 # Optional: proof pruning window (newest full blocks kept), as `--prune-keep-blocks`.
 # Optional: largest pool ledger snapshot in bytes, as `--pool-ledger-max-bytes`
 # (node default 64 MiB; large pools outgrow it).
@@ -67,14 +74,20 @@ CONFIG_FIELDS = {"schema", "public_numeric_ip", "private_bind_ip", "mainnet_seed
 # Optional: miner connection limits, as `--pool-max-connections` (node default 256,
 # up to 4096) and `--pool-max-connections-per-source` (node default 64, up to 256).
 # Optional: sponsor-funded bonus reserve, as `--pool-bonus-rate-bps` (1 to 10000)
-# with `--pool-bonus-sponsor` (the sponsor's 64-hex x-only key); both or neither.
+# with `--pool-bonus-sponsor` (the sponsor's cmfd1... address or 64-hex x-only
+# key); both or neither.
 # `bonus_scan_from_height` (`--pool-bonus-scan-from-height`) needs both and only
 # matters until the ledger has its first bonus scan mark.
+# Optional: `has_previous_rc_installation` (true/false, default true). false declares a
+# new operator with no RC pool key or wallet; the two RC_FILE_HASH_FIELDS must then be
+# null, and the declaration is bound into the deployment marker. true or left out
+# requires real hashes of the old RC files.
 OPTIONAL_FIELDS = {"mainnet_relays", "prune_keep_blocks", "pool_ledger_max_bytes",
                    "share_batch_size", "share_batch_wait_ms", "replay_gpus",
                    "max_connections", "max_connections_per_source", "proof_gpu",
                    "proof_resident_banks",
-                   "bonus_rate_bps", "bonus_sponsor", "bonus_scan_from_height"}
+                   "bonus_rate_bps", "bonus_sponsor", "bonus_scan_from_height",
+                   PREVIOUS_RC_FIELD}
 MIN_PRUNE_KEEP_BLOCKS = 288
 MIN_POOL_LEDGER_MAX_BYTES = 1024 * 1024
 MAX_POOL_LEDGER_MAX_BYTES = 1024 * 1024 * 1024
@@ -167,23 +180,24 @@ def parse_numeric_ip(value: object, label: str, *, public: bool) -> str:
     return address.compressed
 
 
-def parse_seed(value: object, label: str = "mainnet_seed") -> str:
+def parse_seed(value: object, label: str = "mainnet_seed", ports: tuple = ("29444",)) -> str:
     if not isinstance(value, str):
         raise PreflightError(f"{label} must be a numeric IP and port")
     if value.startswith("["):
         host, separator, port = value[1:].partition("]:")
     else:
         host, separator, port = value.rpartition(":")
-    if not separator or port != "29444":
-        raise PreflightError(f"{label} must use the mainnet seed P2P port 29444")
+    if not separator or port not in ports:
+        raise PreflightError(f"{label} must use the mainnet P2P port {' or '.join(ports)}")
     address = parse_numeric_ip(host, label, public=True)
-    return f"[{address}]:29444" if ":" in address else f"{address}:29444"
+    return f"[{address}]:{port}" if ":" in address else f"{address}:{port}"
 
 
 def parse_relays(value: object, seed: str) -> list:
     if not isinstance(value, list) or not 1 <= len(value) <= MAX_RELAYS:
         raise PreflightError(f"mainnet_relays must list 1 to {MAX_RELAYS} relay nodes")
-    relays = [parse_seed(item, "mainnet_relays") for item in value]
+    # 29444 is a relay or node P2P port; 29454 is another pool's P2P listener.
+    relays = [parse_seed(item, "mainnet_relays", ("29444", "29454")) for item in value]
     if len(set(relays)) != len(relays) or seed in relays:
         raise PreflightError("mainnet_relays must be distinct from each other and from mainnet_seed")
     return relays
@@ -193,10 +207,23 @@ def validate_config(config: dict) -> dict:
     fields = set(config)
     if not CONFIG_FIELDS <= fields or fields - CONFIG_FIELDS - OPTIONAL_FIELDS or config.get("schema") != SCHEMA:
         raise PreflightError("pool.json is incomplete or has unexpected fields")
+    # Left out, existing configurations keep the RC migration checks.
+    previous_rc = config.get(PREVIOUS_RC_FIELD, True)
+    if type(previous_rc) is not bool:
+        raise PreflightError(f"{PREVIOUS_RC_FIELD} must be true or false")
     for field in HASH_FIELDS:
+        if field in RC_FILE_HASH_FIELDS and not previous_rc:
+            # A hash next to a "no RC installation" declaration contradicts it: refuse
+            # rather than guess which of the two the operator meant.
+            if config[field] is not None:
+                raise PreflightError(f"{field} must be null when {PREVIOUS_RC_FIELD} is false; "
+                                     f"set {PREVIOUS_RC_FIELD} to true to check RC file hashes")
+            continue
         if (not isinstance(config[field], str) or not HEX64.fullmatch(config[field])
                 or config[field] == "0" * 64):
-            raise PreflightError(f"{field} must be a final lowercase SHA-256 value")
+            hint = (f"; set {PREVIOUS_RC_FIELD} to false if you never ran an RC pool"
+                    if field in RC_FILE_HASH_FIELDS else "")
+            raise PreflightError(f"{field} must be a final lowercase SHA-256 value{hint}")
     for field, (minimum, maximum) in NUMBER_FIELDS.items():
         if type(config[field]) is not int or not minimum <= config[field] <= maximum:
             raise PreflightError(f"{field} must be an approved integer from {minimum} to {maximum}")
@@ -238,8 +265,10 @@ def validate_config(config: dict) -> dict:
                                        or not 1 <= config["bonus_rate_bps"] <= MAX_POOL_BONUS_RATE_BPS):
         raise PreflightError(f"bonus_rate_bps must be an integer from 1 to {MAX_POOL_BONUS_RATE_BPS}")
     if "bonus_sponsor" in config and (not isinstance(config["bonus_sponsor"], str)
-                                      or not HEX64.fullmatch(config["bonus_sponsor"])):
-        raise PreflightError("bonus_sponsor must be the sponsor's 64-character lowercase hex x-only key")
+                                      or not (HEX64.fullmatch(config["bonus_sponsor"])
+                                              or MAINNET_ADDRESS.fullmatch(config["bonus_sponsor"]))):
+        raise PreflightError(
+            "bonus_sponsor must be the sponsor's cmfd1... address or 64-character lowercase hex x-only key")
     if "bonus_scan_from_height" in config:
         if "bonus_sponsor" not in config:
             raise PreflightError("bonus_scan_from_height requires bonus_rate_bps and bonus_sponsor")
@@ -253,7 +282,7 @@ def validate_config(config: dict) -> dict:
             raise PreflightError(f"replay_gpus must list 1 to {MAX_REPLAY_GPUS} distinct NVIDIA GPU UUIDs")
     for fresh, old in (("expected_tls_certificate_sha256", "forbidden_rc_certificate_sha256"),
                        ("expected_tls_private_key_sha256", "forbidden_rc_private_key_sha256")):
-        if config[fresh] == config[old]:
+        if config[old] is not None and config[fresh] == config[old]:
             raise PreflightError("mainnet TLS material must not reuse RC material")
     if config["expected_tls_certificate_sha256"] == RC_CERTIFICATE_SHA256:
         raise PreflightError("known AI01 RC pool certificate cannot be used on mainnet")
@@ -348,6 +377,17 @@ def check_artifacts(root: Path, config: dict, bank: dict, record: dict) -> None:
                  record["sha256"], "node fixed record", static=True)
 
 
+def deployment_identity(config: dict) -> dict:
+    identity = {"schema": MARKER_SCHEMA, "plan_digest": config["expected_plan_digest"],
+                "network_id": config["expected_network_id"],
+                "certificate_sha256": config["expected_tls_certificate_sha256"]}
+    # Existing markers keep their exact bytes. A fresh installation is bound to its
+    # declaration, so a pool started with RC checks cannot later drop them.
+    if config.get(PREVIOUS_RC_FIELD, True) is False:
+        identity[PREVIOUS_RC_FIELD] = False
+    return identity
+
+
 def check_state(state: Path, config: dict) -> tuple[Path, Path]:
     data = state / "data"
     scratch = state / "scratch"
@@ -356,19 +396,19 @@ def check_state(state: Path, config: dict) -> tuple[Path, Path]:
         raise PreflightError("pool state must not use symlinks")
     if data.exists() and not data.is_dir() or scratch.exists() and not scratch.is_dir():
         raise PreflightError("pool data/scratch must be real directories")
-    identity = {"schema": MARKER_SCHEMA, "plan_digest": config["expected_plan_digest"],
-                "network_id": config["expected_network_id"],
-                "certificate_sha256": config["expected_tls_certificate_sha256"]}
+    identity = deployment_identity(config)
     if marker.exists():
         if strict_json(bounded_file(marker, "mainnet pool deployment marker", 4096),
                        "mainnet pool deployment marker", 4096) != identity:
-            raise PreflightError("mainnet pool state belongs to another plan or TLS identity")
+            raise PreflightError("mainnet pool state belongs to another plan, TLS identity "
+                                 f"or {PREVIOUS_RC_FIELD} setting")
     elif data.exists() and any(data.iterdir()):
         raise PreflightError("first mainnet pool start requires an empty fresh data directory")
     wallet = data / "wallet.key"
     if wallet.exists():
         digest, _ = sha256(wallet, "pool wallet")
-        if digest == config["forbidden_rc_wallet_file_sha256"]:
+        if (config["forbidden_rc_wallet_file_sha256"] is not None
+                and digest == config["forbidden_rc_wallet_file_sha256"]):
             raise PreflightError("RC encrypted wallet file was copied into mainnet pool state")
     return data, scratch
 
@@ -522,9 +562,7 @@ def write_marker(state: Path, config: dict) -> None:
     marker = state / "mainnet-pool-deployment.json"
     if marker.exists():
         return
-    identity = {"schema": MARKER_SCHEMA, "plan_digest": config["expected_plan_digest"],
-                "network_id": config["expected_network_id"],
-                "certificate_sha256": config["expected_tls_certificate_sha256"]}
+    identity = deployment_identity(config)
     encoded = (json.dumps(identity, sort_keys=True, separators=(",", ":")) + "\n").encode()
     descriptor = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     with os.fdopen(descriptor, "wb") as output:
@@ -542,8 +580,9 @@ def main() -> int:
     config_path = args.check or args.run
     if config_path != CONFIG_BASE / "pool.json":
         raise PreflightError("only the dedicated /etc/commonfoundry-mainnet-pool/pool.json is accepted")
-    # The unit copies systemd's potentially ACL-backed credentials into its
-    # private runtime directory. Do not weaken the native wallet's 0600 policy.
+    # A privileged ExecStartPre=+ step copies the root-only /etc credentials into
+    # the private runtime directory as service-owned 0600 files. Do not weaken
+    # the native wallet's 0600 policy.
     if os.environ.get("RUNTIME_DIRECTORY") != str(RUNTIME):
         raise PreflightError("the dedicated systemd RuntimeDirectory is required")
     config, data, scratch = preflight(config_path, ROOT, STATE, CONFIG_BASE, INSTALL_BASE,

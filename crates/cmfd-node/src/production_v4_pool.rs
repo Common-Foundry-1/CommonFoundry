@@ -10,25 +10,24 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
-use cmfd_consensus::forgematrix_v4_proof::{
-    forgematrix_v4_final_activation_digest, forgematrix_v4_mask_coefficients,
-};
+use cmfd_consensus::forgematrix_v4_proof::forgematrix_v4_final_activation_digest;
 use cmfd_consensus::forgematrix_v4_proof_codec::decode_forgematrix_v4_transparent_proof;
 use cmfd_consensus::{
-    BlockProof, FORGEMATRIX_V4_ALGORITHM_VERSION, FORGEMATRIX_V4_FIELD_MODULUS,
-    FORGEMATRIX_V4_FINAL_ACTIVATION_DIGEST_DOMAIN, FORGEMATRIX_V4_PROOF_VERSION,
+    BlockProof, FORGEMATRIX_V4_ALGORITHM_VERSION, FORGEMATRIX_V4_PROOF_VERSION,
     FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES, ForgeMatrixV4CandidateProof,
     PRODUCTION_V2_LAYERS, PRODUCTION_V4_MAX_PROOF_BYTES, PRODUCTION_V4_MODEL_MANIFEST_DIGEST,
-    forgematrix_v4_challenge_digest, forgematrix_v4_proof_system_digest,
+    forgematrix_v4_challenge_digest, forgematrix_v4_final_activation_digest_from_le_bytes,
+    forgematrix_v4_proof_system_digest, forgematrix_v4_replay_coefficients,
     forgematrix_v4_work_digest,
 };
 use serde::Serialize;
 
+use crate::honest_work::{GpuReplay, PoolReplayResult, WORK_KNOWN_ANSWERS};
 use crate::pool::{
     PoolError, PoolJob, PoolWorkSearchResult, ProductionV4PoolShareEvaluation,
     ProductionV4PoolShareRequest, ProductionV4PoolShareVerifier,
@@ -45,6 +44,10 @@ const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(600);
 const WORKER_COMMAND_TIMEOUT: Duration = Duration::from_secs(600);
 /// After a worker fails to start, wait this long before trying again.
 const WORKER_RESTART_BACKOFF: Duration = Duration::from_secs(10);
+/// How long a found block's replay worker may take to replay one known
+/// answer before the proof. `RUNBATCH 1` takes about 50 ms once the model
+/// is loaded, so this only cuts short a worker that has stalled.
+const FOUND_BLOCK_KNOWN_ANSWER_TIMEOUT: Duration = Duration::from_secs(2);
 const FROZEN_TEMPLATE_FORMAT_VERSION: u16 = 1;
 pub const PRODUCTION_V4_POOL_SEARCH_MAX_BATCH_SIZE: u32 = 64;
 
@@ -73,6 +76,65 @@ pub struct ProductionV4PoolVerifierConfig {
     pub proof: ProductionV4PoolWorkerCommand,
     pub scratch_directory: PathBuf,
     pub worker_scratch_directory: String,
+    /// The replay worker file block work checks may use. Without it, or
+    /// while a replay worker runs a file that does not match it, a work
+    /// check refuses that worker; shares use it either way.
+    pub work_check_pin: Option<ReplayWorkerPin>,
+}
+
+/// A replay worker file named by its SHA-256. Each time a replay worker
+/// starts, the file is hashed first; only a worker started from a matching
+/// file serves block work checks.
+#[derive(Debug, Clone)]
+pub struct ReplayWorkerPin {
+    executable: PathBuf,
+    sha256: [u8; 32],
+}
+
+impl ReplayWorkerPin {
+    /// Pins `executable` (the file the replay workers run, not the WSL
+    /// launcher) to `sha256`.
+    pub fn new(executable: PathBuf, sha256: [u8; 32]) -> Self {
+        Self { executable, sha256 }
+    }
+
+    /// Pins `executable` to the release's replay worker if it is that
+    /// build; otherwise returns the file's own SHA-256.
+    pub fn release(executable: PathBuf) -> Result<Result<Self, [u8; 32]>, PoolError> {
+        let sha256 = file_sha256(&executable)?;
+        if sha256 == production_v4_release_replay_worker_sha256() {
+            Ok(Ok(Self::new(executable, sha256)))
+        } else {
+            Ok(Err(sha256))
+        }
+    }
+
+    /// Whether the file now has the pinned SHA-256. A file that cannot be
+    /// read does not match.
+    fn matches(&self) -> bool {
+        file_sha256(&self.executable).is_ok_and(|sha256| sha256 == self.sha256)
+    }
+}
+
+/// The SHA-256 of the replay worker shipped with this release.
+pub fn production_v4_release_replay_worker_sha256() -> [u8; 32] {
+    crate::release_gate::PRODUCTION_V4_REPLAY_WORKER_SHA256
+}
+
+/// The SHA-256 of the file at `path`.
+pub fn file_sha256(path: &Path) -> Result<[u8; 32], PoolError> {
+    use sha2::{Digest, Sha256};
+    let mut file = File::open(path).map_err(replay_error)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(replay_error)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().into())
 }
 
 #[derive(Debug, Clone)]
@@ -180,6 +242,10 @@ pub struct ProductionV4PersistentPoolVerifier {
     startup_id: [u8; 8],
     /// Batch scratch-file names, unique across concurrent replay workers.
     next_batch_attempt: AtomicU64,
+    /// Single-share and proof scratch-file names.
+    next_attempt: AtomicU64,
+    /// The proof worker. It is never held while a replay worker runs, and
+    /// no replay worker lock is held while it is taken.
     state: Mutex<WorkerState>,
 }
 
@@ -255,6 +321,7 @@ pub fn production_v4_solo_config(
         proof,
         scratch_directory: search.scratch_directory,
         worker_scratch_directory: search.worker_scratch_directory,
+        work_check_pin: None,
     })
 }
 
@@ -271,7 +338,6 @@ pub struct ProductionV4PersistentPoolSearcher {
 #[derive(Debug)]
 struct WorkerState {
     proof: PersistentWorker,
-    next_attempt: u64,
 }
 
 #[derive(Debug)]
@@ -291,10 +357,14 @@ struct PersistentWorker {
     process: Option<WorkerProcess>,
     retry_after: Option<Instant>,
     restarts: u64,
+    /// Checked before each start; see [`WorkerProcess::pinned`].
+    pin: Option<ReplayWorkerPin>,
 }
 
 #[derive(Debug)]
 struct WorkerProcess {
+    /// The pinned file matched just before this process started.
+    pinned: bool,
     child: Child,
     stdin: ChildStdin,
     /// Lines from the worker's stdout, read on their own thread so every wait
@@ -318,6 +388,8 @@ struct AttemptFiles {
 
 /// A replayed share that meets the chain target, ready to be proved.
 struct ChainShare<'a> {
+    /// The replay worker that replayed it.
+    worker: usize,
     files: &'a AttemptFiles,
     template: &'a BlockTemplate,
     nonce: u64,
@@ -343,7 +415,7 @@ impl ProductionV4PersistentPoolVerifier {
         fs::create_dir_all(&config.scratch_directory).map_err(replay_error)?;
         // Every replay worker loads the model on its own GPU; start them together.
         let start_searcher = |replay: ProductionV4PoolWorkerCommand| {
-            ProductionV4PersistentPoolSearcher::start_for_network(
+            ProductionV4PersistentPoolSearcher::start_pinned(
                 expected_network_id,
                 ProductionV4PoolSearcherConfig {
                     replay,
@@ -351,6 +423,7 @@ impl ProductionV4PersistentPoolVerifier {
                     worker_scratch_directory: config.worker_scratch_directory.clone(),
                     batch_size: 32,
                 },
+                config.work_check_pin.clone(),
             )
         };
         let (searcher, extra_searchers) = std::thread::scope(|scope| {
@@ -387,38 +460,25 @@ impl ProductionV4PersistentPoolVerifier {
             worker_scratch_directory: config.worker_scratch_directory,
             startup_id,
             next_batch_attempt: AtomicU64::new(0),
-            state: Mutex::new(WorkerState {
-                proof,
-                next_attempt: 0,
-            }),
+            next_attempt: AtomicU64::new(0),
+            state: Mutex::new(WorkerState { proof }),
         })
     }
 
-    fn evaluate_locked(
+    /// Checks one share on replay worker 0 with `RUN search`. Only that
+    /// worker's lock is held while it replays. A chain-winning share goes on
+    /// to [`prove_chain_share`](Self::prove_chain_share), which takes the
+    /// proof worker only after releasing the replay worker, so a block work
+    /// check holding worker 0 delays worker 0's shares but never a proof.
+    fn evaluate_single(
         &self,
-        state: &mut WorkerState,
         template: &BlockTemplate,
         nonce: u64,
         share_target: [u8; 32],
     ) -> Result<ProductionV4PoolShareEvaluation, PoolError> {
         let evaluation_started = Instant::now();
-        let mut search_state = self
-            .searcher
-            .state
-            .lock()
-            .map_err(|_| pool_replay_failure("persistent search worker lock is poisoned"))?;
         self.validate_share(template, share_target)?;
-
-        let attempt_number = state.next_attempt;
-        state.next_attempt = state.next_attempt.wrapping_add(1);
-        let token = format!(
-            "cmfd-v4-pool-{}-{attempt_number:016x}",
-            hex::encode(self.startup_id)
-        );
-        let files = AttemptFiles {
-            scratch_directory: self.scratch_directory.clone(),
-            token: token.clone(),
-        };
+        let files = self.attempt_files();
         let coefficients_path = files.path("coefficients.bin");
         let template_path = files.path("template.json");
         let search_prefix = files.path("search");
@@ -431,7 +491,7 @@ impl ProductionV4PersistentPoolVerifier {
         );
         write_new_file(
             &coefficients_path,
-            &production_v4_replay_coefficients(challenge_digest),
+            &forgematrix_v4_replay_coefficients(challenge_digest),
         )?;
         let frozen = FrozenProductionV4Template {
             format_version: FROZEN_TEMPLATE_FORMAT_VERSION,
@@ -445,6 +505,11 @@ impl ProductionV4PersistentPoolVerifier {
             &serde_json::to_vec(&frozen).map_err(replay_error)?,
         )?;
 
+        let mut search_state = self
+            .searcher
+            .state
+            .lock()
+            .map_err(|_| pool_replay_failure("persistent search worker lock is poisoned"))?;
         let search_replay_started = Instant::now();
         search_state.replay.invoke(
             &[
@@ -471,12 +536,13 @@ impl ProductionV4PersistentPoolVerifier {
             return Ok(ProductionV4PoolShareEvaluation {
                 work_digest,
                 chain_proof: None,
+                replay: None,
             });
         }
         self.prove_chain_share(
-            state,
-            &mut search_state,
+            search_state,
             ChainShare {
+                worker: 0,
                 files: &files,
                 template,
                 nonce,
@@ -506,6 +572,18 @@ impl ProductionV4PersistentPoolVerifier {
             ));
         }
         Ok(())
+    }
+
+    /// Scratch files for one single share or one proof.
+    fn attempt_files(&self) -> AttemptFiles {
+        let attempt_number = self.next_attempt.fetch_add(1, Ordering::Relaxed);
+        AttemptFiles {
+            scratch_directory: self.scratch_directory.clone(),
+            token: format!(
+                "cmfd-v4-pool-{}-{attempt_number:016x}",
+                hex::encode(self.startup_id)
+            ),
+        }
     }
 
     fn searcher_for(&self, worker: usize) -> Option<&ProductionV4PersistentPoolSearcher> {
@@ -564,7 +642,7 @@ impl ProductionV4PersistentPoolVerifier {
                         chunk.iter().zip(lane_activations)
                     {
                         results[index] = Some(self.finish_batched_share(
-                            searcher,
+                            worker,
                             &shares[index],
                             challenge_digest,
                             search_final,
@@ -612,7 +690,7 @@ impl ProductionV4PersistentPoolVerifier {
         let search_final_path = files.path("search-final-activation.bin");
         let coefficients = lanes
             .iter()
-            .flat_map(|&(_, challenge_digest)| production_v4_replay_coefficients(challenge_digest))
+            .flat_map(|&(_, challenge_digest)| forgematrix_v4_replay_coefficients(challenge_digest))
             .collect::<Vec<_>>();
         write_new_file(&coefficients_path, &coefficients)?;
         search_state.replay.invoke(
@@ -631,12 +709,11 @@ impl ProductionV4PersistentPoolVerifier {
     }
 
     /// Derives one batched lane's work digest. A chain-winning lane then takes
-    /// the proof lock and its replay worker's lock, in the same order as the
-    /// single-share path, and is written out and proved exactly like a single
-    /// share.
+    /// the lock of replay worker `worker` again and is written out and proved
+    /// exactly like a single share.
     fn finish_batched_share(
         &self,
-        searcher: &ProductionV4PersistentPoolSearcher,
+        worker: usize,
         share: &ProductionV4PoolShareRequest<'_>,
         challenge_digest: [u8; 32],
         search_final: &[u8],
@@ -654,28 +731,16 @@ impl ProductionV4PersistentPoolVerifier {
             return Ok(ProductionV4PoolShareEvaluation {
                 work_digest,
                 chain_proof: None,
+                replay: None,
             });
         }
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| pool_replay_failure("persistent worker lock is poisoned"))?;
-        let mut search_state = searcher
-            .state
-            .lock()
-            .map_err(|_| pool_replay_failure("persistent search worker lock is poisoned"))?;
-        let attempt_number = state.next_attempt;
-        state.next_attempt = state.next_attempt.wrapping_add(1);
-        let files = AttemptFiles {
-            scratch_directory: self.scratch_directory.clone(),
-            token: format!(
-                "cmfd-v4-pool-{}-{attempt_number:016x}",
-                hex::encode(self.startup_id)
-            ),
-        };
+        let searcher = self
+            .searcher_for(worker)
+            .ok_or_else(|| pool_replay_failure("no such pool replay worker"))?;
+        let files = self.attempt_files();
         write_new_file(
             &files.path("coefficients.bin"),
-            &production_v4_replay_coefficients(challenge_digest),
+            &forgematrix_v4_replay_coefficients(challenge_digest),
         )?;
         let frozen = FrozenProductionV4Template {
             format_version: FROZEN_TEMPLATE_FORMAT_VERSION,
@@ -688,10 +753,14 @@ impl ProductionV4PersistentPoolVerifier {
             &files.path("template.json"),
             &serde_json::to_vec(&frozen).map_err(replay_error)?,
         )?;
+        let search_state = searcher
+            .state
+            .lock()
+            .map_err(|_| pool_replay_failure("persistent search worker lock is poisoned"))?;
         self.prove_chain_share(
-            &mut state,
-            &mut search_state,
+            search_state,
             ChainShare {
+                worker,
                 files: &files,
                 template: share.template,
                 nonce: share.nonce,
@@ -708,13 +777,21 @@ impl ProductionV4PersistentPoolVerifier {
     /// Repeats a chain-winning replay in full mode, proves it, and checks the
     /// proof against the replay. `share.files` must already hold the share's
     /// single-nonce coefficients and frozen template.
+    ///
+    /// While it still holds the replay worker, a worker started from the
+    /// pinned file also replays the first known answer, so the node can
+    /// trust the block's result from that same process without borrowing
+    /// the worker again. The replay worker is then released before the proof
+    /// worker is taken: the proof needs only the proof worker, so shares and
+    /// block work checks keep using the replay worker while it runs, and no
+    /// replay worker is started or restarted while the proof worker is held.
     fn prove_chain_share(
         &self,
-        state: &mut WorkerState,
-        search_state: &mut SearchWorkerState,
+        mut search_state: MutexGuard<'_, SearchWorkerState>,
         share: ChainShare<'_>,
     ) -> Result<ProductionV4PoolShareEvaluation, PoolError> {
         let ChainShare {
+            worker,
             files,
             template,
             nonce,
@@ -750,6 +827,12 @@ impl ProductionV4PersistentPoolVerifier {
                 "search replay and full replay final activations differ",
             ));
         }
+        let known_answer = self.known_answer_locked(&mut search_state, worker);
+        drop(search_state);
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| pool_replay_failure("persistent worker lock is poisoned"))?;
         let proof_started = Instant::now();
         // A chain-winning share is rare and valuable: one proof-worker crash
         // (for example a GPU allocation failure) gets one restart and retry.
@@ -808,7 +891,135 @@ impl ProductionV4PersistentPoolVerifier {
         Ok(ProductionV4PoolShareEvaluation {
             work_digest,
             chain_proof: Some(proof),
+            replay: Some(
+                PoolReplayResult::new(challenge_digest, final_activation_digest, worker)
+                    .with_known_answer(known_answer),
+            ),
         })
+    }
+
+    /// The final-activation digest replay worker `worker` produces for the
+    /// first known answer, if its process was started from the pinned file
+    /// and the replay succeeds. A failure is logged and leaves the block's
+    /// result to be checked by the node as usual; it never costs the block.
+    /// It runs before the proof, so it waits at most
+    /// [`FOUND_BLOCK_KNOWN_ANSWER_TIMEOUT`]; a timeout also stops the worker,
+    /// and the next share on it waits while it starts and loads the model.
+    fn known_answer_locked(
+        &self,
+        search_state: &mut SearchWorkerState,
+        worker: usize,
+    ) -> Option<[u8; 32]> {
+        if !search_state
+            .replay
+            .process
+            .as_ref()
+            .is_some_and(|process| process.pinned)
+        {
+            return None;
+        }
+        let answer = WORK_KNOWN_ANSWERS[0];
+        let replayed = self
+            .replay_one_locked(
+                search_state,
+                answer.challenge_digest,
+                FOUND_BLOCK_KNOWN_ANSWER_TIMEOUT,
+            )
+            .and_then(|final_activation| {
+                forgematrix_v4_final_activation_digest_from_le_bytes(
+                    answer.challenge_digest,
+                    &final_activation,
+                )
+                .map_err(replay_error)
+            });
+        match replayed {
+            Ok(digest) => Some(digest),
+            Err(error) => {
+                tracing::warn!(
+                    worker,
+                    %error,
+                    "pool replay worker could not replay its known answer for a found block"
+                );
+                None
+            }
+        }
+    }
+
+    /// Replays one challenge (`RUNBATCH 1`) on the locked replay worker and
+    /// returns its final activation.
+    fn replay_one_locked(
+        &self,
+        search_state: &mut SearchWorkerState,
+        challenge_digest: [u8; 32],
+        timeout: Duration,
+    ) -> Result<Vec<u8>, PoolError> {
+        let attempt_number = self.next_batch_attempt.fetch_add(1, Ordering::Relaxed);
+        let files = AttemptFiles {
+            scratch_directory: self.scratch_directory.clone(),
+            token: format!(
+                "cmfd-v4-work-check-{}-{attempt_number:016x}",
+                hex::encode(self.startup_id)
+            ),
+        };
+        let coefficients_path = files.path("coefficients.bin");
+        write_new_file(
+            &coefficients_path,
+            &forgematrix_v4_replay_coefficients(challenge_digest),
+        )?;
+        search_state.replay.invoke_with_timeout(
+            &[
+                "RUNBATCH".to_owned(),
+                "1".to_owned(),
+                self.worker_path(&coefficients_path)?,
+                self.worker_path(&files.path("search"))?,
+            ],
+            "CMFD_V4_REPLAY_DONE",
+            timeout,
+        )?;
+        read_exact_file(
+            &files.path("search-final-activation.bin"),
+            FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES,
+        )
+    }
+
+    /// Replays one challenge (`RUNBATCH 1`) on replay worker `worker` for a
+    /// block work check, without waiting: a worker whose lock is held is
+    /// reported busy, and one that is not running because it failed, or that
+    /// was not started from the pinned file (see [`ReplayWorkerPin`]), is
+    /// reported stopped. A worker is never started or restarted here; one
+    /// that fails or exceeds `timeout` is stopped as usual and the next pool
+    /// request restarts it.
+    pub(crate) fn try_replay_for_work_check(
+        &self,
+        worker: usize,
+        challenge_digest: [u8; 32],
+        timeout: Duration,
+    ) -> GpuReplay {
+        let Some(searcher) = self.searcher_for(worker) else {
+            return GpuReplay::Failed("no such pool replay worker".to_owned());
+        };
+        let mut search_state = match searcher.state.try_lock() {
+            Ok(search_state) => search_state,
+            Err(TryLockError::WouldBlock) => return GpuReplay::Busy,
+            Err(TryLockError::Poisoned(_)) => {
+                return GpuReplay::Failed("persistent search worker lock is poisoned".to_owned());
+            }
+        };
+        match &search_state.replay.process {
+            None => {
+                return GpuReplay::Stopped(format!("pool replay worker {worker} is not running"));
+            }
+            Some(process) if !process.pinned => {
+                return GpuReplay::Stopped(format!(
+                    "pool replay worker {worker} was not started from the pinned replay worker file"
+                ));
+            }
+            Some(_) => {}
+        }
+        match self.replay_one_locked(&mut search_state, challenge_digest, timeout) {
+            Ok(final_activation) => GpuReplay::Done(final_activation),
+            Err(error) => GpuReplay::Failed(error.to_string()),
+        }
     }
 
     /// Solo mining uses the same persistent replay worker and CPU-checked
@@ -843,6 +1054,14 @@ impl ProductionV4PersistentPoolSearcher {
         expected_network_id: [u8; 32],
         config: ProductionV4PoolSearcherConfig,
     ) -> Result<Self, PoolError> {
+        Self::start_pinned(expected_network_id, config, None)
+    }
+
+    fn start_pinned(
+        expected_network_id: [u8; 32],
+        config: ProductionV4PoolSearcherConfig,
+        pin: Option<ReplayWorkerPin>,
+    ) -> Result<Self, PoolError> {
         validate_expected_network_id(expected_network_id)?;
         validate_scratch_paths(&config.scratch_directory, &config.worker_scratch_directory)?;
         if !(1..=PRODUCTION_V4_POOL_SEARCH_MAX_BATCH_SIZE).contains(&config.batch_size) {
@@ -851,10 +1070,11 @@ impl ProductionV4PersistentPoolSearcher {
             )));
         }
         fs::create_dir_all(&config.scratch_directory).map_err(replay_error)?;
-        let replay = PersistentWorker::start(
+        let replay = PersistentWorker::start_pinned(
             &config.replay,
             "CMFD_V4_REPLAY_READY",
             "ProductionV4 pool search worker",
+            pin,
         )?;
         let mut startup_id = [0_u8; 8];
         getrandom::fill(&mut startup_id).map_err(replay_error)?;
@@ -911,7 +1131,7 @@ impl ProductionV4PersistentPoolSearcher {
                 nonce,
                 PRODUCTION_V4_MODEL_MANIFEST_DIGEST,
             );
-            coefficients.extend_from_slice(&production_v4_replay_coefficients(challenge_digest));
+            coefficients.extend_from_slice(&forgematrix_v4_replay_coefficients(challenge_digest));
         }
         write_new_file(&coefficients_path, &coefficients)?;
         state.replay.invoke(
@@ -960,11 +1180,7 @@ impl ProductionV4PoolShareVerifier for ProductionV4PersistentPoolVerifier {
         nonce: u64,
         share_target: [u8; 32],
     ) -> Result<ProductionV4PoolShareEvaluation, PoolError> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| pool_replay_failure("persistent worker lock is poisoned"))?;
-        self.evaluate_locked(&mut state, template, nonce, share_target)
+        self.evaluate_single(template, nonce, share_target)
     }
 
     fn evaluate_batch(
@@ -987,7 +1203,7 @@ impl ProductionV4PoolShareVerifier for ProductionV4PersistentPoolVerifier {
         if worker == 0 && shares.len() <= 1 {
             return shares
                 .iter()
-                .map(|share| self.evaluate(share.template, share.nonce, share.share_target))
+                .map(|share| self.evaluate_single(share.template, share.nonce, share.share_target))
                 .collect();
         }
         self.evaluate_batch_on_worker(worker, shares)
@@ -1001,21 +1217,51 @@ impl PersistentWorker {
         ready_marker: &'static str,
         label: &'static str,
     ) -> Result<Self, PoolError> {
+        Self::start_pinned(command, ready_marker, label, None)
+    }
+
+    fn start_pinned(
+        command: &ProductionV4PoolWorkerCommand,
+        ready_marker: &'static str,
+        label: &'static str,
+        pin: Option<ReplayWorkerPin>,
+    ) -> Result<Self, PoolError> {
         if !command.program.is_absolute() || !command.program.is_file() {
             return Err(pool_replay_failure(format!(
                 "{label} program must be an existing absolute file: {}",
                 command.program.display()
             )));
         }
-        let process = WorkerProcess::spawn(command, ready_marker, label, WORKER_READY_TIMEOUT)?;
-        Ok(Self {
+        let mut worker = Self {
             command: command.clone(),
             ready_marker,
             label,
-            process: Some(process),
+            process: None,
             retry_after: None,
             restarts: 0,
-        })
+            pin,
+        };
+        worker.process = Some(worker.spawn_process()?);
+        Ok(worker)
+    }
+
+    /// Starts a process, hashing the pinned file just before.
+    fn spawn_process(&self) -> Result<WorkerProcess, PoolError> {
+        let pinned = self.pin.as_ref().is_some_and(ReplayWorkerPin::matches);
+        if self.pin.is_some() && !pinned {
+            tracing::warn!(
+                worker = self.label,
+                "the replay worker file does not match its pin; block work checks will not use this worker"
+            );
+        }
+        let mut process = WorkerProcess::spawn(
+            &self.command,
+            self.ready_marker,
+            self.label,
+            WORKER_READY_TIMEOUT,
+        )?;
+        process.pinned = pinned;
+        Ok(process)
     }
 
     fn invoke(&mut self, fields: &[String], done_marker: &str) -> Result<(), PoolError> {
@@ -1086,12 +1332,7 @@ impl PersistentWorker {
                     self.label
                 )));
             }
-            match WorkerProcess::spawn(
-                &self.command,
-                self.ready_marker,
-                self.label,
-                WORKER_READY_TIMEOUT,
-            ) {
+            match self.spawn_process() {
                 Ok(process) => {
                     self.restarts = self.restarts.saturating_add(1);
                     self.retry_after = None;
@@ -1166,6 +1407,7 @@ impl WorkerProcess {
             })
             .map_err(replay_error)?;
         let mut process = Self {
+            pinned: false,
             child,
             stdin,
             lines,
@@ -1443,40 +1685,12 @@ fn inspect_search_batch(
     })
 }
 
-fn production_v4_replay_coefficients(challenge_digest: [u8; 32]) -> Vec<u8> {
-    let mut coefficients = Vec::with_capacity((PRODUCTION_V2_LAYERS as usize + 1) * 20);
-    coefficients.extend_from_slice(&forgematrix_v4_mask_coefficients(
-        challenge_digest,
-        u32::MAX,
-    ));
-    for layer in 0..PRODUCTION_V2_LAYERS {
-        coefficients.extend_from_slice(&forgematrix_v4_mask_coefficients(challenge_digest, layer));
-    }
-    coefficients
-}
-
 fn final_activation_digest_from_bytes(
     challenge_digest: [u8; 32],
     final_activation: &[u8],
 ) -> Result<[u8; 32], PoolError> {
-    if final_activation.len() != FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES {
-        return Err(pool_replay_failure(
-            "ProductionV4 final activation has the wrong byte length",
-        ));
-    }
-    let mut hasher = blake3::Hasher::new_derive_key(FORGEMATRIX_V4_FINAL_ACTIVATION_DIGEST_DOMAIN);
-    hasher.update(&challenge_digest);
-    hasher.update(&((final_activation.len() / size_of::<u32>()) as u64).to_le_bytes());
-    for encoded in final_activation.chunks_exact(size_of::<u32>()) {
-        let value = u32::from_le_bytes(encoded.try_into().expect("four-byte chunk"));
-        if value >= FORGEMATRIX_V4_FIELD_MODULUS {
-            return Err(pool_replay_failure(
-                "ProductionV4 final activation contains a noncanonical field value",
-            ));
-        }
-    }
-    hasher.update(final_activation);
-    Ok(*hasher.finalize().as_bytes())
+    forgematrix_v4_final_activation_digest_from_le_bytes(challenge_digest, final_activation)
+        .map_err(|error| pool_replay_failure(error.to_string()))
 }
 
 fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), PoolError> {
@@ -1538,18 +1752,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn replay_coefficients_have_the_exact_production_shape() {
-        let first = production_v4_replay_coefficients([7; 32]);
-        let second = production_v4_replay_coefficients([7; 32]);
-        assert_eq!(first, second);
-        assert_eq!(first.len(), (PRODUCTION_V2_LAYERS as usize + 1) * 20);
-        assert_eq!(
-            &first[..20],
-            &forgematrix_v4_mask_coefficients([7; 32], u32::MAX)
-        );
-    }
-
-    #[test]
     fn worker_protocol_paths_reject_command_injection() {
         let local = if cfg!(windows) {
             Path::new(r"C:\cmfd-pool-scratch")
@@ -1575,35 +1777,6 @@ mod tests {
         );
         for invalid in ["", "0,1", "GPU-short", "0;touch /tmp/pwn", "-1", " 1"] {
             assert!(production_v4_worker_cuda_visible_device(Some(invalid)).is_err());
-        }
-    }
-
-    #[test]
-    fn final_activation_digest_matches_consensus_and_rejects_noncanonical_fields() {
-        let challenge_digest = [0x6b; 32];
-        let mut values = (0..FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES / size_of::<u32>())
-            .map(|index| {
-                ((index as u64 * 1_000_003 + 97) % u64::from(FORGEMATRIX_V4_FIELD_MODULUS)) as u32
-            })
-            .collect::<Vec<_>>();
-        values[..3].copy_from_slice(&[0, 1, FORGEMATRIX_V4_FIELD_MODULUS - 1]);
-        let mut encoded = values
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect::<Vec<_>>();
-        let fields: Vec<cmfd_consensus::forgematrix_v4_basefold::ForgeMatrixV4Field> =
-            serde_json::from_value(serde_json::to_value(&values).unwrap()).unwrap();
-        assert_eq!(
-            final_activation_digest_from_bytes(challenge_digest, &encoded).unwrap(),
-            forgematrix_v4_final_activation_digest(challenge_digest, &fields)
-        );
-        for index in [0, values.len() - 1] {
-            let offset = index * size_of::<u32>();
-            encoded[offset..offset + size_of::<u32>()]
-                .copy_from_slice(&FORGEMATRIX_V4_FIELD_MODULUS.to_le_bytes());
-            assert!(final_activation_digest_from_bytes(challenge_digest, &encoded).is_err());
-            encoded[offset..offset + size_of::<u32>()]
-                .copy_from_slice(&values[index].to_le_bytes());
         }
     }
 
@@ -1781,7 +1954,8 @@ done"#;
     /// A fake replay worker for `RUN search` and `RUNBATCH`. Lane `i` (from 1)
     /// of every answer is filled with the field value `i`, the coefficient file
     /// must hold exactly one coefficient set per lane, each command is logged
-    /// to `$1`, and `RUNBATCH` crashes while `$1.crash` exists.
+    /// to `$1`, `RUNBATCH` crashes while `$1.crash` exists, and `RUNBATCH`
+    /// waits while `$1.hold` exists, after creating `$1.holding`.
     #[cfg(unix)]
     fn fake_replay_worker(log: &Path) -> ProductionV4PoolWorkerCommand {
         let script = r#"log="$1"; per="$2"
@@ -1799,6 +1973,10 @@ while read -r command first second third; do
     RUN) count=1 ;;
     *) exit 5 ;;
   esac
+  if [ "$command" = RUNBATCH ] && [ -e "$log.hold" ]; then
+    : > "$log.holding"
+    while [ -e "$log.hold" ]; do sleep 0.05; done
+  fi
   [ "$command" = RUNBATCH ] && [ -e "$log.crash" ] && exit 3
   [ "$(wc -c < "$second")" -eq $((count * per)) ] || exit 6
   out="$third-final-activation.bin"
@@ -1863,6 +2041,7 @@ while read -r line; do [ "$line" = QUIT ] && exit 0; echo CMFD_V4_PROOF_DONE; do
                 proof: fake_proof_worker(),
                 scratch_directory: scratch.clone(),
                 worker_scratch_directory: scratch.to_str().unwrap().to_owned(),
+                work_check_pin: Some(shell_pin()),
             },
         )
         .unwrap();
@@ -1970,6 +2149,409 @@ while read -r line; do [ "$line" = QUIT ] && exit 0; echo CMFD_V4_PROOF_DONE; do
                 fake_lane_work_digest(&template, requests[lane].nonce, lane as u32 + 1)
             );
         }
+        drop(verifier);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn work_check_replay_never_waits_for_or_restarts_a_worker() {
+        let (verifier, scratch, logs) = batch_test_verifier_with_workers("work-check", 2);
+        let timeout = Duration::from_secs(30);
+        let GpuReplay::Done(final_activation) =
+            verifier.try_replay_for_work_check(1, [7; 32], timeout)
+        else {
+            panic!("an idle worker replays");
+        };
+        assert_eq!(
+            final_activation.len(),
+            FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES
+        );
+        assert_eq!(
+            std::fs::read_to_string(&logs[1]).unwrap(),
+            "RUNBATCH 1
+"
+        );
+
+        {
+            let _held = verifier.searcher.state.lock().unwrap();
+            assert_eq!(
+                verifier.try_replay_for_work_check(0, [7; 32], timeout),
+                GpuReplay::Busy
+            );
+        }
+
+        let crash = PathBuf::from(format!("{}.crash", logs[1].display()));
+        std::fs::write(&crash, b"").unwrap();
+        assert!(matches!(
+            verifier.try_replay_for_work_check(1, [7; 32], timeout),
+            GpuReplay::Failed(_)
+        ));
+        std::fs::remove_file(&crash).unwrap();
+        assert!(
+            matches!(
+                verifier.try_replay_for_work_check(1, [7; 32], timeout),
+                GpuReplay::Stopped(_)
+            ),
+            "a stopped worker is reported, not restarted, by a work check"
+        );
+        assert!(matches!(
+            verifier.try_replay_for_work_check(2, [7; 32], timeout),
+            GpuReplay::Failed(_)
+        ));
+        let leftovers = std::fs::read_dir(&scratch)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("cmfd-v4-work-check-"))
+            })
+            .count();
+        assert_eq!(leftovers, 0);
+        drop(verifier);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    /// Pins `/bin/sh`, the program every fake worker runs.
+    #[cfg(unix)]
+    fn shell_pin() -> ReplayWorkerPin {
+        let shell = PathBuf::from("/bin/sh");
+        let sha256 = file_sha256(&shell).unwrap();
+        ReplayWorkerPin::new(shell, sha256)
+    }
+
+    #[test]
+    fn only_the_release_replay_worker_is_pinned_for_work_checks() {
+        let path = std::env::temp_dir().join(format!(
+            "cmfd-pool-worker-release-pin-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"abc").unwrap();
+        let sha256 = file_sha256(&path).unwrap();
+        assert_eq!(
+            hex::encode(sha256),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_ne!(sha256, production_v4_release_replay_worker_sha256());
+        assert_eq!(
+            ReplayWorkerPin::release(path.clone()).unwrap().unwrap_err(),
+            sha256
+        );
+        assert!(ReplayWorkerPin::new(path.clone(), sha256).matches());
+        assert!(!ReplayWorkerPin::new(path.clone(), [0; 32]).matches());
+        std::fs::remove_file(&path).unwrap();
+        assert!(ReplayWorkerPin::release(path.clone()).is_err());
+        assert!(
+            !ReplayWorkerPin::new(path, sha256).matches(),
+            "a file that is gone does not match"
+        );
+        assert_eq!(
+            hex::encode(production_v4_release_replay_worker_sha256()),
+            "33ce76f3832e7703d5aa8200ed51acfe3becfcfb2c2b063886aaf1db5ab1f9f0"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn work_checks_use_only_replay_workers_started_from_the_pinned_file() {
+        let scratch = worker_test_path("work-check-pin");
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+        let log = scratch.join("worker0.log");
+        let worker_file = scratch.join("replay-worker");
+        std::fs::write(&worker_file, b"release build").unwrap();
+        let start = |work_check_pin: Option<ReplayWorkerPin>| {
+            ProductionV4PersistentPoolVerifier::start_for_network(
+                BATCH_TEST_NETWORK_ID,
+                ProductionV4PoolVerifierConfig {
+                    replay: fake_replay_worker(&log),
+                    extra_replays: Vec::new(),
+                    proof: fake_proof_worker(),
+                    scratch_directory: scratch.clone(),
+                    worker_scratch_directory: scratch.to_str().unwrap().to_owned(),
+                    work_check_pin,
+                },
+            )
+            .unwrap()
+        };
+        let template = batch_test_template(BATCH_TEST_NETWORK_ID);
+        let share = [ProductionV4PoolShareRequest {
+            template: &template,
+            nonce: 9,
+            share_target: [0xff; 32],
+        }];
+        let timeout = Duration::from_secs(30);
+        let refused = |replay: GpuReplay| matches!(replay, GpuReplay::Stopped(reason) if reason.contains("pinned"));
+
+        // Without a pin, or with a pin the file does not match, work checks
+        // refuse the worker while shares still use it.
+        for pin in [
+            None,
+            Some(ReplayWorkerPin::new(worker_file.clone(), [0; 32])),
+        ] {
+            let verifier = start(pin);
+            assert!(refused(
+                verifier.try_replay_for_work_check(0, [7; 32], timeout)
+            ));
+            assert!(verifier.evaluate_batch_on(0, &share)[0].is_ok());
+        }
+
+        let sha256 = file_sha256(&worker_file).unwrap();
+        let verifier = start(Some(ReplayWorkerPin::new(worker_file.clone(), sha256)));
+        assert!(matches!(
+            verifier.try_replay_for_work_check(0, [7; 32], timeout),
+            GpuReplay::Done(_)
+        ));
+        // The file changes under the running worker. That process was started
+        // from the pinned file, so it still serves work checks.
+        std::fs::write(&worker_file, b"another build").unwrap();
+        assert!(matches!(
+            verifier.try_replay_for_work_check(0, [7; 32], timeout),
+            GpuReplay::Done(_)
+        ));
+        // Once it fails, a share restarts it from the changed file, and work
+        // checks refuse it from then on.
+        let crash = PathBuf::from(format!("{}.crash", log.display()));
+        std::fs::write(&crash, b"").unwrap();
+        assert!(matches!(
+            verifier.try_replay_for_work_check(0, [7; 32], timeout),
+            GpuReplay::Failed(_)
+        ));
+        std::fs::remove_file(&crash).unwrap();
+        assert!(verifier.evaluate_batch_on(0, &share)[0].is_ok());
+        assert!(refused(
+            verifier.try_replay_for_work_check(0, [7; 32], timeout)
+        ));
+        drop(verifier);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    /// A proof worker that marks each request as started and answers it only
+    /// once `go` exists. It writes no proof, so the share then fails.
+    #[cfg(unix)]
+    fn gated_proof_worker(started: &Path, go: &Path) -> ProductionV4PoolWorkerCommand {
+        let script = r#"echo CMFD_V4_PROOF_READY
+while read -r line; do
+  [ "$line" = QUIT ] && exit 0
+  : > "$1"
+  while [ ! -e "$2" ]; do sleep 0.05; done
+  echo CMFD_V4_PROOF_DONE
+done"#;
+        ProductionV4PoolWorkerCommand {
+            program: PathBuf::from("/bin/sh"),
+            arguments: vec![
+                "-c".into(),
+                script.into(),
+                "gated-proof".into(),
+                started.as_os_str().to_owned(),
+                go.as_os_str().to_owned(),
+            ],
+            environment: Vec::new(),
+        }
+    }
+
+    /// Runs its closure when dropped. Declared inside a `thread::scope`, it
+    /// releases a fake worker that waits on a file when an assertion fails,
+    /// so the scope's join ends instead of waiting forever.
+    #[cfg(unix)]
+    struct OnDrop<F: FnMut()>(F);
+
+    #[cfg(unix)]
+    impl<F: FnMut()> Drop for OnDrop<F> {
+        fn drop(&mut self) {
+            (self.0)();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_running_proof_leaves_its_replay_worker_free_for_work_checks() {
+        let scratch = worker_test_path("proof-releases-replay");
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+        let logs = [scratch.join("worker0.log"), scratch.join("worker1.log")];
+        let started = scratch.join("proof-started");
+        let go = scratch.join("proof-go");
+        let verifier = ProductionV4PersistentPoolVerifier::start_for_network(
+            BATCH_TEST_NETWORK_ID,
+            ProductionV4PoolVerifierConfig {
+                replay: fake_replay_worker(&logs[0]),
+                extra_replays: vec![fake_replay_worker(&logs[1])],
+                proof: gated_proof_worker(&started, &go),
+                scratch_directory: scratch.clone(),
+                worker_scratch_directory: scratch.to_str().unwrap().to_owned(),
+                work_check_pin: Some(shell_pin()),
+            },
+        )
+        .unwrap();
+        // Every nonce meets this chain target, so each share is proved.
+        let mut template = batch_test_template(BATCH_TEST_NETWORK_ID);
+        template.challenge.target = [0xff; 32];
+        let timeout = Duration::from_secs(30);
+        // Worker 0 proves through the single-share path, worker 1 through a batch.
+        for worker in [0_usize, 1] {
+            let _ = std::fs::remove_file(&started);
+            let _ = std::fs::remove_file(&go);
+            std::thread::scope(|scope| {
+                let _release = OnDrop(|| {
+                    let _ = std::fs::write(&go, b"");
+                });
+                let share = scope.spawn(|| {
+                    verifier.evaluate_batch_on(
+                        worker,
+                        &[ProductionV4PoolShareRequest {
+                            template: &template,
+                            nonce: 70 + worker as u64,
+                            share_target: [0xff; 32],
+                        }],
+                    )
+                });
+                let deadline = Instant::now() + timeout;
+                while !started.exists() {
+                    assert!(Instant::now() < deadline, "the proof never started");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                // The proof is running; the share's replay worker is not held.
+                let replay = verifier.try_replay_for_work_check(worker, [7; 32], timeout);
+                std::fs::write(&go, b"").unwrap();
+                assert!(
+                    matches!(replay, GpuReplay::Done(_)),
+                    "worker {worker} answered {replay:?} while a proof ran"
+                );
+                let results = share.join().unwrap();
+                assert!(results[0].is_err(), "the gated worker writes no proof");
+            });
+            // Search, full replay, the known answer before the proof, then
+            // the work check during it.
+            assert_eq!(
+                std::fs::read_to_string(&logs[worker]).unwrap(),
+                if worker == 0 {
+                    "RUN 1\nRUN 1\nRUNBATCH 1\nRUNBATCH 1\n"
+                } else {
+                    "RUNBATCH 1\nRUN 1\nRUNBATCH 1\nRUNBATCH 1\n"
+                }
+            );
+        }
+        drop(verifier);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    /// A block work check that holds replay worker 0 delays only worker 0's
+    /// own shares: a chain-winning share on worker 1 is still replayed and
+    /// proved meanwhile, and worker 0's share goes on once the check is done.
+    #[cfg(unix)]
+    #[test]
+    fn a_held_work_check_delays_only_its_own_workers_shares() {
+        let (verifier, scratch, logs) = batch_test_verifier_with_workers("held-work-check", 2);
+        let verifier = &verifier;
+        // Every nonce meets this chain target, so each share is proved.
+        let mut template = batch_test_template(BATCH_TEST_NETWORK_ID);
+        template.challenge.target = [0xff; 32];
+        let template = &template;
+        let share = |nonce| ProductionV4PoolShareRequest {
+            template,
+            nonce,
+            share_target: [0xff; 32],
+        };
+        let hold = PathBuf::from(format!("{}.hold", logs[0].display()));
+        let holding = PathBuf::from(format!("{}.holding", logs[0].display()));
+        std::fs::write(&hold, b"").unwrap();
+        let timeout = Duration::from_secs(30);
+        std::thread::scope(|scope| {
+            let _release = OnDrop(|| {
+                let _ = std::fs::remove_file(&hold);
+            });
+            let check = scope.spawn(|| verifier.try_replay_for_work_check(0, [7; 32], timeout));
+            let deadline = Instant::now() + timeout;
+            while !holding.exists() {
+                assert!(Instant::now() < deadline, "the work check never started");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let single = scope.spawn(move || verifier.evaluate_batch_on(0, &[share(80)]));
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(
+                !single.is_finished(),
+                "worker 0's share waits for the check"
+            );
+            let (sender, receiver) = mpsc::channel();
+            scope.spawn(move || {
+                let _ = sender.send(verifier.evaluate_batch_on(1, &[share(81)]));
+            });
+            let other = receiver.recv_timeout(Duration::from_secs(10));
+            std::fs::remove_file(&hold).unwrap();
+            let other = other.expect("a share on worker 1 waited for a work check on worker 0");
+            assert!(other[0].is_err(), "the fake proof worker writes no proof");
+            assert!(matches!(check.join().unwrap(), GpuReplay::Done(_)));
+            assert!(single.join().unwrap()[0].is_err());
+        });
+        // Worker 1: batch, full replay, known answer, all before worker 0's
+        // check ended; worker 0: the check, then its share's replays.
+        assert_eq!(
+            std::fs::read_to_string(&logs[1]).unwrap(),
+            "RUNBATCH 1\nRUN 1\nRUNBATCH 1\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&logs[0]).unwrap(),
+            "RUNBATCH 1\nRUN 1\nRUN 1\nRUNBATCH 1\n"
+        );
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    /// A chain-winning share's replay worker replays the first known answer
+    /// before it is released, but only a process started from the pinned
+    /// file does.
+    #[cfg(unix)]
+    #[test]
+    fn a_found_blocks_replay_worker_replays_a_known_answer_only_when_pinned() {
+        let scratch = worker_test_path("found-block-known-answer");
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+        let log = scratch.join("worker0.log");
+        let start = |work_check_pin: Option<ReplayWorkerPin>| {
+            ProductionV4PersistentPoolVerifier::start_for_network(
+                BATCH_TEST_NETWORK_ID,
+                ProductionV4PoolVerifierConfig {
+                    replay: fake_replay_worker(&log),
+                    extra_replays: Vec::new(),
+                    proof: fake_proof_worker(),
+                    scratch_directory: scratch.clone(),
+                    worker_scratch_directory: scratch.to_str().unwrap().to_owned(),
+                    work_check_pin,
+                },
+            )
+            .unwrap()
+        };
+        // The fake worker fills its one lane with the field value 1.
+        let lane = 1_u32
+            .to_le_bytes()
+            .repeat(FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES / 4);
+        let expected = forgematrix_v4_final_activation_digest_from_le_bytes(
+            WORK_KNOWN_ANSWERS[0].challenge_digest,
+            &lane,
+        )
+        .unwrap();
+        let verifier = start(Some(shell_pin()));
+        {
+            let mut search_state = verifier.searcher.state.lock().unwrap();
+            assert_eq!(
+                verifier.known_answer_locked(&mut search_state, 0),
+                Some(expected)
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "RUNBATCH 1\n");
+        drop(verifier);
+        let verifier = start(None);
+        {
+            let mut search_state = verifier.searcher.state.lock().unwrap();
+            assert_eq!(verifier.known_answer_locked(&mut search_state, 0), None);
+        }
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "RUNBATCH 1\n",
+            "an unpinned worker runs nothing"
+        );
         drop(verifier);
         let _ = std::fs::remove_dir_all(scratch);
     }
@@ -2103,12 +2685,14 @@ while read -r line; do [ "$line" = QUIT ] && exit 0; echo CMFD_V4_PROOF_DONE; do
     /// CMFD_HW_REPLAY_WORKER=…/cmfd-v4-replay CMFD_HW_PROOF_WORKER=…/real_bank0_relations \
     /// CMFD_HW_MODEL_BANK=…/MODEL-V2.bank CMFD_HW_FIXED_DIR=…/production-v4/fixed \
     /// CMFD_HW_SCRATCH=/abs/scratch [CMFD_HW_PROVE=1] [CMFD_HW_EXTRA_GPUS=1,2] \
-    ///   <test binary> --ignored real_gpu_batched_replay --nocapture
+    /// [CMFD_HW_NETWORK_ID=<64 hex>] <test binary> --ignored real_gpu_batched_replay --nocapture
     /// ```
     ///
     /// Every batched lane must give exactly the work digest of a one-share
     /// replay of the same nonce. With `CMFD_HW_PROVE=1` two chain-winning
-    /// lanes are also proved from one batch.
+    /// lanes are also proved from one batch. The shares and the proof worker
+    /// use the compiled network, or `CMFD_HW_NETWORK_ID`: a release proof
+    /// worker serves only the ProductionV4 networks, not a Devnet build's.
     #[cfg(unix)]
     #[test]
     #[ignore = "needs a CUDA GPU, the model bank and the production workers"]
@@ -2117,6 +2701,15 @@ while read -r line; do [ "$line" = QUIT ] && exit 0; echo CMFD_V4_PROOF_DONE; do
             PathBuf::from(std::env::var_os(name).unwrap_or_else(|| panic!("{name} is required")))
         };
         let prove = std::env::var("CMFD_HW_PROVE").as_deref() == Ok("1");
+        let network_id: [u8; 32] = std::env::var("CMFD_HW_NETWORK_ID").map_or(
+            COMPILED_NETWORK_PROFILE.network_id,
+            |network_id| {
+                hex::decode(network_id)
+                    .ok()
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .expect("CMFD_HW_NETWORK_ID is 32 bytes in hex")
+            },
+        );
         // CMFD_HW_EXTRA_GPUS: comma-separated CUDA devices that each run one
         // more replay worker; batches then run on every worker at once.
         let extra_gpus = std::env::var("CMFD_HW_EXTRA_GPUS")
@@ -2129,7 +2722,7 @@ while read -r line; do [ "$line" = QUIT ] && exit 0; echo CMFD_V4_PROOF_DONE; do
             })
             .unwrap_or_default();
         let mut config = if prove {
-            production_v4_solo_config(
+            let mut config = production_v4_solo_config(
                 &path("CMFD_HW_REPLAY_WORKER"),
                 &path("CMFD_HW_PROOF_WORKER"),
                 &path("CMFD_HW_MODEL_BANK"),
@@ -2137,7 +2730,11 @@ while read -r line; do [ "$line" = QUIT ] && exit 0; echo CMFD_V4_PROOF_DONE; do
                 &path("CMFD_HW_SCRATCH"),
                 None,
             )
-            .unwrap()
+            .unwrap();
+            // The native proof command is `--server <network ID> <bank> <fixed>`.
+            assert_eq!(config.proof.arguments[0], "--server");
+            config.proof.arguments[1] = hex::encode(network_id).into();
+            config
         } else {
             // Replay only: the proof worker is never asked for anything.
             let search = production_v4_pool_searcher_config(
@@ -2155,6 +2752,7 @@ while read -r line; do [ "$line" = QUIT ] && exit 0; echo CMFD_V4_PROOF_DONE; do
                 proof: fake_proof_worker(),
                 scratch_directory: search.scratch_directory,
                 worker_scratch_directory: search.worker_scratch_directory,
+                work_check_pin: None,
             }
         };
         for gpu in &extra_gpus {
@@ -2168,13 +2766,14 @@ while read -r line; do [ "$line" = QUIT ] && exit 0; echo CMFD_V4_PROOF_DONE; do
             config.extra_replays.push(replay);
         }
         let started = Instant::now();
-        let verifier = ProductionV4PersistentPoolVerifier::start(config).unwrap();
+        let verifier =
+            ProductionV4PersistentPoolVerifier::start_for_network(network_id, config).unwrap();
         eprintln!(
             "{} replay worker(s) ready in {:.1} s",
             verifier.replay_workers(),
             started.elapsed().as_secs_f64()
         );
-        let mut template = batch_test_template(COMPILED_NETWORK_PROFILE.network_id);
+        let mut template = batch_test_template(network_id);
         let nonces = (0..32_u64)
             .map(|index| 0x5eed_0000 + index * 7_919)
             .collect::<Vec<_>>();
@@ -2302,6 +2901,380 @@ while read -r line; do [ "$line" = QUIT ] && exit 0; echo CMFD_V4_PROOF_DONE; do
                 "two chain-winning lanes proved from one batch; lane 0 matches a one-share proof"
             );
         }
+    }
+
+    /// Real-GPU check of block work checks on a pool's replay worker, run by
+    /// hand on a pool host with the release replay worker:
+    ///
+    /// ```text
+    /// CMFD_HW_REPLAY_WORKER=…/cmfd-v4-replay CMFD_HW_MODEL_BANK=…/MODEL-V2.bank \
+    /// CMFD_HW_FIXED_RECORD=…/FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json \
+    /// CMFD_HW_SCRATCH=/abs/scratch [CMFD_WORK_THREADS=6] [CMFD_HW_WORK_CLAIMS=claims.jsonl] \
+    ///   <test binary> --ignored real_gpu_work_checks --nocapture --test-threads=1
+    /// ```
+    ///
+    /// The GPU engine borrows the replay worker through the work-check
+    /// adapter. Both engines must pass their known answers and give the same
+    /// final-activation digest on every committed execution vector: a
+    /// published vector must match, a changed one (its block's claimed work
+    /// over the changed header) must be a confirmed mismatch. Each line of
+    /// `CMFD_HW_WORK_CLAIMS` is a JSON object with a block header
+    /// (`network_id`, `previous_block`, `transaction_root`, `height`,
+    /// `timestamp`, `target`), its `nonce`, its claimed `work_digest`, a
+    /// `label` and the expected verdict (`expect`: `match` or `mismatch`),
+    /// checked the same way. The GPU engine alone never confirms a mismatch,
+    /// and a busy replay worker leaves the check to the CPU engine.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "needs a CUDA GPU, the model bank and the release replay worker"]
+    fn real_gpu_work_checks_agree_with_the_cpu_engine() {
+        use crate::honest_work::{
+            CpuWorkEngine, GPU_WORK_CHECK_TIMEOUT, GpuReplayWorkers, GpuWorkEngine,
+            HonestWorkChecker, WorkClaim, WorkEngine, WorkEngineError, WorkEngineHealth,
+            WorkEngineKind, WorkEngineState, WorkKatReport, WorkProvenance, WorkUnavailable,
+            WorkVerdict, honest_work_digest,
+        };
+        use cmfd_consensus::{
+            ConsensusPowVerifier, ForgeMatrixV4FileLayerSource, ForgeMatrixV4FixedArtifactRecordV1,
+        };
+        use std::sync::Arc;
+
+        struct Case {
+            label: String,
+            claim: WorkClaim,
+            expect_match: bool,
+            /// The final-activation digest an independent engine computed
+            /// before, where it is known.
+            known_final: Option<[u8; 32]>,
+        }
+
+        let path = |name: &str| {
+            PathBuf::from(std::env::var_os(name).unwrap_or_else(|| panic!("{name} is required")))
+        };
+        let digest = |value: &serde_json::Value, field: &str| -> [u8; 32] {
+            let text = value[field]
+                .as_str()
+                .unwrap_or_else(|| panic!("{field} is missing"));
+            hex::decode(text)
+                .unwrap()
+                .try_into()
+                .unwrap_or_else(|_| panic!("{field} is not 32 bytes"))
+        };
+        let challenge_of = |value: &serde_json::Value| -> [u8; 32] {
+            let number = |field: &str| match &value[field] {
+                serde_json::Value::String(text) => text.parse::<u64>().unwrap(),
+                other => other
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("{field} is missing")),
+            };
+            forgematrix_v4_challenge_digest(
+                &cmfd_consensus::BlockChallenge {
+                    network_id: digest(value, "network_id"),
+                    previous_block: digest(value, "previous_block"),
+                    transaction_root: digest(value, "transaction_root"),
+                    height: number("height"),
+                    timestamp: number("timestamp"),
+                    target: digest(value, "target"),
+                },
+                number("nonce"),
+                PRODUCTION_V4_MODEL_MANIFEST_DIGEST,
+            )
+        };
+        let threads = std::env::var("CMFD_WORK_THREADS")
+            .map(|value| value.parse().expect("CMFD_WORK_THREADS is a number"))
+            .unwrap_or(6);
+
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../../cmfd-consensus/data/forgematrix_v4_execution_vectors_v1.json"
+        ))
+        .unwrap();
+        let published = vectors["vectors"].as_array().unwrap();
+        let mut cases = Vec::new();
+        for vector in published {
+            let challenge_digest = challenge_of(vector);
+            assert_eq!(challenge_digest, digest(vector, "challenge_digest"));
+            cases.push(Case {
+                label: format!("published-{}", vector["height"]),
+                claim: WorkClaim {
+                    challenge_digest,
+                    work_digest: digest(vector, "work_digest"),
+                },
+                expect_match: true,
+                known_final: Some(digest(vector, "final_activation_digest")),
+            });
+        }
+        for changed in vectors["changed_vectors"].as_array().unwrap() {
+            let block = published
+                .iter()
+                .find(|vector| vector["height"] == changed["height"])
+                .unwrap();
+            let challenge_digest = digest(changed, "challenge_digest");
+            let final_activation_digest = digest(changed, "final_activation_digest");
+            assert_eq!(
+                honest_work_digest(challenge_digest, final_activation_digest),
+                digest(changed, "work_digest")
+            );
+            cases.push(Case {
+                label: format!(
+                    "changed-{}-{}",
+                    changed["height"],
+                    changed["change"].as_str().unwrap()
+                ),
+                claim: WorkClaim {
+                    challenge_digest,
+                    work_digest: digest(block, "work_digest"),
+                },
+                expect_match: false,
+                known_final: Some(final_activation_digest),
+            });
+        }
+        if let Some(claims) = std::env::var_os("CMFD_HW_WORK_CLAIMS") {
+            let claims = fs::read_to_string(claims).unwrap();
+            for line in claims.lines().filter(|line| !line.trim().is_empty()) {
+                let claim: serde_json::Value = serde_json::from_str(line).unwrap();
+                cases.push(Case {
+                    label: claim["label"].as_str().unwrap().to_owned(),
+                    claim: WorkClaim {
+                        challenge_digest: challenge_of(&claim),
+                        work_digest: digest(&claim, "work_digest"),
+                    },
+                    expect_match: match claim["expect"].as_str() {
+                        Some("match") => true,
+                        Some("mismatch") => false,
+                        other => panic!("expect must be match or mismatch, not {other:?}"),
+                    },
+                    known_final: None,
+                });
+            }
+        }
+
+        // Work checks use the replay worker only if it is the release build.
+        let replay_worker = path("CMFD_HW_REPLAY_WORKER");
+        let pin = ReplayWorkerPin::release(replay_worker.clone())
+            .unwrap()
+            .unwrap_or_else(|sha256| {
+                panic!(
+                    "{} is not the release replay worker (SHA-256 {})",
+                    replay_worker.display(),
+                    hex::encode(sha256)
+                )
+            });
+        let bank_path = path("CMFD_HW_MODEL_BANK");
+        let search = production_v4_pool_searcher_config(
+            &replay_worker,
+            &bank_path,
+            &path("CMFD_HW_SCRATCH"),
+            32,
+            None,
+            None,
+        )
+        .unwrap();
+        let started = Instant::now();
+        let verifier = Arc::new(
+            ProductionV4PersistentPoolVerifier::start(ProductionV4PoolVerifierConfig {
+                replay: search.replay,
+                extra_replays: Vec::new(),
+                // Work checks never prove.
+                proof: fake_proof_worker(),
+                scratch_directory: search.scratch_directory,
+                worker_scratch_directory: search.worker_scratch_directory,
+                work_check_pin: Some(pin),
+            })
+            .unwrap(),
+        );
+        eprintln!(
+            "replay worker ready in {:.1} s",
+            started.elapsed().as_secs_f64()
+        );
+
+        let record: ForgeMatrixV4FixedArtifactRecordV1 =
+            serde_json::from_slice(&fs::read(path("CMFD_HW_FIXED_RECORD")).unwrap()).unwrap();
+        let mainnet_network_id = digest(&published[0], "network_id");
+        let started = Instant::now();
+        let (_, identity) = ConsensusPowVerifier::v4_candidate_for_network_with_layer_roots(
+            mainnet_network_id,
+            record,
+            BufReader::with_capacity(1024 * 1024, File::open(&bank_path).unwrap()),
+        )
+        .unwrap();
+        eprintln!(
+            "bank authenticated in {:.1} s",
+            started.elapsed().as_secs_f64()
+        );
+        let source = ForgeMatrixV4FileLayerSource::new(
+            File::open(&bank_path).unwrap(),
+            &identity.manifest,
+            identity.base_input,
+            identity.layer_roots,
+        )
+        .unwrap();
+        let cpu: Arc<dyn WorkEngine> = Arc::new(CpuWorkEngine::new(Arc::new(source), threads));
+        let workers: Arc<dyn GpuReplayWorkers> = verifier.clone();
+        let gpu: Arc<dyn WorkEngine> =
+            Arc::new(GpuWorkEngine::new(workers, GPU_WORK_CHECK_TIMEOUT));
+        assert_eq!(gpu.workers(), 1);
+
+        // As the node builds it: block checks read without authenticating
+        // again; the known answers authenticate every layer they read.
+        let gpu_only = HonestWorkChecker::new(None, Some(Arc::clone(&gpu)), false).unwrap();
+        let checker =
+            HonestWorkChecker::new(Some(Arc::clone(&cpu)), Some(Arc::clone(&gpu)), false).unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            gpu_only.run_known_answer_tests(),
+            WorkKatReport {
+                cpu: None,
+                gpu: Some(WorkEngineHealth::Ready)
+            }
+        );
+        eprintln!(
+            "GPU engine alone: known answers passed in {:.3} s",
+            started.elapsed().as_secs_f64()
+        );
+        let started = Instant::now();
+        let report = checker.run_known_answer_tests();
+        eprintln!(
+            "CPU and GPU engines: known answers {report:?} in {:.2} s on {threads} threads",
+            started.elapsed().as_secs_f64()
+        );
+        assert_eq!(report.cpu, Some(WorkEngineHealth::Ready));
+        assert_eq!(report.gpu, Some(WorkEngineHealth::Ready));
+        assert_eq!(checker.engine_state(), WorkEngineState::Ready);
+        assert!(checker.has_independent_engines());
+
+        let mut finals = Vec::with_capacity(cases.len());
+        for case in &cases {
+            let challenge_digest = case.claim.challenge_digest;
+            let started = Instant::now();
+            let gpu_final = gpu
+                .final_activation_digest(challenge_digest, 0, false)
+                .unwrap();
+            let gpu_seconds = started.elapsed().as_secs_f64();
+            let started = Instant::now();
+            let cpu_final = cpu
+                .final_activation_digest(challenge_digest, 0, false)
+                .unwrap();
+            let cpu_seconds = started.elapsed().as_secs_f64();
+            assert_eq!(gpu_final, cpu_final, "{}: the engines differ", case.label);
+            if let Some(known) = case.known_final {
+                assert_eq!(cpu_final, known, "{}", case.label);
+            }
+            let honest = honest_work_digest(challenge_digest, cpu_final);
+            assert_eq!(honest == case.claim.work_digest, case.expect_match);
+
+            let started = Instant::now();
+            let verdict = checker.check(case.claim);
+            let check_seconds = started.elapsed().as_secs_f64();
+            let outcome = match &verdict {
+                WorkVerdict::Match(WorkProvenance::OwnEngine) if case.expect_match => "match",
+                WorkVerdict::Mismatch(mismatch) if !case.expect_match => {
+                    assert_eq!(mismatch.provenance(), WorkProvenance::Confirmed);
+                    assert!(mismatch.confirmed().is_some());
+                    assert!(mismatch.cacheable());
+                    assert_eq!(mismatch.honest_final_activation_digest(), cpu_final);
+                    assert_eq!(mismatch.honest_work_digest(), honest);
+                    "confirmed mismatch"
+                }
+                other => panic!("{}: unexpected verdict {other:?}", case.label),
+            };
+            let started = Instant::now();
+            assert_eq!(checker.check(case.claim), verdict);
+            let repeat_seconds = started.elapsed().as_secs_f64();
+            assert!(
+                repeat_seconds < 0.1,
+                "a repeated check answers from the memo"
+            );
+            eprintln!(
+                "CASE {} verdict={outcome} gpu_final={} cpu_final={} claimed_work={} \
+                 honest_work={} gpu_replay_s={gpu_seconds:.6} cpu_s={cpu_seconds:.3} \
+                 check_s={check_seconds:.3} repeat_s={repeat_seconds:.6}",
+                case.label,
+                hex::encode(gpu_final),
+                hex::encode(cpu_final),
+                hex::encode(case.claim.work_digest),
+                hex::encode(honest),
+            );
+            finals.push(cpu_final);
+        }
+        let alarms = checker.alarms();
+        eprintln!("CPU and GPU engines after the checks: {alarms:?}");
+        assert_eq!(alarms.engine_divergence, 0);
+        assert_eq!(alarms.engine_failures, 0);
+        assert_eq!(alarms.own_engine_mismatches, 0);
+        assert_eq!(
+            checker.engine_health(WorkEngineKind::Gpu),
+            Some(WorkEngineHealth::Ready)
+        );
+        assert_eq!(
+            checker.engine_health(WorkEngineKind::Cpu),
+            Some(WorkEngineHealth::Ready)
+        );
+
+        // A busy replay worker: the CPU engine runs the check instead, and
+        // the GPU keeps its health; with no CPU engine there is no verdict.
+        let idle = &cases[0];
+        assert!(checker.forget(idle.claim.challenge_digest));
+        {
+            let _held = verifier.searcher.state.lock().unwrap();
+            assert_eq!(
+                gpu.final_activation_digest(idle.claim.challenge_digest, 0, false),
+                Err(WorkEngineError::Busy)
+            );
+            let started = Instant::now();
+            assert_eq!(
+                checker.check(idle.claim),
+                WorkVerdict::Match(WorkProvenance::OwnEngine)
+            );
+            eprintln!(
+                "BUSY replay worker held: {} matched on the CPU engine in {:.3} s",
+                idle.label,
+                started.elapsed().as_secs_f64()
+            );
+            assert_eq!(
+                checker.engine_health(WorkEngineKind::Gpu),
+                Some(WorkEngineHealth::Ready),
+                "a busy GPU is not retired"
+            );
+            assert_eq!(
+                gpu_only.check(idle.claim),
+                WorkVerdict::Unavailable(WorkUnavailable::Engine(WorkEngineError::Busy))
+            );
+            eprintln!("BUSY replay worker held: the GPU engine alone gives no verdict");
+        }
+
+        // The GPU engine alone: the same answers, but a mismatch is only its
+        // own, never confirmed.
+        assert!(!gpu_only.has_independent_engines());
+        let mut lone_mismatches = 0;
+        for (case, cpu_final) in cases.iter().zip(&finals) {
+            let started = Instant::now();
+            let verdict = gpu_only.check(case.claim);
+            let check_seconds = started.elapsed().as_secs_f64();
+            let outcome = match &verdict {
+                WorkVerdict::Match(WorkProvenance::OwnEngine) if case.expect_match => "match",
+                WorkVerdict::Mismatch(mismatch) if !case.expect_match => {
+                    assert_eq!(mismatch.provenance(), WorkProvenance::OwnEngine);
+                    assert_eq!(mismatch.confirmed(), None);
+                    assert!(mismatch.cacheable(), "no CPU engine can settle it");
+                    assert_eq!(mismatch.honest_final_activation_digest(), *cpu_final);
+                    lone_mismatches += 1;
+                    "own-engine mismatch, not confirmed"
+                }
+                other => panic!("{}: unexpected GPU-only verdict {other:?}", case.label),
+            };
+            eprintln!(
+                "GPU-ONLY {} verdict={outcome} check_s={check_seconds:.6}",
+                case.label
+            );
+        }
+        let alarms = gpu_only.alarms();
+        eprintln!("GPU engine alone after the checks: {alarms:?}");
+        assert_eq!(alarms.own_engine_mismatches, lone_mismatches);
+        assert_eq!(alarms.engine_failures, 0);
+        assert_eq!(
+            gpu_only.engine_health(WorkEngineKind::Gpu),
+            Some(WorkEngineHealth::Ready)
+        );
     }
 
     #[cfg(unix)]

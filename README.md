@@ -1,30 +1,36 @@
 # CommonFoundry
 
-CommonFoundry (CMFD) is a research-first cryptocurrency implementation built
-around ForgeMatrix, a block-bound proof of work whose proposed production
-kernel is dominated by signed INT8 x INT8 matrix multiplication with exact
-INT32 accumulation.
+CommonFoundry (CMFD) is a permissionless proof-of-work network built around
+ForgeMatrix, a block-bound proof of work dominated by exact dense matrix
+multiplication on GPUs. Mainnet has been live since 3 October 2026 at 17:00
+UTC, with no premine.
 
-The [technical white paper](docs/whitepaper.md) explains the motivation,
-consensus architecture, monetary policy, ForgeMatrix v2 relation, proposed
-succinct proof system, inference-market protocol, threat model, and activation
-requirements in detail.
+- **White paper:** [docs/whitepaper.md](docs/whitepaper.md), the mainnet
+  edition: consensus, monetary policy, ForgeMatrix, how blocks are checked,
+  the node, wallet, pool and exchange software, and the inference market.
+- **Downloads:** [releases](https://github.com/JustAResearcher/CommonFoundry-Binaries/releases).
+  Verify each download against `SHA256SUMS.txt` and its signature.
+- **Explorer:** [explorer.commonfoundry.ai](https://explorer.commonfoundry.ai).
+- **Wallet and node guide:** [packaging/mainnet/USER-GUIDE.md](packaging/mainnet/USER-GUIDE.md).
+- **Pools:** [docs/production-v4-pool.md](docs/production-v4-pool.md) and
+  [POOL-SERVICE-SETUP.md](packaging/mainnet/linux/POOL-SERVICE-SETUP.md).
+- **Exchanges:** the [integration kit](https://github.com/Common-Foundry-1/CommonFoundry/tree/v1.0.16/exchange-kit).
+- **Consensus specification:** [docs/consensus/production-v4-core-spec-v1.md](docs/consensus/production-v4-core-spec-v1.md).
 
-This repository contains the consensus oracle, a seedless v2 model format, the
-exact small-profile v2 arithmetic relation, a test-size matrix sumcheck
-transcript, Rust/CUDA arithmetic smoke vectors, monetary policy, signed UTXO
-validation, chain-derived difficulty, an inference payment-channel state
-machine, and adversarial tests. Canonical bounded wire encodings now cover
-transactions, tagged v1/v2 proofs, and blocks. Block validation and `ChainState`
-are bound to immutable network parameters.
+Mainnet runs the ProductionV4 profile: 384 sequential 4,096 by 4,096 layers
+over a batch of 128 rows, computed exactly in the KoalaBear field against a
+fixed 6 GiB model bank, with a 12,025,320-byte transparent proof in every
+block. From release 1.0.16, nodes also re-execute each new block's work above
+the release checkpoint before they accept it. Released source is on the
+`release/v*` branches and `v*` tags (the current release is
+[v1.0.16](https://github.com/Common-Foundry-1/CommonFoundry/tree/v1.0.16));
+`main` carries ongoing development.
 
-The tagged v2 path accepted by Devnet-0 is deliberately tiny. Its proof is a
-compact serialized claim, but every verifier recomputes every model layer. It
-is **not** a succinct proof or a production verifier, and the production-sized
-v2 profile remains disabled. A production transparent PCS, complete succinct
-proof, model-link certificate, soundness analysis, benchmarks, independent
-implementations, adversarial public testnet, and two audits are still required;
-the full gates are in [SECURITY.md](SECURITY.md).
+## Research history and developer networks
+
+The rest of this README documents the research that led to mainnet and the
+developer tooling: the small-profile ForgeMatrix relations, Devnet-0 and the
+prototype proof backends. These describe developer networks, not mainnet.
 
 The optional `remainder-prototype` feature is a complete proof experiment for
 the tiny 2x4x4 relation, not an activated block proof. Its measured transcript
@@ -568,8 +574,8 @@ node before backing up that file and do not share it. An existing nonempty
 Devnet-2 directory retains its original demonstration key during migration so
 an upgrade cannot strand its test outputs.
 
-Devnet-0 is the active Common Foundry testing network. It currently uses
-manually configured peers rather than automatic discovery. See
+Devnet-0 is the local developer network. It uses manually configured peers
+rather than automatic discovery. See
 [docs/devnet-0.md](docs/devnet-0.md) for node and pool commands, RPC examples,
 acceptance checks, and operating limits; detailed protocol limitations remain
 in [SECURITY.md](SECURITY.md).

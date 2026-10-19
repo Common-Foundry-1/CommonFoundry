@@ -118,7 +118,7 @@ describe("Discord-first launch website", () => {
     expect(screen.getByText(/tail is perpetual, not a hard supply cap/i)).toBeVisible();
     expect(screen.getByText(MAINNET_RELEASE_VERSION)).toBeVisible();
     expect(screen.queryByText(/all usage fees burned/i)).not.toBeInTheDocument();
-    expect(WHITEPAPER_URL).toBe("/docs/Common-Foundry-Technical-Whitepaper-v0.4.pdf");
+    expect(WHITEPAPER_URL).toBe("/docs/Common-Foundry-Technical-Whitepaper-v1.0.pdf");
     for (const link of screen.getAllByRole("link", { name: /white paper/i })) {
       expect(link).toHaveAttribute("href", WHITEPAPER_URL);
     }

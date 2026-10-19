@@ -5,9 +5,11 @@ ForgeMatrix, a block-bound proof of work dominated by exact dense matrix
 multiplication on GPUs. Mainnet has been live since 3 October 2026 at 17:00
 UTC, with no premine.
 
-- **White paper:** [docs/whitepaper.md](docs/whitepaper.md), the mainnet
-  edition: consensus, monetary policy, ForgeMatrix, how blocks are checked,
-  the node, wallet, pool and exchange software, and the inference market.
+- **White paper:** [docs/whitepaper.md](docs/whitepaper.md)
+  ([PDF](output/pdf/Common-Foundry-Technical-Whitepaper-v1.0.pdf)), the
+  mainnet edition: consensus, monetary policy, ForgeMatrix, how blocks are
+  checked, the node, wallet, pool and exchange software, and the inference
+  market.
 - **Downloads:** [releases](https://github.com/JustAResearcher/CommonFoundry-Binaries/releases).
   Verify each download against `SHA256SUMS.txt` and its signature.
 - **Explorer:** [explorer.commonfoundry.ai](https://explorer.commonfoundry.ai).

@@ -1,4 +1,4 @@
-import { EXPLORER_URL, MAINNET_FIRST_BLOCK_AT, MAINNET_LAUNCH_AT, WALLET_URL } from "../content";
+import { EXPLORER_URL, MAINNET_FIRST_BLOCK_AT, MAINNET_LAUNCH_AT, MININGCHAMP_URL, WALLET_URL } from "../content";
 import { BurnCounter } from "./BurnCounter";
 
 export function MainnetLive() {
@@ -14,6 +14,8 @@ export function MainnetLive() {
           <a href={EXPLORER_URL} target="_blank" rel="noopener noreferrer">Block explorer</a>
           {" · "}
           <a href={WALLET_URL} target="_blank" rel="noopener noreferrer">Web wallet</a>
+          {" · "}
+          <a href={MININGCHAMP_URL} target="_blank" rel="noopener noreferrer">CMFD on MiningChamp</a>
         </p>
       </div>
       <BurnCounter />

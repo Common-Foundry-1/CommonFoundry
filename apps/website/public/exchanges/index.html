@@ -136,7 +136,7 @@ td code { white-space: nowrap; }
 .checker label { font-weight: 600; font-size: 0.9rem; }
 .checker input { width: 100%; font: 0.85rem var(--mono); padding: 10px 12px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); }
 .checker input:focus { outline: 2px solid var(--accent); outline-offset: 0; }
-.verdict { font-size: 0.92rem; min-height: 1.5em; display: flex; gap: 8px; align-items: baseline; }
+.verdict { font-size: 0.92rem; min-height: 1.5em; display: flex; gap: 8px; align-items: baseline; overflow-wrap: anywhere; }
 .verdict .pill { font: 600 0.72rem var(--body); text-transform: uppercase; letter-spacing: 0.08em; padding: 2px 8px; border-radius: 999px; border: 1px solid currentColor; white-space: nowrap; }
 .verdict.ok { color: var(--good); }
 .verdict.no { color: var(--bad); }
@@ -168,7 +168,7 @@ footer a:hover { color: var(--accent); }
 <div class="page">
   <header class="masthead">
     <a class="brand" href="/">Common <span>Foundry</span></a>
-    <div class="release">Mainnet · release v1.0.15 · exchange integration</div>
+    <div class="release">Mainnet · release v1.0.16 · exchange integration</div>
   </header>
 
   <div class="hero">
@@ -177,7 +177,7 @@ footer a:hover { color: var(--accent); }
     <p class="lede">Run <strong>cmfd-node exchange-wallet</strong> on your own server and point your existing Bitcoin integration at it. It answers Bitcoin Core's wallet RPC (<code>getnewaddress</code>, <code>listsinceblock</code>, <code>sendtoaddress</code> and the rest), keeps your keys with you, and reads the chain from our hosted endpoint, so you never download the chain.</p>
     <div class="hero-actions">
       <a class="button primary" href="#setup">Set it up in four steps</a>
-      <a class="button" href="https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/tag/v1.0.15">Download v1.0.15</a>
+      <a class="button" href="https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/tag/v1.0.16">Download v1.0.16</a>
     </div>
   </div>
 
@@ -186,7 +186,7 @@ footer a:hover { color: var(--accent); }
     <div><dt>Block time</dt><dd>60 s<small>target interval</small></dd></div>
     <div><dt>Credit deposits after</dt><dd>60 conf.<small>about one hour</small></dd></div>
     <div><dt>Network fee</dt><dd>0.1 CMFD<small>flat per transaction, burned</small></dd></div>
-    <div><dt>Address</dt><dd>64 hex<small>x-only public key, no checksum</small></dd></div>
+    <div><dt>Address</dt><dd>cmfd1…<small>checksummed; the 64-hex form is also accepted</small></dd></div>
     <div><dt>Coinbase maturity</dt><dd>100 blocks<small>mined coins spend after 100 blocks</small></dd></div>
   </dl>
 
@@ -213,12 +213,12 @@ footer a:hover { color: var(--accent); }
         <ol class="steps">
           <li>
             <h3>Download and verify the release</h3>
-            <p>Get the runtime archive for your platform from the <a href="https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/tag/v1.0.15">v1.0.15 release</a>, together with <code>SHA256SUMS.txt</code> and <code>SHA256SUMS.txt.sig</code>. Get the signing key separately, from <a href="https://commonfoundry.ai/mainnet-release-key.txt">commonfoundry.ai/mainnet-release-key.txt</a>. Check the signature, then the archive.</p>
+            <p>Get the runtime archive for your platform from the <a href="https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/tag/v1.0.16">v1.0.16 release</a>, together with <code>SHA256SUMS.txt</code> and <code>SHA256SUMS.txt.sig</code>. Get the signing key separately, from <a href="https://commonfoundry.ai/mainnet-release-key.txt">commonfoundry.ai/mainnet-release-key.txt</a>. Check the signature, then the archive.</p>
             <div class="code"><div class="label"><span>shell</span><button class="copy" type="button">Copy</button></div><pre>ssh-keygen -Y verify -f mainnet-release-key.txt \
   -I commonfoundry-mainnet-owner -n commonfoundry-release \
   -s SHA256SUMS.txt.sig &lt; SHA256SUMS.txt
 sha256sum --ignore-missing -c SHA256SUMS.txt
-tar -xzf commonfoundry-mainnet-runtime-linux-x86_64-v1.0.15.tar.gz</pre></div>
+tar -xzf commonfoundry-mainnet-runtime-linux-x86_64-v1.0.16.tar.gz</pre></div>
             <p>A good signature names the key <span class="mono-small">SHA256:cA1Tsf8hL/pxDV5WpOE3iPW3b4uDQosu1dOh//4a/fk</span>; stop if it shows any other. The wallet is part of <code>cmfd-node</code> in that archive; Windows uses the <code>.zip</code> runtime and <code>cmfd-node.exe</code>.</p>
           </li>
           <li>
@@ -235,7 +235,12 @@ rpcpassword=&lt;at least 16 random characters&gt;
 <span class="c"># Where the wallet reads the chain.</span>
 upstream=https://sg-rpc.commonfoundry.ai/mainnet
 upstreamuser=&lt;your hosted-endpoint user&gt;
-upstreampassword=&lt;your hosted-endpoint password&gt;</pre></div>
+upstreampassword=&lt;your hosted-endpoint password&gt;
+<span class="c"># The address form every method prints: hex (the default) or bech32m
+# (checksummed cmfd1... addresses). Both forms are always accepted as input.
+# Your database stores what getnewaddress prints, so choose before the first
+# address: keep hex on a wallet that has already handed out addresses.</span>
+<span class="c">#addressformat=bech32m</span></pre></div>
           </li>
           <li>
             <h3>Start the wallet and back it up</h3>
@@ -293,6 +298,7 @@ bitcoin-cli -rpcport=39120 -rpcuser=exchange -rpcpassword=… backupwallet /secu
           <li>Entries in <code>removed</code> were dropped by a chain reorganization. Reverse any credit you gave for them.</li>
           <li>Deposits appear once they are in a block (1 confirmation), not while they wait in the mempool.</li>
           <li>Mined coins paid straight to a deposit address show as <code>immature</code> until they are 100 blocks deep, then as <code>generate</code>.</li>
+          <li>Addresses print in hex, as above, unless you set <code>addressformat=bech32m</code>. Every method accepts both forms as input.</li>
         </ul>
         <p><code>gettransaction</code>, <code>getreceivedbyaddress</code>, <code>listreceivedbyaddress</code> and <code>listtransactions</code> work as you expect if your system uses them instead.</p>
       </section>
@@ -335,7 +341,7 @@ bitcoin-cli … gettransaction "&lt;txid&gt;"</pre></div>
         <h2>Differences from Bitcoin Core</h2>
         <p>These are the only places where your Bitcoin integration needs a setting or a second look.</p>
         <dl class="diffs">
-          <div><dt>Addresses</dt><dd>64 lowercase hex characters (an x-only public key) with no checksum. Check every customer withdrawal address with <code>validateaddress</code>, and have customers paste rather than type it; see <a href="#addresses">Checking addresses</a>.</dd></div>
+          <div><dt>Addresses</dt><dd>An address is an x-only public key, written as a checksummed <code>cmfd1…</code> address (63 characters) or as 64 lowercase hex characters with no checksum. Both forms name the same key and pay the same coins, so hex addresses issued before 1.0.16 stay valid. Check every customer withdrawal address with <code>validateaddress</code>; see <a href="#addresses">Checking addresses</a>.</dd></div>
           <div><dt>Fees</dt><dd>Every transaction pays the network minimum of 0.1 CMFD, which is burned. <code>settxfee</code>, <code>fee_rate</code> and <code>conf_target</code> are accepted and ignored; <code>estimatesmartfee</code> returns 0.1.</dd></div>
           <div><dt>Change</dt><dd>Unconfirmed outputs cannot be spent, so change returns after one block. The wallet keeps 25 coins ready to cover this.</dd></div>
           <div><dt>Incoming</dt><dd>Deposits appear once mined (1 confirmation), not while in the mempool.</dd></div>
@@ -346,13 +352,19 @@ bitcoin-cli … gettransaction "&lt;txid&gt;"</pre></div>
 
       <section id="addresses">
         <h2>Checking addresses</h2>
-        <p>Addresses carry no checksum. A valid address is 64 lowercase hex characters whose value is the x-coordinate of a point on the secp256k1 curve. That rule rejects malformed input and about half of all mistyped addresses, but the other half still form valid keys. Have customers paste or scan their withdrawal address rather than type it, and show it back to them before you send. Try the rule here; it runs in your browser and sends nothing anywhere.</p>
+        <p>Since 1.0.16 an address can be written two ways, and every method accepts both:</p>
+        <ul class="plain">
+          <li><strong>Checksummed:</strong> <code>cmfd1</code> followed by 58 characters (bech32m, BIP-350), all lowercase or all uppercase. The checksum catches every typo of up to four characters, so a mistyped address is refused instead of paid.</li>
+          <li><strong>Hex:</strong> 64 lowercase hex characters, the only form before 1.0.16. It has no checksum: about half of all mistyped hex addresses are still valid keys.</li>
+        </ul>
+        <p>Both forms pay the same key; a valid address is one whose key is the x-coordinate of a point on the secp256k1 curve. <code>validateaddress</code> returns <code>isvalid</code>, the canonical <code>address</code> in your <code>addressformat</code>, the key as <code>pubkey</code> (hex) and <code>format</code>, the form you passed (<code>hex</code> or <code>bech32m</code>). An invalid address returns <code>isvalid: false</code> and an <code>error</code> that names the problem: a bad checksum, another network (test networks use <code>tcmfd1…</code>), mixed case, or not a key. <code>sendmany</code> refuses one key written both ways as a duplicate recipient.</p>
+        <p>Which form to show customers: desktop wallets up to 1.0.15 accept only hex, so show hex, or both forms, until your customers have upgraded. Whichever you show, have customers paste or scan their withdrawal address rather than type it. Try the rule here; it runs in your browser and sends nothing anywhere.</p>
         <div class="checker">
           <label for="address-input">Common Foundry address</label>
-          <input id="address-input" type="text" spellcheck="false" autocomplete="off" placeholder="64 lowercase hex characters" value="79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798">
+          <input id="address-input" type="text" spellcheck="false" autocomplete="off" placeholder="cmfd1… or 64 lowercase hex characters" value="cmfd10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vq4yhywr">
           <div class="verdict idle" id="address-verdict" role="status" aria-live="polite"></div>
         </div>
-        <p>The example is the secp256k1 generator point, a valid key that nobody should pay. Your integration should still call <code>validateaddress</code> on the wallet, which applies the same rule.</p>
+        <p>The example is the secp256k1 generator point, a valid key that nobody should pay. Your integration should still call <code>validateaddress</code> on the wallet, which applies the same rules.</p>
       </section>
 
       <section id="operations">
@@ -372,6 +384,8 @@ bitcoin-cli … gettransaction "&lt;txid&gt;"</pre></div>
         </ul>
         <h3>Restore</h3>
         <p>Put <code>wallet.json</code> and <code>cmfd-wallet.conf</code> in an empty directory and start the wallet. It rescans from the block at which the wallet was created, about four blocks per second from the hosted endpoint, and finds every address, including ones handed out after the backup was made.</p>
+        <h3>Upgrading</h3>
+        <p>Replace <code>cmfd-node</code> with the one from the new release and restart the wallet; <code>wallet.json</code> and <code>cmfd-wallet.conf</code> stay as they are. The hosted endpoint already runs 1.0.16. If the wallet reads from your own node, upgrade the node first: a wallet newer than its node stops following it, and new deposits wait until the node is upgraded.</p>
       </section>
 
       <section id="endpoint">
@@ -393,16 +407,16 @@ bitcoin-cli … gettransaction "&lt;txid&gt;"</pre></div>
 
       <section id="advanced">
         <h2>Advanced route</h2>
-        <p>Some exchanges prefer to hold one key file per address and build every transaction themselves. For that, the release includes offline tools (<code>exchange-key-new</code>, <code>exchange-tx-sign</code>) and the exchange JSON-RPC with deposit event streams. The <a href="https://github.com/Common-Foundry-1/CommonFoundry/blob/v1.0.15/exchange-kit/INTEGRATION-GUIDE.md">full integration guide</a> covers this route in detail, along with error catalogs and the hosted endpoint's method list.</p>
+        <p>Some exchanges prefer to hold one key file per address and build every transaction themselves. For that, the release includes offline tools (<code>exchange-key-new</code>, <code>exchange-tx-sign</code>) and the exchange JSON-RPC with deposit event streams. The <a href="https://github.com/Common-Foundry-1/CommonFoundry/blob/v1.0.16/exchange-kit/INTEGRATION-GUIDE.md">full integration guide</a> covers this route in detail, along with error catalogs and the hosted endpoint's method list.</p>
       </section>
     </main>
   </div>
 
   <footer>
-    <span>Common Foundry mainnet · exchange integration · v1.0.15</span>
+    <span>Common Foundry mainnet · exchange integration · v1.0.16</span>
     <span>
-      <a href="https://github.com/Common-Foundry-1/CommonFoundry/blob/v1.0.15/exchange-kit/INTEGRATION-GUIDE.md">Integration guide</a> ·
-      <a href="https://github.com/Common-Foundry-1/CommonFoundry/blob/v1.0.15/docs/mainnet-release-verification.md">Release verification</a> ·
+      <a href="https://github.com/Common-Foundry-1/CommonFoundry/blob/v1.0.16/exchange-kit/INTEGRATION-GUIDE.md">Integration guide</a> ·
+      <a href="https://github.com/Common-Foundry-1/CommonFoundry/blob/v1.0.16/docs/mainnet-release-verification.md">Release verification</a> ·
       <a href="https://explorer.commonfoundry.ai">Explorer</a>
     </span>
   </footer>

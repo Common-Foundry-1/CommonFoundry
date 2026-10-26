@@ -85,7 +85,7 @@ impl IndependentUtxoClient {
                 retryable: true,
             });
         }
-        if response.status() != StatusCode::NOT_FOUND && response.status() != StatusCode::OK {
+        if response.status() != StatusCode::NOT_FOUND {
             return Err(ApiError::MalformedResponse);
         }
         let expected_network = hex_network_id();
@@ -392,6 +392,12 @@ mod tests {
         assert!(matches!(
             test_client(&base).probe().await,
             Err(ApiError::WrongNetwork)
+        ));
+        server.join().unwrap();
+        let (base, _, server) = serve_once("200 OK", "{}", Some(&hex_network_id()));
+        assert!(matches!(
+            test_client(&base).probe().await,
+            Err(ApiError::MalformedResponse)
         ));
         server.join().unwrap();
     }

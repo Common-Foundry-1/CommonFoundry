@@ -2,6 +2,10 @@
 
 This is the mainnet Android wallet source. It is a Rust wallet core with a Tauri/React interface and an Android Keystore storage bridge. The app supports English and French and uses the official Common Foundry mark and mineral/graphite/copper design tokens.
 
+## Acknowledgments
+
+Thanks to **Qcvibes1** for contributing the original Android Wallet V1 package that started this work. The current release includes subsequent Common Foundry integration, security changes, and review.
+
 ## Security boundary
 
 Keys are generated, restored, and used to sign in Rust. The local encrypted wallet is wrapped by Android Keystore; a portable encrypted backup is required before a new wallet is activated. The app does not send private keys or passphrases to either public service.

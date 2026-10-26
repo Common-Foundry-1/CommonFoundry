@@ -582,6 +582,23 @@ test("opens the existing backup screen from settings without locking the wallet"
   expect(lockWallet).not.toHaveBeenCalled();
 });
 
+test("keeps an unlocked wallet on screen if it cannot lock before notices", async () => {
+  vi.mocked(lockWallet).mockRejectedValue(new Error("private vault error"));
+  renderUnlockedWallet();
+  await screen.findByText("Solde réel");
+
+  fireEvent.click(screen.getByRole("button", { name: "Paramètres" }));
+  fireEvent.click(screen.getByRole("button", {
+    name: "Licences tierces et confidentialité du scan QR",
+  }));
+
+  await waitFor(() => expect(lockWallet).toHaveBeenCalledTimes(1));
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "Le portefeuille n’a pas pu être verrouillé",
+  );
+  expect(window.location.pathname).toBe("/");
+});
+
 test("localizes a stable native error when English is selected", async () => {
   localStorage.setItem(LANGUAGE_STORAGE_KEY, "en");
   mockedStatus.mockResolvedValue({

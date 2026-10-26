@@ -155,6 +155,14 @@ function WalletApplication() {
             setWalletView("backup");
             setSettingsOpen(false);
           }}
+          onOpenNotices={async () => {
+            if (state.kind === "ready" && state.wallet.unlocked) {
+              const locked = await lockWallet();
+              if (locked.unlocked) throw new Error("wallet did not lock");
+              updateWallet(locked);
+            }
+            window.location.assign("/android-library-notices.html");
+          }}
           onClose={() => setSettingsOpen(false)}
         />
       )}
@@ -166,13 +174,16 @@ function SettingsPanel({
   version,
   backupAvailable,
   onOpenBackup,
+  onOpenNotices,
   onClose,
 }: {
   version: string;
   backupAvailable: boolean;
   onOpenBackup: () => void;
+  onOpenNotices: () => Promise<void>;
   onClose: () => void;
 }) {
+  const [noticesError, setNoticesError] = useState(false);
   const {
     t,
     languagePreference,
@@ -271,7 +282,17 @@ function SettingsPanel({
           <span>{t("version", { version })}</span>
           <span>{t("network")}</span>
           <p>{t("openSource")}</p>
-          <a href="/android-library-notices.html">{t("licensesAndPrivacy")}</a>
+          <button
+            type="button"
+            className="notices-link"
+            onClick={() => {
+              setNoticesError(false);
+              void onOpenNotices().catch(() => setNoticesError(true));
+            }}
+          >
+            {t("licensesAndPrivacy")}
+          </button>
+          {noticesError && <p className="inline-error" role="alert">{t("noticesLockFailed")}</p>}
         </section>
       </section>
     </div>

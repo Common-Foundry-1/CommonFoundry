@@ -171,6 +171,9 @@ impl Node {
         if self.storage_faulted {
             return Err(NodeError::StorageFaulted);
         }
+        // A wallet must not trust chain state that still awaits this node's
+        // release-gated proof-of-work re-execution.
+        self.require_exchange_tip_checked()?;
         let Some(output) = self.state.utxos().get(&outpoint) else {
             return Ok(None);
         };

@@ -760,7 +760,7 @@ impl<'a> UtxoOverlay<'a> {
                 return Err(ChainError::WrongOwner);
             }
             let key =
-                VerifyingKey::from_bytes(public_key).map_err(|_| ChainError::MalformedSignature)?;
+                VerifyingKey::from_slice(public_key).map_err(|_| ChainError::MalformedSignature)?;
             let signature = Signature::try_from(signature.as_slice())
                 .map_err(|_| ChainError::MalformedSignature)?;
             key.verify(&digest, &signature)
@@ -1435,7 +1435,7 @@ fn validate_coinbase(
     else {
         return Err(ChainError::CoinbaseLayout);
     };
-    VerifyingKey::from_bytes(miner_destination).map_err(|_| ChainError::CoinbaseLayout)?;
+    VerifyingKey::from_slice(miner_destination).map_err(|_| ChainError::CoinbaseLayout)?;
     let expected = Coinbase::new(
         coinbase.height,
         allocation,
@@ -1608,7 +1608,7 @@ mod tests {
     use cmfd_marketplace::{ChannelTerms, Settlement, SignedPaymentState};
 
     fn signing_key(byte: u8) -> SigningKey {
-        SigningKey::from_bytes(&[byte; 32]).unwrap()
+        SigningKey::from_slice(&[byte; 32]).unwrap()
     }
 
     fn owner(key: &SigningKey) -> [u8; 32] {

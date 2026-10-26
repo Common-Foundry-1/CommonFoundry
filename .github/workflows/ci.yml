@@ -111,7 +111,11 @@ jobs:
           toolchain: 1.94.1
           components: rustfmt, clippy
       - run: cargo install cargo-audit --version '=0.22.2' --locked
-      - run: cargo audit
+      # Remainder_CE pulls ndarray-npy's default NPZ feature, which locks zip
+      # 0.5.13. These advisories affect archive extraction; the consensus proof
+      # path does not call ZipArchive or ZipStreamReader. Keep this narrow until
+      # the upstream dependency can drop the old zip crate.
+      - run: cargo audit --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 --ignore RUSTSEC-2026-0369
       - name: Check optimized Linux wallet dependency regression
         run: cargo test --locked --release --manifest-path tools/linux-wallet-dependency-check/Cargo.toml
       - run: cargo fmt --all --check

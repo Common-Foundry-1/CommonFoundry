@@ -29,8 +29,8 @@ fn a_channel_close_sent_after_the_pool_job_is_mined_in_the_next_pool_block() {
     use cmfd_marketplace::{ChannelTerms, Settlement, SignedPaymentState};
 
     let (_root, server, node, pin) = server("channel-close");
-    let customer = SigningKey::from_bytes(&[0x21; 32]).unwrap();
-    let provider = SigningKey::from_bytes(&[0x22; 32]).unwrap();
+    let customer = SigningKey::from_slice(&[0x21; 32]).unwrap();
+    let provider = SigningKey::from_slice(&[0x22; 32]).unwrap();
     let (terms, funding) = {
         let mut node = node.lock().unwrap();
         let now = unix_time_seconds().unwrap();
@@ -61,7 +61,7 @@ fn a_channel_close_sent_after_the_pool_job_is_mined_in_the_next_pool_block() {
             channel_id: terms.channel_id().unwrap(),
         };
         transaction
-            .sign_all(&[&SigningKey::from_bytes(&[0x11; 32]).unwrap()])
+            .sign_all(&[&SigningKey::from_slice(&[0x11; 32]).unwrap()])
             .unwrap();
         let funding = OutPoint {
             txid: transaction.txid(),

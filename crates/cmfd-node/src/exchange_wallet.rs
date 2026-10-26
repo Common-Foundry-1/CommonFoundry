@@ -26,7 +26,7 @@ use cmfd_consensus::{
 use k256::elliptic_curve::PrimeField;
 use k256::elliptic_curve::bigint::U256;
 use k256::elliptic_curve::ops::Reduce;
-use k256::elliptic_curve::sec1::ToEncodedPoint;
+use k256::elliptic_curve::sec1::ToSec1Point;
 use k256::schnorr::SigningKey;
 use k256::{FieldBytes, NonZeroScalar, ProjectivePoint, PublicKey, Scalar};
 use serde::{Deserialize, Serialize};
@@ -385,14 +385,14 @@ impl Keys {
             .chain_update([chain.byte()])
             .chain_update(index.to_be_bytes())
             .finalize();
-        <Scalar as Reduce<U256>>::reduce_bytes(&digest)
+        <Scalar as Reduce<U256>>::reduce(&U256::from_be_slice(&digest))
     }
 
     /// Public derivation: works without the master secret.
     fn address(&self, chain: KeyChain, index: u32) -> [u8; 32] {
         let point = (self.master_public + ProjectivePoint::GENERATOR * self.tweak(chain, index))
             .to_affine()
-            .to_encoded_point(true);
+            .to_sec1_point(true);
         let mut address = [0_u8; 32];
         address.copy_from_slice(point.x().expect("a derived key is never the identity"));
         address
@@ -406,7 +406,7 @@ impl Keys {
             })?;
         let child: Zeroizing<[u8; 32]> =
             Zeroizing::new((master + self.tweak(chain, index)).to_bytes().into());
-        SigningKey::from_bytes(child.as_ref())
+        SigningKey::from_slice(child.as_ref())
             .map_err(|_| WalletError::Wallet("a derived signing key is invalid".to_owned()))
     }
 }
@@ -416,7 +416,7 @@ fn public_from_secret(secret: &[u8; 32]) -> Result<(ProjectivePoint, [u8; 33]), 
         .ok_or_else(|| WalletError::Wallet("the master secret is not a valid key".to_owned()))?;
     let point = ProjectivePoint::GENERATOR * *scalar;
     let mut bytes = [0_u8; 33];
-    bytes.copy_from_slice(point.to_affine().to_encoded_point(true).as_bytes());
+    bytes.copy_from_slice(point.to_affine().to_sec1_point(true).as_bytes());
     Ok((point, bytes))
 }
 
@@ -2152,7 +2152,7 @@ mod tests {
     }
 
     fn outside_address() -> [u8; 32] {
-        let key = SigningKey::random(&mut k256::elliptic_curve::rand_core::OsRng);
+        let key = crate::random_test_signing_key();
         key.verifying_key().to_bytes().into()
     }
 

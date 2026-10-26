@@ -250,7 +250,7 @@ fn address_balances_cover_rewards_maturity_spending_change_and_mempool_exclusion
         spendable_height: node.state.next_height(),
     });
     payment
-        .sign_all(&[&SigningKey::from_bytes(&[0x13; 32]).unwrap()])
+        .sign_all(&[&SigningKey::from_slice(&[0x13; 32]).unwrap()])
         .unwrap();
     node.submit_transaction(payment.clone()).unwrap();
     assert_eq!(query(&mut node, owner).confirmed_atoms, reward.to_string());
@@ -449,7 +449,7 @@ fn address_index_handles_intrablock_spends_without_block_reads() {
         }],
     };
     second
-        .sign_all(&[&SigningKey::from_bytes(&[0x31; 32]).unwrap()])
+        .sign_all(&[&SigningKey::from_slice(&[0x31; 32]).unwrap()])
         .unwrap();
     let block = mined_child_with_transactions(
         &node,
@@ -555,7 +555,7 @@ fn address_index_distinguishes_self_transfers_and_channel_escrow() {
         }],
     };
     second
-        .sign_all(&[&SigningKey::from_bytes(&[0x12; 32]).unwrap()])
+        .sign_all(&[&SigningKey::from_slice(&[0x12; 32]).unwrap()])
         .unwrap();
     node.submit_transaction(second).unwrap();
     mine(&mut node, default_miner_destination());
@@ -681,7 +681,7 @@ fn address_pages_read_no_block_bytes_for_a_key_paid_in_every_block() {
         spendable_height: node.state.next_height(),
     });
     payment
-        .sign_all(&[&SigningKey::from_bytes(&[0x12; 32]).unwrap()])
+        .sign_all(&[&SigningKey::from_slice(&[0x12; 32]).unwrap()])
         .unwrap();
     node.submit_transaction(payment.clone()).unwrap();
     let second = mine(&mut node, default_miner_destination());
@@ -689,7 +689,7 @@ fn address_pages_read_no_block_bytes_for_a_key_paid_in_every_block() {
     // A consolidation in block 4: two of the key's coinbase outputs into a
     // payment and two outputs back to the key, so the facts must add up two
     // inputs, two outputs and their atoms.
-    let community_owner = SigningKey::from_bytes(&[0x12; 32]).unwrap();
+    let community_owner = SigningKey::from_slice(&[0x12; 32]).unwrap();
     let pooled: u64 = [&second, &third]
         .iter()
         .map(|block| block.coinbase.outputs[2].value)

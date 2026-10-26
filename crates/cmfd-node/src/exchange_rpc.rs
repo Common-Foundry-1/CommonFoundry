@@ -1969,7 +1969,7 @@ fn route_method(
         "getaddressbalance" | "getbalance" => {
             require_parameter_count(params, 1, 1)?;
             let destination = destination_parameter(&params[0], "destination_hex")?;
-            k256::schnorr::VerifyingKey::from_bytes(&destination).map_err(|_| {
+            k256::schnorr::VerifyingKey::from_slice(&destination).map_err(|_| {
                 RpcFault::invalid_params("destination_hex must encode a valid x-only secp256k1 key")
             })?;
             address_balance(node, destination).map_err(node_fault)
@@ -2085,7 +2085,7 @@ struct UtxoCursorParameter {
 fn route_get_address_utxos(node: &Node, params: &[Value]) -> Result<Value, RpcFault> {
     require_parameter_count(params, 1, 3)?;
     let destination = destination_parameter(&params[0], "destination_hex")?;
-    k256::schnorr::VerifyingKey::from_bytes(&destination).map_err(|_| {
+    k256::schnorr::VerifyingKey::from_slice(&destination).map_err(|_| {
         RpcFault::invalid_params("destination_hex must encode a valid x-only secp256k1 key")
     })?;
     let limit = match params.get(1) {
@@ -3707,11 +3707,10 @@ mod tests {
         let _ = fs::remove_dir_all(&directory);
         let node = Node::open_with_profile(&directory, DEVNET_PROFILE).unwrap();
         let first = node.wallet_destination();
-        let second: [u8; 32] =
-            k256::schnorr::SigningKey::random(&mut k256::elliptic_curve::rand_core::OsRng)
-                .verifying_key()
-                .to_bytes()
-                .into();
+        let second: [u8; 32] = crate::random_test_signing_key()
+            .verifying_key()
+            .to_bytes()
+            .into();
         let shared = Arc::new(Mutex::new(node));
         let exchange_index = Arc::new(Mutex::new(
             ExchangeDepositIndex::open_and_sync(&shared).unwrap(),
@@ -3812,7 +3811,7 @@ mod tests {
         let node = Node::open_with_profile(&directory, DEVNET_PROFILE).unwrap();
         let wallet = node.wallet_destination();
         let random_key = || -> [u8; 32] {
-            k256::schnorr::SigningKey::random(&mut k256::elliptic_curve::rand_core::OsRng)
+            crate::random_test_signing_key()
                 .verifying_key()
                 .to_bytes()
                 .into()
@@ -4795,7 +4794,7 @@ mod tests {
         ] {
             assert_eq!(query(&mut node, params)["error"]["code"], -32602);
         }
-        let other = k256::schnorr::SigningKey::from_bytes(&[77; 32]).unwrap();
+        let other = k256::schnorr::SigningKey::from_slice(&[77; 32]).unwrap();
         let empty = query(
             &mut node,
             json!([hex::encode(other.verifying_key().to_bytes())]),
@@ -5313,7 +5312,7 @@ mod tests {
         };
         let page = || call("getdepositevents", json!(["0", 100]))["result"].clone();
         let other = hex::encode(
-            k256::schnorr::SigningKey::from_bytes(&[0x31; 32])
+            k256::schnorr::SigningKey::from_slice(&[0x31; 32])
                 .unwrap()
                 .verifying_key()
                 .to_bytes(),
@@ -5828,7 +5827,7 @@ mod tests {
 
         use crate::wallet_signing_protocol::{InputSignatureV1, SignerId, WalletKeyId};
 
-        let key = SigningKey::from_bytes(&[0x21; 32]).unwrap();
+        let key = SigningKey::from_slice(&[0x21; 32]).unwrap();
         let signature: Signature = key.sign(&[0x22; 32]);
         let response = SignerResponseV1 {
             package_digest: [0x23; 32],

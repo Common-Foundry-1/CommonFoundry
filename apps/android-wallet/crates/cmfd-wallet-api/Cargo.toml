@@ -1,0 +1,18 @@
+[package]
+name = "cmfd-wallet-api"
+description = "Validated HTTPS client for the Common Foundry public wallet service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cmfd-wallet-core = { path = "../cmfd-wallet-core" }
+hex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

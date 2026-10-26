@@ -1,6 +1,6 @@
 #[cfg(test)]
 use cmfd_consensus::encode_block;
-use cmfd_consensus::{Block, BlockProof, Transaction, encode_transaction};
+use cmfd_consensus::{Block, BlockProof, OutPoint, OutputLock, Transaction, encode_transaction};
 use serde::Serialize;
 use std::time::{Duration, Instant};
 
@@ -102,6 +102,51 @@ pub struct ExplorerTransaction {
     pub fee_burned_atoms: Option<String>,
     pub encoded_bytes: usize,
     pub status: &'static str,
+}
+
+/// One key-locked output read from this node's active, validated UTXO set.
+/// `available` checks confirmed maturity and this node's durable withdrawal
+/// reservations. It does not scan the mempool, keeping this public read O(1).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ExplorerUtxo {
+    pub network_id: String,
+    pub tip: String,
+    pub height: u64,
+    pub txid: String,
+    pub vout: u32,
+    pub value_atoms: String,
+    pub destination_hex: String,
+    pub spendable_height: u64,
+    pub available: bool,
+}
+
+impl Node {
+    pub fn explorer_utxo(&self, outpoint: OutPoint) -> Result<Option<ExplorerUtxo>, NodeError> {
+        if self.storage_faulted {
+            return Err(NodeError::StorageFaulted);
+        }
+        let Some(output) = self.state.utxos().get(&outpoint) else {
+            return Ok(None);
+        };
+        let OutputLock::Key(destination) = &output.lock else {
+            return Ok(None);
+        };
+        let next_height = self.state.next_height();
+        Ok(Some(ExplorerUtxo {
+            network_id: hex::encode(self.params.network_id),
+            tip: hex::encode(self.state.tip()),
+            height: next_height.saturating_sub(1),
+            txid: hex::encode(outpoint.txid),
+            vout: outpoint.index,
+            value_atoms: output.value.to_string(),
+            destination_hex: hex::encode(destination),
+            spendable_height: output.spendable_height,
+            available: output.spendable_height <= next_height
+                && !self
+                    .exchange_withdrawal_reservations
+                    .contains_key(&outpoint),
+        }))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

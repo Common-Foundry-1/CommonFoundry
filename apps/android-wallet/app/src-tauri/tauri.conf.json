@@ -1,0 +1,39 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Common Foundry Wallet",
+  "version": "0.1.0",
+  "identifier": "org.commonfoundry.wallet.mainnet",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [
+      {
+        "title": "Common Foundry Wallet",
+        "width": 430,
+        "height": 820,
+        "minWidth": 320,
+        "minHeight": 560,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' data:; style-src 'self'; font-src 'self' data:; object-src 'none'; base-uri 'none'; frame-src 'none'; frame-ancestors 'none'; form-action 'none'",
+      "freezePrototype": true,
+      "assetProtocol": { "enable": false, "scope": [] }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "category": "Finance",
+    "icon": [],
+    "shortDescription": "Portefeuille mobile Common Foundry",
+    "longDescription": "Portefeuille léger pour le mainnet Common Foundry, sans nœud local ni composant de minage.",
+    "android": { "minSdkVersion": 28 }
+  }
+}

@@ -4,5 +4,10 @@
 ingress:
   - hostname: mainnet-explorer-origin.commonfoundry.ai
     path: '^/v1/explorer(?:$|/block/(?:[0-9]+|[0-9a-fA-F]{64})$|/transaction/[0-9a-fA-F]{64}$|/address/[0-9a-fA-F]{64}(?:/[0-9a-fA-F]{64}\.[1-9][0-9]{0,19}\.(?:0|[1-9][0-9]{0,3}))?$)'
-    service: http://127.0.0.1:29443
+    service: http://127.0.0.1:29456
+  # Dedicated, read-only Falkenstein transport. Do not point this at the
+  # failover router or the Singapore wallet RPC node.
+  - hostname: mainnet-proof-origin.commonfoundry.ai
+    path: '^/v1/explorer/utxo/[0-9a-f]{64}/(?:0|[1-9][0-9]{0,9})$'
+    service: http://127.0.0.1:29455
   - service: http_status:404

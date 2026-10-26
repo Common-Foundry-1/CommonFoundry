@@ -16,9 +16,15 @@ const ATOMS_PER_CMFD = 100_000_000n;
 const ATOMS_PATTERN = /^(0|[1-9][0-9]{0,30})$/;
 const BLOCK_PATH = /^\/v1\/explorer\/block\/(?:[0-9]+|[0-9a-fA-F]{64})$/;
 const TRANSACTION_PATH = /^\/v1\/explorer\/transaction\/[0-9a-fA-F]{64}$/;
+const UTXO_PATH = /^\/v1\/explorer\/utxo\/[0-9a-f]{64}\/(?:0|[1-9][0-9]{0,9})$/;
+
+function isUtxoApiPath(pathname: string): boolean {
+  return UTXO_PATH.test(pathname) && Number(pathname.slice(pathname.lastIndexOf("/") + 1)) <= 0xffff_ffff;
+}
 
 export function isExplorerApiPath(pathname: string): boolean {
-  return pathname === SNAPSHOT_PATH || BLOCK_PATH.test(pathname) || TRANSACTION_PATH.test(pathname) || isAddressApiPath(pathname);
+  return pathname === SNAPSHOT_PATH || BLOCK_PATH.test(pathname) || TRANSACTION_PATH.test(pathname)
+    || isUtxoApiPath(pathname) || isAddressApiPath(pathname);
 }
 
 // Cloudflare Web Analytics loads from static.cloudflareinsights.com and reports to cloudflareinsights.com.
@@ -61,6 +67,16 @@ async function proxyExplorerRequest(request: Request, env: Env): Promise<Respons
     return Response.json({ error: "not_found" }, { status: 404 });
   }
 
+  if (isUtxoApiPath(requestUrl.pathname)) {
+    const { success } = await env.EXPLORER_UTXO_LIMIT.limit({ key: request.headers.get("CF-Connecting-IP") ?? "unknown" });
+    if (!success) {
+      return Response.json({ error: "rate_limited" }, {
+        status: 429,
+        headers: { "Cache-Control": "no-store" },
+      });
+    }
+  }
+
   const mainnet = env.EXPLORER_NETWORK === "mainnet";
   if ((env.EXPLORER_NETWORK !== "rc" && !mainnet)
       || (mainnet && env.EXPLORER_EXPECTED_NETWORK_ID !== MAINNET_NETWORK_ID)) {
@@ -69,7 +85,16 @@ async function proxyExplorerRequest(request: Request, env: Env): Promise<Respons
     });
   }
   try {
-    const origin = new URL(env.EXPLORER_ORIGIN);
+    // Public UTXO corroboration is pinned to the Falkenstein node. The normal
+    // explorer origin can fail over to Singapore, which also hosts the wallet
+    // RPC gateway and therefore cannot serve as an independent source.
+    const proofRead = isUtxoApiPath(requestUrl.pathname);
+    const origin = new URL(proofRead ? env.EXPLORER_PROOF_ORIGIN : env.EXPLORER_ORIGIN);
+    if (mainnet && proofRead && origin.hostname !== "mainnet-proof-origin.commonfoundry.ai") {
+      return Response.json({ error: "explorer_configuration_invalid" }, {
+        status: 503, headers: { "Cache-Control": "no-store" },
+      });
+    }
     const localHttp = origin.protocol === "http:"
       && ["127.0.0.1", "localhost", "[::1]"].includes(origin.hostname);
     if ((!localHttp && origin.protocol !== "https:") || origin.username || origin.password

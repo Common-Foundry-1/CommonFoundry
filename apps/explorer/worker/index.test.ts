@@ -8,6 +8,8 @@ function environment(overrides: Partial<Env> = {}): Env {
   return {
     ASSETS: { fetch: async () => new Response("static explorer"), connect: () => { throw new Error("unused asset connect"); } },
     EXPLORER_ORIGIN: "https://mainnet-explorer-origin.commonfoundry.ai",
+    EXPLORER_PROOF_ORIGIN: "https://mainnet-proof-origin.commonfoundry.ai",
+    EXPLORER_UTXO_LIMIT: { limit: async () => ({ success: true }) } as unknown as Env["EXPLORER_UTXO_LIMIT"],
     EXPLORER_NETWORK: "mainnet",
     EXPLORER_EXPECTED_NETWORK_ID: MAINNET_NETWORK_ID,
     ...overrides,
@@ -37,7 +39,13 @@ describe("explorer edge API allowlist", () => {
       expect(originPath.test(path)).toBe(false);
     }
     expect(yaml).toContain("hostname: mainnet-explorer-origin.commonfoundry.ai");
-    expect(yaml).toContain("service: http://127.0.0.1:29443");
+    expect(yaml).toContain("service: http://127.0.0.1:29456");
+    const proofRule = /hostname: mainnet-proof-origin\.commonfoundry\.ai\s+path: '([^']+)'\s+service: http:\/\/127\.0\.0\.1:29455/m.exec(yaml);
+    expect(proofRule).not.toBeNull();
+    const proofPath = new RegExp(proofRule![1]);
+    expect(proofPath.test(`/v1/explorer/utxo/${"ab".repeat(32)}/0`)).toBe(true);
+    expect(proofPath.test(`/v1/explorer/utxo/${"ab".repeat(32)}/01`)).toBe(false);
+    expect(proofPath.test("/v1/status")).toBe(false);
     expect(yaml.trimEnd().endsWith("- service: http_status:404")).toBe(true);
   });
 
@@ -46,6 +54,8 @@ describe("explorer edge API allowlist", () => {
     expect(isExplorerApiPath("/v1/explorer/block/42")).toBe(true);
     expect(isExplorerApiPath(`/v1/explorer/block/${"ab".repeat(32)}`)).toBe(true);
     expect(isExplorerApiPath(`/v1/explorer/transaction/${"01".repeat(32)}`)).toBe(true);
+    expect(isExplorerApiPath(`/v1/explorer/utxo/${"01".repeat(32)}/0`)).toBe(true);
+    expect(isExplorerApiPath(`/v1/explorer/utxo/${"01".repeat(32)}/4294967295`)).toBe(true);
     expect(isExplorerApiPath(`/v1/explorer/address/${"a1".repeat(32)}`)).toBe(true);
     expect(isExplorerApiPath(`/v1/explorer/address/${"a1".repeat(32)}/${"d1".repeat(32)}.81.1`)).toBe(true);
   });
@@ -54,6 +64,9 @@ describe("explorer edge API allowlist", () => {
     expect(isExplorerApiPath("/v1/status")).toBe(false);
     expect(isExplorerApiPath("/v1/explorer/block/latest/extra")).toBe(false);
     expect(isExplorerApiPath("/v1/explorer/transaction/not-a-transaction")).toBe(false);
+    expect(isExplorerApiPath(`/v1/explorer/utxo/${"01".repeat(32)}/01`)).toBe(false);
+    expect(isExplorerApiPath(`/v1/explorer/utxo/${"01".repeat(32)}/4294967296`)).toBe(false);
+    expect(isExplorerApiPath(`/v1/explorer/utxo/${"01".repeat(32)}/0/extra`)).toBe(false);
   });
 });
 
@@ -63,6 +76,10 @@ describe("mainnet explorer identity gate", () => {
     const config = JSON.parse(readFileSync(new URL("../wrangler.jsonc", import.meta.url), "utf8"));
     expect(MAINNET_NETWORK_ID).toBe(plan.network_id);
     expect(config.env.mainnet.vars.EXPLORER_EXPECTED_NETWORK_ID).toBe(MAINNET_NETWORK_ID);
+    expect(config.env.mainnet.vars.EXPLORER_PROOF_ORIGIN).toBe("https://mainnet-proof-origin.commonfoundry.ai");
+    expect(config.env.mainnet.ratelimits).toEqual([{
+      name: "EXPLORER_UTXO_LIMIT", namespace_id: "4104", simple: { limit: 120, period: 60 },
+    }]);
     expect(config.env.mainnet.routes).toEqual([{ pattern: "explorer.commonfoundry.ai", custom_domain: true }]);
     expect(config.env.mainnet.workers_dev).toBe(false);
     expect(config.env.mainnet.preview_urls).toBe(false);
@@ -114,6 +131,58 @@ describe("mainnet explorer identity gate", () => {
       expect(options.signal).toBeInstanceOf(AbortSignal);
     },
   );
+
+  it("routes one exact UTXO read only to the independent proof origin", async () => {
+    const path = `/v1/explorer/utxo/${"ab".repeat(32)}/0`;
+    const data = { network_id: MAINNET_NETWORK_ID, value_atoms: "7", available: true };
+    const upstream = vi.fn().mockResolvedValue(Response.json(data, {
+      headers: { [NETWORK_HEADER]: MAINNET_NETWORK_ID },
+    }));
+    vi.stubGlobal("fetch", upstream);
+    const response = await worker.fetch(new Request("https://explorer.test" + path, {
+      headers: { Authorization: "must-not-forward", Cookie: "must-not-forward" },
+    }), environment());
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual(data);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    const [url, options] = upstream.mock.calls[0];
+    expect(String(url)).toBe("https://mainnet-proof-origin.commonfoundry.ai" + path);
+    expect(options.headers).toEqual({ Accept: "application/json" });
+  });
+
+  it("passes a network-identified missing outpoint through for the Android readiness probe", async () => {
+    const path = `/v1/explorer/utxo/${"00".repeat(32)}/0`;
+    const upstream = vi.fn().mockResolvedValue(Response.json({ error: "UTXO not found" }, {
+      status: 404,
+      headers: { [NETWORK_HEADER]: MAINNET_NETWORK_ID },
+    }));
+    vi.stubGlobal("fetch", upstream);
+    const response = await worker.fetch(new Request("https://explorer.test" + path), environment());
+    expect(response.status).toBe(404);
+    expect(response.headers.get(NETWORK_HEADER)).toBe(MAINNET_NETWORK_ID);
+    expect(String(upstream.mock.calls[0][0])).toBe("https://mainnet-proof-origin.commonfoundry.ai" + path);
+  });
+
+  it.each(["http://untrusted.example", "https://mainnet-explorer-origin.commonfoundry.ai"])(
+    "rejects an unsafe or non-independent proof origin %s before any UTXO request", async (proofOrigin) => {
+    const upstream = vi.fn(); vi.stubGlobal("fetch", upstream);
+    const path = `/v1/explorer/utxo/${"ab".repeat(32)}/0`;
+    const response = await worker.fetch(new Request("https://explorer.test" + path),
+      environment({ EXPLORER_PROOF_ORIGIN: proofOrigin }));
+    expect(response.status).toBe(503);
+    expect(upstream).not.toHaveBeenCalled();
+    },
+  );
+
+  it("rate-limits UTXO reads before contacting the proof origin", async () => {
+    const upstream = vi.fn(); vi.stubGlobal("fetch", upstream);
+    const path = `/v1/explorer/utxo/${"ab".repeat(32)}/0`;
+    const response = await worker.fetch(new Request("https://explorer.test" + path),
+      environment({ EXPLORER_UTXO_LIMIT: { limit: async () => ({ success: false }) } as unknown as Env["EXPLORER_UTXO_LIMIT"] }));
+    expect(response.status).toBe(429);
+    expect(await response.json()).toEqual({ error: "rate_limited" });
+    expect(upstream).not.toHaveBeenCalled();
+  });
 
   it.each([null, "63".repeat(32), MAINNET_NETWORK_ID + "," + MAINNET_NETWORK_ID])(
     "rejects absent, RC, or ambiguous identity %s before forwarding the body", async (pin) => {

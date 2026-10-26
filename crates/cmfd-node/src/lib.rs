@@ -8643,6 +8643,7 @@ fn route_rpc_request(request: RpcRequest, node: &mut Node) -> RpcResponse {
         && (request.target == "/v1/explorer"
             || request.target.starts_with("/v1/explorer/block/")
             || request.target.starts_with("/v1/explorer/transaction/")
+            || request.target.starts_with("/v1/explorer/utxo/")
             || request.target.starts_with("/v1/explorer/address/"));
     let mut response = route_rpc_request_inner(request, node);
     if explorer_request {
@@ -8710,6 +8711,19 @@ fn route_rpc_request_inner(request: RpcRequest, node: &mut Node) -> RpcResponse 
                     Err(error) => RpcResponse::json_error(500, "Internal Server Error", error),
                 },
                 Ok(None) => RpcResponse::json_error(404, "Not Found", "transaction not found"),
+                Err(error) => RpcResponse::node_error(error),
+            }
+        }
+        ("GET", target) if target.starts_with("/v1/explorer/utxo/") => {
+            let Some(outpoint) = parse_explorer_utxo_path(target) else {
+                return RpcResponse::json_error(400, "Bad Request", "invalid UTXO outpoint");
+            };
+            match node.explorer_utxo(outpoint) {
+                Ok(Some(utxo)) => match serde_json::to_value(utxo) {
+                    Ok(value) => RpcResponse::json(200, "OK", value),
+                    Err(error) => RpcResponse::json_error(500, "Internal Server Error", error),
+                },
+                Ok(None) => RpcResponse::json_error(404, "Not Found", "UTXO not found"),
                 Err(error) => RpcResponse::node_error(error),
             }
         }
@@ -8889,6 +8903,26 @@ fn route_rpc_request_inner(request: RpcRequest, node: &mut Node) -> RpcResponse 
         ("GET" | "POST", _) => RpcResponse::json_error(404, "Not Found", "unknown endpoint"),
         _ => RpcResponse::json_error(405, "Method Not Allowed", "method not allowed"),
     }
+}
+
+fn parse_explorer_utxo_path(target: &str) -> Option<OutPoint> {
+    let suffix = target.strip_prefix("/v1/explorer/utxo/")?;
+    let (txid, index) = suffix.split_once('/')?;
+    if txid.len() != 64
+        || !txid
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        || index.is_empty()
+        || index.len() > 10
+        || (index.len() > 1 && index.starts_with('0'))
+        || !index.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(OutPoint {
+        txid: hex::decode(txid).ok()?.try_into().ok()?,
+        index: index.parse().ok()?,
+    })
 }
 
 fn route_shared_block_request(request: RpcRequest, shared: &Arc<Mutex<Node>>) -> RpcResponse {

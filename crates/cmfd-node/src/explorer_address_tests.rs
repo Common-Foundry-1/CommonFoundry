@@ -101,6 +101,97 @@ fn address_rpc_is_read_only_exact_and_network_bound() {
 }
 
 #[test]
+fn outpoint_read_is_exact_network_bound_and_does_not_make_immature_rewards_available() {
+    let path = test_dir("explorer-utxo-rpc");
+    let mut node = Node::open(&path).unwrap();
+    let owner = default_miner_destination();
+    let funding = mine(&mut node, owner);
+    let txid = hex::encode(funding.coinbase_outpoint_id());
+    let prefix = format!("/v1/explorer/utxo/{txid}/0");
+    let response = route_rpc_request(
+        RpcRequest {
+            method: "GET".into(),
+            target: prefix.clone(),
+            content_type: None,
+            body: Vec::new(),
+        },
+        &mut node,
+    );
+    assert_eq!(response.status, 200);
+    assert_eq!(response.network_id, Some(node.params.network_id));
+    let value: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(value["network_id"], hex::encode(node.params.network_id));
+    assert_eq!(value["txid"], txid);
+    assert_eq!(value["vout"], 0);
+    assert_eq!(
+        value["value_atoms"],
+        funding.coinbase.outputs[0].value.to_string()
+    );
+    assert_eq!(value["destination_hex"], hex::encode(owner));
+    assert_eq!(
+        value["spendable_height"],
+        funding.coinbase.outputs[0].spendable_height
+    );
+    assert_eq!(value["available"], false);
+
+    for target in [
+        format!("/v1/explorer/utxo/{txid}"),
+        format!("/v1/explorer/utxo/{txid}/00"),
+        format!("/v1/explorer/utxo/{txid}/0/extra"),
+        format!("/v1/explorer/utxo/{txid}/4294967296"),
+        format!("/v1/explorer/utxo/{}/0", txid.to_uppercase()),
+    ] {
+        let response = route_rpc_request(
+            RpcRequest {
+                method: "GET".into(),
+                target,
+                content_type: None,
+                body: Vec::new(),
+            },
+            &mut node,
+        );
+        assert_eq!(response.status, 400);
+        assert_eq!(response.network_id, Some(node.params.network_id));
+    }
+    let response = route_rpc_request(
+        RpcRequest {
+            method: "GET".into(),
+            target: format!("/v1/explorer/utxo/{}/0", "ab".repeat(32)),
+            content_type: None,
+            body: Vec::new(),
+        },
+        &mut node,
+    );
+    assert_eq!(response.status, 404);
+    assert_eq!(response.network_id, Some(node.params.network_id));
+    drop(node);
+    clean_test_dir(&path);
+}
+
+#[test]
+fn outpoint_read_disappears_after_a_confirmed_spend() {
+    let path = test_dir("explorer-utxo-spent");
+    let mut node = Node::open(&path).unwrap();
+    let owner = default_miner_destination();
+    let other = insecure_dev_destination(0x66);
+    let funding = mine(&mut node, owner);
+    let outpoint = OutPoint {
+        txid: funding.coinbase_outpoint_id(),
+        index: 0,
+    };
+    for _ in 2..=100 {
+        mine(&mut node, other);
+    }
+    assert!(node.explorer_utxo(outpoint).unwrap().unwrap().available);
+    let payment = spend_coinbase_output(&node, &funding, 0, 0x13, 0x31, 1);
+    node.submit_transaction(payment).unwrap();
+    mine(&mut node, other);
+    assert_eq!(node.explorer_utxo(outpoint).unwrap(), None);
+    drop(node);
+    clean_test_dir(&path);
+}
+
+#[test]
 fn address_balances_cover_rewards_maturity_spending_change_and_mempool_exclusion() {
     let path = test_dir("explorer-address-balances");
     let mut node = Node::open(&path).unwrap();

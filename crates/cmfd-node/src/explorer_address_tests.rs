@@ -217,7 +217,7 @@ fn address_balances_cover_rewards_maturity_spending_change_and_mempool_exclusion
         spendable_height: node.state.next_height(),
     });
     payment
-        .sign_all(&[&SigningKey::from_bytes(&[0x13; 32]).unwrap()])
+        .sign_all(&[&SigningKey::from_slice(&[0x13; 32]).unwrap()])
         .unwrap();
     node.submit_transaction(payment.clone()).unwrap();
     assert_eq!(query(&mut node, owner).confirmed_atoms, reward.to_string());
@@ -413,7 +413,7 @@ fn address_index_handles_intrablock_spends_and_reads_each_page_block_once() {
         }],
     };
     second
-        .sign_all(&[&SigningKey::from_bytes(&[0x31; 32]).unwrap()])
+        .sign_all(&[&SigningKey::from_slice(&[0x31; 32]).unwrap()])
         .unwrap();
     let block = mined_child_with_transactions(
         &node,
@@ -519,7 +519,7 @@ fn address_index_distinguishes_self_transfers_and_channel_escrow() {
         }],
     };
     second
-        .sign_all(&[&SigningKey::from_bytes(&[0x12; 32]).unwrap()])
+        .sign_all(&[&SigningKey::from_slice(&[0x12; 32]).unwrap()])
         .unwrap();
     node.submit_transaction(second).unwrap();
     mine(&mut node, default_miner_destination());

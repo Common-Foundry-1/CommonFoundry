@@ -470,8 +470,8 @@ mod tests {
         );
         assert_ne!(RCNET1_PROFILE.pow_limit, DEVNET_PROFILE.pow_limit);
         assert_ne!(RCNET1_PROFILE.rewards, DEVNET_PROFILE.rewards);
-        assert!(k256::schnorr::VerifyingKey::from_bytes(&RCNET1_PROFILE.rewards.steward).is_ok());
-        assert!(k256::schnorr::VerifyingKey::from_bytes(&RCNET1_PROFILE.rewards.community).is_ok());
+        assert!(k256::schnorr::VerifyingKey::from_slice(&RCNET1_PROFILE.rewards.steward).is_ok());
+        assert!(k256::schnorr::VerifyingKey::from_slice(&RCNET1_PROFILE.rewards.community).is_ok());
         assert_eq!(DEVNET_PROFILE.proof, ProofProfile::DevnetV2Reference);
         assert_eq!(DEVNET_PROFILE.short_name(), "Devnet-0");
         assert_eq!(DEVNET_PROFILE.proof.profile_name(), "DevnetV2");
@@ -544,8 +544,8 @@ mod tests {
             RCNET1_PROFILE.miner_p2p_address()
         );
         assert_eq!(testnet.pow_limit, [0xff; 32]);
-        assert!(k256::schnorr::VerifyingKey::from_bytes(&testnet.rewards.steward).is_ok());
-        assert!(k256::schnorr::VerifyingKey::from_bytes(&testnet.rewards.community).is_ok());
+        assert!(k256::schnorr::VerifyingKey::from_slice(&testnet.rewards.steward).is_ok());
+        assert!(k256::schnorr::VerifyingKey::from_slice(&testnet.rewards.community).is_ok());
     }
 
     #[test]
@@ -617,7 +617,7 @@ mod tests {
         );
         assert_eq!(testnet.bootstrap_peer().to_string(), "107.214.187.2:22444");
         assert_eq!(testnet.miner_p2p_address().to_string(), "127.0.0.1:23444");
-        assert!(k256::schnorr::VerifyingKey::from_bytes(&testnet.rewards.steward).is_ok());
-        assert!(k256::schnorr::VerifyingKey::from_bytes(&testnet.rewards.community).is_ok());
+        assert!(k256::schnorr::VerifyingKey::from_slice(&testnet.rewards.steward).is_ok());
+        assert!(k256::schnorr::VerifyingKey::from_slice(&testnet.rewards.community).is_ok());
     }
 }

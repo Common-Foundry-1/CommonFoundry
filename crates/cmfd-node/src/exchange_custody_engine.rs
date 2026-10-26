@@ -914,7 +914,7 @@ fn validate_and_bind_plan(
     {
         return Err(ExchangeCustodyEngineError::InvalidPlan("request_id"));
     }
-    VerifyingKey::from_bytes(&plan.recipient)
+    VerifyingKey::from_slice(&plan.recipient)
         .map_err(|_| ExchangeCustodyEngineError::InvalidPlan("recipient"))?;
     policy.check_static_limits(plan.amount_atoms, plan.fee_atoms)?;
     let binding = keyring.binding();
@@ -1423,7 +1423,7 @@ mod tests {
     }
 
     fn signing_key(marker: u8) -> SigningKey {
-        SigningKey::from_bytes(&[marker; 32]).expect("test scalar is valid")
+        SigningKey::from_slice(&[marker; 32]).expect("test scalar is valid")
     }
 
     fn public_key(marker: u8) -> [u8; 32] {

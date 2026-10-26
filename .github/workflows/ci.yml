@@ -66,8 +66,6 @@ jobs:
           python3 -m unittest discover -s scripts/tests -p 'test_release_integrity.py' -v
           python3 -m unittest discover -s scripts/tests -p 'test_release_key_transition.py' -v
           python3 -m unittest discover -s scripts/tests -p 'test_update_rollback_qualification.py' -v
-      - name: Test bounded Android UTXO proof origin
-        run: python3 -m unittest discover -s scripts/tests -p 'test_cmfd_utxo_proof_proxy.py' -v
           python3 -m unittest discover -s scripts/tests -p 'test_runtime_bootstrap_integrity.py' -v
           python3 -m unittest discover -s scripts/tests -p 'test_mainnet_packages.py' -v
           python3 -m unittest discover -s scripts/tests -p 'test_hiveos_adapter.py' -v
@@ -93,6 +91,9 @@ jobs:
           bash -n scripts/package-wallet-runtime-bootstrap.sh
           bash -n packaging/production-rc/runtime/linux/prepare-rcnet-runtime.sh
           bash -n packaging/production-rc/runtime/linux/start-wallet.sh
+      - name: Test bounded Android UTXO proof origin
+        run: |
+          python3 -m unittest discover -s scripts/tests -p 'test_cmfd_utxo_proof_proxy.py' -v
       - name: Install Linux desktop dependencies
         run: |
           sudo apt-get update

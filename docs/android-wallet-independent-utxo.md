@@ -20,4 +20,6 @@ This is independent **node corroboration**, not full on-device chain validation 
 5. Rebuild the Android APK from the reviewed integration commit. On an ARM64 evaluation device, test matching and deliberately mismatched inputs, both ordinary and mining-reward outputs, stale heights, unavailable proof origin, and confirmation/broadcast recovery using synthetic wallets first.
 6. Complete security review, official release signing, APK/source verification, and authenticated checksum publication. No real CMFD transfer or production service change is implied by this document.
 
+The restricted outbound tunnel unit is `packaging/mainnet/commonfoundry-proxmox-proof-tunnel.service`. Its private key remains only on the Proxmox relay. The Germany authorized key permits a reverse listener only at `127.0.0.1:29459` and rejects shell commands and other listen ports.
+
 If the proof paths fail after cutover, remove only their tunnel hostname rules and stop their proof proxy instances; leave the existing explorer failover route in place. Roll back either node update using its signed prior release and existing rollback procedure.

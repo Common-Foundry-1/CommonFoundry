@@ -1,6 +1,7 @@
 [package]
 name = "tauri-plugin-cmfd-android"
 version = "0.1.0"
+license = "MIT"
 authors = [ "Common Foundry contributors" ]
 description = "Internal Android Keystore and Storage Access Framework bridge"
 edition = "2021"

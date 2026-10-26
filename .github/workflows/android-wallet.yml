@@ -65,9 +65,31 @@ jobs:
           pnpm audit --audit-level high
           pnpm check
           pnpm test
+      - name: Verify bundled JavaScript and Android library notices
+        working-directory: apps/android-wallet/app
+        run: |
+          pnpm licenses list --json --prod | node ../scripts/generate-js-licenses.mjs
+          node ../scripts/generate-android-library-notices.mjs
+          node ../scripts/normalize-license-html.mjs public/javascript-licenses.html public/android-library-notices.html
+          git diff --exit-code -- public/javascript-licenses.html public/android-library-notices.html
+          test -s public/common-foundry-license.txt
+      - name: Verify bundled Rust runtime notices
+        working-directory: apps/android-wallet/app/src-tauri
+        run: |
+          cargo install cargo-about --version '=0.9.2' --locked --features cli
+          cargo about generate --config about.toml --locked --fail --output-file ../public/rust-licenses.html about.hbs
+          node ../../scripts/normalize-license-html.mjs ../public/rust-licenses.html
+          git diff --exit-code -- ../public/rust-licenses.html
       - name: Build unsigned ARM64 APK
         working-directory: apps/android-wallet/app
         run: pnpm tauri android build --apk --target aarch64
+      - name: Confirm notices are present in the APK
+        working-directory: apps/android-wallet/app/src-tauri/gen/android/app/build/outputs/apk/universal/release
+        run: |
+          unzip -Z1 app-universal-release-unsigned.apk > apk-files.txt
+          for notice in rust-licenses.html javascript-licenses.html android-library-notices.html common-foundry-license.txt; do
+            grep -F "$notice" apk-files.txt
+          done
       - name: Hash unsigned APK
         working-directory: apps/android-wallet/app/src-tauri/gen/android/app/build/outputs/apk/universal/release
         run: |

@@ -271,6 +271,7 @@ function SettingsPanel({
           <span>{t("version", { version })}</span>
           <span>{t("network")}</span>
           <p>{t("openSource")}</p>
+          <a href="/android-library-notices.html">{t("licensesAndPrivacy")}</a>
         </section>
       </section>
     </div>
@@ -773,6 +774,7 @@ function SendPanel({ availability }: { availability: SendAvailability | null }) 
             </button>
           </span>
         </label>
+        <small className="qr-privacy-note">{t("qrPrivacyNote")}</small>
         <label>
           {t("amountCmfd")}
           <input

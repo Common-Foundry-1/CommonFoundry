@@ -257,6 +257,8 @@ input:focus { border-color: var(--brand); box-shadow: 0 0 0 3px var(--focus); }
 .about-section h2 { margin-bottom: .4rem; }
 .about-section span { color: var(--muted); font-size: .88rem; }
 .about-section p { margin-bottom: 0; font-size: .82rem; }
+.about-section a { color: var(--brand); font-size: .88rem; }
+.qr-privacy-note { display: block; color: var(--muted); font-size: .75rem; line-height: 1.35; }
 
 @media (max-width: 430px) {
   .language-options { grid-template-columns: 1fr; }

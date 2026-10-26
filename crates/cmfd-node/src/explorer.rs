@@ -1,6 +1,6 @@
 #[cfg(test)]
 use cmfd_consensus::encode_block;
-use cmfd_consensus::{Transaction, encode_transaction};
+use cmfd_consensus::{OutPoint, OutputLock, Transaction, encode_transaction};
 use serde::Serialize;
 use std::time::{Duration, Instant};
 
@@ -104,6 +104,22 @@ pub struct ExplorerTransaction {
     pub status: &'static str,
 }
 
+/// One key-locked output read from this node's active, validated UTXO set.
+/// `available` checks confirmed maturity and durable withdrawal reservations.
+/// This public read does not scan the mempool, keeping it O(1).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ExplorerUtxo {
+    pub network_id: String,
+    pub tip: String,
+    pub height: u64,
+    pub txid: String,
+    pub vout: u32,
+    pub value_atoms: String,
+    pub destination_hex: String,
+    pub spendable_height: u64,
+    pub available: bool,
+}
+
 /// A transaction found by id, with the validated height it was read with.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ExplorerTransactionDetail {
@@ -151,6 +167,33 @@ pub struct ExplorerBlockDetail {
 }
 
 impl Node {
+    pub fn explorer_utxo(&self, outpoint: OutPoint) -> Result<Option<ExplorerUtxo>, NodeError> {
+        if self.storage_faulted {
+            return Err(NodeError::StorageFaulted);
+        }
+        let Some(output) = self.state.utxos().get(&outpoint) else {
+            return Ok(None);
+        };
+        let OutputLock::Key(destination) = &output.lock else {
+            return Ok(None);
+        };
+        let next_height = self.state.next_height();
+        Ok(Some(ExplorerUtxo {
+            network_id: hex::encode(self.params.network_id),
+            tip: hex::encode(self.state.tip()),
+            height: next_height.saturating_sub(1),
+            txid: hex::encode(outpoint.txid),
+            vout: outpoint.index,
+            value_atoms: output.value.to_string(),
+            destination_hex: hex::encode(destination),
+            spendable_height: output.spendable_height,
+            available: output.spendable_height <= next_height
+                && !self
+                    .exchange_withdrawal_reservations
+                    .contains_key(&outpoint),
+        }))
+    }
+
     pub fn explorer_snapshot(&mut self) -> Result<ExplorerSnapshot, NodeError> {
         if self.storage_faulted {
             return Err(NodeError::StorageFaulted);

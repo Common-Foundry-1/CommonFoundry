@@ -101,6 +101,96 @@ fn address_rpc_is_read_only_exact_and_network_bound() {
 }
 
 #[test]
+fn outpoint_read_is_exact_network_bound_and_does_not_make_immature_rewards_available() {
+    let path = test_dir("explorer-utxo-rpc");
+    let mut node = Node::open(&path).unwrap();
+    let owner = default_miner_destination();
+    let funding = mine(&mut node, owner);
+    let txid = hex::encode(funding.coinbase_outpoint_id());
+    let prefix = format!("/v1/explorer/utxo/{txid}/0");
+    let response = route_rpc_request(
+        RpcRequest {
+            method: "GET".into(),
+            target: prefix.clone(),
+            content_type: None,
+            body: Vec::new(),
+        },
+        &mut node,
+    );
+    assert_eq!(response.status, 200);
+    assert_eq!(response.network_id, Some(node.params.network_id));
+    let value: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(value["network_id"], hex::encode(node.params.network_id));
+    assert_eq!(value["txid"], txid);
+    assert_eq!(value["vout"], 0);
+    assert_eq!(
+        value["value_atoms"],
+        funding.coinbase.outputs[0].value.to_string()
+    );
+    assert_eq!(value["destination_hex"], hex::encode(owner));
+    assert_eq!(
+        value["spendable_height"],
+        funding.coinbase.outputs[0].spendable_height
+    );
+    assert_eq!(value["available"], false);
+    for target in [
+        format!("/v1/explorer/utxo/{txid}"),
+        format!("/v1/explorer/utxo/{txid}/00"),
+        format!("/v1/explorer/utxo/{txid}/0/extra"),
+        format!("/v1/explorer/utxo/{txid}/4294967296"),
+        format!("/v1/explorer/utxo/{}/0", txid.to_uppercase()),
+    ] {
+        let response = route_rpc_request(
+            RpcRequest {
+                method: "GET".into(),
+                target,
+                content_type: None,
+                body: Vec::new(),
+            },
+            &mut node,
+        );
+        assert_eq!(response.status, 400);
+        assert_eq!(response.network_id, Some(node.params.network_id));
+    }
+    let response = route_rpc_request(
+        RpcRequest {
+            method: "GET".into(),
+            target: format!("/v1/explorer/utxo/{}/0", "ab".repeat(32)),
+            content_type: None,
+            body: Vec::new(),
+        },
+        &mut node,
+    );
+    assert_eq!(response.status, 404);
+    assert_eq!(response.network_id, Some(node.params.network_id));
+    drop(node);
+    clean_test_dir(&path);
+}
+
+#[test]
+fn outpoint_read_disappears_after_a_confirmed_spend() {
+    let path = test_dir("explorer-utxo-spent");
+    let mut node = Node::open(&path).unwrap();
+    let owner = default_miner_destination();
+    let other = insecure_dev_destination(0x66);
+    let funding = mine(&mut node, owner);
+    let outpoint = OutPoint {
+        txid: funding.coinbase_outpoint_id(),
+        index: 0,
+    };
+    for _ in 2..=100 {
+        mine(&mut node, other);
+    }
+    assert!(node.explorer_utxo(outpoint).unwrap().unwrap().available);
+    let payment = spend_coinbase_output(&node, &funding, 0, 0x13, 0x31, 1);
+    node.submit_transaction(payment).unwrap();
+    mine(&mut node, other);
+    assert_eq!(node.explorer_utxo(outpoint).unwrap(), None);
+    drop(node);
+    clean_test_dir(&path);
+}
+
+#[test]
 fn address_rpc_reads_checksummed_addresses_and_answers_in_hex() {
     use crate::address::{MAINNET_HRP, TEST_NETWORK_HRP, encode};
 
@@ -160,7 +250,7 @@ fn address_balances_cover_rewards_maturity_spending_change_and_mempool_exclusion
         spendable_height: node.state.next_height(),
     });
     payment
-        .sign_all(&[&SigningKey::from_bytes(&[0x13; 32]).unwrap()])
+        .sign_all(&[&SigningKey::from_slice(&[0x13; 32]).unwrap()])
         .unwrap();
     node.submit_transaction(payment.clone()).unwrap();
     assert_eq!(query(&mut node, owner).confirmed_atoms, reward.to_string());
@@ -359,7 +449,7 @@ fn address_index_handles_intrablock_spends_without_block_reads() {
         }],
     };
     second
-        .sign_all(&[&SigningKey::from_bytes(&[0x31; 32]).unwrap()])
+        .sign_all(&[&SigningKey::from_slice(&[0x31; 32]).unwrap()])
         .unwrap();
     let block = mined_child_with_transactions(
         &node,
@@ -465,7 +555,7 @@ fn address_index_distinguishes_self_transfers_and_channel_escrow() {
         }],
     };
     second
-        .sign_all(&[&SigningKey::from_bytes(&[0x12; 32]).unwrap()])
+        .sign_all(&[&SigningKey::from_slice(&[0x12; 32]).unwrap()])
         .unwrap();
     node.submit_transaction(second).unwrap();
     mine(&mut node, default_miner_destination());
@@ -591,7 +681,7 @@ fn address_pages_read_no_block_bytes_for_a_key_paid_in_every_block() {
         spendable_height: node.state.next_height(),
     });
     payment
-        .sign_all(&[&SigningKey::from_bytes(&[0x12; 32]).unwrap()])
+        .sign_all(&[&SigningKey::from_slice(&[0x12; 32]).unwrap()])
         .unwrap();
     node.submit_transaction(payment.clone()).unwrap();
     let second = mine(&mut node, default_miner_destination());
@@ -599,7 +689,7 @@ fn address_pages_read_no_block_bytes_for_a_key_paid_in_every_block() {
     // A consolidation in block 4: two of the key's coinbase outputs into a
     // payment and two outputs back to the key, so the facts must add up two
     // inputs, two outputs and their atoms.
-    let community_owner = SigningKey::from_bytes(&[0x12; 32]).unwrap();
+    let community_owner = SigningKey::from_slice(&[0x12; 32]).unwrap();
     let pooled: u64 = [&second, &third]
         .iter()
         .map(|block| block.coinbase.outputs[2].value)

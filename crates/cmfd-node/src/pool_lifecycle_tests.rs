@@ -416,10 +416,10 @@ fn bonus_reserve_funds_once_and_pays_the_rate_on_mature_blocks() {
     };
     let node = open_node();
     let pool_wallet = node.lock().unwrap().wallet_destination();
-    let sponsor_key = SigningKey::from_bytes(&[0x5b; 32]).unwrap();
+    let sponsor_key = SigningKey::from_slice(&[0x5b; 32]).unwrap();
     let sponsor: [u8; 32] = sponsor_key.verifying_key().to_bytes().into();
     let (_, funding_txid, funding_height) = fund_bonus_reserve(&node, pool_wallet, &sponsor_key);
-    let signer_b = PoolPayoutSigner::new(SigningKey::from_bytes(&[0x21; 32]).unwrap());
+    let signer_b = PoolPayoutSigner::new(SigningKey::from_slice(&[0x21; 32]).unwrap());
     let recipients = [
         hex::encode(test_payout_signer().payout()),
         hex::encode(signer_b.payout()),
@@ -642,7 +642,7 @@ fn bonus_scan_mark_restarts_below_a_reorganized_height_without_reversing_funding
         Node::open_with_profile(root.path().join("node"), crate::DEVNET_PROFILE).unwrap(),
     ));
     let pool_wallet = node.lock().unwrap().wallet_destination();
-    let sponsor_key = SigningKey::from_bytes(&[0x5b; 32]).unwrap();
+    let sponsor_key = SigningKey::from_slice(&[0x5b; 32]).unwrap();
     let sponsor: [u8; 32] = sponsor_key.verifying_key().to_bytes().into();
     let (blocks, funding_txid, funding_height) =
         fund_bonus_reserve(&node, pool_wallet, &sponsor_key);
@@ -697,7 +697,7 @@ fn bonus_scan_mark_restarts_below_a_reorganized_height_without_reversing_funding
     for block in &blocks[..(COINBASE_MATURITY + 1) as usize] {
         fork.submit_block(block.clone(), now).unwrap();
     }
-    let alternate: [u8; 32] = SigningKey::from_bytes(&[0x41; 32])
+    let alternate: [u8; 32] = SigningKey::from_slice(&[0x41; 32])
         .unwrap()
         .verifying_key()
         .to_bytes()
@@ -757,7 +757,7 @@ fn bonus_funding_record_cap_skips_the_transfer_and_still_advances_the_scan() {
         Node::open_with_profile(root.path().join("node"), crate::DEVNET_PROFILE).unwrap(),
     ));
     let pool_wallet = node.lock().unwrap().wallet_destination();
-    let sponsor_key = SigningKey::from_bytes(&[0x5b; 32]).unwrap();
+    let sponsor_key = SigningKey::from_slice(&[0x5b; 32]).unwrap();
     let sponsor: [u8; 32] = sponsor_key.verifying_key().to_bytes().into();
     let (_, funding_txid, funding_height) = fund_bonus_reserve(&node, pool_wallet, &sponsor_key);
     let mut node = node.lock().unwrap();

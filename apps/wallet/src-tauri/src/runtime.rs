@@ -2359,7 +2359,9 @@ mod tests {
         assert!(opens_as_locked(&data_dir, None));
     }
 
-    #[cfg(not(feature = "production-mainnet"))]
+    // Production profiles require pinned proof artifacts before startup reaches
+    // the wallet-lock check. Their artifact preflight is tested separately.
+    #[cfg(not(any(feature = "production-v3", feature = "production-v4")))]
     #[test]
     fn an_encrypted_wallet_without_a_passphrase_file_waits_for_unlock_without_opening_the_node() {
         let files = TestFiles::new();

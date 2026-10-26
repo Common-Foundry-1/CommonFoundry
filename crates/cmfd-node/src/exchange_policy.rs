@@ -475,7 +475,7 @@ impl WithdrawalPolicy {
             {
                 return Err(ExchangePolicyError::ApprovalSignerUnauthorized);
             }
-            let verifying_key = VerifyingKey::from_bytes(&approval_signature.public_key)
+            let verifying_key = VerifyingKey::from_slice(&approval_signature.public_key)
                 .map_err(|_| ExchangePolicyError::ApprovalSignatureInvalid)?;
             let signature = Signature::try_from(approval_signature.signature.as_slice())
                 .map_err(|_| ExchangePolicyError::ApprovalSignatureInvalid)?;
@@ -632,7 +632,7 @@ impl WithdrawalApproval {
         let mut signatures = Vec::with_capacity(document.signatures.len());
         for entry in document.signatures {
             let public_key = decode_approval_hex(&entry.public_key, "signatures.public_key")?;
-            VerifyingKey::from_bytes(&public_key)
+            VerifyingKey::from_slice(&public_key)
                 .map_err(|_| ExchangePolicyError::InvalidApprovalField("signatures.public_key"))?;
             let signature = decode_approval_hex(&entry.signature, "signatures.signature")?;
             Signature::try_from(signature.as_slice())
@@ -832,7 +832,7 @@ fn parse_rule(
     for encoded in document.public_keys {
         let public_key = decode_lower_hex(&encoded, "approval.public_keys")
             .map_err(|_| ExchangePolicyError::InvalidApproverKey(action))?;
-        VerifyingKey::from_bytes(&public_key)
+        VerifyingKey::from_slice(&public_key)
             .map_err(|_| ExchangePolicyError::InvalidApproverKey(action))?;
         public_keys.push(public_key);
     }
@@ -1039,7 +1039,7 @@ mod tests {
     use super::*;
 
     fn signing_key(marker: u8) -> SigningKey {
-        SigningKey::from_bytes(&[marker; 32]).expect("test key is valid")
+        SigningKey::from_slice(&[marker; 32]).expect("test key is valid")
     }
 
     fn public_key(marker: u8) -> [u8; 32] {

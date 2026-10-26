@@ -5808,7 +5808,7 @@ mod tests {
     }
 
     fn spend_community_output(node: &Node, block: &Block, fee: u64) -> Transaction {
-        let owner = SigningKey::from_bytes(&[0x12; 32]).unwrap();
+        let owner = SigningKey::from_slice(&[0x12; 32]).unwrap();
         let previous_output = &block.coinbase.outputs[2];
         let mut transaction = Transaction {
             network_id: node.peer_hello().network_id,
@@ -6916,7 +6916,7 @@ mod tests {
             let mut competing_transaction = transaction.clone();
             competing_transaction.outputs[0].lock = OutputLock::Key(insecure_dev_destination(0x92));
             competing_transaction
-                .sign_all(&[&SigningKey::from_bytes(&[0x12; 32]).unwrap()])
+                .sign_all(&[&SigningKey::from_slice(&[0x12; 32]).unwrap()])
                 .unwrap();
             let target_output = OutPoint {
                 txid: competing_transaction.txid(),

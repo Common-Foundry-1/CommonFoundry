@@ -209,9 +209,9 @@ impl NetworkParams {
         }
         self.monetary_policy.validate()?;
 
-        VerifyingKey::from_bytes(&self.rewards.steward)
+        VerifyingKey::from_slice(&self.rewards.steward)
             .map_err(|_| NetworkError::InvalidStewardDestination)?;
-        VerifyingKey::from_bytes(&self.rewards.community)
+        VerifyingKey::from_slice(&self.rewards.community)
             .map_err(|_| NetworkError::InvalidCommunityDestination)?;
         Ok(())
     }
@@ -244,7 +244,7 @@ mod tests {
     use crate::v2_test_reference;
 
     fn destination(byte: u8) -> [u8; 32] {
-        SigningKey::from_bytes(&[byte; 32])
+        SigningKey::from_slice(&[byte; 32])
             .unwrap()
             .verifying_key()
             .to_bytes()

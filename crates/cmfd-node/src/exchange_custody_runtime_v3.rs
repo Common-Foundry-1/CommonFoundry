@@ -1218,7 +1218,7 @@ mod tests {
     }
 
     fn signing_key(value: u8) -> SigningKey {
-        SigningKey::from_bytes(&marker(value)).expect("test scalar is valid")
+        SigningKey::from_slice(&marker(value)).expect("test scalar is valid")
     }
 
     fn public_key(value: u8) -> [u8; 32] {

@@ -517,7 +517,7 @@ impl PoolClientConfig {
         payout: [u8; 32],
         params: cmfd_consensus::NetworkParams,
     ) -> Result<Self, PoolError> {
-        VerifyingKey::from_bytes(&payout)
+        VerifyingKey::from_slice(&payout)
             .map_err(|_| PoolError::Node(NodeError::InvalidMinerDestination))?;
         Ok(Self {
             address,
@@ -2608,7 +2608,7 @@ fn verify_stored_payout(
     if verified.contains(payout) {
         return Ok(());
     }
-    VerifyingKey::from_bytes(payout).map_err(|_| PoolError::LedgerCorrupt(label.to_owned()))?;
+    VerifyingKey::from_slice(payout).map_err(|_| PoolError::LedgerCorrupt(label.to_owned()))?;
     verified.insert(*payout);
     Ok(())
 }
@@ -3634,12 +3634,12 @@ pub fn spawn_pool_server(
         }
         // The wallet key's own transfers never fund the reserve.
         if policy.sponsor == wallet_destination
-            || VerifyingKey::from_bytes(&policy.sponsor).is_err()
+            || VerifyingKey::from_slice(&policy.sponsor).is_err()
         {
             return Err(PoolError::InvalidBonusSponsor);
         }
     }
-    VerifyingKey::from_bytes(&config.block_destination)
+    VerifyingKey::from_slice(&config.block_destination)
         .map_err(|_| PoolError::Node(NodeError::InvalidMinerDestination))?;
     let tls = Arc::new(server_tls_config(
         config.certificate_der,
@@ -4125,7 +4125,7 @@ fn handle_connection(
                 return Err(PoolError::FingerprintMismatch);
             }
             validate_worker(&worker)?;
-            if VerifyingKey::from_bytes(&payout).is_err() {
+            if VerifyingKey::from_slice(&payout).is_err() {
                 send_error(
                     &mut stream,
                     "payout_authentication_failed",
@@ -6701,7 +6701,7 @@ fn verified_production_v4_share(
 impl PoolClient {
     pub fn connect(config: PoolClientConfig) -> Result<Self, PoolError> {
         validate_worker(&config.worker)?;
-        VerifyingKey::from_bytes(&config.payout)
+        VerifyingKey::from_slice(&config.payout)
             .map_err(|_| PoolError::Node(NodeError::InvalidMinerDestination))?;
         if let Some(signer) = &config.payout_signer
             && config.payout != signer.payout()
@@ -7138,7 +7138,7 @@ fn verify_payout_authentication(
     digest: [u8; 32],
     signature: &[u8],
 ) -> Result<(), PoolError> {
-    let key = VerifyingKey::from_bytes(&payout).map_err(|_| PoolError::PayoutAuthentication)?;
+    let key = VerifyingKey::from_slice(&payout).map_err(|_| PoolError::PayoutAuthentication)?;
     let signature = Signature::try_from(signature).map_err(|_| PoolError::PayoutAuthentication)?;
     key.verify(&digest, &signature)
         .map_err(|_| PoolError::PayoutAuthentication)
@@ -7880,7 +7880,7 @@ mod tests {
     }
 
     fn test_payout_signer() -> PoolPayoutSigner {
-        let signer = PoolPayoutSigner::new(SigningKey::from_bytes(&[0x13; 32]).unwrap());
+        let signer = PoolPayoutSigner::new(SigningKey::from_slice(&[0x13; 32]).unwrap());
         assert_eq!(signer.payout(), default_miner_destination());
         signer
     }
@@ -8065,7 +8065,7 @@ mod tests {
     #[test]
     fn payout_authentication_binds_key_network_challenge_and_worker() {
         let signer = test_payout_signer();
-        let other = PoolPayoutSigner::new(SigningKey::from_bytes(&[0x21; 32]).unwrap());
+        let other = PoolPayoutSigner::new(SigningKey::from_slice(&[0x21; 32]).unwrap());
         let network = [0x31; 32];
         let fingerprint = [0x32; 32];
         let challenge = [0x33; 32];
@@ -8211,7 +8211,7 @@ mod tests {
     fn reconnecting_worker_reuses_its_disconnected_session() {
         let ledger = DurableLedger::open(None, [0x41; 32], [0x42; 32]).unwrap();
         let payout = test_payout_signer().payout();
-        let other = PoolPayoutSigner::new(SigningKey::from_bytes(&[0x52; 32]).unwrap()).payout();
+        let other = PoolPayoutSigner::new(SigningKey::from_slice(&[0x52; 32]).unwrap()).payout();
         assert_eq!(
             register_session(&ledger, 1, "rig".to_owned(), payout).unwrap(),
             1
@@ -8621,7 +8621,7 @@ mod tests {
             Err(PoolError::InvalidPayoutPolicy)
         ));
 
-        let other_destination: [u8; 32] = SigningKey::from_bytes(&[0x62; 32])
+        let other_destination: [u8; 32] = SigningKey::from_slice(&[0x62; 32])
             .unwrap()
             .verifying_key()
             .to_bytes()
@@ -8692,7 +8692,7 @@ mod tests {
             Err(PoolError::InvalidPplnsWindow)
         ));
 
-        let sponsor: [u8; 32] = SigningKey::from_bytes(&[0x5b; 32])
+        let sponsor: [u8; 32] = SigningKey::from_slice(&[0x5b; 32])
             .unwrap()
             .verifying_key()
             .to_bytes()
@@ -9083,9 +9083,9 @@ mod tests {
     #[test]
     fn pplns_waits_for_maturity_and_deducts_the_frozen_operator_fee() {
         let ledger = DurableLedger::open(None, [0x41; 32], [0x42; 32]).unwrap();
-        let first = PoolPayoutSigner::new(SigningKey::from_bytes(&[0x51; 32]).unwrap()).payout();
-        let second = PoolPayoutSigner::new(SigningKey::from_bytes(&[0x52; 32]).unwrap()).payout();
-        let third = PoolPayoutSigner::new(SigningKey::from_bytes(&[0x53; 32]).unwrap()).payout();
+        let first = PoolPayoutSigner::new(SigningKey::from_slice(&[0x51; 32]).unwrap()).payout();
+        let second = PoolPayoutSigner::new(SigningKey::from_slice(&[0x52; 32]).unwrap()).payout();
+        let third = PoolPayoutSigner::new(SigningKey::from_slice(&[0x53; 32]).unwrap()).payout();
         register_session(&ledger, 1, "first".to_owned(), first).unwrap();
         register_session(&ledger, 2, "second".to_owned(), second).unwrap();
         register_session(&ledger, 3, "third".to_owned(), third).unwrap();
@@ -9372,8 +9372,8 @@ mod tests {
     #[test]
     fn pplns_window_is_frozen_before_later_shares_arrive() {
         let ledger = DurableLedger::open(None, [0x81; 32], [0x82; 32]).unwrap();
-        let finder = PoolPayoutSigner::new(SigningKey::from_bytes(&[0x83; 32]).unwrap()).payout();
-        let later = PoolPayoutSigner::new(SigningKey::from_bytes(&[0x84; 32]).unwrap()).payout();
+        let finder = PoolPayoutSigner::new(SigningKey::from_slice(&[0x83; 32]).unwrap()).payout();
+        let later = PoolPayoutSigner::new(SigningKey::from_slice(&[0x84; 32]).unwrap()).payout();
         register_session(&ledger, 1, "finder".to_owned(), finder).unwrap();
         register_session(&ledger, 2, "later".to_owned(), later).unwrap();
         let policy = PoolPplnsPolicy {
@@ -9524,7 +9524,7 @@ mod tests {
         });
         let server = spawn_pool_server(Arc::clone(&node), config).unwrap();
         let recipient =
-            PoolPayoutSigner::new(SigningKey::from_bytes(&[0x61; 32]).unwrap()).payout();
+            PoolPayoutSigner::new(SigningKey::from_slice(&[0x61; 32]).unwrap()).payout();
         register_session(&server.shared.ledger, 1, "worker".to_owned(), recipient).unwrap();
         credit_accepted_share(&server.shared.ledger, 1, 120).unwrap();
 
@@ -9554,7 +9554,7 @@ mod tests {
 
         let mut fork =
             Node::open_with_profile(root.path().join("fork"), crate::DEVNET_PROFILE).unwrap();
-        let alternate_destination: [u8; 32] = SigningKey::from_bytes(&[0x63; 32])
+        let alternate_destination: [u8; 32] = SigningKey::from_slice(&[0x63; 32])
             .unwrap()
             .verifying_key()
             .to_bytes()
@@ -9656,7 +9656,7 @@ mod tests {
         });
         let server = spawn_pool_server(Arc::clone(&node), config).unwrap();
         let recipient =
-            PoolPayoutSigner::new(SigningKey::from_bytes(&[0x62; 32]).unwrap()).payout();
+            PoolPayoutSigner::new(SigningKey::from_slice(&[0x62; 32]).unwrap()).payout();
         register_session(&server.shared.ledger, 1, "worker".to_owned(), recipient).unwrap();
         credit_accepted_share(&server.shared.ledger, 1, 120).unwrap();
 
@@ -9944,7 +9944,7 @@ mod tests {
             for index in 0..POOL_MAX_LEDGER_PAYOUTS {
                 let mut secret = [0_u8; 32];
                 secret[24..].copy_from_slice(&(index as u64 + 1).to_be_bytes());
-                let payout: [u8; 32] = k256::schnorr::SigningKey::from_bytes(&secret)
+                let payout: [u8; 32] = k256::schnorr::SigningKey::from_slice(&secret)
                     .unwrap()
                     .verifying_key()
                     .to_bytes()
@@ -10198,7 +10198,7 @@ mod tests {
 
         let mut fork =
             Node::open_with_profile(root.path().join("fork"), crate::DEVNET_PROFILE).unwrap();
-        let alternate_destination: [u8; 32] = k256::schnorr::SigningKey::from_bytes(&[0x41; 32])
+        let alternate_destination: [u8; 32] = k256::schnorr::SigningKey::from_slice(&[0x41; 32])
             .unwrap()
             .verifying_key()
             .to_bytes()

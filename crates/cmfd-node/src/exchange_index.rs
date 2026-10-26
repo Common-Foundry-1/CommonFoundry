@@ -1129,7 +1129,7 @@ fn validate_label(label: &str) -> Result<(), ExchangeIndexError> {
 }
 
 fn validate_destination(destination: [u8; 32]) -> Result<(), ExchangeIndexError> {
-    VerifyingKey::from_bytes(&destination)
+    VerifyingKey::from_slice(&destination)
         .map(|_| ())
         .map_err(|_| ExchangeIndexError::InvalidDestination)
 }
@@ -1878,7 +1878,7 @@ mod tests {
     }
 
     fn random_destination() -> [u8; 32] {
-        k256::schnorr::SigningKey::random(&mut k256::elliptic_curve::rand_core::OsRng)
+        crate::random_test_signing_key()
             .verifying_key()
             .to_bytes()
             .into()

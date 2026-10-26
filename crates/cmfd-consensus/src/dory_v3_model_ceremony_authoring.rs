@@ -1867,7 +1867,7 @@ fn verify_signatures_against(
     }
     let message = ceremony_record_signature_message(&record.body)?;
     for (signature, signer) in record.signatures.iter().zip(expected) {
-        let key = VerifyingKey::from_bytes(&signer.public_key)
+        let key = VerifyingKey::from_slice(&signer.public_key)
             .map_err(|_| CeremonyTranscriptError::InvalidPublicKey)?;
         let signature = Signature::try_from(signature.signature.as_slice())
             .map_err(|_| CeremonyTranscriptError::MalformedSignature)?;
@@ -2199,7 +2199,7 @@ mod tests {
 
     fn test_keys(count: usize, offset: u8) -> Vec<SigningKey> {
         (0..count)
-            .map(|index| SigningKey::from_bytes(&[offset.wrapping_add(index as u8); 32]).unwrap())
+            .map(|index| SigningKey::from_slice(&[offset.wrapping_add(index as u8); 32]).unwrap())
             .collect()
     }
 
@@ -2887,7 +2887,7 @@ mod tests {
             Err(ProductionDoryV3CeremonyAuthoringError::SignerPolicy)
         ));
 
-        let wrong_key = SigningKey::from_bytes(&[99; 32]).unwrap();
+        let wrong_key = SigningKey::from_slice(&[99; 32]).unwrap();
         let message = ceremony_record_signature_message(&record.body).unwrap();
         let invalid_signature: Signature = wrong_key.sign_raw(&message, &[0; 32]).unwrap();
         let mut invalid = record;
@@ -3820,7 +3820,7 @@ mod tests {
             Err(ProductionDoryV3CeremonyAuthoringError::SignerPolicy)
         ));
 
-        let wrong_key = SigningKey::from_bytes(&[99; 32]).unwrap();
+        let wrong_key = SigningKey::from_slice(&[99; 32]).unwrap();
         let wrong_signature: Signature = wrong_key
             .sign_raw(&prepared.signature_message(), &[0; 32])
             .unwrap();

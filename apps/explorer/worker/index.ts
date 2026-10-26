@@ -155,7 +155,8 @@ async function proxyExplorerRequest(request: Request, env: Env): Promise<Respons
     console.error(JSON.stringify({
       error: error instanceof Error ? error.name : "UnknownError",
       message: "explorer_origin_unavailable",
-      path: requestUrl.pathname,
+      path: isUtxoApiPath(requestUrl.pathname) || isBackupUtxoApiPath(requestUrl.pathname)
+        ? "/v1/explorer/utxo/*" : requestUrl.pathname,
     }));
     return Response.json(
       { error: "explorer_origin_unavailable" },

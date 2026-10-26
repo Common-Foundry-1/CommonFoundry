@@ -448,7 +448,7 @@ dependencies = [
 
 [[package]]
 name = "cmfd-wallet-api"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cmfd-wallet-core",
  "hex",
@@ -460,7 +460,7 @@ dependencies = [
 
 [[package]]
 name = "cmfd-wallet-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "argon2",
  "blake3",
@@ -475,7 +475,7 @@ dependencies = [
 
 [[package]]
 name = "cmfd-wallet-engine"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cmfd-wallet-api",
  "cmfd-wallet-core",
@@ -485,7 +485,7 @@ dependencies = [
 
 [[package]]
 name = "cmfd-wallet-storage"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cmfd-wallet-core",
  "libc",
@@ -510,7 +510,7 @@ dependencies = [
 
 [[package]]
 name = "common-foundry-android-wallet"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cmfd-wallet-api",
  "cmfd-wallet-core",

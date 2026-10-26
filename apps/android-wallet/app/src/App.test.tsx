@@ -513,7 +513,7 @@ test("opens settings from the CF brand before wallet creation and shows the real
 
   fireEvent.click(screen.getByRole("button", { name: "Paramètres" }));
   expect(await screen.findByRole("dialog", { name: "Paramètres" })).toBeVisible();
-  expect(screen.getByText("Version 0.1.0")).toBeVisible();
+  expect(screen.getByText("Version 0.1.1")).toBeVisible();
   expect(screen.getByRole("radio", { name: /Clair/ })).toBeChecked();
   expect(screen.getByRole("button", { name: "Ouvrir la sauvegarde du portefeuille" })).toBeDisabled();
 

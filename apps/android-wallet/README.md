@@ -44,6 +44,8 @@ pnpm tauri android build --apk --target aarch64
 
 The generated Android project includes a SHA-256-pinned Gradle 8.14.3 distribution and an official wrapper JAR checked against Gradle's published hash. On Windows hosts that prohibit symlink creation, Tauri may finish the optimized Rust library then fail while linking it into `jniLibs`; copy that exact library into `app/src-tauri/gen/android/app/src/main/jniLibs/arm64-v8a/` and run Gradle's `:app:assembleUniversalRelease` with the Rust task excluded. Verify the library hash in the APK matches the compiled library.
 
+The adaptive launcher foreground is generated from `app/src-tauri/icons/icon.png` by `scripts/generate-android-launcher-icons.ps1` on Windows. It centers the original copper CF mark within Android's 66 dp safe circle, leaving extra room for device-specific icon masks. Re-run it after regenerating the Android project resources.
+
 No signing key belongs in this repository. An unsigned build is for static inspection only. Public distribution requires a security-reviewed source commit, a tested ARM64 device build, protected official signing, APK/source verification, and authenticated checksums. No production node, tunnel, Worker, or key operation is authorized by this README.
 
 The `Android wallet unsigned build` workflow checks both Rust lockfiles and the UI dependencies, runs the core and UI tests, regenerates the bundled license notices, and checks their presence in the unsigned ARM64 APK. It retains that APK with its SHA-256 checksum for seven days. The CI artifact is a review input, not an official signed release.

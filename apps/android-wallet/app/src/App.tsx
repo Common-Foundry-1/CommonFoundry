@@ -321,6 +321,7 @@ function Onboarding({ onComplete }: { onComplete: (wallet: WalletStatus) => void
       {flow === "create" && (
         <>
           <p className="safety-warning" role="note">{t("backupLossWarning")}</p>
+          <p className="notice" role="note">{t("backupStorageChoice")}</p>
           <PassphraseAction
             title={t("createAndBackup")}
             explanation={t("createExplanation")}
@@ -958,6 +959,7 @@ function BackupPanel() {
       <p className="eyebrow">{t("backupEyebrow")}</p>
       <h2>{t("exportOfficialCopy")}</h2>
       <p>{t("exportDescription")}</p>
+      <p className="notice" role="note">{t("backupStorageChoice")}</p>
       <p className="safety-warning" role="note">{t("backupLossWarning")}</p>
       <form className="secure-form" onSubmit={(event) => void submit(event)}>
         <label>

@@ -5,6 +5,7 @@ import { App } from "./App";
 import { LANGUAGE_STORAGE_KEY, THEME_STORAGE_KEY } from "./i18n";
 import {
   confirmAndBroadcastPayment,
+  exportWallet,
   getPendingPayments,
   getSendAvailability,
   getWalletOverview,
@@ -513,7 +514,7 @@ test("opens settings from the CF brand before wallet creation and shows the real
 
   fireEvent.click(screen.getByRole("button", { name: "Paramètres" }));
   expect(await screen.findByRole("dialog", { name: "Paramètres" })).toBeVisible();
-  expect(screen.getByText("Version 0.1.1")).toBeVisible();
+  expect(screen.getByText("Version 0.1.2")).toBeVisible();
   expect(screen.getByRole("radio", { name: /Clair/ })).toBeChecked();
   expect(screen.getByRole("button", { name: "Ouvrir la sauvegarde du portefeuille" })).toBeDisabled();
 
@@ -580,6 +581,23 @@ test("opens the existing backup screen from settings without locking the wallet"
 
   expect(await screen.findByText("Exporter une sauvegarde officielle chiffrée")).toBeVisible();
   expect(lockWallet).not.toHaveBeenCalled();
+});
+
+test("leaves optional cloud backup under the user's explicit save choice", async () => {
+  localStorage.setItem(LANGUAGE_STORAGE_KEY, "en");
+  renderUnlockedWallet();
+  await screen.findByText("Live balance");
+  fireEvent.click(screen.getByRole("button", { name: "Backup" }));
+
+  expect(screen.getByText(/Cloud storage is optional/)).toBeVisible();
+  expect(screen.getByText(/cannot recover a forgotten passphrase/)).toBeVisible();
+  expect(exportWallet).not.toHaveBeenCalled();
+
+  fireEvent.change(screen.getByLabelText("Current passphrase"), {
+    target: { value: "synthetic passphrase for testing" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Choose location" }));
+  await waitFor(() => expect(exportWallet).toHaveBeenCalledTimes(1));
 });
 
 test("keeps an unlocked wallet on screen if it cannot lock before notices", async () => {

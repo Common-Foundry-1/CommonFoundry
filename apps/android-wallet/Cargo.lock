@@ -190,7 +190,7 @@ dependencies = [
 
 [[package]]
 name = "cmfd-wallet-api"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "cmfd-wallet-core",
  "hex",
@@ -203,7 +203,7 @@ dependencies = [
 
 [[package]]
 name = "cmfd-wallet-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "argon2",
  "blake3",
@@ -218,7 +218,7 @@ dependencies = [
 
 [[package]]
 name = "cmfd-wallet-engine"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "cmfd-wallet-api",
  "cmfd-wallet-core",
@@ -229,7 +229,7 @@ dependencies = [
 
 [[package]]
 name = "cmfd-wallet-storage"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "cmfd-wallet-core",
  "getrandom 0.3.4",

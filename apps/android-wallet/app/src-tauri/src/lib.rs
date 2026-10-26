@@ -150,12 +150,12 @@ const MAX_UTXO_PAGES: usize = 64;
 const MAX_UTXOS: usize = 8_192;
 const INPUT_LOOKUP_CONCURRENCY: usize = 8;
 const INPUT_VERIFICATION_ERROR: &str = "Les valeurs des entrées ne correspondent pas aux transactions confirmées. L’envoi est bloqué; réessayez après synchronisation du service.";
-const INDEPENDENT_VERIFICATION_ERROR: &str = "Le nœud de vérification indépendant est indisponible ou ne confirme pas les entrées sélectionnées. L’envoi est bloqué.";
+const INDEPENDENT_VERIFICATION_ERROR: &str = "Les nœuds de vérification indépendants sont indisponibles, en retard ou ne confirment pas les entrées sélectionnées. L’envoi est bloqué.";
 const MAX_INDEPENDENT_NODE_LAG_BLOCKS: u64 = 6;
-/// The wallet gateway proposes inputs. A separate Falkenstein node must agree
+/// The wallet gateway proposes inputs. A separate Germany or Proxmox node must agree
 /// on every selected outpoint before signing; both are still trusted services.
 const TRUST_OFFICIAL_WALLET_GATEWAY_UTXOS: bool = true;
-const OFFICIAL_GATEWAY_TRUST_MESSAGE: &str = "Chaque entrée de la passerelle officielle est vérifiée avant signature auprès d’un nœud Falkenstein distinct. Une divergence ou une indisponibilité bloque l’envoi. Le téléphone ne valide pas lui-même toute la chaîne; une compromission des deux services pourrait encore fausser les frais.";
+const OFFICIAL_GATEWAY_TRUST_MESSAGE: &str = "Chaque entrée de la passerelle officielle est vérifiée avant signature auprès du nœud allemand ou, s’il est indisponible ou en retard, du relais Proxmox local. Une divergence bloque l’envoi. Le téléphone ne valide pas lui-même toute la chaîne; une compromission de la passerelle et du nœud utilisé pourrait encore fausser les frais.";
 const DEVELOPMENT_BUILD_SEND_MESSAGE: &str = "L’envoi mainnet est désactivé dans les versions de développement débogables. Utilisez une version release signée et validée.";
 
 #[derive(Serialize)]
@@ -867,7 +867,11 @@ async fn verify_selected_inputs(
                 let vout = outpoint.index;
                 tauri::async_runtime::spawn(async move {
                     independent
-                        .utxo(&txid, vout)
+                        .utxo(
+                            &txid,
+                            vout,
+                            snapshot_height.saturating_sub(MAX_INDEPENDENT_NODE_LAG_BLOCKS),
+                        )
                         .await
                         .map_err(|_| INDEPENDENT_VERIFICATION_ERROR)
                 })

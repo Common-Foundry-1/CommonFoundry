@@ -51,6 +51,7 @@ jobs:
       - name: Check Rust wallet core
         run: |
           cargo test --locked
+          cargo test --locked -p cmfd-wallet-api -- --ignored
           cargo clippy --locked --all-targets -- -D warnings
       - name: Audit Android Rust lockfiles
         run: |

@@ -2785,9 +2785,25 @@ pub(super) mod tests {
             b"keys"
         );
         assert!(!dir.join("data-mainnet").exists());
-        // Only the lock file stays in staging, and it is free again.
+        // Only the lock file stays in staging. A just-finished child process
+        // may briefly retain a duplicate handle before its reaper closes it.
         assert_eq!(fixture.staging_leftovers(), [LOCK_FILE_NAME]);
-        assert!(Staging::open(fixture.iroot(), V17).is_ok());
+        let mut reopened = None;
+        for _ in 0..=50 {
+            match Staging::open(fixture.iroot(), V17) {
+                Ok(staging) => {
+                    reopened = Some(staging);
+                    break;
+                }
+                Err(InstallError::Busy) => std::thread::sleep(Duration::from_millis(20)),
+                Err(error) => panic!("staging could not reopen after install: {error}"),
+            }
+        }
+        assert!(
+            reopened.is_some(),
+            "staging lock did not clear after install"
+        );
+        drop(reopened);
         assert!(holds_only_package_files(dir));
     }
 

@@ -83,13 +83,13 @@ jobs:
       - name: Build unsigned ARM64 APK
         working-directory: apps/android-wallet/app
         run: pnpm tauri android build --apk --target aarch64
-      - name: Confirm notices are present in the APK
-        working-directory: apps/android-wallet/app/src-tauri/gen/android/app/build/outputs/apk/universal/release
+      - name: Confirm notices are embedded in the APK native library
         run: |
-          unzip -Z1 app-universal-release-unsigned.apk > apk-files.txt
-          for notice in rust-licenses.html javascript-licenses.html android-library-notices.html common-foundry-license.txt; do
-            grep -F "$notice" apk-files.txt
-          done
+          node scripts/check-embedded-notices.mjs
+          apk=app/src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk
+          native=app/src-tauri/target/aarch64-linux-android/release/libcommon_foundry_android_wallet_lib.so
+          unzip -Z1 "$apk" | grep -Fx 'lib/arm64-v8a/libcommon_foundry_android_wallet_lib.so'
+          cmp "$native" <(unzip -p "$apk" lib/arm64-v8a/libcommon_foundry_android_wallet_lib.so)
       - name: Hash unsigned APK
         working-directory: apps/android-wallet/app/src-tauri/gen/android/app/build/outputs/apk/universal/release
         run: |

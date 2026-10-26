@@ -327,7 +327,7 @@ impl WalletKeyEntry {
         lifecycle: KeyLifecycle,
     ) -> Result<Self, WalletKeyringError> {
         validate_roles(roles)?;
-        let signing_key = SigningKey::from_bytes(secret.as_ref())
+        let signing_key = SigningKey::from_slice(secret.as_ref())
             .map_err(|_| WalletKeyringError::InvalidLocalSecret)?;
         let public_key: [u8; 32] = signing_key.verifying_key().to_bytes().into();
         Ok(Self {
@@ -509,7 +509,7 @@ impl WalletKeyring {
         let KeyMaterial::Local(secret) = &entry.material else {
             return Err(WalletKeyringError::KeyNotLocallySignable);
         };
-        let signing_key = SigningKey::from_bytes(secret.as_ref())
+        let signing_key = SigningKey::from_slice(secret.as_ref())
             .map_err(|_| WalletKeyringError::InvalidLocalSecret)?;
         let signature: Signature = signing_key.sign(digest);
         Ok(signature.to_bytes())
@@ -1082,7 +1082,7 @@ fn decode_entry(decoder: &mut Decoder<'_>) -> Result<WalletKeyEntry, WalletKeyri
     let entry = match storage_tag {
         LOCAL_STORAGE_TAG => {
             let secret = Zeroizing::new(decoder.array()?);
-            let signing_key = SigningKey::from_bytes(secret.as_ref())
+            let signing_key = SigningKey::from_slice(secret.as_ref())
                 .map_err(|_| WalletKeyringError::InvalidLocalSecret)?;
             let actual_public_key: [u8; 32] = signing_key.verifying_key().to_bytes().into();
             if actual_public_key != public_key {
@@ -1127,7 +1127,7 @@ fn validate_entry(entry: &WalletKeyEntry) -> Result<(), WalletKeyringError> {
     }
     match &entry.material {
         KeyMaterial::Local(secret) => {
-            let key = SigningKey::from_bytes(secret.as_ref())
+            let key = SigningKey::from_slice(secret.as_ref())
                 .map_err(|_| WalletKeyringError::InvalidLocalSecret)?;
             let public_key: [u8; 32] = key.verifying_key().to_bytes().into();
             if public_key != entry.public_key {
@@ -1147,7 +1147,7 @@ fn validate_roles(roles: KeyRoles) -> Result<(), WalletKeyringError> {
 }
 
 fn validate_public_key(public_key: &[u8; 32]) -> Result<(), WalletKeyringError> {
-    VerifyingKey::from_bytes(public_key)
+    VerifyingKey::from_slice(public_key)
         .map(|_| ())
         .map_err(|_| WalletKeyringError::InvalidPublicKey)
 }
@@ -1349,7 +1349,7 @@ mod tests {
     }
 
     fn public_key(marker: u8) -> [u8; 32] {
-        let key = SigningKey::from_bytes(&[marker; 32]).unwrap();
+        let key = SigningKey::from_slice(&[marker; 32]).unwrap();
         key.verifying_key().to_bytes().into()
     }
 
@@ -1745,7 +1745,7 @@ mod tests {
         let local = keyring.active_change_key();
         let signature_bytes = keyring.sign_local_digest(local.key_id, &digest).unwrap();
         let signature = Signature::try_from(signature_bytes.as_slice()).unwrap();
-        let verifying_key = VerifyingKey::from_bytes(&local.public_key).unwrap();
+        let verifying_key = VerifyingKey::from_slice(&local.public_key).unwrap();
         verifying_key.verify(&digest, &signature).unwrap();
 
         let external = keyring

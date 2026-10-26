@@ -1,0 +1,16 @@
+[package]
+name = "cmfd-wallet-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cmfd-wallet-core = { path = "../cmfd-wallet-core" }
+thiserror.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+getrandom.workspace = true

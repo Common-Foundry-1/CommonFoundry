@@ -1,0 +1,25 @@
+# Android wallet: independent UTXO corroboration
+
+The Android wallet must not sign a mainnet transaction using input values supplied only by `wallet.commonfoundry.ai`. A false value for a real outpoint can make the network burn more CMFD than the displayed fee.
+
+## Required boundary
+
+- The wallet gateway proposes spendable UTXOs and still checks each selected input against its confirmed transaction output.
+- The explorer Worker forwards the primary UTXO route only to Germany's own mainnet node and the separate backup route only to the local Proxmox CMFD-Relay node. Both validate the chain on hosts separate from the Singapore wallet gateway. Neither proof path may use the normal explorer failover router, which can select Singapore or St. Louis.
+- The Android client compares each selected input's value, owner, maturity, and availability with the wallet gateway and a proof node. It uses Proxmox only when Germany is unreachable, returns a retryable service error, or reports a height more than six blocks behind the wallet snapshot. A valid missing or unavailable input, wrong network, malformed response, or value mismatch from Germany blocks signing. The backup must itself be current and agree with the gateway. The check runs at payment preparation and immediately before signing.
+- The Send screen probes Germany and, on a retryable outage, Proxmox with a nonexistent outpoint. Until one route returns a network-identified 404, sending stays disabled. Neither public outpoint lookup scans the mempool; a conflicting pending spend can still make broadcast fail.
+
+This is independent **node corroboration**, not full on-device chain validation or a cryptographic UTXO proof. Compromise of the gateway and the proof node used, or their shared control plane, remains a trust risk. Both proof transports currently pass through the Germany tunnel host, so a failure of that host still blocks sending. The app must describe these limits accurately.
+
+## Deployment order
+
+1. Qualify and deploy a node build containing the read-only outpoint route on both Germany and the local Proxmox CMFD-Relay mainnet nodes, one at a time. Verify each node's own chain state, network ID, recent tip, and missing/spent/immature responses locally. Preserve both signed prior releases and rollback procedures.
+2. Create a dedicated outbound reverse SSH tunnel from Proxmox CMFD-Relay to Germany, listening only on Germany loopback port 29459 and forwarding to Proxmox loopback node port 29443. Use a restricted forwarding key and strict host-key verification. Stage `scripts/cmfd_utxo_proof_proxy.py` and `packaging/mainnet/commonfoundry-utxo-proof-origin@.service` on the Germany tunnel host. The germany instance binds only `127.0.0.1:29457` and forwards to the local Germany node at `127.0.0.1:29443`; the proxmox instance binds only `127.0.0.1:29458` and forwards to the reverse tunnel at `127.0.0.1:29459`. Both accept only canonical GET outpoint paths, require the pinned mainnet identity, bound responses to 4 KiB, and cap concurrent and timed requests. Run the proxy unit tests before staging.
+3. Add only the two dedicated proof hostname/path tunnel rules shown in `apps/explorer/origin-ingress.example.yml`, pointing to ports 29457 and 29458. Keep the existing explorer/router, pool, and catch-all rules in place. Verify that neither proof hostname serves node RPC or general explorer paths. Direct hostname requests still reach a bounded proxy. During a controlled canary, stop the Germany proof proxy and confirm the Android client uses Proxmox while ordinary explorer reads continue. Stop both proof proxies and confirm Send blocks. Neither proof path may fall back to Singapore or St. Louis.
+4. Deploy the updated explorer Worker with both `EXPLORER_PROOF_ORIGIN` and `EXPLORER_PROOF_BACKUP_ORIGIN` pinned to their respective hostnames. Verify wrong-network, redirect, malformed-path, unavailable-node, stale-primary, and source-routing behavior. Confirm ordinary explorer traffic still uses its existing origin.
+5. Rebuild the Android APK from the reviewed integration commit. On an ARM64 evaluation device, test matching and deliberately mismatched inputs, both ordinary and mining-reward outputs, stale heights, unavailable proof origin, and confirmation/broadcast recovery using synthetic wallets first.
+6. Complete security review, official release signing, APK/source verification, and authenticated checksum publication. No real CMFD transfer or production service change is implied by this document.
+
+The restricted outbound tunnel unit is `packaging/mainnet/commonfoundry-proxmox-proof-tunnel.service`. Its private key remains only on the Proxmox relay. The Germany authorized key permits a reverse listener only at `127.0.0.1:29459` and rejects shell commands and other listen ports.
+
+If the proof paths fail after cutover, remove only their tunnel hostname rules and stop their proof proxy instances; leave the existing explorer failover route in place. Roll back either node update using its signed prior release and existing rollback procedure.

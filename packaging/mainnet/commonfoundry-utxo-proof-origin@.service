@@ -1,0 +1,26 @@
+[Unit]
+Description=Common Foundry bounded %i UTXO proof origin
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+ExecStart=/usr/bin/python3 -B /usr/local/lib/commonfoundry/cmfd_utxo_proof_proxy.py --mode %i
+Restart=always
+RestartSec=2
+TimeoutStopSec=5
+MemoryMax=128M
+TasksMax=64
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

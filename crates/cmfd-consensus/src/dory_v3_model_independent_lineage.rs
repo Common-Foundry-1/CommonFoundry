@@ -670,7 +670,7 @@ fn validate_statement(
             "required anchor, key, or digest is zero",
         ));
     }
-    VerifyingKey::from_bytes(&statement.reproducer_public_key)
+    VerifyingKey::from_slice(&statement.reproducer_public_key)
         .map_err(|_| ProductionDoryV3IndependentLineageError::Invalid("reproducer public key"))?;
     if !(1..=2).contains(&statement.target_id) {
         return Err(ProductionDoryV3IndependentLineageError::Invalid(
@@ -889,7 +889,7 @@ fn verify_signatures(
                 "signatures are not in exact genesis-roster order",
             ));
         }
-        let key = VerifyingKey::from_bytes(public_key).map_err(|_| {
+        let key = VerifyingKey::from_slice(public_key).map_err(|_| {
             ProductionDoryV3IndependentLineageError::Invalid("genesis roster public key")
         })?;
         let parsed = Signature::try_from(signature.signature.as_slice()).map_err(|_| {
@@ -1308,7 +1308,7 @@ pub(crate) mod tests {
 
     fn keys(count: usize, offset: u8) -> Vec<SigningKey> {
         (0..count)
-            .map(|index| SigningKey::from_bytes(&[offset.wrapping_add(index as u8); 32]).unwrap())
+            .map(|index| SigningKey::from_slice(&[offset.wrapping_add(index as u8); 32]).unwrap())
             .collect()
     }
 

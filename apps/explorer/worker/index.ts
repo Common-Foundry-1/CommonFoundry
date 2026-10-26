@@ -16,9 +16,20 @@ const ATOMS_PER_CMFD = 100_000_000n;
 const ATOMS_PATTERN = /^(0|[1-9][0-9]{0,30})$/;
 const BLOCK_PATH = /^\/v1\/explorer\/block\/(?:[0-9]+|[0-9a-fA-F]{64})$/;
 const TRANSACTION_PATH = /^\/v1\/explorer\/transaction\/[0-9a-fA-F]{64}$/;
+const UTXO_PATH = /^\/v1\/explorer\/utxo\/[0-9a-f]{64}\/(?:0|[1-9][0-9]{0,9})$/;
+const UTXO_BACKUP_PATH = /^\/v1\/explorer\/utxo-backup\/[0-9a-f]{64}\/(?:0|[1-9][0-9]{0,9})$/;
+
+function isUtxoApiPath(pathname: string): boolean {
+  return UTXO_PATH.test(pathname) && Number(pathname.slice(pathname.lastIndexOf("/") + 1)) <= 0xffff_ffff;
+}
+
+function isBackupUtxoApiPath(pathname: string): boolean {
+  return UTXO_BACKUP_PATH.test(pathname) && Number(pathname.slice(pathname.lastIndexOf("/") + 1)) <= 0xffff_ffff;
+}
 
 export function isExplorerApiPath(pathname: string): boolean {
-  return pathname === SNAPSHOT_PATH || BLOCK_PATH.test(pathname) || TRANSACTION_PATH.test(pathname) || isAddressApiPath(pathname);
+  return pathname === SNAPSHOT_PATH || BLOCK_PATH.test(pathname) || TRANSACTION_PATH.test(pathname)
+    || isUtxoApiPath(pathname) || isBackupUtxoApiPath(pathname) || isAddressApiPath(pathname);
 }
 
 // Cloudflare Web Analytics loads from static.cloudflareinsights.com and reports to cloudflareinsights.com.
@@ -61,6 +72,16 @@ async function proxyExplorerRequest(request: Request, env: Env): Promise<Respons
     return Response.json({ error: "not_found" }, { status: 404 });
   }
 
+  if (isUtxoApiPath(requestUrl.pathname) || isBackupUtxoApiPath(requestUrl.pathname)) {
+    const { success } = await env.EXPLORER_UTXO_LIMIT.limit({ key: request.headers.get("CF-Connecting-IP") ?? "unknown" });
+    if (!success) {
+      return Response.json({ error: "rate_limited" }, {
+        status: 429,
+        headers: { "Cache-Control": "no-store" },
+      });
+    }
+  }
+
   const mainnet = env.EXPLORER_NETWORK === "mainnet";
   if ((env.EXPLORER_NETWORK !== "rc" && !mainnet)
       || (mainnet && env.EXPLORER_EXPECTED_NETWORK_ID !== MAINNET_NETWORK_ID)) {
@@ -69,7 +90,20 @@ async function proxyExplorerRequest(request: Request, env: Env): Promise<Respons
     });
   }
   try {
-    const origin = new URL(env.EXPLORER_ORIGIN);
+    // Public UTXO corroboration is pinned to Germany or the separate Proxmox
+    // relay. The normal explorer origin can fail over to Singapore, which
+    // hosts the wallet RPC gateway and cannot serve as an independent source.
+    const backupProofRead = isBackupUtxoApiPath(requestUrl.pathname);
+    const proofRead = isUtxoApiPath(requestUrl.pathname) || backupProofRead;
+    const origin = new URL(backupProofRead ? env.EXPLORER_PROOF_BACKUP_ORIGIN
+      : proofRead ? env.EXPLORER_PROOF_ORIGIN : env.EXPLORER_ORIGIN);
+    const expectedProofHostname = backupProofRead ? "mainnet-proof-backup-origin.commonfoundry.ai"
+      : proofRead ? "mainnet-proof-origin.commonfoundry.ai" : null;
+    if (mainnet && expectedProofHostname && origin.hostname !== expectedProofHostname) {
+      return Response.json({ error: "explorer_configuration_invalid" }, {
+        status: 503, headers: { "Cache-Control": "no-store" },
+      });
+    }
     const localHttp = origin.protocol === "http:"
       && ["127.0.0.1", "localhost", "[::1]"].includes(origin.hostname);
     if ((!localHttp && origin.protocol !== "https:") || origin.username || origin.password
@@ -78,7 +112,10 @@ async function proxyExplorerRequest(request: Request, env: Env): Promise<Respons
         status: 503, headers: { "Cache-Control": "no-store" },
       });
     }
-    const upstreamUrl = new URL(requestUrl.pathname, origin);
+    const upstreamPath = backupProofRead
+      ? requestUrl.pathname.replace("/utxo-backup/", "/utxo/")
+      : requestUrl.pathname;
+    const upstreamUrl = new URL(upstreamPath, origin);
     const upstream = await fetch(upstreamUrl, {
       headers: { Accept: "application/json" },
       method: "GET",
@@ -118,7 +155,8 @@ async function proxyExplorerRequest(request: Request, env: Env): Promise<Respons
     console.error(JSON.stringify({
       error: error instanceof Error ? error.name : "UnknownError",
       message: "explorer_origin_unavailable",
-      path: requestUrl.pathname,
+      path: isUtxoApiPath(requestUrl.pathname) || isBackupUtxoApiPath(requestUrl.pathname)
+        ? "/v1/explorer/utxo/*" : requestUrl.pathname,
     }));
     return Response.json(
       { error: "explorer_origin_unavailable" },

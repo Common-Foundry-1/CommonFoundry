@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/mobile-schema.json",
+  "identifier": "mobile-capability",
+  "description": "Minimum camera permissions required to scan CMFD recipient QR codes.",
+  "windows": ["main"],
+  "platforms": ["android", "iOS"],
+  "permissions": [
+    "barcode-scanner:allow-check-permissions",
+    "barcode-scanner:allow-request-permissions",
+    "barcode-scanner:allow-scan"
+  ]
+}

@@ -1023,7 +1023,7 @@ mod tests {
         REVERSIBLE_STATE_DELTA_FIXED_BYTES - 3 * DELTA_COUNT_BYTES - DELTA_LOCAL_INTEGRITY_BYTES;
 
     fn signing_key(byte: u8) -> SigningKey {
-        SigningKey::from_bytes(&[byte; 32]).unwrap()
+        SigningKey::from_slice(&[byte; 32]).unwrap()
     }
 
     fn owner(byte: u8) -> [u8; 32] {

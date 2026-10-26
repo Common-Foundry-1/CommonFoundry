@@ -1,0 +1,21 @@
+[package]
+name = "tauri-plugin-cmfd-android"
+version = "0.1.0"
+license = "MIT"
+authors = [ "Common Foundry contributors" ]
+description = "Internal Android Keystore and Storage Access Framework bridge"
+edition = "2021"
+rust-version = "1.77.2"
+exclude = ["/examples", "/dist-js", "/guest-js", "/node_modules"]
+links = "tauri-plugin-cmfd-android"
+
+[dependencies]
+base64 = "0.22"
+tauri = { version = "2.11.3" }
+serde = "1.0"
+thiserror = "2"
+
+[build-dependencies]
+tauri-plugin = { version = "2.6.3", features = ["build"] }
+
+[workspace]

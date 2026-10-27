@@ -1,6 +1,7 @@
 export const DISCORD_URL = "https://discord.gg/XGuutqWMWP";
 export const GITHUB_URL = "https://github.com/Common-Foundry-1";
 export const WALLET_URL = "https://wallet.commonfoundry.ai";
+export const RENT_URL = "/rent/";
 export const X_URL = "https://x.com/CommonFoundry1";
 export const EXPLORER_URL = "https://explorer.commonfoundry.ai";
 export const MININGCHAMP_URL = "https://miningchamp.com/coin/common-foundry";

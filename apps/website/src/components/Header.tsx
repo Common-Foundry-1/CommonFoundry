@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { DISCORD_URL, WALLET_URL, navItems, type SectionId } from "../content";
+import { DISCORD_URL, RENT_URL, WALLET_URL, navItems, type SectionId } from "../content";
 import { ArrowIcon, CloseIcon, MenuIcon } from "./Icons";
 
 function useActiveSection() {
@@ -90,6 +90,7 @@ export function Header() {
           </a>
         ))}
         <a href={WALLET_URL} target="_blank" rel="noopener noreferrer">Web wallet</a>
+        <a href={RENT_URL}>Rent a GPU</a>
       </nav>
 
       <a
@@ -130,6 +131,10 @@ export function Header() {
           ))}
           <a href={WALLET_URL} target="_blank" rel="noopener noreferrer" onClick={closeMenu}>
             <span>Web wallet</span>
+            <ArrowIcon />
+          </a>
+          <a href={RENT_URL} onClick={closeMenu}>
+            <span>Rent a GPU</span>
             <ArrowIcon />
           </a>
         </nav>

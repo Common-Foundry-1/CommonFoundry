@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import App from "./App";
-import { DISCORD_URL, EMISSION_URL, EXPLORER_URL, MAINNET_LAUNCH_AT, MAINNET_RELEASE_KEY_FINGERPRINT, MAINNET_RELEASE_KEY_URL, MAINNET_RELEASE_URL, MAINNET_RELEASE_VERSION, MAINNET_SEED_PEER, SOURCE_RELEASE_AT, SECURITY_URL, WALLET_URL, WHITEPAPER_URL } from "./content";
+import { DISCORD_URL, EMISSION_URL, EXPLORER_URL, MAINNET_LAUNCH_AT, MAINNET_RELEASE_KEY_FINGERPRINT, MAINNET_RELEASE_KEY_URL, MAINNET_RELEASE_URL, MAINNET_RELEASE_VERSION, MAINNET_SEED_PEER, RENT_URL, SOURCE_RELEASE_AT, SECURITY_URL, WALLET_URL, WHITEPAPER_URL } from "./content";
 
 describe("Discord-first launch website", () => {
   it("leads with inference and makes Discord the primary first-screen action", () => {
@@ -16,6 +16,13 @@ describe("Discord-first launch website", () => {
     expect(within(hero).getByText("Mainnet is live")).toBeVisible();
     expect(within(hero).queryByRole("timer")).not.toBeInTheDocument();
     expect(within(screen.getByRole("banner")).getByRole("link", { name: "Join Discord" })).toHaveAttribute("href", DISCORD_URL);
+  });
+
+  it("links the GPU marketplace page from both navigations", () => {
+    render(<App />);
+    const primary = screen.getByRole("navigation", { name: "Primary navigation" });
+    expect(within(primary).getByRole("link", { name: "Rent a GPU" })).toHaveAttribute("href", RENT_URL);
+    expect(within(primary).getByRole("link", { name: "Web wallet" })).toHaveAttribute("href", WALLET_URL);
   });
 
   it("records the launch as completed and points to the live services", () => {

@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Rent a GPU on Common Foundry</title>
+<meta name="description" content="Rent GPUs on the Common Foundry marketplace and pay in CMFD. See the machines available now, what each one has and costs, and download the renter app.">
+<link rel="icon" href="/assets/common-foundry-mark.png">
+<style>
+@font-face { font-family: "Rajdhani"; font-style: normal; font-weight: 600; font-display: swap; src: url("/exchanges/fonts/rajdhani-latin-600-normal.woff2") format("woff2"); }
+@font-face { font-family: "Rajdhani"; font-style: normal; font-weight: 700; font-display: swap; src: url("/exchanges/fonts/rajdhani-latin-700-normal.woff2") format("woff2"); }
+@font-face { font-family: "Inter Variable"; font-style: normal; font-weight: 100 900; font-display: swap; src: url("/exchanges/fonts/inter-latin-wght-normal.woff2") format("woff2-variations"); }
+html { -webkit-text-size-adjust: 100%; }
+body { margin: 0; }
+img { max-width: 100%; }
+[hidden] { display: none !important; }
+/* Same tokens as /exchanges/: graphite, mineral, copper; dark first. */
+:root {
+  --bg: #090a0a; --surface: #121414; --surface-2: #191b1b; --fg: #f2f0ec; --muted: #a6a39e;
+  --line: rgba(242, 240, 236, 0.12); --accent: #ec7a30; --accent-strong: #f6a05a; --accent-soft: rgba(236, 122, 48, 0.14);
+  --good: #6fbf8a; --bad: #e5695a; --warn: #d9a441; --code-bg: #0e0f0f;
+  --display: "Rajdhani", "Arial Narrow", sans-serif;
+  --body: "Inter Variable", "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  color-scheme: dark;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg: #fbfaf7; --surface: #f2f0ec; --surface-2: #e9e6e0; --fg: #171919; --muted: #5d5b57;
+    --line: rgba(23, 25, 25, 0.14); --accent: #bd4210; --accent-strong: #9a360c; --accent-soft: rgba(189, 66, 16, 0.1);
+    --good: #2e7d4f; --bad: #b3362a; --warn: #8a6410; --code-bg: #f4f2ee; color-scheme: light;
+  }
+}
+:root[data-theme="light"] {
+  --bg: #fbfaf7; --surface: #f2f0ec; --surface-2: #e9e6e0; --fg: #171919; --muted: #5d5b57;
+  --line: rgba(23, 25, 25, 0.14); --accent: #bd4210; --accent-strong: #9a360c; --accent-soft: rgba(189, 66, 16, 0.1);
+  --good: #2e7d4f; --bad: #b3362a; --warn: #8a6410; --code-bg: #f4f2ee; color-scheme: light;
+}
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--fg); font-family: var(--body); font-size: 16px; line-height: 1.65; padding-inline: 16px; }
+a { color: var(--accent-strong); text-underline-offset: 3px; }
+a:hover { color: var(--accent); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 3px; }
+code, kbd { font-family: var(--mono); font-size: 0.88em; background: var(--surface-2); padding: 0.1em 0.35em; border-radius: 4px; overflow-wrap: anywhere; }
+.page { max-width: 1180px; margin-inline: auto; padding-block: 28px 64px; }
+.masthead { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px 24px; padding-block: 4px 18px; border-bottom: 1px solid var(--line); }
+.brand { color: var(--fg); text-decoration: none; font-family: var(--display); font-weight: 700; font-size: 1.35rem; letter-spacing: 0.08em; text-transform: uppercase; }
+.brand span { color: var(--accent); }
+.release { font-family: var(--mono); font-size: 0.8rem; color: var(--muted); }
+.hero { padding-block: 48px 36px; display: grid; gap: 18px; max-width: 860px; }
+.eyebrow { font-family: var(--display); font-weight: 600; text-transform: uppercase; letter-spacing: 0.16em; font-size: 0.9rem; color: var(--accent); }
+h1 { font-family: var(--display); font-weight: 700; font-size: clamp(2.4rem, 6vw, 4.1rem); line-height: 1.02; margin: 0; text-wrap: balance; letter-spacing: 0.01em; }
+.lede { font-size: 1.15rem; color: var(--muted); max-width: 62ch; margin: 0; }
+.lede strong { color: var(--fg); font-weight: 600; }
+.hero-actions { display: flex; flex-wrap: wrap; gap: 10px; padding-top: 6px; align-items: center; }
+.button { display: inline-flex; align-items: center; gap: 8px; padding: 10px 16px; border-radius: 6px; font-weight: 600; font-size: 0.95rem; text-decoration: none; border: 1px solid var(--line); color: var(--fg); background: var(--surface); }
+.button.primary { background: var(--accent); border-color: var(--accent); color: #140802; }
+.button.primary:hover { background: var(--accent-strong); color: #140802; }
+.button:hover { border-color: var(--accent); color: var(--fg); }
+.hero-actions .fine { font-size: 0.82rem; color: var(--muted); }
+
+h2 { font-family: var(--display); font-weight: 700; font-size: 2rem; line-height: 1.1; margin: 0 0 14px; text-wrap: balance; letter-spacing: 0.01em; }
+h3 { font-family: var(--display); font-weight: 600; font-size: 1.3rem; margin: 28px 0 8px; letter-spacing: 0.02em; }
+p { margin: 0 0 14px; max-width: 68ch; }
+section { padding-block: 36px 44px; border-bottom: 1px solid var(--line); scroll-margin-top: 20px; }
+section:last-of-type { border-bottom: 0; }
+
+/* Catalog */
+.catalog-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px 24px; margin-bottom: 14px; }
+.catalog-head h2 { margin: 0; }
+.status { font-family: var(--mono); font-size: 0.8rem; color: var(--muted); }
+.status.stale { color: var(--warn); }
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; margin: 0; padding: 0; list-style: none; }
+.card { border: 1px solid var(--line); border-radius: 10px; background: var(--surface); padding: 18px; display: grid; gap: 12px; align-content: start; }
+.card.busy { opacity: 0.72; }
+.card-top { display: flex; justify-content: space-between; gap: 12px; align-items: start; }
+.gpu { font-family: var(--display); font-weight: 700; font-size: 1.45rem; line-height: 1.1; margin: 0; }
+.gpu small { display: block; font-family: var(--body); font-weight: 400; font-size: 0.8rem; color: var(--muted); margin-top: 2px; }
+.price { text-align: right; white-space: nowrap; }
+.price b { font-family: var(--display); font-weight: 700; font-size: 1.5rem; line-height: 1; display: block; font-variant-numeric: tabular-nums; }
+.price small { color: var(--muted); font-size: 0.75rem; }
+.price .usd { display: block; color: var(--muted); font-size: 0.82rem; margin-top: 2px; }
+.specs { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 14px; margin: 0; font-size: 0.9rem; }
+.specs div { display: grid; }
+.specs dt { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); }
+.specs dd { margin: 0; font-variant-numeric: tabular-nums; }
+.pill { font: 600 0.7rem var(--body); text-transform: uppercase; letter-spacing: 0.08em; padding: 3px 9px; border-radius: 999px; border: 1px solid currentColor; white-space: nowrap; display: inline-block; }
+.pill.ok { color: var(--good); } .pill.no { color: var(--bad); } .pill.idle { color: var(--muted); }
+.card-foot { display: flex; justify-content: space-between; align-items: center; gap: 10px; font-size: 0.8rem; color: var(--muted); flex-wrap: wrap; }
+.empty { border: 1px dashed var(--line); border-radius: 10px; padding: 28px; color: var(--muted); text-align: center; }
+
+/* Steps */
+.steps { list-style: none; margin: 18px 0 0; padding: 0; display: grid; gap: 28px; counter-reset: step; }
+.steps > li { counter-increment: step; display: grid; grid-template-columns: 44px minmax(0, 1fr); gap: 4px 16px; }
+.steps > li::before { content: counter(step); grid-row: span 3; font-family: var(--display); font-weight: 700; font-size: 1.5rem; color: var(--accent); border: 1px solid var(--accent); border-radius: 50%; width: 40px; height: 40px; display: grid; place-items: center; line-height: 1; }
+.steps h3 { margin: 6px 0 4px; }
+.steps > li > * { grid-column: 2; min-width: 0; }
+.note { border-left: 3px solid var(--accent); background: var(--accent-soft); padding: 12px 16px; border-radius: 0 6px 6px 0; margin: 14px 0; max-width: 68ch; }
+.note p:last-child { margin-bottom: 0; }
+.facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 14px; margin: 18px 0 0; padding: 0; list-style: none; }
+.facts li { border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; background: var(--surface); }
+.facts b { font-family: var(--display); font-weight: 700; font-size: 1.25rem; display: block; margin-bottom: 4px; }
+.facts span { font-size: 0.88rem; color: var(--muted); }
+footer { border-top: 1px solid var(--line); padding-top: 22px; margin-top: 12px; color: var(--muted); font-size: 0.88rem; display: flex; flex-wrap: wrap; gap: 8px 28px; justify-content: space-between; }
+footer a { color: var(--muted); }
+footer a:hover { color: var(--accent); }
+@media (max-width: 560px) {
+  .steps > li { grid-template-columns: 34px minmax(0, 1fr); gap: 4px 12px; }
+  .steps > li::before { width: 32px; height: 32px; font-size: 1.15rem; }
+  h2 { font-size: 1.7rem; }
+  .card-top { flex-direction: column; } .price { text-align: left; }
+}
+@media (prefers-reduced-motion: no-preference) { html { scroll-behavior: smooth; } }
+</style>
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <a class="brand" href="/">Common <span>Foundry</span></a>
+    <div class="release">Mainnet · GPU marketplace beta</div>
+  </header>
+
+  <div class="hero">
+    <div class="eyebrow">GPU marketplace</div>
+    <h1>Rent a GPU. Pay in CMFD.</h1>
+    <p class="lede">Pick a machine below, run the <strong>renter app</strong> on your own PC, and get a container with SSH on a verified GPU. You pay the host directly from a wallet that stays on your computer, by the second, and unused deposit comes back when you stop.</p>
+    <div class="hero-actions">
+      <a class="button primary" href="https://github.com/Common-Foundry-1/CommonFoundry-Marketplace-Binaries/releases/latest/download/CMFD-Renter-Kit-Windows.zip">Download for Windows</a>
+      <a class="button" href="https://github.com/Common-Foundry-1/CommonFoundry-Marketplace-Binaries/releases/latest/download/CMFD-Renter-Kit-Linux.zip">Download for Linux</a>
+      <span class="fine">Latest release · <a href="https://github.com/Common-Foundry-1/CommonFoundry-Marketplace-Binaries/releases/latest">checksums and notes</a></span>
+    </div>
+  </div>
+
+  <section id="gpus" aria-labelledby="gpus-title">
+    <div class="catalog-head">
+      <h2 id="gpus-title">Available now</h2>
+      <div class="status" id="status" aria-live="polite">Loading the live list…</div>
+    </div>
+    <ul class="cards" id="cards"></ul>
+    <div class="empty" id="empty" hidden>No GPUs are listed right now. The list updates by itself; check back soon.</div>
+    <p class="status" style="margin-top:12px">Every machine's claims are signed by its host. <span class="pill ok">Tested</span> means Common Foundry's own tester rented it and the hardware measured as claimed; the test is repeated after the host changes anything. Prices are set by the host.</p>
+  </section>
+
+  <section id="how" aria-labelledby="how-title">
+    <h2 id="how-title">How renting works</h2>
+    <ol class="steps">
+      <li>
+        <h3>Download and start the renter app</h3>
+        <p>Unzip the kit and double-click <strong>Start CMFD Renter</strong> (Linux: <code>./start-cmfd-renter.sh</code>). It sets itself up on your PC, including its own Python, and connects to Common Foundry's node. No account, no sign-up form.</p>
+      </li>
+      <li>
+        <h3>Fund your renter wallet</h3>
+        <p>The app creates a separate spending wallet and shows its address. Send it a few CMFD from your own wallet. About 3 CMFD covers a first hour; the exact deposit is shown before you confirm. The passphrase file it names is yours to keep.</p>
+      </li>
+      <li>
+        <h3>Pick a GPU and a template</h3>
+        <p>Choose a machine, then a template: PyTorch with Jupyter, a CUDA terminal, ComfyUI, Ollama, Qwen inference or vLLM. Confirm the quote. The app pays the host as the rental runs and renews only while you keep it open.</p>
+      </li>
+      <li>
+        <h3>Connect over SSH</h3>
+        <p>The app gives you an SSH command pinned to your rental's host key. Paste it into PowerShell or a terminal. Stop the rental whenever you like; what you didn't use is refunded to your renter wallet, and you can withdraw it back to your own wallet from the app.</p>
+      </li>
+    </ol>
+    <div class="note">
+      <p><strong>Beta.</strong> Hosts are Common Foundry's own machines for now. Renters reach them through a relay in Singapore, so throughput to a container is limited by that path while the beta runs. The app tells you what each rental measured.</p>
+    </div>
+  </section>
+
+  <section id="facts" aria-labelledby="facts-title">
+    <h2 id="facts-title">What you get</h2>
+    <ul class="facts">
+      <li><b>The whole machine</b><span>One rental per host: all of its GPU, CPU threads, RAM and the disk quota shown, not a slice.</span></li>
+      <li><b>Verified hardware</b><span>Listings carry a signed test record. If a host fails a test, renters see it before paying.</span></li>
+      <li><b>Pay by the second</b><span>Deposits fund a payment channel. The host is paid for time served; the rest returns to you.</span></li>
+      <li><b>Keys stay with you</b><span>Your wallet and SSH key live on your PC. The host sees only your public key.</span></li>
+    </ul>
+  </section>
+
+  <footer>
+    <span>Common Foundry mainnet · GPU marketplace beta</span>
+    <span>
+      <a href="https://github.com/Common-Foundry-1/CommonFoundry-Marketplace-Binaries/releases">Releases</a> ·
+      <a href="https://explorer.commonfoundry.ai">Explorer</a> ·
+      <a href="https://discord.gg/XGuutqWMWP">Discord</a>
+    </span>
+  </footer>
+</div>
+<script src="/rent/catalog.js" defer></script>
+</body>
+</html>

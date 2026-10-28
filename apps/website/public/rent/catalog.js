@@ -55,8 +55,9 @@
     li.appendChild(top);
 
     var dl = text("dl", "specs");
-    if (host.cpu_model) spec(dl, "CPU", host.cpu_model.replace(/ with Radeon Graphics$/, "") + " · " + host.cpu_cores + " threads");
-    else spec(dl, "CPU threads", host.cpu_cores);
+    var cpu = host.cpu_cores + " cores" + (host.cpu_threads ? " / " + host.cpu_threads + " threads" : "");
+    if (host.cpu_model) spec(dl, "CPU", host.cpu_model.replace(/ with Radeon Graphics$/, "") + " · " + cpu);
+    else spec(dl, "CPU", cpu);
     spec(dl, "RAM", gib(host.ram_mib));
     spec(dl, "Disk", host.disk_gib + " GiB");
     spec(dl, "Network", host.download_mbps + " ↓ / " + host.upload_mbps + " ↑ Mbit/s");

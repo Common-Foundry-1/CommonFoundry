@@ -1,10 +1,12 @@
 [[permission]]
 identifier = "wallet-commands"
-description = "Allows the main wallet window to use the bounded embedded node, solo-mining, local wallet-custody and update operations."
+description = "Allows the main wallet window to use the bounded embedded node, solo-mining, local wallet-custody and update operations, and to open its transactions on the block explorer."
 commands.allow = [
   "get_node_status",
   "get_peer_settings",
   "update_peer_settings",
+  "clear_failed_peers",
+  "open_transaction_in_explorer",
   "get_wallet_snapshot",
   "get_mempool_snapshot",
   "send_wallet_transaction",

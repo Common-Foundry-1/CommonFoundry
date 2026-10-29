@@ -1,4 +1,5 @@
-import { ArrowDownLeft, ArrowRightLeft, ArrowUpRight, Hammer, Hourglass, Wrench } from "lucide-react";
+import { ArrowDownLeft, ArrowRightLeft, ArrowUpRight, ExternalLink, Hammer, Hourglass, Wrench } from "lucide-react";
+import { useExplorerLink } from "../hooks/useExplorerLink";
 import { formatAtoms, formatTimestamp, shortenHash } from "../lib/amount";
 import type { WalletHistoryEntry } from "../types";
 
@@ -40,6 +41,7 @@ function TransactionIcon({ entry }: { entry: WalletHistoryEntry }) {
 }
 
 export function TransactionList({ entries, compact = false }: TransactionListProps) {
+  const explorer = useExplorerLink();
   const visible = compact ? entries.slice(0, 5) : entries;
   if (visible.length === 0) {
     return (
@@ -53,11 +55,24 @@ export function TransactionList({ entries, compact = false }: TransactionListPro
 
   return (
     <div className="transaction-list">
+      {explorer.error ? <p className="form-error transaction-open-error" role="alert">{explorer.error}</p> : null}
       {visible.map((entry) => {
         const value = BigInt(entry.net_amount_atoms);
         const maintenance = isWalletMaintenance(entry);
         return (
-          <article className="transaction-row" key={`${entry.txid}-${entry.kind}-${entry.height ?? "pending"}`}>
+          <article
+            className="transaction-row"
+            key={`${entry.txid}-${entry.kind}-${entry.height ?? "pending"}`}
+            role="button"
+            tabIndex={0}
+            title="View on the block explorer"
+            onClick={() => explorer.open(entry.txid)}
+            onKeyDown={(event) => {
+              if (event.key !== "Enter" && event.key !== " ") return;
+              event.preventDefault();
+              explorer.open(entry.txid);
+            }}
+          >
             <span
               className={`transaction-icon ${maintenance ? "kind-consolidated kind-maintenance" : `kind-${entry.kind}`}`}
               data-transaction-kind={maintenance ? "maintenance" : entry.kind}
@@ -79,6 +94,7 @@ export function TransactionList({ entries, compact = false }: TransactionListPro
               </div>
               <span className="transaction-meta">
                 {formatTimestamp(entry.timestamp)} · {shortenHash(entry.txid, 7, 7)}
+                <ExternalLink aria-hidden="true" size={10} />
               </span>
             </div>
             <div className="transaction-value">

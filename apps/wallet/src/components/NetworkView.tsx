@@ -1,6 +1,6 @@
 import { ArrowDownToLine, ArrowUpFromLine, Blocks, Check, Clipboard, Hammer, Plus, RefreshCw, RotateCcw, ServerCog, ShieldAlert, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
-import { getPeerSettings, mineDevnetBlock, updatePeerSettings, usesEmbeddedNode } from "../api/nodeClient";
+import { clearFailedPeers, getPeerSettings, mineDevnetBlock, updatePeerSettings, usesEmbeddedNode } from "../api/nodeClient";
 import { formatBytes, shortenHash } from "../lib/amount";
 import type { MempoolSnapshot, NodeStatus, PeerSettings, WalletSnapshot } from "../types";
 import { UpdatePanel } from "./UpdatePanel";
@@ -22,7 +22,10 @@ export function NetworkView({ status, wallet, mempool, refreshing, onRefresh, on
   const [peerInput, setPeerInput] = useState("");
   const [peerSaving, setPeerSaving] = useState(false);
   const [peerError, setPeerError] = useState<string | null>(null);
+  const [clearingPeers, setClearingPeers] = useState(false);
+  const [recentPeersError, setRecentPeersError] = useState<string | null>(null);
   const peers = status?.peers ?? [];
+  const failedPeers = peers.filter((peer) => peer.state === "failed").length;
 
   useEffect(() => {
     if (!usesEmbeddedNode) return;
@@ -66,6 +69,24 @@ export function NetworkView({ status, wallet, mempool, refreshing, onRefresh, on
     const entered = peerInput.trim();
     if (await savePeers([...peerSettings.peers, entered], `Peer ${entered} added. Connection attempts begin automatically.`)) {
       setPeerInput("");
+    }
+  };
+
+  const clearFailed = async () => {
+    setClearingPeers(true);
+    setRecentPeersError(null);
+    try {
+      const cleared = await clearFailedPeers();
+      onNotice(cleared === 1 ? "1 failed peer cleared." : `${cleared} failed peers cleared.`);
+      try {
+        await onRefresh();
+      } catch {
+        // The peers stay cleared even if the best-effort status refresh fails.
+      }
+    } catch (cause) {
+      setRecentPeersError(cause instanceof Error ? cause.message : "Failed peers could not be cleared");
+    } finally {
+      setClearingPeers(false);
     }
   };
 
@@ -219,11 +240,26 @@ export function NetworkView({ status, wallet, mempool, refreshing, onRefresh, on
               <span>Peer activity</span>
               <h3 id="recent-peers-heading">Recent peers</h3>
             </div>
-            <span className="peer-count">{peers.length}</span>
+            <div className="peer-heading-actions">
+              {usesEmbeddedNode ? (
+                <button
+                  className="button-quiet"
+                  type="button"
+                  title="Remove peers whose last session failed. A peer that is tried again is listed again."
+                  disabled={failedPeers === 0 || clearingPeers}
+                  onClick={() => void clearFailed()}
+                >
+                  {clearingPeers ? <RefreshCw className="spin" aria-hidden="true" size={14} /> : <Trash2 aria-hidden="true" size={14} />}
+                  Clear failed
+                </button>
+              ) : null}
+              <span className="peer-count">{peers.length}</span>
+            </div>
           </div>
           <p className="peer-panel-help">
             Short P2P sessions are retained here and update with node diagnostics.
           </p>
+          {recentPeersError ? <p className="form-error" role="alert">{recentPeersError}</p> : null}
           {peers.length === 0 ? (
             <div className="peer-empty">
               <ServerCog aria-hidden="true" size={20} />

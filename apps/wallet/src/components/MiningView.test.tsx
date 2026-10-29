@@ -2,7 +2,7 @@ import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MiningStatus } from "../mining/types";
-import type { NodeStatus, WalletCatchUpStatus, WalletSnapshot, WorkRuleStatus } from "../types";
+import type { NodeStatus, WalletSnapshot } from "../types";
 import { MiningView } from "./MiningView";
 
 const apiMocks = vi.hoisted(() => ({
@@ -32,19 +32,6 @@ const stoppedStatus: MiningStatus = {
   current_height: 128,
   last_block: null,
   last_error: null,
-};
-const runningStatus: MiningStatus = {
-  ...stoppedStatus,
-  lifecycle: "running",
-  mode: "solo",
-  payout,
-  engine: "cuda",
-  device: "NVIDIA GeForce RTX 4090 (CUDA 8.9)",
-  matrix_attempts_per_second: 42.25,
-  session_attempts: 2_500,
-  blocks_found: 1,
-  current_height: 129,
-  last_block: { height: 129, block_id: "44".repeat(32) },
 };
 const poolUrl = `cmfd+tls://192.168.50.20:443?pin=${"ab".repeat(32)}`;
 const runningPoolStatus: MiningStatus = {
@@ -84,39 +71,29 @@ const productionV4NodeStatus = {
 describe("MiningView", () => {
   beforeEach(() => {
     apiMocks.getMiningStatus.mockReset().mockResolvedValue(stoppedStatus);
-    apiMocks.startMining.mockReset().mockResolvedValue(runningStatus);
+    apiMocks.startMining.mockReset().mockResolvedValue(runningPoolStatus);
     apiMocks.stopMining.mockReset().mockResolvedValue(stoppedStatus);
   });
 
   afterEach(() => cleanup());
 
-  it("starts and stops the continuous solo reference miner", async () => {
-    const user = userEvent.setup();
+  it("offers Pool mining only", async () => {
     render(<MiningView wallet={wallet} nodeStatus={nodeStatus} />);
 
-    expect(await screen.findByText("matrix attempts/s")).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "Start Solo Mining" }));
-    expect(apiMocks.startMining).toHaveBeenCalledWith({ mode: "solo", payout });
-    expect(await screen.findByRole("button", { name: "Stop Mining" })).toBeEnabled();
-    expect(screen.getByText("42.25")).toBeInTheDocument();
-    expect(screen.getByText("CUDA INT8 matrix engine")).toBeInTheDocument();
-    expect(screen.getAllByText("NVIDIA GeForce RTX 4090 (CUDA 8.9)").length).toBeGreaterThan(0);
-    expect(screen.getByText(/Rust recomputes every candidate before submission/)).toBeInTheDocument();
-
-    await user.click(screen.getByRole("button", { name: "Stop Mining" }));
-    await waitFor(() => expect(apiMocks.stopMining).toHaveBeenCalledTimes(1));
-    expect(await screen.findByRole("button", { name: "Start Solo Mining" })).toBeEnabled();
+    expect(await screen.findByRole("button", { name: "Start Pool Mining" })).toBeDisabled();
+    expect(screen.getByRole("heading", { name: "Pool mining" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Solo" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Pool" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/solo/i)).not.toBeInTheDocument();
   });
 
   it("validates Pool configuration before enabling start", async () => {
     const user = userEvent.setup();
     render(<MiningView wallet={wallet} nodeStatus={nodeStatus} />);
-    await screen.findByRole("button", { name: "Start Solo Mining" });
+    const startButton = await screen.findByRole("button", { name: "Start Pool Mining" });
 
-    await user.click(screen.getByRole("button", { name: "Pool" }));
     const urlInput = screen.getByRole("textbox", { name: /Pool URL/i });
     const workerInput = screen.getByRole("textbox", { name: /Worker name/i });
-    const startButton = screen.getByRole("button", { name: "Start Pool Mining" });
     expect(screen.getByText(/CMFD-specific TLS job\/share protocol/)).toBeInTheDocument();
     expect(startButton).toBeDisabled();
 
@@ -130,11 +107,9 @@ describe("MiningView", () => {
 
   it("starts Pool mining with the exact config and renders session accounting", async () => {
     const user = userEvent.setup();
-    apiMocks.startMining.mockResolvedValueOnce(runningPoolStatus);
     render(<MiningView wallet={wallet} nodeStatus={nodeStatus} />);
-    await screen.findByRole("button", { name: "Start Solo Mining" });
+    await screen.findByRole("button", { name: "Start Pool Mining" });
 
-    await user.click(screen.getByRole("button", { name: "Pool" }));
     const urlInput = screen.getByRole("textbox", { name: /Pool URL/i });
     const workerInput = screen.getByRole("textbox", { name: /Worker name/i });
     await user.type(urlInput, poolUrl);
@@ -165,65 +140,22 @@ describe("MiningView", () => {
     expect(screen.getByText("4,321")).toBeInTheDocument();
     expect(screen.getByText("Pool height")).toBeInTheDocument();
     expect(screen.getByText("130")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Solo" })).toBeDisabled();
+    expect(screen.getByText("Mining with pool")).toBeInTheDocument();
     expect(urlInput).toBeDisabled();
     expect(workerInput).toBeDisabled();
   });
 
-  it("enables the server-verified ProductionV4 pool path while solo runtime is absent", async () => {
+  it("enables the server-verified ProductionV4 pool path", async () => {
     const user = userEvent.setup();
     render(<MiningView wallet={wallet} nodeStatus={productionV4NodeStatus} />);
-    await screen.findByRole("button", { name: "Start Solo Mining" });
-    expect(screen.getByRole("button", { name: "Start Solo Mining" })).toBeDisabled();
+    await screen.findByRole("button", { name: "Start Pool Mining" });
 
-    await user.click(screen.getByRole("button", { name: "Pool" }));
     await user.type(screen.getByRole("textbox", { name: /Pool URL/i }), poolUrl);
     await user.type(screen.getByRole("textbox", { name: /Worker name/i }), "v4-worker");
 
     expect(screen.getByRole("button", { name: "Start Pool Mining" })).toBeEnabled();
     expect(screen.getByText("CUDA ProductionV4 pool search")).toBeInTheDocument();
     expect(screen.getByText(/persistent batched CUDA/)).toBeInTheDocument();
-  });
-
-  it("starts ProductionV4 solo only when the native runtime reports readiness", async () => {
-    const user = userEvent.setup();
-    apiMocks.getMiningStatus.mockResolvedValue({ ...stoppedStatus, production_solo_available: true });
-    apiMocks.startMining.mockResolvedValue({ ...runningStatus, stage: "Searching ProductionV4 nonces on GPU" });
-    render(<MiningView wallet={wallet} nodeStatus={productionV4NodeStatus} />);
-    await waitFor(() => expect(screen.getByRole("button", { name: "Start Solo Mining" })).toBeEnabled());
-    await user.click(screen.getByRole("button", { name: "Start Solo Mining" }));
-    expect(apiMocks.startMining).toHaveBeenCalledWith({ mode: "solo", payout });
-    expect(await screen.findByText("Searching ProductionV4 nonces on GPU")).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "Stop Mining" }));
-    expect(apiMocks.stopMining).toHaveBeenCalledTimes(1);
-  });
-
-  it("does not present a completed Pool session as Solo work", async () => {
-    const user = userEvent.setup();
-    apiMocks.startMining.mockResolvedValueOnce(runningPoolStatus);
-    apiMocks.stopMining.mockResolvedValueOnce({
-      ...runningPoolStatus,
-      lifecycle: "stopped",
-      mode: null,
-      pool_connected: false,
-    });
-    render(<MiningView wallet={wallet} nodeStatus={nodeStatus} />);
-    await screen.findByRole("button", { name: "Start Solo Mining" });
-
-    await user.click(screen.getByRole("button", { name: "Pool" }));
-    await user.type(screen.getByRole("textbox", { name: /Pool URL/i }), poolUrl);
-    await user.type(screen.getByRole("textbox", { name: /Worker name/i }), "foundry.worker-1");
-    await user.click(screen.getByRole("button", { name: "Start Pool Mining" }));
-    await user.click(await screen.findByRole("button", { name: "Stop Mining" }));
-    await screen.findByRole("button", { name: "Start Pool Mining" });
-
-    await user.click(screen.getByRole("button", { name: "Solo" }));
-
-    expect(screen.getByText("Session attempts").parentElement).toHaveTextContent("0");
-    expect(screen.getByText("Blocks found").parentElement).toHaveTextContent("0");
-    expect(screen.getByText("Current height").parentElement).toHaveTextContent("128");
-    expect(screen.queryByText("4,321")).not.toBeInTheDocument();
-    expect(screen.queryByText("130")).not.toBeInTheDocument();
   });
 
   it("can stop while an unreachable Pool remains in the starting lifecycle", async () => {
@@ -238,7 +170,7 @@ describe("MiningView", () => {
 
     const stopButton = await screen.findByRole("button", { name: "Stop Mining" });
     expect(stopButton).toBeEnabled();
-    expect(screen.getByRole("button", { name: "Solo" })).toBeDisabled();
+    expect(screen.getByRole("textbox", { name: /Pool URL/i })).toBeDisabled();
 
     await user.click(stopButton);
     await waitFor(() => expect(apiMocks.stopMining).toHaveBeenCalledTimes(1));
@@ -249,70 +181,5 @@ describe("MiningView", () => {
     expect(await screen.findByText("CPU reference engine")).toBeInTheDocument();
     expect(screen.getByText("100-block maturity")).toBeInTheDocument();
     expect(screen.getByText("Transaction fees are burned")).toBeInTheDocument();
-  });
-
-  it("says why Solo waits while the newest blocks are checked, with the node's count", async () => {
-    const catchUp = (overrides: Partial<WalletCatchUpStatus>): WalletCatchUpStatus => ({
-      state: "catching_up",
-      reason: null,
-      available_height: 100,
-      blocks_left: 0,
-      newest_checked: 0,
-      newest_needed: 60,
-      sources_answering: 2,
-      granted_above_available: true,
-      ...overrides,
-    });
-    const withCatchUp = (overrides: Partial<WalletCatchUpStatus>) => ({
-      ...nodeStatus,
-      work_rule: { validated_height: 100, wallet_catch_up: catchUp(overrides) } as WorkRuleStatus,
-    }) as NodeStatus;
-    apiMocks.getMiningStatus.mockResolvedValue({ ...runningStatus, stage: "Searching nonces" });
-
-    const { rerender } = render(<MiningView wallet={wallet} nodeStatus={withCatchUp({})} />);
-    expect(await screen.findByText("Solo mining waits until the newest blocks are checked.")).toBeInTheDocument();
-    expect(screen.queryByText("Searching nonces")).not.toBeInTheDocument();
-
-    rerender(<MiningView wallet={wallet} nodeStatus={withCatchUp({
-      state: "waiting_for_check",
-      reason: "other",
-      blocks_left: 42,
-    })} />);
-    expect(screen.getByText("Solo mining waits until the newest blocks are checked: 42 left.")).toBeInTheDocument();
-
-    // Nothing taken unchecked above the available height: no hold line.
-    rerender(<MiningView wallet={wallet} nodeStatus={withCatchUp({
-      state: "waiting_for_check",
-      reason: "earlier_blocks",
-      blocks_left: 9,
-      granted_above_available: false,
-    })} />);
-    expect(screen.queryByText(/Solo mining waits/)).not.toBeInTheDocument();
-    expect(screen.getByText("Searching nonces")).toBeInTheDocument();
-  });
-
-  it("shows no Solo hold line while Pool mining", async () => {
-    apiMocks.getMiningStatus.mockResolvedValue(runningPoolStatus);
-    render(<MiningView
-      wallet={wallet}
-      nodeStatus={{
-        ...nodeStatus,
-        work_rule: {
-          validated_height: 100,
-          wallet_catch_up: {
-            state: "catching_up",
-            reason: null,
-            available_height: 100,
-            blocks_left: 0,
-            newest_checked: 0,
-            newest_needed: 60,
-            sources_answering: 2,
-            granted_above_available: true,
-          },
-        } as WorkRuleStatus,
-      } as NodeStatus}
-    />);
-    expect(await screen.findByRole("button", { name: "Stop Mining" })).toBeEnabled();
-    expect(screen.queryByText(/Solo mining waits/)).not.toBeInTheDocument();
   });
 });

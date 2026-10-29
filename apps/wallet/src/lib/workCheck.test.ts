@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { NodeStatus, WalletCatchUpStatus, WorkRuleStatus } from "../types";
-import { SOLO_HOLD_COPY, soloHoldLine, workCheckView } from "./workCheck";
+import { workCheckView } from "./workCheck";
 
 function rule(overrides: Partial<WorkRuleStatus> = {}): WorkRuleStatus {
   return {
@@ -142,45 +142,5 @@ describe("workCheckView while the wallet catches up", () => {
     expect(withCatchUp({ unsettled_height: 110, unsettled_block_id: "0f".repeat(32) }))
       .toEqual({ kind: "held", height: 110, blockId: "0f".repeat(32), blocksAfter: 18 });
     expect(withCatchUp({})).toEqual({ kind: "waiting_for_check", reason: "other", blocksLeft: 28, paused: false });
-  });
-});
-
-describe("soloHoldLine", () => {
-  const withCatchUp = (overrides: Partial<WalletCatchUpStatus> | null) =>
-    status(rule({ validated_height: 100, wallet_catch_up: overrides ? catchUp(overrides) : null }));
-
-  it("holds Solo only while a block taken without a check lies above the available height", () => {
-    expect(soloHoldLine(null)).toBeNull();
-    expect(soloHoldLine(status(rule()))).toBeNull();
-    expect(soloHoldLine(withCatchUp(null))).toBeNull();
-    expect(soloHoldLine(withCatchUp({ state: "catching_up" }))).toBeNull();
-    expect(soloHoldLine(withCatchUp({ state: "catching_up", granted_above_available: true })))
-      .toBe("Solo mining waits until the newest blocks are checked.");
-    expect(soloHoldLine(withCatchUp({ state: "checking_newest", granted_above_available: true, blocks_left: 40 })))
-      .toBe(SOLO_HOLD_COPY);
-    // Stored blocks wait for the check but nothing was taken unchecked: Solo mines.
-    expect(soloHoldLine(withCatchUp({ state: "waiting_for_check", reason: "earlier_blocks", blocks_left: 9 })))
-      .toBeNull();
-  });
-
-  it("adds the node's count of blocks left while it waits for the check", () => {
-    expect(soloHoldLine(withCatchUp({
-      state: "waiting_for_check",
-      reason: "earlier_blocks",
-      blocks_left: 1234,
-      granted_above_available: true,
-    }))).toBe(`Solo mining waits until the newest blocks are checked: ${(1234).toLocaleString()} left.`);
-  });
-
-  it("says when that count waits for mains power", () => {
-    const paused = (state: WalletCatchUpStatus["state"]) => status(rule({
-      validated_height: 100,
-      backlog_paused: true,
-      wallet_catch_up: catchUp({ state, reason: "earlier_blocks", blocks_left: 9, granted_above_available: true }),
-    }));
-    expect(soloHoldLine(paused("waiting_for_check")))
-      .toBe("Solo mining waits until the newest blocks are checked: 9 left. Paused on battery; continues when plugged in.");
-    // The newest blocks are checked on battery too.
-    expect(soloHoldLine(paused("checking_newest"))).toBe(SOLO_HOLD_COPY);
   });
 });

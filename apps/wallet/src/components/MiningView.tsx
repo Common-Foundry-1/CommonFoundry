@@ -1,5 +1,4 @@
 import {
-  Blocks,
   Cpu,
   Gauge,
   Pickaxe,
@@ -11,8 +10,7 @@ import {
 import { useEffect, useState } from "react";
 import { useMiningData } from "../hooks/useMiningData";
 import { shortenHash } from "../lib/amount";
-import { soloHoldLine } from "../lib/workCheck";
-import type { MiningLifecycle, MiningMode } from "../mining/types";
+import type { MiningLifecycle } from "../mining/types";
 import {
   poolUrlError,
   POOL_URL_REQUIREMENT,
@@ -38,7 +36,7 @@ const rateFormatter = new Intl.NumberFormat(undefined, {
 const lifecycleCopy: Record<MiningLifecycle, string> = {
   stopped: "Ready",
   starting: "Starting miner",
-  running: "Mining solo",
+  running: "Mining with pool",
   stopping: "Stopping miner",
   error: "Miner needs attention",
 };
@@ -54,22 +52,15 @@ function formatAtomCount(value: string | undefined): string {
 
 export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
   const mining = useMiningData();
-  const [mode, setMode] = useState<MiningMode>("solo");
-  const [sessionMode, setSessionMode] = useState<MiningMode | null>(null);
   const [poolUrl, setPoolUrl] = useState("");
   const [workerName, setWorkerName] = useState("");
 
   const lifecycle = mining.status?.lifecycle ?? "stopped";
   const isActive = lifecycle === "starting" || lifecycle === "running";
-  // Solo waits while a block taken without a check here lies above the available height.
-  const soloHold = isActive && mining.status?.mode === "solo" ? soloHoldLine(nodeStatus) : null;
   const isBusy = mining.action !== null || lifecycle === "stopping";
   const configLocked = isActive || isBusy;
-  const metricsStatus = (mining.status?.mode ?? sessionMode) === mode
-    ? mining.status
-    : null;
+  const metricsStatus = mining.status;
   const currentHeight = metricsStatus?.current_height ?? nodeStatus?.accepted_height ?? null;
-  const poolSelected = mode === "pool";
   const cudaActive = metricsStatus?.engine === "cuda";
   const poolUrlIssue = poolUrlError(poolUrl);
   const workerNameIssue = workerNameError(workerName);
@@ -77,30 +68,22 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
   const networkName = nodeStatus?.network_short_name ?? "Network";
   const proofProfile = nodeStatus?.proof_profile ?? "Unknown proof profile";
   const productionV4PoolAvailable = proofProfile === "ProductionV4";
-  const productionSoloAvailable = productionV4PoolAvailable && mining.status?.production_solo_available === true;
-  const canStartBase = !mining.loading
+  const canStartPool = !mining.loading
     && mining.status !== null
     && wallet !== null
     && nodeStatus !== null
     && !isActive
-    && !isBusy;
-  const canStartSolo = mode === "solo" && canStartBase && (referenceMiningAvailable || productionSoloAvailable);
-  const canStartPool = mode === "pool"
-    && canStartBase
+    && !isBusy
     && (referenceMiningAvailable || productionV4PoolAvailable)
     && poolUrlIssue === null
     && workerNameIssue === null;
 
   useEffect(() => {
     const status = mining.status;
-    if (!status?.mode) return;
+    if (status?.mode !== "pool") return;
 
-    setSessionMode(status.mode);
-    setMode(status.mode);
-    if (status.mode === "pool") {
-      if (status.pool_url) setPoolUrl(status.pool_url);
-      if (status.worker_name) setWorkerName(status.worker_name);
-    }
+    if (status.pool_url) setPoolUrl(status.pool_url);
+    if (status.worker_name) setWorkerName(status.worker_name);
   }, [mining.status]);
 
   const displayedLifecycle: MiningLifecycle = mining.action === "starting"
@@ -108,30 +91,20 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
     : mining.action === "stopping"
       ? "stopping"
       : lifecycle;
-  const lifecycleLabel = displayedLifecycle === "running" && mining.status?.mode === "pool"
-    ? "Mining with pool"
-    : lifecycleCopy[displayedLifecycle];
+  const lifecycleLabel = lifecycleCopy[displayedLifecycle];
 
   const handlePrimaryAction = async () => {
     if (isActive) {
       await mining.stop();
       return;
     }
-    if ((!canStartSolo && !canStartPool) || !wallet) return;
-
-    if (mode === "pool") {
-      await mining.start({
-        mode: "pool",
-        payout: wallet.destination,
-        pool_url: poolUrl,
-        worker_name: workerName,
-      });
-      return;
-    }
+    if (!canStartPool || !wallet) return;
 
     await mining.start({
-      mode: "solo",
+      mode: "pool",
       payout: wallet.destination,
+      pool_url: poolUrl,
+      worker_name: workerName,
     });
   };
 
@@ -141,11 +114,9 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
       ? "Stopping miner…"
       : isActive
         ? "Stop Mining"
-        : poolSelected
-          ? "Start Pool Mining"
-          : "Start Solo Mining";
+        : "Start Pool Mining";
 
-  const primaryDisabled = isBusy || (!isActive && !canStartSolo && !canStartPool);
+  const primaryDisabled = isBusy || (!isActive && !canStartPool);
   const statusClass = displayedLifecycle === "running"
     ? " is-running"
     : displayedLifecycle === "error"
@@ -175,77 +146,44 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
             </div>
           </div>
 
-          {poolSelected ? (
-            <dl className="mining-metrics">
-              <div>
-                <dt>Accepted shares</dt>
-                <dd>{integerFormatter.format(metricsStatus?.shares_accepted ?? 0)}</dd>
-              </div>
-              <div>
-                <dt>Rejected shares</dt>
-                <dd>{integerFormatter.format(metricsStatus?.shares_rejected ?? 0)}</dd>
-              </div>
-              <div>
-                <dt>Pool blocks</dt>
-                <dd>{integerFormatter.format(metricsStatus?.blocks_found ?? 0)}</dd>
-              </div>
-              <div>
-                <dt>Credited {networkName} atoms</dt>
-                <dd>{formatAtomCount(metricsStatus?.credited_atoms)}</dd>
-              </div>
-            </dl>
-          ) : (
-            <dl className="mining-metrics">
+          <dl className="mining-metrics">
+            <div>
+              <dt>Accepted shares</dt>
+              <dd>{integerFormatter.format(metricsStatus?.shares_accepted ?? 0)}</dd>
+            </div>
+            <div>
+              <dt>Rejected shares</dt>
+              <dd>{integerFormatter.format(metricsStatus?.shares_rejected ?? 0)}</dd>
+            </div>
+            <div>
+              <dt>Pool blocks</dt>
+              <dd>{integerFormatter.format(metricsStatus?.blocks_found ?? 0)}</dd>
+            </div>
+            <div>
+              <dt>Credited {networkName} atoms</dt>
+              <dd>{formatAtomCount(metricsStatus?.credited_atoms)}</dd>
+            </div>
+          </dl>
+
+          <div className="mining-last-block pool-connection-row">
+            <span className="mining-detail-icon"><Gauge aria-hidden="true" size={18} /></span>
+            <div>
+              <span>Pool connection</span>
+              <strong className={metricsStatus?.pool_connected ? "is-connected" : ""}>
+                {metricsStatus?.pool_connected ? "Connected" : "Not connected"}
+              </strong>
+            </div>
+            <dl className="pool-context-metrics">
               <div>
                 <dt>Session attempts</dt>
                 <dd>{integerFormatter.format(metricsStatus?.session_attempts ?? 0)}</dd>
               </div>
               <div>
-                <dt>Blocks found</dt>
-                <dd>{integerFormatter.format(metricsStatus?.blocks_found ?? 0)}</dd>
-              </div>
-              <div>
-                <dt>Current height</dt>
+                <dt>Pool height</dt>
                 <dd>{currentHeight === null ? "—" : integerFormatter.format(currentHeight)}</dd>
               </div>
-              <div>
-                <dt>Mining route</dt>
-                <dd>{mining.status?.mode === "solo" ? "Solo" : "Not mining"}</dd>
-              </div>
             </dl>
-          )}
-
-          {poolSelected ? (
-            <div className="mining-last-block pool-connection-row">
-              <span className="mining-detail-icon"><Gauge aria-hidden="true" size={18} /></span>
-              <div>
-                <span>Pool connection</span>
-                <strong className={metricsStatus?.pool_connected ? "is-connected" : ""}>
-                  {metricsStatus?.pool_connected ? "Connected" : "Not connected"}
-                </strong>
-              </div>
-              <dl className="pool-context-metrics">
-                <div>
-                  <dt>Session attempts</dt>
-                  <dd>{integerFormatter.format(metricsStatus?.session_attempts ?? 0)}</dd>
-                </div>
-                <div>
-                  <dt>Pool height</dt>
-                  <dd>{currentHeight === null ? "—" : integerFormatter.format(currentHeight)}</dd>
-                </div>
-              </dl>
-            </div>
-          ) : (
-            <div className="mining-last-block">
-              <span className="mining-detail-icon"><Blocks aria-hidden="true" size={18} /></span>
-              <div>
-                <span>Last block found</span>
-                <strong>{metricsStatus?.last_block
-                  ? `Height ${metricsStatus.last_block.height} · ${shortenHash(metricsStatus.last_block.block_id, 9, 9)}`
-                  : "No blocks found this session"}</strong>
-              </div>
-            </div>
-          )}
+          </div>
         </section>
 
         <section className="mining-disclosure-card">
@@ -259,26 +197,23 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
             <div>
               <span className="mining-detail-icon"><Cpu aria-hidden="true" size={18} /></span>
               <div>
-                <strong>{productionV4PoolAvailable && poolSelected
+                <strong>{productionV4PoolAvailable
                   ? "CUDA ProductionV4 pool search"
-                  : productionV4PoolAvailable ? "CUDA ProductionV4 solo miner"
                   : (cudaActive ? "CUDA INT8 matrix engine" : "CPU reference engine")}</strong>
-                <p>{productionV4PoolAvailable && poolSelected
+                <p>{productionV4PoolAvailable
                   ? "Searches server-issued jobs with persistent batched CUDA; the pool independently replays every submitted nonce before crediting it."
                   : referenceMiningAvailable
                   ? (cudaActive
                     ? `Runs the ${nodeStatus?.proof_of_work ?? proofProfile} matrix stage on ${metricsStatus?.device ?? "the selected NVIDIA GPU"}; Rust recomputes every candidate before submission.`
                     : `Runs the ${nodeStatus?.proof_of_work ?? proofProfile} profile for ${networkName} testing.`)
-                  : productionV4PoolAvailable
-                    ? "Uses persistent batched GPU search, proves winning nonces, and submits CPU-verified blocks to the embedded node."
-                    : `${proofProfile} solo mining requires the standalone production miner.`}</p>
+                  : `${proofProfile} mining requires the standalone production miner.`}</p>
               </div>
             </div>
             <div>
               <span className="mining-detail-icon"><WalletCards aria-hidden="true" size={18} /></span>
               <div>
                 <strong>100-block maturity</strong>
-                <p>Solo rewards remain immature until they receive 100 confirmations.</p>
+                <p>Mined rewards remain immature until they receive 100 confirmations.</p>
               </div>
             </div>
             <div>
@@ -295,123 +230,78 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
       <aside className="mining-control-card">
         <span className="forge-icon"><Pickaxe aria-hidden="true" size={23} /></span>
         <span className="card-eyebrow">Mining control</span>
-        <h2>{poolSelected ? "Pool mining" : "Solo mining"}</h2>
-        <p>{poolSelected
-          ? `Submit ForgeMatrix shares to a pinned CMFD pool endpoint for ${networkName} session accounting.`
-          : "Mine directly against the embedded node and send accepted block rewards to this wallet."}</p>
+        <h2>Pool mining</h2>
+        <p>Submit ForgeMatrix shares to a pinned CMFD pool endpoint for {networkName} session accounting.</p>
 
-        {!referenceMiningAvailable && !productionSoloAvailable && !(poolSelected && productionV4PoolAvailable) ? (
+        {!referenceMiningAvailable && !productionV4PoolAvailable ? (
           <div className="info-inline" role="status">
             <ShieldAlert aria-hidden="true" size={17} />
-            <span>{mining.status?.production_solo_setup ?? `${proofProfile} solo mining runtime is not installed. Prepare the solo mining runtime, or select Pool.`}</span>
+            <span>{proofProfile} mining requires the standalone production miner.</span>
           </div>
         ) : null}
 
-        <div className="mining-mode-switch" role="group" aria-label="Mining mode">
-          <button
-            className={!poolSelected ? "is-active" : ""}
-            type="button"
-            aria-pressed={!poolSelected}
-            disabled={configLocked}
-            onClick={() => setMode("solo")}
-          >
-            Solo
-          </button>
-          <button
-            className={poolSelected ? "is-active" : ""}
-            type="button"
-            aria-pressed={poolSelected}
-            disabled={configLocked}
-            onClick={() => setMode("pool")}
-          >
-            Pool
-          </button>
-        </div>
-
-        {poolSelected ? (
-          <div className="pool-configuration">
-            <div className="pool-protocol" role="note">
-              <ShieldAlert aria-hidden="true" size={17} />
-              <div>
-                <strong>Pinned numeric endpoint</strong>
-                <span>A CMFD-specific TLS job/share protocol is required. Stratum endpoints are not compatible.</span>
-              </div>
-            </div>
-            <label htmlFor="pool-url">
-              Pool URL
-              <input
-                id="pool-url"
-                type="text"
-                value={poolUrl}
-                required
-                disabled={configLocked}
-                aria-invalid={poolUrl.length > 0 && poolUrlIssue !== null}
-                aria-describedby="pool-url-help"
-                autoComplete="off"
-                spellCheck={false}
-                placeholder="cmfd+tls://173.249.35.251:19445?pin=64_HEX"
-                onChange={(event) => setPoolUrl(event.target.value)}
-              />
-              <span
-                id="pool-url-help"
-                className={poolUrl.length > 0 && poolUrlIssue ? "pool-field-error" : "pool-field-help"}
-              >
-                {poolUrl.length > 0 && poolUrlIssue ? poolUrlIssue : POOL_URL_REQUIREMENT}
-              </span>
-            </label>
-            <label htmlFor="pool-worker-name">
-              Worker name
-              <input
-                id="pool-worker-name"
-                type="text"
-                value={workerName}
-                required
-                maxLength={32}
-                disabled={configLocked}
-                aria-invalid={workerName.length > 0 && workerNameIssue !== null}
-                aria-describedby="pool-worker-help"
-                autoComplete="off"
-                spellCheck={false}
-                placeholder="foundry-worker"
-                onChange={(event) => setWorkerName(event.target.value)}
-              />
-              <span
-                id="pool-worker-help"
-                className={workerName.length > 0 && workerNameIssue ? "pool-field-error" : "pool-field-help"}
-              >
-                {workerName.length > 0 && workerNameIssue ? workerNameIssue : WORKER_NAME_REQUIREMENT}
-              </span>
-            </label>
-            <div className="miner-destination pool-credit-destination">
-              <span>Pool payout destination</span>
-              <code title={wallet?.destination}>{wallet
-                ? shortenHash(wallet.destination, 10, 10)
-                : "Waiting for wallet"}</code>
+        <div className="pool-configuration">
+          <div className="pool-protocol" role="note">
+            <ShieldAlert aria-hidden="true" size={17} />
+            <div>
+              <strong>Pinned numeric endpoint</strong>
+              <span>A CMFD-specific TLS job/share protocol is required. Stratum endpoints are not compatible.</span>
             </div>
           </div>
-        ) : (
-          <>
-            <div className="miner-destination">
-              <span>Reward destination</span>
-              <code title={wallet?.destination}>{wallet
-                ? shortenHash(wallet.destination, 10, 10)
-                : "Waiting for wallet"}</code>
-            </div>
-            <div className="reference-engine-row">
-              <span className="mining-detail-icon"><Gauge aria-hidden="true" size={17} /></span>
-              <div>
-                <span>Engine</span>
-                <strong>{cudaActive
-                  ? metricsStatus?.device ?? "CUDA accelerator"
-                  : productionV4PoolAvailable ? "ProductionV4 CUDA (NVIDIA)" : "CPU reference evaluator"}</strong>
-              </div>
-            </div>
-          </>
-        )}
+          <label htmlFor="pool-url">
+            Pool URL
+            <input
+              id="pool-url"
+              type="text"
+              value={poolUrl}
+              required
+              disabled={configLocked}
+              aria-invalid={poolUrl.length > 0 && poolUrlIssue !== null}
+              aria-describedby="pool-url-help"
+              autoComplete="off"
+              spellCheck={false}
+              placeholder="cmfd+tls://173.249.35.251:19445?pin=64_HEX"
+              onChange={(event) => setPoolUrl(event.target.value)}
+            />
+            <span
+              id="pool-url-help"
+              className={poolUrl.length > 0 && poolUrlIssue ? "pool-field-error" : "pool-field-help"}
+            >
+              {poolUrl.length > 0 && poolUrlIssue ? poolUrlIssue : POOL_URL_REQUIREMENT}
+            </span>
+          </label>
+          <label htmlFor="pool-worker-name">
+            Worker name
+            <input
+              id="pool-worker-name"
+              type="text"
+              value={workerName}
+              required
+              maxLength={32}
+              disabled={configLocked}
+              aria-invalid={workerName.length > 0 && workerNameIssue !== null}
+              aria-describedby="pool-worker-help"
+              autoComplete="off"
+              spellCheck={false}
+              placeholder="foundry-worker"
+              onChange={(event) => setWorkerName(event.target.value)}
+            />
+            <span
+              id="pool-worker-help"
+              className={workerName.length > 0 && workerNameIssue ? "pool-field-error" : "pool-field-help"}
+            >
+              {workerName.length > 0 && workerNameIssue ? workerNameIssue : WORKER_NAME_REQUIREMENT}
+            </span>
+          </label>
+          <div className="miner-destination pool-credit-destination">
+            <span>Pool payout destination</span>
+            <code title={wallet?.destination}>{wallet
+              ? shortenHash(wallet.destination, 10, 10)
+              : "Waiting for wallet"}</code>
+          </div>
+        </div>
 
-        {soloHold
-          ? <p role="status">{soloHold}</p>
-          : mining.status?.stage ? <p role="status">{mining.status.stage}</p> : null}
+        {mining.status?.stage ? <p role="status">{mining.status.stage}</p> : null}
         {lifecycle === "stopping" ? <p role="status">Finishing the current GPU operation; no further work will be submitted.</p> : null}
         {mining.error ? (
           <div className="form-error mining-error" role="alert">
@@ -434,9 +324,7 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
           {isActive ? <Square aria-hidden="true" size={16} /> : <Pickaxe aria-hidden="true" size={18} />}
           {buttonText}
         </button>
-        <small>{poolSelected
-          ? `${networkName} · pool session statistics · ${productionV4PoolAvailable ? "CUDA search + server-verified replay" : (cudaActive ? "CUDA matrix stage" : "CPU reference")}`
-          : `${networkName} · solo mining · ${productionV4PoolAvailable ? "CUDA search + CPU-verified proof" : cudaActive ? "CUDA matrix stage" : "CPU reference"}`}</small>
+        <small>{networkName} · pool session statistics · {productionV4PoolAvailable ? "CUDA search + server-verified replay" : (cudaActive ? "CUDA matrix stage" : "CPU reference")}</small>
       </aside>
     </div>
   );

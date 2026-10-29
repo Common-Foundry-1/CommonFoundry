@@ -1,6 +1,7 @@
 mod address;
 mod commands;
 mod cuda;
+mod explorer;
 mod mining;
 mod runtime;
 mod updater;
@@ -200,6 +201,8 @@ pub fn run() -> i32 {
             commands::get_node_status,
             commands::get_peer_settings,
             commands::update_peer_settings,
+            commands::clear_failed_peers,
+            commands::open_transaction_in_explorer,
             commands::get_wallet_snapshot,
             commands::get_mempool_snapshot,
             commands::send_wallet_transaction,

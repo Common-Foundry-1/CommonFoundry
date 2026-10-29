@@ -81,20 +81,3 @@ export function workCheckView(status: NodeStatus | null): WorkCheckView {
 
 /** Said after a count that waits while the computer runs on its battery. */
 export const PAUSED_ON_BATTERY_COPY = "Paused on battery; continues when plugged in.";
-
-export const SOLO_HOLD_COPY = "Solo mining waits until the newest blocks are checked.";
-
-/**
- * The mining view's line while Solo mining waits: a block taken without a check here lies above the
- * height coins are available at. While the catch-up waits for the check, it adds the blocks left.
- */
-export function soloHoldLine(status: NodeStatus | null): string | null {
-  const catchUp = status?.work_rule?.wallet_catch_up;
-  if (!catchUp?.granted_above_available) return null;
-  if (catchUp.state === "waiting_for_check") {
-    const line = `${SOLO_HOLD_COPY.slice(0, -1)}: ${catchUp.blocks_left.toLocaleString()} left.`;
-    // N comes from the background check, which waits for mains power.
-    return status?.work_rule?.backlog_paused === true ? `${line} ${PAUSED_ON_BATTERY_COPY}` : line;
-  }
-  return SOLO_HOLD_COPY;
-}

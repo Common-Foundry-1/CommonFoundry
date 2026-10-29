@@ -7,6 +7,7 @@ import { NetworkView } from "./NetworkView";
 const peerApi = vi.hoisted(() => ({
   get: vi.fn(),
   update: vi.fn(),
+  clearFailed: vi.fn(),
 }));
 
 vi.mock("../api/nodeClient", async (importOriginal) => ({
@@ -14,6 +15,7 @@ vi.mock("../api/nodeClient", async (importOriginal) => ({
   usesEmbeddedNode: true,
   getPeerSettings: peerApi.get,
   updatePeerSettings: peerApi.update,
+  clearFailedPeers: peerApi.clearFailed,
 }));
 
 const status: NodeStatus = {
@@ -95,6 +97,7 @@ describe("NetworkView", () => {
       default_peer_port: 18444,
       max_peers: 16,
     }));
+    peerApi.clearFailed.mockReset().mockResolvedValue(1);
   });
 
   it("shows public P2P status without obscuring diagnostics", () => {
@@ -185,6 +188,53 @@ describe("NetworkView", () => {
     expect(screen.getByText("4 successful")).toBeInTheDocument();
     expect(screen.getByText("1 failed")).toBeInTheDocument();
     expect(screen.getByText("Reachable")).toBeInTheDocument();
+  });
+
+  it("clears failed peers from the recent-peer list", async () => {
+    const user = userEvent.setup();
+    const now = Math.floor(Date.now() / 1_000);
+    const peer = (address: string, state: "reachable" | "failed") => ({
+      address,
+      direction: "outbound" as const,
+      state,
+      first_seen: now - 120,
+      last_seen: now - 8,
+      last_success: state === "reachable" ? now - 8 : null,
+      successful_sessions: state === "reachable" ? 1 : 0,
+      failed_sessions: state === "failed" ? 3 : 0,
+      active_connections: 0,
+      remote_height: null,
+      remote_tip: null,
+    });
+    const onRefresh = vi.fn();
+    const onNotice = vi.fn();
+    const view = render(
+      <NetworkView
+        status={{ ...status, peers: [peer("198.51.100.4:18444", "reachable"), peer("198.51.100.9:18444", "failed")] }}
+        wallet={null}
+        mempool={null}
+        refreshing={false}
+        onRefresh={onRefresh}
+        onNotice={onNotice}
+      />,
+    );
+
+    await user.click(view.getByRole("button", { name: "Clear failed" }));
+    expect(peerApi.clearFailed).toHaveBeenCalledOnce();
+    expect(onNotice).toHaveBeenCalledWith("1 failed peer cleared.");
+    expect(onRefresh).toHaveBeenCalledOnce();
+
+    view.rerender(
+      <NetworkView
+        status={{ ...status, peers: [peer("198.51.100.4:18444", "reachable")] }}
+        wallet={null}
+        mempool={null}
+        refreshing={false}
+        onRefresh={onRefresh}
+        onNotice={onNotice}
+      />,
+    );
+    expect(view.getByRole("button", { name: "Clear failed" })).toBeDisabled();
   });
 
   it("adds a peer from a plain IP address and applies it immediately", async () => {

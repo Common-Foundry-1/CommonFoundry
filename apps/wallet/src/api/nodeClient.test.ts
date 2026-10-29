@@ -23,6 +23,8 @@ describe("Tauri node transport", () => {
     await transport.getMempool();
     await transport.getPeerSettings();
     await transport.updatePeerSettings(["192.168.1.20:18444"]);
+    await transport.clearFailedPeers();
+    await transport.openTransactionInExplorer("33".repeat(32));
     await transport.sendWalletTransaction({ recipient: "11".repeat(32), amount: "1", fee: "0.00000001" });
     await transport.consolidateWallet({ fee: "0.00000001", max_inputs: 12 });
     await transport.mineDevnetBlock("22".repeat(32), 50);
@@ -41,6 +43,8 @@ describe("Tauri node transport", () => {
       ["get_mempool_snapshot", undefined],
       ["get_peer_settings", undefined],
       ["update_peer_settings", { request: { peers: ["192.168.1.20:18444"] } }],
+      ["clear_failed_peers", undefined],
+      ["open_transaction_in_explorer", { txid: "33".repeat(32) }],
       ["send_wallet_transaction", { request: { recipient: "11".repeat(32), amount: "1", fee: "0.00000001" } }],
       ["consolidate_wallet", { request: { fee: "0.00000001", max_inputs: 12 } }],
       ["mine_devnet_block", { request: { miner: "22".repeat(32), attempts: 50 } }],

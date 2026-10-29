@@ -47,6 +47,8 @@ export interface NodeTransport {
   getMempool(signal?: AbortSignal): Promise<MempoolSnapshot>;
   getPeerSettings(): Promise<PeerSettings>;
   updatePeerSettings(peers: string[]): Promise<PeerSettings>;
+  clearFailedPeers(): Promise<number>;
+  openTransactionInExplorer(txid: string): Promise<void>;
   sendWalletTransaction(payload: WalletSendRequest): Promise<WalletSendResult>;
   consolidateWallet(payload: ConsolidationRequest): Promise<ConsolidationResult>;
   mineDevnetBlock(miner: string, attempts?: number): Promise<MineResult>;
@@ -104,6 +106,16 @@ export const httpNodeTransport: NodeTransport = {
     "Peer settings are available in the desktop wallet.",
     501,
     "peer_settings_unavailable",
+  )),
+  clearFailedPeers: () => Promise.reject(new NodeApiError(
+    "Clearing failed peers is available in the desktop wallet.",
+    501,
+    "peer_settings_unavailable",
+  )),
+  openTransactionInExplorer: () => Promise.reject(new NodeApiError(
+    "Opening the block explorer is available in the desktop wallet.",
+    501,
+    "explorer_unavailable",
   )),
   sendWalletTransaction: (payload) => request<WalletSendResult>("/v1/wallet/send", {
     method: "POST",
@@ -234,6 +246,12 @@ export function createTauriNodeTransport(invoke: NativeInvoke): NodeTransport {
       "update_peer_settings",
       { request: { peers } },
     ),
+    clearFailedPeers: () => nativeCall<number>(invoke, "clear_failed_peers"),
+    openTransactionInExplorer: (txid) => nativeCall<void>(
+      invoke,
+      "open_transaction_in_explorer",
+      { txid },
+    ),
     sendWalletTransaction: (payload) => nativeCall<WalletSendResult>(
       invoke,
       "send_wallet_transaction",
@@ -313,6 +331,14 @@ export function getPeerSettings(): Promise<PeerSettings> {
 
 export function updatePeerSettings(peers: string[]): Promise<PeerSettings> {
   return transport.updatePeerSettings(peers);
+}
+
+export function clearFailedPeers(): Promise<number> {
+  return transport.clearFailedPeers();
+}
+
+export function openTransactionInExplorer(txid: string): Promise<void> {
+  return transport.openTransactionInExplorer(txid);
 }
 
 export function sendWalletTransaction(payload: WalletSendRequest): Promise<WalletSendResult> {

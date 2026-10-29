@@ -6603,6 +6603,16 @@ impl Node {
             .count()
     }
 
+    /// Forgets the peers whose last session failed and that have no open
+    /// connection, and returns how many. A forgotten peer is listed again on
+    /// its next session.
+    pub fn clear_failed_peers(&mut self) -> usize {
+        let before = self.peer_observations.len();
+        self.peer_observations
+            .retain(|_, record| record.active_connections > 0 || record.last_attempt_succeeded);
+        before - self.peer_observations.len()
+    }
+
     pub(crate) fn record_peer_ended(
         &mut self,
         direction: PeerDirection,
@@ -17778,6 +17788,54 @@ mod tests {
         let reopened = Node::open(&path).unwrap();
         assert!(reopened.status().unwrap().peers.is_empty());
         drop(reopened);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn clearing_failed_peers_keeps_connected_and_reachable_ones() {
+        let path = test_dir("peer-observations-clear");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        let failed = "127.0.0.1:20001".to_owned();
+        node.record_peer_started(PeerDirection::Outbound, failed.clone(), 1);
+        node.record_peer_ended(PeerDirection::Outbound, failed.clone(), true, 1);
+        node.record_peer_started(PeerDirection::Inbound, "127.0.0.2".to_owned(), 2);
+        node.record_peer_ended(PeerDirection::Inbound, "127.0.0.2".to_owned(), true, 2);
+        let reachable = "127.0.0.1:20003".to_owned();
+        node.record_peer_started(PeerDirection::Outbound, reachable.clone(), 3);
+        node.record_peer_succeeded(PeerDirection::Outbound, reachable.clone(), 7, [7; 32], 3);
+        node.record_peer_ended(PeerDirection::Outbound, reachable, false, 3);
+        // Failed before, and in a session again now.
+        let retrying = "127.0.0.1:20004".to_owned();
+        node.record_peer_started(PeerDirection::Outbound, retrying.clone(), 4);
+        node.record_peer_ended(PeerDirection::Outbound, retrying.clone(), true, 4);
+        node.record_peer_started(PeerDirection::Outbound, retrying, 5);
+
+        assert_eq!(node.clear_failed_peers(), 2);
+        let peers = node.status().unwrap().peers;
+        let listed: Vec<_> = peers
+            .iter()
+            .map(|peer| (peer.address.as_str(), peer.state))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                ("127.0.0.1:20004", PeerState::Connected),
+                ("127.0.0.1:20003", PeerState::Reachable),
+            ]
+        );
+        assert_eq!(node.clear_failed_peers(), 0);
+
+        // A forgotten peer is listed again, from scratch, on its next session.
+        node.record_peer_started(PeerDirection::Outbound, failed.clone(), 6);
+        node.record_peer_ended(PeerDirection::Outbound, failed.clone(), true, 6);
+        let peers = node.status().unwrap().peers;
+        let peer = peers.iter().find(|peer| peer.address == failed).unwrap();
+        assert_eq!(
+            (peer.state, peer.first_seen, peer.failed_sessions),
+            (PeerState::Failed, 6, 1)
+        );
+        drop(node);
         clean_test_dir(&path);
     }
 

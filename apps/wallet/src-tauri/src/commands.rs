@@ -128,6 +128,20 @@ pub async fn update_peer_settings(
         })?
 }
 
+/// Removes failed peers from the recent-peer list; returns how many.
+#[tauri::command]
+pub async fn clear_failed_peers(state: State<'_, RuntimeState>) -> Result<usize, NodeClientError> {
+    let node = state.node()?;
+    with_node(node, |node| Ok(node.clear_failed_peers())).await
+}
+
+/// Runs on the main thread, where the shell call that opens the browser
+/// belongs.
+#[tauri::command]
+pub fn open_transaction_in_explorer(txid: String) -> Result<(), NodeClientError> {
+    crate::explorer::open_in_browser(&crate::explorer::transaction_url(&txid)?)
+}
+
 #[tauri::command]
 pub async fn get_wallet_snapshot(
     state: State<'_, RuntimeState>,

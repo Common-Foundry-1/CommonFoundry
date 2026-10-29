@@ -3,6 +3,8 @@ fn main() {
         "get_node_status",
         "get_peer_settings",
         "update_peer_settings",
+        "clear_failed_peers",
+        "open_transaction_in_explorer",
         "get_wallet_snapshot",
         "get_mempool_snapshot",
         "send_wallet_transaction",

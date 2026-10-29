@@ -1,4 +1,5 @@
-import { ArrowRightLeft, Layers3 } from "lucide-react";
+import { ArrowRightLeft, ExternalLink, Layers3 } from "lucide-react";
+import { useExplorerLink } from "../hooks/useExplorerLink";
 import { formatAtoms, formatBytes, shortenHash } from "../lib/amount";
 import type { MempoolSnapshot, WalletSnapshot } from "../types";
 import { TransactionList } from "./TransactionList";
@@ -11,6 +12,7 @@ interface TransactionsViewProps {
 
 export function TransactionsView({ wallet, mempool, onConsolidate }: TransactionsViewProps) {
   const canConsolidate = (wallet?.spendable_utxo_count ?? 0) >= 2;
+  const explorer = useExplorerLink();
 
   return (
     <div className="transactions-layout">
@@ -68,6 +70,7 @@ export function TransactionsView({ wallet, mempool, onConsolidate }: Transaction
             {mempool ? `${mempool.transactions} tx · ${formatBytes(mempool.bytes)}` : "—"}
           </span>
         </div>
+        {explorer.error ? <p className="form-error transaction-open-error" role="alert">{explorer.error}</p> : null}
         {mempool && mempool.entries.length > 0 ? (
           <div className="mempool-table" role="table" aria-label="Mempool transactions">
             <div className="mempool-table-head" role="row">
@@ -78,7 +81,17 @@ export function TransactionsView({ wallet, mempool, onConsolidate }: Transaction
             </div>
             {mempool.entries.map((entry) => (
               <div className="mempool-table-row" role="row" key={entry.txid}>
-                <code role="cell" title={entry.txid}>{shortenHash(entry.txid, 9, 9)}</code>
+                <span role="cell">
+                  <button
+                    className="transaction-link"
+                    type="button"
+                    title={`View ${entry.txid} on the block explorer`}
+                    onClick={() => explorer.open(entry.txid)}
+                  >
+                    <code>{shortenHash(entry.txid, 9, 9)}</code>
+                    <ExternalLink aria-hidden="true" size={11} />
+                  </button>
+                </span>
                 <span role="cell">{formatBytes(entry.encoded_bytes)}</span>
                 <span role="cell">{formatAtoms(entry.fee_burned_atoms ?? String(entry.fee_burned))} CMFD</span>
                 <span role="cell" className="status-pill">Unconfirmed</span>

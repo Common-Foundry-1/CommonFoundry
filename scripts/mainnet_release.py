@@ -49,8 +49,8 @@ def archive_names(version: str) -> dict:
 
 
 def supplemental_names(version: str) -> set[str]:
-    if version == "1.0.16":
-        return {"common-foundry-amd-hip-v1.0.16-linux-x86_64.tar.gz",
+    if version in ("1.0.16", "1.0.17"):
+        return {f"common-foundry-amd-hip-v{version}-linux-x86_64.tar.gz",
                 "Start-CMFD-AMD-Miner-WSL.cmd"}
     return set()
 

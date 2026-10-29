@@ -1030,6 +1030,11 @@ pub(crate) struct WorkPrewarm {
 }
 
 impl WorkPrewarm {
+    /// The block whose work this computes.
+    pub(crate) fn block_id(&self) -> [u8; 32] {
+        self.block_id
+    }
+
     /// Waits for the work lane as long as `request` allows, then computes the
     /// block's work into the memo unless `stop` says to give up. No verdict is
     /// reached and nothing is recorded: the ordered submission does that, from
@@ -1135,6 +1140,138 @@ impl Node {
             priority: from.trusted,
             counted_sender,
         })
+    }
+
+    /// The work prewarms of a contiguous window of fetched blocks, oldest
+    /// first, so a catch-up session with more than one work job can compute
+    /// them side by side before their ordered submission. The first block
+    /// takes the full [`work_prewarm`](Self::work_prewarm) preflight; each
+    /// later block must be the child of the one before it and takes
+    /// [`work_prewarm_descendant`](Self::work_prewarm_descendant). The
+    /// window ends at the first block whose parent is not indexed and not
+    /// the block before it, or that fails its preflight. Empty with one
+    /// work job: the ordered submission then prewarms each block itself.
+    pub(crate) fn work_prewarm_window(
+        &self,
+        blocks: &[Block],
+        accepted_at: u64,
+        from: FetchedFrom,
+    ) -> Vec<WorkPrewarm> {
+        let mut prewarms = Vec::new();
+        if self.work_jobs() < 2 || blocks.len() < 2 {
+            return prewarms;
+        }
+        let mut previous: Option<(&Block, u64)> = None;
+        for block in blocks {
+            let (height, prewarm) = match previous {
+                Some((parent, parent_height))
+                    if block.challenge.previous_block == parent.block_id() =>
+                {
+                    match self.work_prewarm_descendant(block, parent_height, from) {
+                        Ok(prewarm) => (parent_height.saturating_add(1), prewarm),
+                        Err(()) => break,
+                    }
+                }
+                Some(_) => break,
+                None => {
+                    // The first block's parent must be indexed, and the block
+                    // must pass the full admission preflight.
+                    let Some(height) = self.work_height(block) else {
+                        break;
+                    };
+                    if self
+                        .preflight_external_block_admission_from(
+                            block,
+                            accepted_at,
+                            Some(from.block_sender()),
+                            from.heavier,
+                        )
+                        .is_err()
+                    {
+                        break;
+                    }
+                    (height, self.work_prewarm(block, accepted_at, from))
+                }
+            };
+            previous = Some((block, height));
+            prewarms.extend(prewarm);
+        }
+        prewarms
+    }
+
+    /// The work prewarm for `block`, fetched `from` a peer in the same sync
+    /// window as its parent, which is not indexed yet but has passed
+    /// [`work_prewarm`](Self::work_prewarm) (or this) at `parent_height`.
+    /// Lets a catch-up session with more than one work job compute the
+    /// window's blocks side by side. Every check that needs no parent state
+    /// is made: a halted node, a block or parent recorded invalid, a
+    /// remembered rejection, a stale proof or preamble, a block from a peer
+    /// that has used up its one-engine refusals. The target binding, which
+    /// needs the parent's chain state, is left to the ordered submission;
+    /// a wrong target then costs this node at most one wasted engine run per
+    /// window block, which the lone-refusal accounting charges to the
+    /// sender. Not used for a desktop wallet catching up.
+    ///
+    /// `Err(())` means the block would be refused, so the window ends there;
+    /// `Ok(None)` means it needs no engine run (already verified, answered
+    /// by the memo, or below the rule), and the window goes on past it.
+    pub(crate) fn work_prewarm_descendant(
+        &self,
+        block: &Block,
+        parent_height: u64,
+        from: FetchedFrom,
+    ) -> Result<Option<WorkPrewarm>, ()> {
+        let Some(gate) = self.work_gate.as_ref() else {
+            return Ok(None);
+        };
+        let Some(checker) = gate.checker.as_ref() else {
+            return Err(());
+        };
+        if from.catch_up.is_some() {
+            return Err(());
+        }
+        let height = parent_height.checked_add(1).ok_or(())?;
+        let block_id = block.block_id();
+        if self.index.contains(block_id)
+            || self.storage_faulted
+            || self.work_rule_lineage(block).is_err()
+            || (self.rejected_proof_ids.contains(&block_id)
+                && !self.stale_work_rejection(&block_id))
+        {
+            return Err(());
+        }
+        cmfd_consensus::validate_block_resources(block).map_err(|_| ())?;
+        let body_digest = crate::canonical_block_cache_digest(block).map_err(|_| ())?;
+        if self.rejected_body_digests.contains(&body_digest) {
+            return Err(());
+        }
+        cmfd_consensus::validate_block_preamble(block, self.params.network_id).map_err(|_| ())?;
+        self.verifier
+            .preflight(&block.challenge, &block.proof)
+            .map_err(|_| ())?;
+        if !gate.rule.requires_recomputation(height)
+            || gate.status(&block_id) == Some(WorkStatus::Verified)
+        {
+            return Ok(None);
+        }
+        let Some(claim) = gate.claim(block) else {
+            return Err(());
+        };
+        if checker.memo_match(claim).is_some() {
+            return Ok(None);
+        }
+        let counted_sender = (!from.trusted).then_some(from.sender);
+        if !gate.lone_refusals_allow(counted_sender, &block_id) {
+            return Err(());
+        }
+        Ok(Some(WorkPrewarm {
+            gate: gate.clone(),
+            checker: Arc::clone(checker),
+            block_id,
+            claim,
+            priority: from.trusted,
+            counted_sender,
+        }))
     }
 }
 
@@ -1289,6 +1426,23 @@ impl Node {
         bank: WorkBankMode,
         gpu: Option<Arc<dyn crate::honest_work::GpuReplayWorkers>>,
     ) -> Result<Option<(Arc<HonestWorkChecker>, WorkStatusLoad)>, NodeError> {
+        self.install_work_engines_with_jobs(threads, 1, priority, bank, gpu)
+    }
+
+    /// [`install_work_engines`](Self::install_work_engines) with `jobs` CPU
+    /// workers (at least one), each with its own `threads` compute threads,
+    /// and a work lane as wide, so a catch-up session can check that many
+    /// fetched blocks side by side (see [`crate::p2p`]'s fetched window).
+    /// With one job, nothing differs from before.
+    #[cfg(feature = "production-v4")]
+    pub fn install_work_engines_with_jobs(
+        &mut self,
+        threads: usize,
+        jobs: usize,
+        priority: crate::honest_work::WorkThreadPriority,
+        bank: WorkBankMode,
+        gpu: Option<Arc<dyn crate::honest_work::GpuReplayWorkers>>,
+    ) -> Result<Option<(Arc<HonestWorkChecker>, WorkStatusLoad)>, NodeError> {
         use crate::honest_work::{
             CpuWorkEngine, GPU_WORK_CHECK_TIMEOUT, GpuWorkEngine, WorkEngine,
         };
@@ -1350,8 +1504,12 @@ impl Node {
                 .map_err(unusable)?,
             ),
         };
-        let engine: Arc<dyn WorkEngine> =
-            Arc::new(CpuWorkEngine::new(source, threads).with_thread_priority(priority));
+        let jobs = jobs.max(1);
+        let engine: Arc<dyn WorkEngine> = Arc::new(
+            CpuWorkEngine::new(source, threads)
+                .with_thread_priority(priority)
+                .with_jobs(jobs),
+        );
         let gpu = gpu.map(|workers| {
             Arc::new(GpuWorkEngine::new(workers, GPU_WORK_CHECK_TIMEOUT)) as Arc<dyn WorkEngine>
         });
@@ -1362,8 +1520,17 @@ impl Node {
         let load = self.install_work_checker(Arc::clone(&checker))?;
         if let Some(gate) = self.work_gate.as_mut() {
             gate.bank = Some(mode);
+            gate.lane.set_max_active(jobs);
         }
         Ok(load.map(|load| (checker, load)))
+    }
+
+    /// Blocks whose work this node can check at once: the width of its work
+    /// lane (one unless the engines were installed with more jobs).
+    pub(crate) fn work_jobs(&self) -> usize {
+        self.work_gate
+            .as_ref()
+            .map_or(1, |gate| gate.lane.max_active())
     }
 
     /// Hands the checker this pool's own replay result for a block it found

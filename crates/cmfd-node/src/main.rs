@@ -524,6 +524,14 @@ enum Command {
         /// (default: half the logical processors, at most 8).
         #[arg(long, value_parser = clap::value_parser!(u16).range(1..=256))]
         work_threads: Option<u16>,
+        /// Blocks whose work the CPU engine checks at once while this node
+        /// catches up: blocks fetched from a peer in one sync window are
+        /// computed side by side, each on its own `--work-threads`. The
+        /// engine then uses up to `--work-jobs × --work-threads` compute
+        /// threads. Default 1, which changes nothing; set it only on a host
+        /// with the cores and memory for it.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=8))]
+        work_jobs: u8,
         /// How the CPU work engine reads the model bank: `resident` loads
         /// its layers into memory once (about 6 GiB), so a block's check
         /// reads no disk; `streamed` reads them from the bank file for each
@@ -2010,6 +2018,7 @@ fn run_command() -> Result<(), Box<dyn std::error::Error>> {
             allow_public_peers,
             prune_keep_blocks,
             work_threads,
+            work_jobs,
             work_bank,
         } => {
             let shutdown = install_shutdown_handler()?;
@@ -2026,7 +2035,14 @@ fn run_command() -> Result<(), Box<dyn std::error::Error>> {
             )?;
             node.set_public_peer_mode(allow_public_peers);
             node.configure_pruning(prune_keep_blocks)?;
-            install_work_engines(&mut node, work_threads, work_priority, work_bank, None)?;
+            install_work_engines_with_jobs(
+                &mut node,
+                work_threads,
+                usize::from(work_jobs),
+                work_priority,
+                work_bank,
+                None,
+            )?;
             if prune_keep_blocks.is_some()
                 && let Some(report) = node.prune_block_log()?
             {
@@ -2910,25 +2926,44 @@ fn install_work_engines(
     bank: WorkBank,
     replay_workers: Option<Arc<dyn cmfd_node::honest_work::GpuReplayWorkers>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    install_work_engines_with_jobs(node, threads, 1, priority, bank, replay_workers)
+}
+
+/// [`install_work_engines`] with `jobs` CPU workers, so a catch-up session
+/// checks that many fetched blocks at once (see `--work-jobs`).
+fn install_work_engines_with_jobs(
+    node: &mut Node,
+    threads: Option<u16>,
+    jobs: usize,
+    priority: cmfd_node::honest_work::WorkThreadPriority,
+    bank: WorkBank,
+    replay_workers: Option<Arc<dyn cmfd_node::honest_work::GpuReplayWorkers>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "production-v4")]
     {
         use cmfd_node::honest_work::WorkEngineHealth;
         let threads = threads.map_or_else(cmfd_node::work_gate::default_work_threads, usize::from);
+        let jobs = jobs.max(1);
         let gpu = replay_workers.is_some();
         let install_started = std::time::Instant::now();
-        let installed =
-            match node.install_work_engines(threads, priority, bank.into(), replay_workers) {
-                Ok(installed) => installed,
-                Err(error @ cmfd_node::NodeError::WorkCheckpointConflict { block_id, .. }) => {
-                    return Err(Box::new(StartupRefusal(format!(
-                        "{error}; stop the node and remove that block and the blocks stored after \
+        let installed = match node.install_work_engines_with_jobs(
+            threads,
+            jobs,
+            priority,
+            bank.into(),
+            replay_workers,
+        ) {
+            Ok(installed) => installed,
+            Err(error @ cmfd_node::NodeError::WorkCheckpointConflict { block_id, .. }) => {
+                return Err(Box::new(StartupRefusal(format!(
+                    "{error}; stop the node and remove that block and the blocks stored after \
                      it with `cmfd-node storage-quarantine-block --block-id {} \
                      --quarantine-output <new file>`",
-                        hex::encode(block_id)
-                    ))));
-                }
-                Err(error) => return Err(error.into()),
-            };
+                    hex::encode(block_id)
+                ))));
+            }
+            Err(error) => return Err(error.into()),
+        };
         let install_seconds = install_started.elapsed().as_secs_f64();
         if let Some((checker, load)) = installed {
             let bank = node.work_rule_status().and_then(|status| status.bank);
@@ -2942,6 +2977,7 @@ fn install_work_engines(
                     "work_rule": {
                         "engine": if gpu { "cpu+gpu" } else { "cpu" },
                         "threads": threads,
+                        "jobs": jobs,
                         "bank": bank,
                         "install_seconds": install_seconds,
                         "qualified": ready,
@@ -2968,7 +3004,7 @@ fn install_work_engines(
         }
     }
     #[cfg(not(feature = "production-v4"))]
-    let _ = (threads, priority, bank, replay_workers);
+    let _ = (threads, jobs, priority, bank, replay_workers);
     if node.work_checker_missing() {
         return Err(
             "this network enforces the release work rule, but this build has no work engine".into(),

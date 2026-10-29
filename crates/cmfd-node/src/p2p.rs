@@ -11,7 +11,7 @@ use std::io::{self, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -40,7 +40,7 @@ use crate::peer::{
 };
 use crate::work_gate::{
     BlockSender, CatchUpFollow, FetchedFrom, PROBE_BUDGET, PROBE_CONNECT, PROBE_MIN_ATTEMPT,
-    PROBE_READ, WalletCatchUp, WorkBlame,
+    PROBE_READ, WalletCatchUp, WorkBlame, WorkPrewarm,
 };
 use crate::{
     BlockPreverifier, Node, NodeError, PeerDirection, RemoteProofPeerId, RemoteProofRequest,
@@ -1710,6 +1710,7 @@ fn submit_fetched_window(
     // their proofs are checked; checking them all here first would waste it.
     if !lock_node(shared)?.lone_refusals_exhausted(from) {
         crate::prewarm_fetched_proofs(preverifier, pending);
+        prewarm_fetched_window_work(shared, preverifier, pending, from, active_sockets)?;
     }
     for block in pending.drain(..) {
         let block_id = block.block_id();
@@ -1732,6 +1733,87 @@ fn submit_fetched_window(
 /// How long a sync prewarm waits for the work lane: in practice no limit, as
 /// the wait ends on local shutdown; the bound only keeps the deadline finite.
 const WORK_PREWARM_LANE_PATIENCE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Computes the work of a window of fetched, contiguous blocks side by side,
+/// on as many threads as the node has work jobs, into the memo, before their
+/// ordered submission. Does nothing on a node with one work job, so nothing
+/// changes there: each block is then prewarmed just before its own
+/// submission (see [`prewarm_fetched_work`]). Each block's proof is checked
+/// (from the cache the proof prewarm filled) before its work runs. Failures
+/// leave the memo as it was; the submission then checks the block itself.
+fn prewarm_fetched_window_work(
+    shared: &Arc<Mutex<Node>>,
+    preverifier: &BlockPreverifier,
+    blocks: &[Block],
+    from: FetchedFrom,
+    active_sockets: Option<&Arc<ActiveSocketRegistry>>,
+) -> Result<(), P2pError> {
+    let accepted_at = unix_time_seconds()?;
+    let (jobs, prewarms) = {
+        let node = lock_node(shared)?;
+        let jobs = node.work_jobs();
+        if jobs < 2 || blocks.len() < 2 {
+            return Ok(());
+        }
+        (jobs, node.work_prewarm_window(blocks, accepted_at, from))
+    };
+    if prewarms.len() < 2 {
+        return Ok(());
+    }
+    let stopping = active_sockets.map(|registry| Arc::clone(&registry.stopping));
+    let stopped = || {
+        stopping
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+    };
+    if stopped() {
+        return Ok(());
+    }
+    let request = RemoteProofRequest::new(checked_submit_deadline(
+        Instant::now(),
+        WORK_PREWARM_LANE_PATIENCE,
+    )?);
+    let monitor = PeerSubmissionMonitor::local_validation(stopping.clone(), request.clone())?;
+    // Each prewarm is paired with its block so the proof check can gate it.
+    let by_block: HashMap<[u8; 32], &Block> = blocks
+        .iter()
+        .map(|block| (block.block_id(), block))
+        .collect();
+    let workers = jobs.min(prewarms.len());
+    let prewarms: Vec<Mutex<Option<WorkPrewarm>>> = prewarms
+        .into_iter()
+        .map(|prewarm| Mutex::new(Some(prewarm)))
+        .collect();
+    let next = AtomicUsize::new(0);
+    thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(slot) = prewarms.get(index) else {
+                        break;
+                    };
+                    if stopped() {
+                        break;
+                    }
+                    let Some(prewarm) = slot.lock().unwrap_or_else(PoisonError::into_inner).take()
+                    else {
+                        continue;
+                    };
+                    let Some(block) = by_block.get(&prewarm.block_id()) else {
+                        continue;
+                    };
+                    if preverifier.prewarm_fetched_proof(block).is_err() {
+                        continue;
+                    }
+                    prewarm.run(request.clone(), &stopped);
+                }
+            });
+        }
+    });
+    drop(monitor);
+    Ok(())
+}
 
 /// Computes a fetched block's work into the memo just before its ordered
 /// submission, so the block is admitted however slow this node's engine is

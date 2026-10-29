@@ -989,7 +989,10 @@ struct ProofQueueTelemetry {
 struct ProofVerificationQueue {
     state: Mutex<ProofVerificationQueueState>,
     wake: Condvar,
-    max_active: usize,
+    /// Permits that may be held at once. Fixed for every queue but the work
+    /// lane, which [`set_max_active`](Self::set_max_active) widens when the
+    /// work engines are installed with more than one job.
+    max_active: AtomicUsize,
     max_queued: usize,
     wait_timeout: Duration,
     #[cfg(test)]
@@ -1093,12 +1096,26 @@ impl ProofVerificationQueue {
                 priority_proof_failures: 0,
             }),
             wake: Condvar::new(),
-            max_active,
+            max_active: AtomicUsize::new(max_active),
             max_queued,
             wait_timeout,
             #[cfg(test)]
             deadline_wake_barrier: Mutex::new(None),
         }
+    }
+
+    /// Permits that may be held at once.
+    fn max_active(&self) -> usize {
+        self.max_active.load(Ordering::Acquire)
+    }
+
+    /// Lets `max_active` permits (at least one) be held at once. Widening
+    /// wakes waiters, who may now be served; narrowing takes effect as
+    /// permits are released.
+    fn set_max_active(&self, max_active: usize) {
+        self.max_active.store(max_active.max(1), Ordering::Release);
+        let _state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        self.wake.notify_all();
     }
 
     fn acquire(self: &Arc<Self>) -> Result<ProofVerificationPermit, NodeError> {
@@ -1151,7 +1168,9 @@ impl ProofVerificationQueue {
             record_proof_queue_rejection(&mut state, class);
             return Err(NodeError::ProofVerificationQueueTimeout);
         }
-        if state.active < self.max_active && state.normal_queued == 0 && state.priority_queued == 0
+        if state.active < self.max_active()
+            && state.normal_queued == 0
+            && state.priority_queued == 0
         {
             state.active += 1;
             record_proof_queue_active(&mut state, class, true);
@@ -1186,7 +1205,7 @@ impl ProofVerificationQueue {
         record_proof_queue_wait(&mut state, class);
         let waiting = |state: &ProofVerificationQueueState| {
             !state.closing
-                && (state.active >= self.max_active
+                && (state.active >= self.max_active()
                     || match class {
                         ProofQueueClass::Normal => {
                             state.priority_queued != 0 || state.serving_normal_ticket != ticket
@@ -6511,7 +6530,7 @@ impl Node {
                 .as_millis()
                 .min(u128::from(u64::MAX))
                 as u64,
-            proof_verification_capacity: self.block_preverifier.queue.max_active,
+            proof_verification_capacity: self.block_preverifier.queue.max_active(),
             proof_verification_queue_capacity: self
                 .block_preverifier
                 .queue
@@ -13841,6 +13860,35 @@ mod tests {
         assert!(replayed.status().unwrap().storage_healthy);
         drop(replayed);
         clean_test_dir(&path);
+    }
+
+    #[test]
+    fn widening_a_proof_verification_queue_serves_its_waiter() {
+        let queue = Arc::new(ProofVerificationQueue::new(1, 2, Duration::from_secs(10)));
+        assert_eq!(queue.max_active(), 1);
+        let first = queue.acquire().unwrap();
+        let waiter_queue = Arc::clone(&queue);
+        let waiter = thread::spawn(move || waiter_queue.acquire().map(drop));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while queue.counts().unwrap() != (1, 1) && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert_eq!(queue.counts().unwrap(), (1, 1), "the second permit waits");
+        // Two permits at once: the waiter is served while the first is held.
+        queue.set_max_active(2);
+        assert_eq!(queue.max_active(), 2);
+        waiter.join().unwrap().unwrap();
+        let second = queue.acquire().unwrap();
+        assert_eq!(queue.counts().unwrap(), (2, 0), "two permits held at once");
+        assert!(matches!(
+            Arc::new(ProofVerificationQueue::new(1, 0, Duration::from_millis(1))).acquire(),
+            Ok(_)
+        ));
+        drop(second);
+        drop(first);
+        assert_eq!(queue.counts().unwrap(), (0, 0));
+        queue.set_max_active(0);
+        assert_eq!(queue.max_active(), 1, "never narrower than one permit");
     }
 
     #[test]

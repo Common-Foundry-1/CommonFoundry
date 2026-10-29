@@ -1926,14 +1926,19 @@ mod engines {
     use std::sync::atomic::AtomicBool;
 
     /// The consensus CPU executor over a model layer source. It has one
-    /// worker, which runs one job at a time: a job asked for while another
-    /// runs (a block check, a prewarm or a known answer) is refused as busy,
-    /// so the engine never uses more than `threads` compute threads.
+    /// worker by default, which runs one job at a time: a job asked for
+    /// while another runs (a block check, a prewarm or a known answer) is
+    /// refused as busy, so the engine never uses more than `threads` compute
+    /// threads. With [`with_jobs`](Self::with_jobs), it has that many
+    /// workers, each running one job at a time on its own `threads` compute
+    /// threads, so blocks fetched during catch-up can be checked side by
+    /// side; the engine then uses at most `jobs × threads` compute threads.
     pub struct CpuWorkEngine {
         source: Arc<dyn ForgeMatrixV4LayerSource>,
         threads: usize,
         priority: WorkThreadPriority,
-        job: Mutex<()>,
+        /// One job guard per worker.
+        jobs: Vec<Mutex<()>>,
     }
 
     impl CpuWorkEngine {
@@ -1943,7 +1948,7 @@ mod engines {
                 source,
                 threads: threads.max(1),
                 priority: WorkThreadPriority::Normal,
-                job: Mutex::new(()),
+                jobs: vec![Mutex::new(())],
             }
         }
 
@@ -1952,16 +1957,28 @@ mod engines {
             self.priority = priority;
             self
         }
+
+        /// `jobs` workers (at least one), each running one block at a time.
+        pub fn with_jobs(mut self, jobs: usize) -> Self {
+            self.jobs = (0..jobs.max(1)).map(|_| Mutex::new(())).collect();
+            self
+        }
     }
 
     impl CpuWorkEngine {
         fn run(
             &self,
             challenge_digest: [u8; 32],
+            worker: usize,
             authenticate: bool,
             cancel: &WorkCancel<'_>,
         ) -> Result<[u8; 32], WorkEngineError> {
-            let _job = match self.job.try_lock() {
+            let Some(job) = self.jobs.get(worker) else {
+                return Err(WorkEngineError::Failed(format!(
+                    "cpu work engine has no worker {worker}"
+                )));
+            };
+            let _job = match job.try_lock() {
                 Ok(job) => job,
                 // The guard holds no data, so a panicked job left nothing
                 // inconsistent.
@@ -2048,23 +2065,27 @@ mod engines {
             WorkEngineKind::Cpu
         }
 
+        fn workers(&self) -> usize {
+            self.jobs.len()
+        }
+
         fn final_activation_digest(
             &self,
             challenge_digest: [u8; 32],
-            _worker: usize,
+            worker: usize,
             authenticate: bool,
         ) -> Result<[u8; 32], WorkEngineError> {
-            self.run(challenge_digest, authenticate, &|| false)
+            self.run(challenge_digest, worker, authenticate, &|| false)
         }
 
         fn final_activation_digest_cancellable(
             &self,
             challenge_digest: [u8; 32],
-            _worker: usize,
+            worker: usize,
             authenticate: bool,
             cancel: &WorkCancel<'_>,
         ) -> Result<[u8; 32], WorkEngineError> {
-            self.run(challenge_digest, authenticate, cancel)
+            self.run(challenge_digest, worker, authenticate, cancel)
         }
     }
 
@@ -2233,7 +2254,8 @@ mod engines {
                 }
             }
             let engine = CpuWorkEngine::new(Arc::new(Untouched), 2);
-            let running = engine.job.lock().unwrap();
+            assert_eq!(engine.workers(), 1);
+            let running = engine.jobs[0].lock().unwrap();
             assert_eq!(
                 engine.final_activation_digest([1; 32], 0, false),
                 Err(WorkEngineError::Busy)
@@ -2243,6 +2265,57 @@ mod engines {
                 engine.final_activation_digest_cancellable([1; 32], 0, false, &|| true),
                 Err(WorkEngineError::Cancelled),
                 "a job cancelled before it starts reads nothing"
+            );
+        }
+
+        #[test]
+        fn a_cpu_engine_with_jobs_runs_one_per_worker() {
+            struct Untouched;
+            impl ForgeMatrixV4LayerSource for Untouched {
+                fn shape(&self) -> cmfd_consensus::ForgeMatrixV4ExecutionShape {
+                    unreachable!("a refused job reads nothing")
+                }
+                fn base_input(&self) -> &[u8] {
+                    unreachable!("a refused job reads nothing")
+                }
+                fn read_layer(
+                    &self,
+                    _layer: usize,
+                    _out: &mut [u8],
+                    _authenticate: bool,
+                ) -> Result<(), ForgeMatrixV4ExecutionError> {
+                    unreachable!("a refused job reads nothing")
+                }
+            }
+            let engine = CpuWorkEngine::new(Arc::new(Untouched), 2).with_jobs(3);
+            assert_eq!(engine.workers(), 3, "one worker per job");
+            // Worker 1 is busy: only it refuses; worker 2 is free (cancelled
+            // before it starts, so it reads nothing); worker 3 does not exist.
+            let running = engine.jobs[1].lock().unwrap();
+            assert_eq!(
+                engine.final_activation_digest([1; 32], 1, false),
+                Err(WorkEngineError::Busy)
+            );
+            assert_eq!(
+                engine.final_activation_digest_cancellable([1; 32], 2, false, &|| true),
+                Err(WorkEngineError::Cancelled)
+            );
+            assert!(matches!(
+                engine.final_activation_digest([1; 32], 3, false),
+                Err(WorkEngineError::Failed(_))
+            ));
+            drop(running);
+            assert_eq!(
+                engine.final_activation_digest_cancellable([1; 32], 1, false, &|| true),
+                Err(WorkEngineError::Cancelled),
+                "worker 1 is free again"
+            );
+            assert_eq!(
+                CpuWorkEngine::new(Arc::new(Untouched), 2)
+                    .with_jobs(0)
+                    .workers(),
+                1,
+                "at least one worker"
             );
         }
 
@@ -2284,7 +2357,10 @@ mod engines {
                 Err(WorkEngineError::Cancelled)
             );
             assert_eq!(source.reads.load(Ordering::SeqCst), 1);
-            assert!(engine.job.try_lock().is_ok(), "the job slot is free again");
+            assert!(
+                engine.jobs[0].try_lock().is_ok(),
+                "the job slot is free again"
+            );
         }
 
         /// The calling thread's scheduling priority: Windows' relative
@@ -2583,6 +2659,127 @@ mod engines {
             assert!(
                 started.elapsed() < Duration::from_millis(100),
                 "answered from the memo"
+            );
+        }
+
+        /// Measures catch-up work throughput on the production model bank:
+        /// `CMFD_HW_BLOCKS` distinct challenges (default 4) checked with
+        /// `CMFD_HW_JOBS` CPU workers of `CMFD_WORK_THREADS` each, side by
+        /// side as a sync window would, and reports blocks per minute. Each
+        /// result is checked against the one the single-worker engine gives
+        /// for the same challenge, so a wrong parallel answer fails. Run it
+        /// once per configuration to compare, for example `JOBS=1 THREADS=12`
+        /// against `JOBS=2 THREADS=6`:
+        ///
+        /// ```text
+        /// CMFD_HW_MODEL_BANK=/path/MODEL-V2.bank \
+        /// CMFD_HW_FIXED_RECORD=/path/FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json \
+        /// CMFD_WORK_THREADS=6 CMFD_HW_JOBS=2 CMFD_HW_BLOCKS=4 \
+        /// cargo test --release -p cmfd-node --features production-v4 --lib \
+        ///     cpu_engine_throughput_with_jobs_on_the_model_bank \
+        ///     -- --ignored --test-threads=1 --nocapture
+        /// ```
+        #[test]
+        #[ignore = "needs the production model bank; see the doc comment"]
+        fn cpu_engine_throughput_with_jobs_on_the_model_bank() {
+            use cmfd_consensus::{
+                ConsensusPowVerifier, ForgeMatrixV4FixedArtifactRecordV1,
+                ForgeMatrixV4ResidentLayerSource,
+            };
+            use std::fs::File;
+
+            const MAINNET_NETWORK_ID: [u8; 32] =
+                hex32("88296bc39c10e8bc1dd4818d4d42412fe5f08210651110377f495da299812f62");
+            let env_usize = |name: &str, default: usize| {
+                std::env::var(name)
+                    .map(|value| {
+                        value
+                            .parse()
+                            .unwrap_or_else(|_| panic!("{name} is a number"))
+                    })
+                    .unwrap_or(default)
+            };
+            let bank_path = std::env::var_os("CMFD_HW_MODEL_BANK").expect("CMFD_HW_MODEL_BANK");
+            let record_path =
+                std::env::var_os("CMFD_HW_FIXED_RECORD").expect("CMFD_HW_FIXED_RECORD");
+            let threads = env_usize("CMFD_WORK_THREADS", 6);
+            let jobs = env_usize("CMFD_HW_JOBS", 1);
+            let blocks = env_usize("CMFD_HW_BLOCKS", 4);
+            let record: ForgeMatrixV4FixedArtifactRecordV1 =
+                serde_json::from_slice(&std::fs::read(record_path).unwrap()).unwrap();
+            let (_, identity) = ConsensusPowVerifier::v4_candidate_for_network_with_layer_roots(
+                MAINNET_NETWORK_ID,
+                record,
+                std::io::BufReader::with_capacity(1024 * 1024, File::open(&bank_path).unwrap()),
+            )
+            .unwrap();
+            let started = Instant::now();
+            let source: Arc<dyn cmfd_consensus::ForgeMatrixV4LayerSource> = Arc::new(
+                ForgeMatrixV4ResidentLayerSource::load(
+                    File::open(&bank_path).unwrap(),
+                    &identity.manifest,
+                    identity.base_input,
+                    identity.layer_roots,
+                )
+                .unwrap(),
+            );
+            eprintln!("bank resident in {:.1}s", started.elapsed().as_secs_f64());
+            // Distinct challenges, as a window of fetched blocks would carry.
+            let challenges: Vec<[u8; 32]> = (0..blocks)
+                .map(|index| {
+                    let mut challenge = WORK_KNOWN_ANSWERS[0].challenge_digest;
+                    challenge[0] ^= index as u8;
+                    challenge
+                })
+                .collect();
+            let engine = Arc::new(CpuWorkEngine::new(Arc::clone(&source), threads).with_jobs(jobs));
+            assert_eq!(engine.workers(), jobs);
+
+            let started = Instant::now();
+            let next = AtomicUsize::new(0);
+            let results: Mutex<Vec<Option<[u8; 32]>>> = Mutex::new(vec![None; blocks]);
+            std::thread::scope(|scope| {
+                for worker in 0..jobs {
+                    let engine = Arc::clone(&engine);
+                    let next = &next;
+                    let results = &results;
+                    let challenges = &challenges;
+                    scope.spawn(move || {
+                        loop {
+                            let index = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(challenge) = challenges.get(index) else {
+                                break;
+                            };
+                            let digest = engine
+                                .final_activation_digest(*challenge, worker, false)
+                                .expect("each worker runs its own job");
+                            results.lock().unwrap()[index] = Some(digest);
+                        }
+                    });
+                }
+            });
+            let elapsed = started.elapsed().as_secs_f64();
+            let results = results.into_inner().unwrap();
+            assert!(results.iter().all(Option::is_some));
+            eprintln!(
+                "RESULT jobs={jobs} threads={threads} blocks={blocks} elapsed={elapsed:.1}s \
+                 per_block={:.1}s blocks_per_minute={:.2}",
+                elapsed / blocks as f64,
+                60.0 * blocks as f64 / elapsed
+            );
+
+            // The parallel answers must be the single-worker answers.
+            let reference = CpuWorkEngine::new(source, threads);
+            for (challenge, result) in challenges.iter().zip(&results) {
+                let expected = reference
+                    .final_activation_digest(*challenge, 0, false)
+                    .unwrap();
+                assert_eq!(result.as_ref(), Some(&expected), "parallel result matches");
+            }
+            assert_eq!(
+                results[0],
+                Some(WORK_KNOWN_ANSWERS[0].final_activation_digest),
+                "the first challenge is the published known answer"
             );
         }
     }

@@ -1188,19 +1188,17 @@ fn install_work_engine(node: &mut Node, work_threads: Option<u64>) -> Result<(),
     Ok(())
 }
 
-/// The SG relay. By design it is not a catch-up source. It stays in the
-/// dial list ([`config::default_bootstrap_peers`]) for the mempool and relay.
-const NOT_A_CATCH_UP_SOURCE: IpAddr = IpAddr::V4(Ipv4Addr::new(13, 140, 66, 6));
-
 /// The hosting provider of each compiled relay, by IP. Sources in one group
 /// count as one: a block is taken without a check here only if sources in two
 /// groups list it. Any other IP is a group of its own.
-const CATCH_UP_PROVIDER_GROUPS: [(Ipv4Addr, u8); 3] = [
+const CATCH_UP_PROVIDER_GROUPS: [(Ipv4Addr, u8); 4] = [
     // The seed and St. Louis: Contabo.
     (Ipv4Addr::new(173, 249, 35, 251), 0),
     (Ipv4Addr::new(209, 145, 48, 36), 0),
-    // Falkenstein: Hetzner.
-    (Ipv4Addr::new(88, 198, 110, 195), 1),
+    // Singapore: AWS, enforcing the block work rule since 1.0.16.
+    (Ipv4Addr::new(13, 140, 66, 6), 1),
+    // Independently hosted Proxmox relay.
+    (Ipv4Addr::new(107, 214, 187, 2), 2),
 ];
 
 /// The compiled relays the wallet catches up from: the release's bootstrap
@@ -1209,7 +1207,7 @@ fn catch_up_sources() -> Vec<CatchUpSource> {
     catch_up_sources_from(&COMPILED_NETWORK_PROFILE.bootstrap_peers())
 }
 
-/// `peers` without [`NOT_A_CATCH_UP_SOURCE`], each with its provider group.
+/// Every compiled peer, each with its provider group.
 fn catch_up_sources_from(peers: &[SocketAddr]) -> Vec<CatchUpSource> {
     let mut own_groups: Vec<IpAddr> = Vec::new();
     let first_own_group = CATCH_UP_PROVIDER_GROUPS
@@ -1219,7 +1217,6 @@ fn catch_up_sources_from(peers: &[SocketAddr]) -> Vec<CatchUpSource> {
         .unwrap_or(0);
     peers
         .iter()
-        .filter(|addr| addr.ip() != NOT_A_CATCH_UP_SOURCE)
         .map(|&addr| {
             let group = CATCH_UP_PROVIDER_GROUPS
                 .iter()
@@ -2573,7 +2570,7 @@ mod tests {
     }
 
     #[test]
-    fn catch_up_sources_are_the_compiled_relays_but_sg_each_with_its_provider() {
+    fn catch_up_sources_are_the_current_compiled_relays_each_with_its_provider() {
         use cmfd_node::NetworkProfileKind;
         use cmfd_node::network_profile::{MAINNET_BOOTSTRAP_RELAYS_IPV4, PRODUCTION_RC_SEED_IPV4};
 
@@ -2584,7 +2581,8 @@ mod tests {
         let expected = vec![
             source("173.249.35.251:29444", 0),
             source("209.145.48.36:29444", 0),
-            source("88.198.110.195:29444", 1),
+            source("13.140.66.6:29444", 1),
+            source("107.214.187.2:29444", 2),
         ];
         let mainnet = NetworkProfile {
             kind: NetworkProfileKind::Mainnet,
@@ -2599,22 +2597,18 @@ mod tests {
                 .map(|relay| SocketAddr::new(IpAddr::V4(*relay), 29_444)),
         );
         assert_eq!(catch_up_sources_from(&compiled), expected);
-        // SG is still dialled, but it is no source, on any port.
-        let sg = SocketAddr::new(NOT_A_CATCH_UP_SOURCE, 29_444);
-        assert!(mainnet.bootstrap_peers().contains(&sg));
-        assert!(catch_up_sources_from(&[sg, SocketAddr::new(NOT_A_CATCH_UP_SOURCE, 1)]).is_empty());
-
         // Any other IP is a group of its own, one group per IP.
         let groups = catch_up_sources_from(&[
             "10.0.0.1:1".parse().unwrap(),
             "10.0.0.2:1".parse().unwrap(),
             "10.0.0.1:2".parse().unwrap(),
-            "88.198.110.195:1".parse().unwrap(),
+            "13.140.66.6:1".parse().unwrap(),
+            "107.214.187.2:1".parse().unwrap(),
         ])
         .iter()
         .map(|source| source.group)
         .collect::<Vec<_>>();
-        assert_eq!(groups, [2, 3, 2, 1]);
+        assert_eq!(groups, [3, 4, 3, 1, 2]);
 
         // Other networks dial the seed alone, which cannot turn the catch-up
         // on. The wallet reads the compiled peers, never the configured ones.
@@ -2630,6 +2624,46 @@ mod tests {
             catch_up_sources(),
             catch_up_sources_from(&COMPILED_NETWORK_PROFILE.bootstrap_peers())
         );
+    }
+
+    #[test]
+    fn mainnet_catch_up_keeps_independent_providers_after_a_relay_outage() {
+        use cmfd_node::NetworkProfileKind;
+
+        let mainnet = NetworkProfile {
+            kind: NetworkProfileKind::Mainnet,
+            p2p_port: 29_444,
+            ..RCNET1_PROFILE
+        };
+        let sources = catch_up_sources_from(&mainnet.bootstrap_peers());
+        let retired: SocketAddr = "88.198.110.195:29444".parse().unwrap();
+        assert!(sources.iter().all(|source| source.addr != retired));
+
+        // Removing any one endpoint must leave agreement available from
+        // different providers, rather than require the retired relay.
+        for unavailable in &sources {
+            let groups = sources
+                .iter()
+                .filter(|source| source.addr != unavailable.addr)
+                .map(|source| source.group)
+                .collect::<std::collections::BTreeSet<_>>();
+            assert!(groups.len() >= 2, "unavailable: {}", unavailable.addr);
+        }
+        // Both Contabo locations are one provider; either surviving
+        // independent relay supplies the second provider.
+        let contabo = "173.249.35.251:29444".parse().unwrap();
+        let st_louis = "209.145.48.36:29444".parse().unwrap();
+        let group = |addr| {
+            sources
+                .iter()
+                .find(|source| source.addr == addr)
+                .unwrap()
+                .group
+        };
+        assert_eq!(group(contabo), group(st_louis));
+        for independent in ["13.140.66.6:29444", "107.214.187.2:29444"] {
+            assert_ne!(group(contabo), group(independent.parse().unwrap()));
+        }
     }
 
     #[test]

@@ -645,6 +645,12 @@ rest count as `verifying`, and `validated_height` keeps its meaning. Servers,
 pools, relays and a wallet started with `--work-check full` never carry either
 field.
 
+Mainnet catch-up sources are the Germany seed and St. Louis (one provider),
+Singapore (AWS), and the independently hosted Proxmox relay. The retired
+Falkenstein endpoint is no longer a bootstrap or catch-up source. The two-provider
+requirement still applies; adding a custom peer does not change the compiled
+catch-up source list. Existing wallets need an updated binary for this relay change.
+
 A block that only one of the node's engines finds does not match is refused
 (`work_mismatch_unconfirmed`) at no cost to its peer. Each peer address (an
 IPv6 /64 counts as one) may have at most 2 such refusals in any 10 minutes.

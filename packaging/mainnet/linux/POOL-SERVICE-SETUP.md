@@ -280,7 +280,7 @@ those. A unit of your own should carry the same line.
 
 Blocks reach a pool fastest from the other pools and the project's relays.
 List the relays in `mainnet_relays` (up to eight entries):
-`88.198.110.195:29444` first and `209.145.48.36:29444` second, rather than
+`13.140.66.6:29444`, `209.145.48.36:29444` and `107.214.187.2:29444`, rather than
 depending on the seed alone. Another pool's P2P listener can go in the same
 list as `numeric-ip:29454`, which connects the two pools directly; a pool that
 runs `cmfd-node pool-serve` itself adds it with `--peer`.

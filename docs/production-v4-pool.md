@@ -210,7 +210,7 @@ failed state and start it.
 
 New blocks reach a pool fastest over direct links. Give `pool-serve` static
 peers (`--peer`) to the other pools' P2P listeners and to the relays
-`88.198.110.195:29444` and `209.145.48.36:29444` (public addresses also need
+`13.140.66.6:29444`, `209.145.48.36:29444` and `107.214.187.2:29444` (public addresses also need
 `--allow-public-peers`), instead of depending on the seed alone. The packaged
 Linux service takes the relays from `mainnet_relays` in `pool.json`.
 

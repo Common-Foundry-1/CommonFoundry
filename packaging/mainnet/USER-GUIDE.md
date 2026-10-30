@@ -148,7 +148,7 @@ past the Retry or Run anyway question described below: a wallet started this
 way does not ask it.
 
 Where versions are installed. Each version gets its own folder, named like
-`commonfoundry-mainnet-runtime-windows-x86_64-v1.0.17` (Linux: `linux-x86_64`),
+`commonfoundry-mainnet-runtime-windows-x86_64-v1.0.18` (Linux: `linux-x86_64`),
 in the same folder that holds the package folder you extracted. On Windows, if
 that folder is in OneDrive, new versions go to
 `%LOCALAPPDATA%\CommonFoundry\versions` instead, so they are not uploaded.

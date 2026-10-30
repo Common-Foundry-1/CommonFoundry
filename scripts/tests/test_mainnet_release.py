@@ -44,7 +44,7 @@ class MainnetReleaseTests(unittest.TestCase):
             target = self.repo / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes((real_repo / relative).read_bytes().replace(b"\r\n", b"\n"))
-        dashboard_package = {"name": "fixture-pool-dashboard", "version": "1.0.17"}
+        dashboard_package = {"name": "fixture-pool-dashboard", "version": "1.0.18"}
         dashboard_lock = {**dashboard_package, "lockfileVersion": 3,
                           "packages": {"": dashboard_package}}
         for name, blob in {
@@ -58,12 +58,12 @@ class MainnetReleaseTests(unittest.TestCase):
             target.write_bytes(blob)
         self.inventory = self.repo / "packaging/releases/mainnet.inventory"
         self.inventory.parent.mkdir(parents=True, exist_ok=True)
-        inventory_names = release.supplemental_names("1.0.17") | release.BASE_EVIDENCE | set(release.archive_names("1.0.17").values()) | {release.REPRODUCTION, release.REPRODUCTION_SIGNATURE}
+        inventory_names = release.supplemental_names("1.0.18") | release.BASE_EVIDENCE | set(release.archive_names("1.0.18").values()) | {release.REPRODUCTION, release.REPRODUCTION_SIGNATURE}
         self.inventory.write_bytes(("\n".join(sorted(inventory_names)) + "\n").encode())
         for relative in ("crates/cmfd-node/Cargo.toml", "crates/cmfd-miner/Cargo.toml", "apps/wallet/src-tauri/Cargo.toml"):
             target = self.repo / relative
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(b'[package]\nversion="1.0.17"\n')
+            target.write_bytes(b'[package]\nversion="1.0.18"\n')
         self.git("add", ".")
         self.git("-c", "user.name=Release Test", "-c", "user.email=fixture@example.invalid", "commit", "--no-gpg-sign", "-qm", "Synthetic reviewed release tree")
         self.review_commit = self.git("rev-parse", "HEAD")
@@ -134,7 +134,7 @@ class MainnetReleaseTests(unittest.TestCase):
                 evidence[name] = self.material[key]
         for name, path in evidence.items():
             shutil.copyfile(path, self.first / name)
-        for name in release.supplemental_names("1.0.17"):
+        for name in release.supplemental_names("1.0.18"):
             (self.first / name).write_bytes(b"synthetic supplemental asset: " + name.encode())
         shutil.copytree(self.first, self.second)
 
@@ -143,7 +143,7 @@ class MainnetReleaseTests(unittest.TestCase):
         return subprocess.run(["git", "-C", str(self.repo), *arguments], env=env, check=True, capture_output=True).stdout.decode().strip()
 
     def common(self):
-        return dict(repo=self.repo, commit=self.commit, version="1.0.17", verifier=self.plan_fixture.verifier,
+        return dict(repo=self.repo, commit=self.commit, version="1.0.18", verifier=self.plan_fixture.verifier,
                     expected_verifier_sha256=self.plan_fixture.trust["ssh_keygen_sha256"])
 
     def prepare(self, output=None):
@@ -169,12 +169,12 @@ class MainnetReleaseTests(unittest.TestCase):
         self.assertEqual(checked["statement"]["review_evidence"][release.DASHBOARD_BUILD_EVIDENCE],
                          package.file_identity(self.first / release.DASHBOARD_BUILD_EVIDENCE))
         # The ordinary finalizer/verification entry point must not skip mainnet.
-        package.integrity.validate_production_rc_artifacts(version="1.0.17", commit=self.commit,
+        package.integrity.validate_production_rc_artifacts(version="1.0.18", commit=self.commit,
             stage_files=files, repo=self.repo, activation_ssh_keygen=self.plan_fixture.verifier,
             activation_ssh_keygen_sha256=self.plan_fixture.trust["ssh_keygen_sha256"])
 
     def test_supplemental_assets_are_required_and_unknown_files_are_rejected(self):
-        for name in release.supplemental_names("1.0.17"):
+        for name in release.supplemental_names("1.0.18"):
             path = self.first / name
             original = path.read_bytes()
             path.unlink()
@@ -192,14 +192,14 @@ class MainnetReleaseTests(unittest.TestCase):
         statement = checked["statement"]
         self.assertEqual(statement["schema"], "CMFD_MAINNET_OWNER_INTERNAL_REBUILD_V2")
         self.assertEqual(statement["supplemental_assets"], {
-            name: package.file_identity(self.first / name) for name in release.supplemental_names("1.0.17")})
-        name = sorted(release.supplemental_names("1.0.17"))[0]
+            name: package.file_identity(self.first / name) for name in release.supplemental_names("1.0.18")})
+        name = sorted(release.supplemental_names("1.0.18"))[0]
         (self.first / name).write_bytes(b"changed after signing")
         with self.assertRaisesRegex(package.Error, "exact staged release"):
             release.validate_release(**self.common(), files=package.integrity._stage_files(self.first))
 
     def test_empty_or_different_supplemental_assets_are_rejected(self):
-        name = sorted(release.supplemental_names("1.0.17"))[0]
+        name = sorted(release.supplemental_names("1.0.18"))[0]
         path = self.second / name
         path.write_bytes(b"")
         with self.assertRaisesRegex(package.Error, "must not be empty"):
@@ -209,7 +209,7 @@ class MainnetReleaseTests(unittest.TestCase):
             self.prepare()
 
     def test_shared_supplemental_file_is_rejected(self):
-        name = sorted(release.supplemental_names("1.0.17"))[0]
+        name = sorted(release.supplemental_names("1.0.18"))[0]
         (self.second / name).unlink()
         os.link(self.first / name, self.second / name)
         with self.assertRaisesRegex(package.Error, "same archive or supplemental"):
@@ -219,7 +219,7 @@ class MainnetReleaseTests(unittest.TestCase):
         self.prepare()
         self.sign_reproduction()
         original = release.verify_reproduction_signature
-        path = self.first / sorted(release.supplemental_names("1.0.17"))[0]
+        path = self.first / sorted(release.supplemental_names("1.0.18"))[0]
         def verify_then_change(**kwargs):
             original(**kwargs)
             path.write_bytes(b"changed after signature check")
@@ -230,7 +230,7 @@ class MainnetReleaseTests(unittest.TestCase):
     def test_previous_release_keeps_original_inventory_and_statement(self):
         with mock.patch.object(release, "supplemental_names", return_value=set()):
             for stage in (self.first, self.second):
-                for name in ("common-foundry-amd-hip-v1.0.17-linux-x86_64.tar.gz", "Start-CMFD-AMD-Miner-WSL.cmd"):
+                for name in ("common-foundry-amd-hip-v1.0.18-linux-x86_64.tar.gz", "Start-CMFD-AMD-Miner-WSL.cmd"):
                     (stage / name).unlink()
             self.prepare()
             self.sign_reproduction()
@@ -302,14 +302,14 @@ class MainnetReleaseTests(unittest.TestCase):
         self.sign_reproduction()
         script = Path(__file__).resolve().parents[1] / "release_integrity.py"
         command = [sys.executable, str(script), "finalize", "--repo", str(self.repo), "--expected-commit", self.commit,
-                   "--version", "1.0.17", "--stage", str(self.first), "--inventory", str(self.inventory),
+                   "--version", "1.0.18", "--stage", str(self.first), "--inventory", str(self.inventory),
                    "--activation-ssh-keygen", str(self.plan_fixture.verifier),
                    "--activation-ssh-keygen-sha256", self.plan_fixture.trust["ssh_keygen_sha256"]]
         result = subprocess.run(command, capture_output=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr.decode())
         self.assertTrue((self.first / package.integrity.CHECKSUM_NAME).is_file())
         sums = (self.first / package.integrity.CHECKSUM_NAME).read_text()
-        for name in release.supplemental_names("1.0.17"):
+        for name in release.supplemental_names("1.0.18"):
             self.assertIn(package.file_identity(self.first / name)["sha256"] + "  " + name, sums)
         self.assertTrue((self.first / package.integrity.SOURCE_SBOM_NAME).is_file())
         self.assertFalse((self.first / package.integrity.CHECKSUM_SIGNATURE_NAME).exists())
@@ -319,21 +319,21 @@ class MainnetReleaseTests(unittest.TestCase):
 
     def test_generic_non_rc_version_cannot_bypass_mainnet_checks(self):
         with self.assertRaisesRegex(package.Error, "mainnet finalization"):
-            package.integrity.validate_production_rc_artifacts(version="1.0.17", commit=self.commit,
+            package.integrity.validate_production_rc_artifacts(version="1.0.18", commit=self.commit,
                 stage_files=package.integrity._stage_files(self.first), repo=self.repo)
 
     def test_same_stage_or_same_archive_is_not_independent_reproduction(self):
         with self.assertRaisesRegex(package.Error, "different directories"):
             release.prepare_reproduction(**self.common(), producer_stage=self.first, reproducer_stage=self.first,
                                          output=self.root / "statement.json")
-        name = next(iter(release.archive_names("1.0.17").values()))
+        name = next(iter(release.archive_names("1.0.18").values()))
         (self.second / name).unlink()
         os.link(self.first / name, self.second / name)
         with self.assertRaisesRegex(package.Error, "same archive"):
             self.prepare()
 
     def test_two_valid_but_different_package_sets_are_rejected(self):
-        name = release.archive_names("1.0.17")["windows-x86_64", "miner"]
+        name = release.archive_names("1.0.18")["windows-x86_64", "miner"]
         archive = self.second / name
         with zipfile.ZipFile(archive) as handle:
             rows = [(row, handle.read(row)) for row in handle.infolist()]
@@ -356,7 +356,7 @@ class MainnetReleaseTests(unittest.TestCase):
         self.prepare()
         self.sign_reproduction()
         original = release.verify_reproduction_signature
-        archive = self.first / next(iter(release.archive_names("1.0.17").values()))
+        archive = self.first / next(iter(release.archive_names("1.0.18").values()))
         def verify_then_change(**kwargs):
             original(**kwargs)
             archive.write_bytes(archive.read_bytes() + b"changed after signature check")

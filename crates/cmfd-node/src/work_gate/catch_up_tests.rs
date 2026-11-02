@@ -1733,6 +1733,49 @@ fn the_tip_run_records_when_it_was_first_seen_and_last_grew() {
 }
 
 #[test]
+fn a_fully_checked_local_tip_is_not_caught_up_with_a_higher_source_tip() {
+    let facts = CatchUpFacts {
+        tip: 36_070,
+        validated: 36_070,
+        available: 36_070,
+        depth: 60,
+        highest_view: Some(39_326),
+        release_fresh: Some(true),
+        reference_known: true,
+        probe_hit_fresh: true,
+        tip_granted: false,
+        burial_pending: false,
+        top_run_len: 60,
+        top_run_work_ok: true,
+        uncovered_floor: 36_070,
+    };
+    assert_eq!(catch_up_row(&facts), ("catching_up", None, 3_256));
+    // Even a gap smaller than the fast-path depth is still a download gap.
+    assert_eq!(
+        catch_up_row(&CatchUpFacts {
+            highest_view: Some(36_071),
+            ..facts
+        }),
+        ("catching_up", None, 1)
+    );
+    assert_eq!(
+        catch_up_row(&CatchUpFacts {
+            highest_view: Some(36_070),
+            ..facts
+        }),
+        ("caught_up", None, 0)
+    );
+    // Startup and expired source views cannot establish network freshness.
+    assert_eq!(
+        catch_up_row(&CatchUpFacts {
+            highest_view: None,
+            ..facts
+        }),
+        ("catching_up", Some("source_tip_unknown"), 0)
+    );
+}
+
+#[test]
 fn the_status_row_is_the_first_that_matches() {
     let base = CatchUpFacts {
         tip: 100,
@@ -1779,7 +1822,7 @@ fn the_status_row_is_the_first_that_matches() {
             available: 100,
             ..behind
         }),
-        ("caught_up", None, 60)
+        ("catching_up", None, 100)
     );
     // Not behind: neither applies.
     assert_eq!(
@@ -1804,7 +1847,7 @@ fn the_status_row_is_the_first_that_matches() {
             available: 100,
             ..behind
         }),
-        ("caught_up", None, 60)
+        ("catching_up", None, 100)
     );
     // The newest blocks are being checked.
     let forming = CatchUpFacts {
@@ -2334,6 +2377,8 @@ fn the_catch_up_status_reports_a_defined_row_for_every_case() {
             state: "catching_up",
             reason: None,
             available_height: 2,
+            target_height: Some(8),
+            download_blocks_left: Some(3),
             blocks_left: 3,
             newest_checked: 0,
             newest_needed: D,
@@ -2372,6 +2417,8 @@ fn the_catch_up_status_reports_a_defined_row_for_every_case() {
         wallet.fetch(index, from).unwrap();
     }
     let status = wallet.status_at(now);
+    assert_eq!(status.target_height, Some(8));
+    assert_eq!(status.download_blocks_left, Some(0));
     assert_eq!(
         (
             status.state,
@@ -2407,7 +2454,7 @@ fn the_catch_up_status_reports_a_defined_row_for_every_case() {
     assert_eq!(wallet.status_at(now).sources_answering, 2);
     assert_eq!(wallet.status_at(now).state, "single_source");
     catch_up.note_probe_hit(now);
-    assert_eq!(wallet.status_at(now).state, "caught_up");
+    assert_eq!(wallet.status_at(now).state, "catching_up");
     // A failed engine.
     wallet
         .engine
@@ -2418,7 +2465,7 @@ fn the_catch_up_status_reports_a_defined_row_for_every_case() {
     };
     assert!(wallet.fetch(2, unvouched).is_err());
     assert_eq!(wallet.checker.engine_state(), WorkEngineState::Failed);
-    assert_eq!(wallet.status_at(now).state, "caught_up");
+    assert_eq!(wallet.status_at(now).state, "catching_up");
     drop(catch_up);
     wallet.close();
 
@@ -2430,7 +2477,7 @@ fn the_catch_up_status_reports_a_defined_row_for_every_case() {
     .open();
     let now = Instant::now();
     wallet.catch_up().note_view(P, 8, &[], now);
-    assert_eq!(wallet.status_at(now).state, "caught_up");
+    assert_eq!(wallet.status_at(now).state, "catching_up");
     wallet.close();
 
     // A stale release, while behind.
@@ -2441,7 +2488,7 @@ fn the_catch_up_status_reports_a_defined_row_for_every_case() {
     }
     .open();
     let now = Instant::now();
-    assert_eq!(wallet.status_at(now).state, "caught_up");
+    assert_eq!(wallet.status_at(now).state, "catching_up");
     wallet.catch_up().note_view(P, 8, &[], now);
     let status = wallet.status_at(now);
     assert_eq!((status.state, status.blocks_left), ("release_stale", 6));
@@ -2454,7 +2501,7 @@ fn the_catch_up_status_reports_a_defined_row_for_every_case() {
     }
     .open();
     assert_eq!(wallet.checker.engine_state(), WorkEngineState::Qualifying);
-    assert_eq!(wallet.status_at(Instant::now()).state, "caught_up");
+    assert_eq!(wallet.status_at(Instant::now()).state, "catching_up");
     wallet.close();
 
     // With the catch-up off there is no such part.
@@ -2470,5 +2517,93 @@ fn the_catch_up_status_reports_a_defined_row_for_every_case() {
             .wallet_catch_up
             .is_none()
     );
+    wallet.close();
+}
+
+#[test]
+fn a_wallet_rechecks_network_freshness_after_source_views_expire() {
+    let wallet = WalletSetup::new("catch-up-source-freshness").open();
+    let catch_up = wallet.catch_up();
+    let now = Instant::now();
+    let initial = wallet.status_at(now);
+    assert_eq!(initial.state, "catching_up");
+    assert_eq!(initial.reason, Some("source_tip_unknown"));
+    assert_eq!(initial.target_height, None);
+    assert_eq!(initial.download_blocks_left, None);
+
+    catch_up.note_view(P, 2, &[], now);
+    let current = wallet.status_at(now);
+    assert_eq!(current.state, "caught_up");
+    assert_eq!(current.target_height, Some(2));
+    assert_eq!(current.download_blocks_left, Some(0));
+
+    let expired = wallet.status_at(now + super::catch_up::VIEW_FRESH + Duration::from_secs(1));
+    assert_eq!(expired.state, "catching_up");
+    assert_eq!(expired.reason, Some("source_tip_unknown"));
+    assert_eq!(expired.target_height, None);
+    assert_eq!(expired.download_blocks_left, None);
+    drop(catch_up);
+    wallet.close();
+}
+
+#[test]
+fn catching_up_restores_the_full_wallet_balance_including_before_the_checkpoint() {
+    let mut wallet = WalletSetup {
+        total: 12,
+        checkpoint: 6,
+        stored: 6,
+        ..WalletSetup::new("catch-up-wallet-balance")
+    }
+    .open();
+    let destination = wallet.node.lock().unwrap().wallet_destination();
+    let expected = wallet
+        .chain
+        .iter()
+        .flat_map(|block| &block.coinbase.outputs)
+        .filter(|output| output.lock == cmfd_consensus::OutputLock::Key(destination))
+        .map(|output| output.value)
+        .sum::<u64>();
+    let total = |snapshot: &crate::WalletSnapshot| {
+        [
+            &snapshot.balances.spendable_atoms,
+            &snapshot.balances.immature_atoms,
+            &snapshot.balances.verifying_atoms,
+        ]
+        .into_iter()
+        .map(|value| value.parse::<u64>().unwrap())
+        .sum::<u64>()
+    };
+    let before = wallet.node.lock().unwrap().wallet_snapshot().unwrap();
+    let prefix_expected = wallet.chain[..6]
+        .iter()
+        .flat_map(|block| &block.coinbase.outputs)
+        .filter(|output| output.lock == cmfd_consensus::OutputLock::Key(destination))
+        .map(|output| output.value)
+        .sum::<u64>();
+    assert_eq!(total(&before), prefix_expected);
+    assert!(prefix_expected < expected);
+
+    let now = Instant::now();
+    wallet.vouch(Q, 12);
+    wallet.catch_up().note_view(P, 12, &[], now);
+    wallet.catch_up().note_probe_hit(now);
+    assert_eq!(wallet.status_at(now).state, "catching_up");
+    for index in 6..12 {
+        wallet.fetch(index, wallet.from(P, 12)).unwrap();
+    }
+    let caught_up = wallet.node.lock().unwrap().wallet_snapshot().unwrap();
+    assert_eq!(total(&caught_up), expected);
+    assert_eq!(caught_up.history.len(), 12);
+    assert!(
+        caught_up
+            .history
+            .iter()
+            .any(|entry| entry.height == Some(1))
+    );
+    assert_eq!(wallet.status_at(now).state, "caught_up");
+
+    wallet.reopen(true);
+    let reopened = wallet.node.lock().unwrap().wallet_snapshot().unwrap();
+    assert_eq!(reopened, caught_up);
     wallet.close();
 }

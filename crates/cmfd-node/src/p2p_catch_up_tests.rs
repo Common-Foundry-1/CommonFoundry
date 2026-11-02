@@ -48,11 +48,26 @@ impl Source {
     }
 
     fn serve_with(label: &str, blocks: &[Block], nonce: u8, limits: PeerLimits) -> Self {
-        let (path, node) = devnet(label);
+        Self::serve_with_retention(label, blocks, nonce, limits, None)
+    }
+
+    fn serve_with_retention(
+        label: &str,
+        blocks: &[Block],
+        nonce: u8,
+        limits: PeerLimits,
+        keep: Option<u64>,
+    ) -> Self {
+        let (path, mut node) = devnet(label);
+        // Small windows are test-only; production configure_pruning keeps its floor.
+        node.prune_keep_blocks = keep;
         let node = Arc::new(Mutex::new(node));
         let now = unix_time_seconds().unwrap();
         for block in blocks {
             submit_shared_block(&node, block.clone(), now).unwrap();
+        }
+        if keep.is_some() {
+            node.lock().unwrap().prune_block_log().unwrap().unwrap();
         }
         let socket = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = socket.local_addr().unwrap();
@@ -90,6 +105,86 @@ impl Source {
         drop(self.node);
         clean_test_dir(&self.path);
     }
+}
+
+#[test]
+fn pruned_source_corroborates_archive_downloads_without_skipping_validation() {
+    // Stable block spacing keeps this a chain a wallet may grant under its
+    // unchanged difficulty guard. The last prune candidate is at height 128.
+    let (path, mut miner) = devnet("catch-up-pruned-corroborator-chain");
+    let now = unix_time_seconds().unwrap();
+    let chain: Vec<_> = (1..=140)
+        .map(|height| {
+            miner
+                .mine_once(
+                    crate::default_miner_destination(),
+                    now - (140 - height) * 60,
+                    crate::DEFAULT_MINING_ATTEMPTS,
+                )
+                .unwrap()
+        })
+        .collect();
+    drop(miner);
+    clean_test_dir(&path);
+    let limits = PeerLimits {
+        max_blocks_per_session: 2,
+        ..PeerLimits::default()
+    };
+    let archive = Source::serve_with("catch-up-pruned-archive", &chain, 0x51, limits);
+    let pruned = Source::serve_with_retention(
+        "catch-up-pruned-corroborator",
+        &chain,
+        0x52,
+        PeerLimits::default(),
+        Some(10),
+    );
+    let wallet = Wallet::open("catch-up-pruned-corroborator-wallet", &chain, 110, 110);
+    assert!(wallet.enable(&[(archive.addr, 0), (pruned.addr, 1)]));
+    let locator = wallet
+        .node
+        .lock()
+        .unwrap()
+        .block_locator(MAX_BLOCKS_PER_SYNC);
+    assert_eq!(
+        archive
+            .node
+            .lock()
+            .unwrap()
+            .inventory_after(&corroboration_locator(&locator), [0; 32], 2),
+        ids(&chain[110..112]),
+        "legacy servers ignore an unknown leading locator and still use the real tip",
+    );
+    {
+        let mut node = pruned.node.lock().unwrap();
+        assert!(node.block_is_pruned(chain[110].block_id()));
+        assert!(
+            node.inventory_after(&locator, [0; 32], 2).is_empty(),
+            "legacy download query reproduces the live empty reply"
+        );
+        assert_eq!(
+            node.header_inventory_after(&locator, [0; 32], 2),
+            ids(&chain[110..112])
+        );
+        assert!(matches!(
+            node.canonical_block(chain[110].block_id()),
+            Err(NodeError::BlockProofPruned(_))
+        ));
+    }
+    let report = wallet.sync_with(archive.addr, limits).unwrap();
+    assert_eq!(report.accepted_blocks, 2);
+    assert_eq!(wallet.height(), 112);
+    assert_eq!(wallet.granted(&chain), vec![111, 112]);
+    assert_eq!(
+        wallet.engine.block_calls(),
+        0,
+        "the existing corroborated deep-block rule is used, not a new work bypass"
+    );
+    let counts = wallet.catch_up().counts();
+    assert_eq!(counts.granted, 2);
+    assert_eq!((counts.probe_attempts, counts.probe_misses), (1, 0));
+    wallet.close();
+    archive.close();
+    pruned.close();
 }
 
 /// What a scripted peer does with each connection.
@@ -314,6 +409,39 @@ fn a_source_session_admits_blocks_corroborated_deep_enough_and_checks_the_newest
     // The session's summary was logged; the next waits a minute.
     assert!(!catch_up.log_session_summary(0, 10, None, Instant::now()));
     drop(catch_up);
+    wallet.close();
+    p.close();
+    q.close();
+}
+
+#[test]
+fn a_wallet_downloads_past_its_checked_tip_over_repeated_source_sessions() {
+    let chain = chain("catch-up-repeated-chain", 12);
+    let limits = PeerLimits {
+        max_blocks_per_session: 2,
+        ..PeerLimits::default()
+    };
+    let p = Source::serve_with("catch-up-repeated-p", &chain, 0x51, limits);
+    let q = Source::serve("catch-up-repeated-q", &chain, 0x52);
+    let wallet = Wallet::open("catch-up-repeated", &chain, 2, 2);
+    assert!(wallet.enable(&[(p.addr, 0), (q.addr, 1)]));
+
+    for expected_height in (4..=12).step_by(2) {
+        let report = wallet.sync_with(p.addr, limits).unwrap();
+        assert_eq!(report.accepted_blocks, 2);
+        assert_eq!(wallet.height(), expected_height);
+        let status = wallet.node.lock().unwrap().work_rule_status().unwrap();
+        let status = status.wallet_catch_up.unwrap();
+        assert_eq!(status.target_height, Some(12));
+        assert_eq!(status.download_blocks_left, Some(12 - expected_height));
+        if expected_height < 12 {
+            assert_ne!(status.state, "caught_up");
+        } else {
+            assert_eq!(status.state, "caught_up");
+        }
+    }
+    assert_eq!(wallet.tip(), chain.last().unwrap().block_id());
+    assert!(!wallet.granted(&chain).is_empty());
     wallet.close();
     p.close();
     q.close();

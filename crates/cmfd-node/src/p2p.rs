@@ -36,7 +36,8 @@ use crate::ProductionV3MiningPeerIdentity;
 use crate::peer::{
     BlockSubmissionResult, BlockSubmissionStatus, MAX_GOSSIP_PEERS, PeerAddressPolicy,
     PeerConnection, PeerError, PeerHello, PeerLimits, PeerMessage, PeerSession,
-    SUBMIT_BLOCK_RESPONSE_BUDGET, StaticPeerConfig, validate_peer_address,
+    SUBMIT_BLOCK_RESPONSE_BUDGET, StaticPeerConfig, corroboration_locator, header_inventory_marker,
+    validate_peer_address,
 };
 use crate::work_gate::{
     BlockSender, CatchUpFollow, FetchedFrom, PROBE_BUDGET, PROBE_CONNECT, PROBE_MIN_ATTEMPT,
@@ -1965,7 +1966,7 @@ fn probe_catch_up_source(
     connection.send_hello()?;
     let remote_hello = expect_hello(connection.receive()?)?;
     connection.send(PeerMessage::GetHeaders {
-        locator: locator.to_vec(),
+        locator: corroboration_locator(locator),
         stop: remote_hello.tip,
     })?;
     let block_ids = expect_sync_inventory(connection.receive()?)?;
@@ -2423,11 +2424,8 @@ fn perform_relay_blocks_to_peer_once_inner_with_policy(
     let mut peer_tip = remote_hello.tip;
 
     for block_id in &block_ids {
-        let canonical = {
-            let mut node = lock_node(&shared)?;
-            node.canonical_block(*block_id)?
-        }
-        .ok_or(P2pError::UnknownRequestedBlock(*block_id))?;
+        let canonical = crate::canonical_read::read_shared(&shared, *block_id)?
+            .ok_or(P2pError::UnknownRequestedBlock(*block_id))?;
         let block = decode_block(&canonical, network_id)?;
         let actual = block.block_id();
         if actual != *block_id {
@@ -2671,19 +2669,21 @@ fn perform_respond_to_peer_inner_with_policy(
             PeerMessage::GetHeaders { locator, stop } => {
                 let block_ids = {
                     let node = lock_node(&shared)?;
-                    node.inventory_after(&locator, stop, block_batch_limit)
+                    if locator.first() == Some(&header_inventory_marker()) {
+                        node.header_inventory_after(&locator[1..], stop, block_batch_limit)
+                    } else {
+                        node.inventory_after(&locator, stop, block_batch_limit)
+                    }
                 };
                 connection.send(PeerMessage::Inventory { block_ids })?;
             }
             PeerMessage::GetBlock { block_id } => {
-                let canonical = {
-                    let mut node = lock_node(&shared)?;
-                    if node.block_is_pruned(block_id) {
-                        // Not the requester's fault: it learned this block
-                        // from another peer. Close without a penalty.
-                        return Err(P2pError::PrunedRequestedBlock(block_id));
+                let canonical = match crate::canonical_read::read_shared(&shared, block_id) {
+                    Err(NodeError::BlockProofPruned(id)) => {
+                        // Not the requester's fault: close without a penalty.
+                        return Err(P2pError::PrunedRequestedBlock(id));
                     }
-                    node.canonical_block(block_id)?
+                    result => result?,
                 }
                 .ok_or(P2pError::UnknownRequestedBlock(block_id))?;
                 let block = decode_block(&canonical, network_id)?;

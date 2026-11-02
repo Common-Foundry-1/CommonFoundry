@@ -831,6 +831,15 @@ pub(crate) fn catch_up_row(facts: &CatchUpFacts) -> (&'static str, Option<&'stat
         return ("single_source", None, ahead);
     }
     if facts.available >= tip {
+        // Availability only describes the chain already stored here. It
+        // cannot establish that the download has reached a source's tip,
+        // even when every stored block has been fully checked.
+        if facts.highest_view.is_none() {
+            return ("catching_up", Some("source_tip_unknown"), 0);
+        }
+        if ahead > 0 {
+            return ("catching_up", None, ahead);
+        }
         return ("caught_up", None, below_tip);
     }
     if facts.tip_granted {

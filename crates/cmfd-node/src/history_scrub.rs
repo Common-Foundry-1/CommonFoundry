@@ -37,7 +37,7 @@ use super::{
 const SCRUB_BYTES_PER_SECOND: u64 = 96 << 20;
 /// Bytes read per batch. The node lock and a log handle are taken only
 /// between batches, so pruning can swap the log in the gaps.
-const SCRUB_BATCH_BYTES: u64 = 64 << 20;
+const SCRUB_BATCH_BYTES: u64 = 8 << 20;
 
 /// How much of the retained history the scrub has verified.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -121,8 +121,26 @@ pub(crate) fn scrub_in_batches(
     throttle: bool,
     batch_bytes: u64,
 ) -> Result<(), NodeError> {
-    while let Pass::Restart = scrub_pass(shared, stop, throttle, batch_bytes)? {}
+    scrub_with_waiter(shared, stop, throttle, batch_bytes, &mut thread::sleep)
+}
+
+fn scrub_with_waiter(
+    shared: &Mutex<Node>,
+    stop: &AtomicBool,
+    throttle: bool,
+    batch_bytes: u64,
+    wait: &mut impl FnMut(Duration),
+) -> Result<(), NodeError> {
+    while let Pass::Restart = scrub_pass(shared, stop, throttle, batch_bytes, wait)? {}
     Ok(())
+}
+
+/// Retain the existing bandwidth ceiling and reserve at least as much time
+/// for foreground I/O as this batch took. Slow reads never build up credit
+/// for another burst. The pause holds neither the node nor a log reader.
+fn foreground_window(bytes: u64, elapsed: Duration) -> Duration {
+    let budget = Duration::from_secs_f64(bytes as f64 / SCRUB_BYTES_PER_SECOND as f64);
+    budget.saturating_sub(elapsed).max(elapsed)
 }
 
 fn lock(shared: &Mutex<Node>) -> Result<std::sync::MutexGuard<'_, Node>, NodeError> {
@@ -134,6 +152,7 @@ fn scrub_pass(
     stop: &AtomicBool,
     throttle: bool,
     batch_bytes: u64,
+    wait: &mut impl FnMut(Duration),
 ) -> Result<Pass, NodeError> {
     let (instance, epoch, locators, mut hints, network_id, log_path) = {
         let node = lock(shared)?;
@@ -190,6 +209,7 @@ fn scrub_pass(
             }
             node.clone_log_for_read().map_err(NodeError::RpcIo)?
         };
+        let batch_started = Instant::now();
         let mut failure = None;
         let mut recomputed = Vec::new();
         for (position, locator) in (start..end).zip(&locators[start..end]) {
@@ -245,9 +265,16 @@ fn scrub_pass(
             }
         }
         if throttle {
-            let due = Duration::from_secs_f64(read_bytes as f64 / SCRUB_BYTES_PER_SECOND as f64);
-            while started.elapsed() < due && !stop.load(Ordering::Acquire) {
-                thread::sleep((due - started.elapsed()).min(Duration::from_millis(100)));
+            let pause = foreground_window(batch_read, batch_started.elapsed());
+            let yielding = Instant::now();
+            while !stop.load(Ordering::Acquire) {
+                let Some(remaining) = pause
+                    .checked_sub(yielding.elapsed())
+                    .filter(|left| !left.is_zero())
+                else {
+                    break;
+                };
+                wait(remaining.min(Duration::from_millis(100)));
             }
         }
     }
@@ -411,5 +438,79 @@ mod tests {
         assert!(verify_record(&log, &relinked, 0).is_ok());
         drop(log);
         clean_test_dir(&path);
+    }
+
+    #[test]
+    fn paced_scrub_yields_the_node_and_log_before_the_next_batch() {
+        let (path, log, _) = three_records("scrub-foreground-service-window");
+        drop(log);
+        let mut node = Node::open(&path).unwrap();
+        node.history_scrub = Progress::default();
+        let shared = Arc::new(Mutex::new(node));
+        let worker_node = Arc::clone(&shared);
+        let (entered, foreground) = std::sync::mpsc::channel();
+        let (resume, release) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut first = true;
+            scrub_with_waiter(
+                &worker_node,
+                &AtomicBool::new(false),
+                true,
+                1,
+                &mut |pause| {
+                    assert!(pause > Duration::ZERO);
+                    if first {
+                        first = false;
+                        entered.send(()).unwrap();
+                        release.recv_timeout(Duration::from_secs(5)).unwrap();
+                    } else {
+                        thread::sleep(pause);
+                    }
+                },
+            )
+            .unwrap();
+        });
+        foreground.recv_timeout(Duration::from_secs(5)).unwrap();
+        {
+            let mut node = shared
+                .try_lock()
+                .expect("foreground node lock is available");
+            assert!(
+                !node.log_readers_outstanding(),
+                "pruning is not pinned during the pause"
+            );
+            assert_eq!(node.history_scrub.verified_records, 1);
+            assert!(!node.history_scrub.complete);
+            let now = DEVNET_GENESIS_TIMESTAMP + node.state.next_height() * 60;
+            node.mine_once(default_miner_destination(), now, DEFAULT_MINING_ATTEMPTS)
+                .unwrap();
+            assert_eq!(node.state.next_height(), 5);
+        }
+        resume.send(()).unwrap();
+        worker.join().unwrap();
+        {
+            let node = shared.lock().unwrap();
+            assert!(node.history_scrub.complete);
+            assert_eq!(node.history_scrub.verified_records, 3);
+            assert!(!node.storage_faulted);
+        }
+        drop(shared);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn a_slow_scrub_batch_reserves_foreground_time_without_accumulating_credit() {
+        // The old average-since-start limiter offered no pause on a disk
+        // slower than 96 MiB/s. A 64 MiB burst at 8 MiB/s monopolized it.
+        assert_eq!(
+            foreground_window(8 << 20, Duration::from_secs(1)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            foreground_window(8 << 20, Duration::from_secs(20)),
+            Duration::from_secs(20)
+        );
+        let cached_read = Duration::from_millis(1);
+        assert!(foreground_window(8 << 20, cached_read) >= Duration::from_millis(82));
     }
 }

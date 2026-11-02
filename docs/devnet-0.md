@@ -534,9 +534,11 @@ Submission disconnects and peer protocol errors (including malformed frames
 and wrong response IDs) have separate miner counters; neither is counted as a
 cryptographic rejection. Node status reports each admission class as
 `proof_verification_normal_admission`,
-`proof_verification_priority_admission`, and
-`proof_verification_remote_admission`, with `active`, `queued`, `wait_events`,
-`rejections`, and `proof_failures`. It also reports
+`proof_verification_priority_admission`,
+`proof_verification_remote_admission`, and
+`proof_verification_reconstruction_admission` (the single lane that replays
+branch state for a block whose parent is not the active tip), with `active`,
+`queued`, `wait_events`, `rejections`, and `proof_failures`. It also reports
 `proof_verification_remote_admission_capacity` and
 `proof_verification_remote_admission_wait_timeout_ms`. External-worker status
 also exposes `proof_verification_teardown_failures`; this counter can rise while
@@ -645,11 +647,63 @@ rest count as `verifying`, and `validated_height` keeps its meaning. Servers,
 pools, relays and a wallet started with `--work-check full` never carry either
 field.
 
+`available_height` describes the local chain's spendability boundary; it is
+not the network tip. `target_height` is the highest height a catch-up source
+reported within the last ten minutes, and `download_blocks_left` is the gap
+between that target and the local `accepted_height`. Both are `null` without
+a recent source view. The wallet reports `catching_up` while a source is
+ahead, even if all locally stored blocks have been checked. Without a recent
+view, a locally available tip reports `catching_up` with
+`reason: "source_tip_unknown"`. `caught_up` requires a recent source view
+with no remaining download gap; it can still have older work checks running
+in the background, counted by `blocks_left`. Source heights are advisory and
+do not change consensus validation or make coins available.
+
+After fast startup, the retained-log audit gives live traffic a service window
+between batches. Batches target 8 MiB (a larger record runs alone), retain the
+96 MiB/s ceiling, and yield at least as long as the batch took. A slow read does
+not accumulate credit for another burst. The pause holds neither the shared
+node lock nor a log-reader lease, so status requests and pruning can proceed.
+Background auditing may finish later; every record and digest is still checked.
+
+Peer block reads use a separate per-node serialized lane. The shared node lock
+is released during disk reads and decoding, while the tracked log handle pins
+pruning. Completion checks the node instance and log epoch before returning or
+latching a storage failure; a concurrent storage fault refuses the reply.
+Proof, record, identifier and pruning checks remain in force. This avoids
+letting a slow historical block read monopolize status and sync scheduling.
+
+Wallet balances come from the local chain's UTXO state, including outputs
+created before a startup snapshot or prune anchor. Compare balances at the
+same chain height, including the Verifying and Immature amounts. The wallet
+rebuilds its in-memory transaction history from the beginning of the stored
+active chain after restart; proof-pruned records retain the transactions
+needed for that scan. Rebuilding the persistent address/transaction index
+(see [storage recovery](storage-recovery.md)) does not download missing
+blocks or replace the chain-state snapshot.
+
 Mainnet catch-up sources are the Germany seed and St. Louis (one provider),
 Singapore (AWS), and the independently hosted Proxmox relay. The retired
 Falkenstein endpoint is no longer a bootstrap or catch-up source. The two-provider
 requirement still applies; adding a custom peer does not change the compiled
 catch-up source list. Existing wallets need an updated binary for this relay change.
+
+Corroboration queries can include proof-pruned history. They opt in using a
+reserved leading locator, derived with BLAKE3 context
+`CommonFoundry/P2P/HeaderInventory/Locator/v1` and input `headers-only`, followed
+by the usual real block locators. An updated relay returns canonical block IDs
+for this query even when their proofs were pruned. Ordinary download queries
+still omit unservable blocks, and requesting a pruned block still fails. An old
+relay ignores the unknown locator and answers using the following real locator.
+The existing message encoding, locator limit and consensus fingerprint are unchanged.
+
+This prevents pruned relays from needlessly withholding the second provider's
+historical corroboration. It does not replace the archive peer that supplies
+the actual proof, lower the two-provider requirement, or change the depth,
+difficulty, proof-validation or background work-check rules. Upgrade relays and
+wallets to use this path; keep at least one reachable archive covering the
+wallet's missing blocks. Test an old-height download and independent provider
+corroboration after a rolling relay upgrade before distributing the wallet.
 
 A block that only one of the node's engines finds does not match is refused
 (`work_mismatch_unconfirmed`) at no cost to its peer. Each peer address (an

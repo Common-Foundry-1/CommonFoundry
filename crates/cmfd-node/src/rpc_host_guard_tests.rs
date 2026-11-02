@@ -44,8 +44,19 @@ fn exchange_with_body(endpoint: SocketAddr, head: &str, body: &[u8]) -> Reply {
     stream.write_all(head.as_bytes()).unwrap();
     stream.write_all(body).unwrap();
     let mut response = String::new();
-    stream.read_to_string(&mut response).unwrap();
+    // Refusing an unread request body can reset TCP after the complete reply.
+    // Require a complete HTTP body; do not require an orderly socket close.
+    if let Err(error) = stream.read_to_string(&mut response) {
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+    }
     let (head, body) = response.split_once("\r\n\r\n").unwrap();
+    let content_length: usize = head
+        .lines()
+        .find_map(|line| line.strip_prefix("Content-Length: "))
+        .expect("HTTP reply has Content-Length")
+        .parse()
+        .unwrap();
+    assert_eq!(body.len(), content_length, "HTTP reply must be complete");
     let status = head.split(' ').nth(1).unwrap().parse().unwrap();
     Reply {
         status,

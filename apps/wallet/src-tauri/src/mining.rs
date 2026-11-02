@@ -1621,6 +1621,8 @@ mod tests {
             state,
             reason: (state == "waiting_for_check").then_some("earlier_blocks"),
             available_height: 10,
+            target_height: Some(17),
+            download_blocks_left: Some(7),
             blocks_left: 7,
             newest_checked: 0,
             newest_needed: 60,

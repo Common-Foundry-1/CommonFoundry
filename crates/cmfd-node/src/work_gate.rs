@@ -383,9 +383,17 @@ pub struct WalletCatchUpStatus {
     /// `checking_newest` or `waiting_for_check`.
     pub state: &'static str,
     /// With `waiting_for_check`: `earlier_blocks`, `difficulty` or `other`.
+    /// With `catching_up`: `source_tip_unknown` until a recent source view
+    /// can establish whether the local chain is behind.
     pub reason: Option<&'static str>,
     /// Coins in blocks up to this height are available.
     pub available_height: u64,
+    /// The highest height recently reported by a compiled catch-up source.
+    /// This is a download target, not a consensus or spendability boundary.
+    pub target_height: Option<u64>,
+    /// The download gap to `target_height`, separate from background work
+    /// checks. Unknown when no source has a recent height report.
+    pub download_blocks_left: Option<u64>,
     /// How many blocks the state still waits for.
     pub blocks_left: u64,
     /// The blocks at the tip re-executed here, up to `newest_needed`.
@@ -2465,6 +2473,8 @@ impl Node {
             state,
             reason,
             available_height: available,
+            target_height: highest_view,
+            download_blocks_left: highest_view.map(|height| height.saturating_sub(tip)),
             blocks_left,
             newest_checked: top_run_len.min(depth),
             newest_needed: depth,

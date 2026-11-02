@@ -51,6 +51,7 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 pub mod address;
+mod canonical_read;
 #[cfg(windows)]
 pub(crate) mod exchange_acl;
 pub mod exchange_acl_qualification;
@@ -210,7 +211,13 @@ pub const MAX_PARALLEL_FETCHED_PROOF_VERIFICATIONS: usize = 4;
 const MAX_QUEUED_FETCHED_PROOF_VERIFICATIONS: usize = 32;
 const FETCHED_PROOF_VERIFICATION_QUEUE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_BRANCH_STATE_CHECKPOINTS: usize = 4;
-const MAX_BRANCH_STATE_CHECKPOINT_BYTES: usize = 128 * 1024 * 1024;
+// At mainnet's ~180k UTXOs one conservative checkpoint charge is ~85 MiB.
+// A 128 MiB budget retained only the newest tip checkpoint, evicting every
+// usable pre-tip anchor precisely when a shallow competing tip needed one.
+// Keep the existing four-entry bound while allowing those recent anchors to
+// coexist at the current network size. This caches locally validated state;
+// it does not grant proof authority or relax fork/record authentication.
+const MAX_BRANCH_STATE_CHECKPOINT_BYTES: usize = 384 * 1024 * 1024;
 const ACTIVE_BRANCH_CHECKPOINT_INTERVAL: u64 = 16;
 const BRANCH_CHECKPOINT_RETURN_WAIT: Duration = Duration::from_millis(250);
 pub const PRODUCTION_V3_PACKAGE_ARTIFACT_DIRECTORY: &str = "production-v3";
@@ -2104,6 +2111,8 @@ pub struct BlockPreverifier {
     #[cfg(test)]
     replay_state_blocks: Arc<AtomicU64>,
     #[cfg(test)]
+    branch_replay_plans: Arc<AtomicU64>,
+    #[cfg(test)]
     proof_dispatch_delay: Arc<Mutex<Option<Duration>>>,
 }
 
@@ -2209,6 +2218,8 @@ impl BlockPreverifier {
             prefetched_blocks: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             replay_state_blocks: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            branch_replay_plans: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             proof_dispatch_delay: Arc::new(Mutex::new(None)),
         }
@@ -2567,6 +2578,9 @@ pub struct NodeStatus {
     pub proof_verification_normal_admission: ProofAdmissionClassTelemetry,
     pub proof_verification_priority_admission: ProofAdmissionClassTelemetry,
     pub proof_verification_remote_admission: ProofAdmissionClassTelemetry,
+    /// The single lane that replays branch state for a block whose parent is
+    /// not the active tip.
+    pub proof_verification_reconstruction_admission: ProofAdmissionClassTelemetry,
     /// Hard bound across active plus waiting remote proof sessions.
     pub proof_verification_remote_admission_capacity: usize,
     /// Independent deadline for one admitted remote session waiting its turn.
@@ -4011,6 +4025,8 @@ pub struct Node {
     wallet_history_cache: Option<wallet_history::WalletHistoryCache>,
     /// Whole-chain wallet history scan running off the node lock, if any.
     wallet_history_scan: Option<wallet_history::WalletHistoryScan>,
+    /// Serialize peer disk reads without monopolizing the shared node lock.
+    peer_block_read_lane: Arc<Mutex<()>>,
     /// The outputs of the active blocks above the validated height, last read
     /// for a coin the history cache could not place.
     unchecked_outputs: Mutex<wallet_history::UncheckedOutputsMemo>,
@@ -6044,6 +6060,7 @@ impl Node {
             explorer_history_cache: None,
             wallet_history_cache: None,
             wallet_history_scan: None,
+            peer_block_read_lane: Arc::new(Mutex::new(())),
             unchecked_outputs: Mutex::new(wallet_history::UncheckedOutputsMemo::default()),
             #[cfg(test)]
             wallet_history_inline_scan_bytes: wallet_history::INLINE_SCAN_BYTES,
@@ -6463,6 +6480,11 @@ impl Node {
         let proof_queue_telemetry = self.block_preverifier.queue.telemetry()?;
         let proof_verification_remote_admission =
             self.block_preverifier.remote_admission.telemetry()?;
+        let proof_verification_reconstruction_admission = self
+            .block_preverifier
+            .reconstruction_queue
+            .telemetry()?
+            .normal;
         let (
             proof_verification_mode,
             proof_verification_timeout_ms,
@@ -6500,6 +6522,7 @@ impl Node {
             proof_verification_normal_admission: proof_queue_telemetry.normal,
             proof_verification_priority_admission: proof_queue_telemetry.priority,
             proof_verification_remote_admission,
+            proof_verification_reconstruction_admission,
             proof_verification_remote_admission_capacity: self
                 .block_preverifier
                 .remote_admission
@@ -8244,6 +8267,18 @@ impl Node {
         stop: [u8; 32],
         max: usize,
     ) -> Vec<[u8; 32]> {
+        self.servable_inventory(self.header_inventory_after(locator, stop, max))
+    }
+
+    /// Canonical identifiers for corroboration, including proof-pruned blocks.
+    /// This does not promise that their block bodies can be downloaded here.
+    /// Ordinary download inventories retain the servability check above.
+    pub fn header_inventory_after(
+        &self,
+        locator: &[[u8; 32]],
+        stop: [u8; 32],
+        max: usize,
+    ) -> Vec<[u8; 32]> {
         if max == 0 {
             return Vec::new();
         }
@@ -8261,7 +8296,7 @@ impl Node {
                 break;
             }
         }
-        self.servable_inventory(inventory)
+        inventory
     }
 
     /// Pruned blocks form the oldest part of the active chain. An inventory
@@ -8890,6 +8925,10 @@ impl Node {
                 None => self.take_branch_checkpoint(parent)?,
             };
             let log_path = self.data_dir.join(BLOCK_LOG_FILE);
+            #[cfg(test)]
+            self.block_preverifier
+                .branch_replay_plans
+                .fetch_add(1, Ordering::Relaxed);
             let plan = self.index.branch_state_plan(
                 parent,
                 checkpoint,
@@ -9884,9 +9923,17 @@ fn submit_shared_block_with_policy(
         let permit = if let Some(request) = remote_request.as_ref() {
             block_preverifier.reserve_cancellable(request.clone())?
         } else {
-            match policy {
-                SharedBlockPolicy::AnyBranch => block_preverifier.reserve()?,
-                SharedBlockPolicy::ActiveTipOnly => block_preverifier.reserve_priority()?,
+            // Loopback RPC is an operator-owned submission path, including
+            // recovery of a complete downloaded block. It must not be refused
+            // by a full remote/normal queue while reserved local capacity is
+            // idle. This changes scheduling only: every preflight, proof,
+            // work, fork-state and commit check below still runs unchanged.
+            if matches!(policy, SharedBlockPolicy::ActiveTipOnly)
+                || matches!(origin, BlockOrigin::Rpc { loopback: true })
+            {
+                block_preverifier.reserve_priority()?
+            } else {
+                block_preverifier.reserve()?
             }
         };
         {
@@ -9972,29 +10019,36 @@ fn submit_shared_block_with_policy(
     }
     ensure_remote_request_live(remote_request.as_ref())?;
 
-    let admission_work = {
+    // A block off the active tip replays its branch state in the single
+    // reconstruction lane. Take the lane before checking out that state and
+    // reading its replay blocks under the node mutex: a block that would only
+    // time out in the lane must not hold the mutex its holder needs, and the
+    // holder must start from the progress the previous holder handed back.
+    let mut reconstruction_permit = None;
+    let admission_work = loop {
         let mut node = lock_shared_node(shared, remote_request.as_ref())?;
-        if matches!(policy, SharedBlockPolicy::ActiveTipOnly)
-            && block.challenge.previous_block != node.state.tip()
-        {
+        let off_tip = block.challenge.previous_block != node.state.tip();
+        if matches!(policy, SharedBlockPolicy::ActiveTipOnly) && off_tip {
             return Err(NodeError::StaleBlockAdmission);
         }
-        node.begin_external_block_admission(&block, accepted_at)?
+        if production_admission && off_tip && reconstruction_permit.is_none() {
+            drop(node);
+            reconstruction_permit = Some(block_preverifier.reserve_reconstruction()?);
+            continue;
+        }
+        break node.begin_external_block_admission(&block, accepted_at)?;
     };
 
     let admission = match admission_work {
         Some(work) => {
+            // Declared before `pending_work`, so that replay progress is handed
+            // back before the lane is released.
+            let _reconstruction_permit =
+                reconstruction_permit.filter(|_| work.requires_reconstruction());
             let mut pending_work = PendingExternalWork {
                 shared: Arc::clone(shared),
                 work: Some(work),
             };
-            let _reconstruction_permit = pending_work
-                .work
-                .as_ref()
-                .expect("pending replay work")
-                .requires_reconstruction()
-                .then(|| block_preverifier.reserve_reconstruction())
-                .transpose()?;
             loop {
                 ensure_remote_request_live(remote_request.as_ref())?;
                 let work = pending_work.work.take().expect("pending replay work");
@@ -14006,6 +14060,67 @@ mod tests {
     }
 
     #[test]
+    fn loopback_rpc_block_can_enter_reserved_proof_queue_when_normal_queue_is_full() {
+        let (mut node, path, _) = branch_checkpoint_fixture("loopback-rpc-proof-priority", 0);
+        let now = DEVNET_GENESIS_TIMESTAMP + 60;
+        let block = mined_child(&node, node.state.tip(), now, 0x71);
+        let queue = Arc::new(ProofVerificationQueue::new(1, 1, Duration::from_secs(2)));
+        node.block_preverifier.queue = Arc::clone(&queue);
+        let active = queue.acquire().unwrap();
+        let normal_queue = Arc::clone(&queue);
+        let normal = thread::spawn(move || normal_queue.acquire().map(drop));
+        while queue.telemetry().unwrap().normal.queued != 1 {
+            thread::yield_now();
+        }
+        let shared = Arc::new(Mutex::new(node));
+        let request_node = Arc::clone(&shared);
+        let local = thread::spawn(move || submit_shared_rpc_block(&request_node, block, now, true));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut priority_seen = false;
+        while Instant::now() < deadline && !local.is_finished() {
+            if queue.telemetry().unwrap().priority.queued == 1 {
+                priority_seen = true;
+                break;
+            }
+            thread::yield_now();
+        }
+        drop(active);
+        let local_result = local.join().unwrap();
+        normal.join().unwrap().unwrap();
+        assert!(
+            priority_seen,
+            "loopback recovery was refused by the full remote/normal queue: {local_result:?}"
+        );
+        local_result.unwrap();
+        assert_eq!(queue.counts().unwrap(), (0, 0));
+        drop(shared);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn non_loopback_rpc_block_cannot_use_reserved_proof_capacity() {
+        let (mut node, path, _) = branch_checkpoint_fixture("remote-rpc-no-proof-priority", 0);
+        let now = DEVNET_GENESIS_TIMESTAMP + 60;
+        let block = mined_child(&node, node.state.tip(), now, 0x72);
+        let queue = Arc::new(ProofVerificationQueue::new(1, 1, Duration::from_secs(2)));
+        node.block_preverifier.queue = Arc::clone(&queue);
+        let active = queue.acquire().unwrap();
+        let normal_queue = Arc::clone(&queue);
+        let normal = thread::spawn(move || normal_queue.acquire().map(drop));
+        while queue.telemetry().unwrap().normal.queued != 1 {
+            thread::yield_now();
+        }
+        let shared = Arc::new(Mutex::new(node));
+        let result = submit_shared_rpc_block(&shared, block, now, false);
+        assert!(matches!(result, Err(NodeError::ProofVerificationQueueFull)));
+        assert_eq!(queue.telemetry().unwrap().priority.wait_events, 0);
+        drop(active);
+        normal.join().unwrap().unwrap();
+        drop(shared);
+        clean_test_dir(&path);
+    }
+
+    #[test]
     fn remote_proof_scheduler_bounds_sixteen_invalid_peers_and_serves_valid_and_local_work() {
         const INVALID_PEERS: u64 = 16;
         let remote = Arc::new(RemoteProofAdmissionQueue::new(
@@ -15617,6 +15732,74 @@ mod tests {
     }
 
     #[test]
+    fn mainnet_sized_utxo_state_retains_a_pre_tip_fork_checkpoint() {
+        let (mut node, path, _) = branch_checkpoint_fixture("mainnet-sized-fork-cache", 0);
+        // A structurally valid synthetic genesis state models the live UTXO
+        // table's allocation size. It is test data, never proof authority or a
+        // state imported by the production admission path.
+        let mut snapshot = node.state.encode_local_snapshot().unwrap();
+        assert_eq!(
+            u64::from_le_bytes(snapshot[100..108].try_into().unwrap()),
+            0
+        );
+        snapshot.truncate(snapshot.len() - 32);
+        let outputs = 180_000_u64;
+        snapshot[100..108].copy_from_slice(&outputs.to_le_bytes());
+        for index in 0..outputs {
+            let mut txid = [0x5a; 32];
+            txid[..8].copy_from_slice(&index.to_be_bytes());
+            snapshot.extend_from_slice(&txid);
+            snapshot.extend_from_slice(&0_u32.to_le_bytes());
+            snapshot.extend_from_slice(&1_u64.to_le_bytes());
+            snapshot.push(0);
+            snapshot.extend_from_slice(&[7; 32]);
+            snapshot.extend_from_slice(&0_u64.to_le_bytes());
+        }
+        let mut hasher = Hasher::new_derive_key("CMFD/CHAIN-STATE-SNAPSHOT/LOCAL-INTEGRITY/V1");
+        hasher.update(&snapshot);
+        snapshot.extend_from_slice(hasher.finalize().as_bytes());
+        node.state =
+            ChainState::decode_local_snapshot(&snapshot, node.params, node.verifier.clone())
+                .unwrap();
+        drop(snapshot);
+
+        let charge = checkpoint_charge(&node.state, 65).unwrap();
+        assert!(
+            charge > 64 * 1024 * 1024,
+            "fixture must exercise the live-size budget cliff"
+        );
+        let mut parent = node.params.genesis_hash;
+        let mut fork_parent = parent;
+        for height in 1..=64 {
+            let now = DEVNET_GENESIS_TIMESTAMP + height * 60;
+            let block = mined_child(&node, parent, now, height as u8);
+            parent = block.block_id();
+            if height == 63 {
+                fork_parent = parent;
+            }
+            node.submit_block(block, now).unwrap();
+        }
+        assert!(
+            node.branch_checkpoints.entries.len() >= 2,
+            "a mainnet-sized tip must not evict every pre-tip anchor; charge={charge}"
+        );
+        assert!(node.branch_checkpoints.charged_bytes <= MAX_BRANCH_STATE_CHECKPOINT_BYTES);
+        let now = DEVNET_GENESIS_TIMESTAMP + 64 * 60;
+        let candidate = mined_child(&node, fork_parent, now, 0xf1);
+        let verifier = node.block_preverifier.clone();
+        let shared = Arc::new(Mutex::new(node));
+        submit_shared_block(&shared, candidate.clone(), now).unwrap();
+        assert_eq!(
+            verifier.replay_state_blocks.load(Ordering::Relaxed),
+            15,
+            "a shallow fork must reuse the recent validated state instead of replaying genesis"
+        );
+        assert!(shared.lock().unwrap().index.contains(candidate.block_id()));
+        drop(shared);
+        clean_test_dir(&path);
+    }
+
+    #[test]
     fn active_anchor_survives_an_abandoned_short_fork_attempt() {
         let (mut node, path, _) = branch_checkpoint_fixture("checkpoint-anchor-kept", 0);
         let mut parent = node.params.genesis_hash;
@@ -15649,6 +15832,142 @@ mod tests {
             15
         );
         assert!(shared.lock().unwrap().index.contains(candidate.block_id()));
+        drop(shared);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn busy_reconstruction_lane_is_reported_and_waiting_fork_pushes_do_not_plan_replay() {
+        // A relay one block behind a competing branch: one push of the
+        // competing block holds the single branch-replay lane, while further
+        // pushes of it and the sync session's own fetched copy wait for it.
+        let (mut node, path, blocks) = branch_checkpoint_fixture("reconstruction-lane-busy", 20);
+        let now = DEVNET_GENESIS_TIMESTAMP + 20 * 60;
+        let candidate = mined_child(&node, blocks[18].block_id(), now, 0xee);
+        let lane = Arc::new(ProofVerificationQueue::new(
+            1,
+            2,
+            Duration::from_millis(200),
+        ));
+        node.block_preverifier.reconstruction_queue = Arc::clone(&lane);
+        let verifier = node.block_preverifier.clone();
+        let shared = Arc::new(Mutex::new(node));
+        let request = || RemoteProofRequest::new(Instant::now() + Duration::from_secs(30));
+        let holder = lane.acquire().unwrap();
+
+        // The proof counters the status always had read zero; the busy lane
+        // must be visible as well.
+        let status = shared.lock().unwrap().status().unwrap();
+        assert_eq!(status.proof_verification_active, 0);
+        assert_eq!(status.proof_verification_queued, 0);
+        assert_eq!(status.proof_verification_reconstruction_admission.active, 1);
+
+        // The sync session's fetched copy still times out on the lane.
+        assert!(matches!(
+            submit_shared_peer_block_from(
+                &shared,
+                candidate.clone(),
+                now,
+                RemoteProofPeerId::new(1).unwrap(),
+                request(),
+                false,
+                None,
+            ),
+            Err(NodeError::ProofVerificationQueueTimeout)
+        ));
+        for peer in 2..=5 {
+            assert!(matches!(
+                submit_shared_peer_block_cancellable(
+                    &shared,
+                    candidate.clone(),
+                    now,
+                    RemoteProofPeerId::new(peer).unwrap(),
+                    request(),
+                ),
+                Err(NodeError::ProofVerificationQueueTimeout)
+            ));
+        }
+        // None of them checked out branch state or read replay blocks under
+        // the node mutex for a lane it then never got.
+        assert_eq!(verifier.branch_replay_plans.load(Ordering::Relaxed), 0);
+        assert_eq!(verifier.replay_state_blocks.load(Ordering::Relaxed), 0);
+        let lane_status = shared
+            .lock()
+            .unwrap()
+            .status()
+            .unwrap()
+            .proof_verification_reconstruction_admission;
+        assert_eq!((lane_status.wait_events, lane_status.rejections), (5, 5));
+
+        drop(holder);
+        submit_shared_peer_block_cancellable(
+            &shared,
+            candidate.clone(),
+            now,
+            RemoteProofPeerId::new(6).unwrap(),
+            request(),
+        )
+        .unwrap();
+        assert!(shared.lock().unwrap().index.contains(candidate.block_id()));
+        assert_eq!(verifier.replay_state_blocks.load(Ordering::Relaxed), 19);
+        drop(shared);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn queued_fork_push_resumes_from_the_replay_progress_its_predecessor_returned() {
+        // A push that holds the branch-replay lane can lose its request before
+        // the replay is done. The push queued behind it must continue from the
+        // progress handed back, not from the state it saw before it waited.
+        let (mut node, path, blocks) = branch_checkpoint_fixture("reconstruction-lane-resume", 20);
+        let now = DEVNET_GENESIS_TIMESTAMP + 20 * 60;
+        let candidate = mined_child(&node, blocks[18].block_id(), now, 0xee);
+        let lane = Arc::new(ProofVerificationQueue::new(1, 2, Duration::from_secs(30)));
+        node.block_preverifier.reconstruction_queue = Arc::clone(&lane);
+        let verifier = node.block_preverifier.clone();
+        verifier.set_proof_dispatch_delay(Some(Duration::from_millis(300)));
+        let shared = Arc::new(Mutex::new(node));
+        let push = |peer: u64, request: RemoteProofRequest| {
+            let shared = Arc::clone(&shared);
+            let candidate = candidate.clone();
+            thread::spawn(move || {
+                submit_shared_peer_block_cancellable(
+                    &shared,
+                    candidate,
+                    now,
+                    RemoteProofPeerId::new(peer).unwrap(),
+                    request,
+                )
+            })
+        };
+        let wait_until = |condition: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !condition() {
+                assert!(Instant::now() < deadline, "condition not reached");
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
+
+        let first_request = RemoteProofRequest::new(Instant::now() + Duration::from_secs(30));
+        let first = push(1, first_request.clone());
+        wait_until(&|| lane.counts().unwrap() == (1, 0));
+        let second = push(
+            2,
+            RemoteProofRequest::new(Instant::now() + Duration::from_secs(30)),
+        );
+        wait_until(&|| lane.counts().unwrap() == (1, 1));
+        // The first push's peer goes away once its first slice is replayed.
+        wait_until(&|| verifier.replay_state_blocks.load(Ordering::Relaxed) >= 8);
+        assert!(first_request.cancel());
+        assert!(matches!(
+            first.join().unwrap(),
+            Err(NodeError::ProofVerificationQueueTimeout)
+        ));
+        second.join().unwrap().unwrap();
+        verifier.set_proof_dispatch_delay(None);
+        assert!(shared.lock().unwrap().index.contains(candidate.block_id()));
+        // Each of the candidate's 19 ancestors was replayed exactly once.
+        assert_eq!(verifier.replay_state_blocks.load(Ordering::Relaxed), 19);
         drop(shared);
         clean_test_dir(&path);
     }

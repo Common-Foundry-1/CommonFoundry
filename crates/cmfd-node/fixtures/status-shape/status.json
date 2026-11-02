@@ -42,6 +42,13 @@
   },
   "proof_verification_queue_capacity": "number",
   "proof_verification_queued": "number",
+  "proof_verification_reconstruction_admission": {
+    "active": "number",
+    "proof_failures": "number",
+    "queued": "number",
+    "rejections": "number",
+    "wait_events": "number"
+  },
   "proof_verification_remote_admission": {
     "active": "number",
     "proof_failures": "number",

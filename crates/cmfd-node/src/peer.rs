@@ -33,6 +33,36 @@ pub const PEER_PROTOCOL_VERSION_COMPRESSED: u16 = 5;
 pub const PEER_FRAME_HEADER_BYTES: usize = 20;
 pub const MAX_PEER_PAYLOAD_BYTES: usize = MAX_BLOCK_BYTES;
 pub const MAX_HEADER_LOCATORS: usize = 32;
+
+/// Operational opt-in for a corroborating headers query, not a block download.
+/// Old peers ignore this unknown locator and use the real locators after it.
+/// Keeping the existing GetHeaders/Inventory encoding avoids an unknown-message
+/// failure or a consensus identity change during a rolling upgrade.
+pub(crate) fn header_inventory_marker() -> [u8; 32] {
+    blake3::derive_key(
+        "CommonFoundry/P2P/HeaderInventory/Locator/v1",
+        b"headers-only",
+    )
+}
+
+pub(crate) fn corroboration_locator(locator: &[[u8; 32]]) -> Vec<[u8; 32]> {
+    let marker = header_inventory_marker();
+    let mut real = Vec::new();
+    for id in locator {
+        if *id != marker && !real.contains(id) {
+            real.push(*id);
+        }
+    }
+    if real.len() >= MAX_HEADER_LOCATORS {
+        let last = *real.last().expect("nonempty locator");
+        real.truncate(MAX_HEADER_LOCATORS - 2);
+        real.push(last);
+    }
+    let mut result = Vec::with_capacity(real.len() + 1);
+    result.push(marker);
+    result.extend(real);
+    result
+}
 pub const MAX_INVENTORY_ITEMS: usize = 1_024;
 pub const MAX_GOSSIP_PEERS: usize = 32;
 pub const MAX_CONFIGURED_PEERS: usize = 64;
@@ -3338,5 +3368,31 @@ mod tests {
         assert!(
             matches!(new_node.accept_inbound(&from_old), Ok(PeerMessage::Block(b)) if b == block)
         );
+    }
+
+    #[test]
+    fn corroboration_locator_is_wire_compatible_bounded_and_keeps_fallback() {
+        let locator: Vec<_> = (1u8..=32).map(|byte| [byte; 32]).collect();
+        let marked = corroboration_locator(&locator);
+        println!(
+            "corroboration_marker={}",
+            hex::encode(header_inventory_marker())
+        );
+        assert_eq!(marked.len(), MAX_HEADER_LOCATORS);
+        assert_eq!(marked.first(), Some(&header_inventory_marker()));
+        assert_eq!(marked.get(1), locator.first());
+        assert_eq!(marked.last(), locator.last());
+        validate_identifiers(&marked, MAX_HEADER_LOCATORS, "header locator", true).unwrap();
+        let twice = corroboration_locator(&marked);
+        assert_eq!(twice, marked, "the marker is never duplicated");
+        let frame = PeerFrame {
+            sequence: 1,
+            message: PeerMessage::GetHeaders {
+                locator: marked,
+                stop: [0; 32],
+            },
+        };
+        let encoded = encode_peer_frame_for_network(&frame, NETWORK_ID).unwrap();
+        assert_eq!(decode_peer_frame(&encoded, NETWORK_ID).unwrap(), frame);
     }
 }

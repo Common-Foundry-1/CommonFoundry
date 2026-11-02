@@ -67,10 +67,14 @@ export interface WalletCatchUpStatus {
     | "catching_up"
     | "checking_newest"
     | "waiting_for_check";
-  /** With `waiting_for_check`: why the coins still wait. */
-  reason: "earlier_blocks" | "difficulty" | "other" | null;
+  /** Why a check waits, or why network freshness is still unknown. */
+  reason: "earlier_blocks" | "difficulty" | "other" | "source_tip_unknown" | null;
   /** Coins in blocks up to this height are available. */
   available_height: number;
+  /** Highest recent relay-reported height; advisory download target. */
+  target_height?: number | null;
+  /** Missing blocks to that target; null when recent source views are absent. */
+  download_blocks_left?: number | null;
   /** How many blocks the state still waits for; the wallet shows this number as is. */
   blocks_left: number;
   /** The newest blocks checked on this computer, up to `newest_needed`. */

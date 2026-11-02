@@ -161,6 +161,13 @@ fn pruned_node_keeps_history_restarts_reorganizes_and_refuses_deep_forks() {
     let pruned_block_id = node.active_block_id_at_height(tx_height).unwrap();
     let full_before = node.canonical_block(pruned_block_id).unwrap().unwrap();
     let full_before = decode_block(&full_before, node.params.network_id).unwrap();
+    let wallet_before = node.wallet_snapshot().unwrap();
+    assert!(
+        wallet_before
+            .history
+            .iter()
+            .any(|entry| entry.height == Some(100))
+    );
 
     // A valid competing block below the future prune point, built while
     // the proofs it needs are still stored.
@@ -178,6 +185,7 @@ fn pruned_node_keeps_history_restarts_reorganizes_and_refuses_deep_forks() {
     assert!(report.log_bytes_after < log_before);
     assert_eq!(node.prune_height(), Some(128));
     assert_eq!(node.state.tip(), tip);
+    assert_eq!(node.wallet_snapshot().unwrap(), wallet_before);
     for height in 1..=128 {
         assert!(node.block_is_pruned(node.active_block_id_at_height(height).unwrap()));
     }
@@ -249,13 +257,28 @@ fn pruned_node_keeps_history_restarts_reorganizes_and_refuses_deep_forks() {
     assert_eq!(tip_height(&node), 141);
     assert_eq!(node.state.tip(), parent);
     let tip = node.state.tip();
+    let wallet_before = node.wallet_snapshot().unwrap();
 
     // Restart from the startup snapshot.
     drop(node);
-    let node = Node::open_with_profile(&dir.0, DEVNET_PROFILE).unwrap();
+    let mut node = Node::open_with_profile(&dir.0, DEVNET_PROFILE).unwrap();
     assert!(node.startup_snapshot_used);
     assert_eq!(node.prune_height(), Some(128));
     assert_eq!(node.state.tip(), tip);
+    assert_eq!(node.wallet_snapshot().unwrap(), wallet_before);
+
+    // Rebuild the persistent address/transaction index from every retained
+    // record, including transactions below the prune anchor. Neither the
+    // balance nor the in-memory wallet history may start at that anchor.
+    drop(node);
+    fs::rename(
+        dir.0.join("startup-index.bin"),
+        dir.0.join("startup-index.bin.before-rebuild"),
+    )
+    .unwrap();
+    let mut node = Node::open_with_profile(&dir.0, DEVNET_PROFILE).unwrap();
+    assert!(node.startup_snapshot_used);
+    assert_eq!(node.wallet_snapshot().unwrap(), wallet_before);
 
     // Restart by replaying from the anchor, without a snapshot.
     drop(node);
@@ -270,6 +293,7 @@ fn pruned_node_keeps_history_restarts_reorganizes_and_refuses_deep_forks() {
     assert_eq!(node.prune_height(), Some(128));
     assert_eq!(node.state.tip(), tip);
     assert!(node.state.utxos().len() >= utxos_before);
+    assert_eq!(node.wallet_snapshot().unwrap(), wallet_before);
 
     // Mining continues and a later prune advances the anchor.
     node.prune_keep_blocks = Some(10);

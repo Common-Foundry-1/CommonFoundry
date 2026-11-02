@@ -1,6 +1,10 @@
 package org.commonfoundry.wallet.android
 
 import android.app.Activity
+import android.hardware.biometrics.BiometricManager
+import android.hardware.biometrics.BiometricPrompt
+import android.os.Build
+import android.os.CancellationSignal
 import android.content.Intent
 import android.net.Uri
 import android.util.Base64
@@ -14,6 +18,14 @@ import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
 import java.io.ByteArrayOutputStream
 import java.io.FileOutputStream
+import java.security.MessageDigest
+import javax.crypto.Cipher
+
+@InvokeArg
+class BiometricArgs {
+    var language: String = "en"
+    var dataBase64: String = ""
+}
 
 @InvokeArg
 class EncodedWalletArgs {
@@ -29,6 +41,183 @@ class SaveDocumentArgs {
 @TauriPlugin
 class CmfdAndroidPlugin(private val activity: Activity) : Plugin(activity) {
     private val secureStore = SecureWalletStore(activity.applicationContext)
+    private val biometricStore = BiometricWalletStore(activity.applicationContext)
+    private var foreground = true
+    private var biometricOperation: BiometricOperation? = null
+
+    private class BiometricOperation(
+        val invoke: Invoke,
+        val cipher: Cipher,
+        val binding: ByteArray,
+        val secret: ByteArray?,
+        val signal: CancellationSignal = CancellationSignal(),
+    ) {
+        fun clear() {
+            binding.fill(0)
+            secret?.fill(0)
+        }
+    }
+
+    override fun onResume() {
+        foreground = true
+    }
+
+    override fun onPause() {
+        foreground = false
+        cancelBiometricOperation()
+    }
+
+    @Suppress("OVERRIDE_DEPRECATION")
+    override fun onDestroy() {
+        cancelBiometricOperation()
+    }
+
+    private fun cancelBiometricOperation() {
+        val operation = biometricOperation ?: return
+        biometricOperation = null
+        operation.signal.cancel()
+        operation.clear()
+        operation.invoke.reject("biometric_cancelled")
+    }
+
+    @Suppress("DEPRECATION")
+    private fun biometricsAvailable(): Boolean = when {
+        Build.VERSION.SDK_INT >= 30 -> activity.getSystemService(BiometricManager::class.java)
+            ?.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG) == BiometricManager.BIOMETRIC_SUCCESS
+        Build.VERSION.SDK_INT >= 29 -> activity.getSystemService(BiometricManager::class.java)
+            ?.canAuthenticate() == BiometricManager.BIOMETRIC_SUCCESS
+        else -> activity.getSystemService(android.hardware.fingerprint.FingerprintManager::class.java)?.let {
+            it.isHardwareDetected && it.hasEnrolledFingerprints()
+        } == true
+    }
+
+    private fun walletBinding(): ByteArray {
+        val local = secureStore.load()
+        return try {
+            MessageDigest.getInstance("SHA-256").digest(local)
+        } finally {
+            local.fill(0)
+        }
+    }
+
+    @Command
+    fun biometricStatus(invoke: Invoke) {
+        try {
+            val binding = if (secureStore.exists()) walletBinding() else ByteArray(0)
+            try {
+                val result = JSObject()
+                result.put("available", biometricsAvailable())
+                result.put("enabled", binding.isNotEmpty() && biometricStore.isUsable(binding))
+                invoke.resolve(result)
+            } finally {
+                binding.fill(0)
+            }
+        } catch (_: Exception) {
+            invoke.reject("biometric_unavailable")
+        }
+    }
+
+    @Command
+    fun disableBiometrics(invoke: Invoke) {
+        activity.runOnUiThread {
+            try {
+                cancelBiometricOperation()
+                biometricStore.disable()
+                invoke.resolve()
+            } catch (_: Exception) {
+                invoke.reject("biometric_disable_failed")
+            }
+        }
+    }
+
+    @Command
+    fun enableBiometrics(invoke: Invoke) = startBiometricOperation(invoke, true)
+
+    @Command
+    fun unlockBiometrics(invoke: Invoke) = startBiometricOperation(invoke, false)
+
+    private fun startBiometricOperation(invoke: Invoke, enrolling: Boolean) {
+        activity.runOnUiThread {
+            if (!foreground || activity.isFinishing || activity.isDestroyed || biometricOperation != null) {
+                invoke.reject("biometric_unavailable")
+                return@runOnUiThread
+            }
+            var secret: ByteArray? = null
+            var binding = ByteArray(0)
+            try {
+                val args = invoke.parseArgs(BiometricArgs::class.java)
+                if (!biometricsAvailable()) throw IllegalStateException("biometric_unavailable")
+                binding = walletBinding()
+                if (enrolling) {
+                    require(args.dataBase64.length <= (BiometricWalletStore.MAX_SECRET_BYTES + 2) / 3 * 4)
+                    secret = Base64.decode(args.dataBase64, Base64.NO_WRAP)
+                    args.dataBase64 = ""
+                    require(secret.size in 12..BiometricWalletStore.MAX_SECRET_BYTES)
+                }
+                val cipher = if (enrolling) biometricStore.beginEnrollment(binding) else biometricStore.beginUnlock(binding)
+                val operation = BiometricOperation(invoke, cipher, binding, secret)
+                biometricOperation = operation
+                val french = args.language == "fr"
+                val builder = BiometricPrompt.Builder(activity)
+                    .setTitle(if (french) "Common Foundry — biométrie" else "Common Foundry — biometrics")
+                    .setSubtitle(if (enrolling) {
+                        if (french) "Activer le déverrouillage biométrique" else "Enable biometric unlock"
+                    } else {
+                        if (french) "Déverrouiller votre portefeuille" else "Unlock your wallet"
+                    })
+                    .setNegativeButton(if (french) "Annuler" else "Cancel", activity.mainExecutor) { _, _ ->
+                        if (biometricOperation === operation) cancelBiometricOperation()
+                    }
+                if (Build.VERSION.SDK_INT >= 30) {
+                    builder.setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
+                }
+                builder.build().authenticate(
+                    BiometricPrompt.CryptoObject(cipher), operation.signal, activity.mainExecutor,
+                    object : BiometricPrompt.AuthenticationCallback() {
+                        override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                            if (biometricOperation !== operation) return
+                            biometricOperation = null
+                            operation.clear()
+                            invoke.reject("biometric_authentication_failed")
+                        }
+
+                        override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                            if (biometricOperation !== operation) return
+                            biometricOperation = null
+                            var credential = ByteArray(0)
+                            var currentBinding = ByteArray(0)
+                            try {
+                                check(foreground && !activity.isFinishing && !activity.isDestroyed)
+                                check(result.cryptoObject?.cipher === operation.cipher)
+                                currentBinding = walletBinding()
+                                check(MessageDigest.isEqual(operation.binding, currentBinding))
+                                if (enrolling) {
+                                    biometricStore.finishEnrollment(operation.cipher, operation.secret!!, operation.binding)
+                                    invoke.resolve()
+                                } else {
+                                    credential = biometricStore.finishUnlock(operation.cipher, operation.binding)
+                                    val response = JSObject()
+                                    response.put("dataBase64", Base64.encodeToString(credential, Base64.NO_WRAP))
+                                    invoke.resolve(response) // Internal Rust bridge only; never returned to the WebView.
+                                }
+                            } catch (_: Exception) {
+                                invoke.reject("biometric_authentication_failed")
+                            } finally {
+                                credential.fill(0)
+                                currentBinding.fill(0)
+                                operation.clear()
+                            }
+                        }
+                    },
+                )
+            } catch (_: Exception) {
+                biometricOperation = null
+                secret?.fill(0)
+                binding.fill(0)
+                invoke.reject("biometric_unavailable")
+            }
+        }
+    }
 
     @Command
     fun localStatus(invoke: Invoke) {

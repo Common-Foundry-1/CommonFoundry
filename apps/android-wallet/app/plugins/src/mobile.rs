@@ -27,6 +27,49 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
 pub struct CmfdAndroid<R: Runtime>(PluginHandle<R>);
 
 impl<R: Runtime> CmfdAndroid<R> {
+    pub fn biometric_status(&self) -> crate::Result<BiometricStatus> {
+        self.0
+            .run_mobile_plugin("biometricStatus", ())
+            .map_err(Into::into)
+    }
+
+    pub fn enable_biometrics(&self, passphrase: &[u8], language: &str) -> crate::Result<()> {
+        self.0
+            .run_mobile_plugin(
+                "enableBiometrics",
+                BiometricRequest {
+                    language,
+                    data_base64: STANDARD.encode(passphrase),
+                },
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn unlock_biometrics(&self, language: &str) -> crate::Result<zeroize::Zeroizing<Vec<u8>>> {
+        let response: BiometricResponse = self.0.run_mobile_plugin(
+            "unlockBiometrics",
+            BiometricRequest {
+                language,
+                data_base64: String::new(),
+            },
+        )?;
+        let secret = zeroize::Zeroizing::new(
+            STANDARD
+                .decode(&response.data_base64)
+                .map_err(|_| crate::Error::InvalidNativePayload)?,
+        );
+        if !(12..=4096).contains(&secret.len()) {
+            return Err(crate::Error::InvalidNativePayload);
+        }
+        Ok(secret)
+    }
+
+    pub fn disable_biometrics(&self) -> crate::Result<()> {
+        self.0
+            .run_mobile_plugin("disableBiometrics", ())
+            .map_err(Into::into)
+    }
+
     pub fn local_status(&self) -> crate::Result<LocalWalletStatus> {
         self.0
             .run_mobile_plugin("localStatus", ())

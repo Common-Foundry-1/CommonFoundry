@@ -14,6 +14,25 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
 pub struct CmfdAndroid<R: Runtime>(AppHandle<R>);
 
 impl<R: Runtime> CmfdAndroid<R> {
+    pub fn biometric_status(&self) -> crate::Result<BiometricStatus> {
+        Ok(BiometricStatus {
+            available: false,
+            enabled: false,
+        })
+    }
+
+    pub fn enable_biometrics(&self, _passphrase: &[u8], _language: &str) -> crate::Result<()> {
+        Err(crate::Error::UnsupportedPlatform)
+    }
+
+    pub fn unlock_biometrics(&self, _language: &str) -> crate::Result<zeroize::Zeroizing<Vec<u8>>> {
+        Err(crate::Error::UnsupportedPlatform)
+    }
+
+    pub fn disable_biometrics(&self) -> crate::Result<()> {
+        Err(crate::Error::UnsupportedPlatform)
+    }
+
     pub fn local_status(&self) -> crate::Result<LocalWalletStatus> {
         Err(crate::Error::UnsupportedPlatform)
     }

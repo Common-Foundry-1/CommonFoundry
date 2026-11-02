@@ -11,7 +11,7 @@ use cmfd_wallet_core::{OutPoint, PaymentPlanner, Utxo, parse_cmfd};
 use cmfd_wallet_engine::{EngineStatus, WalletEngine};
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
-use tauri_plugin_cmfd_android::CmfdAndroidExt;
+use tauri_plugin_cmfd_android::{BiometricStatus, CmfdAndroidExt};
 use zeroize::Zeroizing;
 
 mod payments;
@@ -382,6 +382,8 @@ fn lock_wallet(
     state: State<'_, WalletState>,
     payments: State<'_, PaymentState>,
 ) -> Result<PublicWalletStatus, String> {
+    // An explicit lock also cancels authentication that is still in flight.
+    state.lifecycle_epoch.fetch_add(1, Ordering::AcqRel);
     lock_payments(&payments)?.clear_prepared();
     let local = app
         .cmfd_android()
@@ -390,6 +392,96 @@ fn lock_wallet(
     with_engine_status(&state, local.exists && !local.accessible, |engine| {
         engine.lock_external(local.exists)
     })
+}
+
+#[tauri::command]
+fn biometric_status(app: AppHandle) -> Result<BiometricStatus, String> {
+    app.cmfd_android()
+        .biometric_status()
+        .map_err(|_| biometric_failed())
+}
+
+#[tauri::command(async)]
+fn enable_biometrics(
+    app: AppHandle,
+    state: State<'_, WalletState>,
+    passphrase: String,
+    language: String,
+) -> Result<(), String> {
+    let passphrase = Zeroizing::new(passphrase);
+    if !(12..=4096).contains(&passphrase.len()) {
+        return Err(biometric_failed());
+    }
+    let local = Zeroizing::new(
+        app.cmfd_android()
+            .load_local()
+            .map_err(|_| biometric_failed())?,
+    );
+    let epoch = {
+        let engine = lock_engine(&state)?;
+        // Re-authenticate the passphrase against the active wallet before saving
+        // any biometric credential. The temporary backup never leaves native memory.
+        let _verified = Zeroizing::new(
+            engine
+                .export_external_authenticated(&local, passphrase.as_bytes())
+                .map_err(|_| biometric_failed())?,
+        );
+        engine.acquired_epoch
+    };
+    app.cmfd_android()
+        .enable_biometrics(passphrase.as_bytes(), &language)
+        .map_err(|_| biometric_failed())?;
+    if biometric_epoch_is_current(&state, epoch).is_err() {
+        let _ = app.cmfd_android().disable_biometrics();
+        return Err(biometric_failed());
+    }
+    Ok(())
+}
+
+#[tauri::command(async)]
+fn unlock_wallet_biometric(
+    app: AppHandle,
+    state: State<'_, WalletState>,
+    language: String,
+) -> Result<PublicWalletStatus, String> {
+    let epoch = lock_engine(&state)?.acquired_epoch;
+    let passphrase = app
+        .cmfd_android()
+        .unlock_biometrics(&language)
+        .map_err(|_| biometric_failed())?;
+    let local = Zeroizing::new(
+        app.cmfd_android()
+            .load_local()
+            .map_err(|_| biometric_failed())?,
+    );
+    let mut engine = biometric_epoch_is_current(&state, epoch)?;
+    let status = engine
+        .unlock_external(&local, &passphrase)
+        .map_err(|_| biometric_failed())?;
+    Ok(PublicWalletStatus::from_engine(status, false))
+}
+
+#[tauri::command(async)]
+fn disable_biometrics(app: AppHandle, state: State<'_, WalletState>) -> Result<(), String> {
+    let engine = lock_engine(&state)?;
+    engine
+        .external_destination()
+        .map_err(|_| biometric_failed())?;
+    app.cmfd_android()
+        .disable_biometrics()
+        .map_err(|_| biometric_failed())
+}
+
+fn biometric_epoch_is_current(state: &WalletState, epoch: u64) -> Result<WalletGuard<'_>, String> {
+    let engine = lock_engine(state)?;
+    if engine.acquired_epoch != epoch {
+        return Err(biometric_failed());
+    }
+    Ok(engine)
+}
+
+fn biometric_failed() -> String {
+    "biometric_authentication_failed".to_owned()
 }
 
 #[tauri::command]
@@ -1113,6 +1205,10 @@ pub fn run() {
             restore_wallet,
             unlock_wallet,
             lock_wallet,
+            biometric_status,
+            enable_biometrics,
+            disable_biometrics,
+            unlock_wallet_biometric,
             export_wallet,
             wallet_overview,
             send_availability,
@@ -1129,6 +1225,22 @@ pub fn run() {
 mod tests {
     use super::*;
     use cmfd_wallet_api::TransactionStatus;
+
+    #[test]
+    fn biometric_results_cannot_unlock_after_backgrounding_or_an_explicit_lock() {
+        let state = WalletState::new(WalletEngine::new(
+            std::env::temp_dir().join("cmfd-biometric-epoch"),
+        ));
+        let epoch = lock_engine(&state).unwrap().acquired_epoch;
+        assert!(biometric_epoch_is_current(&state, epoch).is_ok());
+        state.set_foreground(false);
+        assert!(biometric_epoch_is_current(&state, epoch).is_err());
+        state.set_foreground(true);
+        assert!(biometric_epoch_is_current(&state, epoch).is_err());
+        let epoch = lock_engine(&state).unwrap().acquired_epoch;
+        state.lifecycle_epoch.fetch_add(1, Ordering::AcqRel);
+        assert!(biometric_epoch_is_current(&state, epoch).is_err());
+    }
 
     fn remote_status(status: &str, confirmations: u64) -> TransactionStatus {
         TransactionStatus {

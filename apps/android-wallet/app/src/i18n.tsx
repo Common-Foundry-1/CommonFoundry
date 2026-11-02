@@ -15,6 +15,18 @@ export const LANGUAGE_STORAGE_KEY = "cmfd-wallet-language";
 export const THEME_STORAGE_KEY = "cmfd-wallet-theme";
 
 const en = {
+  biometricTitle: "Biometric unlock",
+  biometricDescription: "Use your fingerprint or supported secure face recognition to unlock on this phone. Keep your passphrase for recovery and backup export.",
+  biometricUnlockFirst: "Unlock your wallet with its passphrase to change this setting.",
+  biometricUnavailable: "Set up a strong biometric in Android settings. Some face unlock methods are not supported.",
+  biometricEnable: "Enable biometrics",
+  biometricDisable: "Disable biometrics",
+  biometricEnrollment: "Confirm your wallet passphrase, then authenticate with Android. An encrypted unlock credential is saved only on this phone, protected by a biometric Keystore key.",
+  biometricConfirm: "Confirm and enable biometrics",
+  biometricUnlock: "Unlock with biometrics",
+  biometricUnlockFailed: "Biometric unlock was cancelled or unavailable. Try again or use your passphrase. If you changed enrolled biometrics, enable this setting again after unlocking.",
+  biometricSetupFailed: "Biometric setup failed. Check your wallet passphrase and enrolled biometrics, then try again.",
+  biometricDisableFailed: "Could not disable biometric unlock. Unlock the wallet and try again.",
   appSubtitle: "Android Wallet",
   settings: "Settings",
   settingsTitle: "Settings",
@@ -163,6 +175,18 @@ const en = {
 } as const;
 
 const fr = {
+  biometricTitle: "Déverrouillage biométrique",
+  biometricDescription: "Utilisez votre empreinte ou une reconnaissance faciale sécurisée compatible sur ce téléphone. Gardez votre phrase secrète pour la récupération et l’exportation des sauvegardes.",
+  biometricUnlockFirst: "Déverrouillez le portefeuille avec sa phrase secrète pour modifier ce réglage.",
+  biometricUnavailable: "Configurez une biométrie forte dans les paramètres Android. Certaines méthodes de reconnaissance faciale ne sont pas compatibles.",
+  biometricEnable: "Activer la biométrie",
+  biometricDisable: "Désactiver la biométrie",
+  biometricEnrollment: "Confirmez la phrase secrète du portefeuille, puis authentifiez-vous avec Android. Un identifiant de déverrouillage chiffré reste uniquement sur ce téléphone, protégé par une clé Keystore biométrique.",
+  biometricConfirm: "Confirmer et activer la biométrie",
+  biometricUnlock: "Déverrouiller avec la biométrie",
+  biometricUnlockFailed: "Déverrouillage biométrique annulé ou indisponible. Réessayez ou utilisez la phrase secrète. Si la biométrie enregistrée a changé, réactivez ce réglage après le déverrouillage.",
+  biometricSetupFailed: "La configuration biométrique a échoué. Vérifiez la phrase secrète du portefeuille et la biométrie enregistrée, puis réessayez.",
+  biometricDisableFailed: "Impossible de désactiver la biométrie. Déverrouillez le portefeuille et réessayez.",
   appSubtitle: "Portefeuille Android",
   settings: "Paramètres",
   settingsTitle: "Paramètres",
@@ -468,6 +492,7 @@ export function localizedNativeMessage(
   language: Language,
   fallback: string,
 ): string {
+  if (message === "biometric_setup_failed") return translations[language].biometricSetupFailed;
   if (language === "fr") return message;
   return englishNativeMessages.get(message) ?? fallback;
 }

@@ -4,6 +4,10 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { App } from "./App";
 import { LANGUAGE_STORAGE_KEY, THEME_STORAGE_KEY } from "./i18n";
 import {
+  getBiometricStatus,
+  enableBiometrics,
+  disableBiometrics,
+  unlockWalletBiometric,
   confirmAndBroadcastPayment,
   exportWallet,
   getPendingPayments,
@@ -26,6 +30,10 @@ import {
 } from "@tauri-apps/plugin-barcode-scanner";
 
 vi.mock("./native", () => ({
+  getBiometricStatus: vi.fn(),
+  enableBiometrics: vi.fn(),
+  disableBiometrics: vi.fn(),
+  unlockWalletBiometric: vi.fn(),
   createWallet: vi.fn(),
   exportWallet: vi.fn(),
   getSendAvailability: vi.fn(),
@@ -62,10 +70,106 @@ const mockedReconcile = vi.mocked(reconcilePendingPayments);
 const ADDRESS = "cmfd10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vq4yhywr";
 const HEX_ADDRESS = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
 
+function lockedWallet() {
+  return {
+    configured: true, unlocked: false, recoveryRequired: false,
+    networkName: "CommonFoundry Mainnet", networkIdHex: "00".repeat(32),
+    destinationHex: null, address: null,
+  };
+}
+
+test("biometric unlock is opt-in and never prompts automatically", async () => {
+  localStorage.setItem(LANGUAGE_STORAGE_KEY, "en");
+  mockedStatus.mockResolvedValue(lockedWallet());
+  vi.mocked(getBiometricStatus).mockResolvedValue({ available: true, enabled: false });
+  render(<App />);
+  expect(await screen.findByRole("button", { name: "Unlock" })).toBeEnabled();
+  await waitFor(() => expect(getBiometricStatus).toHaveBeenCalled());
+  expect(screen.queryByRole("button", { name: "Unlock with biometrics" })).toBeNull();
+  expect(unlockWalletBiometric).not.toHaveBeenCalled();
+});
+
+test("biometric cancellation keeps wallet hidden and passphrase fallback usable", async () => {
+  localStorage.setItem(LANGUAGE_STORAGE_KEY, "en");
+  mockedStatus.mockResolvedValue(lockedWallet());
+  vi.mocked(getBiometricStatus).mockResolvedValue({ available: true, enabled: true });
+  vi.mocked(unlockWalletBiometric).mockRejectedValue("biometric_cancelled");
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "Unlock with biometrics" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("Try again or use your passphrase");
+  expect(screen.queryByText(ADDRESS)).toBeNull();
+  expect(screen.getByRole("button", { name: "Unlock" })).toBeEnabled();
+  expect(unlockWallet).not.toHaveBeenCalled();
+  expect(localStorage.length).toBe(2); // Language and theme only; no biometric credential.
+});
+
+test("biometric success unlocks only after the native result and prevents duplicate authentication", async () => {
+  localStorage.setItem(LANGUAGE_STORAGE_KEY, "en");
+  mockedStatus.mockResolvedValue(lockedWallet());
+  vi.mocked(getBiometricStatus).mockResolvedValue({ available: true, enabled: true });
+  let complete!: (wallet: Awaited<ReturnType<typeof getWalletStatus>>) => void;
+  vi.mocked(unlockWalletBiometric).mockImplementation(() => new Promise(resolve => { complete = resolve; }));
+  mockedOverview.mockResolvedValue({ confirmedAtoms: "0", spendableAtoms: "0", immatureAtoms: "0", acceptedHeight: 100, validatedHeight: 99, includesMempool: false, hasMoreHistory: false, history: [] });
+  mockedAvailability.mockResolvedValue({ available: false, message: null, nextHeight: null, utxoCount: 0, spendableAtoms: null, feeAtoms: null, maximumAtoms: null });
+  mockedPending.mockResolvedValue([]);
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "Unlock with biometrics" }));
+  expect(screen.getByRole("button", { name: "Unlock" })).toBeDisabled();
+  expect(screen.queryByText(ADDRESS)).toBeNull();
+  const unlocked = { ...lockedWallet(), unlocked: true, address: ADDRESS, destinationHex: HEX_ADDRESS };
+  mockedStatus.mockResolvedValue(unlocked);
+  complete(unlocked);
+  expect(await screen.findByRole("button", { name: "Lock" })).toBeVisible();
+  expect(unlockWalletBiometric).toHaveBeenCalledExactlyOnceWith("en");
+});
+
+test("biometric enrollment requires passphrase confirmation and can be disabled", async () => {
+  localStorage.setItem(LANGUAGE_STORAGE_KEY, "en");
+  vi.mocked(getBiometricStatus).mockResolvedValue({ available: true, enabled: false });
+  vi.mocked(enableBiometrics).mockResolvedValue();
+  vi.mocked(disableBiometrics).mockResolvedValue();
+  renderUnlockedWallet();
+  fireEvent.click(await screen.findByRole("button", { name: "Settings" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Enable biometrics" }));
+  const input = screen.getByLabelText("Passphrase");
+  fireEvent.change(input, { target: { value: "synthetic enrollment passphrase" } });
+  fireEvent.click(screen.getByRole("button", { name: "Confirm and enable biometrics" }));
+  expect(await screen.findByRole("button", { name: "Disable biometrics" })).toBeEnabled();
+  expect(enableBiometrics).toHaveBeenCalledExactlyOnceWith("synthetic enrollment passphrase", "en");
+  expect(screen.queryByLabelText("Passphrase")).toBeNull();
+  expect(Object.values(localStorage).join(" ")).not.toContain("synthetic enrollment passphrase");
+  fireEvent.click(screen.getByRole("button", { name: "Disable biometrics" }));
+  expect(await screen.findByRole("button", { name: "Enable biometrics" })).toBeEnabled();
+  expect(disableBiometrics).toHaveBeenCalledTimes(1);
+});
+
+test("failed biometric enrollment clears the passphrase and keeps the setting disabled", async () => {
+  localStorage.setItem(LANGUAGE_STORAGE_KEY, "en");
+  vi.mocked(getBiometricStatus).mockResolvedValue({ available: true, enabled: false });
+  vi.mocked(enableBiometrics).mockRejectedValue("biometric_authentication_failed");
+  renderUnlockedWallet();
+  fireEvent.click(await screen.findByRole("button", { name: "Settings" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Enable biometrics" }));
+  fireEvent.change(screen.getByLabelText("Passphrase"), { target: { value: "synthetic wrong passphrase" } });
+  fireEvent.click(screen.getByRole("button", { name: "Confirm and enable biometrics" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("Biometric setup failed");
+  expect(screen.getByLabelText("Passphrase")).toHaveValue("");
+  expect(screen.queryByRole("button", { name: "Disable biometrics" })).toBeNull();
+});
+
+test("unsupported devices keep passphrase unlock and cannot enable biometrics", async () => {
+  localStorage.setItem(LANGUAGE_STORAGE_KEY, "en");
+  renderUnlockedWallet();
+  fireEvent.click(await screen.findByRole("button", { name: "Settings" }));
+  expect(await screen.findByText(/Set up a strong biometric/)).toBeVisible();
+  expect(screen.getByRole("button", { name: "Enable biometrics" })).toBeDisabled();
+});
+
 beforeEach(() => {
   vi.clearAllMocks();
   localStorage.clear();
   localStorage.setItem(LANGUAGE_STORAGE_KEY, "fr");
+  vi.mocked(getBiometricStatus).mockResolvedValue({ available: false, enabled: false });
 });
 
 afterEach(() => {
@@ -514,7 +618,7 @@ test("opens settings from the CF brand before wallet creation and shows the real
 
   fireEvent.click(screen.getByRole("button", { name: "Paramètres" }));
   expect(await screen.findByRole("dialog", { name: "Paramètres" })).toBeVisible();
-  expect(screen.getByText("Version 0.1.2")).toBeVisible();
+  expect(screen.getByText("Version 0.1.3")).toBeVisible();
   expect(screen.getByRole("radio", { name: /Clair/ })).toBeChecked();
   expect(screen.getByRole("button", { name: "Ouvrir la sauvegarde du portefeuille" })).toBeDisabled();
 

@@ -10,6 +10,11 @@ import {
 } from "@tauri-apps/plugin-barcode-scanner";
 
 import {
+  getBiometricStatus,
+  enableBiometrics,
+  disableBiometrics,
+  unlockWalletBiometric,
+  type BiometricStatus,
   createWallet,
   confirmAndBroadcastPayment,
   exportWallet,
@@ -148,6 +153,7 @@ function WalletApplication() {
       {settingsOpen && (
         <SettingsPanel
           version={appPackage.version}
+          onWalletChange={updateWallet}
           backupAvailable={
             state.kind === "ready" && state.wallet.configured && state.wallet.unlocked
           }
@@ -172,12 +178,14 @@ function WalletApplication() {
 
 function SettingsPanel({
   version,
+  onWalletChange,
   backupAvailable,
   onOpenBackup,
   onOpenNotices,
   onClose,
 }: {
   version: string;
+  onWalletChange: (wallet: WalletStatus) => void;
   backupAvailable: boolean;
   onOpenBackup: () => void;
   onOpenNotices: () => Promise<void>;
@@ -268,6 +276,7 @@ function SettingsPanel({
 
         <section className="settings-section" aria-labelledby="wallet-settings-title">
           <h2 id="wallet-settings-title">{t("walletSection")}</h2>
+          <BiometricSettings unlocked={backupAvailable} onWalletChange={onWalletChange} />
           <button type="button" disabled={!backupAvailable} onClick={onOpenBackup}>
             {t("backupShortcut")}
           </button>
@@ -295,6 +304,80 @@ function SettingsPanel({
           {noticesError && <p className="inline-error" role="alert">{t("noticesLockFailed")}</p>}
         </section>
       </section>
+    </div>
+  );
+}
+
+function BiometricSettings({ unlocked, onWalletChange }: {
+  unlocked: boolean;
+  onWalletChange: (wallet: WalletStatus) => void;
+}) {
+  const { t, language } = useI18n();
+  const [status, setStatus] = useState<BiometricStatus | null>(null);
+  const [enrolling, setEnrolling] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    if (!unlocked) setEnrolling(false);
+    void getBiometricStatus().then(value => {
+      if (active) setStatus(value);
+    }).catch(() => { if (active) setStatus(null); });
+    return () => { active = false; };
+  }, [unlocked]);
+
+  const disable = async () => {
+    setBusy(true);
+    setFailed(false);
+    try {
+      await disableBiometrics();
+      setStatus(current => current && { ...current, enabled: false });
+    } catch {
+      setFailed(true);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="biometric-settings">
+      <h3>{t("biometricTitle")}</h3>
+      <p className="settings-help">{t("biometricDescription")}</p>
+      {!unlocked && <p className="settings-help">{t("biometricUnlockFirst")}</p>}
+      {status && !status.available && <p className="settings-help">{t("biometricUnavailable")}</p>}
+      {!enrolling && (
+        <button
+          type="button"
+          className="secondary"
+          disabled={!unlocked || !status || busy || (!status.enabled && !status.available)}
+          onClick={() => status?.enabled ? void disable() : setEnrolling(true)}
+        >
+          {busy ? t("secureProcessing") : status?.enabled ? t("biometricDisable") : t("biometricEnable")}
+        </button>
+      )}
+      {enrolling && unlocked && (
+        <PassphraseAction
+          title={t("biometricEnable")}
+          explanation={t("biometricEnrollment")}
+          submitLabel={t("biometricConfirm")}
+          action={async passphrase => {
+            try {
+              await enableBiometrics(passphrase, language);
+            } catch {
+              throw "biometric_setup_failed";
+            }
+            return getWalletStatus();
+          }}
+          onCancel={() => setEnrolling(false)}
+          onComplete={wallet => {
+            setEnrolling(false);
+            setStatus(current => current && { ...current, enabled: true });
+            onWalletChange(wallet);
+          }}
+        />
+      )}
+      {failed && <p className="inline-error" role="alert">{t("biometricDisableFailed")}</p>}
     </div>
   );
 }
@@ -354,7 +437,31 @@ function Unlock({
   wallet: WalletStatus;
   onComplete: (wallet: WalletStatus) => void;
 }) {
-  const { t } = useI18n();
+  const { t, language } = useI18n();
+  const [biometrics, setBiometrics] = useState<BiometricStatus | null>(null);
+  const [authBusy, setAuthBusy] = useState(false);
+  const [biometricError, setBiometricError] = useState(false);
+  useEffect(() => {
+    let active = true;
+    if (!wallet.recoveryRequired) {
+      void getBiometricStatus().then(value => {
+        if (active) setBiometrics(value);
+      }).catch(() => { if (active) setBiometrics(null); });
+    }
+    return () => { active = false; };
+  }, [wallet.recoveryRequired]);
+
+  const unlockBiometric = async () => {
+    setAuthBusy(true);
+    setBiometricError(false);
+    try {
+      onComplete(await unlockWalletBiometric(language));
+    } catch {
+      setBiometricError(true);
+    } finally {
+      setAuthBusy(false);
+    }
+  };
   if (wallet.recoveryRequired) {
     return (
       <section className="panel hero compact">
@@ -376,11 +483,25 @@ function Unlock({
       <p className="eyebrow">{t("walletLocked")}</p>
       <h1>{t("unlockRequired")}</h1>
       <p>{t("unlockPrivacy")}</p>
+      {biometrics?.enabled && (
+        <button type="button" disabled={authBusy || !biometrics.available} onClick={() => void unlockBiometric()}>
+          {authBusy ? t("secureProcessing") : t("biometricUnlock")}
+        </button>
+      )}
+      {biometricError && <p className="inline-error" role="alert">{t("biometricUnlockFailed")}</p>}
       <PassphraseAction
         title={t("passphrase")}
         explanation={t("passphraseExplanation")}
         submitLabel={t("unlock")}
-        action={unlockWallet}
+        disabled={authBusy}
+        action={async passphrase => {
+          setAuthBusy(true);
+          try {
+            return await unlockWallet(passphrase);
+          } finally {
+            setAuthBusy(false);
+          }
+        }}
         onComplete={onComplete}
       />
     </section>
@@ -392,6 +513,7 @@ function PassphraseAction({
   explanation,
   submitLabel,
   confirmation = false,
+  disabled = false,
   action,
   onComplete,
   onCancel,
@@ -400,6 +522,7 @@ function PassphraseAction({
   explanation: string;
   submitLabel: string;
   confirmation?: boolean;
+  disabled?: boolean;
   action: (passphrase: string) => Promise<WalletStatus>;
   onComplete: (wallet: WalletStatus) => void;
   onCancel?: () => void;
@@ -412,6 +535,7 @@ function PassphraseAction({
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
+    if (busy || disabled) return;
     let passphrase = passphraseRef.current?.value ?? "";
     const repeated = confirmationRef.current?.value ?? "";
     if (new TextEncoder().encode(passphrase).length < 12) {
@@ -454,7 +578,7 @@ function PassphraseAction({
       )}
       {error && <p className="inline-error" role="alert">{error}</p>}
       <div className="form-actions">
-        <button type="submit" disabled={busy}>{busy ? t("secureProcessing") : submitLabel}</button>
+        <button type="submit" disabled={busy || disabled}>{busy ? t("secureProcessing") : submitLabel}</button>
         {onCancel && (
           <button type="button" className="secondary" disabled={busy} onClick={onCancel}>{t("back")}</button>
         )}

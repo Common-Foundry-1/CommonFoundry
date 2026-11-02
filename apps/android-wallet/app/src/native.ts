@@ -1,5 +1,26 @@
 import { invoke } from "@tauri-apps/api/core";
 
+export interface BiometricStatus {
+  available: boolean;
+  enabled: boolean;
+}
+
+export function getBiometricStatus(): Promise<BiometricStatus> {
+  return invoke<BiometricStatus>("biometric_status");
+}
+
+export function enableBiometrics(passphrase: string, language: string): Promise<void> {
+  return invoke<void>("enable_biometrics", { passphrase, language });
+}
+
+export function disableBiometrics(): Promise<void> {
+  return invoke<void>("disable_biometrics");
+}
+
+export function unlockWalletBiometric(language: string): Promise<WalletStatus> {
+  return invoke<WalletStatus>("unlock_wallet_biometric", { language });
+}
+
 export interface WalletStatus {
   configured: boolean;
   unlocked: boolean;

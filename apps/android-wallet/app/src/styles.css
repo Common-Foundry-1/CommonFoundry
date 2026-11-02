@@ -275,3 +275,6 @@ input:focus { border-color: var(--brand); box-shadow: 0 0 0 3px var(--focus); }
   .history li { grid-template-columns: 1fr auto; }
   .history li > span { grid-column: 1 / -1; }
 }
+.biometric-settings {
+  margin-bottom: 1.5rem;
+}

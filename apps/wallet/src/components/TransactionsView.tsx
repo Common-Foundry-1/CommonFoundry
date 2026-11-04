@@ -2,15 +2,17 @@ import { ArrowRightLeft, ExternalLink, Layers3 } from "lucide-react";
 import { useExplorerLink } from "../hooks/useExplorerLink";
 import { formatAtoms, formatBytes, shortenHash } from "../lib/amount";
 import type { MempoolSnapshot, WalletSnapshot } from "../types";
+import type { useAutoConsolidation } from "../hooks/useAutoConsolidation";
 import { TransactionList } from "./TransactionList";
 
 interface TransactionsViewProps {
   wallet: WalletSnapshot | null;
   mempool: MempoolSnapshot | null;
   onConsolidate: () => void;
+  autoConsolidation: ReturnType<typeof useAutoConsolidation>;
 }
 
-export function TransactionsView({ wallet, mempool, onConsolidate }: TransactionsViewProps) {
+export function TransactionsView({ wallet, mempool, onConsolidate, autoConsolidation }: TransactionsViewProps) {
   const canConsolidate = (wallet?.spendable_utxo_count ?? 0) >= 2;
   const explorer = useExplorerLink();
 
@@ -57,6 +59,43 @@ export function TransactionsView({ wallet, mempool, onConsolidate }: Transaction
         </button>
         {!canConsolidate && wallet ? (
           <small>At least two spendable outputs are required.</small>
+        ) : null}
+        {autoConsolidation.available ? (
+          <div className="auto-consolidation">
+            <label className="auto-consolidation-toggle">
+              <input
+                type="checkbox"
+                checked={autoConsolidation.settings.enabled}
+                onChange={(event) => autoConsolidation.setSettings({
+                  ...autoConsolidation.settings, enabled: event.target.checked,
+                })}
+                disabled={!wallet || autoConsolidation.busy}
+              />
+              <span>Automatic consolidation</span>
+            </label>
+            <p>While this wallet is open, combine up to 128 mature outputs per batch. Each batch burns 0.1 CMFD; the fee must be at most 1% of its selected inputs.</p>
+            <label className="auto-consolidation-threshold" htmlFor="auto-consolidation-threshold">
+              Start at
+              <select
+                id="auto-consolidation-threshold"
+                value={autoConsolidation.settings.threshold}
+                onChange={(event) => autoConsolidation.setSettings({
+                  ...autoConsolidation.settings,
+                  threshold: Number(event.target.value) as 32 | 64 | 128 | 256,
+                })}
+                disabled={!wallet || !autoConsolidation.settings.enabled || autoConsolidation.busy}
+              >
+                {[32, 64, 128, 256].map((count) => <option key={count} value={count}>{count} outputs</option>)}
+              </select>
+            </label>
+            {autoConsolidation.settings.enabled ? (
+              <small role="status">{autoConsolidation.error ?? (autoConsolidation.busy
+                ? "Submitting one consolidation batch…"
+                : autoConsolidation.waitingForBlock ? "Waiting for the next accepted block."
+                  : autoConsolidation.coolingDown ? "Waiting 15 minutes between attempts."
+                    : autoConsolidation.reason ?? "Ready to consolidate.")}</small>
+            ) : null}
+          </div>
         ) : null}
       </aside>
 

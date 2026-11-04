@@ -17,6 +17,7 @@ import { UpdateBanner } from "./components/UpdateBanner";
 import { WalletSecurityDialog } from "./components/WalletSecurityDialog";
 import { WorkCheckNotice } from "./components/WorkCheckNotice";
 import { useWalletData } from "./hooks/useWalletData";
+import { useAutoConsolidation } from "./hooks/useAutoConsolidation";
 import type { WalletCustodyStatus } from "./types";
 
 const TITLES: Record<ViewName, { eyebrow: string; title: string }> = {
@@ -40,6 +41,9 @@ export function App() {
   // locked, so this must still show on the launch screen that follows.
   const [resyncNotice, setResyncNotice] = useState<string | null>(null);
   const data = useWalletData();
+  const autoConsolidation = useAutoConsolidation(
+    data.status, data.wallet, custody?.unlocked === true, data.error === null, data.lastUpdated, data.refresh,
+  );
   const networkShortName = data.status?.network_short_name ?? "Network";
   const heading = view === "network"
     ? { eyebrow: `${networkShortName} operations`, title: "Network" }
@@ -212,6 +216,7 @@ export function App() {
               wallet={data.wallet}
               mempool={data.mempool}
               onConsolidate={openConsolidation}
+              autoConsolidation={autoConsolidation}
             />
           ) : null}
           {view === "mining" ? (

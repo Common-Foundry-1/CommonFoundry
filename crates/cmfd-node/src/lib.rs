@@ -721,6 +721,8 @@ pub enum NodeError {
     WalletNotEnoughUtxos(usize),
     #[error("wallet consolidation fee must be less than its {input} atom input total")]
     WalletConsolidationFee { input: u64 },
+    #[error("wallet consolidation fee {fee} atoms exceeds the {max_basis_points} basis-point limit for {input} input atoms")]
+    WalletConsolidationFeeCap { fee: u64, input: u64, max_basis_points: u16 },
     #[error("RPC request is invalid: {0}")]
     InvalidRpcRequest(String),
     #[error("RPC I/O failed: {0}")]
@@ -868,6 +870,7 @@ impl NodeError {
             Self::InvalidConsolidationMaxInputs => ("invalid_consolidation_max_inputs", 400, false),
             Self::WalletNotEnoughUtxos(_) => ("wallet_not_enough_utxos", 422, false),
             Self::WalletConsolidationFee { .. } => ("wallet_consolidation_fee", 422, false),
+            Self::WalletConsolidationFeeCap { .. } => ("wallet_consolidation_fee_cap", 422, false),
             Self::InvalidRpcRequest(_) => ("invalid_request", 400, false),
             Self::RpcIo(_) => ("rpc_io", 500, true),
             Self::SharedNodePoisoned => ("shared_node_poisoned", 500, false),
@@ -3631,6 +3634,8 @@ pub struct WalletSendRequest {
 pub struct WalletConsolidateRequest {
     pub fee: String,
     pub max_inputs: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_fee_basis_points: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -7354,13 +7359,26 @@ impl Node {
             return Err(NodeError::InvalidConsolidationMaxInputs);
         }
         let fee = parse_cmfd_atoms(&request.fee)?;
-        self.consolidate_dev_wallet(fee, request.max_inputs)
+        self.consolidate_dev_wallet_with_fee_cap(
+            fee,
+            request.max_inputs,
+            request.max_fee_basis_points,
+        )
     }
 
     pub fn consolidate_dev_wallet(
         &mut self,
         fee_burned: u64,
         max_inputs: usize,
+    ) -> Result<WalletConsolidateResponse, NodeError> {
+        self.consolidate_dev_wallet_with_fee_cap(fee_burned, max_inputs, None)
+    }
+
+    fn consolidate_dev_wallet_with_fee_cap(
+        &mut self,
+        fee_burned: u64,
+        max_inputs: usize,
+        max_fee_basis_points: Option<u16>,
     ) -> Result<WalletConsolidateResponse, NodeError> {
         validate_wallet_minimum_fee(self.params.network_id, fee_burned)?;
         if self.exchange_custody_v3_wallet_state.locks_native_wallet() {
@@ -7398,6 +7416,19 @@ impl Node {
         let input_atoms = selected
             .iter()
             .try_fold(0_u64, |total, (_, value)| checked_wallet_add(total, *value))?;
+        if let Some(max_basis_points) = max_fee_basis_points {
+            if max_basis_points == 0
+                || max_basis_points > 10_000
+                || u128::from(fee_burned) * 10_000
+                    > u128::from(input_atoms) * u128::from(max_basis_points)
+            {
+                return Err(NodeError::WalletConsolidationFeeCap {
+                    fee: fee_burned,
+                    input: input_atoms,
+                    max_basis_points,
+                });
+            }
+        }
         let output_atoms = input_atoms
             .checked_sub(fee_burned)
             .filter(|value| *value > 0)
@@ -20885,6 +20916,7 @@ mod tests {
         let consolidation = WalletConsolidateRequest {
             fee: "0.00001000".to_owned(),
             max_inputs: 128,
+            max_fee_basis_points: None,
         };
         assert_eq!(
             serde_json::to_value(&consolidation).unwrap(),
@@ -21067,6 +21099,7 @@ mod tests {
             node.consolidate_dev_wallet_request(WalletConsolidateRequest {
                 fee: "0.00001000".to_owned(),
                 max_inputs: 1,
+                max_fee_basis_points: None,
             }),
             Err(NodeError::InvalidConsolidationMaxInputs)
         ));
@@ -22995,6 +23028,14 @@ mod tests {
         assert!(matches!(
             node.consolidate_dev_wallet(0, MAX_TRANSACTION_INPUTS),
             Err(NodeError::MempoolFeeTooLow { .. })
+        ));
+        assert!(matches!(
+            node.consolidate_dev_wallet_with_fee_cap(
+                split_total / 50,
+                MAX_TRANSACTION_INPUTS,
+                Some(100),
+            ),
+            Err(NodeError::WalletConsolidationFeeCap { .. })
         ));
         assert!(node.mempool.is_empty());
 

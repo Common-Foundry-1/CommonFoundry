@@ -151,6 +151,14 @@ selects mature, unreserved outputs smallest-first, with a requested maximum of
 reserve their inputs; mine the current consolidation before submitting the next
 batch.
 
+The installed wallet also offers **Automatic consolidation** on Transactions.
+It is off by default and saved for the current network and wallet address.
+While the wallet is open and unlocked, it waits for a healthy node and a
+connected peer at the same chain tip, then submits at most one batch of 128
+eligible outputs when the chosen threshold is reached. It skips pending wallet
+activity, waits for another block and at least 15 minutes between attempts,
+and burns 0.1 CMFD only when that fee is at most 1% of the selected inputs.
+
 Each new data directory creates a distinct unencrypted Schnorr test key in
 `wallet.key`. Stop the node before backing up that exact 32-byte file and never
 share it. Unix creation requests mode `0600`; Windows relies on the containing

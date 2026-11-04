@@ -234,6 +234,7 @@ export interface WalletSendResult {
 export interface ConsolidationRequest {
   fee: string;
   max_inputs: number;
+  max_fee_basis_points?: number;
 }
 
 export interface ConsolidationResult {

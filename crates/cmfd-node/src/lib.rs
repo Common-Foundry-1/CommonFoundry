@@ -7418,18 +7418,17 @@ impl Node {
         let input_atoms = selected
             .iter()
             .try_fold(0_u64, |total, (_, value)| checked_wallet_add(total, *value))?;
-        if let Some(max_basis_points) = max_fee_basis_points {
-            if max_basis_points == 0
+        if let Some(max_basis_points) = max_fee_basis_points
+            && (max_basis_points == 0
                 || max_basis_points > 10_000
                 || u128::from(fee_burned) * 10_000
-                    > u128::from(input_atoms) * u128::from(max_basis_points)
-            {
-                return Err(NodeError::WalletConsolidationFeeCap {
-                    fee: fee_burned,
-                    input: input_atoms,
-                    max_basis_points,
-                });
-            }
+                    > u128::from(input_atoms) * u128::from(max_basis_points))
+        {
+            return Err(NodeError::WalletConsolidationFeeCap {
+                fee: fee_burned,
+                input: input_atoms,
+                max_basis_points,
+            });
         }
         let output_atoms = input_atoms
             .checked_sub(fee_burned)

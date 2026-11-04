@@ -118,7 +118,7 @@ describe("Common Foundry wallet", () => {
     expect(screen.getByRole("heading", { name: "Opening your wallet" })).toBeInTheDocument();
     expect(screen.getByRole("progressbar", { name: "Wallet startup progress" })).toHaveAttribute(
       "aria-valuetext",
-      "Authenticating and loading",
+      "Starting your wallet",
     );
     expect(screen.queryByText(/testnet/i)).not.toBeInTheDocument();
   });

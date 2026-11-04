@@ -39,6 +39,17 @@ export interface WalletCustodyStatus {
   launch?: { mining_start_utc: string; ready: boolean; error: string | null } | null;
 }
 
+export interface WalletStartupStatus {
+  phase: 'checking_inputs' | 'opening_data' | 'loading_snapshot' | 'scanning_history' | 'checking_proofs' | 'preparing_balances' | 'connecting' | 'ready' | 'waiting_for_unlock' | 'failed';
+  completed: number;
+  total: number | null;
+  elapsed_seconds: number;
+  seconds_since_progress: number;
+  active: boolean;
+  available_disk_bytes: number | null;
+  error: {code: string; message: string; retryable: boolean} | null;
+}
+
 export interface ProofAdmissionClassTelemetry {
   active: number;
   queued: number;

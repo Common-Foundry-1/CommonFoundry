@@ -84,6 +84,21 @@
   100% { transform: translateX(250%); }
 }
 
+.wallet-startup-status { width: 100%; margin: 20px 0; text-align: left; line-height: 1.5; }
+.wallet-startup-status h3 { margin: 0 0 8px; font-size: 17px; }
+.wallet-startup-status p { margin: 8px 0; font-size: 14px; }
+.wallet-startup-status .startup-progress { margin: 20px 0 12px; background: rgba(117,116,113,.22); }
+.startup-progress.is-measured span, .startup-progress.is-complete span { animation: none; transform: none; transition: width .4s ease; }
+.startup-progress.is-complete span { width: 100%; background: var(--green-600); }
+.startup-count { display: block; font-size: 14px; font-variant-numeric: tabular-nums; }
+.wallet-startup-status .startup-elapsed { font-size: 13px; opacity: .8; font-variant-numeric: tabular-nums; }
+.startup-guidance { padding-top: 8px; border-top: 1px solid rgba(117,116,113,.3); }
+.startup-warning { padding: 12px; border: 1px solid #b75c31; border-radius: 7px; background: rgba(221,92,28,.08); overflow-wrap: anywhere; }
+.startup-copy { margin-top: 8px; padding: 6px 0; border: 0; background: none; color: var(--copper-600); font-size: 13px; text-decoration: underline; }
+.startup-card .startup-copy { color: #ffc09d; }
+.startup-copy-result { font-size: 12px; }
+@media (max-width: 540px) { .startup-screen { padding: 16px; } .startup-card { padding: 32px 22px; } }
+
 @media (prefers-reduced-motion: reduce) {
   .startup-progress span {
     width: 100%;

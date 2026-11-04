@@ -11,6 +11,7 @@ import {
   unlockWallet,
 } from "../api/nodeClient";
 import type { WalletCustodyStatus } from "../types";
+import {WalletStartupProgress} from './WalletStartupProgress';
 
 type CustodyAction = "create" | "unlock" | "backup" | "migrate" | "restore";
 
@@ -56,6 +57,7 @@ export function WalletSecurityDialog({
   const [confirmation, setConfirmation] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [startupAttempted, setStartupAttempted] = useState(false);
 
   useEffect(() => {
     if (!open) return;
@@ -64,6 +66,7 @@ export function WalletSecurityDialog({
     setPassphrase("");
     setConfirmation("");
     setError(null);
+    setStartupAttempted(false);
   }, [open, status?.storage, status?.unlocked]);
 
   useEffect(() => {
@@ -99,6 +102,7 @@ export function WalletSecurityDialog({
 
   if (!open) return null;
 
+  const openingNode = action === 'unlock' && (!status?.launch || status.launch.ready);
   const needsPath = action === "create" || action === "backup" || action === "migrate" || action === "restore";
   const needsConfirmation = action === "create" || action === "migrate";
   const passphraseLabel = action === "unlock" || action === "restore" || action === "backup"
@@ -130,6 +134,7 @@ export function WalletSecurityDialog({
     setPassphrase("");
     setConfirmation("");
     setBusy(true);
+    if (openingNode) setStartupAttempted(true);
     try {
       const next = action === "create"
         ? await createWallet(path, submittedPassphrase)
@@ -209,13 +214,13 @@ export function WalletSecurityDialog({
         role="dialog"
         aria-modal="true"
         aria-labelledby="wallet-security-title"
-        aria-busy={busy}
+        aria-busy={busy && !(openingNode && startupAttempted)}
         tabIndex={-1}
       >
         <div className="dialog-header">
           <div>
             <p className="dialog-eyebrow">Local key custody</p>
-            <h2 className="dialog-title" id="wallet-security-title">{title}</h2>
+            <h2 className="dialog-title" id="wallet-security-title">{busy && openingNode ? 'Opening your wallet' : title}</h2>
           </div>
           {!required ? (
             <button className="button-icon" type="button" onClick={onClose} disabled={busy} aria-label="Close wallet security">
@@ -272,6 +277,8 @@ export function WalletSecurityDialog({
                   : "Your passphrase is sent only to the local desktop process and is never saved by the wallet interface."}
           </p>
 
+          {startupAttempted && openingNode ? <WalletStartupProgress failure={busy ? null : error} /> : null}
+
           {needsPath ? (
             <div className="form-field">
               <label htmlFor="custody-path">{action === "restore" ? "Backup file to restore" : "New backup file"}</label>
@@ -292,7 +299,7 @@ export function WalletSecurityDialog({
             </div>
           ) : null}
 
-          <div className="form-field">
+          <div className="form-field" style={busy && openingNode ? {display: 'none'} : undefined}>
             <label htmlFor="custody-passphrase">{passphraseLabel}</label>
             <input
               id="custody-passphrase"
@@ -319,13 +326,13 @@ export function WalletSecurityDialog({
             </div>
           ) : null}
 
-          {error ? <p className="form-error form-error-summary" role="alert">{error}</p> : null}
+          {error && !(startupAttempted && openingNode) ? <p className="form-error form-error-summary" role="alert">{error}</p> : null}
 
           <div className="dialog-actions">
             {!required ? <button className="button-secondary" type="button" onClick={onClose} disabled={busy}>Cancel</button> : null}
             <button className="button-primary" type="submit" disabled={busy || !status}>
               {busy ? <RefreshCw className="spin" aria-hidden="true" size={16} /> : action === "restore" || action === "backup" || action === "migrate" ? <HardDriveDownload aria-hidden="true" size={16} /> : <KeyRound aria-hidden="true" size={16} />}
-              {busy ? "Working…" : title}
+              {busy ? openingNode ? 'Opening wallet…' : "Working…" : title}
             </button>
           </div>
         </form>

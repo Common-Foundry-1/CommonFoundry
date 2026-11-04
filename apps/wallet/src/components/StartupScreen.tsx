@@ -1,23 +1,14 @@
 import brandMark from "../assets/common-foundry-mark.png";
+import {WalletStartupProgress} from './WalletStartupProgress';
 
 export function StartupScreen() {
   return (
     <main className="startup-screen" aria-labelledby="startup-title">
-      <section className="startup-card" role="status" aria-live="polite">
+      <section className="startup-card">
         <img className="startup-mark" src={brandMark} alt="" />
         <span className="startup-eyebrow">Common Foundry Wallet</span>
         <h1 id="startup-title">Opening your wallet</h1>
-        <p className="startup-message">
-          Authenticating proof inputs and replaying local chain history.
-        </p>
-        <div
-          className="startup-progress"
-          role="progressbar"
-          aria-label="Wallet startup progress"
-          aria-valuetext="Authenticating and loading"
-        >
-          <span />
-        </div>
+        <WalletStartupProgress />
       </section>
     </main>
   );

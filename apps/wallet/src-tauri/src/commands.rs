@@ -241,6 +241,13 @@ pub async fn stop_mining(state: State<'_, RuntimeState>) -> Result<MiningStatus,
 }
 
 #[tauri::command]
+pub async fn get_wallet_startup_status(
+    state: State<'_, RuntimeState>,
+) -> Result<crate::runtime::StartupStatus, NodeClientError> {
+    Ok(state.handle().startup_status())
+}
+
+#[tauri::command]
 pub async fn get_wallet_custody_status(
     state: State<'_, RuntimeState>,
 ) -> Result<WalletCustodyStatus, NodeClientError> {

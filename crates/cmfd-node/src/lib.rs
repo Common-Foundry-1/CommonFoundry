@@ -118,6 +118,7 @@ mod real_fork_checkpoint_tests;
 ))]
 mod rpc_host_guard_tests;
 pub mod seed_peers;
+pub mod startup_progress;
 pub use history_scrub::{HistoryScrub, spawn_history_scrub};
 use pruning::StoredBlock;
 pub use pruning::{
@@ -5982,6 +5983,7 @@ impl Node {
             "startup: wallet key loaded"
         );
 
+        startup_progress::report(startup_progress::Phase::LoadingSnapshot, 0, None);
         let restored =
             startup_snapshot::load_startup_snapshot(&data_dir, &log, &log_path, params, &verifier)?;
         let (state, index, replay, startup_snapshot_used, history_verified) = match restored {
@@ -12983,6 +12985,13 @@ fn replay_log_into(
 
     // A pruned log starts with its pruned prefix; replay begins at the anchor.
     let root = install_pruned_prefix(data_dir, &scanned, index, state, verifier, params)?;
+    let pruned_records = index.blocks.len();
+    let proof_total = scanned.records.len().saturating_sub(pruned_records) as u64;
+    startup_progress::report(
+        startup_progress::Phase::CheckingProofs,
+        0,
+        Some(proof_total),
+    );
     let (mut winning_tip, mut winning_work, mut winning_record_index) =
         match index.blocks.get(&root) {
             Some(entry) => (root, entry.cumulative_work, entry.locator.ordinal),
@@ -13195,6 +13204,19 @@ fn replay_log_into(
                 next_child: 0,
                 undo: Some(undo),
             });
+            let checked = index.blocks.len().saturating_sub(pruned_records) as u64;
+            startup_progress::report(
+                startup_progress::Phase::CheckingProofs,
+                checked,
+                Some(proof_total),
+            );
+            if checked.is_multiple_of(64) || checked == proof_total {
+                tracing::info!(
+                    checked,
+                    total = proof_total,
+                    "startup proof replay progress"
+                );
+            }
             continue;
         }
 
@@ -13276,6 +13298,7 @@ fn replay_log_into(
             "startup DFS did not return to its root after visiting every record".to_owned(),
         ));
     }
+    startup_progress::report(startup_progress::Phase::PreparingBalances, 0, None);
     let mut active_chain = Vec::with_capacity(
         usize::try_from(
             index
@@ -13446,6 +13469,12 @@ fn scan_replay_log(
     let mut last_pruned = params.genesis_hash;
     let mut pruned_height = 0_u64;
     let started = Instant::now();
+    let scan_bytes = reader
+        .get_ref()
+        .metadata()
+        .ok()
+        .map(|metadata| metadata.len());
+    startup_progress::report(startup_progress::Phase::ScanningHistory, 0, scan_bytes);
     tracing::info!(
         bytes = reader
             .get_ref()
@@ -13459,6 +13488,7 @@ fn scan_replay_log(
             .stream_position()
             .map_err(|source| io_error("locate block log record", path, source))?;
         if record_index > 0 && record_index.is_multiple_of(1_000) {
+            startup_progress::report(startup_progress::Phase::ScanningHistory, offset, scan_bytes);
             tracing::info!(
                 records = record_index,
                 bytes = offset,
@@ -13475,6 +13505,11 @@ fn scan_replay_log(
                 address_entries = addresses.entry_count(),
                 seconds = started.elapsed().as_secs(),
                 "block log scanned"
+            );
+            startup_progress::report(
+                startup_progress::Phase::ScanningHistory,
+                log_length,
+                scan_bytes,
             );
             return Ok(ScannedReplayLog {
                 records,

@@ -14,6 +14,7 @@ fn main() {
         "start_mining",
         "stop_mining",
         "get_wallet_custody_status",
+        "get_wallet_startup_status",
         "unlock_wallet",
         "lock_wallet",
         "backup_wallet",

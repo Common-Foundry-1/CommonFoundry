@@ -1,7 +1,6 @@
 use std::fs;
 use std::io::Write as _;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 #[cfg(all(feature = "production-rc", target_os = "windows"))]
 use std::process::Command;
@@ -38,6 +37,8 @@ mod config;
 mod launch;
 mod peers;
 mod power;
+mod startup;
+pub(crate) use startup::StartupStatus;
 
 pub(crate) use config::{ConfigError, NodeRuntimeConfig, ProcessCommand};
 use config::{
@@ -98,6 +99,7 @@ struct RuntimeParts {
 pub(crate) struct RuntimeHandle {
     inner: Arc<Mutex<RuntimeParts>>,
     operation: Arc<Mutex<()>>,
+    startup: Arc<startup::StartupState>,
     stopping: Arc<AtomicBool>,
     /// "Restart to update" waits for sends and custody operations.
     update: Arc<RestartGuard>,
@@ -221,6 +223,7 @@ impl RuntimeState {
                 Err(error) => RuntimeParts::failed(error.clone()),
             })),
             operation: Arc::new(Mutex::new(())),
+            startup: Arc::default(),
             stopping,
             update: Arc::default(),
             launch,
@@ -313,6 +316,7 @@ impl RuntimeState {
             handle: RuntimeHandle {
                 inner: Arc::new(Mutex::new(RuntimeParts::failed(error))),
                 operation: Arc::new(Mutex::new(())),
+                startup: Arc::default(),
                 stopping: Arc::new(AtomicBool::new(false)),
                 update: Arc::default(),
                 config: NodeRuntimeConfig::default_for_test(),
@@ -333,6 +337,7 @@ impl RuntimeState {
             handle: RuntimeHandle {
                 inner: Arc::new(Mutex::new(RuntimeParts::starting())),
                 operation: Arc::new(Mutex::new(())),
+                startup: Arc::default(),
                 stopping: Arc::new(AtomicBool::new(false)),
                 update: Arc::default(),
                 config: NodeRuntimeConfig::default_for_test(),
@@ -345,16 +350,21 @@ impl RuntimeState {
 }
 
 impl RuntimeHandle {
+    pub(crate) fn startup_status(&self) -> StartupStatus {
+        self.startup.snapshot(self.data_dir.as_deref().ok())
+    }
+
     /// Starts the node in the background, as at launch.
     fn spawn_startup(&self, startup_data_dir: PathBuf) {
         let config = self.config.clone();
         let startup_inner = Arc::clone(&self.inner);
         let startup_stopping = Arc::clone(&self.stopping);
         let startup_update = Arc::clone(&self.update);
+        let startup_progress = Arc::clone(&self.startup);
         let spawn = thread::Builder::new()
             .name("cmfd-wallet-startup".to_owned())
             .spawn(move || {
-                let started = catch_unwind(AssertUnwindSafe(|| {
+                let started = startup_progress.run(|| {
                     let wallet_passphrase = config
                         .wallet_passphrase_file
                         .as_deref()
@@ -363,9 +373,7 @@ impl RuntimeHandle {
                         .map_err(|error| {
                             startup_error(
                                 "wallet_passphrase_file",
-                                format!(
-                                    "The wallet passphrase file could not be used: {error}"
-                                ),
+                                format!("The wallet passphrase file could not be used: {error}"),
                                 false,
                             )
                         })?;
@@ -377,13 +385,6 @@ impl RuntimeHandle {
                         &startup_stopping,
                         &startup_update,
                     )
-                }))
-                .unwrap_or_else(|_| {
-                    Err(startup_error(
-                        "node_startup_panicked",
-                        "The embedded node stopped unexpectedly during startup. Reopen the wallet and inspect its log if this repeats.",
-                        true,
-                    ))
                 });
 
                 if let Ok(mut runtime) = startup_inner.lock() {
@@ -469,6 +470,10 @@ impl RuntimeHandle {
 
     pub(crate) fn unlock(&self, passphrase: &[u8]) -> Result<WalletCustodyStatus, NodeClientError> {
         let _operation = self.operation.lock().map_err(|_| runtime_state_error())?;
+        self.startup.run(|| self.unlock_inner(passphrase))
+    }
+
+    fn unlock_inner(&self, passphrase: &[u8]) -> Result<WalletCustodyStatus, NodeClientError> {
         let started_at = Instant::now();
         tracing::info!("unlock received");
         self.update.refuse_if_exiting()?;
@@ -767,14 +772,16 @@ impl RuntimeHandle {
                 None
             }
         };
-        let started = start_embedded_node(
-            data_dir,
-            &self.config,
-            passphrase.as_ref().map(|value| value.as_slice()),
-            Duration::ZERO,
-            &self.stopping,
-            &self.update,
-        );
+        let started = self.startup.run(|| {
+            start_embedded_node(
+                data_dir,
+                &self.config,
+                passphrase.as_ref().map(|value| value.as_slice()),
+                Duration::ZERO,
+                &self.stopping,
+                &self.update,
+            )
+        });
         *self.inner.lock().map_err(|_| runtime_state_error())? = match started {
             Ok(started) => RuntimeParts::ready(started),
             Err(error) => RuntimeParts::failed(error),
@@ -966,6 +973,7 @@ fn start_embedded_node(
     cmfd_node::mainnet_runtime::ensure_compiled_launch_ready()
         .map_err(|error| error.client_error())?;
     let security = prepare_node_security(COMPILED_NETWORK_PROFILE, config)?;
+    cmfd_node::startup_progress::report(cmfd_node::startup_progress::Phase::OpeningData, 0, None);
     let PreparedNodeSecurity {
         production_v3_record,
         production_v4_artifacts,
@@ -1011,6 +1019,7 @@ fn start_embedded_node(
     )
     .map_err(|error| sanitize_node_startup_error(COMPILED_NETWORK_PROFILE, error))?;
     // The stored blocks were replayed inside the open.
+    cmfd_node::startup_progress::report(cmfd_node::startup_progress::Phase::Connecting, 0, None);
     update.mark_data_opened();
     node.configure_pruning(config.prune_keep_blocks)
         .map_err(|error| startup_error("prune_setting_invalid", error.to_string(), false))?;
@@ -2499,6 +2508,25 @@ mod tests {
     }
 
     #[test]
+    fn startup_status_does_not_wait_for_the_custody_or_node_state_lock() {
+        let state = RuntimeState::starting_for_test();
+        let handle = state.handle();
+        let custody = handle.operation.lock().unwrap();
+        let node_state = handle.inner.lock().unwrap();
+        let reader = handle.clone();
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || send.send(reader.startup_status()).unwrap());
+        let result = receive.recv_timeout(Duration::from_secs(2));
+        drop(node_state);
+        drop(custody);
+        worker.join().unwrap();
+        assert!(
+            result.is_ok(),
+            "startup status was blocked by the wallet's startup locks"
+        );
+    }
+
+    #[test]
     fn a_resync_is_refused_unless_the_stored_chain_cannot_be_kept() {
         let files = TestFiles::new();
         let log = files.write("blocks.log", b"stored chain");
@@ -2508,6 +2536,7 @@ mod tests {
                 ..RuntimeParts::starting()
             })),
             operation: Arc::new(Mutex::new(())),
+            startup: Arc::default(),
             stopping: Arc::new(AtomicBool::new(false)),
             update: Arc::default(),
             config: NodeRuntimeConfig::default_for_test(),

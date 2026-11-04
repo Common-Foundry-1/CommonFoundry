@@ -47,6 +47,47 @@ fn scrub(node: Node) -> Node {
 }
 
 #[test]
+fn startup_progress_reports_actual_scans_and_successful_proof_checks() {
+    let path = test_dir("startup-progress-replay");
+    let mut node = Node::open(&path).unwrap();
+    for _ in 0..3 {
+        mine(&mut node);
+    }
+    drop(node);
+    for slot in ["startup-state.0.bin", "startup-state.1.bin"] {
+        let file = path.join(slot);
+        if file.exists() {
+            fs::remove_file(file).unwrap();
+        }
+    }
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let events = Arc::clone(&seen);
+    let node = startup_progress::observe(
+        Arc::new(move |event| events.lock().unwrap().push(event)),
+        || Node::open(&path),
+    )
+    .unwrap();
+    assert_eq!(node.state.next_height(), 4);
+    let events = seen.lock().unwrap();
+    assert!(events.iter().any(
+        |event| event.phase == startup_progress::Phase::ScanningHistory
+            && event.total == Some(event.completed)
+    ));
+    let checks: Vec<_> = events
+        .iter()
+        .filter(|event| event.phase == startup_progress::Phase::CheckingProofs)
+        .map(|event| (event.completed, event.total))
+        .collect();
+    assert_eq!(
+        checks,
+        vec![(0, Some(3)), (1, Some(3)), (2, Some(3)), (3, Some(3))]
+    );
+    drop(events);
+    drop(node);
+    clean_test_dir(&path);
+}
+
+#[test]
 fn fast_start_reads_only_new_records_and_matches_a_full_scan() {
     let path = test_dir("fast-start");
     let (early, late, _) = history(&path);

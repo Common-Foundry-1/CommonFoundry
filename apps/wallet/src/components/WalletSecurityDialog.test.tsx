@@ -13,6 +13,7 @@ const apiMocks = vi.hoisted(() => ({
   migrateWalletEncryption: vi.fn(),
   restoreWallet: vi.fn(),
   unlockWallet: vi.fn(),
+  getWalletStartupStatus: vi.fn(),
 }));
 
 vi.mock("../api/nodeClient", () => apiMocks);
@@ -51,6 +52,20 @@ function renderDialog(status: WalletCustodyStatus) {
 }
 
 describe("WalletSecurityDialog", () => {
+  it('shows live progress while an unlock is still waiting on the node', async () => {
+    const user = userEvent.setup();
+    let finish!: (value: WalletCustodyStatus) => void;
+    apiMocks.unlockWallet.mockReturnValue(new Promise<WalletCustodyStatus>(resolve => {finish = resolve;}));
+    apiMocks.getWalletStartupStatus.mockResolvedValue({phase:'checking_proofs',completed:7,total:20,elapsed_seconds:45,seconds_since_progress:1,active:true,error:null,available_disk_bytes:20*2**30});
+    renderDialog(locked);
+    await user.type(screen.getByLabelText('Wallet passphrase'), 'correct horse battery staple');
+    await user.click(screen.getByRole('button',{name:'Unlock wallet'}));
+    expect(await screen.findByText('7 of 20 stored blocks checked')).toBeInTheDocument();
+    expect(screen.getByRole('button',{name:'Copy startup details'})).toBeEnabled();
+    expect(screen.getByLabelText('Wallet passphrase')).toHaveValue('');
+    expect(screen.getByLabelText('Wallet passphrase')).not.toBeVisible();
+    await act(async () => {finish(unlocked);});
+  });
   it("creates an encrypted wallet and backup without starting the node", async () => {
     const user = userEvent.setup();
     const prepared = { ...locked, destination: "11".repeat(32) };

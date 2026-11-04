@@ -212,6 +212,7 @@ pub fn run() -> i32 {
             commands::start_mining,
             commands::stop_mining,
             commands::get_wallet_custody_status,
+            commands::get_wallet_startup_status,
             commands::unlock_wallet,
             commands::lock_wallet,
             commands::backup_wallet,

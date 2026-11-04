@@ -9,6 +9,7 @@ import type {
   WalletSendRequest,
   WalletSendResult,
   WalletCustodyStatus,
+  WalletStartupStatus,
   WalletSnapshot,
 } from "../types";
 import { invoke } from "@tauri-apps/api/core";
@@ -53,6 +54,7 @@ export interface NodeTransport {
   consolidateWallet(payload: ConsolidationRequest): Promise<ConsolidationResult>;
   mineDevnetBlock(miner: string, attempts?: number): Promise<MineResult>;
   getWalletCustodyStatus(): Promise<WalletCustodyStatus>;
+  getWalletStartupStatus(): Promise<WalletStartupStatus | null>;
   unlockWallet(passphrase: string): Promise<WalletCustodyStatus>;
   lockWallet(): Promise<WalletCustodyStatus>;
   backupWallet(path: string, passphrase: string): Promise<WalletCustodyStatus>;
@@ -136,6 +138,7 @@ export const httpNodeTransport: NodeTransport = {
     });
   },
   getWalletCustodyStatus: () => custodyUnavailable(),
+  getWalletStartupStatus: () => Promise.resolve(null),
   unlockWallet: () => custodyUnavailable(),
   lockWallet: () => custodyUnavailable(),
   backupWallet: () => custodyUnavailable(),
@@ -271,6 +274,7 @@ export function createTauriNodeTransport(invoke: NativeInvoke): NodeTransport {
       invoke,
       "get_wallet_custody_status",
     ),
+    getWalletStartupStatus: () => nativeCall<WalletStartupStatus>(invoke, "get_wallet_startup_status"),
     unlockWallet: (passphrase) => nativeCall<WalletCustodyStatus>(
       invoke,
       "unlock_wallet",
@@ -358,6 +362,10 @@ export function mineDevnetBlock(
 
 export function getWalletCustodyStatus(): Promise<WalletCustodyStatus> {
   return transport.getWalletCustodyStatus();
+}
+
+export function getWalletStartupStatus(): Promise<WalletStartupStatus | null> {
+  return transport.getWalletStartupStatus();
 }
 
 export function unlockWallet(passphrase: string): Promise<WalletCustodyStatus> {

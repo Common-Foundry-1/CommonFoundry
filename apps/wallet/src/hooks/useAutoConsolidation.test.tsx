@@ -39,6 +39,10 @@ describe("automatic consolidation", () => {
   it("requires an unlocked wallet, healthy matching tip, and no pending wallet activity", () => {
     expect(autoConsolidationReason(status, wallet, false, 64)).toMatch(/unlock/);
     expect(autoConsolidationReason({ ...status, storage_healthy: false }, wallet, true, 64)).toMatch(/storage/);
+    expect(autoConsolidationReason({ ...status, work_rule: {
+      halted: false, engine_ready: true, unsettled_height: null,
+      wallet_catch_up: { state: "catching_up", download_blocks_left: 4 },
+    } } as NodeStatus, wallet, true, 64)).toMatch(/catch up/);
     expect(autoConsolidationReason({ ...status, peers: [] }, wallet, true, 64)).toMatch(/peer/);
     expect(autoConsolidationReason(status, { ...wallet, reserved_utxo_count: 1 }, true, 64)).toMatch(/pending/);
     expect(autoConsolidationReason(status, { ...wallet, history: [{ status: "pending" }] } as WalletSnapshot, true, 64)).toMatch(/pending/);

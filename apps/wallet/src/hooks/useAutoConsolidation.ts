@@ -65,6 +65,14 @@ export function autoConsolidationReason(
   if (!unlocked) return "Waiting for wallet unlock.";
   if (!status || !wallet) return "Waiting for node data.";
   if (!status.storage_healthy) return "Waiting for healthy node storage.";
+  const workRule = status.work_rule;
+  if (workRule && (workRule.halted || !workRule.engine_ready || workRule.unsettled_height !== null)) {
+    return "Waiting for healthy block checks.";
+  }
+  const catchUp = workRule?.wallet_catch_up;
+  if (catchUp && (catchUp.state !== "caught_up" || catchUp.download_blocks_left !== 0)) {
+    return "Waiting for the wallet to catch up with the network.";
+  }
   if (status.network !== wallet.network || status.accepted_height !== wallet.accepted_height) {
     return "Waiting for a consistent chain snapshot.";
   }

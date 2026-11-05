@@ -6,7 +6,7 @@ Technical White Paper, Version 1.0 (mainnet edition), October 2026
 
 Common Foundry
 
-> **Mainnet is live.** Mining opened on 3 October 2026 at 17:00 UTC. The current release is 1.0.16, and its release checkpoint is block 20,912. Source: https://github.com/Common-Foundry-1/CommonFoundry. Explorer: https://explorer.commonfoundry.ai.
+> **Mainnet is live.** Mining opened on 3 October 2026 at 17:00 UTC. This October 2026 edition describes release 1.0.16 and its checkpoint at block 20,912. For the newest signed software and qualification limits, see the [release list](https://github.com/Common-Foundry-1/CommonFoundry/releases). Source: https://github.com/Common-Foundry-1/CommonFoundry. Explorer: https://explorer.commonfoundry.ai.
 
 ---
 
@@ -37,7 +37,7 @@ This edition describes the network as it runs today: the consensus rules, the pr
 | Split during the bootstrap | 70% miner, 25% steward, 5% community |
 | Tail reward | 5 CMFD per block, miner only, from block 2,628,001 |
 | Fees | Minimum 0.1 CMFD per transaction; every fee is burned |
-| Current release | 1.0.16, release checkpoint 20,912 |
+| Release documented in this edition | 1.0.16, release checkpoint 20,912; see [newer releases](https://github.com/Common-Foundry-1/CommonFoundry/releases) |
 | Addresses | 64-character hex, or checksummed `cmfd1...` (from 1.0.16) |
 
 ### 1.2 How to read this paper

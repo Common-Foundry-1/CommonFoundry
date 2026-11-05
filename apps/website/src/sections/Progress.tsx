@@ -48,7 +48,7 @@ export function Progress() {
           </p>
         </div>
         <p className="release-line">
-          <strong>Latest desktop release</strong>
+          <strong>Desktop release (Nov 4, 2026)</strong>
           <span>·</span>
           <a href={`https://github.com/Common-Foundry-1/CommonFoundry/releases/tag/${MAINNET_RELEASE_VERSION}`} target="_blank" rel="noopener noreferrer"><code>{MAINNET_RELEASE_VERSION}</code></a>
         </p>

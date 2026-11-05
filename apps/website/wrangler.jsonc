@@ -1,0 +1,8 @@
+{
+  "name": "commonfoundry",
+  "pages_build_output_dir": "./dist",
+  "compatibility_date": "2026-08-22",
+  // Explorer is another Worker in this account. Route fixed public reads through
+  // its public endpoint rather than bypassing its Worker and security rules.
+  "compatibility_flags": ["global_fetch_strictly_public"]
+}

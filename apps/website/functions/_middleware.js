@@ -10,6 +10,7 @@ export const markdownRoutes = Object.freeze({
   "/docs/whitepaper/": "whitepaper.md",
   "/docs/mcp/": "mcp.md",
   "/docs/skills/": "skills.md",
+  "/docs/webmcp/": "webmcp.md",
 });
 
 export function prefersMarkdown(accept = "") {

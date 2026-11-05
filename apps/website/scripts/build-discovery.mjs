@@ -27,6 +27,7 @@ const guides = [
   ...Object.values(GUIDES).map(({ title, path }) => ({ title, url: `https://commonfoundry.ai${path}` })),
   { title: "Agent skills: review and install", url: "https://commonfoundry.ai/docs/skills/" },
   { title: "Browser tools: WebMCP pilot", url: "https://commonfoundry.ai/docs/webmcp/" },
+  { title: "Connect an assistant to private GPU rental status", url: "https://commonfoundry.ai/docs/marketplace-auth/" },
   ...skills.map((skill) => ({ title: skill.name, description: skill.description, url: `https://commonfoundry.ai${skill.url}` })),
 ];
 await mkdir("dist/agent-tools", { recursive: true });

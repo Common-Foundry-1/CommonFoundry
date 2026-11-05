@@ -11,6 +11,7 @@ export const markdownRoutes = Object.freeze({
   "/docs/mcp/": "mcp.md",
   "/docs/skills/": "skills.md",
   "/docs/webmcp/": "webmcp.md",
+  "/docs/marketplace-auth/": "marketplace-auth.md",
 });
 
 export function prefersMarkdown(accept = "") {

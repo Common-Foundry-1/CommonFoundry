@@ -22,6 +22,7 @@
 ## MCP tools
 - [Public MCP connection guide](https://commonfoundry.ai/docs/mcp/)
 - [MCP server card](https://commonfoundry.ai/.well-known/mcp/server-card.json)
+- [User-approved private rental status](https://commonfoundry.ai/docs/marketplace-auth/)
 
 ## Agent skills
 - [Review and install setup skills](https://commonfoundry.ai/docs/skills/)

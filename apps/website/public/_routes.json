@@ -1,5 +1,23 @@
 {
   "version": 1,
-  "include": ["/", "/learn/*", "/docs/api/*", "/docs/whitepaper/*", "/docs/mcp/*", "/docs/skills/*", "/docs/webmcp/*", "/mcp", "/.well-known/agent-skills/*"],
-  "exclude": ["/learn/guide.css"]
+  "include": [
+    "/",
+    "/learn/*",
+    "/docs/api/*",
+    "/docs/whitepaper/*",
+    "/docs/mcp/*",
+    "/docs/skills/*",
+    "/docs/webmcp/*",
+    "/mcp",
+    "/.well-known/agent-skills/*",
+    "/rent/mcp",
+    "/rent/auth/*",
+    "/.well-known/oauth-authorization-server",
+    "/.well-known/oauth-protected-resource",
+    "/.well-known/oauth-protected-resource/rent/mcp",
+    "/docs/marketplace-auth/*"
+  ],
+  "exclude": [
+    "/learn/guide.css"
+  ]
 }

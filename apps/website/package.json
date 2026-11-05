@@ -8,6 +8,7 @@
     "build": "tsc -b && vite build && node scripts/build-agent-text.mjs && node scripts/build-discovery.mjs",
     "test:mcp": "node --test scripts/mcp.node.mjs",
     "test:webmcp": "node --test scripts/webmcp.node.mjs",
+    "test:rental-auth": "node --test scripts/rental-auth-proxy.node.mjs",
     "verify:mcp": "node scripts/verify-mcp-live.mjs",
     "verify:skills": "node scripts/verify-skills-live.mjs",
     "test:discovery": "node --test scripts/agent-discovery.node.mjs",

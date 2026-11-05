@@ -2,13 +2,18 @@
   "linkset": [
     {
       "anchor": "https://commonfoundry.ai/.well-known/api-catalog",
-      "item": [{"href": "https://explorer.commonfoundry.ai/", "title": "Common Foundry public chain data"}]
+      "item": [{"href": "https://explorer.commonfoundry.ai/", "title": "Common Foundry public chain data"}, {"href": "https://commonfoundry.ai/mcp", "title": "Common Foundry public MCP service"}]
     },
     {
       "anchor": "https://explorer.commonfoundry.ai/",
       "service-desc": [{"href": "https://commonfoundry.ai/openapi.json", "type": "application/json"}],
       "service-doc": [{"href": "https://commonfoundry.ai/docs/api/", "type": "text/html"}],
       "service-meta": [{"href": "https://commonfoundry.ai/auth.md", "type": "text/markdown"}]
+    },
+    {
+      "anchor": "https://commonfoundry.ai/mcp",
+      "service-desc": [{"href": "https://commonfoundry.ai/.well-known/mcp/server-card.json", "type": "application/json"}],
+      "service-doc": [{"href": "https://commonfoundry.ai/docs/mcp/", "type": "text/html"}]
     }
   ]
 }

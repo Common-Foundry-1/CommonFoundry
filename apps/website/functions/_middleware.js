@@ -6,6 +6,7 @@ export const markdownRoutes = Object.freeze({
   "/learn/gpu-renting/": "gpu-renting.md",
   "/docs/api/": "api.md",
   "/docs/whitepaper/": "whitepaper.md",
+  "/docs/mcp/": "mcp.md",
 });
 
 export function prefersMarkdown(accept = "") {

@@ -7,6 +7,10 @@ in https://commonfoundry.ai/openapi.json is hosted at
 https://explorer.commonfoundry.ai. Its documented GET endpoints require no
 registration, login, API key, cookie, or Authorization header.
 
+The public MCP service at https://commonfoundry.ai/mcp also requires no
+credentials. Its POST transport carries only read-only tools and resources;
+see https://commonfoundry.ai/docs/mcp/ for connection instructions and limits.
+
 ## Discover the public API
 
 1. Read the catalog at https://commonfoundry.ai/.well-known/api-catalog.

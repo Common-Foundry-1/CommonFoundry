@@ -1,5 +1,5 @@
 {
   "version": 1,
-  "include": ["/", "/learn/*", "/docs/api/*", "/docs/whitepaper/*"],
+  "include": ["/", "/learn/*", "/docs/api/*", "/docs/whitepaper/*", "/docs/mcp/*", "/mcp"],
   "exclude": ["/learn/guide.css"]
 }

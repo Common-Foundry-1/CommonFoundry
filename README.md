@@ -24,9 +24,9 @@ over a batch of 128 rows, computed exactly in the KoalaBear field against a
 fixed 6 GiB model bank, with a 12,025,320-byte transparent proof in every
 block. From release 1.0.16, nodes also re-execute each new block's work above
 the release checkpoint before they accept it. Released source is on the
-`release/v*` branches and `v*` tags (the current release is
-[v1.0.16](https://github.com/Common-Foundry-1/CommonFoundry/tree/v1.0.16));
-`main` carries ongoing development.
+`release/v*` branches and `v*` tags; check the
+[release list](https://github.com/Common-Foundry-1/CommonFoundry/releases)
+for the newest signed package and its qualification limits. `main` carries ongoing development.
 
 ## Research history and developer networks
 

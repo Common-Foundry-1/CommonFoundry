@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "include": ["/", "/learn/*", "/docs/api/*", "/docs/whitepaper/*"],
+  "exclude": ["/learn/guide.css"]
+}

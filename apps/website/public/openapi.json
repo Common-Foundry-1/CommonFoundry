@@ -1,0 +1,63 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Common Foundry public chain data",
+    "version": "2026-11-05",
+    "description": "A documented subset of public, read-only explorer endpoints. No registration or credentials are required. Responses describe an observed chain snapshot, not a promise of service availability or final settlement. Additional fields may be added."
+  },
+  "servers": [{"url": "https://explorer.commonfoundry.ai"}],
+  "externalDocs": {"url": "https://commonfoundry.ai/docs/api/"},
+  "security": [],
+  "paths": {
+    "/api/supply": {
+      "get": {
+        "operationId": "getSupply",
+        "summary": "Read mainnet supply and burned fees at an observed chain tip",
+        "responses": {
+          "200": {
+            "description": "Supply values; CMFD quantities and atom counts are decimal strings. Circulating supply excludes the current steward and community balances. A permanent tail means max_supply is null.",
+            "content": {"application/json": {"schema": {
+              "type": "object",
+              "required": ["network", "height", "tip", "total_supply", "total_supply_atoms", "circulating_supply", "circulating_supply_atoms", "burned_fees", "burned_fees_atoms", "max_supply"],
+              "properties": {
+                "network": {"type": "string"},
+                "height": {"type": "integer", "minimum": 0},
+                "tip": {"type": "string"},
+                "total_supply": {"$ref": "#/components/schemas/CmfdAmount"},
+                "total_supply_atoms": {"$ref": "#/components/schemas/Atoms"},
+                "circulating_supply": {"$ref": "#/components/schemas/CmfdAmount"},
+                "circulating_supply_atoms": {"$ref": "#/components/schemas/Atoms"},
+                "burned_fees": {"$ref": "#/components/schemas/CmfdAmount"},
+                "burned_fees_atoms": {"$ref": "#/components/schemas/Atoms"},
+                "max_supply": {"type": "null"},
+                "excluded_from_circulating": {"type": "array", "items": {"type": "object", "additionalProperties": true}},
+                "definition": {"type": "string"}
+              },
+              "additionalProperties": true
+            }}}
+          },
+          "429": {"description": "Too many requests; honor Retry-After when present."},
+          "5XX": {"description": "Data temporarily unavailable; back off and retry later."}
+        }
+      }
+    },
+    "/v1/explorer": {
+      "get": {
+        "operationId": "getExplorerSnapshot",
+        "summary": "Read a bounded chain, peer, mempool, and recent activity snapshot",
+        "responses": {
+          "200": {
+            "description": "Live explorer JSON snapshot. Height and network fields should be checked before interpreting recent activity. This endpoint does not expose private wallet keys or perform writes.",
+            "content": {"application/json": {"schema": {"type": "object", "additionalProperties": true}}}
+          },
+          "429": {"description": "Too many requests; honor Retry-After when present."},
+          "5XX": {"description": "Data temporarily unavailable; back off and retry later."}
+        }
+      }
+    }
+  },
+  "components": {"schemas": {
+    "CmfdAmount": {"type": "string", "pattern": "^[0-9]+\\.[0-9]{8}$", "description": "CMFD amount with eight decimal places; use decimal arithmetic."},
+    "Atoms": {"type": "string", "pattern": "^[0-9]+$", "description": "Integer atoms as a string. One CMFD equals 100000000 atoms."}
+  }}
+}

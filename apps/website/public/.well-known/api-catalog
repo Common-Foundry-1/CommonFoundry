@@ -1,0 +1,14 @@
+{
+  "linkset": [
+    {
+      "anchor": "https://commonfoundry.ai/.well-known/api-catalog",
+      "item": [{"href": "https://explorer.commonfoundry.ai/", "title": "Common Foundry public chain data"}]
+    },
+    {
+      "anchor": "https://explorer.commonfoundry.ai/",
+      "service-desc": [{"href": "https://commonfoundry.ai/openapi.json", "type": "application/json"}],
+      "service-doc": [{"href": "https://commonfoundry.ai/docs/api/", "type": "text/html"}],
+      "service-meta": [{"href": "https://commonfoundry.ai/auth.md", "type": "text/markdown"}]
+    }
+  ]
+}

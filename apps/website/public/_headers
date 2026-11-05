@@ -4,3 +4,18 @@
   Referrer-Policy: strict-origin-when-cross-origin
   X-Content-Type-Options: nosniff
   X-Frame-Options: DENY
+  Link: </.well-known/api-catalog>; rel="api-catalog"; type="application/linkset+json", </openapi.json>; rel="service-desc"; type="application/json", </docs/api/>; rel="service-doc"; type="text/html", </llms.txt>; rel="describedby"; type="text/plain"
+
+/.well-known/api-catalog
+  Content-Type: application/linkset+json; profile="https://www.rfc-editor.org/info/rfc9727"
+  Cache-Control: public, max-age=300
+
+/auth.md
+  Content-Type: text/markdown; charset=utf-8
+
+/openapi.json
+  Content-Type: application/json; charset=utf-8
+
+/agent-text/*
+  Content-Type: text/markdown; charset=utf-8
+  Cache-Control: public, max-age=300

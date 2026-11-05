@@ -23,4 +23,8 @@
 - [Public MCP connection guide](https://commonfoundry.ai/docs/mcp/)
 - [MCP server card](https://commonfoundry.ai/.well-known/mcp/server-card.json)
 
+## Agent skills
+- [Review and install setup skills](https://commonfoundry.ai/docs/skills/)
+- [Agent skills discovery index](https://commonfoundry.ai/.well-known/agent-skills/index.json)
+
 Request the homepage or guide URLs with Accept: text/markdown for a Markdown representation.

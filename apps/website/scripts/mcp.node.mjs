@@ -35,9 +35,9 @@ function setup({ fetcher, now, burstGuard } = {}) {
   } };
 }
 
-async function connected(options = {}) {
+async function connected(options = {}, clientOptions = {}) {
   const s = setup(options);
-  const client = new Client({ name: "cmfd-protocol-test", version: "1.0.0" });
+  const client = new Client({ name: "cmfd-protocol-test", version: "1.0.0" }, clientOptions);
   const transport = new StreamableHTTPClientTransport(new URL("https://commonfoundry.ai/mcp"), {
     fetch: (input, init) => s.send(new Request(input, init)),
   });
@@ -68,6 +68,15 @@ test("a real MCP client lists the read-only surface and calls both public data t
     assert.equal(supply.structuredContent.data.total_supply_atoms, "5000000000000");
     assert.ok(requests.every((r) => r.method === "GET" && r.url.startsWith("https://explorer.commonfoundry.ai/")));
     assert.ok(requests.every((r) => !Object.keys(r.headers).some((h) => /authorization|cookie/i.test(h))));
+  } finally { await client.close(); }
+});
+
+test("a pinned modern MCP client discovers and executes without a legacy handshake", async () => {
+  const { client } = await connected({}, { versionNegotiation: { mode: { pin: "2026-07-28" } } });
+  try {
+    assert.equal((await client.listTools()).tools.length, 3);
+    const status = await client.callTool({ name: "get_network_status", arguments: {} });
+    assert.equal(status.structuredContent.data.network_id, MAINNET_ID);
   } finally { await client.close(); }
 });
 
@@ -131,6 +140,18 @@ test("upstream failures are tool errors instead of fabricated live data", async 
     assert.match(result.content[0].text, /upstream_unavailable/);
     assert.equal(result.structuredContent, undefined);
   } finally { await client.close(); }
+});
+
+test("public upstream redirects are never followed to another destination", async () => {
+  let requests = 0;
+  const read = createPublicDataReader({ cacheProvider: async () => null, fetcher: async (url, init) => {
+    requests++;
+    assert.equal(url, "https://explorer.commonfoundry.ai/v1/explorer");
+    assert.equal(init.redirect, "manual");
+    return new Response(null, { status: 302, headers: { Location: "https://untrusted.example/" } });
+  } });
+  await assert.rejects(read("status"), /upstream_unavailable/);
+  assert.equal(requests, 1);
 });
 
 test("atom quantities must remain strings to prevent silent precision loss", () => {

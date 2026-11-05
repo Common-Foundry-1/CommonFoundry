@@ -1,5 +1,5 @@
 {
   "version": 1,
-  "include": ["/", "/learn/*", "/docs/api/*", "/docs/whitepaper/*", "/docs/mcp/*", "/mcp"],
+  "include": ["/", "/learn/*", "/docs/api/*", "/docs/whitepaper/*", "/docs/mcp/*", "/docs/skills/*", "/mcp", "/.well-known/agent-skills/*"],
   "exclude": ["/learn/guide.css"]
 }

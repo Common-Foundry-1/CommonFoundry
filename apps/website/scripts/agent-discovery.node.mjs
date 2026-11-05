@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { createHash } from "node:crypto";
+import { SKILL_NAMES } from "../server/skill-info.mjs";
 import { markdownRoutes, onRequest, prefersMarkdown } from "../functions/_middleware.js";
 
 function context({ accept, method = "GET", path = "/", missing = false } = {}) {
@@ -98,4 +100,31 @@ test("catalog description links resolve to built files and advertise only creden
   assert.equal(api.openapi, "3.1.0");
   assert.deepEqual(api.security, []);
   for (const path of Object.values(api.paths)) assert.deepEqual(Object.keys(path), ["get"]);
+});
+
+test("skill discovery describes the exact served artifacts and their metadata", async () => {
+  const index = JSON.parse(await readFile("dist/.well-known/agent-skills/index.json", "utf8"));
+  assert.equal(index.$schema, "https://schemas.agentskills.io/discovery/0.2.0/schema.json");
+  assert.deepEqual(index.skills.map((skill) => skill.name), SKILL_NAMES);
+  for (const skill of index.skills) {
+    assert.equal(skill.type, "skill-md");
+    const bytes = await readFile(`dist${skill.url}`);
+    assert.equal(skill.digest, `sha256:${createHash("sha256").update(bytes).digest("hex")}`);
+    const text = bytes.toString("utf8");
+    assert.ok(text.startsWith(`---\nname: ${skill.name}\ndescription: ${skill.description}\n---\n`) ||
+      text.startsWith(`---\r\nname: ${skill.name}\r\ndescription: ${skill.description}\r\n---\r\n`));
+    assert.doesNotMatch(text, /\[TODO:|<script|<html/i);
+  }
+});
+
+test("missing skill files return genuine 404s instead of the site HTML shell", async () => {
+  for (const path of ["/.well-known/agent-skills/unknown/SKILL.md", "/.well-known/agent-skills/cmfd-mining-setup/missing.md"]) {
+    const response = await onRequest(context({ path }));
+    assert.equal(response.status, 404);
+    assert.match(response.headers.get("Content-Type"), /^text\/plain/);
+    assert.doesNotMatch(await response.text(), /<h1>/);
+  }
+  const response = await onRequest(context({ path: "/.well-known/agent-skills/unknown/SKILL.md", method: "HEAD" }));
+  assert.equal(response.status, 404);
+  assert.equal(await response.text(), "");
 });

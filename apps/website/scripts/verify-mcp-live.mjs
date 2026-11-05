@@ -19,7 +19,10 @@ const fetchBounded = async (input, init) => {
   }
   return response;
 };
-const client = new Client({ name: "cmfd-public-service-verification", version: "1.0.0" });
+const modern = process.argv[4] === "modern";
+const client = new Client({ name: "cmfd-public-service-verification", version: "1.0.0" }, modern ? {
+  versionNegotiation: { mode: { pin: "2026-07-28" } },
+} : {});
 try {
   await client.connect(new StreamableHTTPClientTransport(url, { fetch: fetchBounded }));
   const list = await client.listTools();
@@ -40,7 +43,7 @@ try {
   const card = JSON.parse(cardResult.contents[0].text);
   assert.equal(card.serverInfo.name, "common-foundry-public");
   const report = { endpoint: url.href, checkedUtc: new Date().toISOString(), passed: true,
-    serviceVersion: card.serverInfo.version, tools: list.tools.map((t) => t.name), resourceCount: resources.resources.length,
+    serviceVersion: card.serverInfo.version, protocolMode: modern ? "2026-07-28" : "legacy", tools: list.tools.map((t) => t.name), resourceCount: resources.resources.length,
     networkId: status.structuredContent.data.network_id, acceptedHeight: status.structuredContent.data.accepted_height,
     supplyHeight: supply.structuredContent.data.height, statusFetchedAt: status.structuredContent.fetchedAt,
     supplyFetchedAt: supply.structuredContent.fetchedAt, guideRead: "mining", invalidInputRejected: true, exchanges };

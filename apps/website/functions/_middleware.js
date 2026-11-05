@@ -1,3 +1,5 @@
+import { SKILL_NAMES } from "../server/skill-info.mjs";
+
 export const markdownRoutes = Object.freeze({
   "/": "home.md",
   "/learn/": "learn.md",
@@ -7,6 +9,7 @@ export const markdownRoutes = Object.freeze({
   "/docs/api/": "api.md",
   "/docs/whitepaper/": "whitepaper.md",
   "/docs/mcp/": "mcp.md",
+  "/docs/skills/": "skills.md",
 });
 
 export function prefersMarkdown(accept = "") {
@@ -35,6 +38,14 @@ function withVary(response, method) {
 export async function onRequest(context) {
   const { request } = context;
   const url = new URL(request.url);
+  if (url.pathname.startsWith("/.well-known/agent-skills/")) {
+    const allowed = url.pathname === "/.well-known/agent-skills/index.json" ||
+      SKILL_NAMES.some((name) => url.pathname === `/.well-known/agent-skills/${name}/SKILL.md`);
+    if (!allowed) return new Response(request.method === "HEAD" ? null : "Skill artifact not found.\n", {
+      status: 404, headers: { "Content-Type": "text/plain; charset=utf-8", "X-Content-Type-Options": "nosniff" },
+    });
+    return context.next();
+  }
   if (!Object.hasOwn(markdownRoutes, url.pathname) || !["GET", "HEAD"].includes(request.method)) {
     return context.next();
   }

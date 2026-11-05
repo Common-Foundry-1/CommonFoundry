@@ -104,8 +104,14 @@ export function createPublicDataReader({ fetcher = globalThis.fetch, now = Date.
       }
       let response;
       try { response = await fetcher(SOURCES[kind], { headers: { Accept: "application/json" }, redirect: "error", signal: AbortSignal.timeout(6000) }); }
-      catch { throw new PublicDataError("upstream_unavailable"); }
-      if (!response.ok) throw new PublicDataError("upstream_unavailable");
+      catch (error) {
+        console.warn("cmfd_public_upstream_fetch_failed", kind, error?.name, error?.message);
+        throw new PublicDataError("upstream_unavailable");
+      }
+      if (!response.ok) {
+        console.warn("cmfd_public_upstream_http_failed", kind, response.status);
+        throw new PublicDataError("upstream_unavailable");
+      }
       if (!response.headers.get("Content-Type")?.toLowerCase().includes("application/json")) throw new PublicDataError("invalid_response");
       let raw;
       try { raw = JSON.parse(await boundedText(response)); }

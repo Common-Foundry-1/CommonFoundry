@@ -60,11 +60,10 @@ describe("Discord-first launch website", () => {
     expect(screen.queryByText(/RCNet test/)).not.toBeInTheDocument();
   });
 
-  it("no longer publishes the mining guide", () => {
+  it("links the readable getting started guides", () => {
     render(<App />);
-    expect(screen.queryByText(/mining guide/i)).not.toBeInTheDocument();
-    expect(screen.queryByRole("link", { name: /PDF/ })).not.toBeInTheDocument();
-    expect(document.getElementById("mining-guide")).toBeNull();
+    expect(within(screen.getByRole("navigation", { name: "Primary navigation" })).getByRole("link", { name: "Learn" })).toHaveAttribute("href", "/learn/");
+    expect(screen.getByRole("link", { name: "Read the getting started guides" })).toHaveAttribute("href", "/learn/");
   });
 
   it("keeps the self-hosted pool setup fix for operators", () => {
@@ -125,7 +124,7 @@ describe("Discord-first launch website", () => {
     expect(screen.getByText(/tail is perpetual, not a hard supply cap/i)).toBeVisible();
     expect(screen.getByText(MAINNET_RELEASE_VERSION)).toBeVisible();
     expect(screen.queryByText(/all usage fees burned/i)).not.toBeInTheDocument();
-    expect(WHITEPAPER_URL).toBe("/docs/Common-Foundry-Technical-Whitepaper-v1.0.pdf");
+    expect(WHITEPAPER_URL).toBe("/docs/whitepaper/");
     for (const link of screen.getAllByRole("link", { name: /white paper/i })) {
       expect(link).toHaveAttribute("href", WHITEPAPER_URL);
     }

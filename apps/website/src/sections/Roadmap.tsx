@@ -94,6 +94,7 @@ export function Roadmap() {
             <span>Common Foundry</span>
           </div>
           <nav aria-label="Footer navigation">
+            <a href="/learn/"><span>Learn</span><ArrowIcon /></a>
             <a href={DISCORD_URL} target="_blank" rel="noopener noreferrer"><span>Discord</span><ArrowIcon /></a>
             <a href={MAINNET_RELEASE_URL} target="_blank" rel="noopener noreferrer"><span>Mainnet downloads</span><ArrowIcon /></a>
             <a href={EXPLORER_URL} target="_blank" rel="noopener noreferrer"><span>Explorer</span><ArrowIcon /></a>

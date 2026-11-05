@@ -48,9 +48,9 @@ export function Progress() {
           </p>
         </div>
         <p className="release-line">
-          <strong>Mainnet release</strong>
+          <strong>Latest desktop release</strong>
           <span>·</span>
-          <code>{MAINNET_RELEASE_VERSION}</code>
+          <a href={`https://github.com/Common-Foundry-1/CommonFoundry/releases/tag/${MAINNET_RELEASE_VERSION}`} target="_blank" rel="noopener noreferrer"><code>{MAINNET_RELEASE_VERSION}</code></a>
         </p>
       </div>
 
@@ -94,6 +94,7 @@ export function Progress() {
 
       <div className="progress__close">
         <p>Not sure where to start? We’ll help you find the next step.</p>
+        <a href="/learn/">Read the getting started guides <ArrowIcon /></a>
         <a href={DISCORD_URL} target="_blank" rel="noopener noreferrer">
           <span>Get setup help in Discord</span>
           <ArrowIcon />

@@ -103,7 +103,7 @@ export function createPublicDataReader({ fetcher = globalThis.fetch, now = Date.
         } catch { /* Fetch and validate anew if a cache entry is unusable. */ }
       }
       let response;
-      try { response = await fetcher(SOURCES[kind], { headers: { Accept: "application/json" }, redirect: "error", signal: AbortSignal.timeout(6000) }); }
+      try { response = await fetcher(SOURCES[kind], { headers: { Accept: "application/json" }, redirect: "manual", signal: AbortSignal.timeout(6000) }); }
       catch (error) {
         console.warn("cmfd_public_upstream_fetch_failed", kind, error?.name, error?.message);
         throw new PublicDataError("upstream_unavailable");

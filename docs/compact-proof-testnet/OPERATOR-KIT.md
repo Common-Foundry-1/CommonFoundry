@@ -1,5 +1,7 @@
 # Compact proof testnet operator kit: local pilot
 
+This file preserves the earlier loopback build. Use [the public canary](PUBLIC-CANARY.md) and the packaged README for the current pool invitation.
+
 This kit records the Linux pilot build and its network identity for pool operators preparing a canary. The first pool is running on loopback with two independent peers and three accepted compact-proof blocks. Public seed and pool addresses will be supplied with the public canary package.
 
 ## Network and artifact pins

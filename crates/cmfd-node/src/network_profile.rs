@@ -379,33 +379,36 @@ pub const PRODUCTION_V4_TESTNET_PROFILE: NetworkProfile = NetworkProfile {
     wallet_data_dir_identity: "production-v4-testnet-1",
 };
 
-/// Dedicated direct-proof network with separate genesis, ports, storage, and
-/// loopback-only bootstrap for the first two-node qualification.
+/// Public compact-proof canary with a distinct identity from the local pilot.
 #[cfg(feature = "direct-proof-testnet")]
 pub const DIRECT_PROOF_TESTNET_PROFILE: NetworkProfile = NetworkProfile {
     kind: NetworkProfileKind::DirectProofTestnet,
     proof: ProofProfile::ProductionV4Direct,
     name: "CommonFoundry Compact Proof Testnet-1",
     network_id: [
-        0xdc, 0xda, 0x3e, 0x81, 0x88, 0x1e, 0x14, 0x8a, 0x45, 0x97, 0x0d, 0x2e, 0x71, 0x57, 0xb7,
-        0x7f, 0x27, 0xe9, 0x31, 0xe6, 0x96, 0xdf, 0x28, 0x46, 0x83, 0x90, 0xce, 0x79, 0xbb, 0x1e,
-        0x14, 0xcb,
+        0x8a, 0x34, 0xc0, 0xd9, 0xea, 0xa9, 0x2c, 0x5e, 0xae, 0xc4, 0xaf, 0x7f, 0xe1, 0x46, 0xaf,
+        0xdf, 0xa2, 0xab, 0x68, 0x59, 0x91, 0x8b, 0x7d, 0xeb, 0x0c, 0x97, 0xe0, 0xa1, 0xf6, 0x00,
+        0xd6, 0xd1,
     ],
     virtual_genesis_hash: [
-        0xe4, 0xd3, 0x60, 0xdf, 0xff, 0xd3, 0x68, 0xc8, 0x39, 0x92, 0xc7, 0x86, 0xa4, 0x84, 0x2e,
-        0xd2, 0x11, 0xaa, 0x20, 0x43, 0xcc, 0x6a, 0x1b, 0xc5, 0xad, 0x48, 0x79, 0x19, 0xa6, 0xf9,
-        0x37, 0x54,
+        0xb8, 0xf9, 0x8a, 0xb6, 0xa9, 0xc0, 0x03, 0xda, 0x36, 0x95, 0xce, 0x30, 0x0f, 0x49, 0xcb,
+        0x3b, 0x59, 0xa2, 0x24, 0x5e, 0x72, 0x3d, 0xdc, 0x78, 0xc5, 0xaf, 0x95, 0xcc, 0x8a, 0xf7,
+        0x82, 0x54,
     ],
-    virtual_genesis_timestamp: 1_793_836_800,
-    initial_target: None,
+    virtual_genesis_timestamp: 1_793_923_200,
+    initial_target: Some({
+        let mut target = [0xff; 32];
+        target[0] = 1;
+        target
+    }),
     pow_limit: [0xff; 32],
     rewards: PRODUCTION_V4_TESTNET_PROFILE.rewards,
     rpc_port: 23_443,
     p2p_port: 23_444,
     pool_port: 23_445,
-    bootstrap_ipv4: Ipv4Addr::LOCALHOST,
-    default_data_dir_identity: "commonfoundry-direct-proof-testnet1",
-    wallet_data_dir_identity: "direct-proof-testnet-1",
+    bootstrap_ipv4: Ipv4Addr::new(209, 145, 48, 36),
+    default_data_dir_identity: "commonfoundry-compact-public-testnet1",
+    wallet_data_dir_identity: "compact-public-testnet-1",
 };
 
 /// Isolated rehearsal identity for the first launch-candidate network.
@@ -766,6 +769,11 @@ mod tests {
             );
         }
         assert_eq!(direct.proof, ProofProfile::ProductionV4Direct);
-        assert_eq!(direct.bootstrap_peer().to_string(), "127.0.0.1:23444");
+        assert_eq!(direct.bootstrap_peer().to_string(), "209.145.48.36:23444");
+        assert_eq!(direct.initial_target.unwrap()[0], 1);
+        let work = cmfd_consensus::work_rule::forgematrix_v4_work_rule(direct.network_id).unwrap();
+        assert_eq!(work.checkpoint_block_id(), direct.virtual_genesis_hash);
+        assert_eq!(work.activation_height(), 1);
+        assert!(work.requires_recomputation(1));
     }
 }

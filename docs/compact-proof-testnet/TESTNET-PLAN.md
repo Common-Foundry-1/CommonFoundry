@@ -1,5 +1,7 @@
 # Compact proof testnet implementation plan
 
+The identity below records the completed loopback pilot. The pool invitation uses the fresh [public canary identity](PUBLIC-CANARY.md), a calibrated initial target, and independent work replay from genesis.
+
 The first network is a fresh, isolated ProductionV4 direct-proof testnet built from the v1.0.20 release branch. It exercises the full ForgeMatrix workload and the same model, field, hash, and BaseFold 1/270/16 parameters. Blocks carry one self-contained direct packet and are accepted only after the node checks the complete block statement, all existing relation equations, the new shared-opening reduction, and all six BaseFold commitments.
 
 ## Pinned testnet identity

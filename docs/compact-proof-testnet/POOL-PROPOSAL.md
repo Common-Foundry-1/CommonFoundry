@@ -16,10 +16,10 @@ The testnet keeps the ForgeMatrix workload and existing field, hash, and BaseFol
 - Exercise restarts, stale jobs, mixed GPU models, and multiple miners against the pool.
 - Share practical feedback on setup, logs, reliability, and where the smaller proof makes the biggest difference.
 
-We will provide the pinned network identity, test binaries with checksums, pool configuration, connection details, and a short verification guide as the operator kit is qualified. Testnet coins have no monetary value. Mainnet keeps its existing proof rules while the testnet gathers evidence.
+The Linux operator kit includes the reference pool, miner, compact prover, verified input downloader, checksums, setup guide, and diagnostics collector. Our dedicated Proxmox guest hosts the public seed at **209.145.48.36:23444** through an isolated TCP route. The public canary checks every block's work independently from genesis as well as verifying its compact proof. Testnet coins have no monetary value.
 
 ## Path to a release decision
 
 The optimized local pilot has a useful starting measurement: **4.28 seconds for its GPU proof stage and 16.75 seconds for the complete winning-share-to-block path**. Pool canaries will help us sharpen that full path while measuring propagation, sync bandwidth, GPU memory, and stale rates. We will publish those results for pool operators to review before any versioned mainnet upgrade is proposed.
 
-**Interested in joining?** Tell us which pool software and GPU mix you operate. The local pool and nodes already interoperate end to end; we will send the operator kit and connection details for the public canary.
+**Interested in joining?** Tell us which pool software and GPU mix you operate. Start with our Linux reference pool, share its printed miner URL with your testers, and help us measure compact proofs under real pool traffic. We would love your feedback on setup, propagation, memory, and winning-block timing.

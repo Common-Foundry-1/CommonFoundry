@@ -52,6 +52,17 @@ static PRODUCTION_V4_TESTNET_RULE: ForgeMatrixV4WorkRule = ForgeMatrixV4WorkRule
     canonical_ids: Cow::Borrowed(&[]),
 };
 
+#[cfg(feature = "direct-proof-testnet")]
+static DIRECT_TESTNET_RULE: ForgeMatrixV4WorkRule = ForgeMatrixV4WorkRule {
+    checkpoint_height: 0,
+    checkpoint_block_id: [
+        0xb8, 0xf9, 0x8a, 0xb6, 0xa9, 0xc0, 0x03, 0xda, 0x36, 0x95, 0xce, 0x30, 0x0f, 0x49, 0xcb,
+        0x3b, 0x59, 0xa2, 0x24, 0x5e, 0x72, 0x3d, 0xdc, 0x78, 0xc5, 0xaf, 0x95, 0xcc, 0x8a, 0xf7,
+        0x82, 0x54,
+    ],
+    canonical_ids: Cow::Borrowed(&[]),
+};
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum WorkRuleError {
     #[error("checkpoint block id must be nonzero")]
@@ -244,6 +255,10 @@ pub fn forgematrix_v4_work_rule_checked(
 ) -> Result<Option<&'static ForgeMatrixV4WorkRule>, WorkRuleError> {
     static MAINNET: OnceLock<ForgeMatrixV4WorkRule> = OnceLock::new();
     static RCNET1: OnceLock<ForgeMatrixV4WorkRule> = OnceLock::new();
+    #[cfg(feature = "direct-proof-testnet")]
+    if network_id == crate::FORGEMATRIX_V4_DIRECT_TESTNET_NETWORK_ID {
+        return Ok(Some(&DIRECT_TESTNET_RULE));
+    }
     if network_id == PRODUCTION_V4_TESTNET_NETWORK_ID {
         return Ok(Some(&PRODUCTION_V4_TESTNET_RULE));
     }

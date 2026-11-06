@@ -141,6 +141,12 @@ fn observe_round(c: &mut C, coeff: [E; 3]) {
         observe_ext(c, x)
     }
 }
+fn observe_shared_point(c: &mut C, point: &[E]) {
+    tag(c, b"CommonFoundry/Research/DirectSixOpening/SharedPCS/v1");
+    for x in point {
+        observe_ext(c, *x);
+    }
+}
 fn equal_at(left: &[E], right: &[E]) -> E {
     left.iter()
         .zip(right)
@@ -202,7 +208,7 @@ impl PcsObligation {
             .map(MleEval::from)
             .collect::<Vec<_>>();
         BasefoldVerifier::<G>::new(FriConfig::new(1, 270, 16), 6)
-            .verify_mle_evaluations(
+            .verify_untrusted_evaluations(
                 &self.roots,
                 Point::from(self.point),
                 &evaluations,
@@ -268,20 +274,9 @@ pub fn verify_reduction(s: &Statement, p: &ReductionProof) -> Result<PcsObligati
         end_value(s, &coeff, &point, &p.evaluations_at_shared_point)? == claim,
         "secondary terminal equation"
     );
-    // The backend calls this a TRUSTED-evaluations interface: bind all new claims
-    // before its own batching grind/challenge, rather than relying on the backend.
-    tag(
-        &mut c,
-        b"CommonFoundry/Research/DirectSixOpening/SharedPCS/v1",
-    );
-    for x in &point {
-        observe_ext(&mut c, *x)
-    }
-    for values in &p.evaluations_at_shared_point {
-        for x in values {
-            observe_ext(&mut c, *x)
-        }
-    }
+    // The safe backend wrapper absorbs every evaluation before its batching
+    // witness/challenge, matching the GPU's canonical explicit absorption.
+    observe_shared_point(&mut c, &point);
     Ok(PcsObligation {
         shape: s.shape.clone(),
         roots: s.roots,
@@ -289,4 +284,270 @@ pub fn verify_reduction(s: &Statement, p: &ReductionProof) -> Result<PcsObligati
         values: p.evaluations_at_shared_point.clone(),
         challenger: c,
     })
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+    use slop_challenger::VariableLengthChallenger;
+    use slop_multilinear::MultilinearPcsChallenger;
+
+    fn observe_shared_claims(c: &mut C, point: &[E], values: &[Vec<E>; 6]) {
+        observe_shared_point(c, point);
+        for columns in values {
+            VariableLengthChallenger::<F, D>::observe_constant_length_extension_slice(c, columns);
+        }
+    }
+
+    #[test]
+    fn safe_backend_absorption_matches_the_gpu_transcript() {
+        let mut statement = statement();
+        for (i, columns) in statement.original_evaluations.iter_mut().enumerate() {
+            for (j, value) in columns.iter_mut().enumerate() {
+                let limbs: [F; 4] =
+                    std::array::from_fn(|k| F::from_canonical_usize(1 + i * 10000 + j * 4 + k));
+                *value = E::from_base_slice(&limbs);
+            }
+        }
+        let point = statement.bank_points[0].clone();
+        let mut manual = G::default_challenger();
+        observe_shared_point(&mut manual, &point);
+        for columns in &statement.original_evaluations {
+            for value in columns {
+                observe_ext(&mut manual, *value);
+            }
+        }
+        let mut safe = G::default_challenger();
+        observe_shared_claims(&mut safe, &point, &statement.original_evaluations);
+        for _ in 0..16 {
+            assert_eq!(
+                manual.sample_ext_element::<E>(),
+                safe.sample_ext_element::<E>()
+            );
+        }
+    }
+
+    fn statement() -> Statement {
+        let shape = Shape::production();
+        Statement {
+            original_evaluations: std::array::from_fn(|i| vec![E::zero(); shape.columns[i]]),
+            shape,
+            job: [7; 32],
+            roots: std::array::from_fn(|i| {
+                std::array::from_fn(|j| F::from_canonical_usize(i * 8 + j + 1))
+            }),
+            bank_points: std::array::from_fn(|i| {
+                vec![E::from_base(F::from_canonical_usize(i + 2)); 23]
+            }),
+        }
+    }
+
+    #[test]
+    fn every_original_and_shared_evaluation_changes_the_later_challenger() {
+        let statement = statement();
+        let mut original = initial(&statement).unwrap();
+        let original_challenge = original.sample_ext_element::<E>();
+        let point = vec![E::from_base(F::from_canonical_u32(13)); 23];
+        let mut shared = G::default_challenger();
+        observe_shared_claims(&mut shared, &point, &statement.original_evaluations);
+        let shared_challenge = shared.sample_ext_element::<E>();
+        for component in 0..6 {
+            for column in 0..statement.shape.columns[component] {
+                for limb in 0..4 {
+                    let mut coefficients = [F::zero(); 4];
+                    coefficients[limb] = F::one();
+                    let delta = E::from_base_slice(&coefficients);
+                    let mut changed = statement.clone();
+                    changed.original_evaluations[component][column] += delta;
+                    let mut challenger = initial(&changed).unwrap();
+                    assert_ne!(
+                        challenger.sample_ext_element::<E>(),
+                        original_challenge,
+                        "original evaluation {component}/{column}/{limb} was not bound"
+                    );
+                    let mut challenger = G::default_challenger();
+                    observe_shared_claims(&mut challenger, &point, &changed.original_evaluations);
+                    assert_ne!(
+                        challenger.sample_ext_element::<E>(),
+                        shared_challenge,
+                        "shared evaluation {component}/{column}/{limb} was not bound"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Reads an already public, honestly mined block. A rejected variant can be
+    /// written only to an explicit private test path for node admission checks.
+    /// Reproduces the missing-binding failure at the trusted backend boundary,
+    /// then requires the actual compact verifier to reject the same changes.
+    #[test]
+    #[ignore = "requires CMFD_DIRECT_BLOCK_FIXTURE and CMFD_DIRECT_BASE_INPUT"]
+    fn coordinated_evaluation_changes_are_rejected_by_the_complete_bound_verifier() {
+        use crate::forgematrix_v4_basefold::ForgeMatrixV4TranscriptStatement;
+        use crate::forgematrix_v4_direct as packet_codec;
+        let wire =
+            std::fs::read(std::env::var_os("CMFD_DIRECT_BLOCK_FIXTURE").expect("block fixture"))
+                .unwrap();
+        let base =
+            std::fs::read(std::env::var_os("CMFD_DIRECT_BASE_INPUT").expect("base input")).unwrap();
+        let block =
+            crate::wire::decode_block(&wire, crate::FORGEMATRIX_V4_DIRECT_TESTNET_NETWORK_ID)
+                .unwrap();
+        let crate::BlockProof::V4Candidate(candidate) = &block.proof else {
+            panic!("V4 fixture required")
+        };
+        let transcript = ForgeMatrixV4TranscriptStatement {
+            block: block.challenge,
+            algorithm_version: candidate.algorithm_version,
+            proof_version: candidate.proof_version,
+            nonce: candidate.nonce,
+            proof_system_digest: candidate.proof_system_digest,
+            model_manifest_digest: candidate.model_manifest_digest,
+            challenge_digest: candidate.challenge_digest,
+            final_activation_digest: candidate.final_activation_digest,
+            work_digest: candidate.work_digest,
+        };
+        let record: crate::ForgeMatrixV4FixedArtifactRecordV1 = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"), "/../../packaging/production-v4-pool/shared/FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json"))).unwrap();
+        record.validate().unwrap();
+        let fixed = record.fixed_commitments();
+        let packet = packet_codec::decode(&candidate.transparent_proof, transcript).unwrap();
+        packet_codec::verify_direct(transcript, fixed, &base, &packet).unwrap();
+        let statement = Statement {
+            shape: Shape::production(),
+            job: transcript.digest(),
+            roots: std::array::from_fn(|i| {
+                if i % 2 == 0 {
+                    fixed[i / 2]
+                } else {
+                    packet.public.banks[i / 2].dynamic_commitment
+                }
+            }),
+            bank_points: std::array::from_fn(|i| {
+                packet.public.banks[i]
+                    .opening
+                    .sumcheck
+                    .point_and_eval
+                    .0
+                    .iter()
+                    .copied()
+                    .collect()
+            }),
+            original_evaluations: std::array::from_fn(|i| {
+                if i % 2 == 0 {
+                    packet.public.banks[i / 2]
+                        .opening
+                        .fixed_column_evaluations
+                        .clone()
+                } else {
+                    packet.public.banks[i / 2]
+                        .opening
+                        .dynamic_column_evaluations
+                        .clone()
+                }
+            }),
+        };
+        let obligation = verify_reduction(&statement, &packet.reduction).unwrap();
+        let mut c = initial(&statement).unwrap();
+        assert!(c.check_witness(BATCH_GRINDING_BITS, packet.reduction.batch_witness));
+        let column_weights = weights(&mut c, &statement);
+        let mut bound_challenger = obligation.challenger.clone();
+        for columns in &obligation.values {
+            VariableLengthChallenger::<F, D>::observe_constant_length_extension_slice(
+                &mut bound_challenger,
+                columns,
+            );
+        }
+        let mut batching = bound_challenger.clone();
+        assert!(batching.check_witness(
+            BATCH_GRINDING_BITS,
+            packet.joint_basefold.batch_grinding_witness
+        ));
+        let batching_point = batching.sample_point::<E>(10);
+        let pcs_weights = slop_multilinear::partial_lagrange_blocking(&batching_point);
+        let mut checked = 0;
+        let mut offset = 0;
+        for component in 0..6 {
+            let width = statement.shape.columns[component];
+            for seed in 0..8 {
+                let indices = [
+                    seed % width,
+                    (seed + width / 3 + 1) % width,
+                    (seed + 2 * width / 3 + 2) % width,
+                ];
+                assert!(
+                    indices[0] != indices[1]
+                        && indices[0] != indices[2]
+                        && indices[1] != indices[2]
+                );
+                let equality = equal_at(&statement.bank_points[component / 2], &obligation.point);
+                let a = indices.map(|i| column_weights[offset + i] * equality);
+                let b = indices.map(|i| pcs_weights.as_slice()[offset + i]);
+                let delta = [
+                    a[1] * b[2] - a[2] * b[1],
+                    a[2] * b[0] - a[0] * b[2],
+                    a[0] * b[1] - a[1] * b[0],
+                ];
+                assert!(delta.iter().any(|x| *x != E::zero()));
+                let mut changed = packet.reduction.clone();
+                for j in 0..3 {
+                    changed.evaluations_at_shared_point[component][indices[j]] += delta[j];
+                }
+                // Both linear equations survive, so a terminal-only test is insufficient.
+                let rebound = verify_reduction(&statement, &changed).unwrap();
+                let changed_values = changed
+                    .evaluations_at_shared_point
+                    .iter()
+                    .cloned()
+                    .map(MleEval::from)
+                    .collect::<Vec<_>>();
+                BasefoldVerifier::<G>::new(FriConfig::new(1, 270, 16), 6)
+                    .verify_mle_evaluations(
+                        &obligation.roots,
+                        Point::from(obligation.point.clone()),
+                        &changed_values,
+                        &packet.joint_basefold,
+                        &mut bound_challenger.clone(),
+                    )
+                    .expect("counterfactual unbound backend reproduces the known failure");
+                assert!(
+                    rebound.verify_basefold(&packet.joint_basefold).is_err(),
+                    "bound backend accepted coordinated changes"
+                );
+                let altered = packet_codec::encode(
+                    &packet.public,
+                    transcript,
+                    &changed,
+                    &packet.joint_basefold,
+                )
+                .unwrap();
+                assert!(
+                    packet_codec::verify_wire(transcript, fixed, &base, &altered).is_err(),
+                    "complete verifier accepted coordinated changes"
+                );
+                if component == 0 && seed == 0 {
+                    if let Some(path) = std::env::var_os("CMFD_REJECTED_BLOCK_FIXTURE") {
+                        let mut rejected = block.clone();
+                        let crate::BlockProof::V4Candidate(proof) = &mut rejected.proof else {
+                            unreachable!("fixture is V4")
+                        };
+                        proof.transparent_proof = altered;
+                        std::fs::write(path, crate::wire::encode_block(&rejected).unwrap())
+                            .unwrap();
+                    }
+                }
+                checked += 1;
+            }
+            offset += width;
+        }
+        assert_eq!(checked, 48);
+        if let Some(path) = std::env::var_os("CMFD_SECURITY_REPORT") {
+            std::fs::write(path, serde_json::to_vec_pretty(&serde_json::json!({
+                "baseline_complete_proof_valid": true, "coordinated_cases": checked,
+                "counterfactual_unbound_backend_accepts": checked, "bound_complete_verifier_rejects": checked,
+                "forged_artifacts_written": false, "gpu_used": false,
+            })).unwrap()).unwrap();
+        }
+    }
 }

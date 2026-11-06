@@ -14,7 +14,7 @@ use tauri::webview::{NewWindowResponse, WebviewWindowBuilder};
 use tauri::{Manager, RunEvent};
 
 use cmfd_node::{
-    COMPILED_NETWORK_PROFILE, ProofProfile, canonical_network_info_json_with_v4_artifacts,
+    COMPILED_NETWORK_PROFILE, canonical_network_info_json_with_v4_artifacts,
     production_v4_package_artifacts,
 };
 use runtime::RuntimeState;
@@ -46,7 +46,7 @@ struct WalletRuntimeIdentity<'a> {
 }
 
 fn canonical_runtime_identity_json() -> Result<Vec<u8>, String> {
-    if COMPILED_NETWORK_PROFILE.proof != ProofProfile::ProductionV4 {
+    if !COMPILED_NETWORK_PROFILE.proof.is_forgematrix_v4() {
         return Err("runtime identity is available only in a ProductionV4 wallet build".to_owned());
     }
     #[cfg(feature = "production-v4")]

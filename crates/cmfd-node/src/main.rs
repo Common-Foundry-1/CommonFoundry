@@ -2526,7 +2526,11 @@ fn run_command() -> Result<(), Box<dyn std::error::Error>> {
                 COMPILED_NETWORK_PROFILE.proof,
                 ProofProfile::ProductionV4 | ProofProfile::ProductionV4Direct
             )
-            .then_some(replay_workers.is_some() && work_engine == PoolWorkEngine::Auto);
+            .then_some(
+                node_instance.work_validated_height().is_some()
+                    && replay_workers.is_some()
+                    && work_engine == PoolWorkEngine::Auto,
+            );
             install_work_engines(
                 &mut node_instance,
                 work_threads,

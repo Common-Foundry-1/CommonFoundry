@@ -14,9 +14,10 @@ This is a fresh network for pool operators, GPU miners, and independent node tes
 | RPC | Loopback port 23443 |
 | Reference pool | Port 23445; each operator publishes its own pinned miner URL |
 | Proof | Version 2, self-contained `CMFDDR02`, under 6 MB |
-| Independent work check | Required from height 1 |
+| Node validation | Complete compact proof and normal block rules; ordinary nodes do not rerun matrix mining work |
+| Audit node | The Proxmox seed also replays work for comparison during this canary |
 | Storage identity | `commonfoundry-compact-public-testnet1` |
 
 The Linux package includes the reference pool/node, miner, replay worker, compact prover, verified input downloader, address helper, and diagnostics collector. The pool and miner use Common Foundry's pinned TLS pool protocol. The packaged README contains exact launch commands and hardware/input requirements.
 
-This public network has a separate identity from the loopback pilot recorded in LOCAL-PILOT-RESULTS.md. Its initial difficulty and share target support real mining trials rather than deterministic one-share block tests. Test coins have no monetary value.
+This public network has a separate identity from the loopback pilot recorded in LOCAL-PILOT-RESULTS.md. Its initial difficulty and share target support real mining trials. Testnet v0.2.0 keeps the same network identity and proof format as v0.1.0; node operators can update without resetting their testnet chain. The proof-only policy applies to ordinary nodes, while the seed continues its independent audit replay. Test coins have no monetary value.

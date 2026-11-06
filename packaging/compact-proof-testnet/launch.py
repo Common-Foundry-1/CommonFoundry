@@ -12,6 +12,7 @@ import time
 import urllib.request
 
 ROOT = Path(__file__).resolve().parent
+USER_DATA = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "commonfoundry-compact-testnet1"
 SEED = "209.145.48.36:23444"
 NETWORK = "8a34c0d9eaa92c5eaec4af7fe146afdfa2ab6859918b7deb0c97e0a1f600d6d1"
 RECORD = "FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json"
@@ -124,11 +125,11 @@ def main():
     diag.add_argument("--output", type=Path, default=Path("testnet-diagnostics.json"))
     prep = sub.add_parser("prepare")
     prep.add_argument("--role", choices=("pool", "miner", "node"), default="pool")
-    prep.add_argument("--inputs", type=Path, default=ROOT / "inputs")
+    prep.add_argument("--inputs", type=Path, default=USER_DATA / "inputs")
     for role in ("node", "pool", "miner"):
         p = sub.add_parser(role)
-        p.add_argument("--inputs", type=Path, default=ROOT / "inputs")
-        p.add_argument("--data-dir", type=Path, default=ROOT / "testnet-data" / role)
+        p.add_argument("--inputs", type=Path, default=USER_DATA / "inputs")
+        p.add_argument("--data-dir", type=Path, default=USER_DATA / role)
         p.add_argument("--check", action="store_true", help="verify package and print the launch command")
         if role != "miner":
             p.add_argument("--peer", action="append")

@@ -1,0 +1,8 @@
+{
+  "productName": "Common Foundry Wallet",
+  "identifier": "org.commonfoundry.wallet.compacttestnet1",
+  "bundle": {
+    "shortDescription": "Common Foundry compact proof testnet wallet",
+    "longDescription": "The Common Foundry wallet and embedded node for Compact Proof Testnet-1."
+  }
+}

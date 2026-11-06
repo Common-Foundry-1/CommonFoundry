@@ -1,12 +1,14 @@
-# Common Foundry Compact Proof Testnet — pool canary v0.1.0
+# Common Foundry Compact Proof Testnet — pool canary v0.2.0
 
-Welcome! This canary lets pools and miners exercise the new self-contained block proof, around 5.67 MB in our first three local blocks. It keeps the ForgeMatrix workload and the existing field, hash, and BaseFold parameters. The public seed is `209.145.48.36:23444`, backed by our dedicated Proxmox testnet guest.
+Welcome! This canary lets pools and miners exercise the new self-contained block proof, around 5.7 MB in our first public block. It keeps the ForgeMatrix workload and the existing field, hash, and BaseFold parameters. Ordinary nodes verify the complete proof without rerunning the miner's matrix computation. The public seed at `209.145.48.36:23444` also replays work as an optional audit comparison.
 
 ## What you need
 
 Use x86-64 Linux with glibc 2.35 or newer (Ubuntu 22.04 or newer), Python 3.10+, curl, and sha256sum. GPU roles need a working NVIDIA driver and CUDA 12 runtime (`libcudart.so.12`). This prover includes RTX 30, 40, and 50 architecture targets. Our physical 16 GB proof testing used an RTX 5070 Ti; please include your GPU model in feedback.
 
 A pool's first input download is about **61.2 GB**. Allow **150 GB free disk** during first preparation for input chunks, assembled files, and scratch, and **32 GB system RAM**, with 64 GB useful for running several roles. A pool miner or CPU node downloads only the **6.44 GB model bank**. Downloads resume and authenticate against bundled SHA-256 manifests. Existing inputs can be reused with `--inputs /absolute/path/to/inputs`.
+
+Inputs and node/pool/miner data default to `~/.local/share/commonfoundry-compact-testnet1`, so extracting an updated kit keeps your authenticated inputs and chain. If you used v0.1.0's in-package data directory, pass its existing path with `--inputs` and `--data-dir` when starting v0.2.0.
 
 ## Start a pool
 
@@ -48,4 +50,4 @@ Node verification runs on the CPU; it needs no GPU or CUDA runtime. Restart it, 
 
 Please share your GPU, driver, RAM, miner/pool versions, accepted and rejected shares, block counts, full winning-share-to-block time, peak VRAM, propagation/catch-up observations, and relevant log excerpts. The diagnostics collector includes build identity, node status, and GPU telemetry; it does not collect wallet keys or TLS private keys. Pool logs print proof-stage timings and packet sizes.
 
-The initial public target is seven leading zero bits and adjusts with the chain's 60-second target spacing. Pool shares default to four leading zero bits. This is a fresh testnet with dedicated data and test coins of no monetary value. Our first optimized local pool run took 16.75 seconds through complete block acceptance; improving that full path is one of the canary's measurements.
+The initial public target is seven leading zero bits and adjusts with the chain's 60-second target spacing. Pool shares default to four leading zero bits. This is a fresh testnet with dedicated data and test coins of no monetary value. The proof-only and audit nodes use the same network identity and packet rules. Our first optimized local pool run took 16.75 seconds through complete block acceptance; improving that full path is one of the canary's measurements.

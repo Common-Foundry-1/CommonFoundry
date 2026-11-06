@@ -1472,7 +1472,7 @@ fn prepare_packaged_rcnet_runtime(
     profile: NetworkProfile,
     package_executable: &Path,
 ) -> Result<(), NodeClientError> {
-    if profile.proof != ProofProfile::ProductionV4 {
+    if !profile.proof.is_forgematrix_v4() {
         return Ok(());
     }
     let artifacts = production_v4_package_artifacts(package_executable)
@@ -1670,7 +1670,7 @@ fn prepare_node_security_with_package(
                 verifier_worker: Some(worker),
             })
         }
-        ProofProfile::ProductionV4 => {
+        ProofProfile::ProductionV4 | ProofProfile::ProductionV4Direct => {
             if options.is_configured() {
                 return Err(startup_error(
                     "production_v4_configuration_unexpected",
@@ -1810,7 +1810,10 @@ fn sanitize_node_startup_error(profile: NetworkProfile, error: NodeError) -> Nod
             ),
             false,
         ),
-        (ProofProfile::ProductionV4, "production_v4_unavailable") => startup_error(
+        (
+            ProofProfile::ProductionV4 | ProofProfile::ProductionV4Direct,
+            "production_v4_unavailable",
+        ) => startup_error(
             client.code,
             format!(
                 "{} ({}) cannot start because this wallet build does not include the ProductionV4 verifier.",
@@ -1819,7 +1822,10 @@ fn sanitize_node_startup_error(profile: NetworkProfile, error: NodeError) -> Nod
             ),
             false,
         ),
-        (ProofProfile::ProductionV4, "production_v4_artifacts_missing") => startup_error(
+        (
+            ProofProfile::ProductionV4 | ProofProfile::ProductionV4Direct,
+            "production_v4_artifacts_missing",
+        ) => startup_error(
             client.code,
             format!(
                 "{} ({}) cannot start because its authenticated runtime files are missing. Place production-v4/MODEL-V2.bank and production-v4/FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json beside the wallet executable, or complete the RCNet runtime preparation first, then reopen the wallet.",
@@ -1828,7 +1834,10 @@ fn sanitize_node_startup_error(profile: NetworkProfile, error: NodeError) -> Nod
             ),
             false,
         ),
-        (ProofProfile::ProductionV4, "proof_verifier_configuration") => startup_error(
+        (
+            ProofProfile::ProductionV4 | ProofProfile::ProductionV4Direct,
+            "proof_verifier_configuration",
+        ) => startup_error(
             client.code,
             format!(
                 "{} ({}) rejected the packaged model bank or fixed artifact record. Re-download the package and retry.",
@@ -1905,7 +1914,7 @@ fn command_help_text_for_profile(profile: NetworkProfile) -> String {
             DEFAULT_PROOF_VERIFIER_TIMEOUT_MS,
             DEFAULT_PROOF_VERIFIER_MEMORY_BYTES
         ));
-    } else if profile.proof == ProofProfile::ProductionV4 {
+    } else if profile.proof.is_forgematrix_v4() {
         help.push_str(
             "ProductionV4 startup authenticates the packaged model bank and fixed artifact record before opening node storage.\n",
         );

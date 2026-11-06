@@ -52,7 +52,7 @@ static PRODUCTION_V4_TESTNET_RULE: ForgeMatrixV4WorkRule = ForgeMatrixV4WorkRule
     canonical_ids: Cow::Borrowed(&[]),
 };
 
-#[cfg(feature = "direct-proof-testnet")]
+#[cfg(feature = "direct-proof-testnet-audit")]
 static DIRECT_TESTNET_RULE: ForgeMatrixV4WorkRule = ForgeMatrixV4WorkRule {
     checkpoint_height: 0,
     checkpoint_block_id: [
@@ -257,7 +257,10 @@ pub fn forgematrix_v4_work_rule_checked(
     static RCNET1: OnceLock<ForgeMatrixV4WorkRule> = OnceLock::new();
     #[cfg(feature = "direct-proof-testnet")]
     if network_id == crate::FORGEMATRIX_V4_DIRECT_TESTNET_NETWORK_ID {
+        #[cfg(feature = "direct-proof-testnet-audit")]
         return Ok(Some(&DIRECT_TESTNET_RULE));
+        #[cfg(not(feature = "direct-proof-testnet-audit"))]
+        return Ok(None);
     }
     if network_id == PRODUCTION_V4_TESTNET_NETWORK_ID {
         return Ok(Some(&PRODUCTION_V4_TESTNET_RULE));

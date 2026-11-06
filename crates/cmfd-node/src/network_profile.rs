@@ -775,16 +775,33 @@ mod tests {
         assert_eq!(direct.proof, ProofProfile::ProductionV4Direct);
         assert_eq!(direct.bootstrap_peer().to_string(), "209.145.48.36:23444");
         assert_eq!(direct.initial_target.unwrap()[0], 1);
-        let work = cmfd_consensus::work_rule::forgematrix_v4_work_rule(direct.network_id).unwrap();
-        assert_eq!(work.checkpoint_block_id(), direct.virtual_genesis_hash);
-        assert_eq!(work.activation_height(), 1);
-        assert!(work.requires_recomputation(1));
-        assert_eq!(
-            crate::work_gate::WorkGate::compiled_checkpoint(
-                direct.proof.is_forgematrix_v4(),
-                direct.network_id
-            ),
-            Some((0, direct.virtual_genesis_hash))
-        );
+        #[cfg(feature = "direct-proof-testnet-audit")]
+        {
+            let work =
+                cmfd_consensus::work_rule::forgematrix_v4_work_rule(direct.network_id).unwrap();
+            assert_eq!(work.checkpoint_block_id(), direct.virtual_genesis_hash);
+            assert_eq!(work.activation_height(), 1);
+            assert!(work.requires_recomputation(1));
+            assert_eq!(
+                crate::work_gate::WorkGate::compiled_checkpoint(
+                    direct.proof.is_forgematrix_v4(),
+                    direct.network_id
+                ),
+                Some((0, direct.virtual_genesis_hash))
+            );
+        }
+        #[cfg(not(feature = "direct-proof-testnet-audit"))]
+        {
+            assert!(
+                cmfd_consensus::work_rule::forgematrix_v4_work_rule(direct.network_id).is_none()
+            );
+            assert_eq!(
+                crate::work_gate::WorkGate::compiled_checkpoint(
+                    direct.proof.is_forgematrix_v4(),
+                    direct.network_id
+                ),
+                None
+            );
+        }
     }
 }

@@ -6,7 +6,7 @@ Common Foundry has started a dedicated testnet for a smaller, self-contained For
 
 Our current block proof is 12.03 MB. The direct proof prototype produced and independently verified complete packets around **5.5 MB** on a 16 GB GPU. The new testnet's first three fresh blocks each carried a packet around **5.66–5.67 MB**: roughly **53% fewer raw proof bytes** than today's format. Two earlier proof samples showed about **35% less compressed proof traffic**. Because the existing **16 MiB block limit includes the proof**, the smaller packet can also free roughly **6.4 MB** for transactions in a byte-limited block.
 
-The testnet keeps the ForgeMatrix workload and existing field, hash, and BaseFold proof parameters. It gives us a chance to measure the full benefit in the places pools feel it: winning-block latency, stale blocks, propagation, relay traffic, and new-node catch-up. Every participating pool helps turn a promising compact proof into a well-tested network upgrade.
+The testnet keeps the ForgeMatrix workload and existing field, hash, and BaseFold proof parameters. The updated verifier binds all miner-supplied evaluations before the random batch challenge, so ordinary nodes validate the complete proof without repeating the mining calculation. Our seed also replays work as an optional audit comparison. Every participating pool helps measure winning-block latency, stale blocks, propagation, relay traffic, and new-node catch-up before one proposed mainnet upgrade.
 
 ## What participating pools can test
 
@@ -16,7 +16,7 @@ The testnet keeps the ForgeMatrix workload and existing field, hash, and BaseFol
 - Exercise restarts, stale jobs, mixed GPU models, and multiple miners against the pool.
 - Share practical feedback on setup, logs, reliability, and where the smaller proof makes the biggest difference.
 
-The Linux operator kit includes the reference pool, miner, compact prover, verified input downloader, checksums, setup guide, and diagnostics collector. Our dedicated Proxmox guest hosts the public seed at **209.145.48.36:23444** through an isolated TCP route. The public canary checks every block's work independently from genesis as well as verifying its compact proof. Testnet coins have no monetary value.
+The Linux operator kit includes the reference pool, miner, compact prover, verified input downloader, checksums, setup guide, and diagnostics collector. Our dedicated Proxmox guest hosts the public seed at **209.145.48.36:23444** through an isolated TCP route. Testnet coins have no monetary value.
 
 ## Path to a release decision
 

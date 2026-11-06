@@ -206,6 +206,13 @@ impl MiningManager {
             .lock()
             .map(|status| {
                 let snapshot = status.clone();
+                if COMPILED_NETWORK_PROFILE.proof == ProofProfile::ProductionV4Direct {
+                    return MiningStatus {
+                        production_solo_available: false,
+                        production_solo_setup: Some("Use the compact testnet miner package to mine through a participating pool.".to_owned()),
+                        ..snapshot
+                    };
+                }
                 #[cfg(feature = "production-v4")]
                 if let Some(setup) = setup {
                     return MiningStatus {
@@ -226,6 +233,13 @@ impl MiningManager {
     }
 
     pub fn start(&self, request: MiningStartRequest) -> Result<MiningStatus, NodeClientError> {
+        if COMPILED_NETWORK_PROFILE.proof == ProofProfile::ProductionV4Direct {
+            return Err(manager_error(
+                "testnet_external_miner_required",
+                "Use the compact testnet miner package to mine through a participating pool.",
+                false,
+            ));
+        }
         let node_status = self
             .node
             .lock()

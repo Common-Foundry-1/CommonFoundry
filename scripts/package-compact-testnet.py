@@ -9,7 +9,6 @@ import tarfile
 
 ROOT = Path(__file__).resolve().parents[1]
 NETWORK = "8a34c0d9eaa92c5eaec4af7fe146afdfa2ab6859918b7deb0c97e0a1f600d6d1"
-NAME = "commonfoundry-compact-testnet-v0.1.0-linux-x86_64"
 
 
 def digest(path):
@@ -26,9 +25,11 @@ def main():
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--source-commit", required=True)
     p.add_argument("--source-dirty", action="store_true")
+    p.add_argument("--kit-version", default="0.2.0")
     args = p.parse_args()
     output = args.output.resolve()
-    stage = output / NAME
+    name = f"commonfoundry-compact-testnet-v{args.kit_version}-linux-x86_64"
+    stage = output / name
     stage.mkdir(parents=True, exist_ok=False)
     for name in ("cmfd-node", "cmfd-miner", "cmfd-v4-replay", "cmfd-direct-prover"):
         shutil.copy2(args.artifacts / name, stage / name)
@@ -52,11 +53,12 @@ def main():
     commit = args.source_commit
     if len(commit) != 40 or any(c not in "0123456789abcdef" for c in commit):
         raise ValueError("source commit must be a full lowercase Git SHA")
-    build = {"schema": "CMFD_COMPACT_TESTNET_PACKAGE_V1", "version": "0.1.0", "network_id": NETWORK,
+    build = {"schema": "CMFD_COMPACT_TESTNET_PACKAGE_V1", "version": args.kit_version, "network_id": NETWORK,
         "source_commit": commit, "source_commit_scope": "node, miner, launcher, downloader and packaging",
         "prover_identity": "exact GPU binary SHA-256 in PACKAGE-MANIFEST.json; pinned direct-proof research build",
         "source_dirty": args.source_dirty, "seed": "209.145.48.36:23444",
         "seed_backend": "dedicated Proxmox testnet guest", "proof_version": 2,
+        "work_validation_policy": "complete compact proof; optional separate work-replay audit node",
         "initial_target": "01" + "ff" * 31,
         "roles": ["reference pool", "GPU pool miner", "CPU full node"],
         "gpu_architectures": ["sm_86", "sm_89", "sm_120"],
@@ -69,9 +71,9 @@ def main():
     (stage / "PACKAGE-MANIFEST.json").write_text(json.dumps({"network_id": NETWORK, "files": files}, indent=2) + "\n")
     sums = "".join(f'{digest(path)}  {path.name}\n' for path in sorted(stage.iterdir()) if path.is_file())
     (stage / "PACKAGE-SHA256SUMS.txt").write_text(sums)
-    archive = output / (NAME + ".tar.gz")
+    archive = output / (name + ".tar.gz")
     with tarfile.open(archive, "w:gz") as tar:
-        tar.add(stage, arcname=NAME)
+        tar.add(stage, arcname=name)
     (output / "SHA256SUMS.txt").write_text(f"{digest(archive)}  {archive.name}\n")
     print(json.dumps({"archive": str(archive), "bytes": archive.stat().st_size, "sha256": digest(archive)}))
 

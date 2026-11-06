@@ -3238,7 +3238,7 @@ mod tests {
     }
 
     fn spend_community_output(node: &Node, block: &Block, fee: u64) -> Transaction {
-        let owner = SigningKey::from_bytes(&[0x12; 32]).unwrap();
+        let owner = SigningKey::from_slice(&[0x12; 32]).unwrap();
         let previous_output = &block.coinbase.outputs[2];
         let mut transaction = Transaction {
             network_id: node.peer_hello().network_id,

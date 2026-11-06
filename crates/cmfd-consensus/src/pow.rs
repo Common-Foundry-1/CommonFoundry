@@ -2869,7 +2869,7 @@ mod tests {
 
     #[cfg(feature = "dory-v3-consensus-adapter")]
     fn destination(byte: u8) -> [u8; 32] {
-        SigningKey::from_bytes(&[byte; 32])
+        SigningKey::from_slice(&[byte; 32])
             .unwrap()
             .verifying_key()
             .to_bytes()

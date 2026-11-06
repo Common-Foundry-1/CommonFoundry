@@ -1,0 +1,105 @@
+name: Android wallet unsigned build
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/android-wallet.yml
+      - apps/android-wallet/**
+      - docs/android-wallet-independent-utxo.md
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android-wallet:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    env:
+      CARGO_INCREMENTAL: "0"
+    defaults:
+      run:
+        working-directory: apps/android-wallet
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
+        with:
+          version: 11.25.0
+          run_install: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: apps/android-wallet/app/pnpm-lock.yaml
+      - uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
+        with:
+          accept-android-sdk-licenses: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable snapshot 2026-08-05
+        with:
+          toolchain: 1.94.1
+          targets: aarch64-linux-android
+          components: clippy
+      - name: Install pinned Android SDK components
+        run: |
+          sdkmanager --install "platforms;android-36" "build-tools;36.0.0" "ndk;30.0.16248370"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/30.0.16248370" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/30.0.16248370" >> "$GITHUB_ENV"
+      - name: Check Rust wallet core
+        run: |
+          cargo test --locked
+          cargo test --locked -p cmfd-wallet-api -- --ignored
+          cargo clippy --locked --all-targets -- -D warnings
+      - name: Audit Android Rust lockfiles
+        run: |
+          cargo install cargo-audit --version '=0.22.2' --locked
+          cargo audit --file Cargo.lock
+          cargo audit --file app/src-tauri/Cargo.lock
+      - name: Install and check Android UI
+        working-directory: apps/android-wallet/app
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm audit --audit-level high
+          pnpm check
+          pnpm test
+      - name: Verify bundled JavaScript and Android library notices
+        working-directory: apps/android-wallet/app
+        run: |
+          pnpm licenses list --json --prod | node ../scripts/generate-js-licenses.mjs
+          node ../scripts/generate-android-library-notices.mjs
+          node ../scripts/normalize-license-html.mjs public/javascript-licenses.html public/android-library-notices.html
+          git diff --exit-code -- public/javascript-licenses.html public/android-library-notices.html
+          test -s public/common-foundry-license.txt
+      - name: Verify bundled Rust runtime notices
+        working-directory: apps/android-wallet/app/src-tauri
+        run: |
+          cargo install cargo-about --version '=0.9.2' --locked --features cli
+          cargo about generate --config about.toml --locked --fail --output-file ../public/rust-licenses.html about.hbs
+          node ../../scripts/normalize-license-html.mjs ../public/rust-licenses.html
+          git diff --exit-code -- ../public/rust-licenses.html
+      - name: Build unsigned ARM64 APK
+        working-directory: apps/android-wallet/app
+        run: pnpm tauri android build --apk --target aarch64
+      - name: Confirm notices are embedded in the APK native library
+        run: |
+          node scripts/check-embedded-notices.mjs
+          apk=app/src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk
+          native=app/src-tauri/target/aarch64-linux-android/release/libcommon_foundry_android_wallet_lib.so
+          unzip -Z1 "$apk" | grep -Fx 'lib/arm64-v8a/libcommon_foundry_android_wallet_lib.so'
+          cmp "$native" <(unzip -p "$apk" lib/arm64-v8a/libcommon_foundry_android_wallet_lib.so)
+      - name: Hash unsigned APK
+        working-directory: apps/android-wallet/app/src-tauri/gen/android/app/build/outputs/apk/universal/release
+        run: |
+          test -f app-universal-release-unsigned.apk
+          sha256sum app-universal-release-unsigned.apk > SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cmfd-android-unsigned-${{ github.sha }}
+          path: |
+            apps/android-wallet/app/src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk
+            apps/android-wallet/app/src-tauri/gen/android/app/build/outputs/apk/universal/release/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7

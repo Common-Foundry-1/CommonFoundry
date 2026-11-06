@@ -19,7 +19,6 @@ use cmfd_consensus::{
     decode_block, decode_transaction, encode_block, encode_transaction,
     max_block_bytes_for_network, merkle_root,
 };
-use k256::elliptic_curve::rand_core::{OsRng, RngCore};
 use thiserror::Error;
 
 pub const PEER_MAGIC: [u8; 4] = *b"CMFP";
@@ -393,7 +392,7 @@ pub fn process_node_nonce() -> [u8; 32] {
     static NONCE: OnceLock<[u8; 32]> = OnceLock::new();
     *NONCE.get_or_init(|| {
         let mut nonce = [0_u8; 32];
-        OsRng.fill_bytes(&mut nonce);
+        getrandom::fill(&mut nonce).expect("obtain random process node nonce");
         if nonce == [0; 32] {
             nonce[31] = 1;
         }

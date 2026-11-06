@@ -7,9 +7,18 @@
   "workers_dev": true,
   "vars": {
     "EXPLORER_ORIGIN": "https://devnet-explorer-origin.commonfoundry.ai",
+    "EXPLORER_PROOF_ORIGIN": "https://devnet-explorer-origin.commonfoundry.ai",
+    "EXPLORER_PROOF_BACKUP_ORIGIN": "https://devnet-explorer-origin.commonfoundry.ai",
     "EXPLORER_NETWORK": "rc",
     "EXPLORER_EXPECTED_NETWORK_ID": ""
   },
+  "ratelimits": [
+    {
+      "name": "EXPLORER_UTXO_LIMIT",
+      "namespace_id": "4104",
+      "simple": { "limit": 120, "period": 60 }
+    }
+  ],
   "assets": {
     "directory": "./dist",
     "binding": "ASSETS",
@@ -29,9 +38,18 @@
       ],
       "vars": {
         "EXPLORER_ORIGIN": "https://mainnet-explorer-origin.commonfoundry.ai",
+        "EXPLORER_PROOF_ORIGIN": "https://mainnet-proof-origin.commonfoundry.ai",
+        "EXPLORER_PROOF_BACKUP_ORIGIN": "https://mainnet-proof-backup-origin.commonfoundry.ai",
         "EXPLORER_NETWORK": "mainnet",
         "EXPLORER_EXPECTED_NETWORK_ID": "88296bc39c10e8bc1dd4818d4d42412fe5f08210651110377f495da299812f62"
       },
+      "ratelimits": [
+        {
+          "name": "EXPLORER_UTXO_LIMIT",
+          "namespace_id": "4104",
+          "simple": { "limit": 240, "period": 60 }
+        }
+      ],
       "assets": {
         "directory": "./dist-mainnet",
         "binding": "ASSETS",

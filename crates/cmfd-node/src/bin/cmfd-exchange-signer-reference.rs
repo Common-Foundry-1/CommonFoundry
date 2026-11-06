@@ -235,7 +235,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The raw test key is opened only after every independently authenticated
     // policy, package, authorization, and transaction-intent check succeeds.
     let secret = read_secret_key(&cli.secret_key_file)?;
-    let signing_key = SigningKey::from_bytes(secret.as_ref())
+    let signing_key = SigningKey::from_slice(secret.as_ref())
         .map_err(|_| "secret key file does not contain a valid nonzero secp256k1 scalar")?;
     let signing_public_key: [u8; 32] = signing_key.verifying_key().to_bytes().into();
     if signing_public_key != signer_context.signing_public_key
@@ -429,7 +429,7 @@ fn authenticate_trusted_context(
     if digest != parse_hex32(&envelope.context_digest)? {
         return Err("trusted signer context digest does not match its canonical fields".into());
     }
-    let verifying_key = VerifyingKey::from_bytes(&authority_public_key)
+    let verifying_key = VerifyingKey::from_slice(&authority_public_key)
         .map_err(|_| "context authority public key is not a valid BIP340 key")?;
     let signature = Signature::try_from(parse_hex64(&envelope.signature)?.as_slice())
         .map_err(|_| "trusted signer context signature is invalid")?;
@@ -451,7 +451,7 @@ fn validate_signer_context(
     let signer_id = SignerId(parse_nonzero_hex32(&signer.signer_id, "signer_id")?);
     let capability_digest = parse_nonzero_hex32(&signer.capability_digest, "capability_digest")?;
     let signing_public_key = parse_nonzero_hex32(&signer.signing_public_key, "signing_public_key")?;
-    VerifyingKey::from_bytes(&signing_public_key)
+    VerifyingKey::from_slice(&signing_public_key)
         .map_err(|_| "trusted signing public key is not a valid BIP340 key")?;
     let signing_key_id = WalletKeyId(parse_nonzero_hex32(
         &signer.signing_key_id,
@@ -538,7 +538,7 @@ fn validate_transaction_intent(
         &expected.recipient_destination,
         "transaction recipient_destination",
     )?;
-    VerifyingKey::from_bytes(&recipient)
+    VerifyingKey::from_slice(&recipient)
         .map_err(|_| "transaction recipient is not a valid BIP340 key")?;
     let amount_atoms = parse_canonical_u64(&expected.amount_atoms)?;
     let fee_atoms = parse_canonical_u64(&expected.fee_atoms)?;
@@ -579,7 +579,7 @@ fn validate_transaction_intent(
             .as_deref()
             .ok_or("nonzero-change intent omitted the change destination")?;
         let change_destination = parse_nonzero_hex32(change_destination, "change_destination")?;
-        VerifyingKey::from_bytes(&change_destination)
+        VerifyingKey::from_slice(&change_destination)
             .map_err(|_| "change destination is not a valid BIP340 key")?;
         let change = &transaction.outputs[1];
         if change.value != change_atoms
@@ -645,7 +645,7 @@ fn validate_signed_approval(
     let mut approved_keys = Vec::with_capacity(rule.public_keys.len());
     for value in &rule.public_keys {
         let key = parse_nonzero_hex32(value, "approval rule public key")?;
-        VerifyingKey::from_bytes(&key)
+        VerifyingKey::from_slice(&key)
             .map_err(|_| "approval rule contains an invalid BIP340 key")?;
         approved_keys.push(key);
     }
@@ -667,7 +667,7 @@ fn validate_signed_approval(
         }
         let signature = Signature::try_from(parse_hex64(&entry.signature)?.as_slice())
             .map_err(|_| "approval signature encoding is invalid")?;
-        VerifyingKey::from_bytes(&public_key)
+        VerifyingKey::from_slice(&public_key)
             .map_err(|_| "approval signature public key is invalid")?
             .verify(&digest, &signature)
             .map_err(|_| "approval signature did not verify")?;
@@ -1059,7 +1059,7 @@ mod tests {
     use super::*;
 
     fn fixture() -> (SigningKey, SignerCapabilitiesV1, SigningPackageV1) {
-        let key = SigningKey::from_bytes(&[7; 32]).unwrap();
+        let key = SigningKey::from_slice(&[7; 32]).unwrap();
         let public_key: [u8; 32] = key.verifying_key().to_bytes().into();
         let key_id = wallet_key_id(&public_key);
         let signer_id = SignerId([8; 32]);
@@ -1164,7 +1164,7 @@ mod tests {
             commitment: [16; 32],
         };
         let decision_id = [17; 32];
-        let approver = SigningKey::from_bytes(&[18; 32]).unwrap();
+        let approver = SigningKey::from_slice(&[18; 32]).unwrap();
         let approver_public_key: [u8; 32] = approver.verifying_key().to_bytes().into();
         let mut approval = SignedApprovalDocument {
             schema: APPROVAL_SCHEMA.to_owned(),
@@ -1245,7 +1245,7 @@ mod tests {
                 public_keys: vec![hex::encode(approver_public_key)],
             },
         };
-        let authority = SigningKey::from_bytes(&[19; 32]).unwrap();
+        let authority = SigningKey::from_slice(&[19; 32]).unwrap();
         let authority_public_key: [u8; 32] = authority.verifying_key().to_bytes().into();
         let context_bytes = serde_json::to_vec(&context).unwrap();
         let context_digest = exact_bytes_digest(TRUSTED_CONTEXT_DOMAIN, &context_bytes);
@@ -1339,7 +1339,7 @@ mod tests {
             )
             .is_err()
         );
-        let other = SigningKey::from_bytes(&[14; 32]).unwrap();
+        let other = SigningKey::from_slice(&[14; 32]).unwrap();
         assert!(
             sign_response(
                 &package,
@@ -1511,9 +1511,9 @@ mod tests {
             .signed_approval
             .clone();
         let mut approvers = [
-            SigningKey::from_bytes(&[21; 32]).unwrap(),
-            SigningKey::from_bytes(&[22; 32]).unwrap(),
-            SigningKey::from_bytes(&[23; 32]).unwrap(),
+            SigningKey::from_slice(&[21; 32]).unwrap(),
+            SigningKey::from_slice(&[22; 32]).unwrap(),
+            SigningKey::from_slice(&[23; 32]).unwrap(),
         ]
         .into_iter()
         .map(|key| {

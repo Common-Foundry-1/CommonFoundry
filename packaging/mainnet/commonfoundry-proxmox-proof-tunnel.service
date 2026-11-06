@@ -1,0 +1,25 @@
+[Unit]
+Description=Common Foundry Proxmox backup proof reverse tunnel
+Wants=network-online.target commonfoundry-mainnet-node.service
+After=network-online.target commonfoundry-mainnet-node.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/ssh -N -T -i /etc/commonfoundry-proof-tunnel/id_ed25519 -o IdentitiesOnly=yes -o BatchMode=yes -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -o StrictHostKeyChecking=yes -o HostKeyAlgorithms=ssh-ed25519 -o UpdateHostKeys=no -o UserKnownHostsFile=/etc/commonfoundry-proof-tunnel/known_hosts -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o ConnectTimeout=10 -R 127.0.0.1:29459:127.0.0.1:29443 cfadmin@173.249.35.251
+Restart=always
+RestartSec=3
+TimeoutStopSec=5
+MemoryMax=64M
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

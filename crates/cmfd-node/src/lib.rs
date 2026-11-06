@@ -4548,7 +4548,7 @@ pub fn parse_miner_destination(value: &str) -> Result<[u8; 32], NodeError> {
     let destination: [u8; 32] = bytes
         .try_into()
         .map_err(|_| NodeError::InvalidMinerDestination)?;
-    VerifyingKey::from_bytes(&destination).map_err(|_| NodeError::InvalidMinerDestination)?;
+    VerifyingKey::from_slice(&destination).map_err(|_| NodeError::InvalidMinerDestination)?;
     Ok(destination)
 }
 
@@ -4706,7 +4706,7 @@ fn build_template_from_state(
     now_unix_seconds: u64,
     transactions: Vec<Transaction>,
 ) -> Result<BlockTemplate, NodeError> {
-    VerifyingKey::from_bytes(&miner_destination).map_err(|_| NodeError::InvalidMinerDestination)?;
+    VerifyingKey::from_slice(&miner_destination).map_err(|_| NodeError::InvalidMinerDestination)?;
     let earliest = state
         .median_time_past()
         .checked_add(1)
@@ -5809,14 +5809,14 @@ impl Node {
         change_destination: [u8; 32],
         additional_reserved: &HashSet<OutPoint>,
     ) -> Result<WalletPaymentPlan, NodeError> {
-        VerifyingKey::from_bytes(&recipient).map_err(|_| NodeError::InvalidWalletRecipient)?;
+        VerifyingKey::from_slice(&recipient).map_err(|_| NodeError::InvalidWalletRecipient)?;
         validate_wallet_minimum_fee(self.params.network_id, fee_burned)?;
         if amount == 0 {
             return Err(NodeError::WalletZeroAmount);
         }
         let mut destinations = HashSet::with_capacity(input_destinations.len());
         for destination in input_destinations {
-            VerifyingKey::from_bytes(destination)
+            VerifyingKey::from_slice(destination)
                 .map_err(|_| NodeError::InvalidWalletPaymentPlan("custody input key is invalid"))?;
             if !destinations.insert(*destination) {
                 return Err(NodeError::InvalidWalletPaymentPlan(
@@ -5824,7 +5824,7 @@ impl Node {
                 ));
             }
         }
-        VerifyingKey::from_bytes(&change_destination)
+        VerifyingKey::from_slice(&change_destination)
             .map_err(|_| NodeError::InvalidWalletPaymentPlan("custody change key is invalid"))?;
         if !destinations.contains(&change_destination) {
             return Err(NodeError::InvalidWalletPaymentPlan(
@@ -6035,9 +6035,9 @@ impl Node {
         input_destinations: &HashSet<[u8; 32]>,
         change_destination: [u8; 32],
     ) -> Result<(), NodeError> {
-        VerifyingKey::from_bytes(&plan.recipient)
+        VerifyingKey::from_slice(&plan.recipient)
             .map_err(|_| NodeError::InvalidWalletPaymentPlan("recipient key is invalid"))?;
-        VerifyingKey::from_bytes(&change_destination)
+        VerifyingKey::from_slice(&change_destination)
             .map_err(|_| NodeError::InvalidWalletPaymentPlan("change key is invalid"))?;
         if input_destinations.is_empty() || !input_destinations.contains(&change_destination) {
             return Err(NodeError::InvalidWalletPaymentPlan(
@@ -8643,6 +8643,7 @@ fn route_rpc_request(request: RpcRequest, node: &mut Node) -> RpcResponse {
         && (request.target == "/v1/explorer"
             || request.target.starts_with("/v1/explorer/block/")
             || request.target.starts_with("/v1/explorer/transaction/")
+            || request.target.starts_with("/v1/explorer/utxo/")
             || request.target.starts_with("/v1/explorer/address/"));
     let mut response = route_rpc_request_inner(request, node);
     if explorer_request {
@@ -8710,6 +8711,19 @@ fn route_rpc_request_inner(request: RpcRequest, node: &mut Node) -> RpcResponse 
                     Err(error) => RpcResponse::json_error(500, "Internal Server Error", error),
                 },
                 Ok(None) => RpcResponse::json_error(404, "Not Found", "transaction not found"),
+                Err(error) => RpcResponse::node_error(error),
+            }
+        }
+        ("GET", target) if target.starts_with("/v1/explorer/utxo/") => {
+            let Some(outpoint) = parse_explorer_utxo_path(target) else {
+                return RpcResponse::json_error(400, "Bad Request", "invalid UTXO outpoint");
+            };
+            match node.explorer_utxo(outpoint) {
+                Ok(Some(utxo)) => match serde_json::to_value(utxo) {
+                    Ok(value) => RpcResponse::json(200, "OK", value),
+                    Err(error) => RpcResponse::json_error(500, "Internal Server Error", error),
+                },
+                Ok(None) => RpcResponse::json_error(404, "Not Found", "UTXO not found"),
                 Err(error) => RpcResponse::node_error(error),
             }
         }
@@ -8891,6 +8905,26 @@ fn route_rpc_request_inner(request: RpcRequest, node: &mut Node) -> RpcResponse 
     }
 }
 
+fn parse_explorer_utxo_path(target: &str) -> Option<OutPoint> {
+    let suffix = target.strip_prefix("/v1/explorer/utxo/")?;
+    let (txid, index) = suffix.split_once('/')?;
+    if txid.len() != 64
+        || !txid
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        || index.is_empty()
+        || index.len() > 10
+        || (index.len() > 1 && index.starts_with('0'))
+        || !index.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(OutPoint {
+        txid: hex::decode(txid).ok()?.try_into().ok()?,
+        index: index.parse().ok()?,
+    })
+}
+
 fn route_shared_block_request(request: RpcRequest, shared: &Arc<Mutex<Node>>) -> RpcResponse {
     let network_id = match shared.lock() {
         Ok(node) => node.params.network_id,
@@ -8978,7 +9012,7 @@ fn parse_wallet_recipient(value: &str) -> Result<[u8; 32], NodeError> {
     let recipient: [u8; 32] = bytes
         .try_into()
         .map_err(|_| NodeError::InvalidWalletRecipient)?;
-    VerifyingKey::from_bytes(&recipient).map_err(|_| NodeError::InvalidWalletRecipient)?;
+    VerifyingKey::from_slice(&recipient).map_err(|_| NodeError::InvalidWalletRecipient)?;
     Ok(recipient)
 }
 
@@ -9328,13 +9362,13 @@ fn write_rpc_response(stream: &mut impl Write, response: RpcResponse) -> Result<
 
 #[cfg(test)]
 fn insecure_dev_destination(secret_byte: u8) -> [u8; 32] {
-    let signing = SigningKey::from_bytes(&[secret_byte; 32])
+    let signing = SigningKey::from_slice(&[secret_byte; 32])
         .expect("fixed nonzero development signing key must be valid");
     signing.verifying_key().to_bytes().into()
 }
 
 fn insecure_dev_wallet_signing_key() -> SigningKey {
-    SigningKey::from_bytes(&[0x13; 32])
+    SigningKey::from_slice(&[0x13; 32])
         .expect("fixed nonzero development wallet signing key must be valid")
 }
 
@@ -9543,7 +9577,7 @@ fn load_or_create_wallet_key(
                 let mut secret = Zeroizing::new([0_u8; 32]);
                 file.read_exact(secret.as_mut())
                     .map_err(|_| NodeError::InvalidWalletKey)?;
-                let key = SigningKey::from_bytes(secret.as_ref())
+                let key = SigningKey::from_slice(secret.as_ref())
                     .map_err(|_| NodeError::InvalidWalletKey)?;
                 let destination: [u8; 32] = key.verifying_key().to_bytes().into();
                 let legacy = destination == default_miner_destination();
@@ -9560,7 +9594,7 @@ fn load_or_create_wallet_key(
                 wallet_backup::decrypt_wallet_key_bytes(&encrypted, profile.network_id, passphrase)
                     .map_err(wallet_backup_error_to_node)?;
             let key =
-                SigningKey::from_bytes(secret.as_ref()).map_err(|_| NodeError::InvalidWalletKey)?;
+                SigningKey::from_slice(secret.as_ref()).map_err(|_| NodeError::InvalidWalletKey)?;
             let destination: [u8; 32] = key.verifying_key().to_bytes().into();
             let legacy = destination == default_miner_destination();
             Ok((key, legacy))
@@ -9646,7 +9680,7 @@ fn random_wallet_signing_key() -> Result<SigningKey, NodeError> {
                 io::Error::other(source.to_string()),
             )
         })?;
-        if let Ok(key) = SigningKey::from_bytes(secret.as_ref()) {
+        if let Ok(key) = SigningKey::from_slice(secret.as_ref()) {
             return Ok(key);
         }
     }
@@ -12795,7 +12829,7 @@ mod tests {
         fee: u64,
     ) -> Transaction {
         let previous_output = &block.coinbase.outputs[output_index as usize];
-        let owner = SigningKey::from_bytes(&[owner_secret; 32]).unwrap();
+        let owner = SigningKey::from_slice(&[owner_secret; 32]).unwrap();
         let mut transaction = Transaction {
             network_id: node.params.network_id,
             version: TRANSACTION_VERSION,
@@ -12840,7 +12874,7 @@ mod tests {
         assert!(node.mempool.is_empty());
 
         let transaction = spend_coinbase_output(&node, &funding, 2, 0x12, 0x31, 10);
-        let recipient = SigningKey::from_bytes(&[0x31; 32]).unwrap();
+        let recipient = SigningKey::from_slice(&[0x31; 32]).unwrap();
         let mut unconfirmed_child = Transaction {
             network_id: node.params.network_id,
             version: TRANSACTION_VERSION,
@@ -12908,7 +12942,7 @@ mod tests {
                 spendable_height: node.state.next_height(),
             })
             .collect();
-        let owner = SigningKey::from_bytes(&[0x12; 32]).unwrap();
+        let owner = SigningKey::from_slice(&[0x12; 32]).unwrap();
         transaction.sign_all(&[&owner]).unwrap();
         let encoded_bytes = encode_transaction(&transaction).unwrap().len();
         let required = u64::try_from(encoded_bytes.div_ceil(1024)).unwrap();
@@ -12941,12 +12975,12 @@ mod tests {
         let mut first = spend_coinbase_output(&node, &funding, 1, 0x11, 0x35, 1);
         first.outputs[0].lock = OutputLock::InferenceChannel { channel_id };
         first
-            .sign_all(&[&SigningKey::from_bytes(&[0x11; 32]).unwrap()])
+            .sign_all(&[&SigningKey::from_slice(&[0x11; 32]).unwrap()])
             .unwrap();
         let mut second = spend_coinbase_output(&node, &funding, 2, 0x12, 0x36, 1);
         second.outputs[0].lock = OutputLock::InferenceChannel { channel_id };
         second
-            .sign_all(&[&SigningKey::from_bytes(&[0x12; 32]).unwrap()])
+            .sign_all(&[&SigningKey::from_slice(&[0x12; 32]).unwrap()])
             .unwrap();
 
         node.submit_transaction(first.clone()).unwrap();
@@ -15541,7 +15575,7 @@ mod tests {
             .unwrap()
             .try_into()
             .unwrap();
-        let key = SigningKey::from_bytes(&secret).unwrap();
+        let key = SigningKey::from_slice(&secret).unwrap();
         assert_eq!(
             <[u8; 32]>::from(key.verifying_key().to_bytes()),
             default_miner_destination()
@@ -17156,7 +17190,7 @@ mod tests {
 
         // Confirm a third-party output so ordinary relay can be distinguished
         // from transactions spending this node's custody wallet.
-        let third_party_key = SigningKey::from_bytes(&[0x7c; 32]).unwrap();
+        let third_party_key = SigningKey::from_slice(&[0x7c; 32]).unwrap();
         let third_party_destination = third_party_key.verifying_key().to_bytes().into();
         let (third_party_funding, _) = node
             .prepare_dev_wallet_payment(third_party_destination, 10, 1)

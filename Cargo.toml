@@ -36,7 +36,7 @@ ctrlc = "3.4"
 fs2 = "0.4.3"
 getrandom = "0.3.4"
 hex = "0.4"
-k256 = { version = "0.13", features = ["schnorr"] }
+k256 = { version = "0.14.0", features = ["schnorr"] }
 libloading = "0.8.9"
 primitive-types = "0.13"
 rayon = "=1.12.0"

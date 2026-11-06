@@ -1,0 +1,76 @@
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Rust licenses · Common Foundry Wallet</title>
+    <style>
+        :root { color-scheme: dark; }
+        body { margin: 0; background: #121717; color: #ebe9e3; }
+        a { color: #e7b961; }
+        .container {
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            max-width: 960px;
+            margin: 0 auto;
+            padding: 24px 18px 72px;
+        }
+        .intro { border-bottom: 1px solid #47423a; margin-bottom: 24px; }
+        .eyebrow { color: #e7b961; font-size: .75rem; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; }
+        h1 { line-height: 1.1; }
+        .licenses-list {
+            list-style-type: none;
+            margin: 0;
+            padding: 0;
+        }
+        .license { border: 1px solid #47423a; border-radius: 10px; margin: 12px 0; padding: 14px; background: #1b2020; }
+        .license summary { cursor: pointer; color: #e7b961; font-weight: 700; }
+        .license-used-by { line-height: 1.8; }
+        .license-text {
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+            background: #111515;
+            padding: 16px;
+            border-radius: 8px;
+            font-size: .8rem;
+            line-height: 1.5;
+        }
+    </style>
+</head>
+
+<body>
+    <main class="container">
+        <div class="intro">
+            <p class="eyebrow">Common Foundry Wallet</p>
+            <h1>Rust open-source licenses</h1>
+            <p>License notices for the Rust packages included in the Android wallet. <a href="/">Back to wallet</a>.</p>
+            <p>See also <a href="/javascript-licenses.html">JavaScript notices</a> and <a href="/android-library-notices.html">Android library notices</a>.</p>
+        </div>
+
+        <h2>Overview of licenses:</h2>
+        <ul class="licenses-overview">
+            {{#each overview}}
+            <li><a href="#{{id}}">{{name}}</a> ({{count}})</li>
+            {{/each}}
+        </ul>
+
+        <h2>All license text:</h2>
+        <ul class="licenses-list">
+            {{#each licenses}}
+            <li class="license">
+                <details id="{{id}}">
+                <summary>{{name}}</summary>
+                <h4>Used by</h4>
+                <ul class="license-used-by">
+                    {{#each used_by}}
+                    <li><a href="{{#if crate.repository}}{{crate.repository}}{{else}}https://crates.io/crates/{{crate.name}}{{/if}}">{{crate.name}} {{crate.version}}</a></li>
+                    {{/each}}
+                </ul>
+                <pre class="license-text">{{text}}</pre>
+                </details>
+            </li>
+            {{/each}}
+        </ul>
+    </main>
+</body>
+
+</html>

@@ -176,7 +176,7 @@ fn payout_reorg_hold_restart_restore_manual_resume_and_second_paid_reorg() {
     let mut fork =
         Node::open_with_profile(root.path().join("fork"), crate::DEVNET_PROFILE).unwrap();
     let alternate_owner =
-        PoolPayoutSigner::new(SigningKey::from_bytes(&[0x71; 32]).unwrap()).payout();
+        PoolPayoutSigner::new(SigningKey::from_slice(&[0x71; 32]).unwrap()).payout();
     for offset in 0..COINBASE_MATURITY + 2 {
         let block = fork
             .mine_once(alternate_owner, now + offset, 10_000)
@@ -312,7 +312,7 @@ fn payout_hold_is_scoped_and_wallet_planner_keeps_signed_inputs_reserved() {
         node.mine_once(owner, now + offset, 10_000).unwrap();
     }
     let recipient = test_payout_signer().payout();
-    let other = PoolPayoutSigner::new(SigningKey::from_bytes(&[0x75; 32]).unwrap()).payout();
+    let other = PoolPayoutSigner::new(SigningKey::from_slice(&[0x75; 32]).unwrap()).payout();
     let ledger = protection_ledger(&node);
     register_session(&ledger, 1, "affected".into(), recipient).unwrap();
     register_session(&ledger, 2, "unaffected".into(), other).unwrap();

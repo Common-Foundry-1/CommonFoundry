@@ -91,6 +91,9 @@ jobs:
           bash -n scripts/package-wallet-runtime-bootstrap.sh
           bash -n packaging/production-rc/runtime/linux/prepare-rcnet-runtime.sh
           bash -n packaging/production-rc/runtime/linux/start-wallet.sh
+      - name: Test bounded Android UTXO proof origin
+        run: |
+          python3 -m unittest discover -s scripts/tests -p 'test_cmfd_utxo_proof_proxy.py' -v
       - name: Install Linux desktop dependencies
         run: |
           sudo apt-get update
@@ -110,7 +113,11 @@ jobs:
           toolchain: 1.94.1
           components: rustfmt, clippy
       - run: cargo install cargo-audit --version '=0.22.2' --locked
-      - run: cargo audit
+      # Remainder_CE pulls ndarray-npy's default NPZ feature, which locks zip
+      # 0.5.13. These advisories affect ZipArchive/ZipStreamReader extraction;
+      # the consensus proof path does not call archive extraction. Keep the
+      # exception explicit until the upstream dependency can drop old zip.
+      - run: cargo audit --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 --ignore RUSTSEC-2026-0369
       - name: Check optimized Linux wallet dependency regression
         run: cargo test --locked --release --manifest-path tools/linux-wallet-dependency-check/Cargo.toml
       - run: cargo fmt --all --check

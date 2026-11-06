@@ -1033,7 +1033,7 @@ fn validate_label(label: &str) -> Result<(), ExchangeIndexError> {
 }
 
 fn validate_destination(destination: [u8; 32]) -> Result<(), ExchangeIndexError> {
-    VerifyingKey::from_bytes(&destination)
+    VerifyingKey::from_slice(&destination)
         .map(|_| ())
         .map_err(|_| ExchangeIndexError::InvalidDestination)
 }
@@ -1799,10 +1799,13 @@ mod tests {
     }
 
     fn random_destination() -> [u8; 32] {
-        k256::schnorr::SigningKey::random(&mut k256::elliptic_curve::rand_core::OsRng)
-            .verifying_key()
-            .to_bytes()
-            .into()
+        let mut secret = [0_u8; 32];
+        loop {
+            getrandom::fill(&mut secret).expect("obtain random test destination");
+            if let Ok(key) = k256::schnorr::SigningKey::from_slice(&secret) {
+                return key.verifying_key().to_bytes().into();
+            }
+        }
     }
 
     fn test_deposit(

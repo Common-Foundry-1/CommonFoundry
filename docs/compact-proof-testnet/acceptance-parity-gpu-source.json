@@ -1,0 +1,31 @@
+{
+  "schema": "CMFD_ACCEPTANCE_PARITY_GPU_SOURCE_V1",
+  "baseline_runtime_commit": "61a8c70c0e7171041f71ef1ffb0eb530951ed68b",
+  "patch_text_line_endings": "LF; normalize baseline text before applying",
+  "git_apply_flags": [
+    "--unidiff-zero"
+  ],
+  "files": [
+    {
+      "path": "src/bin/real_bank0_all_relations.rs",
+      "before_sha256": "dec568a66367d391aeef842fd0b71e37c7dcf04eefc8211a21d3c25a966c1f3c",
+      "after_sha256": "d785695e423e3af85dd51e7ae3c61df884b84ba0a79e7c78ea6da2e91557058c",
+      "before_normalized_lf_sha256": "9e4e37b55f688e2199f45e568caea11eb8a07e9a75797f790e37fe58ae605092",
+      "after_normalized_lf_sha256": "f2b1593502b9ff34d990ef958c353b23808113fd713c9c813b25e97195f18f3f"
+    },
+    {
+      "path": "src/direct_opening.rs",
+      "before_sha256": "f5e5b3559f03e903a7dfef198d7e73d39008056443d08263798a158f087bef6f",
+      "after_sha256": "6ac9143d4efe43333734f94ca1d8a515deeecd4d5ce8ef211f31c3e84d56a110",
+      "before_normalized_lf_sha256": "f5e5b3559f03e903a7dfef198d7e73d39008056443d08263798a158f087bef6f",
+      "after_normalized_lf_sha256": "6ac9143d4efe43333734f94ca1d8a515deeecd4d5ce8ef211f31c3e84d56a110"
+    },
+    {
+      "path": "cuda/koala_four_limb_replay.cu",
+      "before_sha256": "dc776e013785143575425ae3e81e71aea58eaef7dfcf23de9064b4091a20075f",
+      "after_sha256": "0f9c3cded0ee18de44cb357c69e7d85ae208846634802affd2d8733427aada60",
+      "before_normalized_lf_sha256": "dcff0b9a999072d890c2d70b964e0374db3f847c76bd68bd8c9e98fdeba611e5",
+      "after_normalized_lf_sha256": "0f9c3cded0ee18de44cb357c69e7d85ae208846634802affd2d8733427aada60"
+    }
+  ]
+}

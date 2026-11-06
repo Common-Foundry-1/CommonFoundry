@@ -1,0 +1,419 @@
+--- a/src/bin/real_bank0_all_relations.rs
++++ b/src/bin/real_bank0_all_relations.rs
+@@ -144,0 +145 @@
++    source_model: PathBuf,
+@@ -550,0 +552 @@
++        source_model: model_path.to_owned(),
+@@ -656,0 +659,9 @@
++    // Pinned proof inputs may displace the replay worker's file-cache pages
++    // during startup. Fault the shared source back in before accepting shares;
++    // this uses reclaimable mappings and allocates no second model copy.
++    let warmup_started=Instant::now();
++    let source=unsafe{MmapOptions::new().map(&File::open(&prepared.source_model)?)?};
++    let touched=source.par_chunks(4096).map(|page|page[0] as u64).sum::<u64>();
++    std::hint::black_box(touched);
++    drop(source);
++    eprintln!("shared_model_cache_warmup_seconds={:.6}",warmup_started.elapsed().as_secs_f64());
+@@ -942 +953 @@
+-    relations.push(bank_relations);claims.push(bank_claims);claims[1].extend(boundary_claims);drop(final_encoded_device);scope.synchronize_blocking()?;
++    relations.push(bank_relations);claims.push(bank_claims);claims[1].extend(boundary_claims);scope.synchronize_blocking()?;
+@@ -968 +979,5 @@
+-    let mut fixed_devices=Vec::with_capacity(3);
++    let mut fixed_devices:[Option<DeviceBuffer<u8>>;3]=std::array::from_fn(|_|None);
++    fixed_devices[2]=Some(match final_encoded_device {
++        DeviceBank::Owned(buffer)=>buffer,
++        DeviceBank::Resident(_)=>anyhow::bail!("unexpected resident relation bank"),
++    });
+@@ -970 +985,2 @@
+-        let encoded=DeviceBuffer::from_host_slice(&encoded_banks[bank],scope)?;scope.synchronize_blocking()?;
++        if fixed_devices[bank].is_none(){fixed_devices[bank]=Some(DeviceBuffer::from_host_slice(&encoded_banks[bank],scope)?);}
++        let encoded=fixed_devices[bank].as_ref().expect("current fixed bank");scope.synchronize_blocking()?;
+@@ -972 +988 @@
+-            bank,&fixed_maps[bank],&encoded,dynamic,gpu_fixed[bank],gpu_dynamic[bank],&claims[bank],
++            bank,&fixed_maps[bank],encoded,dynamic,gpu_fixed[bank],gpu_dynamic[bank],&claims[bank],
+@@ -974,2 +990 @@
+-        if retain_fixed { fixed_devices.push(encoded); }
+-        else { drop(encoded); scope.synchronize_blocking()?; }
++        if !retain_fixed && bank!=2 {drop(fixed_devices[bank].take());scope.synchronize_blocking()?;}
+@@ -980,3 +994,0 @@
+-    let fixed_devices:Option<[DeviceBuffer<u8>;3]>=if retain_fixed {
+-        Some(fixed_devices.try_into().map_err(|_|anyhow::anyhow!("retained fixed bank count"))?)
+-    } else { None };
+@@ -999,2 +1011,2 @@
+-    let result=direct_opening::prove_integrated(prepared,statement,&proof,dynamic_traces,fixed_devices,output_path,scope)?;
+-    ensure!(result["selfcontained_verified"]==true,"direct receiver did not verify");
++    let result=direct_opening::prove_integrated(prepared,statement,&proof,dynamic_traces,fixed_devices,output_path,scope,self_check)?;
++    ensure!(!self_check || result["selfcontained_verified"]==true,"standalone direct receiver did not verify");
+@@ -1016 +1028,2 @@
+-        "real_direct_proof=VERIFIED bytes={} online_seconds={:.6} self_check={} output={}",
++        "real_direct_proof={} bytes={} online_seconds={:.6} self_check={} output={}",
++        if self_check {"VERIFIED"} else {"GENERATED_FOR_NODE_VERIFICATION"},
+@@ -1240,8 +1253 @@
+-        let next_values = (0..LAYERS)
+-            .map(|layer| {
+-                evaluate_row(
+-                    &next_reduced[layer * WIDTH..(layer + 1) * WIDTH],
+-                    &terminal_common,
+-                )
+-            })
+-            .collect::<Vec<_>>();
++        let next_values = evaluate_rows(&next_reduced, &terminal_common);
+@@ -1282 +1288 @@
+-        if bank == 0 {
++        let initial_check = if bank == 0 {
+@@ -1284,0 +1291,3 @@
++            let base_input=base_input.to_vec();
++            let expected_boundary=cpu_shift.boundary_evaluation;
++            Some(thread::spawn(move || -> Result<()> {
+@@ -1288 +1297 @@
+-                base_input,
++                &base_input,
+@@ -1294 +1303 @@
+-                expected == cpu_shift.boundary_evaluation,
++                expected == expected_boundary,
+@@ -1296,0 +1306,2 @@
++            Ok(())
++            }))
+@@ -1303 +1314,2 @@
+-        }
++            None
++        };
+@@ -1344,0 +1357,3 @@
++        if let Some(check)=initial_check {
++            check.join().map_err(|_|anyhow::anyhow!("initial boundary check panicked"))??;
++        }
+@@ -1540,8 +1555,10 @@
+-    let point = Point::from(
+-        layer
+-            .iter()
+-            .chain(output.iter())
+-            .copied()
+-            .collect::<Vec<_>>(),
+-    );
+-    evaluate_row(values, &point)
++    evaluate_row(&evaluate_rows(values,output),layer)
++}
++
++fn evaluate_rows(values:&[Ext],point:&Point<Ext>)->Vec<Ext>{
++    let equality=Mle::<Ext>::partial_lagrange(point);
++    let weights=equality.guts().as_slice();
++    assert!(!weights.is_empty() && values.len()%weights.len()==0);
++    values.par_chunks_exact(weights.len())
++        .map(|row|row.iter().zip(weights).map(|(a,b)|*a**b).sum())
++        .collect()
+@@ -1691,0 +1709,17 @@
++    #[test]
++    fn factored_parallel_evaluations_match_the_original_flat_mle() {
++        for seed in 1..5 {
++            let mut challenger=TestGC::default_challenger();
++            challenger.observe(Felt::from_canonical_usize(seed));
++            let layer=sample_point(&mut challenger,3);
++            let output=sample_point(&mut challenger,5);
++            let values=(0..256).map(|_|challenger.sample_ext_element()).collect::<Vec<_>>();
++            let flat=Point::from(layer.iter().chain(output.iter()).copied().collect::<Vec<_>>());
++            assert_eq!(evaluate_matrix(&values,&layer,&output),evaluate_row(&values,&flat));
++            let rows=evaluate_rows(&values,&output);
++            assert_eq!(rows.len(),8);
++            for (row,expected) in values.chunks_exact(32).zip(rows) {
++                assert_eq!(expected,evaluate_row(row,&output));
++            }
++        }
++    }
+--- a/src/direct_opening.rs
++++ b/src/direct_opening.rs
+@@ -44 +44 @@
+-  prove_impl(prepared,statement,original,dynamic_traces,None,output,scope,false)
++  prove_impl(prepared,statement,original,dynamic_traces,std::array::from_fn(|_|None),output,scope,false,true)
+@@ -49 +49 @@
+-  dynamic_traces:PreparedDynamicTraces,fixed_banks:Option<[DeviceBuffer<u8>;3]>,output:&Path,scope:&TaskScope,
++  dynamic_traces:PreparedDynamicTraces,fixed_banks:[Option<DeviceBuffer<u8>>;3],output:&Path,scope:&TaskScope,self_check:bool,
+@@ -51 +51 @@
+-  prove_impl(prepared,statement,public_carrier,dynamic_traces,fixed_banks,output,scope,true)
++  prove_impl(prepared,statement,public_carrier,dynamic_traces,fixed_banks,output,scope,true,self_check)
+@@ -56 +56 @@
+-  dynamic_traces:PreparedDynamicTraces,preloaded_fixed:Option<[DeviceBuffer<u8>;3]>,output:&Path,scope:&TaskScope,integrated:bool,
++  dynamic_traces:PreparedDynamicTraces,preloaded_fixed:[Option<DeviceBuffer<u8>>;3],output:&Path,scope:&TaskScope,integrated:bool,self_check:bool,
+@@ -62,5 +62,6 @@
+-  // Default to one transient fixed bank. The same pinned host bytes are
+-  // uploaded again for the later shared-point evaluation; no relation,
+-  // transcript observation, opening, or field check is omitted.
+-  let reused_fixed_banks=preloaded_fixed.is_some();
+-  let fixed_banks=preloaded_fixed;
++  // Keep bank 2 from relation proving. Rotate one additional bank through
++  // reductions and shared evaluations; no more than two fixed banks are live.
++  // Reordering the independent column evaluations does not observe or sample
++  // the transcript: assemble the same six values in their canonical order.
++  let reused_fixed_banks=preloaded_fixed.iter().any(Option::is_some);
++  let mut fixed_banks=preloaded_fixed;
+@@ -71 +72 @@
+-   let transient=if fixed_banks.is_none(){Some(DeviceBuffer::from_host_slice(&prepared.encoded_banks[bank],scope)?)}else{None};
++   if fixed_banks[bank].is_none(){fixed_banks[bank]=Some(DeviceBuffer::from_host_slice(&prepared.encoded_banks[bank],scope)?);}
+@@ -73 +74 @@
+-   let fixed=match &fixed_banks{Some(banks)=>&banks[bank],None=>transient.as_ref().expect("transient fixed bank")};
++   let fixed=fixed_banks[bank].as_ref().expect("secondary fixed bank");
+@@ -77 +78 @@
+-   scope.synchronize_blocking()?;drop(transient);scope.synchronize_blocking()?;
++   scope.synchronize_blocking()?;if bank==0{drop(fixed_banks[bank].take());}scope.synchronize_blocking()?;
+@@ -81,7 +82,7 @@
+-  let shared_started=Instant::now();let shared_point=sumcheck.point_and_eval.0.clone();let mut shared=Vec::with_capacity(6);
+- for bank in 0..3{
+-   let transient=if fixed_banks.is_none(){Some(DeviceBuffer::from_host_slice(&prepared.encoded_banks[bank],scope)?)}else{None};
+-   let fixed=match &fixed_banks{Some(banks)=>&banks[bank],None=>transient.as_ref().expect("transient shared fixed bank")};
+-   shared.push(real_v4_opening::evaluate_fixed_columns(fixed,&shared_point,scope)?);scope.synchronize_blocking()?;
+-  shared.push(real_v4_opening::evaluate_dynamic_columns(dynamic_traces[bank].main_virtual_tensor(LOG_ROWS),&shared_point,scope)?);budget("shared-evaluations",&mut peak)?;
+-   scope.synchronize_blocking()?;drop(transient);scope.synchronize_blocking()?;
++  let shared_started=Instant::now();let shared_point=sumcheck.point_and_eval.0.clone();let mut shared:[Vec<Ext>;6]=std::array::from_fn(|_|Vec::new());
++ for bank in [1usize,0,2]{
++   if fixed_banks[bank].is_none(){fixed_banks[bank]=Some(DeviceBuffer::from_host_slice(&prepared.encoded_banks[bank],scope)?);}
++   let fixed=fixed_banks[bank].as_ref().expect("shared fixed bank");
++   shared[2*bank]=real_v4_opening::evaluate_fixed_columns(fixed,&shared_point,scope)?;scope.synchronize_blocking()?;
++   shared[2*bank+1]=real_v4_opening::evaluate_dynamic_columns(dynamic_traces[bank].main_virtual_tensor(LOG_ROWS),&shared_point,scope)?;budget("shared-evaluations",&mut peak)?;
++   scope.synchronize_blocking()?;drop(fixed_banks[bank].take());scope.synchronize_blocking()?;
+@@ -89 +90 @@
+-  let shared_seconds=shared_started.elapsed().as_secs_f64();drop(fixed_banks);scope.synchronize_blocking()?;budget("fixed-banks-released",&mut peak)?;let gpu_shared:[Vec<Ext>;6]=shared.try_into().map_err(|_|anyhow::anyhow!("shared evaluation count"))?;
++  let shared_seconds=shared_started.elapsed().as_secs_f64();drop(fixed_banks);scope.synchronize_blocking()?;budget("fixed-banks-released",&mut peak)?;let gpu_shared=shared;
+@@ -115 +116,4 @@
+-  let verify_started=Instant::now();if integrated{cmfd_consensus::forgematrix_v4_direct::verify_wire(statement,prepared.cpu_fixed,&prepared.base_input,&wire)?;}else{cmfd_consensus::forgematrix_v4_direct::decode(&wire,statement)?;}let selfcontained_verify_seconds=verify_started.elapsed().as_secs_f64();
++  // The pool server passes self_check=false, as in the original prover. Its
++  // untrusted output must still pass the node's complete consensus verifier.
++  // Standalone qualification retains the independent full CPU self-check.
++  let verify_started=Instant::now();if integrated&&self_check{cmfd_consensus::forgematrix_v4_direct::verify_wire(statement,prepared.cpu_fixed,&prepared.base_input,&wire)?;}else{cmfd_consensus::forgematrix_v4_direct::decode(&wire,statement)?;}let selfcontained_verify_seconds=verify_started.elapsed().as_secs_f64();
+@@ -119 +123 @@
+-  let report=serde_json::json!({"schema":if integrated{"CMFD_DIRECT_SELFCONTAINED_GPU_RESEARCH_V3"}else{"CMFD_DIRECT_SIX_OPENING_GPU_PROTOTYPE_V3"},"verified":true,"selfcontained_verified":integrated,"selfcontained_verify_seconds":selfcontained_verify_seconds,"wire_bytes":wire.len(),"secondary_reduction_bytes":reduction_bytes.len(),"raw_joint_basefold_bytes":raw_basefold_bytes,"compressed_joint_basefold_bytes":compressed_basefold_bytes,"reused_fixed_banks":reused_fixed_banks,"fixed_initial_upload_seconds":fixed_initial_upload_seconds,"secondary_inputs_seconds":secondary_inputs_seconds,"reduction_seconds":reduction_seconds,"shared_evaluations_seconds":shared_seconds,"dynamic_recommit_seconds":dynamic_recommit_seconds,"joint_basefold_seconds":pcs_seconds,"bridge_seconds":bridge_seconds,"encoding_seconds":encoding_seconds,"direct_stage_seconds":began.elapsed().as_secs_f64(),"peak_sampled_gpu_bytes":peak,"absolute_gpu_guard_gib":guard_gib,"original_field_parameters":{"log_blowup":1,"queries":270,"grinding_bits":16,"commitments":6},"original_full_proof_used_only_as_valid_fixture_input":!integrated,"production_consensus_or_admission_implemented":false,"overall_security_qualified":false});std::fs::write(output.with_extension("result.json"),serde_json::to_vec_pretty(&report)?)?;Ok(report)
++  let report=serde_json::json!({"schema":if integrated{"CMFD_DIRECT_SELFCONTAINED_GPU_RESEARCH_V3"}else{"CMFD_DIRECT_SIX_OPENING_GPU_PROTOTYPE_V3"},"verified":!integrated||self_check,"node_verification_required":integrated&&!self_check,"relation_checks_completed":true,"selfcontained_verified":integrated&&self_check,"producer_self_check_requested":self_check,"selfcontained_verify_seconds":selfcontained_verify_seconds,"wire_bytes":wire.len(),"secondary_reduction_bytes":reduction_bytes.len(),"raw_joint_basefold_bytes":raw_basefold_bytes,"compressed_joint_basefold_bytes":compressed_basefold_bytes,"reused_fixed_banks":reused_fixed_banks,"fixed_initial_upload_seconds":fixed_initial_upload_seconds,"secondary_inputs_seconds":secondary_inputs_seconds,"reduction_seconds":reduction_seconds,"shared_evaluations_seconds":shared_seconds,"dynamic_recommit_seconds":dynamic_recommit_seconds,"joint_basefold_seconds":pcs_seconds,"bridge_seconds":bridge_seconds,"encoding_seconds":encoding_seconds,"direct_stage_seconds":began.elapsed().as_secs_f64(),"peak_sampled_gpu_bytes":peak,"absolute_gpu_guard_gib":guard_gib,"original_field_parameters":{"log_blowup":1,"queries":270,"grinding_bits":16,"commitments":6},"original_full_proof_used_only_as_valid_fixture_input":!integrated,"production_consensus_or_admission_implemented":false,"overall_security_qualified":false});eprintln!("CMFD_DIRECT_PROFILE {}",report);std::fs::write(output.with_extension("result.json"),serde_json::to_vec_pretty(&report)?)?;Ok(report)
+--- a/cuda/koala_four_limb_replay.cu
++++ b/cuda/koala_four_limb_replay.cu
+@@ -19,0 +20,13 @@
++#include <cerrno>
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <sys/statfs.h>
++#include <sys/syscall.h>
++#include <unistd.h>
++#include <linux/memfd.h>
++#include <linux/magic.h>
++#include <thread>
++#include <exception>
++#include <future>
++#include <memory>
+@@ -744,0 +758,106 @@
++// Hold one immutable 1.5 GiB witness and one separate 1.5 GiB standby slot.
++// A new replay closes the preceding witness; process exit closes all handles.
++// EVICT releases GPU weights but must not invalidate the pending handoff.
++class SealedReplayExports {
++    struct Slot { int fd = -1; void* mapping = MAP_FAILED; bool registered = false; };
++    static constexpr size_t BYTES = size_t{512} << 20;
++public:
++    ~SealedReplayExports() { clear(); }
++    void clear() {
++        for (auto& slot : slots_) {
++            if (slot.registered) cudaHostUnregister(slot.mapping);
++            if (slot.mapping != MAP_FAILED) ::munmap(slot.mapping, BYTES);
++            if (slot.fd >= 0) ::close(slot.fd);
++        }
++        slots_.clear(); published_ = 0;
++    }
++    void prepare(const std::string& path) {
++        if (slots_.size() == 3 && published_ == 0) return;
++        if (standby_.valid()) {
++            auto next = standby_.get();
++            clear();
++            slots_ = std::move(next->slots_);
++            return;
++        }
++        const auto parent = std::filesystem::path(path).parent_path();
++        struct stat permissions{}; struct statfs filesystem{};
++        if (::stat(parent.c_str(), &permissions) || ::statfs(parent.c_str(), &filesystem)
++            || permissions.st_uid != ::geteuid() || (permissions.st_mode & 0777) != 0700
++            || filesystem.f_type != TMPFS_MAGIC)
++            throw std::runtime_error("sealed replay export requires an owned private tmpfs directory");
++        // A new RUN is serialized after the previous prover finished opening
++        // the immutable descriptors. Bound resident handoff storage to 1.5 GiB.
++        clear();
++        const auto started = std::chrono::steady_clock::now();
++        try {
++            for (int bank = 0; bank < 3; ++bank) {
++                slots_.push_back(Slot{});
++                auto& slot = slots_.back();
++                slot.fd = static_cast<int>(::syscall(SYS_memfd_create,
++                    "cmfd-sealed-gpu-witness", MFD_CLOEXEC | MFD_ALLOW_SEALING));
++                if (slot.fd < 0 || ::ftruncate(slot.fd, BYTES))
++                    throw std::runtime_error("allocate bounded replay memfd");
++                slot.mapping = ::mmap(nullptr, BYTES, PROT_READ | PROT_WRITE,
++                    MAP_SHARED | MAP_POPULATE, slot.fd, 0);
++                if (slot.mapping == MAP_FAILED) throw std::runtime_error("populate replay memfd");
++                cuda_check(cudaHostRegister(slot.mapping, BYTES, cudaHostRegisterDefault),
++                    "register bounded replay destination");
++                slot.registered = true;
++            }
++        } catch (...) { clear(); throw; }
++        std::fprintf(stderr, "sealed_witness_prepare_seconds=%.6f bytes=%zu\n",
++            std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count(), 3*BYTES);
++    }
++    void append(const std::string& path, const uint32_t* first,
++                const uint32_t* second, size_t values) {
++        if (2 * values * sizeof(uint32_t) != BYTES || slots_.size() != 3 || published_ >= 3)
++            throw std::runtime_error("sealed replay witness exceeds its bounded shape");
++        auto& slot = slots_[published_];
++        const auto started = std::chrono::steady_clock::now();
++        cuda_check(cudaMemcpy(slot.mapping, first, values * sizeof(uint32_t), cudaMemcpyDeviceToHost),
++                   "export first sealed witness half");
++        cuda_check(cudaMemcpy(static_cast<uint32_t*>(slot.mapping) + values, second,
++                              values * sizeof(uint32_t), cudaMemcpyDeviceToHost),
++                   "export second sealed witness half");
++        const double copy_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count();
++        cuda_check(cudaHostUnregister(slot.mapping), "unregister sealed witness destination");
++        slot.registered = false;
++        if (::munmap(slot.mapping, BYTES)) throw std::runtime_error("unmap sealed witness writer");
++        slot.mapping = MAP_FAILED;
++        constexpr int seals = F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL;
++        if (::fcntl(slot.fd, F_ADD_SEALS, seals) || (::fcntl(slot.fd, F_GET_SEALS) & seals) != seals)
++            throw std::runtime_error("seal replay witness before publishing");
++        const auto source = "/proc/" + std::to_string(::getpid()) + "/fd/" + std::to_string(slot.fd);
++        if (::symlink(source.c_str(), path.c_str()))
++            throw std::runtime_error("publish sealed replay descriptor");
++        ++published_;
++        if (published_ == 3) {
++            // Prepare a separate bounded witness slot while the current sealed
++            // witness is proved. Its fds/maps never alias published bytes.
++            // Two slots total at most 3 GiB of host RAM and add no device arrays.
++            standby_ = std::async(std::launch::async, [path] {
++                cuda_check(cudaSetDevice(0), "select standby witness context");
++                auto next = std::make_unique<SealedReplayExports>();
++                next->prepare(path);
++                return next;
++            });
++        }
++        std::fprintf(stderr, "sealed_witness_export bank=%zu copy_seconds=%.6f seal_and_release_seconds=%.6f\n",
++            published_-1, copy_seconds,
++            std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count()-copy_seconds);
++    }
++private:
++    std::vector<Slot> slots_;
++    size_t published_ = 0;
++    std::future<std::unique_ptr<SealedReplayExports>> standby_;
++};
++
++bool sealed_witness_enabled() {
++    const char* setting = std::getenv("CMFD_REPLAY_SEALED_EXPORT");
++    return setting && std::strcmp(setting, "1") == 0;
++}
++SealedReplayExports& replay_exports() {
++    static thread_local SealedReplayExports exports;
++    return exports;
++}
++
+@@ -761,0 +881,2 @@
++    const bool sealed = sealed_witness_enabled();
++    if (sealed) replay_exports().prepare(prefix);
+@@ -765,8 +886,9 @@
+-        std::ofstream output(path, std::ios::binary | std::ios::trunc);
+-        if (!output) throw std::runtime_error("create V4 bank dynamic trace");
+-        append_device_u32(output,
+-                          preactivation_trace + size_t(bank) * bank_values,
+-                          bank_values);
+-        append_device_u32(output,
+-                          activation_trace + (size_t(bank) * 128 + 1) * cells,
+-                          bank_values);
++        if (sealed) {
++            replay_exports().append(path, preactivation_trace + size_t(bank) * bank_values,
++                activation_trace + (size_t(bank) * 128 + 1) * cells, bank_values);
++        } else {
++            std::ofstream output(path, std::ios::binary | std::ios::trunc);
++            if (!output) throw std::runtime_error("create V4 bank dynamic trace");
++            append_device_u32(output, preactivation_trace + size_t(bank) * bank_values, bank_values);
++            append_device_u32(output, activation_trace + (size_t(bank) * 128 + 1) * cells, bank_values);
++        }
+@@ -1013,0 +1136,59 @@
++        const char* parallel_setting = std::getenv("CMFD_REPLAY_PARALLEL_LOAD");
++        if (parallel_setting && std::strcmp(parallel_setting, "1") == 0) {
++            const int descriptor = ::open(model_path_.c_str(), O_RDONLY | O_CLOEXEC);
++            if (descriptor < 0) throw std::runtime_error("open parallel model input");
++            first_canonical_layer_.resize(layer_cells);
++            std::exception_ptr failures[3];
++            std::thread loaders[3];
++            for (unsigned bank = 0; bank < 3; ++bank) loaders[bank] = std::thread([&,bank] {
++                uint8_t* staging = nullptr; uint8_t* device_layer = nullptr;
++                cudaStream_t stream = nullptr;
++                cudaEvent_t consumed[2] = {nullptr,nullptr};
++                try {
++                    cuda_check(cudaSetDevice(0), "select shared primary model context");
++                    cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "create model load stream");
++                    cuda_check(cudaMallocHost(&staging, 2*layer_cells), "allocate bounded parallel staging");
++                    cuda_check(cudaMalloc(&device_layer, layer_cells), "allocate parallel model layer");
++                    for (auto& event : consumed)
++                        cuda_check(cudaEventCreateWithFlags(&event,cudaEventDisableTiming), "create parallel staging event");
++                    for (uint32_t layer = bank*128; layer < (bank+1)*128; ++layer) {
++                        const unsigned slot = layer%2;
++                        if (layer >= bank*128+2) cuda_check(cudaEventSynchronize(consumed[slot]), "await model staging reuse");
++                        uint8_t* bytes = staging + slot*layer_cells;
++                        size_t read = 0;
++                        while (read < layer_cells) {
++                            const ssize_t count = ::pread(descriptor,bytes+read,layer_cells-read,
++                                MODEL_HEADER_BYTES+MODEL_BASE_BYTES+size_t(layer)*layer_cells+read);
++                            if (count < 0 && errno == EINTR) continue;
++                            if (count <= 0) throw std::runtime_error("read exact parallel model layer");
++                            read += static_cast<size_t>(count);
++                        }
++                        if (layer == 0) std::transform(bytes,bytes+layer_cells,first_canonical_layer_.begin(),decode_model_byte);
++                        cuda_check(cudaMemcpyAsync(device_layer,bytes,layer_cells,cudaMemcpyHostToDevice,stream),
++                            "upload parallel model layer");
++                        decode_transpose_square_layer<<<dim3(PRODUCTION_WIDTH/32,PRODUCTION_WIDTH/32),dim3(32,8),0,stream>>>(
++                            device_layer,weights_+size_t(layer)*layer_cells,PRODUCTION_WIDTH);
++                        cuda_check(cudaGetLastError(),"decode parallel model layer");
++                        cuda_check(cudaEventRecord(consumed[slot],stream),"record parallel staging consumption");
++                    }
++                    cuda_check(cudaStreamSynchronize(stream),"finish parallel model bank");
++                } catch (...) { failures[bank]=std::current_exception(); }
++                if (stream) cudaStreamSynchronize(stream);
++                for (auto event : consumed) if (event) cudaEventDestroy(event);
++                if (device_layer) cudaFree(device_layer);
++                if (staging) cudaFreeHost(staging);
++                if (stream) cudaStreamDestroy(stream);
++            });
++            for (auto& loader : loaders) loader.join();
++            ::close(descriptor);
++            for (auto failure : failures) if (failure) std::rethrow_exception(failure);
++            const size_t count=size_t(PRODUCTION_LAYERS)*PRODUCTION_WIDTH;
++            cuda_check(cudaMalloc(&device_weight_row_sums_,count*sizeof(int32_t)), "allocate parallel model row sums");
++            calculate_weight_row_sums<<<static_cast<uint32_t>((count+THREADS-1)/THREADS),THREADS>>>(
++                weights_,device_weight_row_sums_,PRODUCTION_LAYERS,PRODUCTION_WIDTH);
++            cuda_check(cudaDeviceSynchronize(),"prepare parallel production weights");
++            std::fprintf(stderr,"model_parallel_load_seconds=%.6f pinned_staging_bytes=%zu device_staging_bytes=%zu\n",
++                std::chrono::duration<double>(std::chrono::steady_clock::now()-load_started).count(),
++                6*layer_cells,3*layer_cells);
++            return;
++        }
+@@ -1022 +1203,4 @@
+-        cuda_check(cudaMallocHost(&encoded_layer, layer_cells), "allocate pinned encoded layer staging");
++        cuda_check(cudaMallocHost(&encoded_layer, 2 * layer_cells), "allocate double buffered encoded layer staging");
++        cudaEvent_t layer_consumed[2];
++        for (auto& event : layer_consumed)
++            cuda_check(cudaEventCreateWithFlags(&event, cudaEventDisableTiming), "create model staging event");
+@@ -1028,0 +1213,4 @@
++            const unsigned slot = layer % 2;
++            if (layer >= 2)
++                cuda_check(cudaEventSynchronize(layer_consumed[slot]), "wait before reusing model staging");
++            uint8_t* staging = encoded_layer + slot * layer_cells;
+@@ -1030 +1218 @@
+-            model.read(reinterpret_cast<char*>(encoded_layer), layer_cells);
++            model.read(reinterpret_cast<char*>(staging), layer_cells);
+@@ -1036 +1224 @@
+-                std::transform(encoded_layer, encoded_layer + layer_cells, canonical_layer.begin(), decode_model_byte);
++                std::transform(staging, staging + layer_cells, canonical_layer.begin(), decode_model_byte);
+@@ -1040,2 +1228,2 @@
+-            cuda_check(cudaMemcpy(device_canonical_layer, encoded_layer,
+-                                  layer_cells, cudaMemcpyHostToDevice),
++            cuda_check(cudaMemcpyAsync(device_canonical_layer, staging,
++                                  layer_cells, cudaMemcpyHostToDevice, nullptr),
+@@ -1047,0 +1236 @@
++            cuda_check(cudaEventRecord(layer_consumed[slot], nullptr), "record model staging consumption");
+@@ -1053,0 +1243 @@
++        for (auto event : layer_consumed) cudaEventDestroy(event);
+@@ -1058 +1248 @@
+-                    read_seconds, upload_seconds, layer_cells);
++                    read_seconds, upload_seconds, 2 * layer_cells);
+@@ -1505,0 +1696,2 @@
++        if (sealed_witness_enabled() && fields[1] == "search")
++            replay_exports().prepare(fields[3]);

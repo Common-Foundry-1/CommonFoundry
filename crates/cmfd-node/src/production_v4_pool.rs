@@ -477,6 +477,81 @@ impl ProductionV4PersistentPoolVerifier {
         }
         self.searcher.evict_model()?;
         self.serial_gpu = true;
+        if std::env::var("CMFD_REPLAY_SEALED_EXPORT").as_deref() == Ok("1") {
+            for answer in WORK_KNOWN_ANSWERS {
+                self.warm_up_serial_replay(
+                    answer.challenge_digest,
+                    answer.final_activation_digest,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Pay the first model reload and immutable-witness allocation cost before
+    /// opening the pool. This known answer grants no work-check qualification;
+    /// the release pin and the node's complete proof verification still apply.
+    fn warm_up_serial_replay(
+        &self,
+        challenge_digest: [u8; 32],
+        expected_digest: [u8; 32],
+    ) -> Result<(), PoolError> {
+        if !self.serial_gpu {
+            return Err(pool_replay_failure(
+                "serial warmup requires the single GPU lease",
+            ));
+        }
+        let started = Instant::now();
+        let files = self.attempt_files();
+        let coefficients = files.path("coefficients.bin");
+        let prefix = files.path("warmup");
+        write_new_file(
+            &coefficients,
+            &forgematrix_v4_replay_coefficients(challenge_digest),
+        )?;
+        let mut state = self
+            .searcher
+            .state
+            .lock()
+            .map_err(|_| pool_replay_failure("replay worker lock is poisoned"))?;
+        let result = (|| {
+            state.replay.invoke_with_timeout(
+                &[
+                    "RUN".to_owned(),
+                    "search".to_owned(),
+                    self.worker_path(&coefficients)?,
+                    self.worker_path(&prefix)?,
+                ],
+                "CMFD_V4_REPLAY_DONE",
+                Duration::from_secs(60),
+            )?;
+            let final_activation = read_exact_file(
+                &files.path("warmup-final-activation.bin"),
+                FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES,
+            )?;
+            let digest = forgematrix_v4_final_activation_digest_from_le_bytes(
+                challenge_digest,
+                &final_activation,
+            )
+            .map_err(replay_error)?;
+            if digest != expected_digest {
+                return Err(pool_replay_failure(
+                    "serial GPU startup known answer mismatch",
+                ));
+            }
+            Ok(())
+        })();
+        let evicted = state
+            .replay
+            .invoke(&["EVICT".to_owned()], "CMFD_V4_REPLAY_EVICTED");
+        result?;
+        evicted?;
+        if std::env::var("CMFD_DROPOUT_REHEARSAL_TELEMETRY").as_deref() == Ok("1") {
+            eprintln!(
+                "CMFD_DROPOUT_POOL_WARMUP {{\"startup_seconds\":{},\"known_answer_verified\":true,\"work_check_qualification_granted\":false}}",
+                started.elapsed().as_secs_f64()
+            );
+        }
         Ok(())
     }
 
@@ -1603,7 +1678,10 @@ impl Drop for AttemptFiles {
                 .file_name()
                 .and_then(|value| value.to_str())
                 .is_some_and(|value| value.starts_with(&self.token));
-            if belongs_to_attempt && path.is_file() {
+            let removable = entry
+                .file_type()
+                .is_ok_and(|kind| kind.is_file() || kind.is_symlink());
+            if belongs_to_attempt && removable {
                 let _ = fs::remove_file(path);
             }
         }
@@ -2610,6 +2688,68 @@ done"#;
                 .contains("exactly one")
         );
         drop(verifier);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serial_warmup_checks_the_answer_evicts_on_failure_and_grants_no_pin() {
+        let (mut verifier, scratch, log) = batch_test_verifier("serial-startup-warmup");
+        let challenge = WORK_KNOWN_ANSWERS[0].challenge_digest;
+        let lane = 1_u32
+            .to_le_bytes()
+            .repeat(FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES / 4);
+        let expected =
+            forgematrix_v4_final_activation_digest_from_le_bytes(challenge, &lane).unwrap();
+        assert!(verifier.warm_up_serial_replay(challenge, expected).is_err());
+        verifier.serial_gpu = true;
+        verifier
+            .searcher
+            .state
+            .lock()
+            .unwrap()
+            .replay
+            .process
+            .as_mut()
+            .unwrap()
+            .pinned = false;
+        verifier.warm_up_serial_replay(challenge, expected).unwrap();
+        let error = verifier
+            .warm_up_serial_replay(challenge, [0; 32])
+            .unwrap_err();
+        assert!(error.to_string().contains("known answer mismatch"));
+        {
+            let mut state = verifier.searcher.state.lock().unwrap();
+            assert!(!state.replay.process.as_ref().unwrap().pinned);
+            assert_eq!(verifier.known_answer_locked(&mut state, 0), None);
+        }
+        assert_eq!(
+            std::fs::read_to_string(log).unwrap(),
+            "RUN 1\nEVICT\nRUN 1\nEVICT\n"
+        );
+        drop(verifier);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attempt_cleanup_removes_only_owned_files_and_dangling_descriptors() {
+        let scratch = worker_test_path("sealed-descriptor-cleanup");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let files = AttemptFiles {
+            scratch_directory: scratch.clone(),
+            token: "owned-attempt".to_owned(),
+        };
+        let dangling = files.path("bank0-dynamic.bin");
+        std::os::unix::fs::symlink("/proc/0/fd/999", &dangling).unwrap();
+        let regular = files.path("coefficients.bin");
+        std::fs::write(&regular, b"owned").unwrap();
+        let unrelated = scratch.join("another-attempt.bin");
+        std::fs::write(&unrelated, b"preserve").unwrap();
+        drop(files);
+        assert!(std::fs::symlink_metadata(dangling).is_err());
+        assert!(!regular.exists());
+        assert_eq!(std::fs::read(unrelated).unwrap(), b"preserve");
         let _ = std::fs::remove_dir_all(scratch);
     }
 

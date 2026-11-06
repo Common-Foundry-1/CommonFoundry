@@ -182,6 +182,8 @@ def main():
                 help="private Linux tmpfs mount capped at 2 GiB for pool witness files")
             p.add_argument("--serial-gpu", action="store_true",
                 help="release the one replay GPU's model while that same GPU proves")
+            p.add_argument("--sealed-witness", action="store_true",
+                help="hand replay traces directly to the prover in immutable Linux RAM")
             p.add_argument("--enable-payouts", action="store_true")
         else:
             p.add_argument("--pool", required=True)
@@ -227,6 +229,14 @@ def main():
     data = args.data_dir.expanduser().resolve()
     if args.action == "pool" and args.ram_witness_dir is not None:
         args.ram_witness_dir = validate_ram_witness_directory(args.ram_witness_dir)
+    if args.action == "pool" and args.sealed_witness:
+        if args.ram_witness_dir is None or not args.serial_gpu:
+            raise ValueError("sealed witness handoff requires --ram-witness-dir and --serial-gpu")
+        os.environ["CMFD_REPLAY_SEALED_EXPORT"] = "1"
+        os.environ.setdefault("CMFD_REPLAY_PARALLEL_LOAD", "1")
+        os.environ.setdefault("CUDA_MODULE_LOADING", "EAGER")
+    if args.action == "miner" and args.yield_gpu_on_share:
+        os.environ.setdefault("CUDA_MODULE_LOADING", "EAGER")
     if not args.check:
         data.mkdir(parents=True, mode=0o700, exist_ok=True)
         prepare(inputs, args.action)

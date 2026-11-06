@@ -1,0 +1,519 @@
+{
+  "schema": "CMFD_COMPACT_ACCEPTANCE_PARITY_RESULT_V1",
+  "hardware": "RTX 5090 32 GiB; same local device as the prior RAM-witness baseline",
+  "gpu_uuid": "GPU-0a1365a4-18dc-3472-b037-257b8ccc3a98",
+  "memory_clock_mhz": 7001,
+  "power_limit_w": 520,
+  "physical_16gb_card_tested": false,
+  "cuda_module_loading": "EAGER",
+  "endpoint": "pool evaluation wall time plus complete local node submission; excludes winning-nonce search, one-time startup and WAN propagation",
+  "baseline_full_local_acceptance_seconds": [
+    7.895515659,
+    7.5593125830000005
+  ],
+  "selected_full_local_acceptance_seconds": [
+    5.8826710019999995,
+    5.6843896009999995,
+    5.658832605
+  ],
+  "baseline_mean_seconds": 7.727414121000001,
+  "selected_mean_seconds": 5.7419644026666665,
+  "mean_reduction_seconds": 1.9854497183333342,
+  "mean_reduction_percent": 25.6935850369101,
+  "first_live_block_seconds": 5.8826710019999995,
+  "warm_mean_seconds": 5.671611103,
+  "five_second_goal_met": false,
+  "proof_parameters_changed": false,
+  "proof_parameters": {
+    "log_blowup": 1,
+    "queries": 270,
+    "grinding_bits": 16,
+    "commitments": 6
+  },
+  "node_full_verification_mandatory": true,
+  "worker_standalone_self_verification_retained": true,
+  "duplicate_worker_self_verification_in_pool_mode": false,
+  "host_witness_slots_max_bytes": 3221225472,
+  "scratch_tmpfs_capacity_bytes": 2147483648,
+  "incremental_gpu_guard_gib": 13,
+  "gpu_sample": {
+    "baseline_total_mib": 4698.0,
+    "peak_total_mib": 17719.0,
+    "peak_incremental_mib": 13021.0,
+    "minimum_available_wsl_ram_bytes": 7344701440
+  },
+  "peak_incremental_gpu_gib": 12.7158203125,
+  "minimum_available_wsl_ram_gib": 6.8402862548828125,
+  "blocks": [
+    {
+      "proof": {
+        "full_replay_seconds": 0.249066416,
+        "height": 17,
+        "network_id": "8a34c0d9eaa92c5eaec4af7fe146afdfa2ab6859918b7deb0c97e0a1f600d6d1",
+        "nonce": 2928066030220991884,
+        "parent": "13ddd91f6882033dafc2d02b5b8433bfba6df09f7e2106fa4d6490e1968afe0e",
+        "pool_evaluation_wall_seconds": 5.445954871,
+        "proof_bytes": 5691162,
+        "proof_seconds": 4.556989275,
+        "replay_handoff_seconds": 0.032321841,
+        "search_replay_seconds": 0.545065607
+      },
+      "admission": {
+        "block_id": "db600debf43cddec8f34564f6a6d5c3385b67b3e495da8269365fdcd918344e4",
+        "height": 17,
+        "network_id": "8a34c0d9eaa92c5eaec4af7fe146afdfa2ab6859918b7deb0c97e0a1f600d6d1",
+        "node_submission_seconds": 0.436716131,
+        "nonce": 2928066030220991884,
+        "parent": "13ddd91f6882033dafc2d02b5b8433bfba6df09f7e2106fa4d6490e1968afe0e"
+      }
+    },
+    {
+      "proof": {
+        "full_replay_seconds": 0.209933616,
+        "height": 18,
+        "network_id": "8a34c0d9eaa92c5eaec4af7fe146afdfa2ab6859918b7deb0c97e0a1f600d6d1",
+        "nonce": 8642582081397512856,
+        "parent": "db600debf43cddec8f34564f6a6d5c3385b67b3e495da8269365fdcd918344e4",
+        "pool_evaluation_wall_seconds": 5.257906026,
+        "proof_bytes": 5650178,
+        "proof_seconds": 4.392780366,
+        "replay_handoff_seconds": 0.032038048,
+        "search_replay_seconds": 0.584682591
+      },
+      "admission": {
+        "block_id": "fa3da8a304f683842810a6c38d46c630e1c8b6a76cdf1b9d3c29e263acf7e100",
+        "height": 18,
+        "network_id": "8a34c0d9eaa92c5eaec4af7fe146afdfa2ab6859918b7deb0c97e0a1f600d6d1",
+        "node_submission_seconds": 0.426483575,
+        "nonce": 8642582081397512856,
+        "parent": "db600debf43cddec8f34564f6a6d5c3385b67b3e495da8269365fdcd918344e4"
+      }
+    },
+    {
+      "proof": {
+        "full_replay_seconds": 0.212633538,
+        "height": 19,
+        "network_id": "8a34c0d9eaa92c5eaec4af7fe146afdfa2ab6859918b7deb0c97e0a1f600d6d1",
+        "nonce": 14824992727246580446,
+        "parent": "fa3da8a304f683842810a6c38d46c630e1c8b6a76cdf1b9d3c29e263acf7e100",
+        "pool_evaluation_wall_seconds": 5.239959905,
+        "proof_bytes": 5680662,
+        "proof_seconds": 4.373174983,
+        "replay_handoff_seconds": 0.032635553,
+        "search_replay_seconds": 0.583286152
+      },
+      "admission": {
+        "block_id": "499d1493536cc23fbe5f4bf0e5dca399aa812ad10ccb3a65dec6772873d67d93",
+        "height": 19,
+        "network_id": "8a34c0d9eaa92c5eaec4af7fe146afdfa2ab6859918b7deb0c97e0a1f600d6d1",
+        "node_submission_seconds": 0.4188727,
+        "nonce": 14824992727246580446,
+        "parent": "fa3da8a304f683842810a6c38d46c630e1c8b6a76cdf1b9d3c29e263acf7e100"
+      }
+    }
+  ],
+  "direct_profiles": [
+    {
+      "absolute_gpu_guard_gib": 13,
+      "bridge_seconds": 0.005834538,
+      "compressed_joint_basefold_bytes": 3533934,
+      "direct_stage_seconds": 1.526931323,
+      "dynamic_recommit_seconds": 0.156758693,
+      "encoding_seconds": 0.021791001,
+      "fixed_initial_upload_seconds": 0.20957278599999998,
+      "joint_basefold_seconds": 0.652709561,
+      "node_verification_required": true,
+      "original_field_parameters": {
+        "commitments": 6,
+        "grinding_bits": 16,
+        "log_blowup": 1,
+        "queries": 270
+      },
+      "original_full_proof_used_only_as_valid_fixture_input": false,
+      "overall_security_qualified": false,
+      "peak_sampled_gpu_bytes": 9612886016,
+      "producer_self_check_requested": false,
+      "production_consensus_or_admission_implemented": false,
+      "raw_joint_basefold_bytes": 4713576,
+      "reduction_seconds": 0.059658318,
+      "relation_checks_completed": true,
+      "reused_fixed_banks": true,
+      "schema": "CMFD_DIRECT_SELFCONTAINED_GPU_RESEARCH_V3",
+      "secondary_inputs_seconds": 0.270516278,
+      "secondary_reduction_bytes": 14220,
+      "selfcontained_verified": false,
+      "selfcontained_verify_seconds": 0.035552479,
+      "shared_evaluations_seconds": 0.312390558,
+      "verified": false,
+      "wire_bytes": 5691162
+    },
+    {
+      "absolute_gpu_guard_gib": 13,
+      "bridge_seconds": 0.002285092,
+      "compressed_joint_basefold_bytes": 3492950,
+      "direct_stage_seconds": 1.503591879,
+      "dynamic_recommit_seconds": 0.155706273,
+      "encoding_seconds": 0.016400452,
+      "fixed_initial_upload_seconds": 0.209244991,
+      "joint_basefold_seconds": 0.641358414,
+      "node_verification_required": true,
+      "original_field_parameters": {
+        "commitments": 6,
+        "grinding_bits": 16,
+        "log_blowup": 1,
+        "queries": 270
+      },
+      "original_full_proof_used_only_as_valid_fixture_input": false,
+      "overall_security_qualified": false,
+      "peak_sampled_gpu_bytes": 9612886016,
+      "producer_self_check_requested": false,
+      "production_consensus_or_admission_implemented": false,
+      "raw_joint_basefold_bytes": 4713576,
+      "reduction_seconds": 0.058600243,
+      "relation_checks_completed": true,
+      "reused_fixed_banks": true,
+      "schema": "CMFD_DIRECT_SELFCONTAINED_GPU_RESEARCH_V3",
+      "secondary_inputs_seconds": 0.27594558,
+      "secondary_reduction_bytes": 14220,
+      "selfcontained_verified": false,
+      "selfcontained_verify_seconds": 0.03402707,
+      "shared_evaluations_seconds": 0.31069367,
+      "verified": false,
+      "wire_bytes": 5650178
+    },
+    {
+      "absolute_gpu_guard_gib": 13,
+      "bridge_seconds": 0.002336462,
+      "compressed_joint_basefold_bytes": 3523434,
+      "direct_stage_seconds": 1.492729883,
+      "dynamic_recommit_seconds": 0.150066728,
+      "encoding_seconds": 0.014041154,
+      "fixed_initial_upload_seconds": 0.208624137,
+      "joint_basefold_seconds": 0.65081774,
+      "node_verification_required": true,
+      "original_field_parameters": {
+        "commitments": 6,
+        "grinding_bits": 16,
+        "log_blowup": 1,
+        "queries": 270
+      },
+      "original_full_proof_used_only_as_valid_fixture_input": false,
+      "overall_security_qualified": false,
+      "peak_sampled_gpu_bytes": 9612886016,
+      "producer_self_check_requested": false,
+      "production_consensus_or_admission_implemented": false,
+      "raw_joint_basefold_bytes": 4713576,
+      "reduction_seconds": 0.059567961,
+      "relation_checks_completed": true,
+      "reused_fixed_banks": true,
+      "schema": "CMFD_DIRECT_SELFCONTAINED_GPU_RESEARCH_V3",
+      "secondary_inputs_seconds": 0.268961954,
+      "secondary_reduction_bytes": 14220,
+      "selfcontained_verified": false,
+      "selfcontained_verify_seconds": 0.028126671,
+      "shared_evaluations_seconds": 0.310316131,
+      "verified": false,
+      "wire_bytes": 5680662
+    }
+  ],
+  "checked_startup_warmups": [
+    {
+      "startup_seconds": 3.969682927,
+      "known_answer_verified": true,
+      "work_check_qualification_granted": false
+    },
+    {
+      "startup_seconds": 2.685397004,
+      "known_answer_verified": true,
+      "work_check_qualification_granted": false
+    }
+  ],
+  "prior_exact_witness_and_seal_controls": {
+    "schema": "CMFD_ACCEPTANCE_PARITY_LOCAL_5090_V1",
+    "gpu": "GPU-0a1365a4-18dc-3472-b037-257b8ccc3a98",
+    "physical_card_vram_gib": 32,
+    "actual_16gb_card_tested": false,
+    "incremental_gpu_guard_mib": 13312,
+    "replay_differential": [
+      {
+        "height": 43424,
+        "wall_seconds": 1.1727185029885732,
+        "gpu_compute_seconds": 0.019258,
+        "hashes": {
+          "-final-activation.bin": "ce693363f9a35f7504c42bf923a6c1b1d0fb735f8e4f7c9145fef46e53bc103c",
+          "-bank0-dynamic.bin": "5c707bf1d06db52b9907205370067f5a9a3cd8223c1816f8ca421d59eef82161",
+          "-bank1-dynamic.bin": "5598de3f1dc821b82e19ae19a92b7523e6a03503906ad64b04dfc1d837aad824",
+          "-bank2-dynamic.bin": "342c3d96b84cb4bd53ffcf0fd1b00291f62cd01dc741e08caa9434b2fb6e4e85"
+        },
+        "worker": "baseline"
+      },
+      {
+        "height": 43425,
+        "wall_seconds": 1.1154640419990756,
+        "gpu_compute_seconds": 0.018379,
+        "hashes": {
+          "-final-activation.bin": "af8c42fb5c0f40ccd382523075eeabcc4b4950509f8c8f19e4c10f75ce38e467",
+          "-bank0-dynamic.bin": "2d9d1e2cbea60719bffad3c2b140abe72174e17504064398326688f3a7891256",
+          "-bank1-dynamic.bin": "839b1824080ac379816cd30f06c1dd44d0996a80a6a62e9bf42257794c933003",
+          "-bank2-dynamic.bin": "e62c2b3803205ae1efaf55111c1c8b64d3bf0c1b5b2c56bdf3a756dafd0f5334"
+        },
+        "worker": "baseline"
+      },
+      {
+        "height": 43424,
+        "wall_seconds": 1.0660486519918777,
+        "gpu_compute_seconds": 0.01866,
+        "hashes": {
+          "-final-activation.bin": "ce693363f9a35f7504c42bf923a6c1b1d0fb735f8e4f7c9145fef46e53bc103c",
+          "-bank0-dynamic.bin": "5c707bf1d06db52b9907205370067f5a9a3cd8223c1816f8ca421d59eef82161",
+          "-bank1-dynamic.bin": "5598de3f1dc821b82e19ae19a92b7523e6a03503906ad64b04dfc1d837aad824",
+          "-bank2-dynamic.bin": "342c3d96b84cb4bd53ffcf0fd1b00291f62cd01dc741e08caa9434b2fb6e4e85"
+        },
+        "worker": "optimized"
+      },
+      {
+        "height": 43425,
+        "wall_seconds": 0.6828975609969348,
+        "gpu_compute_seconds": 0.018344,
+        "hashes": {
+          "-final-activation.bin": "af8c42fb5c0f40ccd382523075eeabcc4b4950509f8c8f19e4c10f75ce38e467",
+          "-bank0-dynamic.bin": "2d9d1e2cbea60719bffad3c2b140abe72174e17504064398326688f3a7891256",
+          "-bank1-dynamic.bin": "839b1824080ac379816cd30f06c1dd44d0996a80a6a62e9bf42257794c933003",
+          "-bank2-dynamic.bin": "e62c2b3803205ae1efaf55111c1c8b64d3bf0c1b5b2c56bdf3a756dafd0f5334"
+        },
+        "worker": "optimized"
+      }
+    ],
+    "blocks": [
+      {
+        "proof": {
+          "full_replay_seconds": 0.262598454,
+          "height": 11,
+          "network_id": "8a34c0d9eaa92c5eaec4af7fe146afdfa2ab6859918b7deb0c97e0a1f600d6d1",
+          "nonce": 16942684096120486342,
+          "parent": "025c4990b57b11d23fbec0fd78ebecb1693a5df434cbc6837bdd726da369f00a",
+          "pool_evaluation_wall_seconds": 15.444256892,
+          "proof_bytes": 5683630,
+          "proof_seconds": 4.685050448,
+          "replay_handoff_seconds": 0.032819837,
+          "search_replay_seconds": 10.414611982
+        },
+        "admission": {
+          "block_id": "673c8d6b45a603d36b9ffdd6a2aaf78f3160a1fc12a040f5c44cf3064b69e0c2",
+          "height": 11,
+          "network_id": "8a34c0d9eaa92c5eaec4af7fe146afdfa2ab6859918b7deb0c97e0a1f600d6d1",
+          "node_submission_seconds": 0.435831566,
+          "nonce": 16942684096120486342,
+          "parent": "025c4990b57b11d23fbec0fd78ebecb1693a5df434cbc6837bdd726da369f00a"
+        }
+      },
+      {
+        "proof": {
+          "full_replay_seconds": 0.210567175,
+          "height": 12,
+          "network_id": "8a34c0d9eaa92c5eaec4af7fe146afdfa2ab6859918b7deb0c97e0a1f600d6d1",
+          "nonce": 9632548266075717884,
+          "parent": "673c8d6b45a603d36b9ffdd6a2aaf78f3160a1fc12a040f5c44cf3064b69e0c2",
+          "pool_evaluation_wall_seconds": 5.315790539,
+          "proof_bytes": 5685370,
+          "proof_seconds": 4.454547035,
+          "replay_handoff_seconds": 0.03273411,
+          "search_replay_seconds": 0.580812473
+        },
+        "admission": {
+          "block_id": "bc13975ff2c972c31a381fb418035489df086669e121861849507883c4002ef9",
+          "height": 12,
+          "network_id": "8a34c0d9eaa92c5eaec4af7fe146afdfa2ab6859918b7deb0c97e0a1f600d6d1",
+          "node_submission_seconds": 0.422186327,
+          "nonce": 9632548266075717884,
+          "parent": "673c8d6b45a603d36b9ffdd6a2aaf78f3160a1fc12a040f5c44cf3064b69e0c2"
+        }
+      },
+      {
+        "proof": {
+          "full_replay_seconds": 0.207324168,
+          "height": 13,
+          "network_id": "8a34c0d9eaa92c5eaec4af7fe146afdfa2ab6859918b7deb0c97e0a1f600d6d1",
+          "nonce": 1372771557710775154,
+          "parent": "bc13975ff2c972c31a381fb418035489df086669e121861849507883c4002ef9",
+          "pool_evaluation_wall_seconds": 5.298750436,
+          "proof_bytes": 5669011,
+          "proof_seconds": 4.448257412,
+          "replay_handoff_seconds": 0.031652996,
+          "search_replay_seconds": 0.574142239
+        },
+        "admission": {
+          "block_id": "2d9e6a31e73e6260fccee0667a968b48e4dbf398382f14520c6cea7027109437",
+          "height": 13,
+          "network_id": "8a34c0d9eaa92c5eaec4af7fe146afdfa2ab6859918b7deb0c97e0a1f600d6d1",
+          "node_submission_seconds": 0.4146515,
+          "nonce": 1372771557710775154,
+          "parent": "bc13975ff2c972c31a381fb418035489df086669e121861849507883c4002ef9"
+        }
+      }
+    ],
+    "started_unix": 1793979547.1108606,
+    "sealed_handoff_write_and_truncate_rejected": true,
+    "full_witness_byte_identity_passed": true,
+    "selected_model_reload": "parallel",
+    "winner_search": [
+      {
+        "height": 11,
+        "job_id": "1fac245c664f74ee735b277e194db2a8c3f97199fa56117c1e64b01046a7f134",
+        "network_id": "8a34c0d9eaa92c5eaec4af7fe146afdfa2ab6859918b7deb0c97e0a1f600d6d1",
+        "nonce": 16942684096120486342,
+        "worker": "parity5090.gpu0",
+        "worker_job_elapsed_seconds": 1.030319086,
+        "worker_job_reported_work_units": 32,
+        "worker_job_search_seconds": 1.030233614
+      },
+      {
+        "height": 12,
+        "job_id": "a62dd79659b5ae34ad4ae61606367d6608451274264c82f12e0d96cc5df0a4eb",
+        "network_id": "8a34c0d9eaa92c5eaec4af7fe146afdfa2ab6859918b7deb0c97e0a1f600d6d1",
+        "nonce": 9632548266075717884,
+        "worker": "parity5090.gpu0",
+        "worker_job_elapsed_seconds": 1.562653243,
+        "worker_job_reported_work_units": 32,
+        "worker_job_search_seconds": 1.5259585279999999
+      },
+      {
+        "height": 13,
+        "job_id": "8085dccbefb3a62f101644e4634bd68abd1547c886cb62578c5ef0f1b5d97748",
+        "network_id": "8a34c0d9eaa92c5eaec4af7fe146afdfa2ab6859918b7deb0c97e0a1f600d6d1",
+        "nonce": 1372771557710775154,
+        "worker": "parity5090.gpu0",
+        "worker_job_elapsed_seconds": 1.552978016,
+        "worker_job_reported_work_units": 32,
+        "worker_job_search_seconds": 1.51981152
+      }
+    ],
+    "miner_yields_gpu_before_submission": true,
+    "success": true,
+    "gpu_sample": {
+      "baseline_total_mib": 4826.0,
+      "peak_total_mib": 17442.0,
+      "peak_incremental_mib": 12616.0,
+      "minimum_available_wsl_ram_bytes": 7487598592
+    },
+    "completed_unix": 1793979647.6977222
+  },
+  "node_admission_regression": {
+    "forged_http_status": 422,
+    "forged_response": "{\"error\":\"ForgeMatrix v4 candidate verification failed: direct testnet proof verification failed: six-commitment BaseFold rejected: invalid batch grinding witness\"}",
+    "height_after_forged": 0,
+    "honest_http_status": 200,
+    "height_after_honest": 1,
+    "tip": "d481382ea7efe88c0d994b6730c1f134ed2494979f6e76d24c23f8e86f8cddf9",
+    "work_rule": null,
+    "proof_verification_mode": "in_process",
+    "storage_healthy": true
+  },
+  "independent_p2p_sync": {
+    "accepted_height": 19,
+    "tip": "499d1493536cc23fbe5f4bf0e5dca399aa812ad10ccb3a65dec6772873d67d93",
+    "work_rule": null,
+    "proof_verification_mode": "in_process",
+    "storage_healthy": true,
+    "history_verified": null,
+    "peer_count": null,
+    "initial_height": 1,
+    "matches_measured_chain": true,
+    "gpu_workers_started": false
+  },
+  "tests": {
+    "prover": 17,
+    "pool": 25,
+    "pool_hardware_tests_not_run": 2,
+    "miner": 7,
+    "launcher": 9,
+    "binding_tests": 3,
+    "coordinated_forgery_cases_rejected": 48
+  },
+  "tested_git_base_commit": "ec7466fd287c127fc2d6c153f3f5fe923aacb24b",
+  "tested_source_dirty": true,
+  "runtime_patch_sha256": "605d676f1b22aa74d1c7f0c48bf75337359ccd1195b7426bdbdff047db272092",
+  "gpu_source_patch_sha256": "548ccaf980b120c4c66f52ca680df82e9d10daab6da08c88638ce2a6f76b0000",
+  "binary_sha256": {
+    "cmfd-node": "957ede7aa7ccd85c948f33e99af21b513e9343b83705ba42a523cfc1bd8a153a",
+    "cmfd-miner": "df907ab7c33df1d698136b33de1edd0c6e35b0a85a211eac546bed387c0e2e25",
+    "cmfd-v4-replay": "6c7624344c8d91164d83d9bdc4a931622a90be668d2e071042d71bc7c0baf040",
+    "cmfd-direct-prover": "d73f534904ea35921ef73a8c90008aa95f33174e2423c90c27e02ea4c144f916"
+  },
+  "archive_sha256": "5054315af260ed6ef03444e9d500514106ddc4180c0313cb98bce201c770466b",
+  "archive_bytes": 77619787,
+  "archive_local_path": "C:\\Users\\benef\\.codex\\worktrees\\direct-proof-testnet\\CommonFoundry\\target\\compact-public\\acceptance-parity-20261106\\qualified\\commonfoundry-compact-testnet-v0.2.2-parity-candidate-linux-x86_64.tar.gz",
+  "public_release_published": false,
+  "intermediate_trials_including_cold_outliers": [
+    {
+      "trial": ".",
+      "success": true,
+      "full_local_acceptance_seconds": [
+        6.8094968289999995,
+        6.390972006
+      ],
+      "peak_incremental_gpu_mib": 12355.0
+    },
+    {
+      "trial": "round2",
+      "success": true,
+      "full_local_acceptance_seconds": [
+        10.224794004,
+        6.319524099000001
+      ],
+      "peak_incremental_gpu_mib": 12635.0
+    },
+    {
+      "trial": "round3",
+      "success": true,
+      "full_local_acceptance_seconds": [
+        15.880088458,
+        5.737976866,
+        5.7134019359999995
+      ],
+      "peak_incremental_gpu_mib": 12616.0
+    },
+    {
+      "trial": "round4",
+      "success": true,
+      "full_local_acceptance_seconds": [
+        6.7773355660000005,
+        5.7421664550000004,
+        5.765707509
+      ],
+      "peak_incremental_gpu_mib": 13047.0
+    },
+    {
+      "trial": "round5",
+      "success": true,
+      "full_local_acceptance_seconds": [
+        5.8826710019999995,
+        5.6843896009999995,
+        5.658832605
+      ],
+      "peak_incremental_gpu_mib": 13021.0
+    }
+  ],
+  "mining_and_cleanup": {
+    "verified_utc": "2026-11-06T16:13:36.9436361Z",
+    "task_state": "Running",
+    "task_sha256": "29f227b4ede69cc6a924c59cfd842c406cede1fe4fc1075f5707652dfb5c7922",
+    "mining_version": "1.0.0s",
+    "uptime": 876,
+    "fresh_accepted_shares": 8.0,
+    "rejected_shares": 0.0,
+    "hashrate": [
+      400156847069961,
+      399376821291754,
+      0
+    ],
+    "gpu_readback": "GPU-0a1365a4-18dc-3472-b037-257b8ccc3a98, 7001, 520.00, 99",
+    "remaining_watchdogs": [],
+    "linux_cleanup": {
+      "owned_runtime_processes": [],
+      "remaining_ram_mounts": [],
+      "listening_test_ports": []
+    },
+    "removed_unselected_candidate_bytes": 625567559.0
+  }
+}

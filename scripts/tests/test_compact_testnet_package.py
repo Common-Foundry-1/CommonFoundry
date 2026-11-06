@@ -2,6 +2,7 @@ import argparse
 from contextlib import ExitStack
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -135,6 +136,29 @@ class CompactPackageTests(unittest.TestCase):
                 command = run.call_args.args[0]
                 self.assertEqual(command[command.index("--role") + 1], expected)
                 self.assertTrue(run.call_args.kwargs["check"])
+
+    def test_sealed_handoff_requires_private_ram_and_serial_worker_lifetime(self):
+        for options in ([], ["--serial-gpu"], ["--ram-witness-dir", "/private-witness"]):
+            with self.subTest(options=options), \
+                    patch.object(sys, "argv", ["launch.py", "pool", "--public-ip", "127.0.0.1", "--check", "--sealed-witness"] + options), \
+                    patch.object(launcher, "verify"), \
+                    patch.object(launcher, "validate_ram_witness_directory", return_value=Path("/private-witness")):
+                with self.assertRaisesRegex(ValueError, "requires --ram-witness-dir and --serial-gpu"):
+                    launcher.main()
+
+    def test_sealed_profile_selects_tested_startup_defaults_and_preserves_overrides(self):
+        for inherited, expected in (({}, "EAGER"), ({"CUDA_MODULE_LOADING": "LAZY"}, "LAZY")):
+            with tempfile.TemporaryDirectory() as d, patch.dict(os.environ, inherited, clear=True), \
+                    patch.object(sys, "argv", ["launch.py", "pool", "--public-ip", "127.0.0.1",
+                        "--check", "--data-dir", d, "--sealed-witness", "--serial-gpu",
+                        "--ram-witness-dir", "/private-witness"]), \
+                    patch.object(launcher, "verify"), \
+                    patch.object(launcher, "validate_ram_witness_directory", return_value=Path("/private-witness")), \
+                    patch("builtins.print"):
+                launcher.main()
+                self.assertEqual(os.environ["CMFD_REPLAY_SEALED_EXPORT"], "1")
+                self.assertEqual(os.environ["CMFD_REPLAY_PARALLEL_LOAD"], "1")
+                self.assertEqual(os.environ["CUDA_MODULE_LOADING"], expected)
 
 
 if __name__ == "__main__":

@@ -52,6 +52,12 @@ share, waits for checking/proving, and reloads before its next search. This
 serial setup avoids keeping two search models on one device. Separate replay
 and proof GPUs allow shares to keep running during proving.
 
+Add `--sealed-witness` to the serial GPU command to transfer replay output
+directly into immutable RAM buffers. This mode prepares the next witness while
+the current proof runs, uses at most **3 GiB of host RAM** for the two witness
+slots, and checks two known answers before opening the pool. It keeps every
+field-word check, proof parameter and complete node-verification check.
+
 ## Connect a miner
 
 Create a dedicated testnet payout key and copy the displayed public address:

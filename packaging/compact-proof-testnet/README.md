@@ -25,6 +25,33 @@ Reserve the proof GPU for pool workers and run mining clients on other GPUs or r
 
 The reference pool uses Common Foundry's certificate-pinned pool protocol. Operators using another pool stack can first run this reference instance, then coordinate their own integration with us.
 
+### RAM witnesses and one proof/replay GPU
+
+Pools can keep witness files in a dedicated **2 GiB tmpfs** with
+`--ram-witness-dir /dev/shm/cmfd-pool-witness`. The launcher checks its capacity,
+free space, private ownership and permissions, and available host RAM. Create
+the mount as the same user that runs the pool:
+
+```bash
+mkdir -m 700 /dev/shm/cmfd-pool-witness
+sudo mount -t tmpfs -o size=2G,mode=0700,uid="$(id -u)",gid="$(id -g)",nosuid,nodev,noexec tmpfs /dev/shm/cmfd-pool-witness
+./START-POOL.sh --public-ip YOUR_NUMERIC_PUBLIC_IP --ram-witness-dir /dev/shm/cmfd-pool-witness
+```
+
+The prover still copies regular witness files into immutable kernel-sealed
+buffers and checks every field word. The proof parameters and node verification
+remain the same. After stopping the pool, unmount this exact directory and
+remove the empty mount point.
+
+For one GPU serving both pool replay and proof generation, add
+`--replay-gpu 0 --proof-gpu 0 --serial-gpu`. This releases replay's model before
+proving and prevents replay from reloading it until proving finishes. Other
+mining clients can use their own GPU. A miner sharing the proof GPU can add
+`--yield-gpu-on-share` to `START-MINER.sh`: it releases its model before each
+share, waits for checking/proving, and reloads before its next search. This
+serial setup avoids keeping two search models on one device. Separate replay
+and proof GPUs allow shares to keep running during proving.
+
 ## Connect a miner
 
 Create a dedicated testnet payout key and copy the displayed public address:

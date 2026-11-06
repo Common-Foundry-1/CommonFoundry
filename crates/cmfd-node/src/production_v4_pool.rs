@@ -243,9 +243,10 @@ pub struct ProductionV4PersistentPoolVerifier {
     next_batch_attempt: AtomicU64,
     /// Single-share and proof scratch-file names.
     next_attempt: AtomicU64,
-    /// The proof worker. It is never held while a replay worker runs, and
-    /// no replay worker lock is held while it is taken.
+    /// The proof worker. Parallel mode releases replay first; serial GPU mode
+    /// retains the evicted replay lease so its model cannot reload meanwhile.
     state: Mutex<WorkerState>,
+    serial_gpu: bool,
 }
 
 /// Reuse the authenticated production worker protocol for embedded solo mining.
@@ -461,14 +462,43 @@ impl ProductionV4PersistentPoolVerifier {
             next_batch_attempt: AtomicU64::new(0),
             next_attempt: AtomicU64::new(0),
             state: Mutex::new(WorkerState { proof }),
+            serial_gpu: false,
         })
+    }
+
+    /// Release the single replay model before proving and keep that worker
+    /// locked until proving finishes, so another share cannot reload it into
+    /// the proof GPU. All replay and proof verification checks still run.
+    pub fn enable_serial_gpu(&mut self) -> Result<(), PoolError> {
+        if !self.extra_searchers.is_empty() {
+            return Err(pool_replay_failure(
+                "serial GPU mode requires exactly one replay worker",
+            ));
+        }
+        self.searcher.evict_model()?;
+        self.serial_gpu = true;
+        Ok(())
+    }
+
+    fn handoff_replay_for_proof<'a>(
+        &self,
+        mut replay: MutexGuard<'a, SearchWorkerState>,
+    ) -> Result<Option<MutexGuard<'a, SearchWorkerState>>, PoolError> {
+        if self.serial_gpu {
+            replay
+                .replay
+                .invoke(&["EVICT".to_owned()], "CMFD_V4_REPLAY_EVICTED")?;
+            Ok(Some(replay))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Checks one share on replay worker 0 with `RUN search`. Only that
     /// worker's lock is held while it replays. A chain-winning share goes on
     /// to [`prove_chain_share`](Self::prove_chain_share), which takes the
-    /// proof worker only after releasing the replay worker, so a block work
-    /// check holding worker 0 delays worker 0's shares but never a proof.
+    /// proof worker after releasing replay in parallel mode. Serial GPU mode
+    /// evicts and retains the single replay lease until proving finishes.
     fn evaluate_single(
         &self,
         template: &BlockTemplate,
@@ -532,6 +562,11 @@ impl ProductionV4PersistentPoolVerifier {
             final_activation_digest,
         );
         if work_digest > template.challenge.target {
+            if self.serial_gpu {
+                search_state
+                    .replay
+                    .invoke(&["EVICT".to_owned()], "CMFD_V4_REPLAY_EVICTED")?;
+            }
             return Ok(ProductionV4PoolShareEvaluation {
                 work_digest,
                 chain_proof: None,
@@ -727,6 +762,11 @@ impl ProductionV4PersistentPoolVerifier {
             final_activation_digest,
         );
         if work_digest > share.template.challenge.target {
+            if self.serial_gpu {
+                self.searcher_for(worker)
+                    .ok_or_else(|| pool_replay_failure("no such pool replay worker"))?
+                    .evict_model()?;
+            }
             return Ok(ProductionV4PoolShareEvaluation {
                 work_digest,
                 chain_proof: None,
@@ -784,6 +824,8 @@ impl ProductionV4PersistentPoolVerifier {
     /// worker is taken: the proof needs only the proof worker, so shares and
     /// block work checks keep using the replay worker while it runs, and no
     /// replay worker is started or restarted while the proof worker is held.
+    /// Serial GPU mode instead evicts replay and retains its lease throughout
+    /// proving, preventing concurrent shares from reloading the same GPU.
     fn prove_chain_share(
         &self,
         mut search_state: MutexGuard<'_, SearchWorkerState>,
@@ -827,7 +869,9 @@ impl ProductionV4PersistentPoolVerifier {
             ));
         }
         let known_answer = self.known_answer_locked(&mut search_state, worker);
-        drop(search_state);
+        let handoff_started = Instant::now();
+        let _serial_replay_lease = self.handoff_replay_for_proof(search_state)?;
+        let replay_handoff_seconds = handoff_started.elapsed().as_secs_f64();
         let mut state = self
             .state
             .lock()
@@ -927,6 +971,7 @@ impl ProductionV4PersistentPoolVerifier {
                     "nonce": nonce,
                     "search_replay_seconds": search_replay_seconds,
                     "full_replay_seconds": full_replay_seconds,
+                    "replay_handoff_seconds": replay_handoff_seconds,
                     "proof_seconds": proof_seconds,
                     "pool_evaluation_wall_seconds": evaluation_started.elapsed().as_secs_f64(),
                     "proof_bytes": proof_bytes,
@@ -1100,6 +1145,16 @@ impl ProductionV4PersistentPoolSearcher {
         config: ProductionV4PoolSearcherConfig,
     ) -> Result<Self, PoolError> {
         Self::start_pinned(expected_network_id, config, None)
+    }
+
+    /// Release this miner's GPU model before a shared GPU proves its winner.
+    /// The next search reloads through the normal authenticated worker path.
+    pub fn evict_model(&self) -> Result<(), PoolError> {
+        self.state
+            .lock()
+            .map_err(|_| pool_replay_failure("persistent search worker lock is poisoned"))?
+            .replay
+            .invoke(&["EVICT".to_owned()], "CMFD_V4_REPLAY_EVICTED")
     }
 
     fn start_pinned(
@@ -2014,6 +2069,7 @@ echo CMFD_V4_REPLAY_READY
 while read -r command first second third; do
   case "$command" in
     QUIT) exit 0 ;;
+    EVICT) echo EVICT >> "$log"; echo CMFD_V4_REPLAY_EVICTED; continue ;;
     RUNBATCH) count="$first" ;;
     RUN) count=1 ;;
     *) exit 5 ;;
@@ -2479,6 +2535,136 @@ done"#;
                 }
             );
         }
+        drop(verifier);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serial_gpu_evicts_and_holds_replay_until_the_proof_finishes() {
+        let scratch = worker_test_path("serial-gpu-handoff");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let log = scratch.join("replay.log");
+        let started = scratch.join("proof-started");
+        let go = scratch.join("proof-go");
+        let mut verifier = ProductionV4PersistentPoolVerifier::start_for_network(
+            BATCH_TEST_NETWORK_ID,
+            ProductionV4PoolVerifierConfig {
+                replay: fake_replay_worker(&log),
+                extra_replays: vec![],
+                proof: gated_proof_worker(&started, &go),
+                scratch_directory: scratch.clone(),
+                worker_scratch_directory: scratch.to_str().unwrap().to_owned(),
+                work_check_pin: Some(shell_pin()),
+            },
+        )
+        .unwrap();
+        verifier.enable_serial_gpu().unwrap();
+        let mut template = batch_test_template(BATCH_TEST_NETWORK_ID);
+        template.challenge.target = [0xff; 32];
+        let timeout = Duration::from_secs(30);
+        std::thread::scope(|scope| {
+            let _release = OnDrop(|| {
+                let _ = std::fs::write(&go, b"");
+            });
+            let share = scope.spawn(|| verifier.evaluate_single(&template, 91, [0xff; 32]));
+            let deadline = Instant::now() + timeout;
+            while !started.exists() {
+                assert!(Instant::now() < deadline, "the proof never started");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(std::fs::read_to_string(&log).unwrap().ends_with("EVICT\n"));
+            assert!(
+                matches!(
+                    verifier.try_replay_for_work_check(0, [7; 32], timeout),
+                    GpuReplay::Busy
+                ),
+                "an evicted replay must not reload while proving"
+            );
+            std::fs::write(&go, b"").unwrap();
+            assert!(
+                share.join().unwrap().is_err(),
+                "fake proof writes no proof file"
+            );
+        });
+        assert!(
+            matches!(
+                verifier.try_replay_for_work_check(0, [7; 32], timeout),
+                GpuReplay::Done(_)
+            ),
+            "replay must become available again after proving"
+        );
+        drop(verifier);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serial_gpu_rejects_multiple_replay_workers() {
+        let (mut verifier, scratch, _) = batch_test_verifier_with_workers("serial-multi", 2);
+        assert!(
+            verifier
+                .enable_serial_gpu()
+                .unwrap_err()
+                .to_string()
+                .contains("exactly one")
+        );
+        drop(verifier);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serial_gpu_evicts_idle_and_nonwinning_share_models() {
+        let (mut verifier, scratch, log) = batch_test_verifier("serial-ordinary-share");
+        verifier.enable_serial_gpu().unwrap();
+        let mut template = batch_test_template(BATCH_TEST_NETWORK_ID);
+        template.challenge.target = [0; 32];
+        let result = verifier.evaluate_single(&template, 96, [0xff; 32]).unwrap();
+        assert!(result.chain_proof.is_none());
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "EVICT\nRUN 1\nEVICT\n"
+        );
+        let results = verifier.evaluate_batch_on(
+            0,
+            &[
+                ProductionV4PoolShareRequest {
+                    template: &template,
+                    nonce: 97,
+                    share_target: [0xff; 32],
+                },
+                ProductionV4PoolShareRequest {
+                    template: &template,
+                    nonce: 98,
+                    share_target: [0xff; 32],
+                },
+            ],
+        );
+        assert!(
+            results
+                .iter()
+                .all(|result| result.as_ref().unwrap().chain_proof.is_none())
+        );
+        assert!(
+            std::fs::read_to_string(&log)
+                .unwrap()
+                .ends_with("RUNBATCH 2\nEVICT\nEVICT\n")
+        );
+        drop(verifier);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn miner_gpu_yield_requires_eviction_ack_and_allows_later_replay() {
+        let (verifier, scratch, log) = batch_test_verifier("miner-yield");
+        verifier.searcher.evict_model().unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "EVICT\n");
+        assert!(matches!(
+            verifier.try_replay_for_work_check(0, [7; 32], Duration::from_secs(30)),
+            GpuReplay::Done(_)
+        ));
         drop(verifier);
         let _ = std::fs::remove_dir_all(scratch);
     }

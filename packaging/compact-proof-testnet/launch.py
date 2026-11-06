@@ -6,6 +6,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import time
@@ -16,6 +17,9 @@ USER_DATA = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) 
 SEED = "209.145.48.36:23444"
 NETWORK = "8a34c0d9eaa92c5eaec4af7fe146afdfa2ab6859918b7deb0c97e0a1f600d6d1"
 RECORD = "FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json"
+RAM_WITNESS_MIN_FREE = 1_650_000_000
+RAM_WITNESS_MAX_CAPACITY = 2 * 1024**3
+RAM_WITNESS_HOST_RESERVE = 8 * 1024**3
 
 
 def sha256(path):
@@ -62,6 +66,32 @@ def common(inputs, data):
         "--production-v4-fixed-record", str(inputs / "fixed" / RECORD), "-vv"]
 
 
+def validate_ram_witness_directory(path):
+    """Require a private, quota-bounded tmpfs; never silently fall back to disk."""
+    path = path.expanduser()
+    if sys.platform != "linux" or path.is_symlink() or not path.is_dir():
+        raise ValueError("RAM witnesses require an existing Linux tmpfs mount")
+    path = path.resolve(strict=True)
+    info = path.stat()
+    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
+        raise ValueError("RAM witness mount must be owned by this user with mode 0700")
+    if not os.path.ismount(path):
+        raise ValueError("RAM witness directory must be a dedicated bounded tmpfs mount")
+    filesystem = subprocess.check_output(["stat", "-f", "-c", "%T", str(path)], text=True).strip()
+    if filesystem != "tmpfs":
+        raise ValueError("RAM witness directory must use tmpfs")
+    capacity = os.statvfs(path)
+    if capacity.f_blocks * capacity.f_frsize > RAM_WITNESS_MAX_CAPACITY:
+        raise ValueError("RAM witness tmpfs capacity must be capped at 2 GiB")
+    if capacity.f_bavail * capacity.f_frsize < RAM_WITNESS_MIN_FREE:
+        raise ValueError("RAM witness tmpfs needs at least 1.65 GB free")
+    available = next((int(line.split()[1]) * 1024 for line in
+        Path("/proc/meminfo").read_text().splitlines() if line.startswith("MemAvailable:")), 0)
+    if available < RAM_WITNESS_HOST_RESERVE:
+        raise ValueError("RAM witnesses need at least 8 GiB available host RAM before startup")
+    return path
+
+
 def peers(values):
     result = ["--no-default-seeds", "--allow-public-peers"]
     for peer in values or [SEED]:
@@ -81,6 +111,8 @@ def build_command(args, inputs, data):
             "--production-v4-scratch", str(data / "miner-scratch")]
         if args.gpu is not None:
             command += ["--gpu", args.gpu]
+        if args.yield_gpu_on_share:
+            command += ["--yield-gpu-on-share"]
         return command
     public = ipaddress.ip_address(args.public_ip)
     bind = ipaddress.ip_address(args.bind_ip)
@@ -102,13 +134,15 @@ def build_command(args, inputs, data):
         "--share-leading-zero-bits", str(args.share_bits),
         "--production-v4-pool-replay-worker", str(ROOT / "cmfd-v4-replay"),
         "--production-v4-pool-proof-worker", str(ROOT / "cmfd-direct-prover"),
-        "--production-v4-pool-scratch", str(data / "pool-scratch"),
+        "--production-v4-pool-scratch", str(args.ram_witness_dir or data / "pool-scratch"),
         "--pool-operator-fee-bps", "0", "--work-bank", args.work_bank,
         "--allow-public-pool-clients", "--allow-address-only-payouts"] + peers(args.peer)
     if args.replay_gpu is not None:
         command += ["--production-v4-pool-replay-gpu", args.replay_gpu]
     if args.proof_gpu is not None:
         command += ["--production-v4-pool-proof-gpu", args.proof_gpu]
+    if args.serial_gpu:
+        command += ["--production-v4-pool-serial-gpu"]
     if args.enable_payouts:
         command += ["--enable-testnet-payouts"]
     return command
@@ -144,12 +178,18 @@ def main():
             p.add_argument("--share-bits", type=int, choices=range(7), default=4)
             p.add_argument("--replay-gpu")
             p.add_argument("--proof-gpu")
+            p.add_argument("--ram-witness-dir", type=Path,
+                help="private Linux tmpfs mount capped at 2 GiB for pool witness files")
+            p.add_argument("--serial-gpu", action="store_true",
+                help="release the one replay GPU's model while that same GPU proves")
             p.add_argument("--enable-payouts", action="store_true")
         else:
             p.add_argument("--pool", required=True)
             p.add_argument("--address", required=True)
             p.add_argument("--worker", default="testnet")
             p.add_argument("--gpu")
+            p.add_argument("--yield-gpu-on-share", action="store_true",
+                help="release mining model VRAM while a shared GPU checks or proves each share")
     args = parser.parse_args()
     os.environ["LD_LIBRARY_PATH"] = str(ROOT / "lib") + (
         ":" + os.environ["LD_LIBRARY_PATH"] if os.environ.get("LD_LIBRARY_PATH") else "")
@@ -185,6 +225,8 @@ def main():
         prepare(inputs, args.role)
         return
     data = args.data_dir.expanduser().resolve()
+    if args.action == "pool" and args.ram_witness_dir is not None:
+        args.ram_witness_dir = validate_ram_witness_directory(args.ram_witness_dir)
     if not args.check:
         data.mkdir(parents=True, mode=0o700, exist_ok=True)
         prepare(inputs, args.action)

@@ -1,0 +1,29 @@
+{
+  "schema": "CMFD_RAM_WITNESS_GPU_SOURCE_PATCH_V1",
+  "files": [
+    {
+      "path": "cuda/koala_four_limb_replay.cu",
+      "before_sha256": "f6eeb65bd8a1e6d2038fee61694115a8771ce023f698c2fa470e1c8a5152b327",
+      "after_sha256": "dc776e013785143575425ae3e81e71aea58eaef7dfcf23de9064b4091a20075f"
+    },
+    {
+      "path": "src/sealed_words.rs",
+      "before_sha256": "16582f27188b2f61f0e10a733d0fa7e12287ef452aba1f454466c47744cc1bd7",
+      "after_sha256": "178937d1e48df534580b14bfbd5cc27099b71b624740d5ee767ad6fb56de8115"
+    },
+    {
+      "path": "src/bin/real_bank0_all_relations.rs",
+      "before_sha256": "12fe06d2af5574bc03b158b78e0cc7473bb14ea8d3d10d6573aecbfd9fcd4a76",
+      "after_sha256": "dec568a66367d391aeef842fd0b71e37c7dcf04eefc8211a21d3c25a966c1f3c"
+    },
+    {
+      "path": "src/direct_opening.rs",
+      "before_sha256": "f3b8822d2001e8ed8bfae86db3025b1b477aa66cf60577d26da7774d48239d51",
+      "after_sha256": "f5e5b3559f03e903a7dfef198d7e73d39008056443d08263798a158f087bef6f"
+    }
+  ],
+  "patch_sha256": "215b515c6c2ab27ae9ae7f1ed0135de203aa47024b8c83d06fe3a447771612e6",
+  "proof_parameters_changed": false,
+  "scope": "Witness transport, exact replay export staging, fixed-bank residency and post-job GPU release only.",
+  "patch_format": "zero-context unified diff; verify exact before hashes and use git apply --unidiff-zero"
+}

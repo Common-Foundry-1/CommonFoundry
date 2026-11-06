@@ -237,6 +237,10 @@ enum Command {
         /// An inherited single CUDA_VISIBLE_DEVICES selector is also honored.
         #[arg(long)]
         gpu: Option<String>,
+        /// Release this miner's GPU model before submitting each share, for
+        /// pool replay/proving sharing this GPU. Reload before the next search.
+        #[arg(long)]
+        yield_gpu_on_share: bool,
         /// Absolute path to the pinned ProductionV4 model bank.
         #[arg(long)]
         production_v4_bank: PathBuf,
@@ -662,6 +666,7 @@ fn main() -> Result<()> {
             miner,
             worker,
             gpu,
+            yield_gpu_on_share,
             production_v4_bank,
             production_v4_replay_worker,
             production_v4_scratch,
@@ -672,6 +677,7 @@ fn main() -> Result<()> {
             miner,
             worker,
             gpu,
+            yield_gpu_on_share,
             model_bank: production_v4_bank,
             replay_worker: production_v4_replay_worker,
             scratch_directory: production_v4_scratch,
@@ -936,6 +942,7 @@ struct ProductionV4PoolMinerOptions {
     miner: String,
     worker: String,
     gpu: Option<String>,
+    yield_gpu_on_share: bool,
     model_bank: PathBuf,
     replay_worker: PathBuf,
     scratch_directory: PathBuf,
@@ -1317,6 +1324,7 @@ fn run_production_v4_pool_miner(options: ProductionV4PoolMinerOptions) -> Result
             report_interval,
             &worker,
             &gpu,
+            options.yield_gpu_on_share,
         ) {
             Ok(()) => break,
             Err(error) if pool_error_is_reconnectable(&error) => {
@@ -1338,6 +1346,7 @@ fn run_production_v4_pool_miner(options: ProductionV4PoolMinerOptions) -> Result
 }
 
 #[cfg(feature = "production-v4")]
+#[allow(clippy::too_many_arguments)]
 fn mine_production_v4_pool_session(
     client: &mut PoolClient,
     searcher: &ProductionV4PersistentPoolSearcher,
@@ -1346,6 +1355,7 @@ fn mine_production_v4_pool_session(
     report_interval: Duration,
     worker: &str,
     gpu: &ResolvedPoolGpu,
+    yield_gpu_on_share: bool,
 ) -> Result<(), PoolError> {
     let mut job_id = None;
     let mut next_nonce = 0_u64;
@@ -1443,6 +1453,15 @@ fn mine_production_v4_pool_session(
                 continue;
             }
         };
+
+        if yield_gpu_on_share {
+            let started = Instant::now();
+            searcher.evict_model()?;
+            eprintln!(
+                "CMFD_MINER_GPU_YIELD seconds={:.6}",
+                started.elapsed().as_secs_f64()
+            );
+        }
 
         let Some(mut submitted) = client.submit_share_interruptible(job.job_id, nonce, stop)?
         else {
@@ -6113,9 +6132,10 @@ mod tests {
             "--worker", "rig", "--gpu", "GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
             "--production-v4-bank", "/tmp/bank", "--production-v4-replay-worker", "/tmp/replay",
             "--production-v4-scratch", "/tmp/scratch",
+            "--yield-gpu-on-share",
         ]).unwrap();
         assert!(
-            matches!(cli.command, Command::Pool { gpu: Some(value), .. } if value == "GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+            matches!(cli.command, Command::Pool { gpu: Some(value), yield_gpu_on_share: true, .. } if value == "GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
         );
     }
 

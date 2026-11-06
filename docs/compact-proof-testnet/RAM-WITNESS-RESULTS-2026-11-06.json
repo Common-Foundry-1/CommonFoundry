@@ -1,0 +1,147 @@
+{
+  "schema": "CMFD_RAM_WITNESS_TESTNET_RESULT_V1",
+  "hardware": "RTX 5090 32 GB",
+  "memory_clock_mhz": 7001,
+  "power_limit_w": 520,
+  "physical_16gb_card_tested": false,
+  "witness_tmpfs_capacity_bytes": 2147483648,
+  "proof_parameters_changed": false,
+  "base_commit": "b9ffa34776b795e8658f8316973dcbba19763ddc",
+  "tested_runtime_patch_sha256": "6df8ad41a728c5131c7338ff2a6eba4770433e0186853a1772871bdb0b23d656",
+  "gpu_source_patch": {
+    "schema": "CMFD_RAM_WITNESS_GPU_SOURCE_PATCH_V1",
+    "files": [
+      {
+        "path": "cuda/koala_four_limb_replay.cu",
+        "before_sha256": "f6eeb65bd8a1e6d2038fee61694115a8771ce023f698c2fa470e1c8a5152b327",
+        "after_sha256": "dc776e013785143575425ae3e81e71aea58eaef7dfcf23de9064b4091a20075f"
+      },
+      {
+        "path": "src/sealed_words.rs",
+        "before_sha256": "16582f27188b2f61f0e10a733d0fa7e12287ef452aba1f454466c47744cc1bd7",
+        "after_sha256": "178937d1e48df534580b14bfbd5cc27099b71b624740d5ee767ad6fb56de8115"
+      },
+      {
+        "path": "src/bin/real_bank0_all_relations.rs",
+        "before_sha256": "12fe06d2af5574bc03b158b78e0cc7473bb14ea8d3d10d6573aecbfd9fcd4a76",
+        "after_sha256": "dec568a66367d391aeef842fd0b71e37c7dcf04eefc8211a21d3c25a966c1f3c"
+      },
+      {
+        "path": "src/direct_opening.rs",
+        "before_sha256": "f3b8822d2001e8ed8bfae86db3025b1b477aa66cf60577d26da7774d48239d51",
+        "after_sha256": "f5e5b3559f03e903a7dfef198d7e73d39008056443d08263798a158f087bef6f"
+      }
+    ],
+    "patch_sha256": "215b515c6c2ab27ae9ae7f1ed0135de203aa47024b8c83d06fe3a447771612e6",
+    "proof_parameters_changed": false,
+    "scope": "Witness transport, exact replay export staging, fixed-bank residency and post-job GPU release only.",
+    "patch_format": "zero-context unified diff; verify exact before hashes and use git apply --unidiff-zero"
+  },
+  "baseline": {
+    "pool_evaluation_seconds": 18.012661143,
+    "full_replay_seconds": 8.70187679,
+    "proof_worker_seconds": 9.072661259,
+    "node_admission_seconds": 0.464943367
+  },
+  "cases": [
+    {
+      "proof": {
+        "full_replay_seconds": 0.922590488,
+        "height": 5,
+        "network_id": "8a34c0d9eaa92c5eaec4af7fe146afdfa2ab6859918b7deb0c97e0a1f600d6d1",
+        "nonce": 8402177296695812293,
+        "parent": "9c0b89a8d061f091617b13fc8a78b270a60cba88f143e64ebc67a4110e39f51e",
+        "pool_evaluation_wall_seconds": 7.473920543,
+        "proof_bytes": 5661321,
+        "proof_seconds": 5.890327266,
+        "replay_handoff_seconds": 0.029481943,
+        "search_replay_seconds": 0.582609266
+      },
+      "admission": {
+        "block_id": "479571c25dc73b0aea6807bd15b1f18b817994743dc86e2ea9b54c5c00e6ce9f",
+        "height": 5,
+        "network_id": "8a34c0d9eaa92c5eaec4af7fe146afdfa2ab6859918b7deb0c97e0a1f600d6d1",
+        "node_submission_seconds": 0.421595116,
+        "nonce": 8402177296695812293,
+        "parent": "9c0b89a8d061f091617b13fc8a78b270a60cba88f143e64ebc67a4110e39f51e"
+      }
+    },
+    {
+      "proof": {
+        "full_replay_seconds": 0.945139169,
+        "height": 6,
+        "network_id": "8a34c0d9eaa92c5eaec4af7fe146afdfa2ab6859918b7deb0c97e0a1f600d6d1",
+        "nonce": 14064644948894726692,
+        "parent": "479571c25dc73b0aea6807bd15b1f18b817994743dc86e2ea9b54c5c00e6ce9f",
+        "pool_evaluation_wall_seconds": 7.137192694,
+        "proof_bytes": 5664164,
+        "proof_seconds": 5.518474086,
+        "replay_handoff_seconds": 0.031843816,
+        "search_replay_seconds": 0.602187483
+      },
+      "admission": {
+        "block_id": "116dbb07624ea4353e322bcd5d394e2760e303257dd7e1b7c78ce7a885b9389f",
+        "height": 6,
+        "network_id": "8a34c0d9eaa92c5eaec4af7fe146afdfa2ab6859918b7deb0c97e0a1f600d6d1",
+        "node_submission_seconds": 0.422119889,
+        "nonce": 14064644948894726692,
+        "parent": "479571c25dc73b0aea6807bd15b1f18b817994743dc86e2ea9b54c5c00e6ce9f"
+      }
+    }
+  ],
+  "online_proving_seconds": [
+    5.013082,
+    4.763762
+  ],
+  "resources": {
+    "baseline_total_mib": 3914.0,
+    "peak_total_mib": 16787.0,
+    "peak_incremental_mib": 12873.0,
+    "minimum_available_wsl_ram_bytes": 7542370304
+  },
+  "security_tests": {
+    "pool_passed": 23,
+    "miner_passed": 7,
+    "launcher_passed": 7,
+    "prover_passed": 16,
+    "full_replay_fixture_heights": [
+      43424,
+      43425
+    ],
+    "complete_witness_byte_identity": true
+  },
+  "independent_verification": {
+    "height": 6,
+    "tip": "116dbb07624ea4353e322bcd5d394e2760e303257dd7e1b7c78ce7a885b9389f",
+    "work_rule_is_null": true,
+    "proof_mode": "in_process",
+    "history_verified": true,
+    "storage_healthy": true,
+    "audit_seed_height": 6,
+    "audit_seed_tip": "116dbb07624ea4353e322bcd5d394e2760e303257dd7e1b7c78ce7a885b9389f"
+  },
+  "owner_mining_restore": {
+    "utc": "2026-11-06T07:07:16.6498702Z",
+    "task_state": "Running",
+    "task_sha256": "29f227b4ede69cc6a924c59cfd842c406cede1fe4fc1075f5707652dfb5c7922",
+    "miner_version": "1.0.0s",
+    "shares_accepted": [
+      6
+    ],
+    "shares_rejected": [
+      0
+    ],
+    "gpu_utilization": 99.0,
+    "gpu_memory_mib": 4869.0,
+    "memory_clock_mhz": 7001.0,
+    "power_limit_w": 520.0,
+    "remaining_test_listeners": [],
+    "ram_mount_exists": false
+  },
+  "candidate_archive_sha256": "0f21e73e73ac391897f65d5a847f7b0bbc1d39fb9e66c15b1991bb8ce3286fd4",
+  "sampled_online_incremental_cuda_gib": [
+    7.5,
+    7.25
+  ],
+  "internal_cuda_sampler_excludes_prepared_trace_baseline": true
+}

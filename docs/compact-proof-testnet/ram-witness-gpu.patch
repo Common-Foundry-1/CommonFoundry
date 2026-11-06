@@ -1,0 +1,168 @@
+--- a/cuda/koala_four_limb_replay.cu
++++ b/cuda/koala_four_limb_replay.cu
+@@ -558,0 +559,15 @@
++class ReplayExportStaging {
++public:
++    static constexpr size_t VALUES = (size_t{16} << 20) / sizeof(uint32_t);
++    ReplayExportStaging() {
++        cuda_check(cudaMallocHost(&data_, VALUES * sizeof(uint32_t)),
++                   "allocate bounded pinned replay export staging");
++    }
++    ~ReplayExportStaging() { cudaFreeHost(data_); }
++    ReplayExportStaging(const ReplayExportStaging&) = delete;
++    ReplayExportStaging& operator=(const ReplayExportStaging&) = delete;
++    uint32_t* data() { return data_; }
++private:
++    uint32_t* data_ = nullptr;
++};
++
+@@ -561,4 +576,6 @@
+-    constexpr size_t CHUNK_VALUES = (size_t{16} << 20) / sizeof(uint32_t);
+-    std::vector<uint32_t> buffer(std::min(count, CHUNK_VALUES));
+-    for (size_t offset = 0; offset < count; offset += buffer.size()) {
+-        const size_t chunk = std::min(buffer.size(), count - offset);
++    // Reuse one 16 MiB pinned host buffer. This changes transport only: every
++    // word, its order, output length and the receiver's seal/field checks stay
++    // identical. No extra device memory or persistent witness is retained.
++    static thread_local ReplayExportStaging buffer;
++    for (size_t offset = 0; offset < count; offset += ReplayExportStaging::VALUES) {
++        const size_t chunk = std::min(ReplayExportStaging::VALUES, count - offset);
+@@ -1054,0 +1072 @@
++    const auto wall_started = std::chrono::steady_clock::now();
+@@ -1179,0 +1198 @@
++    const auto export_started = std::chrono::steady_clock::now();
+@@ -1192,0 +1212,6 @@
++    std::fprintf(stderr,
++                 "replay_profile mode=%s compute_seconds=%.6f export_and_release_seconds=%.6f wall_seconds=%.6f pinned_export_bytes=%zu\n",
++                 full_trace ? "full" : "search", double(elapsed_ms) / 1000.0,
++                 std::chrono::duration<double>(std::chrono::steady_clock::now() - export_started).count(),
++                 std::chrono::duration<double>(std::chrono::steady_clock::now() - wall_started).count(),
++                 ReplayExportStaging::VALUES * sizeof(uint32_t));
+--- a/src/sealed_words.rs
++++ b/src/sealed_words.rs
+@@ -33 +33,4 @@
+-        if seals < 0 {
++        // Ordinary tmpfs inodes report F_SEAL_SEAL alone: they cannot acquire
++        // write/grow/shrink seals. Treat them as mutable replay files, exactly
++        // like disk files, and validate only an owned, fully sealed snapshot.
++        if seals < 0 || seals == libc::F_SEAL_SEAL {
+@@ -51 +54,4 @@
+-                return Err(format!("create snapshot memfd: {}", std::io::Error::last_os_error()));
++                return Err(format!(
++                    "create snapshot memfd: {}",
++                    std::io::Error::last_os_error()
++                ));
+@@ -71 +77,4 @@
+-                return Err(format!("seal snapshot: {}", std::io::Error::last_os_error()));
++                return Err(format!(
++                    "seal snapshot: {}",
++                    std::io::Error::last_os_error()
++                ));
+@@ -85 +94,5 @@
+-        let map = unsafe { MmapOptions::new().map(&file).map_err(|e| format!("map snapshot: {e}"))? };
++        let map = unsafe {
++            MmapOptions::new()
++                .map(&file)
++                .map_err(|e| format!("map snapshot: {e}"))?
++        };
+@@ -167,0 +181,35 @@
++    fn ordinary_tmpfs_replay_file_is_snapshotted_and_checked() {
++        let path = std::path::PathBuf::from("/dev/shm").join(format!(
++            "cmfd-tmpfs-snapshot-test-{}-{}",
++            std::process::id(),
++            std::time::SystemTime::now()
++                .duration_since(std::time::UNIX_EPOCH)
++                .unwrap()
++                .as_nanos()
++        ));
++        let mut source = fs::OpenOptions::new()
++            .write(true)
++            .create_new(true)
++            .open(&path)
++            .unwrap();
++        for word in [0, 1, P - 1, 7] {
++            source.write_all(&word.to_le_bytes()).unwrap();
++        }
++        source.flush().unwrap();
++        assert_eq!(
++            unsafe { libc::fcntl(source.as_raw_fd(), libc::F_GET_SEALS) },
++            libc::F_SEAL_SEAL
++        );
++        let snapshot = SealedWords::open(&path, 16, P).unwrap();
++        source.seek(SeekFrom::Start(0)).unwrap();
++        source.write_all(&P.to_le_bytes()).unwrap();
++        source.flush().unwrap();
++        assert_eq!(snapshot.words(), &[0, 1, P - 1, 7]);
++        assert!(
++            SealedWords::open(&path, 16, P).is_err(),
++            "noncanonical tmpfs words must still fail"
++        );
++        fs::remove_file(path).unwrap();
++    }
++
++    #[test]
+--- a/src/bin/real_bank0_all_relations.rs
++++ b/src/bin/real_bank0_all_relations.rs
+@@ -684,0 +685,8 @@
++        // The pool may hand this same GPU back to mining immediately after
++        // DONE. Complete stream-ordered frees first; the zero release threshold
++        // then returns unused pool allocations instead of overlapping a reload.
++        let release_started = Instant::now();
++        scope.synchronize_blocking()?;
++        let (free, total) = cuda_memory_info()?;
++        eprintln!("proof_job_release seconds={:.6} used_bytes={}",
++            release_started.elapsed().as_secs_f64(), total-free);
+@@ -958,0 +967 @@
++    let retain_fixed = std::env::var("CMFD_DIRECT_RETAIN_FIXED_BANKS").as_deref() == Ok("1");
+@@ -965 +974,2 @@
+-        fixed_devices.push(encoded);
++        if retain_fixed { fixed_devices.push(encoded); }
++        else { drop(encoded); scope.synchronize_blocking()?; }
+@@ -967,4 +977,6 @@
+-        ensure!(total-free<=(13usize<<30),"retained fixed bank exceeded 13 GiB GPU guard");
+-        eprintln!("direct_retained_fixed_bank={bank} used_bytes={}",total-free);
+-    }
+-    let fixed_devices:[DeviceBuffer<u8>;3]=fixed_devices.try_into().map_err(|_|anyhow::anyhow!("retained fixed bank count"))?;
++        ensure!(total-free<=(13usize<<30),"fixed-bank opening exceeded 13 GiB GPU guard");
++        eprintln!("direct_fixed_bank={bank} retained={} used_bytes={}",retain_fixed,total-free);
++    }
++    let fixed_devices:Option<[DeviceBuffer<u8>;3]>=if retain_fixed {
++        Some(fixed_devices.try_into().map_err(|_|anyhow::anyhow!("retained fixed bank count"))?)
++    } else { None };
+--- a/src/direct_opening.rs
++++ b/src/direct_opening.rs
+@@ -49 +49 @@
+-  dynamic_traces:PreparedDynamicTraces,fixed_banks:[DeviceBuffer<u8>;3],output:&Path,scope:&TaskScope,
++  dynamic_traces:PreparedDynamicTraces,fixed_banks:Option<[DeviceBuffer<u8>;3]>,output:&Path,scope:&TaskScope,
+@@ -51 +51 @@
+-  prove_impl(prepared,statement,public_carrier,dynamic_traces,Some(fixed_banks),output,scope,true)
++  prove_impl(prepared,statement,public_carrier,dynamic_traces,fixed_banks,output,scope,true)
+@@ -62,3 +62,3 @@
+-  // All three fixed banks fit alongside the six reduced row traces under the
+-  // 13 GiB research cap. Keep them only through the shared-point evaluation,
+-  // then release them before allocating the joint PCS codewords.
++  // Default to one transient fixed bank. The same pinned host bytes are
++  // uploaded again for the later shared-point evaluation; no relation,
++  // transcript observation, opening, or field check is omitted.
+@@ -66,2 +66,2 @@
+-  let fixed_banks:[DeviceBuffer<u8>;3]=match preloaded_fixed{Some(banks)=>banks,None=>(0..3).map(|bank|Ok(DeviceBuffer::from_host_slice(&prepared.encoded_banks[bank],scope)?)).collect::<Result<Vec<_>>>()?.try_into().map_err(|_|anyhow::anyhow!("fixed bank count"))?};
+-  scope.synchronize_blocking()?;let fixed_initial_upload_seconds=fixed_upload_started.elapsed().as_secs_f64();budget("fixed-banks-ready",&mut peak)?;
++  let fixed_banks=preloaded_fixed;
++  scope.synchronize_blocking()?;let mut fixed_initial_upload_seconds=fixed_upload_started.elapsed().as_secs_f64();budget("fixed-bank-storage-ready",&mut peak)?;
+@@ -70 +70,6 @@
+-   let fixed_weights=&weights[offset..offset+256];traces.push(real_v4_opening::fixed_bank_rlc(&fixed_banks[bank],fixed_weights,scope)?);claims.push(evaluations[2*bank].iter().zip(fixed_weights).map(|(v,w)|*v**w).sum());offset+=256;scope.synchronize_blocking()?;
++   let upload_started=Instant::now();
++   let transient=if fixed_banks.is_none(){Some(DeviceBuffer::from_host_slice(&prepared.encoded_banks[bank],scope)?)}else{None};
++   scope.synchronize_blocking()?;fixed_initial_upload_seconds+=upload_started.elapsed().as_secs_f64();
++   let fixed=match &fixed_banks{Some(banks)=>&banks[bank],None=>transient.as_ref().expect("transient fixed bank")};
++   budget("secondary-fixed-bank",&mut peak)?;
++   let fixed_weights=&weights[offset..offset+256];traces.push(real_v4_opening::fixed_bank_rlc(fixed,fixed_weights,scope)?);claims.push(evaluations[2*bank].iter().zip(fixed_weights).map(|(v,w)|*v**w).sum());offset+=256;scope.synchronize_blocking()?;
+@@ -71,0 +77 @@
++   scope.synchronize_blocking()?;drop(transient);scope.synchronize_blocking()?;
+@@ -77 +83,3 @@
+-   shared.push(real_v4_opening::evaluate_fixed_columns(&fixed_banks[bank],&shared_point,scope)?);scope.synchronize_blocking()?;
++   let transient=if fixed_banks.is_none(){Some(DeviceBuffer::from_host_slice(&prepared.encoded_banks[bank],scope)?)}else{None};
++   let fixed=match &fixed_banks{Some(banks)=>&banks[bank],None=>transient.as_ref().expect("transient shared fixed bank")};
++   shared.push(real_v4_opening::evaluate_fixed_columns(fixed,&shared_point,scope)?);scope.synchronize_blocking()?;
+@@ -78,0 +87 @@
++   scope.synchronize_blocking()?;drop(transient);scope.synchronize_blocking()?;

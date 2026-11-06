@@ -928,6 +928,11 @@ enum Command {
         /// no replay worker.
         #[arg(long)]
         production_v4_pool_proof_gpu: Option<String>,
+        /// Share one GPU sequentially: evict replay weights before proving and
+        /// prevent share replay from reloading them until the proof is finished.
+        /// Requires one explicit replay GPU and the same explicit proof GPU.
+        #[arg(long)]
+        production_v4_pool_serial_gpu: bool,
         /// Absolute native path to the persistent ProductionV4 proof worker.
         #[arg(long)]
         production_v4_pool_proof_worker: Option<PathBuf>,
@@ -2399,6 +2404,7 @@ fn run_command() -> Result<(), Box<dyn std::error::Error>> {
             production_v4_pool_replay_worker,
             production_v4_pool_replay_gpus,
             production_v4_pool_proof_gpu,
+            production_v4_pool_serial_gpu,
             production_v4_pool_proof_worker,
             production_v4_pool_scratch,
             production_v4_pool_wsl_distribution,
@@ -2516,6 +2522,7 @@ fn run_command() -> Result<(), Box<dyn std::error::Error>> {
                 production_v4_pool_replay_worker.as_ref(),
                 &production_v4_pool_replay_gpus,
                 production_v4_pool_proof_gpu.as_deref(),
+                production_v4_pool_serial_gpu,
                 production_v4_pool_proof_worker.as_ref(),
                 production_v4_pool_scratch.as_ref(),
                 production_v4_pool_wsl_distribution.as_deref(),
@@ -2683,6 +2690,7 @@ fn run_command() -> Result<(), Box<dyn std::error::Error>> {
                     "share_batch_wait_ms": pool_share_batch_wait_ms,
                     "replay_gpus": production_v4_pool_replay_gpus,
                     "proof_gpu": production_v4_pool_proof_gpu,
+                    "serial_gpu": production_v4_pool_serial_gpu,
                     "work_checks_use_replay_workers": work_checks_use_replay_workers,
                     "ledger_max_bytes": pool_ledger_max_bytes,
                     "dashboard": dashboard.as_ref().map(|dashboard| format!("http://{}", dashboard.local_addr())),
@@ -3468,6 +3476,7 @@ fn configure_production_v4_pool_verifier(
     replay_worker: Option<&PathBuf>,
     replay_gpus: &[String],
     proof_gpu: Option<&str>,
+    serial_gpu: bool,
     proof_worker: Option<&PathBuf>,
     scratch_directory: Option<&PathBuf>,
     wsl_distribution: Option<&str>,
@@ -3475,6 +3484,7 @@ fn configure_production_v4_pool_verifier(
     let supplied = replay_worker.is_some()
         || !replay_gpus.is_empty()
         || proof_gpu.is_some()
+        || serial_gpu
         || proof_worker.is_some()
         || scratch_directory.is_some()
         || wsl_distribution.is_some();
@@ -3498,6 +3508,14 @@ fn configure_production_v4_pool_verifier(
 
     #[cfg(feature = "production-v4")]
     {
+        if serial_gpu
+            && (replay_gpus.len() != 1 || proof_gpu != replay_gpus.first().map(String::as_str))
+        {
+            return Err(
+                "serial GPU mode requires one explicit replay GPU and the same explicit proof GPU"
+                    .into(),
+            );
+        }
         let replay_worker =
             canonical_regular_file(replay_worker, "ProductionV4 pool replay worker")?;
         // Block work checks use the replay workers only when they run the
@@ -3567,7 +3585,7 @@ fn configure_production_v4_pool_verifier(
                     environment: match proof_gpu {
                         Some(gpu) => {
                             let device = cmfd_node::production_v4_pool::production_v4_worker_cuda_visible_device(Some(gpu))?;
-                            if replay_gpus.iter().any(|replay| replay == gpu) {
+                            if !serial_gpu && replay_gpus.iter().any(|replay| replay == gpu) {
                                 tracing::warn!(
                                     gpu = %device,
                                     "the proof worker shares its GPU with a replay worker; a proof needs about 7 GiB of free VRAM beside the replay worker's working set, which does not fit on 16 GB cards"
@@ -3592,18 +3610,24 @@ fn configure_production_v4_pool_verifier(
             ),
         };
         let pinned = work_check_pin.is_some();
-        let verifier = Arc::new(ProductionV4PersistentPoolVerifier::start(
-            ProductionV4PoolVerifierConfig {
+        let mut verifier =
+            ProductionV4PersistentPoolVerifier::start(ProductionV4PoolVerifierConfig {
                 replay,
                 extra_replays,
                 proof,
                 scratch_directory,
                 worker_scratch_directory,
                 work_check_pin,
-            },
-        )?);
+            })?;
+        if serial_gpu {
+            verifier.enable_serial_gpu()?;
+        }
+        let verifier = Arc::new(verifier);
         config.production_v4_share_verifier = Some(Arc::clone(&verifier) as _);
-        Ok(pinned.then_some(verifier as _))
+        // Serial mode reserves replay's GPU for its share/proof lease; ordinary
+        // block work checks keep the independent CPU path instead of reloading
+        // the model while a mining client owns the shared device.
+        Ok((pinned && !serial_gpu).then_some(verifier as _))
     }
     #[cfg(not(feature = "production-v4"))]
     {

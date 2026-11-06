@@ -2377,9 +2377,9 @@ impl PoolDashboardSource {
         });
         ledger.blocks.truncate(100);
         ledger.payout_transactions.sort_by(|left, right| {
-            right
+            left
                 .confirmations
-                .cmp(&left.confirmations)
+                .cmp(&right.confirmations)
                 .then_with(|| left.txid.cmp(&right.txid))
         });
         ledger.payout_transactions.truncate(100);

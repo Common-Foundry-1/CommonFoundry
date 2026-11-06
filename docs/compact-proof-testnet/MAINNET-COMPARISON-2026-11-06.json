@@ -1,0 +1,300 @@
+{
+  "schema": "CMFD_MAINNET_COMPACT_REFERENCE_COMPARISON_V1",
+  "release_identity": {
+    "schema": "CMFD_PUBLIC_MAINNET_BASELINE_IDENTITY_V1",
+    "release": "v1.0.20",
+    "source_commit": "9e688839b138814c1a07c01c6b1f07d2a1e19a1d",
+    "public_archive_sha256": "d40b792b1c9f84a3af8919915b47fc7853b1bc1929892b94379085985cc54a0f",
+    "proof_worker": {
+      "member": "commonfoundry-mainnet-runtime-linux-x86_64-v1.0.20/production-v4/real_bank0_relations",
+      "bytes": 97658968,
+      "sha256": "0202bbe9dc88a169fbee2e17c406a475503ca263080c8acea4d543dffc734135"
+    }
+  },
+  "hardware": "RTX 5090 32 GB",
+  "memory_clock_mhz": 7001,
+  "power_limit_w": 520,
+  "mainnet_scope": "Offline public historical mainnet winners 43424/43425; replay, GPU handoff, unmodified released prover and independent CPU proof check; excludes live mainnet pool/node admission and WAN propagation.",
+  "mainnet_prover_environment": "Production defaults; no proof optimization override. Every case reported fixed_data_preload=false.",
+  "cold_model_reference_cases": [
+    {
+      "height": 43424,
+      "storage": "windows-disk",
+      "search_replay_seconds": 1.189417584973853,
+      "full_replay_seconds": 9.445760697009973,
+      "gpu_handoff_seconds": 0.030745771015062928,
+      "proof_worker_seconds": 8.32265746302437,
+      "independent_verify_seconds": 0.4029538850300014,
+      "winning_proof_pipeline_seconds": 19.448429626005236,
+      "proof_bytes": 12025320,
+      "proof_sha256": "178b4d6ad74d6bc04ec698185f43ae45b919a8c0dc25abf2222011bb80e58fec",
+      "prover_startup_seconds_excluded": 5.596489104034845,
+      "worker_mode": [
+        "fixed_data_preload=false pinned_banks=0"
+      ],
+      "online_proving_seconds": [
+        2.524826
+      ],
+      "independent_cpu_verification_passed": true
+    },
+    {
+      "height": 43424,
+      "storage": "linux-disk",
+      "search_replay_seconds": 1.4577955600107089,
+      "full_replay_seconds": 1.4216042860061862,
+      "gpu_handoff_seconds": 0.03016407700488344,
+      "proof_worker_seconds": 4.453891795012169,
+      "independent_verify_seconds": 0.4048278139671311,
+      "winning_proof_pipeline_seconds": 7.7814335729926825,
+      "proof_bytes": 12025320,
+      "proof_sha256": "99c982bacb11de188e2e41f022a899d2ee6e7bc8db762cef133b6f75524f10bf",
+      "prover_startup_seconds_excluded": 0.5006859819986857,
+      "worker_mode": [
+        "fixed_data_preload=false pinned_banks=0"
+      ],
+      "online_proving_seconds": [
+        2.795331
+      ],
+      "independent_cpu_verification_passed": true
+    },
+    {
+      "height": 43424,
+      "storage": "ram",
+      "search_replay_seconds": 1.0421208909829147,
+      "full_replay_seconds": 0.8561859920155257,
+      "gpu_handoff_seconds": 0.031192339025437832,
+      "proof_worker_seconds": 4.013926209998317,
+      "independent_verify_seconds": 0.3915626989910379,
+      "winning_proof_pipeline_seconds": 6.346665716962889,
+      "proof_bytes": 12025320,
+      "proof_sha256": "365d5a442183653141564c9fa4c098a01ad0c260a0e2e6cfd78b934a08670110",
+      "prover_startup_seconds_excluded": 0.41957605798961595,
+      "worker_mode": [
+        "fixed_data_preload=false pinned_banks=0"
+      ],
+      "online_proving_seconds": [
+        2.333958
+      ],
+      "independent_cpu_verification_passed": true
+    },
+    {
+      "height": 43425,
+      "storage": "ram",
+      "search_replay_seconds": 1.1398190189502202,
+      "full_replay_seconds": 0.8979477990069427,
+      "gpu_handoff_seconds": 0.033056195999961346,
+      "proof_worker_seconds": 4.15644864900969,
+      "independent_verify_seconds": 0.4075467890361324,
+      "winning_proof_pipeline_seconds": 6.670279929006938,
+      "proof_bytes": 12025320,
+      "proof_sha256": "56ec2cbe8dc3cc62492bdd372d82c680c266b38c079a6ec5aa4a90fea254c5f3",
+      "prover_startup_seconds_excluded": 0.40981959499185905,
+      "worker_mode": [
+        "fixed_data_preload=false pinned_banks=0"
+      ],
+      "online_proving_seconds": [
+        2.431716
+      ],
+      "independent_cpu_verification_passed": true
+    },
+    {
+      "height": 43425,
+      "storage": "linux-disk",
+      "search_replay_seconds": 1.138593893032521,
+      "full_replay_seconds": 1.0071301470161416,
+      "gpu_handoff_seconds": 0.030205582035705447,
+      "proof_worker_seconds": 4.017594046017621,
+      "independent_verify_seconds": 0.3950867140083574,
+      "winning_proof_pipeline_seconds": 6.6007956939865835,
+      "proof_bytes": 12025320,
+      "proof_sha256": "ba68dc6a964695abfe9625f758fa958e860cb45bd68839d940fee15547e30b22",
+      "prover_startup_seconds_excluded": 0.42360697098774835,
+      "worker_mode": [
+        "fixed_data_preload=false pinned_banks=0"
+      ],
+      "online_proving_seconds": [
+        2.333828
+      ],
+      "independent_cpu_verification_passed": true
+    },
+    {
+      "height": 43425,
+      "storage": "windows-disk",
+      "search_replay_seconds": 1.0629181599942967,
+      "full_replay_seconds": 7.616680660983548,
+      "gpu_handoff_seconds": 0.03040174097986892,
+      "proof_worker_seconds": 7.2741035189828835,
+      "independent_verify_seconds": 0.4035281939432025,
+      "winning_proof_pipeline_seconds": 16.421286801050883,
+      "proof_bytes": 12025320,
+      "proof_sha256": "bf5a3cc21cffc0625af9da0befab845d7a01aef1718b5bca64c3fb6bb533031d",
+      "prover_startup_seconds_excluded": 0.39485896297264844,
+      "worker_mode": [
+        "fixed_data_preload=false pinned_banks=0"
+      ],
+      "online_proving_seconds": [
+        2.289228
+      ],
+      "independent_cpu_verification_passed": true
+    }
+  ],
+  "warm_model_reference_cases": [
+    {
+      "height": 43424,
+      "storage": "linux-disk",
+      "search_replay_seconds": 0.02467991696903482,
+      "full_replay_seconds": 1.549321944010444,
+      "gpu_handoff_seconds": 0.03142747801030055,
+      "proof_worker_seconds": 4.449684497958515,
+      "independent_verify_seconds": 0.4062197519815527,
+      "winning_proof_pipeline_seconds": 6.4834003610303625,
+      "proof_bytes": 12025320,
+      "proof_sha256": "8d31013bec7923be02f6031425a769c4a4935b28c8bf66b658b7dd11d3579e67",
+      "prover_startup_seconds_excluded": 5.400694242038298,
+      "replay_model_warmup_seconds_excluded": 1.253757654048968,
+      "model_gpu_resident_at_measurement_start": true,
+      "worker_mode": [
+        "fixed_data_preload=false pinned_banks=0"
+      ],
+      "online_proving_seconds": [
+        2.533764
+      ],
+      "independent_cpu_verification_passed": true
+    },
+    {
+      "height": 43424,
+      "storage": "ram",
+      "search_replay_seconds": 0.024595650960691273,
+      "full_replay_seconds": 0.8140252099838108,
+      "gpu_handoff_seconds": 0.030212679994292557,
+      "proof_worker_seconds": 4.230811335030012,
+      "independent_verify_seconds": 0.453621263965033,
+      "winning_proof_pipeline_seconds": 5.5673649740056135,
+      "proof_bytes": 12025320,
+      "proof_sha256": "52361d05e968274d72d9b6232eba9cce9ffc96d757f1c0fcf5c2df682d115cc9",
+      "prover_startup_seconds_excluded": 0.4041791810304858,
+      "replay_model_warmup_seconds_excluded": 1.2112612719647586,
+      "model_gpu_resident_at_measurement_start": true,
+      "worker_mode": [
+        "fixed_data_preload=false pinned_banks=0"
+      ],
+      "online_proving_seconds": [
+        2.464367
+      ],
+      "independent_cpu_verification_passed": true
+    },
+    {
+      "height": 43425,
+      "storage": "ram",
+      "search_replay_seconds": 0.02369773102691397,
+      "full_replay_seconds": 0.8301008910057135,
+      "gpu_handoff_seconds": 0.03039135900326073,
+      "proof_worker_seconds": 4.123346694977954,
+      "independent_verify_seconds": 0.4154963339678943,
+      "winning_proof_pipeline_seconds": 5.444136192032602,
+      "proof_bytes": 12025320,
+      "proof_sha256": "3e294ccd1632bc93405bc88856f0546c8148a77ae1787ad7cfbfcbc26297fb55",
+      "prover_startup_seconds_excluded": 0.5176154200453311,
+      "replay_model_warmup_seconds_excluded": 1.5493477000272833,
+      "model_gpu_resident_at_measurement_start": true,
+      "worker_mode": [
+        "fixed_data_preload=false pinned_banks=0"
+      ],
+      "online_proving_seconds": [
+        2.372994
+      ],
+      "independent_cpu_verification_passed": true
+    },
+    {
+      "height": 43425,
+      "storage": "linux-disk",
+      "search_replay_seconds": 0.02324706595391035,
+      "full_replay_seconds": 1.017762365983799,
+      "gpu_handoff_seconds": 0.033473915013018996,
+      "proof_worker_seconds": 4.057576033985242,
+      "independent_verify_seconds": 0.404253859014716,
+      "winning_proof_pipeline_seconds": 5.551289425988216,
+      "proof_bytes": 12025320,
+      "proof_sha256": "2dd48b39660362a838ef5ae72d6b511ae1934702cd505627ae05c31292d1ce51",
+      "prover_startup_seconds_excluded": 0.5038226100150496,
+      "replay_model_warmup_seconds_excluded": 1.296833397995215,
+      "model_gpu_resident_at_measurement_start": true,
+      "worker_mode": [
+        "fixed_data_preload=false pinned_banks=0"
+      ],
+      "online_proving_seconds": [
+        2.327808
+      ],
+      "independent_cpu_verification_passed": true
+    }
+  ],
+  "warm_model_memory_sample": {
+    "baseline_total_mib": 4869.0,
+    "peak_total_mib": 19075.0,
+    "peak_incremental_mib": 14206.0,
+    "minimum_available_wsl_ram_bytes": 20732104704
+  },
+  "compact_scope": "Fresh public-testnet blocks 5/6 through actual local reference pool and node admission; serial shared GPU with model reloads, 13 GiB workload guard.",
+  "compact_cases": [
+    {
+      "proof": {
+        "full_replay_seconds": 0.922590488,
+        "height": 5,
+        "network_id": "8a34c0d9eaa92c5eaec4af7fe146afdfa2ab6859918b7deb0c97e0a1f600d6d1",
+        "nonce": 8402177296695812293,
+        "parent": "9c0b89a8d061f091617b13fc8a78b270a60cba88f143e64ebc67a4110e39f51e",
+        "pool_evaluation_wall_seconds": 7.473920543,
+        "proof_bytes": 5661321,
+        "proof_seconds": 5.890327266,
+        "replay_handoff_seconds": 0.029481943,
+        "search_replay_seconds": 0.582609266
+      },
+      "admission": {
+        "block_id": "479571c25dc73b0aea6807bd15b1f18b817994743dc86e2ea9b54c5c00e6ce9f",
+        "height": 5,
+        "network_id": "8a34c0d9eaa92c5eaec4af7fe146afdfa2ab6859918b7deb0c97e0a1f600d6d1",
+        "node_submission_seconds": 0.421595116,
+        "nonce": 8402177296695812293,
+        "parent": "9c0b89a8d061f091617b13fc8a78b270a60cba88f143e64ebc67a4110e39f51e"
+      }
+    },
+    {
+      "proof": {
+        "full_replay_seconds": 0.945139169,
+        "height": 6,
+        "network_id": "8a34c0d9eaa92c5eaec4af7fe146afdfa2ab6859918b7deb0c97e0a1f600d6d1",
+        "nonce": 14064644948894726692,
+        "parent": "479571c25dc73b0aea6807bd15b1f18b817994743dc86e2ea9b54c5c00e6ce9f",
+        "pool_evaluation_wall_seconds": 7.137192694,
+        "proof_bytes": 5664164,
+        "proof_seconds": 5.518474086,
+        "replay_handoff_seconds": 0.031843816,
+        "search_replay_seconds": 0.602187483
+      },
+      "admission": {
+        "block_id": "116dbb07624ea4353e322bcd5d394e2760e303257dd7e1b7c78ce7a885b9389f",
+        "height": 6,
+        "network_id": "8a34c0d9eaa92c5eaec4af7fe146afdfa2ab6859918b7deb0c97e0a1f600d6d1",
+        "node_submission_seconds": 0.422119889,
+        "nonce": 14064644948894726692,
+        "parent": "479571c25dc73b0aea6807bd15b1f18b817994743dc86e2ea9b54c5c00e6ce9f"
+      }
+    }
+  ],
+  "compact_workload_memory_sample": {
+    "baseline_total_mib": 3914.0,
+    "peak_total_mib": 16787.0,
+    "peak_incremental_mib": 12873.0,
+    "minimum_available_wsl_ram_bytes": 7542370304
+  },
+  "limits": [
+    "Two historical winners per storage/state condition; no mainnet-wide latency average or tail estimate.",
+    "Mainnet CPU proof verification is not the complete live mainnet admission path.",
+    "Mainnet warm-model baseline and compact serial shared-GPU configuration have different model residency and node-admission endpoints."
+  ],
+  "cleanup_errors": {
+    "first_reference": [],
+    "warm_reference": []
+  },
+  "mainnet_chain_state_mutated": false
+}

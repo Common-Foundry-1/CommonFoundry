@@ -6926,7 +6926,10 @@ impl Node {
         if self.rejected_proof_ids.contains(&block_id) {
             return Err(NodeError::CachedInvalidBlock(block_id));
         }
-        if !matches!(self.profile.proof, ProofProfile::ProductionV3) {
+        if !matches!(
+            self.profile.proof,
+            ProofProfile::ProductionV3 | ProofProfile::ProductionV4
+        ) {
             return Ok(());
         }
         if self.storage_faulted {
@@ -6998,7 +7001,10 @@ impl Node {
         checkpoint: Option<BranchStateCheckpoint>,
     ) -> Result<Option<ExternalBlockAdmissionWork>, NodeError> {
         self.preflight_external_block_admission(block, accepted_at)?;
-        if !matches!(self.profile.proof, ProofProfile::ProductionV3) {
+        if !matches!(
+            self.profile.proof,
+            ProofProfile::ProductionV3 | ProofProfile::ProductionV4
+        ) {
             if checkpoint.is_some() {
                 return Err(NodeError::ProofVerifierProfileMismatch);
             }
@@ -7113,7 +7119,10 @@ impl Node {
         preverified: PreverifiedBlockProof,
         admission: ExternalBlockAdmission,
     ) -> Result<u64, NodeError> {
-        if !matches!(self.profile.proof, ProofProfile::ProductionV3) {
+        if !matches!(
+            self.profile.proof,
+            ProofProfile::ProductionV3 | ProofProfile::ProductionV4
+        ) {
             return Err(NodeError::ProofVerifierProfileMismatch);
         }
         if admission.revision != self.chain_revision
@@ -7141,7 +7150,10 @@ impl Node {
         admission: ExternalBlockAdmission,
         request: Option<&RemoteProofRequest>,
     ) -> Result<u64, NodeError> {
-        if !matches!(self.profile.proof, ProofProfile::ProductionV3) {
+        if !matches!(
+            self.profile.proof,
+            ProofProfile::ProductionV3 | ProofProfile::ProductionV4
+        ) {
             return Err(NodeError::ProofVerifierProfileMismatch);
         }
         if admission.revision != self.chain_revision
@@ -7645,7 +7657,7 @@ fn latch_shared_external_completion_failure(
 
 fn begin_proof_attempt(
     block_preverifier: &BlockPreverifier,
-    production_v3: bool,
+    production_admission: bool,
     remote_peer: Option<RemoteProofPeerId>,
     remote_request: Option<&RemoteProofRequest>,
     block_cache_digest: [u8; 32],
@@ -7653,7 +7665,7 @@ fn begin_proof_attempt(
     // Production remote sessions reserve FIFO admission before consulting the
     // successful-proof cache. A cache hit avoids relation dispatch only; it
     // cannot overtake a peer already waiting for network admission.
-    let remote_permit = if production_v3 {
+    let remote_permit = if production_admission {
         match (remote_peer, remote_request) {
             (Some(peer), Some(request)) => {
                 Some(block_preverifier.reserve_remote_cancellable(peer, request.clone())?)
@@ -7694,14 +7706,17 @@ fn submit_shared_block_with_policy(
 ) -> Result<u64, NodeError> {
     let block_id = block.block_id();
     ensure_remote_request_live(remote_request.as_ref())?;
-    let (block_preverifier, production_v3) = {
+    let (block_preverifier, production_admission) = {
         let node = lock_shared_node(shared, remote_request.as_ref())?;
         (
             node.block_preverifier(),
-            matches!(node.profile.proof, ProofProfile::ProductionV3),
+            matches!(
+                node.profile.proof,
+                ProofProfile::ProductionV3 | ProofProfile::ProductionV4
+            ),
         )
     };
-    if production_v3 {
+    if production_admission {
         // Keep trivial duplicates, cached deterministic rejects, unknown
         // parents, malformed bodies, and impossible headers out of the scarce
         // proof queue. This snapshot is deliberately discarded and repeated
@@ -7718,7 +7733,7 @@ fn submit_shared_block_with_policy(
     let block_cache_digest = canonical_block_cache_digest(&block)?;
     let attempt = begin_proof_attempt(
         &block_preverifier,
-        production_v3,
+        production_admission,
         remote_peer,
         remote_request.as_ref(),
         block_cache_digest,
@@ -7760,7 +7775,7 @@ fn submit_shared_block_with_policy(
             {
                 return Err(NodeError::StaleBlockAdmission);
             }
-            if production_v3 {
+            if production_admission {
                 node.preflight_external_block_admission(&block, accepted_at)?;
             }
         }
@@ -7779,7 +7794,7 @@ fn submit_shared_block_with_policy(
         match finalize_proof_attempt(remote_permit, Some(permit), result) {
             Ok(preverified) => preverified,
             Err(error) => {
-                if production_v3 {
+                if production_admission {
                     let mut node = lock_shared_node(shared, remote_request.as_ref())?;
                     if is_cacheable_proof_rejection(&error) {
                         node.remember_rejected_proof(block_id);
@@ -12340,6 +12355,104 @@ mod tests {
         assert_eq!(node.state.next_height(), 1);
         assert_eq!(node.log.metadata().unwrap().len(), 0);
         drop(node);
+        drop(shared);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn production_v4_shared_submission_rejects_bad_headers_before_proof_dispatch() {
+        let path = test_dir("production-v4-preflight-order");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        let now = DEVNET_GENESIS_TIMESTAMP + 60;
+        let valid = mined_candidate(&node, now);
+        node.profile.proof = ProofProfile::ProductionV4;
+        *node.block_preverifier.backend.write().unwrap() = ProofVerificationBackend::Unavailable;
+        let shared = Arc::new(Mutex::new(node));
+
+        let mut wrong_version = valid.clone();
+        wrong_version.version = u32::MAX;
+        assert!(matches!(
+            submit_shared_block(&shared, wrong_version, now),
+            Err(NodeError::Chain(ChainError::UnsupportedBlockVersion))
+        ));
+
+        let mut wrong_target = valid.clone();
+        wrong_target.challenge.target[0] ^= 1;
+        assert!(matches!(
+            submit_shared_block(&shared, wrong_target, now),
+            Err(NodeError::Chain(ChainError::UnexpectedTarget))
+        ));
+
+        let mut orphan = valid.clone();
+        orphan.challenge.previous_block = [0xA5; 32];
+        assert!(matches!(
+            submit_shared_block(&shared, orphan, now),
+            Err(NodeError::UnknownParent(parent)) if parent == [0xA5; 32]
+        ));
+
+        let mut wrong_root = valid.clone();
+        wrong_root.challenge.transaction_root[0] ^= 1;
+        assert!(matches!(
+            submit_shared_block(&shared, wrong_root, now),
+            Err(NodeError::Chain(ChainError::MerkleRoot))
+        ));
+
+        let node = shared.lock().unwrap();
+        assert_eq!(
+            node.block_preverifier
+                .worker_dispatches
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(node.state.next_height(), 1);
+        assert_eq!(node.log.metadata().unwrap().len(), 0);
+        drop(node);
+        drop(shared);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn production_v4_side_branch_replay_completes_without_node_mutex() {
+        let path = test_dir("production-v4-side-replay");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        let genesis = node.params.genesis_hash;
+        let t1 = DEVNET_GENESIS_TIMESTAMP + 60;
+        let t2 = t1 + 60;
+        let a1 = mined_child(&node, genesis, t1, 0x31);
+        node.submit_block(a1.clone(), t1).unwrap();
+        let a2 = mined_child(&node, a1.block_id(), t2, 0x32);
+        node.submit_block(a2, t2).unwrap();
+        let b1 = mined_child(&node, genesis, t1, 0x41);
+        node.submit_block(b1.clone(), t1).unwrap();
+        let b2 = mined_child(&node, b1.block_id(), t2, 0x42);
+
+        node.profile.proof = ProofProfile::ProductionV4;
+        let work = node
+            .begin_external_block_admission(&b2, t2)
+            .unwrap()
+            .expect("V4 side branches need an out-of-lock replay plan");
+        assert!(work.requires_reconstruction());
+        let submitted = b2.clone();
+        let shared = Arc::new(Mutex::new(node));
+        let held_node_guard = shared.lock().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let _ = sender.send(work.complete(&b2));
+        });
+        let completed = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("V4 side replay waited for the shared node mutex")
+            .unwrap();
+        assert!(matches!(
+            completed,
+            ExternalBlockAdmissionProgress::Ready(_)
+        ));
+        drop(held_node_guard);
+        worker.join().unwrap();
+        submit_shared_block(&shared, submitted.clone(), t2).unwrap();
+        assert!(shared.lock().unwrap().index.contains(submitted.block_id()));
         drop(shared);
         clean_test_dir(&path);
     }

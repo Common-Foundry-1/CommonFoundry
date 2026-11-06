@@ -236,6 +236,10 @@ impl NetworkProfile {
 }
 
 impl ProofProfile {
+    pub const fn is_forgematrix_v4(self) -> bool {
+        matches!(self, Self::ProductionV4 | Self::ProductionV4Direct)
+    }
+
     pub const fn profile_name(self) -> &'static str {
         match self {
             Self::DevnetV2Reference => "DevnetV2",
@@ -775,5 +779,12 @@ mod tests {
         assert_eq!(work.checkpoint_block_id(), direct.virtual_genesis_hash);
         assert_eq!(work.activation_height(), 1);
         assert!(work.requires_recomputation(1));
+        assert_eq!(
+            crate::work_gate::WorkGate::compiled_checkpoint(
+                direct.proof.is_forgematrix_v4(),
+                direct.network_id
+            ),
+            Some((0, direct.virtual_genesis_hash))
+        );
     }
 }

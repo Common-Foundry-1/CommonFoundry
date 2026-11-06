@@ -334,7 +334,7 @@ pub fn reconsider_work_block(
     require_existing_data_directory(data_dir)?;
     let _lock = DataDirLock::acquire(data_dir)?;
     let path = data_dir.join(super::work_gate::WORK_STATUS_FILE);
-    let production_v4 = matches!(profile.proof, super::ProofProfile::ProductionV4);
+    let production_v4 = profile.proof.is_forgematrix_v4();
     let Some((checkpoint_height, checkpoint_block_id)) =
         super::work_gate::WorkGate::compiled_checkpoint(production_v4, profile.network_id)
     else {

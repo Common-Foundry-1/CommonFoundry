@@ -5934,7 +5934,7 @@ impl Node {
         );
         // A compiled work checkpoint that does not match its digest refuses
         // the open here rather than panicking when the rule is first built.
-        if matches!(profile.proof, ProofProfile::ProductionV4) {
+        if profile.proof.is_forgematrix_v4() {
             cmfd_consensus::forgematrix_v4_work_rule_checked(params.network_id).map_err(
                 |error| {
                     tracing::error!(
@@ -6108,7 +6108,7 @@ impl Node {
             rejected_body_order: VecDeque::new(),
             work_rejections: HashMap::new(),
             work_gate: work_gate::WorkGate::compiled(
-                matches!(profile.proof, ProofProfile::ProductionV4),
+                profile.proof.is_forgematrix_v4(),
                 params.network_id,
             ),
             work_blame: Vec::new(),
@@ -8686,7 +8686,9 @@ impl Node {
         }
         if !matches!(
             self.profile.proof,
-            ProofProfile::ProductionV3 | ProofProfile::ProductionV4
+            ProofProfile::ProductionV3
+                | ProofProfile::ProductionV4
+                | ProofProfile::ProductionV4Direct
         ) {
             return self.work_rule_preflight(block, sender, any_depth);
         }
@@ -8788,7 +8790,9 @@ impl Node {
     fn remember_branch_checkpoint(&mut self, checkpoint: BranchStateCheckpoint) {
         if !matches!(
             self.profile.proof,
-            ProofProfile::ProductionV3 | ProofProfile::ProductionV4
+            ProofProfile::ProductionV3
+                | ProofProfile::ProductionV4
+                | ProofProfile::ProductionV4Direct
         ) || self.block_preverifier.ensure_reconstruction_open().is_err()
             || !self.checkpoint_matches_index(&checkpoint)
         {
@@ -8807,7 +8811,9 @@ impl Node {
             || height == 0
             || !matches!(
                 self.profile.proof,
-                ProofProfile::ProductionV3 | ProofProfile::ProductionV4
+                ProofProfile::ProductionV3
+                    | ProofProfile::ProductionV4
+                    | ProofProfile::ProductionV4Direct
             )
             || (!force && !height.is_multiple_of(ACTIVE_BRANCH_CHECKPOINT_INTERVAL))
             || self.block_preverifier.ensure_reconstruction_open().is_err()
@@ -8938,7 +8944,9 @@ impl Node {
         self.preflight_external_block_admission(block, accepted_at)?;
         if !matches!(
             self.profile.proof,
-            ProofProfile::ProductionV3 | ProofProfile::ProductionV4
+            ProofProfile::ProductionV3
+                | ProofProfile::ProductionV4
+                | ProofProfile::ProductionV4Direct
         ) {
             if checkpoint.is_some() {
                 return Err(NodeError::ProofVerifierProfileMismatch);
@@ -9102,7 +9110,9 @@ impl Node {
     ) -> Result<u64, NodeError> {
         if !matches!(
             self.profile.proof,
-            ProofProfile::ProductionV3 | ProofProfile::ProductionV4
+            ProofProfile::ProductionV3
+                | ProofProfile::ProductionV4
+                | ProofProfile::ProductionV4Direct
         ) {
             return Err(NodeError::ProofVerifierProfileMismatch);
         }
@@ -9135,7 +9145,9 @@ impl Node {
     ) -> Result<u64, NodeError> {
         if !matches!(
             self.profile.proof,
-            ProofProfile::ProductionV3 | ProofProfile::ProductionV4
+            ProofProfile::ProductionV3
+                | ProofProfile::ProductionV4
+                | ProofProfile::ProductionV4Direct
         ) {
             return Err(NodeError::ProofVerifierProfileMismatch);
         }
@@ -9909,7 +9921,9 @@ fn submit_shared_block_with_policy(
             node.block_preverifier(),
             matches!(
                 node.profile.proof,
-                ProofProfile::ProductionV3 | ProofProfile::ProductionV4
+                ProofProfile::ProductionV3
+                    | ProofProfile::ProductionV4
+                    | ProofProfile::ProductionV4Direct
             ),
             node.work_gate.is_some(),
         )

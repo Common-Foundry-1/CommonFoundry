@@ -2923,7 +2923,9 @@ fn is_retryable_block_admission(error: &NodeError) -> bool {
 fn uses_remote_proof_cooldowns(node: &Node) -> bool {
     matches!(
         node.profile.proof,
-        crate::ProofProfile::ProductionV3 | crate::ProofProfile::ProductionV4
+        crate::ProofProfile::ProductionV3
+            | crate::ProofProfile::ProductionV4
+            | crate::ProofProfile::ProductionV4Direct
     ) || node.work_gate.is_some()
 }
 

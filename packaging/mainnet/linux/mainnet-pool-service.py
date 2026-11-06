@@ -40,6 +40,9 @@ HASH_FIELDS = (
     "expected_tls_private_key_sha256", "forbidden_rc_certificate_sha256",
     "forbidden_rc_private_key_sha256", "forbidden_rc_wallet_file_sha256",
 )
+RC_FILE_HASH_FIELDS = {"forbidden_rc_private_key_sha256", "forbidden_rc_wallet_file_sha256"}
+PREVIOUS_RC_FIELD = "has_previous_rc_installation"
+IDLE_SEARCH_FIELD = "idle_gpu_search"
 NUMBER_FIELDS = {
     "worker_threads": (1, 96), "share_leading_zero_bits": (0, 7),
     "minimum_payout_atoms": (1, 2**64 - 1),
@@ -144,9 +147,20 @@ def parse_seed(value: object) -> str:
 
 
 def validate_config(config: dict) -> dict:
-    if set(config) != CONFIG_FIELDS or config.get("schema") != SCHEMA:
+    if (set(config) - {PREVIOUS_RC_FIELD, IDLE_SEARCH_FIELD} != CONFIG_FIELDS
+            or config.get("schema") != SCHEMA):
         raise PreflightError("pool.json is incomplete or has unexpected fields")
+    if type(config.get(IDLE_SEARCH_FIELD, False)) is not bool:
+        raise PreflightError("idle_gpu_search must be true or false")
+    # Existing v1 configurations keep the original RC migration checks.
+    previous_rc = config.get(PREVIOUS_RC_FIELD, True)
+    if type(previous_rc) is not bool:
+        raise PreflightError(f"{PREVIOUS_RC_FIELD} must be true or false")
     for field in HASH_FIELDS:
+        if field in RC_FILE_HASH_FIELDS and not previous_rc:
+            if config[field] is not None:
+                raise PreflightError(f"{field} must be null when {PREVIOUS_RC_FIELD} is false")
+            continue
         if (not isinstance(config[field], str) or not HEX64.fullmatch(config[field])
                 or config[field] == "0" * 64):
             raise PreflightError(f"{field} must be a final lowercase SHA-256 value")
@@ -165,7 +179,7 @@ def validate_config(config: dict) -> dict:
     config["mainnet_seed"] = parse_seed(config["mainnet_seed"])
     for fresh, old in (("expected_tls_certificate_sha256", "forbidden_rc_certificate_sha256"),
                        ("expected_tls_private_key_sha256", "forbidden_rc_private_key_sha256")):
-        if config[fresh] == config[old]:
+        if config[old] is not None and config[fresh] == config[old]:
             raise PreflightError("mainnet TLS material must not reuse RC material")
     if config["expected_tls_certificate_sha256"] == RC_CERTIFICATE_SHA256:
         raise PreflightError("known AI01 RC pool certificate cannot be used on mainnet")
@@ -260,6 +274,17 @@ def check_artifacts(root: Path, config: dict, bank: dict, record: dict) -> None:
                  record["sha256"], "node fixed record", static=True)
 
 
+def deployment_identity(config: dict) -> dict:
+    identity = {"schema": MARKER_SCHEMA, "plan_digest": config["expected_plan_digest"],
+                "network_id": config["expected_network_id"],
+                "certificate_sha256": config["expected_tls_certificate_sha256"]}
+    # Keep legacy marker bytes compatible, but bind new fresh installations to
+    # their declared mode so it cannot be used to bypass an existing RC check.
+    if config.get(PREVIOUS_RC_FIELD, True) is False:
+        identity[PREVIOUS_RC_FIELD] = False
+    return identity
+
+
 def check_state(state: Path, config: dict) -> tuple[Path, Path]:
     data = state / "data"
     scratch = state / "scratch"
@@ -268,19 +293,18 @@ def check_state(state: Path, config: dict) -> tuple[Path, Path]:
         raise PreflightError("pool state must not use symlinks")
     if data.exists() and not data.is_dir() or scratch.exists() and not scratch.is_dir():
         raise PreflightError("pool data/scratch must be real directories")
-    identity = {"schema": MARKER_SCHEMA, "plan_digest": config["expected_plan_digest"],
-                "network_id": config["expected_network_id"],
-                "certificate_sha256": config["expected_tls_certificate_sha256"]}
+    identity = deployment_identity(config)
     if marker.exists():
         if strict_json(bounded_file(marker, "mainnet pool deployment marker", 4096),
                        "mainnet pool deployment marker", 4096) != identity:
-            raise PreflightError("mainnet pool state belongs to another plan or TLS identity")
+            raise PreflightError("mainnet pool state belongs to another plan, TLS identity, or RC migration mode")
     elif data.exists() and any(data.iterdir()):
         raise PreflightError("first mainnet pool start requires an empty fresh data directory")
     wallet = data / "wallet.key"
     if wallet.exists():
         digest, _ = sha256(wallet, "pool wallet")
-        if digest == config["forbidden_rc_wallet_file_sha256"]:
+        if (config["forbidden_rc_wallet_file_sha256"] is not None
+                and digest == config["forbidden_rc_wallet_file_sha256"]):
             raise PreflightError("RC encrypted wallet file was copied into mainnet pool state")
     return data, scratch
 
@@ -350,7 +374,7 @@ def build_command(root: Path, state: Path, credential_base: Path, config: dict) 
     def socket(address: str, port: int) -> str:
         return f"[{address}]:{port}" if ":" in address else f"{address}:{port}"
     pin = config["expected_tls_certificate_sha256"]
-    return [
+    command = [
         str(root / "cmfd-node"), "--data-dir", str(state / "data"),
         "--wallet-passphrase-file", str(credential_base / "wallet-passphrase"),
         "--production-v4-bank", str(root / "production-v4/MODEL-V2.bank"),
@@ -374,6 +398,9 @@ def build_command(root: Path, state: Path, credential_base: Path, config: dict) 
         "--pool-public-url", f"cmfd+tls://{socket(config['public_numeric_ip'], 29445)}?pin={pin}",
         "--shutdown-request-file", str(state / "shutdown.request"),
     ]
+    if config.get(IDLE_SEARCH_FIELD, False):
+        command.append("--production-v4-pool-idle-search")
+    return command
 
 
 def preflight(config_path: Path, root: Path, state: Path, config_base: Path, install_base: Path,
@@ -385,6 +412,11 @@ def preflight(config_path: Path, root: Path, state: Path, config_base: Path, ins
                  "mainnet pool certificate", static=True)
     credentials(config, credential_base)
     require_hash(root / "cmfd-node", config["expected_node_sha256"], "node", static=True)
+    if config.get(IDLE_SEARCH_FIELD, False):
+        help_result = subprocess.run([str(root / "cmfd-node"), "pool-serve", "--help"],
+                                     check=True, capture_output=True, text=True, timeout=15)
+        if "--production-v4-pool-idle-search" not in help_result.stdout:
+            raise PreflightError("this node does not support coordinated idle GPU search")
     info = native_launch_info(root / "cmfd-node")
     bank, record = validate_info(info, config)
     plan = strict_json(bounded_file(root / "production-mainnet/MAINNET-PLAN.json",
@@ -402,9 +434,7 @@ def write_marker(state: Path, config: dict) -> None:
     marker = state / "mainnet-pool-deployment.json"
     if marker.exists():
         return
-    identity = {"schema": MARKER_SCHEMA, "plan_digest": config["expected_plan_digest"],
-                "network_id": config["expected_network_id"],
-                "certificate_sha256": config["expected_tls_certificate_sha256"]}
+    identity = deployment_identity(config)
     encoded = (json.dumps(identity, sort_keys=True, separators=(",", ":")) + "\n").encode()
     descriptor = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     with os.fdopen(descriptor, "wb") as output:

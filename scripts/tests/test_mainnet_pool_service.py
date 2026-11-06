@@ -153,6 +153,104 @@ class MainnetPoolServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(pool.PreflightError, "expected_proof_worker_sha256"):
             self.preflight()
 
+    def fresh_config(self):
+        self.config[pool.PREVIOUS_RC_FIELD] = False
+        for field in pool.RC_FILE_HASH_FIELDS:
+            self.config[field] = None
+        self.save_config()
+
+    def test_fresh_install_preflight_and_restart_without_rc_files(self):
+        self.fresh_config()
+        config, data, _scratch = self.preflight()
+        self.assertIsNone(config["forbidden_rc_private_key_sha256"])
+        self.assertIsNone(config["forbidden_rc_wallet_file_sha256"])
+        pool.write_marker(self.state, config)
+        marker = json.loads((self.state / "mainnet-pool-deployment.json").read_text())
+        self.assertIs(marker[pool.PREVIOUS_RC_FIELD], False)
+        data.mkdir()
+        (data / "wallet.key").write_bytes(b"new encrypted mainnet wallet fixture")
+        self.preflight()
+
+    def test_rc_mode_must_be_an_explicit_boolean_if_present(self):
+        for value in (None, 0, 1, "false", "true", [], {}):
+            with self.subTest(value=value):
+                config = dict(self.config, has_previous_rc_installation=value)
+                with self.assertRaisesRegex(pool.PreflightError, "must be true or false"):
+                    pool.validate_config(config)
+
+    def test_null_rc_hashes_require_explicit_fresh_mode(self):
+        for mode in ("omitted", True):
+            for field in pool.RC_FILE_HASH_FIELDS:
+                with self.subTest(mode=mode, field=field):
+                    config = dict(self.config)
+                    if mode is True:
+                        config[pool.PREVIOUS_RC_FIELD] = True
+                    config[field] = None
+                    with self.assertRaisesRegex(pool.PreflightError, field):
+                        pool.validate_config(config)
+        explicit = dict(self.config, has_previous_rc_installation=True)
+        pool.validate_config(explicit)
+
+    def test_fresh_mode_rejects_hash_placeholders_and_missing_fields(self):
+        self.fresh_config()
+        for field in pool.RC_FILE_HASH_FIELDS:
+            for value in ("", "0" * 64, digest(b""), "none", "3" * 64):
+                with self.subTest(field=field, value=value):
+                    config = dict(self.config)
+                    config[field] = value
+                    with self.assertRaisesRegex(pool.PreflightError, "must be null"):
+                        pool.validate_config(config)
+            config = dict(self.config)
+            del config[field]
+            with self.assertRaisesRegex(pool.PreflightError, "incomplete"):
+                pool.validate_config(config)
+
+    def test_fresh_mode_keeps_expected_hash_and_known_certificate_checks(self):
+        self.fresh_config()
+        for field in set(pool.HASH_FIELDS) - pool.RC_FILE_HASH_FIELDS:
+            config = dict(self.config)
+            config[field] = None
+            with self.subTest(field=field), self.assertRaisesRegex(pool.PreflightError, field):
+                pool.validate_config(config)
+        self.config["expected_tls_certificate_sha256"] = pool.RC_CERTIFICATE_SHA256
+        with self.assertRaisesRegex(pool.PreflightError, "TLS material|known AI01"):
+            pool.validate_config(self.config)
+
+    def test_fresh_mode_still_verifies_new_private_key_and_worker_bytes(self):
+        self.fresh_config()
+        (self.credential_base / "pool-private-key").write_bytes(b"changed key fixture")
+        with self.assertRaisesRegex(pool.PreflightError, "mainnet TLS private key SHA-256"):
+            self.preflight()
+        (self.credential_base / "pool-private-key").write_bytes(b"fresh mainnet private key")
+        (self.root / "production-v4/real_bank0_relations").write_bytes(b"changed worker")
+        with self.assertRaisesRegex(pool.PreflightError, "proof worker SHA-256"):
+            self.preflight()
+
+    def test_fresh_mode_does_not_allow_preexisting_unmarked_data(self):
+        self.fresh_config()
+        data = self.state / "data"
+        data.mkdir()
+        (data / "wallet.key").write_bytes(b"preexisting wallet fixture")
+        with self.assertRaisesRegex(pool.PreflightError, "empty fresh data"):
+            self.preflight()
+
+    def test_existing_migration_marker_cannot_be_downgraded_to_fresh(self):
+        pool.write_marker(self.state, self.config)
+        original = (self.state / "mainnet-pool-deployment.json").read_bytes()
+        self.fresh_config()
+        with self.assertRaisesRegex(pool.PreflightError, "RC migration mode"):
+            self.preflight()
+        self.assertEqual((self.state / "mainnet-pool-deployment.json").read_bytes(), original)
+
+    def test_fresh_marker_cannot_silently_switch_to_migration_mode(self):
+        legacy = dict(self.config)
+        self.fresh_config()
+        pool.write_marker(self.state, self.config)
+        self.config = legacy
+        self.save_config()
+        with self.assertRaisesRegex(pool.PreflightError, "RC migration mode"):
+            self.preflight()
+
     def test_payout_threshold_and_fee_must_match_mainnet_plan(self):
         self.config["minimum_payout_atoms"] = 1
         self.save_config()
@@ -331,6 +429,28 @@ class MainnetPoolServiceTests(unittest.TestCase):
         with mock.patch.object(type(self.state), "is_symlink", return_value=True):
             with self.assertRaisesRegex(pool.PreflightError, "real dedicated directory"):
                 pool.check_isolation(self.root, self.state, self.config_path, self.install, self.config_base)
+
+    def test_idle_search_is_explicit_boolean_and_command_opt_in(self):
+        legacy = pool.validate_config(self.config)
+        command = pool.build_command(self.root, self.state, self.credential_base, legacy)
+        self.assertNotIn("--production-v4-pool-idle-search", command)
+        for enabled in (False, True):
+            config = pool.validate_config(dict(self.config, idle_gpu_search=enabled))
+            command = pool.build_command(self.root, self.state, self.credential_base, config)
+            self.assertEqual("--production-v4-pool-idle-search" in command, enabled)
+        for bad in (None, 0, 1, "true", "false", []):
+            with self.assertRaises(pool.PreflightError):
+                pool.validate_config(dict(self.config, idle_gpu_search=bad))
+
+    def test_fresh_install_dropin_only_replaces_launcher(self):
+        dropin = (SOURCE / "30-fresh-install.conf").read_text(encoding="utf-8")
+        lines = [line.strip() for line in dropin.splitlines()
+                 if line.strip() and not line.lstrip().startswith("#")]
+        self.assertEqual(lines, [
+            "[Service]", "ExecStart=",
+            "ExecStart=/usr/bin/python3 /usr/local/lib/commonfoundry/mainnet-pool-service.py"
+            " --run /etc/commonfoundry-mainnet-pool/pool.json",
+        ])
 
     def test_unit_never_enables_or_starts_and_uses_separate_identity(self):
         unit = (SOURCE / "commonfoundry-mainnet-pool.service").read_text(encoding="utf-8")

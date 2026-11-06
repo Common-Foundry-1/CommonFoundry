@@ -19,7 +19,7 @@ Extract the archive, enter its directory, and verify it against the separately s
 
 The first start prepares inputs, creates dedicated testnet storage and a pool TLS certificate, then prints your complete `cmfd+tls://...?...` miner URL. Forward TCP **23444** for peers and **23445** for miners to the pool host. `--bind-ip` selects the local listen address. Share the printed miner URL with testers; it includes the exact certificate pin.
 
-Pools with separate devices can use `--replay-gpu 0 --proof-gpu 1`. This is a useful layout for 16 GB proof cards. The default operator fee is zero for this canary. Add `--enable-payouts` to exercise automatic testnet payouts after coinbase maturity (100 blocks). Ctrl+C gracefully stops the pool; rerunning the same command preserves the testnet ledger and certificate.
+Reserve the proof GPU for pool workers and run mining clients on other GPUs or rigs. Pools with separate devices can use `--replay-gpu 0 --proof-gpu 1`; this is a useful layout for 16 GB proof cards. The prover keeps its memory guard active. The default operator fee is zero for this canary. Add `--enable-payouts` to exercise automatic testnet payouts after coinbase maturity (100 blocks). Ctrl+C gracefully stops the pool; rerunning the same command preserves the testnet ledger and certificate.
 
 The reference pool uses Common Foundry's certificate-pinned pool protocol. Operators using another pool stack can first run this reference instance, then coordinate their own integration with us.
 

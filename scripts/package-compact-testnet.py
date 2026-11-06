@@ -53,7 +53,9 @@ def main():
     if len(commit) != 40 or any(c not in "0123456789abcdef" for c in commit):
         raise ValueError("source commit must be a full lowercase Git SHA")
     build = {"schema": "CMFD_COMPACT_TESTNET_PACKAGE_V1", "version": "0.1.0", "network_id": NETWORK,
-        "source_commit": commit, "source_dirty": args.source_dirty, "seed": "209.145.48.36:23444",
+        "source_commit": commit, "source_commit_scope": "node, miner, launcher, downloader and packaging",
+        "prover_identity": "exact GPU binary SHA-256 in PACKAGE-MANIFEST.json; pinned direct-proof research build",
+        "source_dirty": args.source_dirty, "seed": "209.145.48.36:23444",
         "seed_backend": "dedicated Proxmox testnet guest", "proof_version": 2,
         "initial_target": "01" + "ff" * 31,
         "roles": ["reference pool", "GPU pool miner", "CPU full node"],

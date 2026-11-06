@@ -2,6 +2,9 @@ import argparse
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
+import sys
+import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -13,6 +16,24 @@ spec.loader.exec_module(launcher)
 
 
 class CompactPackageTests(unittest.TestCase):
+    def test_archive_keeps_the_kit_version_after_copying_binary_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            artifacts = root / "artifacts"
+            artifacts.mkdir()
+            for name in ("cmfd-node", "cmfd-miner", "cmfd-v4-replay", "cmfd-direct-prover"):
+                (artifacts / name).write_bytes(b"test binary")
+            output = root / "output"
+            script = SOURCE.parents[2] / "scripts/package-compact-testnet.py"
+            subprocess.run([sys.executable, str(script), "--artifacts", str(artifacts),
+                "--output", str(output), "--source-commit", "a" * 40], check=True,
+                capture_output=True, text=True)
+            archive = output / "commonfoundry-compact-testnet-v0.2.0-linux-x86_64.tar.gz"
+            self.assertTrue(archive.is_file())
+            with tarfile.open(archive) as packaged:
+                self.assertIn("commonfoundry-compact-testnet-v0.2.0-linux-x86_64/BUILD-INFO.json",
+                    packaged.getnames())
+
     def test_corrupted_payload_and_foreign_network_are_rejected(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)

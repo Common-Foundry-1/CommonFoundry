@@ -28,8 +28,8 @@ def main():
     p.add_argument("--kit-version", default="0.2.0")
     args = p.parse_args()
     output = args.output.resolve()
-    name = f"commonfoundry-compact-testnet-v{args.kit_version}-linux-x86_64"
-    stage = output / name
+    kit_name = f"commonfoundry-compact-testnet-v{args.kit_version}-linux-x86_64"
+    stage = output / kit_name
     stage.mkdir(parents=True, exist_ok=False)
     for name in ("cmfd-node", "cmfd-miner", "cmfd-v4-replay", "cmfd-direct-prover"):
         shutil.copy2(args.artifacts / name, stage / name)
@@ -71,9 +71,9 @@ def main():
     (stage / "PACKAGE-MANIFEST.json").write_text(json.dumps({"network_id": NETWORK, "files": files}, indent=2) + "\n")
     sums = "".join(f'{digest(path)}  {path.name}\n' for path in sorted(stage.iterdir()) if path.is_file())
     (stage / "PACKAGE-SHA256SUMS.txt").write_text(sums)
-    archive = output / (name + ".tar.gz")
+    archive = output / (kit_name + ".tar.gz")
     with tarfile.open(archive, "w:gz") as tar:
-        tar.add(stage, arcname=name)
+        tar.add(stage, arcname=kit_name)
     (output / "SHA256SUMS.txt").write_text(f"{digest(archive)}  {archive.name}\n")
     print(json.dumps({"archive": str(archive), "bytes": archive.stat().st_size, "sha256": digest(archive)}))
 

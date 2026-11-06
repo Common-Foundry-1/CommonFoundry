@@ -27,6 +27,7 @@ getrandom.workspace = true
 hex.workspace = true
 k256.workspace = true
 matrixmultiply = { version = "=0.3.11", optional = true }
+miniz_oxide = { version = "=0.8.9", optional = true }
 primitive-types.workspace = true
 p3-blake3 = { version = "=0.6.3", optional = true }
 p3-blake3-air = { version = "=0.6.3", optional = true }
@@ -94,6 +95,12 @@ forgematrix-v4-verifier = [
     "dep:slop-multilinear",
     "dep:slop-sumcheck",
     "dep:slop-tensor",
+]
+direct-proof-testnet = [
+    "forgematrix-v4-verifier",
+    "forgematrix-v4-executor",
+    "dep:bincode",
+    "dep:miniz_oxide",
 ]
 production-whir-candidate = ["whir-prototype"]
 remainder-prototype = [

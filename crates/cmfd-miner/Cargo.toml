@@ -22,6 +22,7 @@ production-v4 = [
     "dep:same-file",
 ]
 production-v4-testnet = ["production-v4", "cmfd-node/production-v4-testnet"]
+direct-proof-testnet = ["production-v4", "cmfd-node/direct-proof-testnet"]
 production-rc = ["production-v4", "cmfd-node/production-rc"]
 production-mainnet = ["production-v4", "cmfd-node/production-mainnet"]
 

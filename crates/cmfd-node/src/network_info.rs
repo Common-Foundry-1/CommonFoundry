@@ -119,7 +119,10 @@ struct ProductionV4ProofOfWorkIdentity {
     proof_system_digest: String,
     model_manifest_digest: String,
     fixed_artifact_record_digest: String,
-    exact_transparent_proof_bytes: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exact_transparent_proof_bytes: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    maximum_transparent_proof_bytes: Option<String>,
     artifacts: ProductionV4ArtifactIdentities,
 }
 
@@ -440,7 +443,8 @@ fn canonical_network_info_json_for_profile(
                         Some(hex::encode(Sha256::digest(&activation_evidence))),
                     )
                 }
-                NetworkProfileKind::ProductionV4Testnet => (None, None),
+                NetworkProfileKind::ProductionV4Testnet
+                | NetworkProfileKind::DirectProofTestnet => (None, None),
                 NetworkProfileKind::Mainnet => {
                     let build_source_commit = option_env!("CMFD_BUILD_SOURCE_COMMIT").ok_or(
                         NodeError::MainnetLaunchEvidence("trusted build source commit is absent"),
@@ -467,7 +471,11 @@ fn canonical_network_info_json_for_profile(
                 }
             };
             ProofOfWorkIdentity::ProductionV4(ProductionV4ProofOfWorkIdentity {
-                selection: "ProductionV4",
+                selection: if profile.kind == NetworkProfileKind::DirectProofTestnet {
+                    "ProductionV4Direct"
+                } else {
+                    "ProductionV4"
+                },
                 profile: profile.proof_name(),
                 build_source_commit,
                 activation_evidence_sha256,
@@ -481,7 +489,21 @@ fn canonical_network_info_json_for_profile(
                 fixed_artifact_record_digest: hex::encode(
                     parameters.fixed_artifact_record_digest(),
                 ),
-                exact_transparent_proof_bytes: FORGEMATRIX_V4_TRANSPARENT_PROOF_BYTES.to_string(),
+                exact_transparent_proof_bytes: (profile.kind
+                    != NetworkProfileKind::DirectProofTestnet)
+                    .then(|| FORGEMATRIX_V4_TRANSPARENT_PROOF_BYTES.to_string()),
+                maximum_transparent_proof_bytes: {
+                    #[cfg(feature = "direct-proof-testnet")]
+                    {
+                        (profile.kind == NetworkProfileKind::DirectProofTestnet).then(|| {
+                            cmfd_consensus::forgematrix_v4_direct::MAX_WIRE_BYTES.to_string()
+                        })
+                    }
+                    #[cfg(not(feature = "direct-proof-testnet"))]
+                    {
+                        None
+                    }
+                },
                 artifacts: ProductionV4ArtifactIdentities {
                     bank: production_v4_file_identity(pins.bank),
                     fixed_record: production_v4_file_identity(pins.fixed_record),
@@ -589,6 +611,7 @@ mod tests {
     #[cfg(not(any(
         feature = "production-v3-testnet",
         feature = "production-v4-testnet",
+        feature = "direct-proof-testnet",
         feature = "production-rc",
         feature = "production-mainnet"
     )))]
@@ -680,6 +703,7 @@ mod tests {
     #[cfg(not(any(
         feature = "production-v3-testnet",
         feature = "production-v4-testnet",
+        feature = "direct-proof-testnet",
         feature = "production-rc",
         feature = "production-mainnet"
     )))]
@@ -694,6 +718,19 @@ mod tests {
     #[cfg(feature = "production-rc")]
     #[test]
     fn production_rc_network_info_does_not_fall_back_to_devnet_without_artifacts() {
+        assert!(matches!(
+            canonical_network_info_json(),
+            Err(NodeError::ProductionV4ArtifactsMissing)
+        ));
+    }
+
+    #[cfg(feature = "direct-proof-testnet")]
+    #[test]
+    fn direct_testnet_network_info_requires_pinned_v4_artifacts() {
+        assert_eq!(
+            COMPILED_NETWORK_PROFILE,
+            crate::DIRECT_PROOF_TESTNET_PROFILE
+        );
         assert!(matches!(
             canonical_network_info_json(),
             Err(NodeError::ProductionV4ArtifactsMissing)

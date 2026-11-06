@@ -41,6 +41,31 @@ pub const FORGEMATRIX_V4_RELATION_TRANSCRIPT: &str = "commitments-v1;bank0-relat
 
 pub const FORGEMATRIX_V4_ALGORITHM_VERSION: u32 = 4;
 pub const FORGEMATRIX_V4_PROOF_VERSION: u32 = 1;
+/// Dedicated testnet proof version. Mainnet remains on version 1.
+#[cfg(feature = "direct-proof-testnet")]
+pub const FORGEMATRIX_V4_DIRECT_PROOF_VERSION: u32 = 2;
+#[cfg(feature = "direct-proof-testnet")]
+pub const FORGEMATRIX_V4_DIRECT_TESTNET_NETWORK_ID: [u8; 32] = [
+    0xdc, 0xda, 0x3e, 0x81, 0x88, 0x1e, 0x14, 0x8a, 0x45, 0x97, 0x0d, 0x2e, 0x71, 0x57, 0xb7, 0x7f,
+    0x27, 0xe9, 0x31, 0xe6, 0x96, 0xdf, 0x28, 0x46, 0x83, 0x90, 0xce, 0x79, 0xbb, 0x1e, 0x14, 0xcb,
+];
+
+/// Domain-separates the new direct transcript and packet grammar while keeping
+/// the ForgeMatrix workload and original BaseFold security parameters pinned.
+#[cfg(feature = "direct-proof-testnet")]
+pub fn forgematrix_v4_direct_proof_system_digest() -> [u8; 32] {
+    let mut hasher =
+        blake3::Hasher::new_derive_key("CMFD/ForgeMatrix/V4/DirectProofSystem/Testnet/V1");
+    hasher.update(&1_u32.to_le_bytes());
+    hasher.update(&forgematrix_v4_proof_system_digest());
+    hasher.update(&FORGEMATRIX_V4_DIRECT_PROOF_VERSION.to_le_bytes());
+    hasher.update(b"CMFDDR02");
+    hasher.update(&[1, 6]); // canonical zlib level and commitment count
+    hasher.update(&FORGEMATRIX_V4_BASEFOLD_LOG_BLOWUP.to_le_bytes());
+    hasher.update(&FORGEMATRIX_V4_BASEFOLD_QUERIES.to_le_bytes());
+    hasher.update(&FORGEMATRIX_V4_BASEFOLD_POW_BITS.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
 pub const FORGEMATRIX_V4_FIELD_MODULUS: u32 = 0x7f00_0001;
 pub const FORGEMATRIX_V4_EXTENSION_DEGREE: u32 = 4;
 pub const FORGEMATRIX_V4_BASEFOLD_ROW_VARIABLES: u32 = 23;

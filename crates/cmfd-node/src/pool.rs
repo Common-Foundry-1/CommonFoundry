@@ -3874,10 +3874,14 @@ fn ensure_pool_profile_supported(
 ) -> Result<(), PoolError> {
     match profile.proof {
         ProofProfile::ProductionV3 => Err(PoolError::ProductionV3Unsupported),
-        ProofProfile::ProductionV4 if !has_production_v4_share_verifier => {
+        ProofProfile::ProductionV4 | ProofProfile::ProductionV4Direct
+            if !has_production_v4_share_verifier =>
+        {
             Err(PoolError::ProductionV4Unsupported)
         }
-        ProofProfile::ProductionV4 | ProofProfile::DevnetV2Reference => Ok(()),
+        ProofProfile::ProductionV4
+        | ProofProfile::ProductionV4Direct
+        | ProofProfile::DevnetV2Reference => Ok(()),
     }
 }
 
@@ -6652,12 +6656,14 @@ fn evaluate_pool_share(
             })
         }
         ProofProfile::ProductionV3 => Err(PoolError::ProductionV3Unsupported),
-        ProofProfile::ProductionV4 => evaluate_production_v4_pool_share(
-            shared.production_v4_share_verifier.as_deref(),
-            &active.mining.template,
-            nonce,
-            active.wire.share_target,
-        ),
+        ProofProfile::ProductionV4 | ProofProfile::ProductionV4Direct => {
+            evaluate_production_v4_pool_share(
+                shared.production_v4_share_verifier.as_deref(),
+                &active.mining.template,
+                nonce,
+                active.wire.share_target,
+            )
+        }
     }
 }
 

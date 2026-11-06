@@ -146,6 +146,8 @@ pub use network_info::{
     canonical_network_info_json, canonical_network_info_json_with_artifacts,
     canonical_network_info_json_with_record, canonical_network_info_json_with_v4_artifacts,
 };
+#[cfg(feature = "direct-proof-testnet")]
+pub use network_profile::DIRECT_PROOF_TESTNET_PROFILE;
 pub use network_profile::{
     COMPILED_NETWORK_PROFILE, DEVNET_PROFILE, NetworkProfile, NetworkProfileKind,
     PRODUCTION_V3_TESTNET_PROFILE, PRODUCTION_V4_TESTNET_PROFILE, ProofProfile, RCNET1_PROFILE,
@@ -358,6 +360,10 @@ pub(crate) fn production_v3_record_for_profile(
         (ProofProfile::ProductionV3, None) => Ok(None),
         (ProofProfile::ProductionV4, Some(_)) => Err(NodeError::ProductionV3ArtifactsUnexpected),
         (ProofProfile::ProductionV4, None) => Ok(None),
+        (ProofProfile::ProductionV4Direct, Some(_)) => {
+            Err(NodeError::ProductionV3ArtifactsUnexpected)
+        }
+        (ProofProfile::ProductionV4Direct, None) => Ok(None),
     }
 }
 
@@ -2157,6 +2163,7 @@ impl BlockPreverifier {
             ProofProfile::DevnetV2Reference => ProofVerificationBackend::InProcess,
             ProofProfile::ProductionV3 => ProofVerificationBackend::Unavailable,
             ProofProfile::ProductionV4 => ProofVerificationBackend::InProcess,
+            ProofProfile::ProductionV4Direct => ProofVerificationBackend::InProcess,
         };
         Self::with_limits_and_backend(
             verifier,
@@ -5089,7 +5096,7 @@ fn network_params_verifier_and_work_bank_with_launch(
                 return Err(NodeError::ProductionV3Unavailable);
             }
         }
-        ProofProfile::ProductionV4 => {
+        ProofProfile::ProductionV4 | ProofProfile::ProductionV4Direct => {
             if production_v3_record.is_some() {
                 return Err(NodeError::ProductionV3ArtifactsUnexpected);
             }
@@ -5342,7 +5349,7 @@ pub(crate) fn thin_miner_network_params() -> Result<NetworkParams, NodeError> {
     match COMPILED_NETWORK_PROFILE.proof {
         ProofProfile::DevnetV2Reference => network_params_for_profile(COMPILED_NETWORK_PROFILE),
         ProofProfile::ProductionV3 => Err(NodeError::ProductionV3Unavailable),
-        ProofProfile::ProductionV4 => {
+        ProofProfile::ProductionV4 | ProofProfile::ProductionV4Direct => {
             #[cfg(feature = "production-v4")]
             {
                 network_params_from_pow(
@@ -6263,6 +6270,7 @@ impl Node {
             return Err(match self.profile.proof {
                 ProofProfile::ProductionV3 => NodeError::ProductionV3Unavailable,
                 ProofProfile::ProductionV4 => NodeError::ProductionV4Unavailable,
+                ProofProfile::ProductionV4Direct => NodeError::ProductionV4Unavailable,
                 ProofProfile::DevnetV2Reference => unreachable!(),
             });
         }

@@ -2522,9 +2522,11 @@ fn run_command() -> Result<(), Box<dyn std::error::Error>> {
             )?;
             // Whether block work checks use the release replay worker; the
             // startup report shows it next to the worker options.
-            let work_checks_use_replay_workers = (COMPILED_NETWORK_PROFILE.proof
-                == ProofProfile::ProductionV4)
-                .then_some(replay_workers.is_some() && work_engine == PoolWorkEngine::Auto);
+            let work_checks_use_replay_workers = matches!(
+                COMPILED_NETWORK_PROFILE.proof,
+                ProofProfile::ProductionV4 | ProofProfile::ProductionV4Direct
+            )
+            .then_some(replay_workers.is_some() && work_engine == PoolWorkEngine::Auto);
             install_work_engines(
                 &mut node_instance,
                 work_threads,
@@ -3415,7 +3417,10 @@ fn validate_production_v3_override_set(cli: &Cli) -> Result<(), Box<dyn std::err
 fn production_v4_artifacts(
     cli: &Cli,
 ) -> Result<Option<ProductionV4VerifierArtifacts>, Box<dyn std::error::Error>> {
-    let is_v4 = COMPILED_NETWORK_PROFILE.proof == ProofProfile::ProductionV4;
+    let is_v4 = matches!(
+        COMPILED_NETWORK_PROFILE.proof,
+        ProofProfile::ProductionV4 | ProofProfile::ProductionV4Direct
+    );
     match (
         cli.production_v4_bank.as_ref(),
         cli.production_v4_fixed_record.as_ref(),
@@ -3469,7 +3474,10 @@ fn configure_production_v4_pool_verifier(
         || proof_worker.is_some()
         || scratch_directory.is_some()
         || wsl_distribution.is_some();
-    if COMPILED_NETWORK_PROFILE.proof != ProofProfile::ProductionV4 {
+    if !matches!(
+        COMPILED_NETWORK_PROFILE.proof,
+        ProofProfile::ProductionV4 | ProofProfile::ProductionV4Direct
+    ) {
         if supplied {
             return Err(
                 "ProductionV4 pool worker options were supplied for a non-ProductionV4 profile"
@@ -4099,7 +4107,9 @@ fn require_bounded_reference_mining(command: &str) -> Result<(), Box<dyn std::er
 
 fn require_pool_mining_profile() -> Result<(), Box<dyn std::error::Error>> {
     match COMPILED_NETWORK_PROFILE.proof {
-        ProofProfile::DevnetV2Reference | ProofProfile::ProductionV4 => Ok(()),
+        ProofProfile::DevnetV2Reference
+        | ProofProfile::ProductionV4
+        | ProofProfile::ProductionV4Direct => Ok(()),
         ProofProfile::ProductionV3 => Err(format!(
             "pool-serve is unavailable for {} ({}); no DevnetV2 fallback is permitted",
             COMPILED_NETWORK_PROFILE.short_name(),

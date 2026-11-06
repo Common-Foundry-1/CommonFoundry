@@ -32,6 +32,10 @@ pub const MAX_PROOF_BYTES: usize = 256 * 1024;
 pub const MAX_BLOCK_BYTES: usize = 1024 * 1024;
 pub const PRODUCTION_V4_MAX_PROOF_BYTES: usize = 13 * 1024 * 1024;
 pub const PRODUCTION_V4_MAX_BLOCK_BYTES: usize = 16 * 1024 * 1024;
+/// Complete proof frame for the compact testnet. The direct packet inside it
+/// has its own 6,000,000-byte cap.
+#[cfg(feature = "direct-proof-testnet")]
+pub const DIRECT_PROOF_TESTNET_MAX_PROOF_BYTES: usize = 6_100_000;
 
 /// SHA-256("CMFD/PRODUCTION-V4-TESTNET/V1/NETWORK-ID").
 pub const PRODUCTION_V4_TESTNET_NETWORK_ID: [u8; 32] = [
@@ -110,6 +114,10 @@ pub enum WireError {
 }
 
 pub fn max_proof_bytes_for_network(network_id: [u8; 32]) -> usize {
+    #[cfg(feature = "direct-proof-testnet")]
+    if network_id == crate::FORGEMATRIX_V4_DIRECT_TESTNET_NETWORK_ID {
+        return DIRECT_PROOF_TESTNET_MAX_PROOF_BYTES;
+    }
     if is_production_v4_network(network_id) {
         PRODUCTION_V4_MAX_PROOF_BYTES
     } else {
@@ -139,6 +147,16 @@ fn is_production_v4_network(network_id: [u8; 32]) -> bool {
         network_id,
         PRODUCTION_V4_TESTNET_NETWORK_ID | PRODUCTION_V4_RCNET1_NETWORK_ID
     ) || crate::mainnet_network::is_mainnet_network(network_id)
+        || {
+            #[cfg(feature = "direct-proof-testnet")]
+            {
+                network_id == crate::FORGEMATRIX_V4_DIRECT_TESTNET_NETWORK_ID
+            }
+            #[cfg(not(feature = "direct-proof-testnet"))]
+            {
+                false
+            }
+        }
 }
 
 /// Derives the four-byte frame discriminator from all 32 bytes of a network ID.

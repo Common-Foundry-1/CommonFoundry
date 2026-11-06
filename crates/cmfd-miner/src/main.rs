@@ -36,13 +36,13 @@ use cmfd_consensus::forgematrix_v4_proof::forgematrix_v4_mask_coefficients;
 use cmfd_consensus::forgematrix_v4_proof_codec::decode_forgematrix_v4_transparent_proof;
 #[cfg(feature = "production-v4")]
 use cmfd_consensus::{
-    BlockChallenge, Coinbase, FORGEMATRIX_V4_ALGORITHM_VERSION, FORGEMATRIX_V4_FIELD_MODULUS,
-    FORGEMATRIX_V4_FINAL_ACTIVATION_DIGEST_DOMAIN, FORGEMATRIX_V4_PROOF_VERSION,
-    FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES, ForgeMatrixV4CandidateProof,
+    BlockChallenge, Coinbase, FORGEMATRIX_V4_FIELD_MODULUS,
+    FORGEMATRIX_V4_FINAL_ACTIVATION_DIGEST_DOMAIN, FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES,
+    ForgeMatrixV4CandidateParameters, ForgeMatrixV4CandidateProof,
     ForgeMatrixV4FixedArtifactRecordV1, PRODUCTION_V2_LAYERS,
     PRODUCTION_V4_FIXED_ARTIFACT_RECORD_DIGEST, PRODUCTION_V4_MAX_BLOCK_BYTES,
     PRODUCTION_V4_MAX_PROOF_BYTES, Transaction, forgematrix_v4_challenge_digest,
-    forgematrix_v4_proof_system_digest, forgematrix_v4_work_digest,
+    forgematrix_v4_work_digest,
 };
 #[cfg(feature = "production-v3-testnet")]
 use cmfd_consensus::{
@@ -113,7 +113,7 @@ const DEFAULT_MINER_P2P_ADDRESS: SocketAddr = COMPILED_NETWORK_PROFILE.miner_p2p
 const DEFAULT_BATCH_SIZE: u32 = match COMPILED_NETWORK_PROFILE.proof {
     ProofProfile::DevnetV2Reference => 8_192,
     ProofProfile::ProductionV3 => 64,
-    ProofProfile::ProductionV4 => 1,
+    ProofProfile::ProductionV4 | ProofProfile::ProductionV4Direct => 1,
 };
 const MAX_BATCH_SIZE: u32 = 65_536;
 #[cfg(feature = "production-v3")]
@@ -1237,7 +1237,10 @@ fn scheduled_pool_search_work(start_nonce: u64) -> u64 {
 
 #[cfg(feature = "production-v4")]
 fn run_production_v4_pool_miner(options: ProductionV4PoolMinerOptions) -> Result<()> {
-    if COMPILED_NETWORK_PROFILE.proof != ProofProfile::ProductionV4 {
+    if !matches!(
+        COMPILED_NETWORK_PROFILE.proof,
+        ProofProfile::ProductionV4 | ProofProfile::ProductionV4Direct
+    ) {
         bail!("pool mining requires a ProductionV4 network build");
     }
     if options.stats_seconds == 0 {
@@ -2311,19 +2314,38 @@ fn submit_v4_template(
         bail!("ProductionV4 fixed artifact record is not the compiled testnet record");
     }
 
+    let parameters = ForgeMatrixV4CandidateParameters::for_network(template.challenge.network_id)?;
     let transparent_proof = read_bounded_file(
         transparent_proof_path,
         PRODUCTION_V4_MAX_PROOF_BYTES,
         "ProductionV4 transparent proof",
     )?;
-    let decoded = decode_forgematrix_v4_transparent_proof(&transparent_proof)?;
     let challenge_digest =
         forgematrix_v4_challenge_digest(&template.challenge, nonce, fixed_record.manifest_digest());
-    let final_activation_digest =
+    #[cfg(feature = "direct-proof-testnet")]
+    let direct =
+        template.challenge.network_id == cmfd_consensus::FORGEMATRIX_V4_DIRECT_TESTNET_NETWORK_ID;
+    #[cfg(not(feature = "direct-proof-testnet"))]
+    let direct = false;
+    let final_activation_digest = if direct {
+        #[cfg(feature = "direct-proof-testnet")]
+        {
+            cmfd_consensus::forgematrix_v4_direct::final_activation_digest_from_packet(
+                challenge_digest,
+                &transparent_proof,
+            )?
+        }
+        #[cfg(not(feature = "direct-proof-testnet"))]
+        {
+            unreachable!("direct proof network is not compiled")
+        }
+    } else {
+        let decoded = decode_forgematrix_v4_transparent_proof(&transparent_proof)?;
         cmfd_consensus::forgematrix_v4_proof::forgematrix_v4_final_activation_digest(
             challenge_digest,
             &decoded.final_activation,
-        );
+        )
+    };
     let work_digest = forgematrix_v4_work_digest(
         fixed_record.manifest_digest(),
         challenge_digest,
@@ -2333,10 +2355,10 @@ fn submit_v4_template(
         bail!("ProductionV4 proof does not meet the frozen template target");
     }
     let proof = BlockProof::V4Candidate(Box::new(ForgeMatrixV4CandidateProof {
-        algorithm_version: FORGEMATRIX_V4_ALGORITHM_VERSION,
-        proof_version: FORGEMATRIX_V4_PROOF_VERSION,
+        algorithm_version: parameters.algorithm_version(),
+        proof_version: parameters.proof_version(),
         nonce,
-        proof_system_digest: forgematrix_v4_proof_system_digest(),
+        proof_system_digest: parameters.proof_system_digest(),
         model_manifest_digest: fixed_record.manifest_digest(),
         challenge_digest,
         final_activation_digest,
@@ -2403,7 +2425,10 @@ fn submit_v4_template(
 
 #[cfg(feature = "production-v4")]
 fn ensure_production_v4_tool() -> Result<()> {
-    if COMPILED_NETWORK_PROFILE.proof != ProofProfile::ProductionV4 {
+    if !matches!(
+        COMPILED_NETWORK_PROFILE.proof,
+        ProofProfile::ProductionV4 | ProofProfile::ProductionV4Direct
+    ) {
         bail!("ProductionV4 template commands require a ProductionV4 network build");
     }
     Ok(())
@@ -2954,7 +2979,9 @@ const fn mining_runtime(profile: cmfd_node::NetworkProfile) -> MiningRuntime {
     match profile.proof {
         ProofProfile::DevnetV2Reference => MiningRuntime::DevnetV2,
         ProofProfile::ProductionV3 => MiningRuntime::ProductionV3,
-        ProofProfile::ProductionV4 => MiningRuntime::ProductionV4,
+        ProofProfile::ProductionV4 | ProofProfile::ProductionV4Direct => {
+            MiningRuntime::ProductionV4
+        }
     }
 }
 

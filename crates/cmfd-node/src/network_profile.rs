@@ -48,6 +48,7 @@ pub enum NetworkProfileKind {
     Devnet,
     ProductionV3Testnet,
     ProductionV4Testnet,
+    DirectProofTestnet,
     Rcnet,
     Mainnet,
 }
@@ -68,6 +69,7 @@ pub enum ProofProfile {
     DevnetV2Reference,
     ProductionV3,
     ProductionV4,
+    ProductionV4Direct,
 }
 
 impl NetworkProfile {
@@ -76,6 +78,7 @@ impl NetworkProfile {
             NetworkProfileKind::Devnet => "Devnet-0",
             NetworkProfileKind::ProductionV3Testnet => "ProductionV3 Testnet-1",
             NetworkProfileKind::ProductionV4Testnet => "ProductionV4 Testnet-1",
+            NetworkProfileKind::DirectProofTestnet => "Compact Proof Testnet-1",
             NetworkProfileKind::Rcnet => "RCNet-1",
             NetworkProfileKind::Mainnet => "Mainnet",
         }
@@ -90,6 +93,7 @@ impl NetworkProfile {
             NetworkProfileKind::ProductionV4Testnet => {
                 "Private ProductionV4 latency test network · Not RCNet or mainnet"
             }
+            NetworkProfileKind::DirectProofTestnet => "Compact proof testnet · Test coins only",
             NetworkProfileKind::Rcnet => "Release-candidate rehearsal network · Not mainnet",
             NetworkProfileKind::Mainnet => "Common Foundry mainnet",
         }
@@ -100,6 +104,9 @@ impl NetworkProfile {
             NetworkProfileKind::Devnet => "Community testing",
             NetworkProfileKind::ProductionV3Testnet => "ProductionV3 end-to-end testing",
             NetworkProfileKind::ProductionV4Testnet => "ProductionV4 latency and admission testing",
+            NetworkProfileKind::DirectProofTestnet => {
+                "Compact proof mining, pool, and sync testing"
+            }
             NetworkProfileKind::Rcnet => "Launch rehearsal",
             NetworkProfileKind::Mainnet => "Mainnet",
         }
@@ -117,6 +124,9 @@ impl NetworkProfile {
             }
             NetworkProfileKind::ProductionV4Testnet => {
                 "Common Foundry Wallet — ProductionV4 Testnet-1"
+            }
+            NetworkProfileKind::DirectProofTestnet => {
+                "Common Foundry Wallet — Compact Proof Testnet-1"
             }
             NetworkProfileKind::Rcnet => "Common Foundry Wallet — RCNet-1",
             NetworkProfileKind::Mainnet => "Common Foundry Wallet — Mainnet",
@@ -143,6 +153,12 @@ impl NetworkProfile {
             (NetworkProfileKind::ProductionV4Testnet, false) => {
                 "ProductionV4 Testnet-1 wallet: back up wallet.key before testing recovery. This is not RCNet or mainnet."
             }
+            (NetworkProfileKind::DirectProofTestnet, true) => {
+                "Compact Proof Testnet-1 uses a known development key. Create a fresh testnet wallet."
+            }
+            (NetworkProfileKind::DirectProofTestnet, false) => {
+                "Compact Proof Testnet-1 wallet: enjoy testing with dedicated test coins."
+            }
             (NetworkProfileKind::Rcnet, true) => {
                 "RCNet-1 wallet uses a known development key. Create a fresh RCNet wallet before testing."
             }
@@ -163,6 +179,7 @@ impl NetworkProfile {
             NetworkProfileKind::Devnet => "commonfoundry-miner-devnet0",
             NetworkProfileKind::ProductionV3Testnet => "commonfoundry-miner-production-v3-testnet1",
             NetworkProfileKind::ProductionV4Testnet => "commonfoundry-miner-production-v4-testnet1",
+            NetworkProfileKind::DirectProofTestnet => "commonfoundry-miner-compact-proof-testnet1",
             NetworkProfileKind::Rcnet => "commonfoundry-miner-rcnet1",
             NetworkProfileKind::Mainnet => "commonfoundry-miner-mainnet",
         }
@@ -183,6 +200,7 @@ impl NetworkProfile {
             ProofProfile::DevnetV2Reference => "ForgeMatrix-v2 tiny full-recompute reference",
             ProofProfile::ProductionV3 => "ForgeMatrix-v3 production Dory",
             ProofProfile::ProductionV4 => "ForgeMatrix-v4 transparent BaseFold",
+            ProofProfile::ProductionV4Direct => "ForgeMatrix-v4 six-commitment direct proof",
         }
     }
 
@@ -223,6 +241,7 @@ impl ProofProfile {
             Self::DevnetV2Reference => "DevnetV2",
             Self::ProductionV3 => "ProductionV3",
             Self::ProductionV4 => "ProductionV4",
+            Self::ProductionV4Direct => "ProductionV4Direct",
         }
     }
 
@@ -360,6 +379,35 @@ pub const PRODUCTION_V4_TESTNET_PROFILE: NetworkProfile = NetworkProfile {
     wallet_data_dir_identity: "production-v4-testnet-1",
 };
 
+/// Dedicated direct-proof network with separate genesis, ports, storage, and
+/// loopback-only bootstrap for the first two-node qualification.
+#[cfg(feature = "direct-proof-testnet")]
+pub const DIRECT_PROOF_TESTNET_PROFILE: NetworkProfile = NetworkProfile {
+    kind: NetworkProfileKind::DirectProofTestnet,
+    proof: ProofProfile::ProductionV4Direct,
+    name: "CommonFoundry Compact Proof Testnet-1",
+    network_id: [
+        0xdc, 0xda, 0x3e, 0x81, 0x88, 0x1e, 0x14, 0x8a, 0x45, 0x97, 0x0d, 0x2e, 0x71, 0x57, 0xb7,
+        0x7f, 0x27, 0xe9, 0x31, 0xe6, 0x96, 0xdf, 0x28, 0x46, 0x83, 0x90, 0xce, 0x79, 0xbb, 0x1e,
+        0x14, 0xcb,
+    ],
+    virtual_genesis_hash: [
+        0xe4, 0xd3, 0x60, 0xdf, 0xff, 0xd3, 0x68, 0xc8, 0x39, 0x92, 0xc7, 0x86, 0xa4, 0x84, 0x2e,
+        0xd2, 0x11, 0xaa, 0x20, 0x43, 0xcc, 0x6a, 0x1b, 0xc5, 0xad, 0x48, 0x79, 0x19, 0xa6, 0xf9,
+        0x37, 0x54,
+    ],
+    virtual_genesis_timestamp: 1_793_836_800,
+    initial_target: None,
+    pow_limit: [0xff; 32],
+    rewards: PRODUCTION_V4_TESTNET_PROFILE.rewards,
+    rpc_port: 23_443,
+    p2p_port: 23_444,
+    pool_port: 23_445,
+    bootstrap_ipv4: Ipv4Addr::LOCALHOST,
+    default_data_dir_identity: "commonfoundry-direct-proof-testnet1",
+    wallet_data_dir_identity: "direct-proof-testnet-1",
+};
+
 /// Isolated rehearsal identity for the first launch-candidate network.
 ///
 /// RCNet-1 is not mainnet. Its immutable identity was derived from the
@@ -452,6 +500,10 @@ pub const COMPILED_NETWORK_PROFILE: NetworkProfile = match (
     }
     (CompiledNetworkProfile::ProductionV4Testnet, ConsensusProofSelection::ProductionV4) => {
         PRODUCTION_V4_TESTNET_PROFILE
+    }
+    #[cfg(feature = "direct-proof-testnet")]
+    (CompiledNetworkProfile::DirectProofTestnet, ConsensusProofSelection::ProductionV4Direct) => {
+        DIRECT_PROOF_TESTNET_PROFILE
     }
     (CompiledNetworkProfile::Rcnet, ConsensusProofSelection::ProductionV4) => RCNET1_PROFILE,
     (CompiledNetworkProfile::Mainnet, ConsensusProofSelection::ProductionV4) => {
@@ -608,6 +660,7 @@ mod tests {
         #[cfg(not(any(
             feature = "production-v3-testnet",
             feature = "production-v4-testnet",
+            feature = "direct-proof-testnet",
             feature = "production-rc",
             feature = "production-mainnet"
         )))]
@@ -630,6 +683,18 @@ mod tests {
             assert_eq!(
                 COMPILED_NETWORK_PROFILE.network_id,
                 cmfd_consensus::PRODUCTION_V4_TESTNET_NETWORK_ID
+            );
+        }
+        #[cfg(feature = "direct-proof-testnet")]
+        {
+            assert_eq!(COMPILED_NETWORK_PROFILE, DIRECT_PROOF_TESTNET_PROFILE);
+            assert_eq!(
+                COMPILED_NETWORK_PROFILE.proof,
+                ProofProfile::ProductionV4Direct
+            );
+            assert_eq!(
+                COMPILED_NETWORK_PROFILE.network_id,
+                cmfd_consensus::FORGEMATRIX_V4_DIRECT_TESTNET_NETWORK_ID
             );
         }
         #[cfg(feature = "production-rc")]
@@ -674,5 +739,33 @@ mod tests {
         assert_eq!(testnet.miner_p2p_address().to_string(), "127.0.0.1:23444");
         assert!(k256::schnorr::VerifyingKey::from_bytes(&testnet.rewards.steward).is_ok());
         assert!(k256::schnorr::VerifyingKey::from_bytes(&testnet.rewards.community).is_ok());
+    }
+
+    #[cfg(feature = "direct-proof-testnet")]
+    #[test]
+    fn direct_proof_testnet_is_isolated_from_existing_networks() {
+        let direct = DIRECT_PROOF_TESTNET_PROFILE;
+        for other in [
+            DEVNET_PROFILE,
+            PRODUCTION_V3_TESTNET_PROFILE,
+            PRODUCTION_V4_TESTNET_PROFILE,
+            RCNET1_PROFILE,
+        ] {
+            assert_ne!(direct.network_id, other.network_id);
+            assert_ne!(direct.virtual_genesis_hash, other.virtual_genesis_hash);
+            assert_ne!(direct.rpc_port, other.rpc_port);
+            assert_ne!(direct.p2p_port, other.p2p_port);
+            assert_ne!(direct.pool_port, other.pool_port);
+            assert_ne!(
+                direct.default_data_dir_identity,
+                other.default_data_dir_identity
+            );
+            assert_ne!(
+                direct.wallet_data_dir_identity,
+                other.wallet_data_dir_identity
+            );
+        }
+        assert_eq!(direct.proof, ProofProfile::ProductionV4Direct);
+        assert_eq!(direct.bootstrap_peer().to_string(), "127.0.0.1:23444");
     }
 }

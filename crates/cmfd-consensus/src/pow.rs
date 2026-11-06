@@ -339,12 +339,27 @@ pub struct ForgeMatrixV4CandidateParameters {
 
 #[cfg(feature = "forgematrix-v4-verifier")]
 impl ForgeMatrixV4CandidateParameters {
+    fn proof_identity_for_network(network_id: [u8; 32]) -> (u32, [u8; 32]) {
+        #[cfg(feature = "direct-proof-testnet")]
+        if network_id == crate::FORGEMATRIX_V4_DIRECT_TESTNET_NETWORK_ID {
+            return (
+                crate::FORGEMATRIX_V4_DIRECT_PROOF_VERSION,
+                crate::forgematrix_v4_direct_proof_system_digest(),
+            );
+        }
+        (
+            FORGEMATRIX_V4_PROOF_VERSION,
+            forgematrix_v4_proof_system_digest(),
+        )
+    }
+
     pub fn for_network(network_id: [u8; 32]) -> Result<Self, PowError> {
+        let (proof_version, proof_system_digest) = Self::proof_identity_for_network(network_id);
         let parameters = Self {
             network_id,
             algorithm_version: FORGEMATRIX_V4_ALGORITHM_VERSION,
-            proof_version: FORGEMATRIX_V4_PROOF_VERSION,
-            proof_system_digest: forgematrix_v4_proof_system_digest(),
+            proof_version,
+            proof_system_digest,
             model_manifest_digest: crate::forgematrix_v4::PRODUCTION_V4_MODEL_MANIFEST_DIGEST,
             fixed_artifact_record_digest:
                 crate::forgematrix_v4::PRODUCTION_V4_FIXED_ARTIFACT_RECORD_DIGEST,
@@ -375,10 +390,11 @@ impl ForgeMatrixV4CandidateParameters {
         if self.network_id != network_id {
             return Err(ForgeMatrixV4ConsensusError::WrongNetwork.into());
         }
+        let (expected_version, expected_digest) = Self::proof_identity_for_network(network_id);
         if network_id == [0; 32]
             || self.algorithm_version != FORGEMATRIX_V4_ALGORITHM_VERSION
-            || self.proof_version != FORGEMATRIX_V4_PROOF_VERSION
-            || self.proof_system_digest != forgematrix_v4_proof_system_digest()
+            || self.proof_version != expected_version
+            || self.proof_system_digest != expected_digest
             || self.model_manifest_digest == [0; 32]
             || self.fixed_artifact_record_digest == [0; 32]
         {
@@ -506,6 +522,9 @@ pub enum ForgeMatrixV4ConsensusError {
     Codec(#[from] ForgeMatrixV4TransparentCodecError),
     #[error("ProductionV4 proof verification failed: {0}")]
     Proof(#[from] ForgeMatrixV4ProofError),
+    #[cfg(feature = "direct-proof-testnet")]
+    #[error("direct testnet proof verification failed: {0}")]
+    DirectProof(anyhow::Error),
 }
 
 impl ExternalPreverificationBinding {
@@ -662,7 +681,22 @@ impl ForgeMatrixV4ConsensusVerifier {
         {
             return Err(ForgeMatrixV4ConsensusError::ParameterMismatch);
         }
-        if proof.transparent_proof.len() != FORGEMATRIX_V4_TRANSPARENT_PROOF_BYTES {
+        #[cfg(feature = "direct-proof-testnet")]
+        let direct = block.network_id == crate::FORGEMATRIX_V4_DIRECT_TESTNET_NETWORK_ID;
+        #[cfg(not(feature = "direct-proof-testnet"))]
+        let direct = false;
+        let proof_len = proof.transparent_proof.len();
+        #[cfg(feature = "direct-proof-testnet")]
+        let direct_size_ok = (crate::forgematrix_v4_direct::HEADER_BYTES
+            + crate::forgematrix_v4_direct::PUBLIC_BYTES
+            + crate::forgematrix_v4_direct::REDUCTION_BYTES
+            ..crate::forgematrix_v4_direct::MAX_WIRE_BYTES)
+            .contains(&proof_len);
+        #[cfg(not(feature = "direct-proof-testnet"))]
+        let direct_size_ok = false;
+        if (direct && !direct_size_ok)
+            || (!direct && proof_len != FORGEMATRIX_V4_TRANSPARENT_PROOF_BYTES)
+        {
             return Err(ForgeMatrixV4ConsensusError::ProofSize);
         }
         let challenge =
@@ -691,7 +725,6 @@ impl ForgeMatrixV4ConsensusVerifier {
         enforce_target: bool,
     ) -> Result<(), ForgeMatrixV4ConsensusError> {
         self.preflight(block, proof, enforce_target)?;
-        let transparent = decode_forgematrix_v4_transparent_proof(&proof.transparent_proof)?;
         let statement = ForgeMatrixV4TranscriptStatement {
             block: *block,
             algorithm_version: proof.algorithm_version,
@@ -703,6 +736,17 @@ impl ForgeMatrixV4ConsensusVerifier {
             final_activation_digest: proof.final_activation_digest,
             work_digest: proof.work_digest,
         };
+        #[cfg(feature = "direct-proof-testnet")]
+        if block.network_id == crate::FORGEMATRIX_V4_DIRECT_TESTNET_NETWORK_ID {
+            return crate::forgematrix_v4_direct::verify_wire(
+                statement,
+                self.fixed_commitments,
+                &self.base_input,
+                &proof.transparent_proof,
+            )
+            .map_err(ForgeMatrixV4ConsensusError::DirectProof);
+        }
+        let transparent = decode_forgematrix_v4_transparent_proof(&proof.transparent_proof)?;
         verify_forgematrix_v4_transparent_proof(
             statement,
             self.fixed_commitments,
@@ -2141,6 +2185,76 @@ mod tests {
                 false
             ),
             Err(ForgeMatrixV4ConsensusError::WrongNetwork)
+        ));
+    }
+
+    #[cfg(feature = "direct-proof-testnet")]
+    #[test]
+    fn direct_testnet_selects_only_its_versioned_proof_identity() {
+        let direct = ForgeMatrixV4CandidateParameters::for_network(
+            crate::FORGEMATRIX_V4_DIRECT_TESTNET_NETWORK_ID,
+        )
+        .unwrap();
+        let original = ForgeMatrixV4CandidateParameters::production_testnet();
+        assert_eq!(
+            direct.proof_version(),
+            crate::FORGEMATRIX_V4_DIRECT_PROOF_VERSION
+        );
+        assert_eq!(
+            direct.proof_system_digest(),
+            crate::forgematrix_v4_direct_proof_system_digest()
+        );
+        assert_eq!(original.proof_version(), FORGEMATRIX_V4_PROOF_VERSION);
+        assert_ne!(direct.proof_system_digest(), original.proof_system_digest());
+        assert_eq!(
+            crate::wire::max_block_bytes_for_network(direct.network_id()),
+            crate::PRODUCTION_V4_MAX_BLOCK_BYTES
+        );
+        assert_eq!(
+            crate::wire::max_proof_bytes_for_network(direct.network_id()),
+            crate::wire::DIRECT_PROOF_TESTNET_MAX_PROOF_BYTES
+        );
+        assert!(matches!(
+            direct.validate_for_network(original.network_id()),
+            Err(PowError::V4(ForgeMatrixV4ConsensusError::WrongNetwork))
+        ));
+        let verifier = ForgeMatrixV4ConsensusVerifier {
+            parameters: direct,
+            fixed_commitments: Default::default(),
+            base_input: Arc::from([]),
+        };
+        let challenge = block(direct.network_id());
+        let nonce = 7;
+        let challenge_digest = crate::forgematrix_v4_challenge_digest(
+            &challenge,
+            nonce,
+            direct.model_manifest_digest(),
+        );
+        let final_activation_digest = [2; 32];
+        let work_digest = crate::forgematrix_v4_work_digest(
+            direct.model_manifest_digest(),
+            challenge_digest,
+            final_activation_digest,
+        );
+        let mut candidate = ForgeMatrixV4CandidateProof {
+            algorithm_version: direct.algorithm_version(),
+            proof_version: direct.proof_version(),
+            nonce,
+            proof_system_digest: direct.proof_system_digest(),
+            model_manifest_digest: direct.model_manifest_digest(),
+            challenge_digest,
+            final_activation_digest,
+            work_digest,
+            transparent_proof: Vec::new(),
+        };
+        assert!(matches!(
+            verifier.preflight(&challenge, &candidate, false),
+            Err(ForgeMatrixV4ConsensusError::ProofSize)
+        ));
+        candidate.proof_version = FORGEMATRIX_V4_PROOF_VERSION;
+        assert!(matches!(
+            verifier.preflight(&challenge, &candidate, false),
+            Err(ForgeMatrixV4ConsensusError::ParameterMismatch)
         ));
     }
 

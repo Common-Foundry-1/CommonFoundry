@@ -985,6 +985,7 @@ dependencies = [
  "k256",
  "libc",
  "matrixmultiply",
+ "miniz_oxide",
  "p3-air",
  "p3-batch-stark",
  "p3-blake3",

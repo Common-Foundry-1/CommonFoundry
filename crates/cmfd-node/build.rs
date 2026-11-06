@@ -15,6 +15,7 @@ fn main() {
         "CARGO_FEATURE_PRODUCTION_MAINNET",
         "CARGO_FEATURE_PRODUCTION_V3_TESTNET",
         "CARGO_FEATURE_PRODUCTION_V4_TESTNET",
+        "CARGO_FEATURE_DIRECT_PROOF_TESTNET",
         "CARGO_FEATURE_WORK_RULE_TEST_SUPPORT",
         "CMFD_BUILD_SOURCE_COMMIT",
     ] {
@@ -34,6 +35,7 @@ fn main() {
         env::var_os("CARGO_FEATURE_PRODUCTION_MAINNET").is_some(),
         env::var_os("CARGO_FEATURE_PRODUCTION_V3_TESTNET").is_some(),
         env::var_os("CARGO_FEATURE_PRODUCTION_V4_TESTNET").is_some(),
+        env::var_os("CARGO_FEATURE_DIRECT_PROOF_TESTNET").is_some(),
     ]
     .into_iter()
     .filter(|selected| *selected)

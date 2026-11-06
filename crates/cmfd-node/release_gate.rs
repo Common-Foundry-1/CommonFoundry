@@ -10,6 +10,7 @@ pub enum CompiledNetworkProfile {
         any(
             feature = "production-v3-testnet",
             feature = "production-v4-testnet",
+            feature = "direct-proof-testnet",
             feature = "production-rc",
             feature = "production-mainnet"
         ),
@@ -20,6 +21,8 @@ pub enum CompiledNetworkProfile {
     ProductionV3Testnet,
     #[cfg_attr(not(feature = "production-v4-testnet"), allow(dead_code))]
     ProductionV4Testnet,
+    #[cfg(feature = "direct-proof-testnet")]
+    DirectProofTestnet,
     Rcnet,
     #[allow(dead_code)]
     Mainnet,
@@ -31,6 +34,7 @@ pub enum ConsensusProofSelection {
         any(
             feature = "production-v3-testnet",
             feature = "production-v4-testnet",
+            feature = "direct-proof-testnet",
             feature = "production-rc",
             feature = "production-mainnet"
         ),
@@ -39,6 +43,8 @@ pub enum ConsensusProofSelection {
     DevnetV2Reference,
     ProductionV3,
     ProductionV4,
+    #[cfg(feature = "direct-proof-testnet")]
+    ProductionV4Direct,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -345,6 +351,20 @@ pub const COMPILED_RELEASE_PROFILE: CompiledReleaseProfile = CompiledReleaseProf
     production_network_identity: None,
 };
 
+/// A fresh testnet identity for the six-commitment direct proof. The compiled
+/// mainnet and RC release profiles retain their existing proof selection.
+#[cfg(feature = "direct-proof-testnet")]
+pub const COMPILED_RELEASE_PROFILE: CompiledReleaseProfile = CompiledReleaseProfile {
+    network: CompiledNetworkProfile::DirectProofTestnet,
+    proof: ConsensusProofSelection::ProductionV4Direct,
+    activation: None,
+    production_v3_artifacts: None,
+    production_v3_verifier_workers: None,
+    production_v4_activation: None,
+    production_v4_artifacts: Some(PRODUCTION_V4_ARTIFACT_PINS),
+    production_network_identity: None,
+};
+
 #[cfg(feature = "production-rc")]
 pub const PRODUCTION_RC_NETWORK_IDENTITY: ProductionRcNetworkIdentityPin =
     ProductionRcNetworkIdentityPin {
@@ -424,6 +444,7 @@ pub const COMPILED_RELEASE_PROFILE: CompiledReleaseProfile = CompiledReleaseProf
 #[cfg(not(any(
     feature = "production-v3-testnet",
     feature = "production-v4-testnet",
+    feature = "direct-proof-testnet",
     feature = "production-rc",
     feature = "production-mainnet"
 )))]

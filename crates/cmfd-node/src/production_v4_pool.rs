@@ -18,11 +18,10 @@ use std::time::{Duration, Instant};
 use cmfd_consensus::forgematrix_v4_proof::forgematrix_v4_final_activation_digest;
 use cmfd_consensus::forgematrix_v4_proof_codec::decode_forgematrix_v4_transparent_proof;
 use cmfd_consensus::{
-    BlockProof, FORGEMATRIX_V4_ALGORITHM_VERSION, FORGEMATRIX_V4_PROOF_VERSION,
-    FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES, ForgeMatrixV4CandidateProof,
-    PRODUCTION_V2_LAYERS, PRODUCTION_V4_MAX_PROOF_BYTES, PRODUCTION_V4_MODEL_MANIFEST_DIGEST,
-    forgematrix_v4_challenge_digest, forgematrix_v4_final_activation_digest_from_le_bytes,
-    forgematrix_v4_proof_system_digest, forgematrix_v4_replay_coefficients,
+    BlockProof, FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES, ForgeMatrixV4CandidateParameters,
+    ForgeMatrixV4CandidateProof, PRODUCTION_V2_LAYERS, PRODUCTION_V4_MAX_PROOF_BYTES,
+    PRODUCTION_V4_MODEL_MANIFEST_DIGEST, forgematrix_v4_challenge_digest,
+    forgematrix_v4_final_activation_digest_from_le_bytes, forgematrix_v4_replay_coefficients,
     forgematrix_v4_work_digest,
 };
 use serde::Serialize;
@@ -848,20 +847,66 @@ impl ProductionV4PersistentPoolVerifier {
         )?;
         let proof_seconds = proof_started.elapsed().as_secs_f64();
         let transparent_proof = read_bounded_file(&proof_path, PRODUCTION_V4_MAX_PROOF_BYTES)?;
-        let decoded =
-            decode_forgematrix_v4_transparent_proof(&transparent_proof).map_err(replay_error)?;
-        if forgematrix_v4_final_activation_digest(challenge_digest, &decoded.final_activation)
-            != final_activation_digest
-        {
+        let parameters = ForgeMatrixV4CandidateParameters::for_network(self.expected_network_id)
+            .map_err(replay_error)?;
+        #[cfg(feature = "direct-proof-testnet")]
+        let direct =
+            self.expected_network_id == cmfd_consensus::FORGEMATRIX_V4_DIRECT_TESTNET_NETWORK_ID;
+        #[cfg(not(feature = "direct-proof-testnet"))]
+        let direct = false;
+        #[cfg(feature = "direct-proof-testnet")]
+        let decoded_direct = if direct {
+            let statement =
+                cmfd_consensus::forgematrix_v4_basefold::ForgeMatrixV4TranscriptStatement {
+                    block: template.challenge,
+                    algorithm_version: parameters.algorithm_version(),
+                    proof_version: parameters.proof_version(),
+                    nonce,
+                    proof_system_digest: parameters.proof_system_digest(),
+                    model_manifest_digest: PRODUCTION_V4_MODEL_MANIFEST_DIGEST,
+                    challenge_digest,
+                    final_activation_digest,
+                    work_digest,
+                };
+            Some(
+                cmfd_consensus::forgematrix_v4_direct::decode(&transparent_proof, statement)
+                    .map_err(replay_error)?,
+            )
+        } else {
+            None
+        };
+        let final_activation_matches = if direct {
+            #[cfg(feature = "direct-proof-testnet")]
+            {
+                let packet = decoded_direct
+                    .as_ref()
+                    .expect("direct packet was decoded above");
+                forgematrix_v4_final_activation_digest(
+                    challenge_digest,
+                    &packet.public.final_activation,
+                ) == final_activation_digest
+            }
+            #[cfg(not(feature = "direct-proof-testnet"))]
+            {
+                unreachable!("direct proof network is not compiled")
+            }
+        } else {
+            // The old codec remains the only path for existing networks.
+            let decoded = decode_forgematrix_v4_transparent_proof(&transparent_proof)
+                .map_err(replay_error)?;
+            forgematrix_v4_final_activation_digest(challenge_digest, &decoded.final_activation)
+                == final_activation_digest
+        };
+        if !final_activation_matches {
             return Err(pool_replay_failure(
                 "proof final activation does not match the replay",
             ));
         }
         let proof = BlockProof::V4Candidate(Box::new(ForgeMatrixV4CandidateProof {
-            algorithm_version: FORGEMATRIX_V4_ALGORITHM_VERSION,
-            proof_version: FORGEMATRIX_V4_PROOF_VERSION,
+            algorithm_version: parameters.algorithm_version(),
+            proof_version: parameters.proof_version(),
             nonce,
-            proof_system_digest: forgematrix_v4_proof_system_digest(),
+            proof_system_digest: parameters.proof_system_digest(),
             model_manifest_digest: PRODUCTION_V4_MODEL_MANIFEST_DIGEST,
             challenge_digest,
             final_activation_digest,

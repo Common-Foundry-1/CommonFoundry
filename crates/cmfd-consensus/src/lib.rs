@@ -107,6 +107,8 @@ pub mod forgematrix_v4;
 pub mod forgematrix_v4_basefold;
 #[cfg(feature = "forgematrix-v4-verifier")]
 pub mod forgematrix_v4_basefold_codec;
+#[cfg(feature = "direct-proof-testnet")]
+pub mod forgematrix_v4_direct;
 #[cfg(feature = "forgematrix-v4-executor")]
 pub mod forgematrix_v4_execution;
 #[cfg(feature = "forgematrix-v4-verifier")]
@@ -204,6 +206,11 @@ pub use forgematrix_v4::{
     PRODUCTION_V4_FIXED_ARTIFACT_RECORD_DIGEST, PRODUCTION_V4_MODEL_MANIFEST_DIGEST,
     forgematrix_v4_challenge_digest, forgematrix_v4_dynamic_index,
     forgematrix_v4_proof_system_digest, forgematrix_v4_weight_index, forgematrix_v4_work_digest,
+};
+#[cfg(feature = "direct-proof-testnet")]
+pub use forgematrix_v4::{
+    FORGEMATRIX_V4_DIRECT_PROOF_VERSION, FORGEMATRIX_V4_DIRECT_TESTNET_NETWORK_ID,
+    forgematrix_v4_direct_proof_system_digest,
 };
 #[cfg(feature = "forgematrix-v4-executor")]
 pub use forgematrix_v4_execution::{

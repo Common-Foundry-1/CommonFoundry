@@ -1,6 +1,6 @@
 # Compact Proof Testnet-1 public canary
 
-This is a fresh network for pool operators, GPU miners, and independent node testers. It follows the successful three-block local pilot and activates independent ForgeMatrix work replay from genesis alongside the complete compact proof verifier.
+This network lets pool operators, GPU miners and independent node testers exercise the complete compact proof verifier. Ordinary nodes use proof-only validation; the dedicated seed also replays ForgeMatrix work as an independent audit.
 
 | Setting | Public canary |
 | --- | --- |
@@ -20,4 +20,4 @@ This is a fresh network for pool operators, GPU miners, and independent node tes
 
 The Linux package includes the reference pool/node, miner, replay worker, compact prover, verified input downloader, address helper, and diagnostics collector. The pool and miner use Common Foundry's pinned TLS pool protocol. The packaged README contains exact launch commands and hardware/input requirements.
 
-This public network has a separate identity from the loopback pilot recorded in LOCAL-PILOT-RESULTS.md. Its initial difficulty and share target support real mining trials. Testnet v0.2.0 keeps the same network identity and proof format as v0.1.0; node operators can update without resetting their testnet chain. The proof-only policy applies to ordinary nodes, while the seed continues its independent audit replay. Test coins have no monetary value.
+This public network has a separate identity from the loopback pilot recorded in LOCAL-PILOT-RESULTS.md. Its initial difficulty and share target support real mining trials. Testnet v0.3.0 keeps the network identity, genesis and proof format of v0.1/v0.2; operators can upgrade with their existing chain and inputs. The latest local pool path averaged 5.74 seconds with 5.65–5.69 MB proofs. The proof-only policy applies to ordinary nodes, while the seed continues its independent audit replay. Test coins have no monetary value.

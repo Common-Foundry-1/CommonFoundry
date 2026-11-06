@@ -26,7 +26,16 @@ def main():
     p.add_argument("--source-commit", required=True)
     p.add_argument("--source-dirty", action="store_true")
     p.add_argument("--kit-version", default="0.2.0")
+    p.add_argument("--qualification-report", type=Path)
     args = p.parse_args()
+    qualification = None
+    if args.qualification_report is not None:
+        qualification = json.loads(args.qualification_report.read_text())
+        if qualification.get("schema") != "CMFD_COMPACT_TESTNET_QUALIFICATION_V1" or qualification.get("network_id") != NETWORK:
+            raise ValueError("qualification report has the wrong schema or network")
+        for worker in ("cmfd-v4-replay", "cmfd-direct-prover"):
+            if qualification.get("proof_workers", {}).get(worker) != digest(args.artifacts / worker):
+                raise ValueError(f"qualification does not match the packaged worker: {worker}")
     output = args.output.resolve()
     kit_name = f"commonfoundry-compact-testnet-v{args.kit_version}-linux-x86_64"
     stage = output / kit_name
@@ -34,6 +43,9 @@ def main():
     for name in ("cmfd-node", "cmfd-miner", "cmfd-v4-replay", "cmfd-direct-prover"):
         shutil.copy2(args.artifacts / name, stage / name)
         (stage / name).chmod(0o755)
+        if qualification is not None and name in qualification["proof_workers"]:
+            if digest(stage / name) != qualification["proof_workers"][name]:
+                raise ValueError(f"copied qualification worker differs: {name}")
     shutil.copy2(ROOT / "packaging/compact-proof-testnet/launch.py", stage / "launch.py")
     shutil.copy2(ROOT / "scripts/production-v4-inputs.py", stage / "production-v4-inputs.py")
     for path in (ROOT / "packaging/production-v4-pool/shared").iterdir():
@@ -62,9 +74,14 @@ def main():
         "initial_target": "01" + "ff" * 31,
         "roles": ["reference pool", "GPU pool miner", "CPU full node"],
         "gpu_architectures": ["sm_86", "sm_89", "sm_120"],
-        "platform": "Linux x86_64, glibc 2.35+, CUDA 12 runtime for GPU roles",
-        "proof_bytes_local_pilot": [5667661, 5662826, 5665867],
-        "local_pilot_full_acceptance_seconds": 16.75}
+        "platform": "Linux x86_64, glibc 2.35+, CUDA 12 runtime for GPU roles"}
+    if qualification is not None:
+        shutil.copy2(args.qualification_report, stage / "PROOF-QUALIFICATION.json")
+        build["qualification_report"] = {
+            "path": "PROOF-QUALIFICATION.json",
+            "sha256": digest(args.qualification_report),
+            "benchmark": qualification["benchmark"],
+        }
     (stage / "BUILD-INFO.json").write_text(json.dumps(build, indent=2) + "\n")
     files = {str(path.relative_to(stage)).replace("\\", "/"): {"bytes": path.stat().st_size, "sha256": digest(path)}
         for path in sorted(stage.rglob("*")) if path.is_file()}

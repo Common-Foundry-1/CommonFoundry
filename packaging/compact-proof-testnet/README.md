@@ -1,4 +1,4 @@
-# Common Foundry Compact Proof Testnet — pool canary v0.2.0
+# Common Foundry Compact Proof Testnet — pool canary v0.3.0
 
 Welcome! This canary lets pools and miners exercise the new self-contained block proof, around 5.7 MB in our first public block. It keeps the ForgeMatrix workload and the existing field, hash, and BaseFold parameters. Ordinary nodes verify the complete proof without rerunning the miner's matrix computation. The public seed at `209.145.48.36:23444` also replays work as an optional audit comparison.
 
@@ -83,4 +83,6 @@ Node verification runs on the CPU; it needs no GPU or CUDA runtime. Restart it, 
 
 Please share your GPU, driver, RAM, miner/pool versions, accepted and rejected shares, block counts, full winning-share-to-block time, peak VRAM, propagation/catch-up observations, and relevant log excerpts. The diagnostics collector includes build identity, node status, and GPU telemetry; it does not collect wallet keys or TLS private keys. Pool logs print proof-stage timings and packet sizes.
 
-The initial public target is seven leading zero bits and adjusts with the chain's 60-second target spacing. Pool shares default to four leading zero bits. This is a fresh testnet with dedicated data and test coins of no monetary value. The proof-only and audit nodes use the same network identity and packet rules. Our first optimized local pool run took 16.75 seconds through complete block acceptance; improving that full path is one of the canary's measurements.
+The initial public target is seven leading zero bits and adjusts with the chain's 60-second target spacing. Pool shares default to four leading zero bits. The proof-only and audit nodes use the same network identity and packet rules. Existing v0.1/v0.2 testnet data and inputs carry forward into v0.3.0.
+
+The latest tested RAM/serial profile averaged **5.74 seconds** through complete local acceptance on an RTX 5090 (7001 MHz memory, 520 W), with three blocks at 5.88, 5.68 and 5.66 seconds. Proofs measured **5.65–5.69 MB**, and the incremental GPU workload peaked at **12.72 GiB** under its 13 GiB guard. This is the latest 32 GiB-card measurement; please include your hardware and peak memory in reports. The included qualification record identifies the exact measured GPU workers and timing scope.

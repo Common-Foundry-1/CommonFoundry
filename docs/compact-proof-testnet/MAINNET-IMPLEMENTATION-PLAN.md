@@ -64,9 +64,11 @@ and cannot make ordinary nodes depend on that work engine.
   direct-proof soundness accounting. Publish the exact reviewed source,
   binaries, hashes, H and rollback procedure together.
 
-Current testnet evidence: three fresh local GPU-proven blocks, one public
-GPU-proven block, two independent local nodes, public audit seed, live
-proof-only admission/restart, 48 coordinated attack rejections, 6,528
-evaluation-limb binding checks, and Linux/Windows package qualification.
+Current testnet evidence: a GPU-proven chain through height 19, independent
+CPU-only node catch-up, a public audit seed, live proof-only admission/restart,
+48 coordinated attack rejections, 6,528 evaluation-limb binding checks,
+and Linux/Windows package qualification. The latest full local pool/node
+acceptance averaged 5.74 seconds with 5.65–5.69 MB proofs; the sampled workload
+peaked at 12.72 GiB under its 13 GiB guard on the RTX 5090 test card.
 Those tests establish the testnet path; the height-H mainnet implementation
 and its cross-height tests remain the next engineering milestone.

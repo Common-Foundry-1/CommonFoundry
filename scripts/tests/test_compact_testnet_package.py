@@ -1,6 +1,7 @@
 import argparse
 from contextlib import ExitStack
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,42 @@ spec.loader.exec_module(launcher)
 
 
 class CompactPackageTests(unittest.TestCase):
+    def test_qualification_is_bound_to_the_worker_bytes_and_bundled(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            artifacts = root / "artifacts"
+            artifacts.mkdir()
+            for name in ("cmfd-node", "cmfd-miner", "cmfd-v4-replay", "cmfd-direct-prover"):
+                (artifacts / name).write_bytes(name.encode())
+            qualification = {
+                "schema": "CMFD_COMPACT_TESTNET_QUALIFICATION_V1",
+                "network_id": launcher.NETWORK,
+                "proof_workers": {name: hashlib.sha256((artifacts / name).read_bytes()).hexdigest()
+                    for name in ("cmfd-v4-replay", "cmfd-direct-prover")},
+                "benchmark": {"mean_full_local_acceptance_seconds": 5.742},
+            }
+            report = root / "qualification.json"
+            script = SOURCE.parents[2] / "scripts/package-compact-testnet.py"
+            command = [sys.executable, str(script), "--artifacts", str(artifacts),
+                "--source-commit", "a" * 40, "--kit-version", "0.3.0",
+                "--qualification-report", str(report)]
+            for label, changed in (
+                    ("network", {**qualification, "network_id": "00" * 32}),
+                    ("worker", {**qualification, "proof_workers": {"cmfd-v4-replay": "00" * 32}})):
+                report.write_text(json.dumps(changed))
+                output = root / label
+                rejected = subprocess.run(command + ["--output", str(output)], capture_output=True, text=True)
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertFalse(output.exists())
+            report.write_text(json.dumps(qualification))
+            output = root / "qualified"
+            subprocess.run(command + ["--output", str(output)], check=True, capture_output=True)
+            stage = output / "commonfoundry-compact-testnet-v0.3.0-linux-x86_64"
+            self.assertEqual(json.loads((stage / "PROOF-QUALIFICATION.json").read_text()), qualification)
+            build = json.loads((stage / "BUILD-INFO.json").read_text())
+            self.assertEqual(build["qualification_report"]["benchmark"], qualification["benchmark"])
+            self.assertNotIn("local_pilot_full_acceptance_seconds", build)
+
     def test_archive_keeps_the_kit_version_after_copying_binary_files(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)

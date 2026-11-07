@@ -864,6 +864,26 @@ pub struct PeerDiscovery {
     state: Mutex<PeerDiscoveryState>,
 }
 
+/// A wildcard listener also owns its same-family loopback address. TCP
+/// relays can make every remote peer appear to arrive from that address.
+fn is_self_listener_address(address: SocketAddr, listen_address: SocketAddr) -> bool {
+    if address == listen_address {
+        return true;
+    }
+    if address.port() != listen_address.port() {
+        return false;
+    }
+    match (listen_address.ip(), address.ip()) {
+        (IpAddr::V4(listen), IpAddr::V4(candidate)) => {
+            listen.is_unspecified() && candidate.is_loopback()
+        }
+        (IpAddr::V6(listen), IpAddr::V6(candidate)) => {
+            listen.is_unspecified() && candidate.is_loopback()
+        }
+        _ => false,
+    }
+}
+
 impl PeerDiscovery {
     pub fn open(
         data_dir: &Path,
@@ -910,7 +930,7 @@ impl PeerDiscovery {
 
     fn add_candidate(&self, address: SocketAddr) -> Result<(), P2pError> {
         validate_peer_address(address, self.address_policy)?;
-        if address == self.listen_address {
+        if is_self_listener_address(address, self.listen_address) {
             return Ok(());
         }
         let mut state = self
@@ -982,7 +1002,7 @@ impl PeerDiscovery {
 
     fn mark_verified(&self, address: SocketAddr) -> Result<(), P2pError> {
         validate_peer_address(address, self.address_policy)?;
-        if address == self.listen_address {
+        if is_self_listener_address(address, self.listen_address) {
             return Ok(());
         }
         let verified_addresses = {
@@ -1157,7 +1177,7 @@ fn load_peer_cache(
         })?;
         validate_peer_address(address, address_policy)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        if address != listen_address && !addresses.contains(&address) {
+        if !is_self_listener_address(address, listen_address) && !addresses.contains(&address) {
             addresses.push(address);
         }
         if addresses.len() >= MAX_DISCOVERED_PEERS {
@@ -5573,6 +5593,47 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        drop(discovery);
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn wildcard_listener_does_not_discover_itself_through_a_loopback_relay() {
+        let path = test_dir("discovery-wildcard-loopback");
+        let node = open_shared(&path);
+        let hello = node.lock().unwrap().peer_hello();
+        let listener: SocketAddr = "0.0.0.0:23444".parse().unwrap();
+        let own_address: SocketAddr = "127.0.0.1:23444".parse().unwrap();
+        let other_address: SocketAddr = "127.0.0.1:24444".parse().unwrap();
+        let discovery = PeerDiscovery::open(&path, hello, listener, PeerAddressPolicy::PrivateOnly);
+
+        discovery.add_candidate(own_address).unwrap();
+        discovery.add_candidate(other_address).unwrap();
+        {
+            let state = discovery.state.lock().unwrap();
+            assert!(!state.peers.contains_key(&own_address));
+            assert!(state.peers.contains_key(&other_address));
+        }
+        assert!(is_self_listener_address(
+            "[::1]:23444".parse().unwrap(),
+            "[::]:23444".parse().unwrap(),
+        ));
+        drop(discovery);
+
+        write_peer_cache(
+            &path.join(PEER_CACHE_FILE),
+            hello.network_id,
+            hello.consensus_fingerprint,
+            &[own_address, other_address],
+        )
+        .unwrap();
+        let discovery = PeerDiscovery::open(&path, hello, listener, PeerAddressPolicy::PrivateOnly);
+        {
+            let state = discovery.state.lock().unwrap();
+            assert!(!state.peers.contains_key(&own_address));
+            assert!(state.peers.contains_key(&other_address));
+        }
         drop(discovery);
         drop(node);
         clean_test_dir(&path);

@@ -1,14 +1,17 @@
 """Build an isolated shared-model overlay; preserve the qualified resident kit."""
 from pathlib import Path
 import shutil
+import os
 ROOT=Path(__file__).resolve().parents[2];TOOLS=ROOT/'tools/compact-multigpu'
-OUT=ROOT/'target/compact-multigpu-shared-model-20261108';GPU=OUT/'gpu-prover'
-source=(TOOLS/'prepare-resident.py').read_text().replace("OUT=ROOT/'target/compact-multigpu-speed-20261107'","OUT=ROOT/'target/compact-multigpu-shared-model-20261108'")
+OUT=ROOT/'target/compact-witness-pipeline-20261108';GPU=OUT/'gpu-prover'
+OUT=Path(os.environ.get('CMFD_COMPACT_BUILD_DIRECTORY',str(OUT))).resolve();GPU=OUT/'gpu-prover'
+assert OUT.parent==ROOT/'target'
+source=(TOOLS/'prepare-resident.py').read_text().replace("OUT=ROOT/'target/compact-multigpu-speed-20261107'","OUT=ROOT/"+repr(OUT.relative_to(ROOT).as_posix()))
 exec(compile(source,'<resident-overlay>','exec'),{'__file__':str(TOOLS/'prepare-resident.py')})
 cpp=(OUT/'replay-source/koala_four_limb_replay.cu').read_text()
 cpp='#include <array>\n'+cpp
 at=cpp.index('bool write_replay_outputs(')
-cpp=cpp[:at]+(TOOLS/'cuda/shared-model-kernels.inc').read_text()+'\n'+cpp[at:]
+cpp=cpp[:at]+(TOOLS/'cuda/stream-witness.inc').read_text()+'\n'+(TOOLS/'cuda/shared-model-kernels.inc').read_text()+'\n'+cpp[at:]
 cpp=cpp.replace('bool pre_only) {','bool pre_only) {',1)
 needle='    if(gpu_witness_enabled() && gpu_replay_export().retain('
 at=cpp.index(needle)

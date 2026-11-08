@@ -112,6 +112,10 @@ struct Request {
     replay_batch_size: u32,
     #[serde(default)]
     replay_challenges: PathBuf,
+    #[serde(default)]
+    capture_id: String,
+    #[serde(default)]
+    provider_pid: u32,
 }
 #[derive(Deserialize)]
 struct Response {
@@ -225,7 +229,7 @@ pub(crate) fn shared_base_input() -> Result<Vec<u8>> {
     Ok(bytes)
 }
 thread_local! {static NEXT_ID:Cell<u64>=const{Cell::new(0)};}
-fn exchange(mut request: serde_json::Value) -> Result<Response> {
+fn begin_exchange(mut request: serde_json::Value) -> Result<u64> {
     let id = NEXT_ID.with(|id| {
         let next = id.get() + 1;
         id.set(next);
@@ -234,12 +238,18 @@ fn exchange(mut request: serde_json::Value) -> Result<Response> {
     request["id"] = id.into();
     request["event"] = "fixed_request".into();
     send(request)?;
+    Ok(id)
+}
+fn finish_exchange(id: u64) -> Result<Response> {
     let response: Response = read()?;
     ensure!(
         response.op == "fixed_response" && response.id == id,
         "out-of-order fixed response"
     );
     Ok(response)
+}
+fn exchange(request: serde_json::Value) -> Result<Response> {
+    finish_exchange(begin_exchange(request)?)
 }
 fn vector(response: Response, elements: usize, scope: &TaskScope) -> Result<Mle<Ext, TaskScope>> {
     ensure!(response.elements == elements, "remote vector shape");
@@ -276,6 +286,28 @@ pub(crate) fn fixed_evaluations(bank: usize, evaluation_point: &Point<Ext>) -> R
     ensure!(response.values.len() == 256, "fixed evaluation count");
     values(&response.values)
 }
+pub(crate) fn opening_evaluations(
+    bank: usize,
+    point: &Point<Ext>,
+    dynamic: TensorView<'_, Felt, TaskScope>,
+    scope: &TaskScope,
+) -> Result<(Vec<Ext>, Vec<Ext>)> {
+    if std::env::var("CMFD_DEVICE_RELATIONS").as_deref() != Ok("1") {
+        return Ok((
+            fixed_evaluations(bank, point)?,
+            real_v4_opening::evaluate_dynamic_columns(dynamic, point, scope)?,
+        ));
+    }
+    // The point is already fixed by the transcript. These two evaluations are
+    // independent and can run on B and A at the same time. Only one RPC is in flight.
+    let id = begin_exchange(
+        serde_json::json!({"op":"evaluate","bank":bank,"point":point.iter().copied().map(word).collect::<Vec<_>>()}),
+    )?;
+    let local = real_v4_opening::evaluate_dynamic_columns(dynamic, point, scope)?;
+    let remote = finish_exchange(id)?;
+    ensure!(remote.values.len() == 256, "fixed evaluation count");
+    Ok((values(&remote.values)?, local))
+}
 pub(crate) fn component(
     coefficients: Vec<Ext>,
     evaluation_point: &Point<Ext>,
@@ -311,8 +343,18 @@ pub(crate) fn distributed_sumcheck(
         claims.iter().copied().sum::<Ext>() + fixed_total == total,
         "distributed claimed sum"
     );
-    let mut remote = exchange(serde_json::json!({"op":"begin","components":fixed}))?;
+    let pipelined = std::env::var("CMFD_DEVICE_RELATIONS").as_deref() == Ok("1");
+    let initial = begin_exchange(serde_json::json!({"op":"begin","components":fixed}))?;
+    let mut remote = if pipelined {
+        None
+    } else {
+        Some(finish_exchange(initial)?)
+    };
     let mut local = low_memory_sumcheck::ComponentSumcheck::new(traces, points, claims);
+    if pipelined {
+        remote = Some(finish_exchange(initial)?);
+    }
+    let mut remote = remote.unwrap();
     let mut polynomials = Vec::new();
     let mut evaluation_point = Vec::new();
     let mut terminal = total;
@@ -329,8 +371,15 @@ pub(crate) fn distributed_sumcheck(
         evaluation_point.insert(0, alpha);
         terminal = polynomial.eval_at_point(alpha);
         polynomials.push(polynomial);
-        local.fold(alpha);
-        remote = exchange(serde_json::json!({"op":"step","round":round,"alpha":word(alpha)}))?;
+        let request = serde_json::json!({"op":"step","round":round,"alpha":word(alpha)});
+        if pipelined {
+            let id = begin_exchange(request)?;
+            local.fold(alpha);
+            remote = finish_exchange(id)?;
+        } else {
+            local.fold(alpha);
+            remote = exchange(request)?;
+        }
     }
     ensure!(
         remote.finished && remote.polynomial.is_empty(),
@@ -662,6 +711,7 @@ fn prove(
     request: &Request,
     network: [u8; 32],
     scope: &TaskScope,
+    captured: Option<gpu_witness::StreamCapture>,
 ) -> Result<serde_json::Value> {
     NEXT_ID.with(|id| id.set(0));
     let began = Instant::now();
@@ -693,14 +743,33 @@ fn prove(
         ),
     };
     let upload_started = Instant::now();
-    let mut traces =
-        if let Some(captured) = gpu_witness::from_gpu(&request.prefix, challenge_digest, scope)? {
-            captured.into_iter().map(Some).collect::<Vec<_>>()
-        } else {
-            (0..3)
-                .map(|bank| trace(&request.prefix, bank, scope).map(Some))
-                .collect::<Result<Vec<_>>>()?
-        };
+    let capture_stats = captured.as_ref().map(|c| c.stats.clone());
+    let mut traces = if let Some(captured) = captured {
+        ensure!(
+            captured.capture_id == request.capture_id,
+            "captured stream identity differs"
+        );
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&forgematrix_v4_mask_coefficients(
+            challenge_digest,
+            u32::MAX,
+        ));
+        for layer in 0..384 {
+            expected.extend_from_slice(&forgematrix_v4_mask_coefficients(challenge_digest, layer));
+        }
+        ensure!(
+            hex::decode(captured.coefficients_hex)? == expected,
+            "captured stream belongs to another nonce/template"
+        );
+        captured.traces.into_iter().map(Some).collect::<Vec<_>>()
+    } else if let Some(captured) = gpu_witness::from_gpu(&request.prefix, challenge_digest, scope)?
+    {
+        captured.into_iter().map(Some).collect::<Vec<_>>()
+    } else {
+        (0..3)
+            .map(|bank| trace(&request.prefix, bank, scope).map(Some))
+            .collect::<Result<Vec<_>>>()?
+    };
     let upload_seconds = upload_started.elapsed().as_secs_f64();
     let commit_started = Instant::now();
     let mut gpu_dynamic = Vec::new();
@@ -1048,7 +1117,7 @@ fn prove(
         .open(&request.output)?
         .write_all(&wire)?;
     Ok(
-        serde_json::json!({"verified":true,"wire_bytes":wire.len(),"proof_version":2,"workspace_cache_limit_bytes":if std::env::var("CMFD_SHARED_MODEL").as_deref()==Ok("1"){4u64<<30}else{0},"trace_upload_seconds":upload_seconds,"initial_commit_seconds":commit_seconds,"relations_and_openings_seconds":relations_seconds,"secondary_seconds":secondary_seconds,"joint_basefold_seconds":pcs_seconds,"full_cpu_verification_seconds":verify_seconds,"proof_seconds":began.elapsed().as_secs_f64(),"parameters":{"log_blowup":1,"queries":270,"grinding_bits":16,"commitments":6}}),
+        serde_json::json!({"verified":true,"wire_bytes":wire.len(),"proof_version":2,"stream_capture":capture_stats,"device_relations":std::env::var("CMFD_DEVICE_RELATIONS").as_deref()==Ok("1"),"workspace_cache_limit_bytes":if std::env::var("CMFD_SHARED_MODEL").as_deref()==Ok("1"){4u64<<30}else{0},"trace_upload_seconds":upload_seconds,"initial_commit_seconds":commit_seconds,"relations_and_openings_seconds":relations_seconds,"secondary_seconds":secondary_seconds,"joint_basefold_seconds":pcs_seconds,"full_cpu_verification_seconds":verify_seconds,"proof_seconds":began.elapsed().as_secs_f64(),"parameters":{"log_blowup":1,"queries":270,"grinding_bits":16,"commitments":6}}),
     )
 }
 
@@ -1068,13 +1137,42 @@ pub(crate) fn run_dynamic(
         dynamic_workspace_cache(scope, true)?;
     }
     send(serde_json::json!({"event":"ready","role":"dynamic"}))?;
+    let mut captured = None;
     loop {
         let request: Request = read()?;
         if request.op == "quit" {
             break;
         }
+        if request.op == "prefetch" {
+            ensure!(
+                persistent
+                    && std::env::var("CMFD_WITNESS_PIPELINE").as_deref() == Ok("1")
+                    && captured.is_none(),
+                "stream capture phase"
+            );
+            let result = gpu_witness::capture_stream(
+                &request.prefix,
+                request.provider_pid,
+                &request.capture_id,
+                &request.replay_coefficients,
+                scope,
+            )?;
+            let stats = result.stats.clone();
+            captured = Some(result);
+            send(
+                serde_json::json!({"event":"captured","capture_id":request.capture_id,"stats":stats}),
+            )?;
+            continue;
+        }
+        if request.op == "discard_capture" {
+            captured = None;
+            scope.synchronize_blocking()?;
+            dynamic_workspace_cache(scope, false)?;
+            send(serde_json::json!({"event":"discarded"}))?;
+            continue;
+        }
         ensure!(request.op == "prove", "dynamic proof request");
-        let report = prove(prepared, &request, network, scope)?;
+        let report = prove(prepared, &request, network, scope, captured.take())?;
         scope.synchronize_blocking()?;
         if persistent {
             dynamic_workspace_cache(scope, false)?;

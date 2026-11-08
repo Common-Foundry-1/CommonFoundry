@@ -13,12 +13,272 @@ use std::{
 unsafe extern "C" {
     fn cudaMemcpy(destination: *mut c_void, source: *const c_void, bytes: usize, kind: i32) -> i32;
     fn cudaDeviceSynchronize() -> i32;
+    fn cudaHostRegister(pointer: *mut c_void, bytes: usize, flags: u32) -> i32;
+    fn cudaHostUnregister(pointer: *mut c_void) -> i32;
+    fn cudaMallocHost(pointer: *mut *mut c_void, bytes: usize) -> i32;
+    fn cudaFreeHost(pointer: *mut c_void) -> i32;
+    fn cudaGetLastError() -> i32;
     fn cmfd_resident_trace_layout_kernel() -> sp1_gpu_sys::runtime::KernelPtr;
     fn cmfd_resident_validate_words_kernel() -> sp1_gpu_sys::runtime::KernelPtr;
     fn cmfd_resident_derive_activations_kernel() -> sp1_gpu_sys::runtime::KernelPtr;
     fn cmfd_resident_validate_lifts_kernel() -> sp1_gpu_sys::runtime::KernelPtr;
     fn cudaIpcOpenMemHandle(pointer: *mut *mut c_void, handle: IpcHandle, flags: u32) -> i32;
     fn cudaIpcCloseMemHandle(pointer: *mut c_void) -> i32;
+}
+const STREAM_CHUNK_BYTES: usize = 16 << 20;
+pub(crate) struct StreamCapture {
+    pub traces: Vec<JaggedTraceMle<Felt, TaskScope>>,
+    pub coefficients_hex: String,
+    pub capture_id: String,
+    pub stats: serde_json::Value,
+}
+struct HostRegistration {
+    pointer: *mut c_void,
+    registered: bool,
+}
+impl HostRegistration {
+    fn open(pointer: *const u8, bytes: usize) -> Self {
+        let registered = unsafe { cudaHostRegister(pointer.cast_mut().cast(), bytes, 8) } == 0;
+        if !registered {
+            unsafe {
+                cudaGetLastError();
+            }
+        }
+        Self {
+            pointer: pointer.cast_mut().cast(),
+            registered,
+        }
+    }
+    fn close(mut self) -> Result<()> {
+        if self.registered {
+            ensure!(
+                unsafe { cudaHostUnregister(self.pointer) } == 0,
+                "unregister immutable witness pages"
+            );
+            self.registered = false;
+        }
+        Ok(())
+    }
+}
+impl Drop for HostRegistration {
+    fn drop(&mut self) {
+        if self.registered {
+            unsafe {
+                cudaHostUnregister(self.pointer);
+            }
+        }
+    }
+}
+struct PinnedChunk(*mut c_void);
+impl PinnedChunk {
+    fn new() -> Result<Self> {
+        let mut pointer = std::ptr::null_mut();
+        ensure!(
+            unsafe { cudaMallocHost(&mut pointer, STREAM_CHUNK_BYTES) } == 0,
+            "allocate bounded pinned witness chunk"
+        );
+        Ok(Self(pointer))
+    }
+}
+impl Drop for PinnedChunk {
+    fn drop(&mut self) {
+        unsafe {
+            cudaFreeHost(self.0);
+        }
+    }
+}
+pub(crate) fn open_stream_chunk(path: &Path, provider: u32, expected_bytes: usize) -> Result<File> {
+    ensure!(provider > 1 && expected_bytes > 0, "stream provider/shape");
+    let target = std::fs::read_link(path)?;
+    let text = target.to_str().context("stream descriptor encoding")?;
+    let prefix = format!("/proc/{provider}/fd/");
+    let suffix = text
+        .strip_prefix(&prefix)
+        .context("stream chunk belongs to another provider")?;
+    ensure!(
+        !suffix.is_empty() && suffix.bytes().all(|c| c.is_ascii_digit()),
+        "stream descriptor path"
+    );
+    let file = File::open(&target)?;
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.len() == expected_bytes as u64 && metadata.uid() == unsafe { libc::geteuid() },
+        "stream chunk shape/owner"
+    );
+    let seals = unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&file), libc::F_GET_SEALS) };
+    ensure!(
+        seals >= 0 && seals & 15 == 15,
+        "stream chunk is not kernel-immutable"
+    );
+    Ok(file)
+}
+fn wait_stream_path(path: &Path, deadline: Instant) -> Result<()> {
+    loop {
+        if std::fs::symlink_metadata(path).is_ok() {
+            return Ok(());
+        }
+        ensure!(Instant::now() < deadline, "sealed witness stream deadline");
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+pub(crate) fn capture_stream(
+    prefix: &Path,
+    provider: u32,
+    capture_id: &str,
+    coefficients_path: &Path,
+    scope: &TaskScope,
+) -> Result<StreamCapture> {
+    ensure!(
+        capture_id.len() == 32 && capture_id.bytes().all(|b| b.is_ascii_hexdigit()),
+        "stream capture identity"
+    );
+    ensure!(
+        prefix.is_absolute()
+            && !prefix
+                .components()
+                .any(|p| matches!(p, std::path::Component::ParentDir)),
+        "absolute stream prefix"
+    );
+    let parent = prefix.parent().context("stream parent")?;
+    let metadata = std::fs::symlink_metadata(parent)?;
+    ensure!(
+        metadata.is_dir()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.permissions().mode() & 0o077 == 0,
+        "private stream directory"
+    );
+    let began = Instant::now();
+    let deadline = began + Duration::from_secs(120);
+    let mut coefficients = Vec::new();
+    File::open(coefficients_path)?
+        .take(7701)
+        .read_to_end(&mut coefficients)?;
+    ensure!(
+        coefficients.len() == 7700 && coefficients.iter().all(|x| *x <= 250),
+        "stream coefficient geometry/range"
+    );
+    let descriptor = PathBuf::from(format!("{}-stream-witness.json", prefix.display()));
+    wait_stream_path(&descriptor, deadline)?;
+    let mut bytes = Vec::new();
+    File::open(descriptor)?
+        .take(65537)
+        .read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= 65536, "stream metadata length");
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    ensure!(
+        value["schema"] == "CMFD_SEALED_WITNESS_STREAM_V1"
+            && value["provider_pid"].as_u64() == Some(provider as u64),
+        "stream metadata provider"
+    );
+    ensure!(
+        value["chunk_bytes"].as_u64() == Some(STREAM_CHUNK_BYTES as u64)
+            && value["bank_bytes"].as_u64() == Some((BANK_VALUES * 4) as u64),
+        "stream metadata geometry"
+    );
+    let coefficients_hex = value["coefficients_hex"]
+        .as_str()
+        .context("stream coefficient binding")?
+        .to_owned();
+    ensure!(
+        hex::decode(&coefficients_hex)? == coefficients,
+        "stream coefficient file changed"
+    );
+    let mut traces = Vec::new();
+    let mut pinned = None;
+    let mut registered_chunks = 0usize;
+    let mut dma_seconds = 0.0;
+    for bank in 0..3 {
+        let mut storage = allocate(LOG_ROWS, scope)?;
+        for chunk in 0..BANK_VALUES * 4 / STREAM_CHUNK_BYTES {
+            let path = PathBuf::from(format!(
+                "{}-bank{bank}-pre-chunk{chunk}.bin",
+                prefix.display()
+            ));
+            wait_stream_path(&path, deadline)?;
+            let file = open_stream_chunk(&path, provider, STREAM_CHUNK_BYTES)?;
+            let map = unsafe {
+                memmap2::MmapOptions::new()
+                    .len(STREAM_CHUNK_BYTES)
+                    .map(&file)?
+            };
+            let registration = HostRegistration::open(map.as_ptr(), map.len());
+            let source = if registration.registered {
+                registered_chunks += 1;
+                map.as_ptr().cast::<c_void>()
+            } else {
+                if pinned.is_none() {
+                    pinned = Some(PinnedChunk::new()?);
+                }
+                let buffer = pinned.as_ref().unwrap();
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        map.as_ptr(),
+                        buffer.0.cast::<u8>(),
+                        STREAM_CHUNK_BYTES,
+                    );
+                }
+                buffer.0.cast_const()
+            };
+            let target = unsafe {
+                storage
+                    .dense
+                    .as_mut_ptr()
+                    .add(ROWS + chunk * (STREAM_CHUNK_BYTES / 4))
+            };
+            let dma_started = Instant::now();
+            unsafe {
+                ensure!(
+                    cudaMemcpy(target.cast(), source, STREAM_CHUNK_BYTES, 1) == 0,
+                    "upload immutable stream chunk"
+                );
+                ensure!(
+                    cudaDeviceSynchronize() == 0,
+                    "complete streamed default/SDK handoff"
+                );
+            }
+            dma_seconds += dma_started.elapsed().as_secs_f64();
+            let mut invalid = DeviceBuffer::from_host_slice(&[0u32], scope)?;
+            let arguments = args!(target, STREAM_CHUNK_BYTES / 4, invalid.as_mut_ptr());
+            unsafe {
+                scope.launch_kernel(
+                    cmfd_resident_validate_words_kernel(),
+                    512usize,
+                    256usize,
+                    &arguments,
+                    0,
+                )?;
+            }
+            scope.synchronize_blocking()?;
+            ensure!(invalid.to_host()?[0] == 0, "noncanonical owned stream word");
+            let next = unsafe { target.add(BANK_VALUES) };
+            let arguments = args!(target, next, STREAM_CHUNK_BYTES / 4);
+            unsafe {
+                scope.launch_kernel(
+                    cmfd_resident_derive_activations_kernel(),
+                    512usize,
+                    256usize,
+                    &arguments,
+                    0,
+                )?;
+            }
+            scope.synchronize_blocking()?;
+            registration.close()?;
+            drop(map);
+            drop(file);
+        }
+        let trace = finish(storage, bank, scope)?;
+        validate_capture(&trace, &format!("stream-bank-{bank}"), scope)?;
+        traces.push(trace);
+    }
+    scope.synchronize_blocking()?;
+    let stats = serde_json::json!({"wall_seconds":began.elapsed().as_secs_f64(),"upload_seconds":dma_seconds,"chunks":48,"bytes":3*BANK_VALUES*4,"registered_readonly_chunks":registered_chunks,"fallback_pinned_chunks":48-registered_chunks,"sealed_snapshots":true});
+    eprintln!("SEALED_WITNESS_CAPTURE {stats}");
+    Ok(StreamCapture {
+        traces,
+        coefficients_hex,
+        capture_id: capture_id.to_owned(),
+        stats,
+    })
 }
 pub(crate) fn validate_lifts(
     dynamic: &slop_tensor::TensorView<'_, Felt, TaskScope>,
@@ -569,6 +829,36 @@ pub(crate) fn trace(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stream_chunks_require_the_expected_provider_seals_and_length() {
+        let directory =
+            std::env::temp_dir().join(format!("cmfd-stream-open-test-{}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let snapshot = super::super::multi_gpu::Snapshot::bytes(b"immutable sample").unwrap();
+        let link = directory.join("chunk");
+        std::os::unix::fs::symlink(snapshot.path(), &link).unwrap();
+        assert!(open_stream_chunk(&link, std::process::id(), 16).is_ok());
+        assert!(open_stream_chunk(&link, std::process::id() + 1, 16).is_err());
+        assert!(open_stream_chunk(&link, std::process::id(), 15).is_err());
+        std::fs::remove_file(&link).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(directory.join("mutable"))
+            .unwrap();
+        file.set_len(16).unwrap();
+        let target = format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            std::os::fd::AsRawFd::as_raw_fd(&file)
+        );
+        std::os::unix::fs::symlink(target, &link).unwrap();
+        assert!(open_stream_chunk(&link, std::process::id(), 16).is_err());
+        std::fs::remove_file(link).unwrap();
+        std::fs::remove_file(directory.join("mutable")).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
     #[test]
     fn gpu_descriptor_binds_nonce_device_and_exact_allocation_shapes() {
         let challenge = [3u8; 32];

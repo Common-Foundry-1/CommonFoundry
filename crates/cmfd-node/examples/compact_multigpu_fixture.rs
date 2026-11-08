@@ -37,6 +37,57 @@ fn coefficients(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.len() == 6 && args[0] == "--compare-proof-transcripts" {
+        use cmfd_consensus::forgematrix_v4_basefold::ForgeMatrixV4TranscriptStatement;
+        use cmfd_consensus::forgematrix_v4_direct as direct;
+        let frozen: Frozen = serde_json::from_slice(&fs::read(&args[1])?)?;
+        let record = fixed(&args[2])?;
+        let reference = fs::read(&args[3])?;
+        let candidate = fs::read(&args[4])?;
+        let challenge_digest = forgematrix_v4_challenge_digest(
+            &frozen.challenge,
+            frozen.nonce,
+            record.manifest_digest(),
+        );
+        let final_activation_digest =
+            direct::final_activation_digest_from_packet(challenge_digest, &reference)?;
+        let statement = ForgeMatrixV4TranscriptStatement {
+            block: frozen.challenge,
+            algorithm_version: cmfd_consensus::FORGEMATRIX_V4_ALGORITHM_VERSION,
+            proof_version: cmfd_consensus::FORGEMATRIX_V4_DIRECT_PROOF_VERSION,
+            nonce: frozen.nonce,
+            proof_system_digest: cmfd_consensus::forgematrix_v4_direct_proof_system_digest(),
+            model_manifest_digest: record.manifest_digest(),
+            challenge_digest,
+            final_activation_digest,
+            work_digest: forgematrix_v4_work_digest(
+                record.manifest_digest(),
+                challenge_digest,
+                final_activation_digest,
+            ),
+        };
+        let old = direct::decode(&reference, statement)?;
+        let new = direct::decode(&candidate, statement)?;
+        let public_end = direct::HEADER_BYTES + direct::PUBLIC_BYTES;
+        let reduction_end = public_end + direct::REDUCTION_BYTES;
+        if reference[direct::HEADER_BYTES..public_end]
+            != candidate[direct::HEADER_BYTES..public_end]
+            || reference[public_end..reduction_end] != candidate[public_end..reduction_end]
+        {
+            return Err("public relation/opening transcript or secondary reduction differs".into());
+        }
+        let report = serde_json::json!({
+            "public_relations_openings_exact":true,
+            "secondary_reduction_exact":true,
+            "complete_packet_equal":reference==candidate,
+            "reference_basefold_batch_witness":old.joint_basefold.batch_grinding_witness,
+            "candidate_basefold_batch_witness":new.joint_basefold.batch_grinding_witness,
+            "full_cpu_verification_required":true,
+        });
+        fs::write(&args[5], serde_json::to_vec_pretty(&report)?)?;
+        println!("{report}");
+        return Ok(());
+    }
     if args.len() == 6 && args[0] == "--nonce-input" {
         let block = decode_block(
             &fs::read(&args[1])?,

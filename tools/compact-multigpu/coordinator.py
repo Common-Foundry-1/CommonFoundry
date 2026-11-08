@@ -14,6 +14,7 @@ from pathlib import Path
 import queue
 import re
 import signal
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -303,7 +304,7 @@ class ResidentSession:
             from shared_model import private_parent
             endpoint=Path(os.environ['CMFD_SHARED_REPLAY_SOCKET']);private_parent(endpoint);parent=endpoint.parent
         self.scratch=tempfile.TemporaryDirectory(prefix='cmfd-resident-fixed-',dir=parent)
-        self.fixed=None;self.dynamic=None;self.jobs=0
+        self.fixed=None;self.dynamic=None;self.jobs=0;self.capture=None
         self.lock=threading.RLock()
         start=time.monotonic();monitor=Monitor([selected[1]])
         try:
@@ -350,12 +351,36 @@ class ResidentSession:
             command.update(replay_mode=mode,replay_coefficients=str(value['coefficients']),prefix=str(prefix),
                            replay_batch_size=value.get('batch_size',0),replay_challenges=value.get('challenges',''))
         with self.lock:
-            start=time.monotonic();monitor=Monitor([self.selected[1]])
+            start=time.monotonic()
+            pipeline=operation=='replay' and os.environ.get('CMFD_WITNESS_PIPELINE')=='1'
+            capture_mode=pipeline and value['mode']=='full'
+            monitor=Monitor(self.selected if capture_mode else [self.selected[1]])
+            prefetch_started=False
             try:
+                if operation=='replay' and self.capture is not None:
+                    self.dynamic.send({'op':'discard_capture'});self.dynamic.receive({'discarded'},start+600,monitor);self.capture=None
+                if capture_mode:
+                    if self.dynamic is None or self.dynamic.process.poll() is not None:
+                        if self.dynamic is not None:self.dynamic.close()
+                        self.dynamic=Worker(self.executable,'dynamic',self.selected[0],self.args,Path(self.scratch.name),cache=self.cache)
+                        self.dynamic.receive({'ready'},start+600,monitor)
+                    capture_id=secrets.token_hex(16)
+                    self.dynamic.send(dict(op='prefetch',prefix=command['prefix'],replay_coefficients=command['replay_coefficients'],provider_pid=self.fixed.process.pid,capture_id=capture_id))
+                    prefetch_started=True
                 self.fixed.send(command);reply=self.fixed.receive({'fixed_done'},start+600,monitor)
                 if reply.get('id')!=0:raise ValueError('replay response identity differs')
+                if capture_mode:
+                    captured=self.dynamic.receive({'captured'},start+600,monitor)
+                    if captured.get('capture_id')!=capture_id:raise ValueError('stream capture response differs')
+                    self.capture=dict(id=capture_id,prefix=str(Path(command['prefix']).parent.resolve(strict=True)/Path(command['prefix']).name),stats=captured['stats'])
                 monitor.check()
-                return dict(ok=True,seconds=time.monotonic()-start,model_reload_bytes=0,peak_total_device_bytes=monitor.peak)
+                return dict(ok=True,seconds=time.monotonic()-start,model_reload_bytes=0,peak_total_device_bytes=monitor.peak,
+                            stream_capture=self.capture['stats'] if capture_mode else None)
+            except BaseException:
+                if prefetch_started:
+                    self.capture=None
+                    if self.dynamic is not None:self.dynamic.close();self.dynamic=None
+                raise
             finally:monitor.close()
 
     def prove(self, template, prefix, final, output):
@@ -369,8 +394,15 @@ class ResidentSession:
         with tempfile.TemporaryDirectory(prefix='cmfd-resident-job-',dir=self.scratch.name if self.dynamic is not None else None) as work:
             scratch=Path(work)
             try:
+                capture_id=''
+                pipelined=os.environ.get('CMFD_WITNESS_PIPELINE')=='1'
+                if pipelined:
+                    source=Path(prefix);source=str(source.parent.resolve(strict=True)/source.name)
+                    if self.capture is None or self.capture['prefix']!=source:raise ValueError('proof has no matching prefetched witness')
+                    capture_id=self.capture['id']
                 gpu_descriptor=Path(str(prefix)+'-gpu-witness.json')
-                if gpu_descriptor.exists():
+                if pipelined:pass
+                elif gpu_descriptor.exists():
                     if gpu_descriptor.is_symlink():raise ValueError('GPU witness descriptor is a symlink')
                     with gpu_descriptor.open('rb') as file:data=file.read(65537)
                     if len(data)>65536:raise ValueError('oversized GPU witness descriptor')
@@ -399,7 +431,7 @@ class ResidentSession:
                 persistent=self.dynamic is not None
                 worker=self.dynamic if persistent else Worker(self.executable,'dynamic',self.selected[0],self.args,scratch,cache=self.cache)
                 if not persistent:worker.receive({'ready'},deadline,monitor)
-                worker.send(dict(op='prove',template=str(scratch/'template.json'),prefix=str(scratch/'witness'),final_path=str(scratch/'final.bin'),output=str(output)))
+                worker.send(dict(op='prove',template=str(scratch/'template.json'),prefix=str(scratch/'witness'),final_path=str(scratch/'final.bin'),output=str(output),capture_id=capture_id))
                 expected_id=1
                 while True:
                     message=worker.receive({'fixed_request','done'},deadline,monitor)
@@ -418,6 +450,7 @@ class ResidentSession:
                             fixed_weights_reused=self.jobs>1,dynamic_process_exited=not persistent,
                             dynamic_worker_pid=worker.process.pid,dynamic_worker_reused=persistent and self.jobs>1,
                             fixed_worker_pid=self.fixed.process.pid)
+                        report['witness_pipeline']=pipelined
                         Path(str(output)+'.multigpu.json').write_text(json.dumps(report,indent=2)+'\n')
                         return report
                     if message.get('id')!=expected_id or message.get('op') not in {'weights','evaluate','begin','step','combined'}:
@@ -431,8 +464,12 @@ class ResidentSession:
                 failure=dict(complete=False,error=str(error),elapsed_seconds=time.monotonic()-start,
                              peak_total_device_bytes=monitor.peak if monitor else None,fixed_rpc_count=rpc_count)
                 Path(str(output)+'.multigpu-failed.json').write_text(json.dumps(failure,indent=2)+'\n')
+                if os.environ.get('CMFD_WITNESS_PIPELINE')=='1' and self.dynamic is not None:
+                    failed=self.dynamic;self.dynamic=None;failed.close()
+                    if worker is failed:worker=None
                 raise
             finally:
+                if os.environ.get('CMFD_WITNESS_PIPELINE')=='1':self.capture=None
                 if worker is not None:
                     if worker is not self.dynamic:worker.close()
                     if os.environ.get('CMFD_MULTI_GPU_LOG_DIR'):

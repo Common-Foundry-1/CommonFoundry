@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-spec=importlib.util.spec_from_file_location('launcher',Path(__file__).with_name('launch.py'))
+spec=importlib.util.spec_from_file_location('launcher',Path(__file__).resolve().parents[2]/'packaging/compact-proof-testnet/launch.py')
 launcher=importlib.util.module_from_spec(spec);spec.loader.exec_module(launcher)
 
 class LauncherTests(unittest.TestCase):
@@ -28,6 +28,8 @@ class LauncherTests(unittest.TestCase):
         with patch.object(sys,'argv',arguments),patch.object(launcher,'verify'),patch.dict(os.environ,{},clear=False),contextlib.redirect_stdout(output):
             launcher.main()
             self.assertEqual(os.environ['CMFD_SHARED_MODEL'],'1')
+            self.assertEqual(os.environ['CMFD_WITNESS_PIPELINE'],'1')
+            self.assertEqual(os.environ['CMFD_DEVICE_RELATIONS'],'1')
             self.assertEqual(os.environ['CMFD_REPLAY_GPU_IPC'],'0')
             self.assertTrue(os.environ['CMFD_SHARED_REPLAY_SOCKET'].endswith('/pool-scratch/model.sock'))
         raw=output.getvalue();command=json.loads(raw[raw.index('[\n'):])

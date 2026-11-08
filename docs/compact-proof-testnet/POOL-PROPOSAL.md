@@ -1,15 +1,13 @@
-# Common Foundry Compact Proof Testnet v0.4.0
+# Common Foundry Compact Proof Testnet v0.5.0
 
 Pool operators,
 
-We are opening up more GPU options with **two-GPU compact proving and a shared resident model**. Replay and proving now reuse the same model allocation: our next replay was ready in **0.11-0.13 seconds**, replacing a **16.77-second reload** on the same rig.
+Our compact-proof testnet just got faster. **v0.5.0 cuts full local pool acceptance to 8.27-8.52 seconds on PCIe Gen2 x1 risers**, compared with 11.57-12.08 seconds in v0.4.0. Pipelined transfers and GPU-resident calculations keep the two proving cards working together, with one shared model and no reload between proofs.
 
-The new mode stayed within **7.46 GiB per card** while producing complete proofs around **5.7 MB**. The ForgeMatrix work, six commitments, 270 queries, 16 grinding bits and full node verification stay unchanged. Ordinary nodes verify the proof without repeating the mining computation.
+Proofs remain around **5.7 MB**, and measured memory stayed within **6.77 / 7.46 GiB per card**. ForgeMatrix work, all six commitments, 270 queries, 16 grinding bits and complete node verification are unchanged. Ordinary nodes verify the proof without repeating mining.
 
-Our live pool accepted two consecutive blocks with one resident model and no model transfers after startup. Full pool evaluation plus local admission took **12.08 and 11.57 seconds on PCIe Gen2 x1 risers**. About 4.7 seconds was witness transfer over those links, giving us a clear next optimization target. The existing single-GPU path remains available alongside this new mode.
+The update includes the Linux pool/miner/prover kit, matching Windows GUI/node preview, quickstarts and signed checksums. Existing keys, chain data, inputs, pool ledger and TLS identity carry forward. The public seed remains **209.145.48.36:23444**, and a fresh published node just synced through height 65 in about 51 seconds.
 
-**v0.4.0 includes the Linux pool/miner/prover kit, matching Windows GUI/node preview, updated quickstarts and signed checksums.** It also carries the seed self-discovery repair. Existing testnet keys, chain data, model inputs, ledger and pool TLS identity carry forward; the seed remains **209.145.48.36:23444**.
+The optimized shared-model path is automatic when you use `--shared-model`. The existing single-GPU and other two-GPU layouts remain available. Our measurements used physical 16 GiB RTX 4070 Ti SUPER cards under a 7.5 GiB guard; feedback from physical 8 GB pairs and faster PCIe layouts is especially useful.
 
-We would love pool feedback on both modes: GPU/driver and PCIe layout, winning-block latency, peak memory, stale rate, synchronization and restart behavior. The 7.46 GiB run used physical 16 GiB cards under a 7.5 GiB guard; an actual 8 GB RTX 3080 mobile pair is our next hardware canary.
-
-These improvements continue toward one future mainnet upgrade combining compact proofs and the evaluation-binding repair. Thank you for helping us bring more GPU choices, smaller proofs and smoother pool operation to Common Foundry.
+Please share your GPU/driver and PCIe layout, full winning-block acceptance time, peak memory, stale rate, propagation, sync and restart results. The five-second full-path target remains our next performance goal. These compatible testnet improvements continue toward one mainnet upgrade combining compact proofs and the evaluation-binding repair.

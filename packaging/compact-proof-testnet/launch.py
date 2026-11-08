@@ -204,7 +204,8 @@ def main():
     if args.action=='pool' and args.shared_model:
         if not args.proof_gpus or not args.serial_gpu or len(args.replay_gpu or [])!=1 or args.gpu_witness or args.sealed_witness:
             raise ValueError('shared model requires two proving GPUs, one serial replay GPU on the second card, and no other witness mode')
-        os.environ.update(CMFD_SHARED_MODEL='1',CMFD_REPLAY_GPU_IPC='0',CMFD_REPLAY_SEALED_EXPORT='0')
+        os.environ.update(CMFD_SHARED_MODEL='1',CMFD_WITNESS_PIPELINE='1',CMFD_DEVICE_RELATIONS='1',
+                          CMFD_REPLAY_GPU_IPC='0',CMFD_REPLAY_SEALED_EXPORT='0')
     if args.action=="pool" and args.gpu_witness:
         if not args.proof_gpus or not args.serial_gpu or len(args.replay_gpu or [])!=1 or args.sealed_witness:
             raise ValueError("GPU witness handoff requires split proving, one serial replay GPU, and no sealed-witness flag")

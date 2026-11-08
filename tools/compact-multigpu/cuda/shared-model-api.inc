@@ -18,6 +18,7 @@ extern "C" int cmfd_shared_model_open(const uint8_t* b0,const uint8_t* b1,const 
 extern "C" int cmfd_shared_model_run(const char* mode,const char* coefficients,const char* prefix,char* error,size_t capacity){
     return resident_api([&]{
         if(!resident_replay_model)throw std::runtime_error("shared model is not ready");
+        cmfd_v4_replay::resident_stream_exports().clear();
         bool full=std::string(mode)=="full";
         if(!full&&std::string(mode)!="search")throw std::runtime_error("shared replay mode");
         if(full)cmfd_v4_replay::resident_search_buffers().clear();
@@ -26,7 +27,7 @@ extern "C" int cmfd_shared_model_run(const char* mode,const char* coefficients,c
     },error,capacity);
 }
 extern "C" int cmfd_shared_model_run_batch(uint32_t count,const char* coefficients,const char* prefix,const char* challenges,char* error,size_t capacity){
-    return resident_api([&]{if(!resident_replay_model||count<1||count>64)throw std::runtime_error("shared batch shape");cmfd_v4_replay::run_production_search_batch(*resident_replay_model,count,coefficients,prefix,challenges);},error,capacity);
+    return resident_api([&]{if(!resident_replay_model||count<1||count>64)throw std::runtime_error("shared batch shape");cmfd_v4_replay::resident_stream_exports().clear();cmfd_v4_replay::run_production_search_batch(*resident_replay_model,count,coefficients,prefix,challenges);},error,capacity);
 }
-extern "C" int cmfd_shared_model_trim(char* error,size_t capacity){return resident_api([&]{if(!resident_replay_model)throw std::runtime_error("shared model not ready");cmfd_v4_replay::resident_search_buffers().clear();resident_replay_model->evict();},error,capacity);}
-extern "C" void cmfd_shared_model_close(){cmfd_v4_replay::resident_search_buffers().clear();resident_replay_model.reset();cudaDeviceSynchronize();}
+extern "C" int cmfd_shared_model_trim(char* error,size_t capacity){return resident_api([&]{if(!resident_replay_model)throw std::runtime_error("shared model not ready");cmfd_v4_replay::resident_stream_exports().clear();cmfd_v4_replay::resident_search_buffers().clear();resident_replay_model->evict();},error,capacity);}
+extern "C" void cmfd_shared_model_close(){cmfd_v4_replay::resident_stream_exports().clear();cmfd_v4_replay::resident_search_buffers().clear();resident_replay_model.reset();cudaDeviceSynchronize();}

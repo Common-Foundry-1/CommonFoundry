@@ -1,5 +1,47 @@
 # Two-GPU compact proving
 
+## GPU-resident relations candidate
+
+The latest local candidate keeps reduced relation matrices and sumcheck inputs
+on the GPU and overlaps independent work across A and B. On Rig06 it reduced
+relations/openings by **30.8%**, from 2.80–2.90 seconds to 1.92–2.03 seconds for
+matching winners. Two real local pool blocks reached complete acceptance in
+**8.520 and 8.274 seconds**, another 8.1% improvement over the witness pipeline.
+Peak total device use remained 6.775 / 7.463 GiB under the 7.5 GiB guard.
+The five-second full-path goal remains open.
+
+Use `prepare-device-relations.py` for the separate
+`target/compact-relations-device-20261108` overlay. With its matching worker,
+set `CMFD_DEVICE_RELATIONS=1` alongside `CMFD_WITNESS_PIPELINE=1` and the existing
+shared-model configuration. Both changed-stage transcripts match the previous
+implementation exactly; every complete final proof still passes the full CPU
+verifier. See
+[`DEVICE-RELATIONS-RESULTS-2026-11-08.md`](../../docs/compact-proof-testnet/DEVICE-RELATIONS-RESULTS-2026-11-08.md)
+for the comparisons, hardware scope, checks and restored mining state.
+
+## Pipelined witness candidate
+
+The new research overlay overlaps witness export on GPU B with upload on GPU A.
+It publishes 48 immutable, kernel-sealed 16 MiB chunks, validates every supplied
+field word and reconstructs the exact activations on A. A nonce/template-bound
+capture is consumed once. Both workers and the single resident model persist.
+
+On the same Rig06 Gen2 x1 links, two real pool blocks reached local acceptance
+in **9.277 and 9.002 seconds**, compared with **12.079 and 11.566 seconds** for
+the v0.4.0 shared-model baseline. This is a 22.7% reduction in mean acceptance
+time. The complete path remains above five seconds. Peak total device use
+stayed below 7.5 GiB per card on physical 16 GiB cards; physical 8 GB mobile
+cards have not yet been measured. Proof bytes, transcript and security
+parameters are unchanged. See
+[`WITNESS-PIPELINE-RESULTS-2026-11-08.md`](../../docs/compact-proof-testnet/WITNESS-PIPELINE-RESULTS-2026-11-08.md)
+for timings, checks and the next bottleneck.
+
+This candidate requires the newly built shared-model worker and matching
+controller. It is enabled explicitly with `CMFD_WITNESS_PIPELINE=1` alongside
+the existing `--shared-model` configuration below. The published v0.4.0 kit
+does not contain this optimization. Omitting the environment variable retains
+the sequential host-witness path.
+
 ## Shared resident model
 
 The shared-model mode keeps one immutable 6 GiB model on GPU B for both replay
@@ -121,8 +163,11 @@ also pass the independent full CPU verifier.
 
 `prepare-resident.py` creates an isolated overlay in
 `target/compact-multigpu-speed-20261107`; the qualified v0.3.0 source is preserved.
-`prepare-shared-model.py` builds the shared-model overlay separately in
-`target/compact-multigpu-shared-model-20261108` using the same pinned environment.
+`prepare-shared-model.py` builds the new overlay separately in
+`target/compact-witness-pipeline-20261108` using the same pinned environment,
+preserving the qualified v0.4.0 shared-model build. An optional
+`CMFD_COMPACT_BUILD_DIRECTORY` must name a direct child of the repository's
+`target` directory.
 Build with the existing pinned CUDA/Rust environment. The older
 `prepare-candidate.py` streaming implementation remains a reference.
 

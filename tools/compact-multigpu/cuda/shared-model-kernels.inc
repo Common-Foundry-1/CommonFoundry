@@ -17,6 +17,7 @@ void write_host_pre_only(const char* prefix,const uint32_t* pre,const std::vecto
     const auto parent=std::filesystem::path(prefix).parent_path();struct stat info{};
     if(::lstat(parent.c_str(),&info)!=0||!S_ISDIR(info.st_mode)||info.st_uid!=::geteuid()||(info.st_mode&077))
         throw std::runtime_error("resident witness requires owned private scratch");
+    if(stream_witness_enabled()){write_stream_witness(prefix,pre,coefficients,cells);return;}
     for(unsigned bank=0;bank<3;++bank){
         const std::string path=std::string(prefix)+"-bank"+std::to_string(bank)+"-pre.bin";
         int fd=::open(path.c_str(),O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0600);

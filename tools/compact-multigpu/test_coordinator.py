@@ -14,6 +14,51 @@ spec.loader.exec_module(c)
 
 
 class CoordinatorTests(unittest.TestCase):
+    def test_pipeline_starts_capture_before_export_and_consumes_it_once(self):
+        workers=[];events=[]
+        class Worker:
+            def __init__(self,executable,role,gpu,args,scratch,cache=None):
+                self.role=role;self.process=self;self.pid=700+len(workers);self.alive=True;self.command=None;workers.append(self)
+            def poll(self):return None if self.alive else 0
+            def send(self,value):self.command=value;events.append((self.role,value['op']))
+            def receive(self,expected,deadline,monitor):
+                if 'ready' in expected:return {'event':'ready','role':self.role,'network_id':'network','proof_version':2,'proof_system_digest':'e8d7ed68504e5ff76548a74beff735b22c3bb442cddf9b7dd119e943a58e3dc7','cache':{'pid':700},'shared_model':True}
+                if 'captured' in expected:return {'event':'captured','capture_id':self.command['capture_id'],'stats':{'chunks':48}}
+                if 'discarded' in expected:return {'event':'discarded'}
+                if 'reset' in expected:return {'event':'reset'}
+                if self.role=='fixed':return {'event':'fixed_done','id':0}
+                assert self.command['capture_id'];return {'event':'done','report':{'verified':True,'wire_bytes':1}}
+            def close(self):self.alive=False
+        class Monitor:
+            def __init__(self,devices):self.peak=[0]*len(devices)
+            def check(self):pass
+            def close(self):pass
+        with tempfile.TemporaryDirectory() as directory,patch.dict(os.environ,{'CMFD_SHARED_MODEL':'1','CMFD_WITNESS_PIPELINE':'1'}),patch.object(c,'Worker',Worker),patch.object(c,'Monitor',Monitor):
+            root=Path(directory);os.environ['CMFD_SHARED_REPLAY_SOCKET']=str(root/'model.sock')
+            (root/'template').write_bytes(b'{}');(root/'final').write_bytes(b'1234')
+            session=c.ResidentSession('worker',['network','model','fixed'],['GPU-a','GPU-b'])
+            try:
+                reply=session.replay(dict(op='replay',mode='full',coefficients=str(root/'coefficients'),prefix=str(root/'trace')))
+                self.assertEqual(reply['stream_capture']['chunks'],48)
+                self.assertLess(events.index(('dynamic','prefetch')),events.index(('fixed','replay')))
+                report=session.prove(root/'template',root/'trace',root/'final',root/'output')
+                self.assertTrue(report['witness_pipeline']);self.assertIsNone(session.capture)
+                session.replay(dict(op='replay',mode='full',coefficients=str(root/'coefficients'),prefix=str(root/'trace2')))
+                session.replay(dict(op='replay',mode='search',coefficients=str(root/'coefficients'),prefix=str(root/'next')))
+                self.assertIn(('dynamic','discard_capture'),events);self.assertIsNone(session.capture)
+                session.replay(dict(op='replay',mode='full',coefficients=str(root/'coefficients'),prefix=str(root/'trace3')))
+                with self.assertRaisesRegex(ValueError,'no matching prefetched witness'):
+                    session.prove(root/'template',root/'wrong-trace',root/'final',root/'wrong-output')
+                self.assertIsNone(session.capture);self.assertIsNone(session.dynamic)
+                self.assertFalse((root/'wrong-output').exists())
+                # A rejected capture must not poison the next replay or be reusable.
+                session.replay(dict(op='replay',mode='full',coefficients=str(root/'coefficients'),prefix=str(root/'trace4')))
+                self.assertTrue(session.prove(root/'template',root/'trace4',root/'final',root/'output4')['verified'])
+                with self.assertRaisesRegex(ValueError,'no matching prefetched witness'):
+                    session.prove(root/'template',root/'trace4',root/'final',root/'reused-output')
+                self.assertFalse((root/'reused-output').exists())
+            finally:session.close()
+
     def test_shared_model_reuses_both_workers_and_sealed_pre_only_transport(self):
         workers=[]
         class Process:

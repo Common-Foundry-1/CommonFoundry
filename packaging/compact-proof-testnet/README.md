@@ -1,12 +1,14 @@
-# Common Foundry Compact Proof Testnet - v0.4.0
+# Common Foundry Compact Proof Testnet - v0.5.0
 
 Welcome! This canary lets pools and miners exercise the new self-contained block proof, around 5.7 MB in our first public block. It keeps the ForgeMatrix workload and the existing field, hash, and BaseFold parameters. Ordinary nodes verify the complete proof without rerunning the miner's matrix computation. The public seed at `209.145.48.36:23444` also replays work as an optional audit comparison.
 
-v0.4.0 adds two-GPU proving and a shared resident-model mode. Replay resumes
-after a proof in 0.11-0.13 seconds in our measured setup, replacing its previous
-16.77-second model reload. The measured per-card peak was 7.46 GiB, with full
-proof verification and the same proof parameters. This was measured on physical
-16 GiB cards under a 7.5 GiB guard; physical 8 GB mobile testing is the next canary.
+v0.5.0 makes shared-model two-GPU proving faster with pipelined witness transfer
+and GPU-resident relation inputs. Our complete local pool acceptance improved
+from v0.4.0's 11.57-12.08 seconds to **8.27-8.52 seconds** on the same PCIe Gen2 x1
+rig. Peak device memory remained **6.77 / 7.46 GiB**, with full proof verification
+and unchanged security parameters. Post-proof replay resumes without reloading
+the model. These measurements used physical 16 GiB cards under a 7.5 GiB guard;
+physical 8 GB mobile testing is the next canary.
 
 Existing testnet keys, chain data, inputs, ledger and TLS certificates carry
 forward. This is the same network and v2 proof format.

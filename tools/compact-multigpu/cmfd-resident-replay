@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+"""Pool replay protocol proxy; the fixed service owns all CUDA allocations."""
+import os,sys
+from pathlib import Path
+from shared_model import request
+if len(sys.argv)!=3 or sys.argv[1]!='--server':raise SystemExit('usage: --server MODEL')
+path=os.environ['CMFD_SHARED_REPLAY_SOCKET'];request(path,{'op':'ping','model':sys.argv[2]})
+print('CMFD_V4_REPLAY_READY',flush=True)
+for line in sys.stdin:
+    fields=line.rstrip('\n').split('\t')
+    if fields==['QUIT']:break
+    if fields==['EVICT']:
+        request(path,{'op':'trim'});print('CMFD_V4_REPLAY_EVICTED',flush=True);continue
+    if len(fields)==4 and fields[0]=='RUN' and fields[1] in ('search','full'):
+        request(path,{'op':'replay','mode':fields[1],'coefficients':fields[2],'prefix':fields[3]})
+    elif fields[0] in ('RUNBATCH','RUNBATCHDIGEST') and len(fields)==(5 if fields[0]=='RUNBATCHDIGEST' else 4):
+        request(path,{'op':'replay','mode':'digest' if fields[0]=='RUNBATCHDIGEST' else 'batch','batch_size':int(fields[1]),'coefficients':fields[2],'prefix':fields[3],'challenges':fields[4] if len(fields)==5 else ''})
+    else:raise ValueError('invalid resident replay command')
+    print('CMFD_V4_REPLAY_DONE',flush=True)

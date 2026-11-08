@@ -27,6 +27,7 @@ def main():
     p.add_argument("--source-dirty", action="store_true")
     p.add_argument("--kit-version", default="0.2.0")
     p.add_argument("--qualification-report", type=Path)
+    p.add_argument("--multigpu-artifacts",type=Path,help="qualified two-GPU worker directory")
     args = p.parse_args()
     qualification = None
     if args.qualification_report is not None:
@@ -36,6 +37,10 @@ def main():
         for worker in ("cmfd-v4-replay", "cmfd-direct-prover"):
             if qualification.get("proof_workers", {}).get(worker) != digest(args.artifacts / worker):
                 raise ValueError(f"qualification does not match the packaged worker: {worker}")
+    if args.multigpu_artifacts is not None:
+        worker=args.multigpu_artifacts/'cmfd-direct-multigpu-worker'
+        if qualification is None or qualification.get('proof_workers',{}).get(worker.name)!=digest(worker):
+            raise ValueError('two-GPU worker is not bound to the qualification report')
     output = args.output.resolve()
     kit_name = f"commonfoundry-compact-testnet-v{args.kit_version}-linux-x86_64"
     stage = output / kit_name
@@ -47,6 +52,13 @@ def main():
             if digest(stage / name) != qualification["proof_workers"][name]:
                 raise ValueError(f"copied qualification worker differs: {name}")
     shutil.copy2(ROOT / "packaging/compact-proof-testnet/launch.py", stage / "launch.py")
+    if args.multigpu_artifacts is not None:
+        shutil.copy2(args.multigpu_artifacts/'cmfd-direct-multigpu-worker',stage/'cmfd-direct-multigpu-worker')
+        (stage/'cmfd-direct-multigpu-worker').chmod(0o755)
+        for name in ('coordinator.py','shared_model.py','cmfd-direct-multigpu-prover','cmfd-resident-replay','LICENSE-SP1-MIT'):
+            shutil.copy2(ROOT/'tools/compact-multigpu'/name,stage/name)
+            if name in ('cmfd-direct-multigpu-prover','cmfd-resident-replay'):(stage/name).chmod(0o755)
+        shutil.copy2(ROOT/'tools/compact-multigpu/README.md',stage/'MULTI-GPU.md')
     shutil.copy2(ROOT / "scripts/production-v4-inputs.py", stage / "production-v4-inputs.py")
     for path in (ROOT / "packaging/production-v4-pool/shared").iterdir():
         if path.name in ("V4-INPUT-CHUNKS.json", "production-v4-rcnet-1-inputs.json", "FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json"):
@@ -82,6 +94,9 @@ def main():
             "sha256": digest(args.qualification_report),
             "benchmark": qualification["benchmark"],
         }
+    if args.multigpu_artifacts is not None:
+        build['gpu_modes']=['single-gpu','two-gpu','shared-resident-model']
+        build['shared_model_total_device_guard_gib']=7.5
     (stage / "BUILD-INFO.json").write_text(json.dumps(build, indent=2) + "\n")
     files = {str(path.relative_to(stage)).replace("\\", "/"): {"bytes": path.stat().st_size, "sha256": digest(path)}
         for path in sorted(stage.rglob("*")) if path.is_file()}

@@ -1,12 +1,24 @@
-# Common Foundry Compact Proof Testnet — pool canary v0.3.0
+# Common Foundry Compact Proof Testnet - v0.4.0
 
 Welcome! This canary lets pools and miners exercise the new self-contained block proof, around 5.7 MB in our first public block. It keeps the ForgeMatrix workload and the existing field, hash, and BaseFold parameters. Ordinary nodes verify the complete proof without rerunning the miner's matrix computation. The public seed at `209.145.48.36:23444` also replays work as an optional audit comparison.
+
+v0.4.0 adds two-GPU proving and a shared resident-model mode. Replay resumes
+after a proof in 0.11-0.13 seconds in our measured setup, replacing its previous
+16.77-second model reload. The measured per-card peak was 7.46 GiB, with full
+proof verification and the same proof parameters. This was measured on physical
+16 GiB cards under a 7.5 GiB guard; physical 8 GB mobile testing is the next canary.
+
+Existing testnet keys, chain data, inputs, ledger and TLS certificates carry
+forward. This is the same network and v2 proof format.
 
 ## What you need
 
 Use x86-64 Linux with glibc 2.35 or newer (Ubuntu 22.04 or newer), Python 3.10+, curl, and sha256sum. GPU roles need a working NVIDIA driver and CUDA 12 runtime (`libcudart.so.12`). This prover includes RTX 30, 40, and 50 architecture targets. Our physical 16 GB proof testing used an RTX 5070 Ti; please include your GPU model in feedback.
 
 A pool's first input download is about **61.2 GB**. Allow **150 GB free disk** during first preparation for input chunks, assembled files, and scratch, and **32 GB system RAM**, with 64 GB useful for running several roles. A pool miner or CPU node downloads only the **6.44 GB model bank**. Downloads resume and authenticate against bundled SHA-256 manifests. Existing inputs can be reused with `--inputs /absolute/path/to/inputs`.
+
+The shared-model test also ran on a 16 GB system. More host RAM is useful for
+busy pools and extra roles; the worker checks available RAM throughout proving.
 
 Inputs and node/pool/miner data default to `~/.local/share/commonfoundry-compact-testnet1`, so extracting an updated kit keeps your authenticated inputs and chain. If you used v0.1.0's in-package data directory, pass its existing path with `--inputs` and `--data-dir` when starting v0.2.0.
 
@@ -24,6 +36,27 @@ The first start prepares inputs, creates dedicated testnet storage and a pool TL
 Reserve the proof GPU for pool workers and run mining clients on other GPUs or rigs. Pools with separate devices can use `--replay-gpu 0 --proof-gpu 1`; this is a useful layout for 16 GB proof cards. The prover keeps its memory guard active. The default operator fee is zero for this canary. Add `--enable-payouts` to exercise automatic testnet payouts after coinbase maturity (100 blocks). Ctrl+C gracefully stops the pool; rerunning the same command preserves the testnet ledger and certificate.
 
 The reference pool uses Common Foundry's certificate-pinned pool protocol. Operators using another pool stack can first run this reference instance, then coordinate their own integration with us.
+
+### Two-GPU shared resident model
+
+Create the bounded RAM mount described below, then run:
+
+```bash
+./START-POOL.sh --public-ip YOUR_NUMERIC_PUBLIC_IP \
+  --proof-gpus 0,1 --replay-gpu 1 --serial-gpu --shared-model \
+  --ram-witness-dir /dev/shm/cmfd-pool-witness
+```
+
+GPU 0 handles dynamic proving; GPU 1 keeps one model for replay and fixed-proof
+reductions. Reserve both cards for the pool; miners connect from other GPUs or
+hosts. No NVLink or direct GPU peer access is needed. `MULTI-GPU.md` contains
+the measured modes, device selection, memory budget and restart behavior.
+
+Two live blocks reached pool evaluation plus local node admission in 12.08 and
+11.57 seconds on Rig06's PCIe Gen2 x1 risers. About 4.7 seconds was witness
+export/upload over those links; the five-second complete-path goal remains open.
+The existing single-GPU prover and its previously measured profile remain
+available. These are distinct hardware/mode measurements.
 
 ### RAM witnesses and one proof/replay GPU
 

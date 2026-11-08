@@ -20,6 +20,26 @@ spec.loader.exec_module(launcher)
 
 
 class CompactPackageTests(unittest.TestCase):
+    def test_multigpu_payload_is_qualified_and_has_executable_proxy(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);artifacts=root/'artifacts';artifacts.mkdir()
+            for name in ('cmfd-node','cmfd-miner','cmfd-v4-replay','cmfd-direct-prover','cmfd-direct-multigpu-worker'):
+                (artifacts/name).write_bytes(name.encode())
+            qualification={'schema':'CMFD_COMPACT_TESTNET_QUALIFICATION_V1','network_id':launcher.NETWORK,
+                'proof_workers':{name:hashlib.sha256((artifacts/name).read_bytes()).hexdigest() for name in ('cmfd-v4-replay','cmfd-direct-prover','cmfd-direct-multigpu-worker')},'benchmark':{}}
+            report=root/'proof.json';report.write_text(json.dumps(qualification))
+            command=[sys.executable,str(SOURCE.parents[2]/'scripts/package-compact-testnet.py'),'--artifacts',str(artifacts),
+                '--multigpu-artifacts',str(artifacts),'--output',str(root/'output'),'--source-commit','a'*40,'--kit-version','0.4.0','--qualification-report',str(report)]
+            qualification['proof_workers']['cmfd-direct-multigpu-worker']='00'*32;report.write_text(json.dumps(qualification))
+            self.assertNotEqual(subprocess.run(command,capture_output=True).returncode,0)
+            qualification['proof_workers']['cmfd-direct-multigpu-worker']=hashlib.sha256((artifacts/'cmfd-direct-multigpu-worker').read_bytes()).hexdigest();report.write_text(json.dumps(qualification))
+            subprocess.run(command,check=True,capture_output=True)
+            archive=root/'output/commonfoundry-compact-testnet-v0.4.0-linux-x86_64.tar.gz'
+            with tarfile.open(archive) as kit:
+                entry=kit.getmember('commonfoundry-compact-testnet-v0.4.0-linux-x86_64/cmfd-resident-replay')
+                self.assertTrue(entry.mode&0o111)
+                self.assertIn('commonfoundry-compact-testnet-v0.4.0-linux-x86_64/shared_model.py',kit.getnames())
+
     def test_qualification_is_bound_to_the_worker_bytes_and_bundled(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
@@ -180,7 +200,7 @@ class CompactPackageTests(unittest.TestCase):
                     patch.object(sys, "argv", ["launch.py", "pool", "--public-ip", "127.0.0.1", "--check", "--sealed-witness"] + options), \
                     patch.object(launcher, "verify"), \
                     patch.object(launcher, "validate_ram_witness_directory", return_value=Path("/private-witness")):
-                with self.assertRaisesRegex(ValueError, "requires --ram-witness-dir and --serial-gpu"):
+                with self.assertRaisesRegex(ValueError, "requires --ram-witness-dir and a serial or split GPU layout"):
                     launcher.main()
 
     def test_sealed_profile_selects_tested_startup_defaults_and_preserves_overrides(self):

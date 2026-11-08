@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+kit="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+export CMFD_DIRECT_MULTI_GPU_WORKER="$kit/cmfd-direct-multigpu-worker"
+exec python3 -B "$kit/coordinator.py" "$@"

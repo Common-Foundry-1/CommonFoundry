@@ -30,7 +30,7 @@ def sha256(path):
     return h.hexdigest()
 
 
-def verify(root=ROOT, worker=False):
+def verify(root=ROOT, worker=False, multi=False):
     manifest = json.loads((root / "PACKAGE-MANIFEST.json").read_text())
     if manifest["network_id"] != NETWORK:
         raise ValueError("package network identity differs from this launcher")
@@ -41,7 +41,8 @@ def verify(root=ROOT, worker=False):
         if not path.is_file() or path.stat().st_size != expected["bytes"] or sha256(path) != expected["sha256"]:
             raise ValueError(f"package checksum mismatch: {name}")
     if worker:
-        info = json.loads(subprocess.check_output([str(root / "cmfd-direct-prover"), "network-info"]))
+        program = "cmfd-direct-multigpu-prover" if multi else "cmfd-direct-prover"
+        info = json.loads(subprocess.check_output([str(root / program), "network-info"]))
         if info["network_id"] != NETWORK or info["proof_version"] != 2:
             raise ValueError("proof worker has the wrong network identity")
     print("Compact Proof Testnet-1 package verified.", file=sys.stderr, flush=True)
@@ -132,15 +133,17 @@ def build_command(args, inputs, data):
     command = common(inputs, data) + ["pool-serve", "--bind", f"{local}:{args.pool_port}",
         "--p2p-bind", args.p2p_bind, "--certificate", str(cert), "--private-key", str(key),
         "--share-leading-zero-bits", str(args.share_bits),
-        "--production-v4-pool-replay-worker", str(ROOT / "cmfd-v4-replay"),
-        "--production-v4-pool-proof-worker", str(ROOT / "cmfd-direct-prover"),
+        "--production-v4-pool-replay-worker", str(ROOT / ("cmfd-resident-replay" if getattr(args,'shared_model',False) else "cmfd-v4-replay")),
+        "--production-v4-pool-proof-worker", str(ROOT / ("cmfd-direct-multigpu-prover" if getattr(args,'proof_gpus',None) else "cmfd-direct-prover")),
         "--production-v4-pool-scratch", str(args.ram_witness_dir or data / "pool-scratch"),
         "--pool-operator-fee-bps", "0", "--work-bank", args.work_bank,
         "--allow-public-pool-clients", "--allow-address-only-payouts"] + peers(args.peer)
-    if args.replay_gpu is not None:
-        command += ["--production-v4-pool-replay-gpu", args.replay_gpu]
+    for gpu in args.replay_gpu or []:
+        command += ["--production-v4-pool-replay-gpu", gpu]
     if args.proof_gpu is not None:
         command += ["--production-v4-pool-proof-gpu", args.proof_gpu]
+    if getattr(args,'proof_gpus',None) is not None:
+        command += ["--production-v4-pool-proof-gpus", args.proof_gpus]
     if args.serial_gpu:
         command += ["--production-v4-pool-serial-gpu"]
     if args.enable_payouts:
@@ -176,14 +179,19 @@ def main():
             p.add_argument("--bind-ip", default="0.0.0.0")
             p.add_argument("--pool-port", type=int, default=23445)
             p.add_argument("--share-bits", type=int, choices=range(7), default=4)
-            p.add_argument("--replay-gpu")
-            p.add_argument("--proof-gpu")
+            p.add_argument("--replay-gpu", action="append")
+            proof_group=p.add_mutually_exclusive_group()
+            proof_group.add_argument("--proof-gpu")
+            proof_group.add_argument("--proof-gpus", help="two GPUs for one compact proof, for example 0,1")
             p.add_argument("--ram-witness-dir", type=Path,
                 help="private Linux tmpfs mount capped at 2 GiB for pool witness files")
             p.add_argument("--serial-gpu", action="store_true",
                 help="release the one replay GPU's model while that same GPU proves")
             p.add_argument("--sealed-witness", action="store_true",
                 help="hand replay traces directly to the prover in immutable Linux RAM")
+            p.add_argument("--gpu-witness",action="store_true",
+                help="snapshot the replay witness directly on the shared proving GPU")
+            p.add_argument("--shared-model",action="store_true",help="reuse fixed GPU weights for replay without a model reload")
             p.add_argument("--enable-payouts", action="store_true")
         else:
             p.add_argument("--pool", required=True)
@@ -193,13 +201,25 @@ def main():
             p.add_argument("--yield-gpu-on-share", action="store_true",
                 help="release mining model VRAM while a shared GPU checks or proves each share")
     args = parser.parse_args()
+    if args.action=='pool' and args.shared_model:
+        if not args.proof_gpus or not args.serial_gpu or len(args.replay_gpu or [])!=1 or args.gpu_witness or args.sealed_witness:
+            raise ValueError('shared model requires two proving GPUs, one serial replay GPU on the second card, and no other witness mode')
+        os.environ.update(CMFD_SHARED_MODEL='1',CMFD_REPLAY_GPU_IPC='0',CMFD_REPLAY_SEALED_EXPORT='0')
+    if args.action=="pool" and args.gpu_witness:
+        if not args.proof_gpus or not args.serial_gpu or len(args.replay_gpu or [])!=1 or args.sealed_witness:
+            raise ValueError("GPU witness handoff requires split proving, one serial replay GPU, and no sealed-witness flag")
+        os.environ['CMFD_REPLAY_GPU_IPC']='1'
+        os.environ['CMFD_REPLAY_SEALED_EXPORT']='0'
+    if args.action == "pool" and args.proof_gpus:
+        # Bound both replay and prover module residency on 8 GB cards.
+        os.environ["CUDA_MODULE_LOADING"] = "LAZY"
     os.environ["LD_LIBRARY_PATH"] = str(ROOT / "lib") + (
         ":" + os.environ["LD_LIBRARY_PATH"] if os.environ.get("LD_LIBRARY_PATH") else "")
     for cuda in (os.environ.get("CUDA_HOME", ""), "/usr/local/cuda-12.9", "/usr/local/cuda-12.8", "/usr/local/cuda-12", "/usr/local/cuda"):
         if cuda and (Path(cuda) / "lib64/libcudart.so.12").is_file():
             os.environ["LD_LIBRARY_PATH"] += ":" + str(Path(cuda) / "lib64")
             break
-    verify(worker=args.action in ("pool", "miner"))
+    verify(worker=args.action in ("pool", "miner"),multi=args.action=="pool" and args.proof_gpus is not None)
     if args.action == "verify":
         return
     if args.action == "new-address":
@@ -229,9 +249,11 @@ def main():
     data = args.data_dir.expanduser().resolve()
     if args.action == "pool" and args.ram_witness_dir is not None:
         args.ram_witness_dir = validate_ram_witness_directory(args.ram_witness_dir)
+    if args.action=='pool' and args.shared_model:
+        os.environ['CMFD_SHARED_REPLAY_SOCKET']=str((args.ram_witness_dir or data/'pool-scratch')/'model.sock')
     if args.action == "pool" and args.sealed_witness:
-        if args.ram_witness_dir is None or not args.serial_gpu:
-            raise ValueError("sealed witness handoff requires --ram-witness-dir and --serial-gpu")
+        if args.ram_witness_dir is None or not (args.serial_gpu or args.proof_gpus):
+            raise ValueError("sealed witness handoff requires --ram-witness-dir and a serial or split GPU layout")
         os.environ["CMFD_REPLAY_SEALED_EXPORT"] = "1"
         os.environ.setdefault("CMFD_REPLAY_PARALLEL_LOAD", "1")
         os.environ.setdefault("CUDA_MODULE_LOADING", "EAGER")

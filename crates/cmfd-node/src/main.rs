@@ -923,14 +923,19 @@ enum Command {
         #[arg(long = "production-v4-pool-replay-gpu")]
         production_v4_pool_replay_gpus: Vec<String>,
         /// Run the proof worker on this GPU, a CUDA device index or GPU UUID.
-        /// Omit to use the pool process's default CUDA device. A proof needs
-        /// about 7 GiB of free VRAM, so on 16 GB cards give it a GPU that runs
-        /// no replay worker.
+        /// Omit to use the pool process's default CUDA device. Reserve enough
+        /// VRAM for the selected prover, or use serial mode to evict replay.
         #[arg(long)]
         production_v4_pool_proof_gpu: Option<String>,
+        /// Split one compact proof across two GPUs, for example 0,1. Use the
+        /// multi-GPU coordinator as proof-worker. Replay can use separate GPUs,
+        /// or one of these GPUs with serial mode.
+        #[arg(long, conflicts_with = "production_v4_pool_proof_gpu")]
+        production_v4_pool_proof_gpus: Option<String>,
         /// Share one GPU sequentially: evict replay weights before proving and
         /// prevent share replay from reloading them until the proof is finished.
-        /// Requires one explicit replay GPU and the same explicit proof GPU.
+        /// For split proving, replay must use the first proving GPU; the second
+        /// keeps fixed weights resident.
         #[arg(long)]
         production_v4_pool_serial_gpu: bool,
         /// Absolute native path to the persistent ProductionV4 proof worker.
@@ -2404,6 +2409,7 @@ fn run_command() -> Result<(), Box<dyn std::error::Error>> {
             production_v4_pool_replay_worker,
             production_v4_pool_replay_gpus,
             production_v4_pool_proof_gpu,
+            production_v4_pool_proof_gpus,
             production_v4_pool_serial_gpu,
             production_v4_pool_proof_worker,
             production_v4_pool_scratch,
@@ -2522,6 +2528,7 @@ fn run_command() -> Result<(), Box<dyn std::error::Error>> {
                 production_v4_pool_replay_worker.as_ref(),
                 &production_v4_pool_replay_gpus,
                 production_v4_pool_proof_gpu.as_deref(),
+                production_v4_pool_proof_gpus.as_deref(),
                 production_v4_pool_serial_gpu,
                 production_v4_pool_proof_worker.as_ref(),
                 production_v4_pool_scratch.as_ref(),
@@ -2690,6 +2697,7 @@ fn run_command() -> Result<(), Box<dyn std::error::Error>> {
                     "share_batch_wait_ms": pool_share_batch_wait_ms,
                     "replay_gpus": production_v4_pool_replay_gpus,
                     "proof_gpu": production_v4_pool_proof_gpu,
+                    "proof_gpus": production_v4_pool_proof_gpus,
                     "serial_gpu": production_v4_pool_serial_gpu,
                     "work_checks_use_replay_workers": work_checks_use_replay_workers,
                     "ledger_max_bytes": pool_ledger_max_bytes,
@@ -3476,6 +3484,7 @@ fn configure_production_v4_pool_verifier(
     replay_worker: Option<&PathBuf>,
     replay_gpus: &[String],
     proof_gpu: Option<&str>,
+    proof_gpus: Option<&str>,
     serial_gpu: bool,
     proof_worker: Option<&PathBuf>,
     scratch_directory: Option<&PathBuf>,
@@ -3484,6 +3493,7 @@ fn configure_production_v4_pool_verifier(
     let supplied = replay_worker.is_some()
         || !replay_gpus.is_empty()
         || proof_gpu.is_some()
+        || proof_gpus.is_some()
         || serial_gpu
         || proof_worker.is_some()
         || scratch_directory.is_some()
@@ -3508,11 +3518,72 @@ fn configure_production_v4_pool_verifier(
 
     #[cfg(feature = "production-v4")]
     {
-        if serial_gpu
-            && (replay_gpus.len() != 1 || proof_gpu != replay_gpus.first().map(String::as_str))
+        let mut split_devices = proof_gpus
+            .map(cmfd_node::production_v4_pool::production_v4_split_proof_devices)
+            .transpose()?;
+        let mut physical_replays = replay_gpus.to_vec();
+        if let Some(devices) = &split_devices {
+            if wsl_distribution.is_some() {
+                return Err("split proving requires a native Linux pool".into());
+            }
+            let output = std::process::Command::new("nvidia-smi")
+                .args(["--query-gpu=index,uuid", "--format=csv,noheader,nounits"])
+                .output()?;
+            if !output.status.success() {
+                return Err("cannot resolve physical NVIDIA GPU identities".into());
+            }
+            let inventory = std::str::from_utf8(&output.stdout)?;
+            let resolved = cmfd_node::production_v4_pool::production_v4_resolve_gpu_devices(
+                devices, inventory,
+            )?;
+            physical_replays = cmfd_node::production_v4_pool::production_v4_resolve_gpu_devices(
+                replay_gpus,
+                inventory,
+            )?;
+            split_devices = Some(resolved.try_into().map_err(|_| "split GPU count")?);
+        }
+        let replay_gpus = &physical_replays;
+        let shared_model = std::env::var("CMFD_SHARED_MODEL").as_deref() == Ok("1");
+        if shared_model
+            && (split_devices.is_none()
+                || !serial_gpu
+                || std::env::var("CMFD_REPLAY_GPU_IPC").as_deref() == Ok("1"))
+        {
+            return Err("shared model replay requires split proving, serial mode and host preactivation transport".into());
+        }
+        if std::env::var("CMFD_REPLAY_GPU_IPC").as_deref() == Ok("1")
+            && (split_devices.is_none() || !serial_gpu)
         {
             return Err(
-                "serial GPU mode requires one explicit replay GPU and the same explicit proof GPU"
+                "GPU witness handoff requires split proving with serial replay on its first GPU"
+                    .into(),
+            );
+        }
+        if split_devices.is_some()
+            && !matches!(
+                COMPILED_NETWORK_PROFILE.proof,
+                ProofProfile::ProductionV4Direct
+            )
+        {
+            return Err("split proving requires the compact testnet".into());
+        }
+        if let Some(devices) = &split_devices {
+            if replay_gpus.is_empty() {
+                return Err("split proving requires explicit replay GPUs".into());
+            }
+            if !serial_gpu && replay_gpus.iter().any(|gpu| devices.contains(gpu)) {
+                return Err("overlapping replay and proof GPUs require serial GPU mode".into());
+            }
+        }
+        let replay_matches_proof = match &split_devices {
+            Some(devices) => replay_gpus.first().is_some_and(|replay| {
+                devices.get(if shared_model { 1 } else { 0 }) == Some(replay)
+            }),
+            None => proof_gpu == replay_gpus.first().map(String::as_str),
+        };
+        if serial_gpu && (replay_gpus.len() != 1 || !replay_matches_proof) {
+            return Err(
+                "serial GPU mode requires one replay GPU matching its proving role (second GPU for shared model, first otherwise)"
                     .into(),
             );
         }
@@ -3535,17 +3606,39 @@ fn configure_production_v4_pool_verifier(
             .ok_or("ProductionV4 fixed artifact record has no parent directory")?;
         // One replay worker per listed GPU, each pinned with its own
         // CUDA_VISIBLE_DEVICES; none listed keeps one worker on the pool's GPU.
+        let shared_socket = if shared_model {
+            let path = PathBuf::from(
+                std::env::var_os("CMFD_SHARED_REPLAY_SOCKET")
+                    .ok_or("shared model socket is missing")?,
+            );
+            if !path.is_absolute()
+                || path.parent() != Some(scratch_directory.as_path())
+                || path.as_os_str().len() > 103
+            {
+                return Err(
+                    "shared model socket must be a short absolute path inside pool scratch".into(),
+                );
+            }
+            Some(path.into_os_string())
+        } else {
+            None
+        };
         let replay_command = |device: Option<String>| ProductionV4PoolWorkerCommand {
             program: replay_worker.clone(),
             arguments: vec!["--server".into(), artifacts.bank.as_os_str().to_owned()],
             environment: device
                 .map(|device| ("CUDA_VISIBLE_DEVICES".into(), device.into()))
                 .into_iter()
+                .chain(
+                    shared_socket
+                        .clone()
+                        .map(|socket| ("CMFD_SHARED_REPLAY_SOCKET".into(), socket)),
+                )
                 .collect(),
         };
         let mut extra_replays = Vec::new();
         let (replay, proof, worker_scratch_directory) = match wsl_distribution {
-            Some(_) if !replay_gpus.is_empty() || proof_gpu.is_some() => {
+            Some(_) if !replay_gpus.is_empty() || proof_gpu.is_some() || proof_gpus.is_some() => {
                 return Err(
                     "--production-v4-pool-replay-gpu and --production-v4-pool-proof-gpu need a native Linux pool, not WSL".into(),
                 );
@@ -3582,8 +3675,19 @@ fn configure_production_v4_pool_verifier(
                         artifacts.bank.as_os_str(),
                         fixed_artifact_directory.as_os_str(),
                     ),
-                    environment: match proof_gpu {
-                        Some(gpu) => {
+                    environment: match (&split_devices, proof_gpu) {
+                        (Some(devices), _) => {
+                            let mut environment = vec![(
+                                "CMFD_DIRECT_MULTI_GPU_DEVICES".into(),
+                                devices.join(",").into(),
+                            )];
+                            if let Some(socket) = shared_socket.clone() {
+                                environment.push(("CMFD_SHARED_MODEL".into(), "1".into()));
+                                environment.push(("CMFD_SHARED_REPLAY_SOCKET".into(), socket));
+                            }
+                            environment
+                        }
+                        (None, Some(gpu)) => {
                             let device = cmfd_node::production_v4_pool::production_v4_worker_cuda_visible_device(Some(gpu))?;
                             if !serial_gpu && replay_gpus.iter().any(|replay| replay == gpu) {
                                 tracing::warn!(
@@ -3593,7 +3697,7 @@ fn configure_production_v4_pool_verifier(
                             }
                             vec![("CUDA_VISIBLE_DEVICES".into(), device.into())]
                         }
-                        None => {
+                        (None, None) => {
                             if !replay_gpus.is_empty() {
                                 tracing::warn!(
                                     "no --production-v4-pool-proof-gpu: the proof worker runs on the pool process's default CUDA device, which may also host a replay worker"

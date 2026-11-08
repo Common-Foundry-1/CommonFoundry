@@ -413,6 +413,21 @@ impl ProductionV4PersistentPoolVerifier {
         validate_expected_network_id(expected_network_id)?;
         validate_scratch_paths(&config.scratch_directory, &config.worker_scratch_directory)?;
         fs::create_dir_all(&config.scratch_directory).map_err(replay_error)?;
+        // Shared replay borrows the proof service's already resident weights.
+        let shared_model = config
+            .proof
+            .environment
+            .iter()
+            .any(|(key, value)| key == "CMFD_SHARED_MODEL" && value == "1");
+        let early_proof = if shared_model {
+            Some(PersistentWorker::start(
+                &config.proof,
+                "CMFD_V4_PROOF_READY",
+                "ProductionV4 proof worker",
+            )?)
+        } else {
+            None
+        };
         // Every replay worker loads the model on its own GPU; start them together.
         let start_searcher = |replay: ProductionV4PoolWorkerCommand| {
             ProductionV4PersistentPoolSearcher::start_pinned(
@@ -445,11 +460,15 @@ impl ProductionV4PersistentPoolVerifier {
             (first, extra)
         });
         let (searcher, extra_searchers) = (searcher?, extra_searchers?);
-        let proof = PersistentWorker::start(
-            &config.proof,
-            "CMFD_V4_PROOF_READY",
-            "ProductionV4 proof worker",
-        )?;
+        let proof = if let Some(proof) = early_proof {
+            proof
+        } else {
+            PersistentWorker::start(
+                &config.proof,
+                "CMFD_V4_PROOF_READY",
+                "ProductionV4 proof worker",
+            )?
+        };
         let mut startup_id = [0_u8; 8];
         getrandom::fill(&mut startup_id).map_err(replay_error)?;
         Ok(Self {
@@ -1717,6 +1736,112 @@ fn validate_wsl_distribution(distribution: &str) -> Result<(), PoolError> {
 /// CUDA enumerates a one-device visibility mask as ordinal zero. Pool miners
 /// pass an explicit UUID. With no override, preserve the historical WSL
 /// default of GPU zero and let native solo workers inherit their own mask.
+pub fn production_v4_split_proof_devices(selected: &str) -> Result<[String; 2], PoolError> {
+    let parts = selected.split(',').collect::<Vec<_>>();
+    if parts.len() != 2 {
+        return Err(pool_replay_failure(
+            "split proving requires exactly two GPU selectors",
+        ));
+    }
+    let first = production_v4_worker_cuda_visible_device(Some(parts[0]))?;
+    let second = production_v4_worker_cuda_visible_device(Some(parts[1]))?;
+    if first.eq_ignore_ascii_case(&second) {
+        return Err(pool_replay_failure(
+            "split proving requires two different GPUs",
+        ));
+    }
+    // The coordinator also resolves indices and UUIDs to physical identities,
+    // rejecting aliases of one GPU before it initializes either CUDA worker.
+    Ok([first, second])
+}
+
+/// Resolve every pool role against one physical inventory. Numeric/UUID aliases
+/// must not accidentally place a resident replay model on a proving GPU.
+pub fn production_v4_resolve_gpu_devices(
+    selected: &[String],
+    inventory: &str,
+) -> Result<Vec<String>, PoolError> {
+    let mut devices = Vec::new();
+    for line in inventory.lines().filter(|line| !line.trim().is_empty()) {
+        let Some((index, uuid)) = line.split_once(',') else {
+            return Err(pool_replay_failure("invalid NVIDIA GPU inventory"));
+        };
+        let index = index.trim().parse::<u32>().map_err(replay_error)?;
+        let uuid = production_v4_worker_cuda_visible_device(Some(uuid.trim()))?;
+        if !uuid.starts_with("GPU-")
+            || devices
+                .iter()
+                .any(|(old, id): &(u32, String)| *old == index || id.eq_ignore_ascii_case(&uuid))
+        {
+            return Err(pool_replay_failure("ambiguous NVIDIA GPU inventory"));
+        }
+        devices.push((index, uuid));
+    }
+    let mut resolved = Vec::new();
+    for value in selected {
+        production_v4_worker_cuda_visible_device(Some(value))?;
+        let found = devices
+            .iter()
+            .find(|(index, uuid)| {
+                value.parse::<u32>().is_ok_and(|number| number == *index)
+                    || value.eq_ignore_ascii_case(uuid)
+            })
+            .ok_or_else(|| {
+                pool_replay_failure("selected GPU is absent from the NVIDIA inventory")
+            })?;
+        if resolved.contains(&found.1) {
+            return Err(pool_replay_failure(
+                "GPU selectors resolve to the same physical GPU",
+            ));
+        }
+        resolved.push(found.1.clone());
+    }
+    Ok(resolved)
+}
+
+#[cfg(test)]
+mod split_gpu_tests {
+    use super::{
+        production_v4_resolve_gpu_devices as resolve, production_v4_split_proof_devices as parse,
+    };
+    #[test]
+    fn accepts_two_devices_and_preserves_order() {
+        assert_eq!(parse("0,1").unwrap(), ["0", "1"]);
+        assert_eq!(
+            parse("GPU-6342414c-41d3-a4cc-a405-9805b502a1a6,1").unwrap()[1],
+            "1"
+        );
+    }
+    #[test]
+    fn rejects_duplicate_missing_and_malformed_devices() {
+        for value in [
+            "",
+            "0",
+            "0,0",
+            "0,1,2",
+            "0, 1",
+            "0,",
+            "-1,2",
+            "GPU-invalid,1",
+        ] {
+            assert!(parse(value).is_err(), "accepted {value}");
+        }
+    }
+    #[test]
+    fn physical_resolution_rejects_aliases_and_finds_roles() {
+        let first = "GPU-6342414c-41d3-a4cc-a405-9805b502a1a6";
+        let second = "GPU-82d90784-fef6-05e7-9e95-ae39e0b43f81";
+        let inventory = format!("0, {first}\n1, {second}\n");
+        assert_eq!(
+            resolve(&["1".into(), first.into()], &inventory).unwrap(),
+            [second, first]
+        );
+        assert!(resolve(&["0".into(), first.into()], &inventory).is_err());
+        assert!(resolve(&["2".into()], &inventory).is_err());
+        assert!(resolve(&["0".into()], &format!("0, {first}\n1, {first}")).is_err());
+    }
+}
+
 pub fn production_v4_worker_cuda_visible_device(
     explicit: Option<&str>,
 ) -> Result<String, PoolError> {
@@ -2023,6 +2148,48 @@ done"#;
     #[cfg(unix)]
     fn worker_test_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!("cmfd-pool-worker-{label}-{}", std::process::id()))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_model_starts_proof_owner_before_replay_client() {
+        let scratch = worker_test_path("shared-start-order");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let ready = scratch.join("model-ready");
+        let command = |script: &str| ProductionV4PoolWorkerCommand {
+            program: PathBuf::from("/bin/sh"),
+            arguments: vec![
+                "-c".into(),
+                script.into(),
+                "shared-test".into(),
+                ready.as_os_str().to_owned(),
+            ],
+            environment: vec![],
+        };
+        let mut proof = command(
+            ": > \"$1\"; printf 'CMFD_V4_PROOF_READY\\n'; while read -r line; do [ \"$line\" = QUIT ] && break; done",
+        );
+        proof
+            .environment
+            .push(("CMFD_SHARED_MODEL".into(), "1".into()));
+        let replay = command(
+            "[ -e \"$1\" ] || exit 3; printf 'CMFD_V4_REPLAY_READY\\n'; while read -r line; do [ \"$line\" = QUIT ] && break; done",
+        );
+        let verifier = ProductionV4PersistentPoolVerifier::start_for_network(
+            [7; 32],
+            ProductionV4PoolVerifierConfig {
+                replay,
+                extra_replays: vec![],
+                proof,
+                scratch_directory: scratch.clone(),
+                worker_scratch_directory: scratch.to_str().unwrap().into(),
+                work_check_pin: None,
+            },
+        )
+        .unwrap();
+        assert!(ready.exists());
+        drop(verifier);
+        std::fs::remove_dir_all(scratch).unwrap();
     }
 
     #[cfg(unix)]

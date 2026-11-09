@@ -938,6 +938,11 @@ enum Command {
         /// keeps fixed weights resident.
         #[arg(long)]
         production_v4_pool_serial_gpu: bool,
+        /// Keep replay resident between ordinary shares on GPUs dedicated to
+        /// this pool. Native Linux only; excludes local CMFD miners and still
+        /// evicts replay before proving. Mining clients must use other GPUs.
+        #[arg(long, requires = "production_v4_pool_serial_gpu")]
+        production_v4_pool_keep_replay_resident: bool,
         /// Absolute native path to the persistent ProductionV4 proof worker.
         #[arg(long)]
         production_v4_pool_proof_worker: Option<PathBuf>,
@@ -2411,6 +2416,7 @@ fn run_command() -> Result<(), Box<dyn std::error::Error>> {
             production_v4_pool_proof_gpu,
             production_v4_pool_proof_gpus,
             production_v4_pool_serial_gpu,
+            production_v4_pool_keep_replay_resident,
             production_v4_pool_proof_worker,
             production_v4_pool_scratch,
             production_v4_pool_wsl_distribution,
@@ -2530,6 +2536,7 @@ fn run_command() -> Result<(), Box<dyn std::error::Error>> {
                 production_v4_pool_proof_gpu.as_deref(),
                 production_v4_pool_proof_gpus.as_deref(),
                 production_v4_pool_serial_gpu,
+                production_v4_pool_keep_replay_resident,
                 production_v4_pool_proof_worker.as_ref(),
                 production_v4_pool_scratch.as_ref(),
                 production_v4_pool_wsl_distribution.as_deref(),
@@ -2699,6 +2706,7 @@ fn run_command() -> Result<(), Box<dyn std::error::Error>> {
                     "proof_gpu": production_v4_pool_proof_gpu,
                     "proof_gpus": production_v4_pool_proof_gpus,
                     "serial_gpu": production_v4_pool_serial_gpu,
+                    "keep_replay_resident": production_v4_pool_keep_replay_resident,
                     "work_checks_use_replay_workers": work_checks_use_replay_workers,
                     "ledger_max_bytes": pool_ledger_max_bytes,
                     "dashboard": dashboard.as_ref().map(|dashboard| format!("http://{}", dashboard.local_addr())),
@@ -3486,6 +3494,7 @@ fn configure_production_v4_pool_verifier(
     proof_gpu: Option<&str>,
     proof_gpus: Option<&str>,
     serial_gpu: bool,
+    keep_replay_resident: bool,
     proof_worker: Option<&PathBuf>,
     scratch_directory: Option<&PathBuf>,
     wsl_distribution: Option<&str>,
@@ -3495,6 +3504,7 @@ fn configure_production_v4_pool_verifier(
         || proof_gpu.is_some()
         || proof_gpus.is_some()
         || serial_gpu
+        || keep_replay_resident
         || proof_worker.is_some()
         || scratch_directory.is_some()
         || wsl_distribution.is_some();
@@ -3521,8 +3531,15 @@ fn configure_production_v4_pool_verifier(
         let mut split_devices = proof_gpus
             .map(cmfd_node::production_v4_pool::production_v4_split_proof_devices)
             .transpose()?;
+        if keep_replay_resident && (!serial_gpu || cfg!(windows) || wsl_distribution.is_some()) {
+            return Err(
+                "resident replay requires serial mode on a native Linux pool with dedicated GPUs"
+                    .into(),
+            );
+        }
         let mut physical_replays = replay_gpus.to_vec();
-        if let Some(devices) = &split_devices {
+        let mut physical_proof = proof_gpu.map(str::to_owned);
+        if split_devices.is_some() || keep_replay_resident {
             if wsl_distribution.is_some() {
                 return Err("split proving requires a native Linux pool".into());
             }
@@ -3533,17 +3550,36 @@ fn configure_production_v4_pool_verifier(
                 return Err("cannot resolve physical NVIDIA GPU identities".into());
             }
             let inventory = std::str::from_utf8(&output.stdout)?;
-            let resolved = cmfd_node::production_v4_pool::production_v4_resolve_gpu_devices(
-                devices, inventory,
-            )?;
+            if let Some(devices) = &split_devices {
+                let resolved = cmfd_node::production_v4_pool::production_v4_resolve_gpu_devices(
+                    devices, inventory,
+                )?;
+                split_devices = Some(resolved.try_into().map_err(|_| "split GPU count")?);
+            }
             physical_replays = cmfd_node::production_v4_pool::production_v4_resolve_gpu_devices(
                 replay_gpus,
                 inventory,
             )?;
-            split_devices = Some(resolved.try_into().map_err(|_| "split GPU count")?);
+            if keep_replay_resident {
+                if let Some(gpu) = proof_gpu {
+                    physical_proof =
+                        cmfd_node::production_v4_pool::production_v4_resolve_gpu_devices(
+                            &[gpu.to_owned()],
+                            inventory,
+                        )?
+                        .into_iter()
+                        .next();
+                }
+            }
         }
+        let proof_gpu = physical_proof.as_deref();
         let replay_gpus = &physical_replays;
         let shared_model = std::env::var("CMFD_SHARED_MODEL").as_deref() == Ok("1");
+        if shared_model && keep_replay_resident {
+            return Err(
+                "shared-model mode already retains its model; omit keep-replay-resident".into(),
+            );
+        }
         if shared_model
             && (split_devices.is_none()
                 || !serial_gpu
@@ -3713,6 +3749,34 @@ fn configure_production_v4_pool_verifier(
                     .to_owned(),
             ),
         };
+        // Claim every selected physical card before starting any GPU worker.
+        // The lease uses the local miner lock namespace and lives with the verifier.
+        let dedicated_gpu_lease = if keep_replay_resident {
+            let mut devices = replay_gpus.to_vec();
+            if let Some(proof) = &split_devices {
+                devices.extend(proof.iter().cloned());
+            }
+            if let Some(proof) = proof_gpu {
+                devices.push(proof.to_owned());
+            }
+            let lease = cmfd_node::pool_gpu_lease::PoolGpuLease::acquire(&devices)?;
+            let processes = std::process::Command::new("nvidia-smi")
+                .args([
+                    "--query-compute-apps=gpu_uuid,pid,process_name",
+                    "--format=csv,noheader,nounits",
+                ])
+                .output()?;
+            if !processes.status.success() {
+                return Err("cannot inspect assigned GPU workloads".into());
+            }
+            cmfd_node::pool_gpu_lease::validate_idle_devices(
+                &devices,
+                std::str::from_utf8(&processes.stdout)?,
+            )?;
+            Some(lease)
+        } else {
+            None
+        };
         let pinned = work_check_pin.is_some();
         let mut verifier =
             ProductionV4PersistentPoolVerifier::start(ProductionV4PoolVerifierConfig {
@@ -3725,6 +3789,10 @@ fn configure_production_v4_pool_verifier(
             })?;
         if serial_gpu {
             verifier.enable_serial_gpu()?;
+        }
+        if let Some(lease) = dedicated_gpu_lease {
+            verifier.keep_serial_replay_resident(lease)?;
+            tracing::info!("pool keeps replay resident between shares on its dedicated GPUs");
         }
         let verifier = Arc::new(verifier);
         config.production_v4_share_verifier = Some(Arc::clone(&verifier) as _);
@@ -3741,6 +3809,7 @@ fn configure_production_v4_pool_verifier(
             proof_worker,
             scratch_directory,
             artifacts,
+            keep_replay_resident,
         );
         Err("ProductionV4 pool support is not compiled into this binary".into())
     }
@@ -4637,6 +4706,31 @@ mod tests {
             unreachable!()
         };
         assert_eq!(prune_keep_blocks, Some(720));
+    }
+
+    #[test]
+    fn resident_pool_replay_requires_serial_mode_at_the_cli_boundary() {
+        let arguments = [
+            "cmfd-node",
+            "pool-serve",
+            "--certificate",
+            "cert.der",
+            "--private-key",
+            "key.der",
+            "--production-v4-pool-keep-replay-resident",
+        ];
+        assert!(Cli::try_parse_from(arguments).is_err());
+        let mut allowed = arguments.to_vec();
+        allowed.push("--production-v4-pool-serial-gpu");
+        let parsed = Cli::try_parse_from(allowed).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::PoolServe {
+                production_v4_pool_keep_replay_resident: true,
+                production_v4_pool_serial_gpu: true,
+                ..
+            }
+        ));
     }
 
     #[test]

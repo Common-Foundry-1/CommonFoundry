@@ -103,6 +103,7 @@ pub mod p2p;
 pub mod peer;
 pub mod pool;
 pub mod pool_dashboard;
+pub mod pool_gpu_lease;
 mod pool_timing;
 #[cfg(feature = "production-v4")]
 pub mod production_v4_pool;

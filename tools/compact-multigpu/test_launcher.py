@@ -14,6 +14,21 @@ spec=importlib.util.spec_from_file_location('launcher',Path(__file__).resolve().
 launcher=importlib.util.module_from_spec(spec);spec.loader.exec_module(launcher)
 
 class LauncherTests(unittest.TestCase):
+    def test_dedicated_residency_is_explicit_and_excludes_other_sharing_modes(self):
+        base=['launch.py','pool','--public-ip','127.0.0.1','--proof-gpu','0','--replay-gpu','0','--keep-replay-resident','--check']
+        with patch.object(sys,'platform','linux'),patch.object(sys,'argv',base),patch.object(launcher,'verify') as verify:
+            with self.assertRaises(ValueError):launcher.main()
+            verify.assert_not_called()
+        output=io.StringIO()
+        with patch.object(sys,'platform','linux'),patch.object(sys,'argv',base+['--serial-gpu']),patch.object(launcher,'verify'),contextlib.redirect_stdout(output):
+            launcher.main()
+        raw=output.getvalue();command=json.loads(raw[raw.index('[\n'):])
+        self.assertIn('--production-v4-pool-keep-replay-resident',command)
+        for arguments,platform in [(base+['--serial-gpu','--shared-model'],'linux'),(base+['--serial-gpu'],'win32')]:
+            with patch.object(sys,'platform',platform),patch.object(sys,'argv',arguments),patch.object(launcher,'verify') as verify:
+                with self.assertRaises(ValueError):launcher.main()
+                verify.assert_not_called()
+
     def test_shared_socket_uses_the_validated_ram_directory(self):
         arguments=['launch.py','pool','--public-ip','127.0.0.1','--proof-gpus','0,1','--replay-gpu','1',
                    '--serial-gpu','--shared-model','--ram-witness-dir','relative-ram','--check']

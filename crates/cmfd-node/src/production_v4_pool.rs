@@ -247,6 +247,8 @@ pub struct ProductionV4PersistentPoolVerifier {
     /// retains the evicted replay lease so its model cannot reload meanwhile.
     state: Mutex<WorkerState>,
     serial_gpu: bool,
+    /// Held for the verifier lifetime; ordinary shares retain their replay model.
+    dedicated_gpu_lease: Option<crate::pool_gpu_lease::PoolGpuLease>,
 }
 
 /// Reuse the authenticated production worker protocol for embedded solo mining.
@@ -482,6 +484,7 @@ impl ProductionV4PersistentPoolVerifier {
             next_attempt: AtomicU64::new(0),
             state: Mutex::new(WorkerState { proof }),
             serial_gpu: false,
+            dedicated_gpu_lease: None,
         })
     }
 
@@ -504,6 +507,22 @@ impl ProductionV4PersistentPoolVerifier {
                 )?;
             }
         }
+        Ok(())
+    }
+
+    /// For GPUs dedicated to pool replay/proving, retain the model until a
+    /// winning proof needs the device. The proof handoff still evicts replay
+    /// and holds its lock for the entire proof, preserving the memory envelope.
+    pub fn keep_serial_replay_resident(
+        &mut self,
+        lease: crate::pool_gpu_lease::PoolGpuLease,
+    ) -> Result<(), PoolError> {
+        if !self.serial_gpu {
+            return Err(pool_replay_failure(
+                "resident replay requires serial GPU mode",
+            ));
+        }
+        self.dedicated_gpu_lease = Some(lease);
         Ok(())
     }
 
@@ -656,7 +675,7 @@ impl ProductionV4PersistentPoolVerifier {
             final_activation_digest,
         );
         if work_digest > template.challenge.target {
-            if self.serial_gpu {
+            if self.serial_gpu && self.dedicated_gpu_lease.is_none() {
                 search_state
                     .replay
                     .invoke(&["EVICT".to_owned()], "CMFD_V4_REPLAY_EVICTED")?;
@@ -856,7 +875,7 @@ impl ProductionV4PersistentPoolVerifier {
             final_activation_digest,
         );
         if work_digest > share.template.challenge.target {
-            if self.serial_gpu {
+            if self.serial_gpu && self.dedicated_gpu_lease.is_none() {
                 self.searcher_for(worker)
                     .ok_or_else(|| pool_replay_failure("no such pool replay worker"))?
                     .evict_model()?;
@@ -2802,7 +2821,22 @@ done"#;
     #[cfg(unix)]
     #[test]
     fn serial_gpu_evicts_and_holds_replay_until_the_proof_finishes() {
-        let scratch = worker_test_path("serial-gpu-handoff");
+        check_serial_proof_handoff(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resident_replay_still_evicts_and_holds_the_gpu_during_proving() {
+        check_serial_proof_handoff(true);
+    }
+
+    #[cfg(unix)]
+    fn check_serial_proof_handoff(retain: bool) {
+        let scratch = worker_test_path(if retain {
+            "resident-gpu-handoff"
+        } else {
+            "serial-gpu-handoff"
+        });
         std::fs::create_dir_all(&scratch).unwrap();
         let log = scratch.join("replay.log");
         let started = scratch.join("proof-started");
@@ -2820,6 +2854,14 @@ done"#;
         )
         .unwrap();
         verifier.enable_serial_gpu().unwrap();
+        if retain {
+            let lease = crate::pool_gpu_lease::PoolGpuLease::acquire_at(
+                &["GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".into()],
+                &scratch.join("locks"),
+            )
+            .unwrap();
+            verifier.keep_serial_replay_resident(lease).unwrap();
+        }
         let mut template = batch_test_template(BATCH_TEST_NETWORK_ID);
         template.challenge.target = [0xff; 32];
         let timeout = Duration::from_secs(30);
@@ -2975,6 +3017,170 @@ done"#;
         );
         drop(verifier);
         let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dedicated_replay_remains_resident_for_single_and_batched_ordinary_shares() {
+        let (mut verifier, scratch, log) = batch_test_verifier("keep-resident-ordinary");
+        let gpu = "GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_owned();
+        let lease =
+            crate::pool_gpu_lease::PoolGpuLease::acquire_at(&[gpu.clone()], &scratch.join("locks"))
+                .unwrap();
+        assert!(verifier.keep_serial_replay_resident(lease).is_err());
+        verifier.enable_serial_gpu().unwrap();
+        let lease = crate::pool_gpu_lease::PoolGpuLease::acquire_at(&[gpu], &scratch.join("locks"))
+            .unwrap();
+        verifier.keep_serial_replay_resident(lease).unwrap();
+        let mut template = batch_test_template(BATCH_TEST_NETWORK_ID);
+        template.challenge.target = [0; 32];
+        for nonce in [96, 97] {
+            assert!(
+                verifier
+                    .evaluate_single(&template, nonce, [0xff; 32])
+                    .unwrap()
+                    .chain_proof
+                    .is_none()
+            );
+        }
+        let shares = [
+            ProductionV4PoolShareRequest {
+                template: &template,
+                nonce: 98,
+                share_target: [0xff; 32],
+            },
+            ProductionV4PoolShareRequest {
+                template: &template,
+                nonce: 99,
+                share_target: [0xff; 32],
+            },
+        ];
+        assert!(
+            verifier.evaluate_batch_on(0, &shares).iter().all(|r| r
+                .as_ref()
+                .unwrap()
+                .chain_proof
+                .is_none())
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "EVICT\nRUN 1\nRUN 1\nRUNBATCH 2\n"
+        );
+        drop(verifier);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    /// Own-rig validation of the actual backend policy with the real GPU replay.
+    /// No proof is generated: the zero chain target keeps these as ordinary
+    /// shares, and the real proof-handoff function is exercised separately.
+    #[cfg(all(unix, feature = "direct-proof-testnet"))]
+    #[test]
+    #[ignore = "requires an explicitly reserved GPU, model and diagnostic root"]
+    fn real_gpu_dedicated_replay_retains_model_and_releases_for_proof_handoff() {
+        use std::process::Command;
+        let root = PathBuf::from(
+            std::env::var_os("CMFD_RESIDENCY_TEST_ROOT").expect("reserved test root"),
+        );
+        let replay = PathBuf::from(
+            std::env::var_os("CMFD_RESIDENCY_TEST_REPLAY").expect("real replay worker"),
+        );
+        let gpu = std::env::var("CUDA_VISIBLE_DEVICES").expect("one reserved physical GPU");
+        assert!(root.is_absolute() && replay.is_absolute());
+        let memory_used = || -> u64 {
+            let result = Command::new("nvidia-smi")
+                .args([
+                    "-i",
+                    &gpu,
+                    "--query-gpu=memory.used",
+                    "--format=csv,noheader,nounits",
+                ])
+                .output()
+                .unwrap();
+            assert!(result.status.success());
+            std::str::from_utf8(&result.stdout)
+                .unwrap()
+                .trim()
+                .parse::<u64>()
+                .unwrap()
+                * (1 << 20)
+        };
+        let mut expected = std::collections::BTreeMap::new();
+        let mut results = Vec::new();
+        for retain in [false, true] {
+            let scratch = root.join(if retain { "retained" } else { "evicted" });
+            std::fs::create_dir(&scratch).unwrap();
+            let mut verifier = ProductionV4PersistentPoolVerifier::start_for_network(
+                cmfd_consensus::FORGEMATRIX_V4_DIRECT_TESTNET_NETWORK_ID,
+                ProductionV4PoolVerifierConfig {
+                    replay: ProductionV4PoolWorkerCommand {
+                        program: replay.clone(),
+                        arguments: vec![
+                            "--server".into(),
+                            root.join("MODEL-V2.bank").into_os_string(),
+                        ],
+                        environment: vec![],
+                    },
+                    extra_replays: vec![],
+                    proof: fake_proof_worker(),
+                    scratch_directory: scratch.clone(),
+                    worker_scratch_directory: scratch.to_string_lossy().into_owned(),
+                    work_check_pin: None,
+                },
+            )
+            .unwrap();
+            verifier.enable_serial_gpu().unwrap();
+            if retain {
+                let lease = crate::pool_gpu_lease::PoolGpuLease::acquire_at(
+                    &[gpu.clone()],
+                    &root.join("test-locks"),
+                )
+                .unwrap();
+                verifier.keep_serial_replay_resident(lease).unwrap();
+            }
+            let mut template =
+                batch_test_template(cmfd_consensus::FORGEMATRIX_V4_DIRECT_TESTNET_NETWORK_ID);
+            template.challenge.target = [0; 32];
+            let count = if retain { 6 } else { 2 };
+            for index in 0..count {
+                let nonce = 96 + index % 2;
+                let started = Instant::now();
+                let result = verifier
+                    .evaluate_single(&template, nonce, [0xff; 32])
+                    .unwrap();
+                let seconds = started.elapsed().as_secs_f64();
+                assert!(result.chain_proof.is_none());
+                if let Some(before) = expected.get(&nonce) {
+                    assert_eq!(before, &result.work_digest);
+                } else {
+                    expected.insert(nonce, result.work_digest);
+                }
+                let used = memory_used();
+                if retain {
+                    assert!(used > 6 * (1 << 30));
+                } else {
+                    assert!(used < 1 << 30);
+                }
+                results.push(serde_json::json!({"retained":retain,"index":index,"nonce":nonce,"seconds":seconds,"used_bytes_after_share":used,"work_digest":hex::encode(result.work_digest)}));
+            }
+            if retain {
+                let state = verifier.searcher.state.lock().unwrap();
+                let held = verifier.handoff_replay_for_proof(state).unwrap();
+                assert!(held.is_some());
+                assert!(verifier.searcher.state.try_lock().is_err());
+                let released = memory_used();
+                assert!(
+                    released < 1 << 30,
+                    "replay model stayed allocated at proof handoff"
+                );
+                drop(held);
+                let started = Instant::now();
+                let resumed = verifier.evaluate_single(&template, 96, [0xff; 32]).unwrap();
+                assert_eq!(expected[&96], resumed.work_digest);
+                results.push(serde_json::json!({"retained":true,"after_proof_handoff":true,"nonce":96,"seconds":started.elapsed().as_secs_f64(),"memory_at_proof_handoff":released,"used_bytes_after_share":memory_used(),"work_digest":hex::encode(resumed.work_digest)}));
+            }
+            drop(verifier);
+        }
+        std::fs::write(root.join("GPU-RESIDENCY-RESULT.json"),serde_json::to_vec_pretty(&serde_json::json!({"success":true,"ordinary_shares_only":true,"fresh_proof_generated":false,"proof_handoff_evicted_model":true,"proof_handoff_held_replay_lock":true,"work_digests_exact_across_policies":true,"cases":results})).unwrap()).unwrap();
     }
 
     #[cfg(unix)]

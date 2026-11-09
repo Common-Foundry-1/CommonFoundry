@@ -146,6 +146,8 @@ def build_command(args, inputs, data):
         command += ["--production-v4-pool-proof-gpus", args.proof_gpus]
     if args.serial_gpu:
         command += ["--production-v4-pool-serial-gpu"]
+    if getattr(args,'keep_replay_resident',False):
+        command += ["--production-v4-pool-keep-replay-resident"]
     if args.enable_payouts:
         command += ["--enable-testnet-payouts"]
     return command
@@ -192,6 +194,8 @@ def main():
             p.add_argument("--gpu-witness",action="store_true",
                 help="snapshot the replay witness directly on the shared proving GPU")
             p.add_argument("--shared-model",action="store_true",help="reuse fixed GPU weights for replay without a model reload")
+            p.add_argument("--keep-replay-resident",action="store_true",
+                help="native Linux pool-only GPUs: keep replay between shares; miners use other GPUs")
             p.add_argument("--enable-payouts", action="store_true")
         else:
             p.add_argument("--pool", required=True)
@@ -201,6 +205,9 @@ def main():
             p.add_argument("--yield-gpu-on-share", action="store_true",
                 help="release mining model VRAM while a shared GPU checks or proves each share")
     args = parser.parse_args()
+    if args.action=='pool' and args.keep_replay_resident:
+        if sys.platform!='linux' or not args.serial_gpu or args.shared_model or len(args.replay_gpu or [])!=1:
+            raise ValueError('keep-replay-resident requires native Linux, serial mode, one explicit replay GPU and no shared-model flag')
     if args.action=='pool' and args.shared_model:
         if not args.proof_gpus or not args.serial_gpu or len(args.replay_gpu or [])!=1 or args.gpu_witness or args.sealed_witness:
             raise ValueError('shared model requires two proving GPUs, one serial replay GPU on the second card, and no other witness mode')

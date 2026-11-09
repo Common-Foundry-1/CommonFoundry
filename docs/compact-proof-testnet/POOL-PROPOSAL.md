@@ -1,6 +1,8 @@
-# Common Foundry Compact Proof Testnet v0.5.1
+# Common Foundry Compact Proof Testnet v0.5.2
 
 Pool operators,
+
+**v0.5.2 keeps replay ready between ordinary shares on dedicated pool GPUs.** The optional `--keep-replay-resident` native Linux mode avoids repeated full-model reloads, with ordinary checks measured at about 0.042 seconds after the initial load on Rig06. It preserves the existing eviction and replay lock before proving. The two-GPU shared-model mode already keeps its model resident.
 
 **v0.5.1 makes pool timings visible automatically.** Proof phases and total accepted-block processing time now appear in the normal rotating logs, even with a silent console. There is no diagnostic flag to enable and no extra benchmark run required.
 
@@ -12,4 +14,6 @@ The update includes the Linux pool/miner/prover kit, matching Windows GUI/node p
 
 The optimized shared-model path is automatic when you use `--shared-model`. The existing single-GPU and other two-GPU layouts remain available. Our measurements used physical 16 GiB RTX 4070 Ti SUPER cards under a 7.5 GiB guard; feedback from physical 8 GB pairs and faster PCIe layouts is especially useful.
 
-Please share your GPU/driver and PCIe layout, full winning-block acceptance time, peak memory, stale rate, propagation, sync and restart results. The five-second full-path target remains our next performance goal. These compatible testnet improvements continue toward one mainnet upgrade combining compact proofs and the evaluation-binding repair.
+Operators can collect timing and memory feedback during ordinary use; no extra benchmark run is required. The five-second full-path target remains our next performance goal. These compatible testnet improvements continue toward one mainnet upgrade combining compact proofs and the evaluation-binding repair.
+
+The residency measurement covers ordinary-share checks and proof handoff, not a new proof-generation benchmark. The last measured full local acceptance remains 5.74 seconds average on the RTX 5090 and 8.27-8.52 seconds on the two-GPU Gen2 x1 rig.

@@ -1,6 +1,15 @@
-# Common Foundry Compact Proof Testnet - v0.5.1
+# Common Foundry Compact Proof Testnet - v0.5.2
 
 Welcome! This canary lets pools and miners exercise the new self-contained block proof, around 5.7 MB in our first public block. It keeps the ForgeMatrix workload and the existing field, hash, and BaseFold parameters. Ordinary nodes verify the complete proof without rerunning the miner's matrix computation. The public seed at `209.145.48.36:23444` also replays work as an optional audit comparison.
+
+v0.5.2 adds `--keep-replay-resident` for native Linux GPUs dedicated to a pool.
+It avoids repeated model reloads between ordinary shares, while still evicting
+replay and holding its lock during proving. On Rig06, subsequent ordinary-share
+checks took about 0.042 seconds after the initial load. See
+`REPLAY-MODEL-RETENTION.md` for the mode, ownership checks and measured scope.
+The existing two-GPU `--shared-model` mode already retains its model and does
+not need this additional option. Initial and post-proof loads remain in the
+legacy serial layout; this update does not establish a new full-proof time.
 
 v0.5.1 writes proof phases and total accepted-block processing time into normal
 pool logs automatically. No diagnostic flag is needed. See

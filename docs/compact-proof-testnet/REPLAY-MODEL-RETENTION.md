@@ -1,8 +1,8 @@
 # Dedicated pool replay residency
 
-Status: tested local candidate; not included in the published v0.5.1 kit.
+Included in the v0.5.2 update; older v0.5.1 kits do not have this option.
 
-The candidate removes repeated full-model reloads between ordinary shares for
+This mode removes repeated full-model reloads between ordinary shares for
 GPUs dedicated to pool replay/proving. The existing serial-sharing behavior
 remains the default. Proof handoff still evicts the model and holds replay's
 mutex throughout proving. No proof arithmetic, parameters or validation rules

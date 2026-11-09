@@ -66,6 +66,7 @@ def main():
     for source, target in (("LICENSE", "LICENSE"), ("THIRD_PARTY_NOTICES.md", "THIRD_PARTY_NOTICES.md"),
             ("packaging/compact-proof-testnet/README.md", "README.md"),
             ("docs/compact-proof-testnet/POOL-TIMING-LOGS.md", "POOL-TIMING-LOGS.md"),
+            ("docs/compact-proof-testnet/REPLAY-MODEL-RETENTION.md", "REPLAY-MODEL-RETENTION.md"),
             ("docs/compact-proof-testnet/POOL-PROPOSAL.md", "POOL-INVITATION.md")):
         shutil.copy2(ROOT / source, stage / target)
     for filename, action in (("START-POOL.sh", "pool"), ("START-MINER.sh", "miner"),

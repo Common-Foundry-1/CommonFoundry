@@ -1,8 +1,10 @@
-# Common Foundry Compact Proof Testnet v0.5.0
+# Common Foundry Compact Proof Testnet v0.5.1
 
 Pool operators,
 
-Our compact-proof testnet just got faster. **v0.5.0 cuts full local pool acceptance to 8.27-8.52 seconds on PCIe Gen2 x1 risers**, compared with 11.57-12.08 seconds in v0.4.0. Pipelined transfers and GPU-resident calculations keep the two proving cards working together, with one shared model and no reload between proofs.
+**v0.5.1 makes pool timings visible automatically.** Proof phases and total accepted-block processing time now appear in the normal rotating logs, even with a silent console. There is no diagnostic flag to enable and no extra benchmark run required.
+
+Our compact-proof testnet just got faster. **The v0.5.0 proving improvements cut full local pool acceptance to 8.27-8.52 seconds on PCIe Gen2 x1 risers**, compared with 11.57-12.08 seconds in v0.4.0. Pipelined transfers and GPU-resident calculations keep the two proving cards working together, with one shared model and no reload between proofs.
 
 Proofs remain around **5.7 MB**, and measured memory stayed within **6.77 / 7.46 GiB per card**. ForgeMatrix work, all six commitments, 270 queries, 16 grinding bits and complete node verification are unchanged. Ordinary nodes verify the proof without repeating mining.
 

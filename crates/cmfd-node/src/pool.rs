@@ -4361,6 +4361,7 @@ fn process_share(
     job_id: [u8; 32],
     nonce: u64,
 ) -> Result<PoolShareResult, PoolError> {
+    let processing_started = Instant::now();
     let active = {
         let state = shared
             .state
@@ -4371,6 +4372,7 @@ fn process_share(
     if job_id != active.wire.job_id {
         return rejected_result(shared, session_id, job_id, nonce, "stale_job");
     }
+    let evaluation_started = Instant::now();
     let evaluation = match &shared.share_batcher {
         Some(batcher) => {
             let Some(evaluation) = batcher.submit(&shared.stop, Arc::clone(&active), nonce)? else {
@@ -4386,6 +4388,7 @@ fn process_share(
             evaluate_pool_share(shared, &active, nonce)?
         }
     };
+    let share_evaluation_seconds = evaluation_started.elapsed().as_secs_f64();
     if evaluation.work_digest > active.wire.share_target {
         return rejected_result(shared, session_id, job_id, nonce, "low_difficulty_share");
     }
@@ -4593,6 +4596,17 @@ fn process_share(
     )?;
     let node_submission_seconds = node_submission_started.elapsed().as_secs_f64();
     rotate_if_tip_changed(shared)?;
+    crate::pool_timing::AcceptanceTiming {
+        network_id: shared.network_id,
+        height: block_credit.height,
+        parent: block_credit.parent,
+        block_id: block_credit.block_id,
+        nonce,
+        share_evaluation_seconds,
+        node_submission_seconds,
+        total_acceptance_seconds: processing_started.elapsed().as_secs_f64(),
+    }
+    .record();
     if std::env::var("CMFD_DROPOUT_REHEARSAL_TELEMETRY").as_deref() == Ok("1") {
         eprintln!(
             "CMFD_DROPOUT_POOL_ADMISSION {}",
@@ -9709,6 +9723,150 @@ mod tests {
         let address = server.local_addr();
         server.stop().unwrap();
         assert!(TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_err());
+    }
+
+    /// Run in a separate process so this exercises the real global subscriber
+    /// without racing other tests' tracing configuration.
+    #[test]
+    fn pool_timings_reach_the_file_before_shutdown_without_diagnostic_flags() {
+        use std::process::{Command, Stdio};
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let root = TestRoot::new("live-timing-logs");
+        let mut child = Child(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "pool::tests::timing_log_writer_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("CMFD_POOL_TIMING_LOG_TEST_DIR", root.path())
+                .env_remove("CMFD_DROPOUT_REHEARSAL_TELEMETRY")
+                // Even a silent console must not suppress the rotating file.
+                .env("CMFD_LOG", "off")
+                .env("RUST_LOG", "off")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let contents = loop {
+            let contents = fs::read_dir(root.path().join("logs"))
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if contents.contains("pool proof timing")
+                && contents.contains("pool block accepted timing")
+            {
+                break contents;
+            }
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "timing child exited before its logs appeared"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "timing records did not reach the live log file: {contents}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "the process must still be running when its logs are read"
+        );
+        assert_eq!(contents.matches("pool block accepted timing").count(), 1);
+        let proof = contents
+            .lines()
+            .find(|line| line.contains("pool proof timing"))
+            .unwrap();
+        for field in [
+            "height=",
+            "nonce=",
+            "full_replay_seconds=",
+            "proof_seconds=",
+            "pool_evaluation_wall_seconds=",
+            "proof_bytes=",
+        ] {
+            assert!(proof.contains(field), "missing {field}: {proof}");
+        }
+        let accepted = contents
+            .lines()
+            .find(|line| line.contains("pool block accepted timing"))
+            .unwrap();
+        let number = |name: &str| -> f64 {
+            accepted
+                .split_whitespace()
+                .find_map(|word| word.strip_prefix(name))
+                .unwrap()
+                .parse()
+                .unwrap()
+        };
+        let total = number("total_acceptance_seconds=");
+        assert!(total.is_finite() && total >= 0.0);
+        assert!(total >= number("node_submission_seconds=") + number("share_evaluation_seconds="));
+        writeln!(child.0.stdin.as_mut().unwrap(), "release").unwrap();
+        let exit_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            assert!(
+                Instant::now() < exit_deadline,
+                "timing child failed to shut down"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    #[ignore = "subprocess helper for the live timing-log regression"]
+    fn timing_log_writer_child() {
+        let Some(root) = std::env::var_os("CMFD_POOL_TIMING_LOG_TEST_DIR") else {
+            return;
+        };
+        assert!(std::env::var_os("CMFD_DROPOUT_REHEARSAL_TELEMETRY").is_none());
+        let _log_guard = crate::logging::init_tracing(Path::new(&root), 0);
+        let (_root, server, _node, pin) = server("timing-log-child");
+        let mut client = client(server.local_addr(), pin, "timing-worker");
+        let work = client.current_work().unwrap();
+        let partial_nonce = find_share(&work, false);
+        let partial = client
+            .submit_share(work.job().job_id, partial_nonce)
+            .unwrap();
+        assert!(partial.accepted && !partial.block_accepted);
+        let nonce = find_share(&work, true);
+        crate::pool_timing::ProofTiming {
+            network_id: work.job().challenge.network_id,
+            height: work.job().challenge.height,
+            parent: work.job().challenge.previous_block,
+            nonce,
+            search_replay_seconds: 0.01,
+            full_replay_seconds: 0.02,
+            replay_handoff_seconds: 0.003,
+            proof_seconds: 0.04,
+            pool_evaluation_wall_seconds: 0.08,
+            proof_bytes: 5_700_000,
+        }
+        .record();
+        let accepted = client.submit_share(work.job().job_id, nonce).unwrap();
+        assert!(accepted.accepted && accepted.block_accepted);
+        // Hold the pool and the writer guard alive until the parent has read
+        // the file. A shutdown-only flush cannot make this test pass.
+        let mut release = String::new();
+        assert!(std::io::stdin().read_line(&mut release).unwrap() > 0);
+        server.stop().unwrap();
     }
 
     #[test]

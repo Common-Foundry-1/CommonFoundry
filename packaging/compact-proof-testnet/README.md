@@ -1,6 +1,10 @@
-# Common Foundry Compact Proof Testnet - v0.5.0
+# Common Foundry Compact Proof Testnet - v0.5.1
 
 Welcome! This canary lets pools and miners exercise the new self-contained block proof, around 5.7 MB in our first public block. It keeps the ForgeMatrix workload and the existing field, hash, and BaseFold parameters. Ordinary nodes verify the complete proof without rerunning the miner's matrix computation. The public seed at `209.145.48.36:23444` also replays work as an optional audit comparison.
+
+v0.5.1 writes proof phases and total accepted-block processing time into normal
+pool logs automatically. No diagnostic flag is needed. See
+`POOL-TIMING-LOGS.md` for the fields and log location.
 
 v0.5.0 makes shared-model two-GPU proving faster with pipelined witness transfer
 and GPU-resident relation inputs. Our complete local pool acceptance improved

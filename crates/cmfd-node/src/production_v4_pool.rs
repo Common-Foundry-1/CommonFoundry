@@ -1051,11 +1051,26 @@ impl ProductionV4PersistentPoolVerifier {
             work_digest,
             transparent_proof,
         }));
+        let proof_bytes = match &proof {
+            BlockProof::V4Candidate(candidate) => candidate.transparent_proof.len(),
+            _ => unreachable!("constructed a V4 proof above"),
+        };
+        let pool_evaluation_wall_seconds = evaluation_started.elapsed().as_secs_f64();
+        crate::pool_timing::ProofTiming {
+            network_id: self.expected_network_id,
+            height: template.challenge.height,
+            parent: template.challenge.previous_block,
+            nonce,
+            search_replay_seconds,
+            full_replay_seconds,
+            replay_handoff_seconds,
+            proof_seconds,
+            pool_evaluation_wall_seconds,
+            proof_bytes,
+        }
+        .record();
+        // Keep the existing machine-readable rehearsal stream for benchmark tools.
         if std::env::var("CMFD_DROPOUT_REHEARSAL_TELEMETRY").as_deref() == Ok("1") {
-            let proof_bytes = match &proof {
-                BlockProof::V4Candidate(candidate) => candidate.transparent_proof.len(),
-                _ => unreachable!("constructed a V4 proof above"),
-            };
             eprintln!(
                 "CMFD_DROPOUT_POOL_PROOF {}",
                 serde_json::json!({
@@ -1067,7 +1082,7 @@ impl ProductionV4PersistentPoolVerifier {
                     "full_replay_seconds": full_replay_seconds,
                     "replay_handoff_seconds": replay_handoff_seconds,
                     "proof_seconds": proof_seconds,
-                    "pool_evaluation_wall_seconds": evaluation_started.elapsed().as_secs_f64(),
+                    "pool_evaluation_wall_seconds": pool_evaluation_wall_seconds,
                     "proof_bytes": proof_bytes,
                 })
             );

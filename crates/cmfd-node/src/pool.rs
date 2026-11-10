@@ -3411,13 +3411,7 @@ impl PoolDashboardSource {
                 .then_with(|| left.block_id.cmp(&right.block_id))
         });
         ledger.blocks.truncate(100);
-        ledger.payout_transactions.sort_by(|left, right| {
-            right
-                .confirmations
-                .cmp(&left.confirmations)
-                .then_with(|| left.txid.cmp(&right.txid))
-        });
-        ledger.payout_transactions.truncate(100);
+        retain_recent_payout_transactions(&mut ledger.payout_transactions);
 
         let node_status = self
             .shared
@@ -3500,6 +3494,17 @@ impl PoolDashboardSource {
             ledger,
         })
     }
+}
+
+fn retain_recent_payout_transactions(transactions: &mut Vec<PoolPayoutTransactionStats>) {
+    // An unconfirmed payment is newest; among confirmed payments, fewer
+    // confirmations means a more recent transaction.
+    transactions.sort_by(|left, right| {
+        left.confirmations
+            .cmp(&right.confirmations)
+            .then_with(|| left.txid.cmp(&right.txid))
+    });
+    transactions.truncate(100);
 }
 
 impl PoolServerHandle {
@@ -7445,6 +7450,38 @@ fn decode_hex_32(value: &str) -> Result<[u8; 32], PoolError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dashboard_keeps_the_newest_payout_transactions() {
+        use super::{PoolPayoutTransactionStats, retain_recent_payout_transactions};
+
+        let mut transactions = (1..=102)
+            .rev()
+            .map(|confirmations| PoolPayoutTransactionStats {
+                txid: format!("{confirmations:064x}"),
+                payout: String::new(),
+                amount_atoms: 1,
+                fee_atoms: 0,
+                state: "confirmed".to_owned(),
+                confirmations,
+            })
+            .collect::<Vec<_>>();
+        transactions.push(PoolPayoutTransactionStats {
+            txid: "pending".to_owned(),
+            payout: String::new(),
+            amount_atoms: 1,
+            fee_atoms: 0,
+            state: "broadcast".to_owned(),
+            confirmations: 0,
+        });
+
+        retain_recent_payout_transactions(&mut transactions);
+
+        assert_eq!(transactions.len(), 100);
+        assert_eq!(transactions[0].txid, "pending");
+        assert_eq!(transactions[1].confirmations, 1);
+        assert_eq!(transactions[99].confirmations, 99);
+    }
+
     #[test]
     fn a_payout_pause_is_reported_once_until_a_payment_is_prepared() {
         let pause = super::PayoutPause::default();

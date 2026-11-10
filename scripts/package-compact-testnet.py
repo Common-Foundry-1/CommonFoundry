@@ -63,7 +63,11 @@ def main():
         (stage/'cmfd-direct-multigpu-worker').chmod(0o755)
         for name in ('coordinator.py','shared_model.py','cmfd-direct-multigpu-prover','cmfd-resident-replay','LICENSE-SP1-MIT'):
             shutil.copy2(ROOT/'tools/compact-multigpu'/name,stage/name)
-            if name in ('cmfd-direct-multigpu-prover','cmfd-resident-replay'):(stage/name).chmod(0o755)
+            if name in ('cmfd-direct-multigpu-prover','cmfd-resident-replay'):
+                # A Windows checkout may use CRLF. Linux interprets a CR in
+                # the shebang as part of the executable name and cannot run it.
+                (stage/name).write_text((stage/name).read_text(), newline='\n')
+                (stage/name).chmod(0o755)
         shutil.copy2(ROOT/'tools/compact-multigpu/README.md',stage/'MULTI-GPU.md')
     shutil.copy2(ROOT / "scripts/production-v4-inputs.py", stage / "production-v4-inputs.py")
     for path in (ROOT / "packaging/production-v4-pool/shared").iterdir():

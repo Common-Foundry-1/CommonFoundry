@@ -45,6 +45,9 @@ class CompactPackageTests(unittest.TestCase):
             with tarfile.open(archive) as kit:
                 entry=kit.getmember('commonfoundry-compact-testnet-v0.4.0-linux-x86_64/cmfd-resident-replay')
                 self.assertTrue(entry.mode&0o111)
+                self.assertNotIn(b'\r', kit.extractfile(entry).readline())
+                wrapper = kit.extractfile('commonfoundry-compact-testnet-v0.4.0-linux-x86_64/cmfd-direct-multigpu-prover')
+                self.assertEqual(wrapper.readline(), b'#!/bin/sh\n')
                 self.assertIn('commonfoundry-compact-testnet-v0.4.0-linux-x86_64/shared_model.py',kit.getnames())
 
     def test_qualification_is_bound_to_the_worker_bytes_and_bundled(self):

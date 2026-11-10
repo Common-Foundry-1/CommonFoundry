@@ -86,7 +86,9 @@ mod tests {
     #[ignore = "requires CMFD_RAM_WITNESS_TEST_DIR naming a private dedicated 2 GiB tmpfs"]
     fn accepts_a_private_bounded_tmpfs_mount() {
         let path = std::env::var_os("CMFD_RAM_WITNESS_TEST_DIR").expect("test tmpfs path");
-        assert_eq!(super::validate(std::path::Path::new(&path)).unwrap(),
-            std::path::Path::new(&path).canonicalize().unwrap());
+        assert_eq!(
+            super::validate(std::path::Path::new(&path)).unwrap(),
+            std::path::Path::new(&path).canonicalize().unwrap()
+        );
     }
 }

@@ -1,0 +1,30 @@
+{
+  "activation_height": 65535,
+  "algorithm_version": 4,
+  "at_and_after_activation": {
+    "complete_proof_verification": true,
+    "direct_packet_exclusive_limit_bytes": 6000000,
+    "maximum_proof_frame_bytes": 6100000,
+    "proof_system_digest": "d1671fc4760134bf86f0b37d8694f4827037e5cea2642e312cb2eb705f3aef0d",
+    "proof_version": 2,
+    "required_work_replay": false
+  },
+  "before_activation": {
+    "complete_proof_verification": true,
+    "direct_packet_exclusive_limit_bytes": 0,
+    "maximum_proof_frame_bytes": 13631488,
+    "proof_system_digest": "e849e3bfc83f8f8dd0f1fc1100879417718ba2bffb92af5cd649b61c720675a3",
+    "proof_version": 1,
+    "required_work_replay": true
+  },
+  "consensus_fingerprint": "5b9626178bb3777230ceda1cfc0fee5a8872ad0bb0ac1c5d0c7457cf67f083a5",
+  "fingerprint_domain": "CMFD/MAINNET/COMPACT-FORK/FINGERPRINT/V1",
+  "fingerprint_hash": "BLAKE3 derive_key",
+  "fingerprint_preimage_hex": "0100000088296bc39c10e8bc1dd4818d4d42412fe5f08210651110377f495da299812f62e9d81f15c580031302656609eb24fa8351efe0a34135ad894c793f3dd9044079ffff0000000000000400000068f6fe674f75a363c62c275ebb11fa74aa089e9bbde5bcb952ec35b8890b575c2efd2c4244bbd7808547b85266987544233fbe339f445135b07843aa8893d45e000000010000000001000000e849e3bfc83f8f8dd0f1fc1100879417718ba2bffb92af5cd649b61c720675a30000d000000000000000000000000000010102000000d1671fc4760134bf86f0b37d8694f4827037e5cea2642e312cb2eb705f3aef0d20145d0000000000808d5b00000000000001",
+  "fixed_artifact_record_digest": "2efd2c4244bbd7808547b85266987544233fbe339f445135b07843aa8893d45e",
+  "maximum_block_bytes": 16777216,
+  "model_manifest_digest": "68f6fe674f75a363c62c275ebb11fa74aa089e9bbde5bcb952ec35b8890b575c",
+  "network_id": "88296bc39c10e8bc1dd4818d4d42412fe5f08210651110377f495da299812f62",
+  "predecessor_fingerprint": "e9d81f15c580031302656609eb24fa8351efe0a34135ad894c793f3dd9044079",
+  "schema": "CMFD_COMPACT_MAINNET_FORK_IDENTITY_V1"
+}

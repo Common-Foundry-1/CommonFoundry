@@ -493,6 +493,23 @@ mod tests {
             hex::encode(parameters.fingerprint().unwrap()),
             MAINNET_FINGERPRINT
         );
+        let fork =
+            cmfd_consensus::compact_mainnet_fork::CompactMainnetForkIdentity::from_mainnet_params(
+                &parameters,
+            )
+            .unwrap();
+        assert_eq!(
+            hex::encode(fork.fingerprint()),
+            cmfd_consensus::compact_mainnet_fork::COMPACT_MAINNET_FINGERPRINT_HEX
+        );
+        let mut wrong = parameters;
+        wrong.genesis_hash[0] ^= 1;
+        assert!(
+            cmfd_consensus::compact_mainnet_fork::CompactMainnetForkIdentity::from_mainnet_params(
+                &wrong
+            )
+            .is_err()
+        );
     }
 
     /// Same check from the tracked launch plan and the published beacon:

@@ -3,8 +3,10 @@
 The compact-proof testnet exercises the two changes together: a self-contained
 version-2 proof with bound evaluation claims, and ordinary nodes that verify
 that proof without replaying the 384-layer mining calculation. Mainnet will
-activate both changes at one height **H**. H is intentionally unset while the
-testnet and independent proof review run.
+activate both changes at height **H = 65,535**, selected by the owner on
+2026-11-10. The fork and proof-system fingerprints are pinned in
+[`MAINNET-FINGERPRINT-65535.md`](MAINNET-FINGERPRINT-65535.md). Activation still
+requires the implementation and qualification below.
 
 ## Exact consensus boundary
 
@@ -21,10 +23,10 @@ node restarts, imports history, or crosses H during a reorganization. An audit
 node may replay post-H work independently; its replay result is observational
 and cannot make ordinary nodes depend on that work engine.
 
-## Code paths to complete before choosing H
+## Code paths to complete before activation
 
-1. Pin H, the direct proof-system digest and the authenticated model identity
-   in the owner-signed mainnet release configuration. A build without all
+1. Carry the pinned H, direct proof-system digest and authenticated model identity
+   from `compact_mainnet_fork.rs` into the owner-signed mainnet release configuration. A build without all
    three pins must fail closed.
 2. Make `PowParameters`, `ConsensusPowVerifier` and the node's block
    preverification select version 1 or 2 from the **block's height**. Apply

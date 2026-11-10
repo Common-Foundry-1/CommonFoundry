@@ -10,6 +10,7 @@ pub struct FileIdentity {
 }
 
 pub mod chain;
+pub mod compact_mainnet_fork;
 pub mod difficulty;
 #[cfg(feature = "dory-bls12-381-prototype")]
 pub mod dory_bls12_381_aggregate;

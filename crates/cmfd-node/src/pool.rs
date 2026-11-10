@@ -1393,6 +1393,241 @@ struct LedgerStore {
     _lock: std::fs::File,
 }
 
+#[derive(Debug, Serialize)]
+pub struct PoolLedgerRebindReport {
+    pub source_generation: u64,
+    pub network_id: String,
+    pub source_fingerprint: String,
+    pub target_fingerprint: String,
+    pub source_payload_blake3: String,
+    pub target_payload_blake3: String,
+    pub archive_bytes: Option<u64>,
+    pub archive_blake3: Option<String>,
+    pub output_ledger: PathBuf,
+}
+
+/// Rebind an intact, stopped v2 pool ledger to a reviewed new consensus
+/// fingerprint. The source is never written; the result is a new directory.
+pub fn rebind_pool_ledger_fingerprint(
+    source_directory: &Path,
+    output_directory: &Path,
+    network_id: [u8; 32],
+    source_fingerprint: [u8; 32],
+    target_fingerprint: [u8; 32],
+    expected_generation: u64,
+    max_bytes: usize,
+) -> Result<PoolLedgerRebindReport, PoolError> {
+    validate_ledger_size_limit(max_bytes)?;
+    if source_fingerprint == target_fingerprint {
+        return Err(PoolError::Reconciliation(
+            "source and target consensus fingerprints are identical".into(),
+        ));
+    }
+    let source_directory = fs::canonicalize(source_directory)?;
+    let output_parent = output_directory.parent().ok_or_else(|| {
+        PoolError::Reconciliation("output ledger needs an existing parent directory".into())
+    })?;
+    let output_parent = fs::canonicalize(output_parent)?;
+    let output_name = output_directory
+        .file_name()
+        .ok_or_else(|| PoolError::Reconciliation("output ledger needs a directory name".into()))?;
+    let output_directory = output_parent.join(output_name);
+    if output_parent.starts_with(&source_directory) || output_directory.exists() {
+        return Err(PoolError::Reconciliation(
+            "output must be a new directory outside the source ledger".into(),
+        ));
+    }
+
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(source_directory.join("pool-ledger.lock"))?;
+    FileExt::try_lock_exclusive(&lock).map_err(|error| {
+        let expected = fs2::lock_contended_error();
+        let contended = match (error.raw_os_error(), expected.raw_os_error()) {
+            (Some(actual), Some(expected)) => actual == expected,
+            _ => error.kind() == expected.kind(),
+        };
+        if contended {
+            PoolError::LedgerInUse
+        } else {
+            PoolError::Io(error)
+        }
+    })?;
+    let source = LedgerStore {
+        directory: source_directory.clone(),
+        network_id,
+        consensus_fingerprint: source_fingerprint,
+        max_bytes,
+        next_slot: AtomicU8::new(0),
+        _lock: lock,
+    };
+    let guard_path = source_directory.join(POOL_LEDGER_GUARD_FILE);
+    if !fs::symlink_metadata(&guard_path)?.file_type().is_file() {
+        return Err(PoolError::LedgerCorrupt(
+            "source payout guard must be a regular file".into(),
+        ));
+    }
+    let (ledger, slot) = source.load()?;
+    let slot = slot.ok_or_else(|| {
+        PoolError::Reconciliation("migration requires a protected format_version 2 snapshot".into())
+    })?;
+    if ledger.guard_version != 1 || ledger.generation != expected_generation {
+        return Err(PoolError::Reconciliation(
+            "protected ledger generation differs from the expected generation".into(),
+        ));
+    }
+    let source_path = source.slot_path(slot);
+    if !fs::symlink_metadata(&source_path)?.file_type().is_file() {
+        return Err(PoolError::LedgerCorrupt(
+            "source snapshot must be a regular file".into(),
+        ));
+    }
+    let stored: StoredLedgerV1 = serde_json::from_slice(&fs::read(&source_path)?)?;
+    let guard = source.load_guard()?.ok_or_else(|| {
+        PoolError::Reconciliation("protected source payout guard is missing".into())
+    })?;
+    if stored.generation != expected_generation
+        || stored.format_version != POOL_LEDGER_FORMAT_VERSION
+        || stored.network_id != network_id
+        || stored.consensus_fingerprint != source_fingerprint
+        || stored.payload_blake3 != guard.payload_blake3
+        || ledger_payload_checksum(
+            stored.generation,
+            network_id,
+            source_fingerprint,
+            &stored.payload,
+        )? != stored.payload_blake3
+    {
+        return Err(PoolError::LedgerCorrupt(
+            "source snapshot changed or no longer matches its payout guard".into(),
+        ));
+    }
+
+    let archive_path = source_directory.join(POOL_LEDGER_ARCHIVE_FILE);
+    let archive = match fs::symlink_metadata(&archive_path) {
+        Ok(metadata) if metadata.file_type().is_file() => Some(metadata.len()),
+        Ok(_) => {
+            return Err(PoolError::LedgerCorrupt(
+                "pool archive must be a regular file".into(),
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if archive.is_none()
+        && (ledger.archived_canonical_blocks != 0
+            || ledger.archived_orphaned_blocks != 0
+            || ledger.archived_operator_fee_atoms != 0
+            || ledger
+                .payouts
+                .values()
+                .any(|record| record.settled_atoms != 0))
+    {
+        return Err(PoolError::LedgerCorrupt(
+            "ledger has retired history but its archive is missing".into(),
+        ));
+    }
+
+    let mut random = [0_u8; 8];
+    getrandom::fill(&mut random).map_err(|error| PoolError::Random(error.to_string()))?;
+    let stage = output_parent.join(format!(
+        ".{}.migrating-{}",
+        output_name.to_string_lossy(),
+        hex::encode(random)
+    ));
+    fs::create_dir(&stage)?;
+    let stage_lock = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(stage.join("pool-ledger.lock"))?;
+    let target = LedgerStore {
+        directory: stage.clone(),
+        network_id,
+        consensus_fingerprint: target_fingerprint,
+        max_bytes,
+        next_slot: AtomicU8::new(0),
+        _lock: stage_lock,
+    };
+    let target_digest = ledger_payload_checksum(
+        expected_generation,
+        network_id,
+        target_fingerprint,
+        &stored.payload,
+    )?;
+    let target_stored = StoredLedgerV1 {
+        consensus_fingerprint: target_fingerprint,
+        payload_blake3: target_digest,
+        ..stored
+    };
+    let archive_blake3 = if archive.is_some() {
+        let mut input = std::fs::File::open(&archive_path)?;
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(stage.join(POOL_LEDGER_ARCHIVE_FILE))?;
+        let mut hasher = blake3::Hasher::new();
+        let mut copied = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = input.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            output.write_all(&buffer[..count])?;
+            hasher.update(&buffer[..count]);
+            copied = copied
+                .checked_add(count as u64)
+                .ok_or_else(|| PoolError::LedgerCorrupt("pool archive size overflow".into()))?;
+        }
+        output.sync_all()?;
+        if Some(copied) != archive {
+            return Err(PoolError::LedgerCorrupt(
+                "pool archive changed during migration".into(),
+            ));
+        }
+        Some(hasher.finalize().to_hex().to_string())
+    } else {
+        None
+    };
+    target.write_guard(&target_stored)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target.slot_path(slot))?;
+    let bytes = serde_json::to_vec(&target_stored)?;
+    if bytes.len() > max_bytes {
+        return Err(PoolError::LedgerSizeLimit {
+            bytes: bytes.len(),
+            limit: max_bytes,
+        });
+    }
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    drop(file);
+    sync_ledger_directory(&stage)?;
+    let (reloaded, _) = target.load()?;
+    if reloaded.generation != expected_generation || reloaded.guard_version != 1 {
+        return Err(PoolError::LedgerCorrupt(
+            "migrated ledger did not verify".into(),
+        ));
+    }
+    drop(target);
+    fs::rename(&stage, &output_directory)?;
+    sync_ledger_directory(&output_parent)?;
+    Ok(PoolLedgerRebindReport {
+        source_generation: expected_generation,
+        network_id: hex::encode(network_id),
+        source_fingerprint: hex::encode(source_fingerprint),
+        target_fingerprint: hex::encode(target_fingerprint),
+        source_payload_blake3: hex::encode(guard.payload_blake3),
+        target_payload_blake3: hex::encode(target_digest),
+        archive_bytes: archive,
+        archive_blake3,
+        output_ledger: output_directory,
+    })
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LedgerGuard {
@@ -8746,6 +8981,151 @@ mod tests {
     }
 
     #[test]
+    fn guarded_v2_rebind_preserves_payload_and_archive_without_writing_source() {
+        let root = TestRoot::new("ledger-fingerprint-rebind");
+        let source = root.path().join("source");
+        let output = root.path().join("output");
+        let network = [0x41; 32];
+        let old = [0x42; 32];
+        let new = [0x43; 32];
+        let payout = default_miner_destination();
+        let generation;
+        {
+            let ledger = DurableLedger::open(Some(source.clone()), network, old).unwrap();
+            register_session(&ledger, 1, "worker".to_owned(), payout).unwrap();
+            credit_accepted_share(&ledger, 1, 9).unwrap();
+            let payment = Transaction {
+                network_id: network,
+                version: 1,
+                inputs: Vec::new(),
+                outputs: vec![crate::TxOutput {
+                    value: 5,
+                    lock: OutputLock::Key(payout),
+                    spendable_height: 0,
+                }],
+            };
+            ledger
+                .transaction(|state| {
+                    state.payout_transactions.insert(
+                        payment.txid(),
+                        PayoutTransactionRecord {
+                            payout,
+                            amount_atoms: 5,
+                            fee_atoms: 1,
+                            transaction: payment,
+                            state: PoolPayoutTransactionState::Broadcast,
+                            confirmations: 0,
+                            created_at: None,
+                            confirmed_at: None,
+                            absent_through: None,
+                        },
+                    );
+                    Ok(())
+                })
+                .unwrap();
+            generation = ledger.state.lock().unwrap().generation;
+            assert!(matches!(
+                rebind_pool_ledger_fingerprint(
+                    &source,
+                    &output,
+                    network,
+                    old,
+                    new,
+                    generation,
+                    DEFAULT_POOL_LEDGER_MAX_BYTES,
+                ),
+                Err(PoolError::LedgerInUse)
+            ));
+        }
+        let archive_bytes = b"{\"kind\":\"payout_transaction\",\"txid\":\"audit\"}\n";
+        fs::write(source.join(POOL_LEDGER_ARCHIVE_FILE), archive_bytes).unwrap();
+        let slot = generation as u8 & 1;
+        let source_snapshot = fs::read(source.join(format!("pool-ledger-v2.{slot}.json"))).unwrap();
+        let source_guard = fs::read(source.join(POOL_LEDGER_GUARD_FILE)).unwrap();
+
+        let report = rebind_pool_ledger_fingerprint(
+            &source,
+            &output,
+            network,
+            old,
+            new,
+            generation,
+            DEFAULT_POOL_LEDGER_MAX_BYTES,
+        )
+        .unwrap();
+        assert_eq!(report.archive_bytes, Some(archive_bytes.len() as u64));
+        assert_eq!(
+            fs::read(source.join(POOL_LEDGER_GUARD_FILE)).unwrap(),
+            source_guard
+        );
+        assert_eq!(
+            fs::read(source.join(format!("pool-ledger-v2.{slot}.json"))).unwrap(),
+            source_snapshot
+        );
+        assert_eq!(
+            fs::read(output.join(POOL_LEDGER_ARCHIVE_FILE)).unwrap(),
+            archive_bytes
+        );
+        let before: serde_json::Value = serde_json::from_slice(&source_snapshot).unwrap();
+        let after: serde_json::Value = serde_json::from_slice(
+            &fs::read(output.join(format!("pool-ledger-v2.{slot}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(before["payload"], after["payload"]);
+        assert_ne!(before["payload_blake3"], after["payload_blake3"]);
+        let reopened = DurableLedger::open(Some(output), network, new).unwrap();
+        let snapshot = snapshot_ledger(&reopened).unwrap();
+        assert_eq!(snapshot.credited_devnet_atoms, 9);
+        assert_eq!(snapshot.payout_transactions.len(), 1);
+        assert_eq!(snapshot.payout_transactions[0].amount_atoms, 5);
+    }
+
+    #[test]
+    fn guarded_v2_rebind_rejects_wrong_identity_generation_and_missing_guard() {
+        let root = TestRoot::new("ledger-rebind-reject");
+        let source = root.path().join("source");
+        let output = root.path().join("output");
+        let network = [0x51; 32];
+        let old = [0x52; 32];
+        let new = [0x53; 32];
+        let generation;
+        {
+            let ledger = DurableLedger::open(Some(source.clone()), network, old).unwrap();
+            register_session(&ledger, 1, "worker".to_owned(), default_miner_destination()).unwrap();
+            generation = ledger.state.lock().unwrap().generation;
+        }
+        for (fingerprint, expected) in [(old, generation + 1), ([0x54; 32], generation)] {
+            assert!(
+                rebind_pool_ledger_fingerprint(
+                    &source,
+                    &output,
+                    network,
+                    fingerprint,
+                    new,
+                    expected,
+                    DEFAULT_POOL_LEDGER_MAX_BYTES,
+                )
+                .is_err()
+            );
+            assert!(!output.exists());
+        }
+        fs::remove_file(source.join(POOL_LEDGER_GUARD_FILE)).unwrap();
+        assert!(
+            rebind_pool_ledger_fingerprint(
+                &source,
+                &output,
+                network,
+                old,
+                new,
+                generation,
+                DEFAULT_POOL_LEDGER_MAX_BYTES,
+            )
+            .is_err()
+        );
+        assert!(!output.exists());
+    }
+
+    #[test]
     fn payout_policy_requires_nonzero_values_and_the_pool_wallet() {
         let root = TestRoot::new("payout-policy");
         let node = Arc::new(Mutex::new(
@@ -9743,19 +10123,47 @@ mod tests {
 
         server.stop().unwrap();
         let params = devnet_pool_params().unwrap();
-        let recovered = DurableLedger::open(
-            Some(root.path().join("ledger")),
-            params.network_id,
-            params.fingerprint().unwrap(),
-        )
-        .unwrap();
-        let recovered = snapshot_ledger(&recovered).unwrap();
+        let recovered = {
+            let ledger = DurableLedger::open(
+                Some(root.path().join("ledger")),
+                params.network_id,
+                params.fingerprint().unwrap(),
+            )
+            .unwrap();
+            snapshot_ledger(&ledger).unwrap()
+        };
         assert_eq!(recovered.payout_transactions.len(), 1);
         assert_eq!(recovered.payout_transactions[0].state, "prepared");
         assert_eq!(recovered.payouts[0].confirmed_payout_atoms, 0);
         assert_eq!(recovered.payouts[0].available_payout_atoms, 0);
         assert_eq!(recovered.payouts[0].reserved_payout_atoms, 120);
         assert!(recovered.payouts[0].payout_on_hold);
+
+        let source = root.path().join("ledger");
+        let output = root.path().join("rebound-ledger");
+        let generation = {
+            let source_guard: LedgerGuard =
+                serde_json::from_slice(&fs::read(source.join(POOL_LEDGER_GUARD_FILE)).unwrap())
+                    .unwrap();
+            source_guard.generation
+        };
+        let new_fingerprint = [0xa5; 32];
+        rebind_pool_ledger_fingerprint(
+            &source,
+            &output,
+            params.network_id,
+            params.fingerprint().unwrap(),
+            new_fingerprint,
+            generation,
+            DEFAULT_POOL_LEDGER_MAX_BYTES,
+        )
+        .unwrap();
+        let rebound =
+            DurableLedger::open(Some(output), params.network_id, new_fingerprint).unwrap();
+        let rebound = snapshot_ledger(&rebound).unwrap();
+        assert_eq!(rebound.payout_transactions, recovered.payout_transactions);
+        assert_eq!(rebound.payouts, recovered.payouts);
+        assert_eq!(rebound.payout_protection, recovered.payout_protection);
     }
 
     #[test]

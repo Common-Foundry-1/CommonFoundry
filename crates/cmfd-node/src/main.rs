@@ -44,8 +44,8 @@ use cmfd_node::pool::{
     DEFAULT_PPLNS_WINDOW_SHARES, DEFAULT_SHARE_LEADING_ZERO_BITS, MAX_POOL_BONUS_RATE_BPS,
     PoolBonusPolicy, PoolPayoutPolicy, PoolPayoutReconciliationRequest, PoolPplnsPolicy,
     PoolServerConfig, certificate_sha256, generate_pool_certificate,
-    inspect_pool_payout_protection_with_limit, reconcile_pool_payout_protection_with_limit,
-    require_existing_pool_ledger, spawn_pool_server,
+    inspect_pool_payout_protection_with_limit, rebind_pool_ledger_fingerprint,
+    reconcile_pool_payout_protection_with_limit, require_existing_pool_ledger, spawn_pool_server,
 };
 use cmfd_node::pool_dashboard::{
     DEFAULT_POOL_DASHBOARD_ADDRESS, PoolDashboardConfig, spawn_pool_dashboard,
@@ -872,6 +872,22 @@ enum Command {
         #[arg(long, required = true)]
         acknowledge_reconciliation: bool,
     },
+    /// Copy a stopped, guarded v2 pool ledger to a new consensus fingerprint.
+    PoolLedgerRebind {
+        #[arg(long)]
+        source_ledger: PathBuf,
+        /// New directory; the source ledger remains unchanged.
+        #[arg(long)]
+        output_ledger: PathBuf,
+        #[arg(long, value_parser = parse_hex32)]
+        source_fingerprint: [u8; 32],
+        #[arg(long, value_parser = parse_hex32)]
+        target_fingerprint: [u8; 32],
+        #[arg(long)]
+        expected_generation: u64,
+        #[arg(long, default_value_t = DEFAULT_POOL_LEDGER_MAX_BYTES)]
+        pool_ledger_max_bytes: usize,
+    },
     /// Generate a self-signed TLS certificate and print its required SHA-256 pin.
     PoolCertificate {
         /// Output path for the DER-encoded self-signed certificate.
@@ -1194,6 +1210,27 @@ fn run_command() -> Result<(), Box<dyn std::error::Error>> {
     }
     let cli = parse_cli()?;
     validate_exchange_withdrawal_cli(&cli)?;
+    if let Command::PoolLedgerRebind {
+        source_ledger,
+        output_ledger,
+        source_fingerprint,
+        target_fingerprint,
+        expected_generation,
+        pool_ledger_max_bytes,
+    } = &cli.command
+    {
+        let report = rebind_pool_ledger_fingerprint(
+            source_ledger,
+            output_ledger,
+            COMPILED_NETWORK_PROFILE.network_id,
+            *source_fingerprint,
+            *target_fingerprint,
+            *expected_generation,
+            *pool_ledger_max_bytes,
+        )?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
     if matches!(
         &cli.command,
         Command::PoolPayoutStatus { .. } | Command::PoolPayoutReconcile { .. }
@@ -2269,6 +2306,7 @@ fn run_command() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string_pretty(&node.status()?)?);
             Ok(())
         }
+        Command::PoolLedgerRebind { .. } => unreachable!("handled before opening node state"),
         Command::PoolPayoutStatus {
             pool_payout_fee_atoms,
             pool_ledger_max_bytes,
@@ -4946,6 +4984,7 @@ mod tests {
     }
 
     #[test]
+<<<<<<< HEAD
     fn pool_dashboard_bind_cannot_be_silently_ignored() {
         let base = [
             "cmfd-node",
@@ -4981,10 +5020,31 @@ mod tests {
         assert!(
             matches!(cli.command, Command::PoolServe { pool_dashboard_bind: Some(bind), .. }
             if bind == "127.0.0.1:23446".parse::<SocketAddr>().unwrap())
+=======
+    fn pool_ledger_rebind_cli_requires_both_fingerprints_and_generation() {
+        let old = "11".repeat(32);
+        let new = "22".repeat(32);
+        let args = [
+            "cmfd-node",
+            "pool-ledger-rebind",
+            "--source-ledger",
+            "old/pool-ledger",
+            "--output-ledger",
+            "new/pool-ledger",
+            "--source-fingerprint",
+            &old,
+            "--target-fingerprint",
+            &new,
+        ];
+        assert!(Cli::try_parse_from(args).is_err());
+        assert!(
+            Cli::try_parse_from(args.into_iter().chain(["--expected-generation", "5"])).is_ok()
+>>>>>>> fb04a5f9 (Add guarded pool ledger fingerprint migration)
         );
     }
 
     #[test]
+<<<<<<< HEAD
     fn compact_pool_shared_model_and_ram_flags_work_in_direct_launches() {
         let base = [
             "cmfd-node",
@@ -5065,6 +5125,8 @@ mod tests {
     }
 
     #[test]
+=======
+>>>>>>> fb04a5f9 (Add guarded pool ledger fingerprint migration)
     fn production_rc_seed_defaults_are_explicit_replaceable_and_disableable() {
         let seed = vec![cmfd_node::seed_peers::PRODUCTION_RC_SEED];
         let (defaults, public) =

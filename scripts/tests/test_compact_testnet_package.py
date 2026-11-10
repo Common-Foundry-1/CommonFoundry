@@ -20,6 +20,13 @@ spec.loader.exec_module(launcher)
 
 
 class CompactPackageTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.dashboard = Path(directory.name)
+        (self.dashboard / "index.html").write_text("<html>pool dashboard</html>")
+        (self.dashboard / "assets").mkdir()
+        (self.dashboard / "assets/app.js").write_text("console.log('pool')")
     def test_multigpu_payload_is_qualified_and_has_executable_proxy(self):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d);artifacts=root/'artifacts';artifacts.mkdir()
@@ -28,7 +35,7 @@ class CompactPackageTests(unittest.TestCase):
             qualification={'schema':'CMFD_COMPACT_TESTNET_QUALIFICATION_V1','network_id':launcher.NETWORK,
                 'proof_workers':{name:hashlib.sha256((artifacts/name).read_bytes()).hexdigest() for name in ('cmfd-v4-replay','cmfd-direct-prover','cmfd-direct-multigpu-worker')},'benchmark':{}}
             report=root/'proof.json';report.write_text(json.dumps(qualification))
-            command=[sys.executable,str(SOURCE.parents[2]/'scripts/package-compact-testnet.py'),'--artifacts',str(artifacts),
+            command=[sys.executable,str(SOURCE.parents[2]/'scripts/package-compact-testnet.py'),'--pool-dashboard-assets',str(self.dashboard),'--artifacts',str(artifacts),
                 '--multigpu-artifacts',str(artifacts),'--output',str(root/'output'),'--source-commit','a'*40,'--kit-version','0.4.0','--qualification-report',str(report)]
             qualification['proof_workers']['cmfd-direct-multigpu-worker']='00'*32;report.write_text(json.dumps(qualification))
             self.assertNotEqual(subprocess.run(command,capture_output=True).returncode,0)
@@ -56,7 +63,7 @@ class CompactPackageTests(unittest.TestCase):
             }
             report = root / "qualification.json"
             script = SOURCE.parents[2] / "scripts/package-compact-testnet.py"
-            command = [sys.executable, str(script), "--artifacts", str(artifacts),
+            command = [sys.executable, str(script), "--pool-dashboard-assets", str(self.dashboard), "--artifacts", str(artifacts),
                 "--source-commit", "a" * 40, "--kit-version", "0.3.0",
                 "--qualification-report", str(report)]
             for label, changed in (
@@ -85,13 +92,15 @@ class CompactPackageTests(unittest.TestCase):
                 (artifacts / name).write_bytes(b"test binary")
             output = root / "output"
             script = SOURCE.parents[2] / "scripts/package-compact-testnet.py"
-            subprocess.run([sys.executable, str(script), "--artifacts", str(artifacts),
+            subprocess.run([sys.executable, str(script), "--pool-dashboard-assets", str(self.dashboard), "--artifacts", str(artifacts),
                 "--output", str(output), "--source-commit", "a" * 40], check=True,
                 capture_output=True, text=True)
             archive = output / "commonfoundry-compact-testnet-v0.2.0-linux-x86_64.tar.gz"
             self.assertTrue(archive.is_file())
             with tarfile.open(archive) as packaged:
                 self.assertIn("commonfoundry-compact-testnet-v0.2.0-linux-x86_64/BUILD-INFO.json",
+                    packaged.getnames())
+                self.assertIn("commonfoundry-compact-testnet-v0.2.0-linux-x86_64/pool-dashboard/index.html",
                     packaged.getnames())
 
     def test_corrupted_payload_and_foreign_network_are_rejected(self):
@@ -134,11 +143,14 @@ class CompactPackageTests(unittest.TestCase):
             self.assertIn(launcher.SEED, command)
             self.assertIn("--no-default-seeds", command)
             self.assertNotIn("--enable-mainnet-payouts", command)
+            self.assertEqual(command[command.index("--pool-dashboard-bind") + 1], "127.0.0.1:23446")
+            self.assertEqual(command[command.index("--pool-public-url") + 1],
+                "cmfd+tls://[2001:db8::1]:23445?pin=CERTIFICATE_CREATED_ON_START")
 
             args.ram_witness_dir = Path("/dev/shm/private-test-witness")
             args.serial_gpu = True
             command = launcher.build_command(args, Path(d) / "inputs", Path(d) / "testnet")
-            self.assertEqual(command[command.index("--production-v4-pool-scratch") + 1],
+            self.assertEqual(command[command.index("--ram-witness-dir") + 1],
                 str(args.ram_witness_dir))
             self.assertEqual(command[command.index("--data-dir") + 1], str(Path(d) / "testnet"))
             self.assertIn("--production-v4-pool-serial-gpu", command)

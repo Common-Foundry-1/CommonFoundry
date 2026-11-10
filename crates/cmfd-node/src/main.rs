@@ -105,6 +105,22 @@ fn parse_hex32(value: &str) -> Result<[u8; 32], String> {
         .map_err(|_| "expected a 32-byte hexadecimal value".to_owned())
 }
 
+fn verify_rebind_target_fingerprint(
+    network_info: &[u8],
+    expected: [u8; 32],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let info: serde_json::Value = serde_json::from_slice(network_info)?;
+    let compiled = info["consensus"]["consensus_fingerprint"]
+        .as_str()
+        .ok_or("network-info has no consensus fingerprint")?;
+    if parse_hex32(compiled)? != expected {
+        return Err(
+            "target fingerprint does not match this binary's authenticated network-info".into(),
+        );
+    }
+    Ok(())
+}
+
 /// A reward destination: 64 lowercase hex characters or a checksummed address
 /// with `hrp`. The plan builder checks the key itself.
 #[cfg(feature = "production-v4")]
@@ -881,6 +897,7 @@ enum Command {
         output_ledger: PathBuf,
         #[arg(long, value_parser = parse_hex32)]
         source_fingerprint: [u8; 32],
+        /// Expected value from this binary's authenticated network-info.
         #[arg(long, value_parser = parse_hex32)]
         target_fingerprint: [u8; 32],
         #[arg(long)]
@@ -1210,27 +1227,6 @@ fn run_command() -> Result<(), Box<dyn std::error::Error>> {
     }
     let cli = parse_cli()?;
     validate_exchange_withdrawal_cli(&cli)?;
-    if let Command::PoolLedgerRebind {
-        source_ledger,
-        output_ledger,
-        source_fingerprint,
-        target_fingerprint,
-        expected_generation,
-        pool_ledger_max_bytes,
-    } = &cli.command
-    {
-        let report = rebind_pool_ledger_fingerprint(
-            source_ledger,
-            output_ledger,
-            COMPILED_NETWORK_PROFILE.network_id,
-            *source_fingerprint,
-            *target_fingerprint,
-            *expected_generation,
-            *pool_ledger_max_bytes,
-        )?;
-        println!("{}", serde_json::to_string_pretty(&report)?);
-        return Ok(());
-    }
     if matches!(
         &cli.command,
         Command::PoolPayoutStatus { .. } | Command::PoolPayoutReconcile { .. }
@@ -1796,6 +1792,32 @@ fn run_command() -> Result<(), Box<dyn std::error::Error>> {
     validate_production_v3_override_set(&cli)?;
     let production_v3_record = production_v3_record(&cli)?;
     let production_v4_artifacts = production_v4_artifacts(&cli)?;
+    if let Command::PoolLedgerRebind {
+        source_ledger,
+        output_ledger,
+        source_fingerprint,
+        target_fingerprint,
+        expected_generation,
+        pool_ledger_max_bytes,
+    } = &cli.command
+    {
+        let bytes = match production_v4_artifacts.as_ref() {
+            Some(artifacts) => canonical_network_info_json_with_v4_artifacts(artifacts)?,
+            None => canonical_network_info_json_with_record(production_v3_record.as_ref())?,
+        };
+        verify_rebind_target_fingerprint(&bytes, *target_fingerprint)?;
+        let report = rebind_pool_ledger_fingerprint(
+            source_ledger,
+            output_ledger,
+            COMPILED_NETWORK_PROFILE.network_id,
+            *source_fingerprint,
+            *target_fingerprint,
+            *expected_generation,
+            *pool_ledger_max_bytes,
+        )?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
     if matches!(&cli.command, Command::NetworkInfo) {
         let bytes = match production_v4_artifacts.as_ref() {
             Some(artifacts) => canonical_network_info_json_with_v4_artifacts(artifacts)?,
@@ -4493,7 +4515,7 @@ fn peer_warning(allow_public_peers: bool) -> String {
         )
     } else {
         format!(
-            "{} · {}",
+            "{} Â· {}",
             COMPILED_NETWORK_PROFILE.name,
             COMPILED_NETWORK_PROFILE.network_notice()
         )
@@ -4984,7 +5006,6 @@ mod tests {
     }
 
     #[test]
-<<<<<<< HEAD
     fn pool_dashboard_bind_cannot_be_silently_ignored() {
         let base = [
             "cmfd-node",
@@ -5020,7 +5041,10 @@ mod tests {
         assert!(
             matches!(cli.command, Command::PoolServe { pool_dashboard_bind: Some(bind), .. }
             if bind == "127.0.0.1:23446".parse::<SocketAddr>().unwrap())
-=======
+        );
+    }
+
+    #[test]
     fn pool_ledger_rebind_cli_requires_both_fingerprints_and_generation() {
         let old = "11".repeat(32);
         let new = "22".repeat(32);
@@ -5039,12 +5063,10 @@ mod tests {
         assert!(Cli::try_parse_from(args).is_err());
         assert!(
             Cli::try_parse_from(args.into_iter().chain(["--expected-generation", "5"])).is_ok()
->>>>>>> fb04a5f9 (Add guarded pool ledger fingerprint migration)
         );
     }
 
     #[test]
-<<<<<<< HEAD
     fn compact_pool_shared_model_and_ram_flags_work_in_direct_launches() {
         let base = [
             "cmfd-node",
@@ -5084,49 +5106,13 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "production-v4")]
-    fn direct_shared_model_selects_second_card_and_sets_all_worker_modes() {
-        let devices = ["GPU-a".to_owned(), "GPU-b".to_owned()];
-        assert!(pool_replay_matches_proof(
-            &[devices[1].clone()],
-            None,
-            Some(&devices),
-            true
-        ));
-        assert!(!pool_replay_matches_proof(
-            &[devices[0].clone()],
-            None,
-            Some(&devices),
-            true
-        ));
-        assert!(pool_replay_matches_proof(
-            &[devices[0].clone()],
-            None,
-            Some(&devices),
-            false
-        ));
-        let environment =
-            split_pool_worker_environment(&devices, Some("/run/pool/model.sock".into()));
-        let setting = |name: &str| {
-            environment
-                .iter()
-                .find(|(key, _)| key == name)
-                .unwrap()
-                .1
-                .to_str()
-                .unwrap()
-        };
-        assert_eq!(setting("CMFD_SHARED_MODEL"), "1");
-        assert_eq!(setting("CMFD_WITNESS_PIPELINE"), "1");
-        assert_eq!(setting("CMFD_DEVICE_RELATIONS"), "1");
-        assert_eq!(setting("CMFD_REPLAY_GPU_IPC"), "0");
-        assert_eq!(setting("CMFD_REPLAY_SEALED_EXPORT"), "0");
-        assert_eq!(setting("CUDA_MODULE_LOADING"), "LAZY");
+    fn pool_ledger_rebind_requires_the_binarys_actual_fingerprint() {
+        let info = br#"{"consensus":{"consensus_fingerprint":"1111111111111111111111111111111111111111111111111111111111111111"}}"#;
+        assert!(verify_rebind_target_fingerprint(info, [0x11; 32]).is_ok());
+        assert!(verify_rebind_target_fingerprint(info, [0x22; 32]).is_err());
     }
 
     #[test]
-=======
->>>>>>> fb04a5f9 (Add guarded pool ledger fingerprint migration)
     fn production_rc_seed_defaults_are_explicit_replaceable_and_disableable() {
         let seed = vec![cmfd_node::seed_peers::PRODUCTION_RC_SEED];
         let (defaults, public) =

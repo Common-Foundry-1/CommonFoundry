@@ -1,4 +1,4 @@
-# Pool dashboard and direct launch fixes — v0.5.3 candidate
+# Pool dashboard and direct launch fixes — v0.5.3
 
 The Linux kit now includes the built pool dashboard. `START-POOL.sh` enables
 it at **http://127.0.0.1:23446** and supplies the dashboard assets and advertised

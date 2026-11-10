@@ -1,4 +1,4 @@
-# Common Foundry Compact Proof Testnet - v0.5.3 candidate
+# Common Foundry Compact Proof Testnet - v0.5.3
 
 v0.5.3 bundles and enables the read-only pool dashboard at
 `http://127.0.0.1:23446`, rejects incomplete native dashboard options, and adds

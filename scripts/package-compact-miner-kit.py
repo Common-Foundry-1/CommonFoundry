@@ -173,6 +173,11 @@ def main() -> None:
     files["MINER-COMPATIBILITY.md"] = candidate.GUIDE.read_bytes()
     files["MAINNET-FORK-IDENTITY-65535.json"] = candidate.MANIFEST.read_bytes()
     if wsl:
+        # WSL exposes NVIDIA's utility here without consistently adding it to
+        # the non-interactive PATH inherited by `wsl --exec bash`.
+        files["start-miner.sh"] = files["start-miner.sh"].replace(
+            b"set -euo pipefail\n",
+            b"set -euo pipefail\nexport PATH=\"/usr/lib/wsl/lib:$PATH\"\n", 1)
         files["START-HERE.txt"] = b"""Common Foundry pool miner - Windows WSL2 edition
 
 Requires Ubuntu-22.04 in WSL2 with working NVIDIA GPU support.

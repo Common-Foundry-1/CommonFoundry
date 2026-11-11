@@ -67,9 +67,12 @@ HiveOS kits from the signed v1.0.20 miner distribution, replacing the standalone
 miner and recording the inherited launcher, CUDA runtime and GPU workers with
 their original provenance. It verifies the signed baseline, every inherited
 file and the new executable's source identity and two-fingerprint policy.
-Windows kits additionally require valid timestamped Authenticode signatures.
+Native Windows EXE kits additionally require valid timestamped Authenticode
+signatures. The Windows WSL2 edition instead ships the Linux payload and runs
+through the installed Microsoft-signed `wsl.exe`; it contains no new Windows EXE.
 
-Extract native kits into a new directory and use the included launcher. Reuse
+Extract kits into a new directory and use the included launcher. The Windows
+WSL2 edition includes `START-HERE.txt` with its one-line terminal command. Reuse
 the existing verified input bank to avoid downloading it again. Preserve the
 pool URL, certificate pin, payout address, worker name and GPU settings. For
 HiveOS, use the complete `commonfoundry-mainnet-hiveos-1.0.21.tar.gz` installation

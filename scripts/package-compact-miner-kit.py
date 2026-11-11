@@ -126,7 +126,7 @@ def main() -> None:
     for name in ("baseline", "baseline-checksums", "baseline-signature", "miner", "output"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--expected-commit", required=True)
-    parser.add_argument("--platform", required=True, choices=("linux-x86_64", "windows-x86_64"))
+    parser.add_argument("--platform", required=True, choices=("linux-x86_64", "windows-x86_64", "windows-wsl2-x86_64"))
     parser.add_argument("--kind", default="miner", choices=("miner", "hiveos"))
     parser.add_argument("--unsigned-miner", type=Path)
     parser.add_argument("--signed-launch", type=Path)
@@ -141,9 +141,11 @@ def main() -> None:
     if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
         raise ValueError("complete miner kits require a numeric version")
     windows = args.platform == "windows-x86_64"
-    if windows and args.kind == "hiveos":
+    wsl = args.platform == "windows-wsl2-x86_64"
+    if (windows or wsl) and args.kind == "hiveos":
         raise ValueError("HiveOS requires Linux")
-    expected_baseline = f"commonfoundry-mainnet-miner-{args.platform}-v1.0.20" + (".zip" if windows else ".tar.gz")
+    baseline_platform = "linux-x86_64" if wsl else args.platform
+    expected_baseline = f"commonfoundry-mainnet-miner-{baseline_platform}-v1.0.20" + (".zip" if windows else ".tar.gz")
     if args.kind == "hiveos":
         expected_baseline = "commonfoundry-mainnet-hiveos-1.0.20.tar.gz"
     if args.baseline.name != expected_baseline:
@@ -162,7 +164,7 @@ def main() -> None:
         require_authenticode(args.signed_launch)
         files["cmfd-launch.exe"] = args.signed_launch.read_bytes()
     name = f"commonfoundry-mainnet-miner-{args.platform}-v{version}"
-    archive_name = name + (".zip" if windows else ".tar.gz")
+    archive_name = name + (".zip" if windows or wsl else ".tar.gz")
     if args.kind == "hiveos":
         name = "commonfoundry-mainnet-hiveos"
         archive_name = name + f"-{version}.tar.gz"
@@ -170,14 +172,37 @@ def main() -> None:
     files["BASELINE-PACKAGE.json"] = baseline_receipt
     files["MINER-COMPATIBILITY.md"] = candidate.GUIDE.read_bytes()
     files["MAINNET-FORK-IDENTITY-65535.json"] = candidate.MANIFEST.read_bytes()
+    if wsl:
+        files["START-HERE.txt"] = b"""Common Foundry pool miner - Windows WSL2 edition
+
+Requires Ubuntu-22.04 in WSL2 with working NVIDIA GPU support.
+Extract this ZIP into a new directory. Open Windows Terminal in that directory
+(right-click the directory background and choose Open in Terminal), then run:
+
+wsl -d Ubuntu-22.04 --exec bash ./start-miner.sh
+
+Enter your existing CMFD receive address and complete pinned pool URL when
+asked. Ctrl+C stops the miner. You can reuse the inputs directory from your
+previous miner to avoid another model download. Keep the previous kit intact.
+
+This edition runs the miner and GPU worker inside WSL. It contains Linux
+executables and uses Windows' installed Microsoft-signed wsl.exe launcher.
+It does not include a new native Windows EXE or require a code-signing account.
+See README.md and MINER-COMPATIBILITY.md for verification and compatibility.
+"""
+        if any(Path(n).suffix.lower() in (".exe", ".dll", ".cmd", ".bat", ".ps1") for n in files):
+            raise ValueError("WSL edition must not contain native Windows executables or scripts")
+    launch_instruction = ("For Windows WSL2, follow START-HERE.txt: open a terminal in this directory\n"
+                          "and run `wsl -d Ubuntu-22.04 --exec bash ./start-miner.sh`." if wsl else
+                          "For native Linux, run `./start-miner.sh`. For a signed native Windows kit,\n"
+                          "run `START-MINER.bat` with working Ubuntu-22.04 WSL2 GPU support.")
     guide = f"""# Common Foundry pool miner {version}
 
 This complete NVIDIA miner kit supports today's mainnet pool and the exact
 planned compact-mainnet identity. This pre-activation compatibility prerelease
 does not activate the fork. Full node/pool cross-height qualification is pending.
 
-For native Linux, run `./start-miner.sh`. For Windows, run `START-MINER.bat`
-with working Ubuntu-22.04 WSL2 GPU support. Supply your existing CMFD receive
+{launch_instruction} Supply your existing CMFD receive
 address and full certificate-pinned pool URL. Keep your worker/GPU settings.
 Model downloads are resumable and verified. Reuse your existing verified model
 bank by copying the inputs directory into this new installation. Keep the old
@@ -230,11 +255,12 @@ files; MINER-KIT.json is the inventory for this kit and records both provenances
                    "baseline_release": "v1.0.20", "baseline_archive": args.baseline.name,
                    "baseline_archive_sha256": candidate.sha256(args.baseline), "release_approved": False,
                    "scope": "pool-nonce-search", "full_mainnet_fork_qualification": "pending",
-                   "windows_authenticode": "valid-timestamped" if windows else "not-applicable",
+                   "windows_authenticode": "valid-timestamped" if windows else "not-applicable-linux-payload",
+                   "payload_platform": "windows-x86_64" if windows else "linux-x86_64",
                    "files": {n: {"bytes": len(d), "sha256": hashlib.sha256(d).hexdigest()} for n, d in sorted(files.items())}}
         (stage / "MINER-KIT.json").write_bytes(candidate.canonical(receipt))
         epoch = int(candidate.output(["git", "show", "-s", "--format=%ct", commit], cwd=ROOT))
-        create = integrity.create_deterministic_zip if windows else integrity.create_deterministic_tar_gz
+        create = integrity.create_deterministic_zip if windows or wsl else integrity.create_deterministic_tar_gz
         create(stage, archive, epoch)
     print(json.dumps({"archive": str(archive), "sha256": candidate.sha256(archive), "source_commit": commit}))
 

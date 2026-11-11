@@ -91,8 +91,8 @@ def main() -> None:
         elif header[:6] != b"\x7fELF\x02\x01" or header[18:20] != b"\x3e\x00":
             raise ValueError("Linux candidate must be a little-endian ELF x86-64 executable")
     if os.name == "nt" and not windows:
-        linux_path = output(["wsl.exe", "-d", args.wsl_distribution, "--", "wslpath", "-u", str(miner)]).decode().strip()
-        executable = ["wsl.exe", "-d", args.wsl_distribution, "--", linux_path]
+        linux_path = output(["wsl.exe", "-d", args.wsl_distribution, "--exec", "wslpath", "-u", miner.as_posix()]).decode().strip()
+        executable = ["wsl.exe", "-d", args.wsl_distribution, "--exec", linux_path]
     else:
         executable = [str(miner)]
     if output([*executable, "--version"]).decode().strip() != f"cmfd-miner {version}":

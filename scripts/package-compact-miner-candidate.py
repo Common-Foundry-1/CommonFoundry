@@ -74,8 +74,8 @@ def main() -> None:
     if output(["git", "status", "--porcelain", "--untracked-files=normal"], cwd=ROOT).strip():
         raise ValueError("freeze a clean checkout before packaging")
     version = tomllib.loads((ROOT / "crates/cmfd-miner/Cargo.toml").read_text())["package"]["version"]
-    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+-compact\.[0-9]+", version):
-        raise ValueError("candidate version must be explicitly marked -compact.N")
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-compact\.[0-9]+)?", version):
+        raise ValueError("invalid pool miner version")
     miner = args.miner.resolve(strict=True)
     if not miner.is_file() or args.miner.is_symlink():
         raise ValueError("miner must be a regular file")

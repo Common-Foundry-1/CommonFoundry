@@ -1,11 +1,12 @@
 # Common Foundry for HiveOS
 
-This is the NVIDIA mainnet custom-miner package. Packages are scheduled for
-October 2, 2026 at noon Central; mining starts October 3 at noon Central.
-Starting it early prepares the model and waits for the authenticated launch.
+This is the NVIDIA mainnet custom-miner package. Version 1.0.21 adds pool-client
+support for the exact planned compact-mainnet consensus fingerprint while
+remaining compatible with existing mainnet pools. It does not activate the
+fork or replace the pool's proof generator. See `MINER-COMPATIBILITY.md`.
 
 In your flight sheet, choose **Custom** and use the installation URL for
-`commonfoundry-mainnet-hiveos-1.0.20.tar.gz` from the official release.
+`commonfoundry-mainnet-hiveos-1.0.21.tar.gz` from the official compatibility prerelease.
 
 - **Wallet template:** `%WAL%` (your CMFD receive address: a checksummed `cmfd1...` address or the 64-character destination public key)
 - **Pool URL:** the complete `cmfd+tls://IP:PORT?pin=...` URL supplied by the pool
@@ -46,8 +47,8 @@ wallet address and the correct pool certificate pin are required.
 For manual installation, run HiveOS's own installer with the official asset URL:
 
 ```sh
-/hive/miners/custom/custom-get 'https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/download/v1.0.20/commonfoundry-mainnet-hiveos-1.0.20.tar.gz'
+/hive/miners/custom/custom-get 'https://github.com/Common-Foundry-1/CommonFoundry-Binaries/releases/download/pool-miner-v1.0.21-compact.1/commonfoundry-mainnet-hiveos-1.0.21.tar.gz'
 ```
 
-That URL becomes usable when the scheduled release is published. Before launch,
-configure HiveOS watchdogs to allow model preparation and the scheduled wait.
+Verify the archive against the release's signed checksum manifest. Allow the
+watchdog enough time for first-start model preparation.

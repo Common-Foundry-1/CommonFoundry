@@ -1061,7 +1061,7 @@ dependencies = [
 
 [[package]]
 name = "cmfd-miner"
-version = "1.0.21-compact.1"
+version = "1.0.21"
 dependencies = [
  "anyhow",
  "blake3",

@@ -1,6 +1,6 @@
 # Miner preparation for the compact-proof mainnet fork
 
-Candidate version: **1.0.21-compact.1**, pool-client preparation only.
+Miner version: **1.0.21**, pre-activation pool-client compatibility.
 
 ## What developers need to change
 
@@ -62,27 +62,30 @@ tests, not fresh mainnet block or GPU mining evidence.
 Build the frozen source with `CMFD_BUILD_SOURCE_COMMIT` set to its exact
 commit and `cargo build --release --locked -p cmfd-miner --features
 production-mainnet`. Use the platform's usual release compiler and runtime
-settings. `scripts/package-compact-miner-candidate.py` produces an explicitly
-unsigned test overlay containing the new executable, compatibility report,
-this guide and per-file hashes. It checks the executable's source identity,
-mainnet ID and exact two-fingerprint policy before assembling anything.
+settings. `scripts/package-compact-miner-kit.py` builds complete native and
+HiveOS kits from the signed v1.0.20 miner distribution, replacing the standalone
+miner and recording the inherited launcher, CUDA runtime and GPU workers with
+their original provenance. It verifies the signed baseline, every inherited
+file and the new executable's source identity and two-fingerprint policy.
+Windows kits additionally require valid timestamped Authenticode signatures.
 
-Use the overlay in a **separate copy** of the matching mainnet miner kit.
-Preserve the existing launchers, input bank, GPU worker, pool URL, certificate
-pin, payout address, worker name and GPU settings. Linux overlays also apply
-to the executable inside a copied HiveOS kit. Keep the original installation
-for rollback. No overlay installer stops a running miner or changes a fleet.
+Extract native kits into a new directory and use the included launcher. Reuse
+the existing verified input bank to avoid downloading it again. Preserve the
+pool URL, certificate pin, payout address, worker name and GPU settings. For
+HiveOS, use the complete `commonfoundry-mainnet-hiveos-1.0.21.tar.gz` installation
+URL in the custom-miner flight sheet. Keep the original installation for
+rollback. These packages do not change an installed fleet automatically.
 
 ## What remains before a production release
 
-This candidate does not activate the hard fork and does not generate compact
+This miner does not activate the hard fork and does not generate compact
 mainnet block proofs in solo mode. The node/pool fork must still implement
 height-aware proof selection, historical storage and peer transitions,
 compact-mainnet proving and stale-job retirement. Qualify the miner against
 that full pool across H-1, H and H+1, including reconnects and fresh accepted
-shares/blocks, then complete the existing release review and signing gates.
-The stable release and its downloads must remain unchanged until those gates
-pass. See [the mainnet implementation plan](MAINNET-IMPLEMENTATION-PLAN.md).
+shares/blocks, before claiming complete mainnet-fork qualification. The
+compatibility prerelease is distributed separately from stable node/wallet
+updates. See [the mainnet implementation plan](MAINNET-IMPLEMENTATION-PLAN.md).
 
 ## Draft message for third-party miner developers
 

@@ -5,6 +5,10 @@
 //! only the server-issued job identifier and a nonce; the server recomputes
 //! the exact ForgeMatrix evaluation before crediting anything.
 
+#[cfg(test)]
+#[path = "pool_client_fork_tests.rs"]
+mod pool_client_fork_tests;
+
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::fs::{self, OpenOptions};
@@ -466,9 +470,39 @@ pub struct PoolClientConfig {
     pub payout_signer: Option<PoolPayoutSigner>,
     pub expected_network_id: [u8; 32],
     pub expected_consensus_fingerprint: [u8; 32],
+    compact_mainnet_compatibility: bool,
 }
 
 impl PoolClientConfig {
+    /// Permit the exact planned compact-mainnet identity as well as its pinned
+    /// predecessor. This is only pool-client negotiation: it does not change
+    /// node consensus, accept arbitrary fingerprints, or enable a block prover.
+    pub fn with_compact_mainnet_compatibility(mut self) -> Result<Self, PoolError> {
+        use cmfd_consensus::compact_mainnet_fork::{
+            COMPACT_MAINNET_NETWORK_ID, COMPACT_MAINNET_PREDECESSOR_FINGERPRINT,
+        };
+        if self.expected_network_id != COMPACT_MAINNET_NETWORK_ID {
+            return Err(PoolError::NetworkMismatch);
+        }
+        if self.expected_consensus_fingerprint != COMPACT_MAINNET_PREDECESSOR_FINGERPRINT {
+            return Err(PoolError::FingerprintMismatch);
+        }
+        self.compact_mainnet_compatibility = true;
+        Ok(self)
+    }
+
+    fn accepts_consensus_fingerprint(&self, fingerprint: [u8; 32]) -> bool {
+        use cmfd_consensus::compact_mainnet_fork::{
+            COMPACT_MAINNET_NETWORK_ID, COMPACT_MAINNET_PREDECESSOR_FINGERPRINT,
+            CompactMainnetForkIdentity,
+        };
+        fingerprint == self.expected_consensus_fingerprint
+            || (self.compact_mainnet_compatibility
+                && self.expected_network_id == COMPACT_MAINNET_NETWORK_ID
+                && self.expected_consensus_fingerprint == COMPACT_MAINNET_PREDECESSOR_FINGERPRINT
+                && fingerprint == CompactMainnetForkIdentity::pinned().fingerprint())
+    }
+
     pub fn devnet(
         address: SocketAddr,
         certificate_sha256: [u8; 32],
@@ -527,6 +561,7 @@ impl PoolClientConfig {
             payout_signer: None,
             expected_network_id: params.network_id,
             expected_consensus_fingerprint: params.fingerprint().map_err(NodeError::from)?,
+            compact_mainnet_compatibility: false,
         })
     }
 
@@ -546,6 +581,7 @@ impl PoolClientConfig {
             payout_signer: Some(payout_signer),
             expected_network_id: params.network_id,
             expected_consensus_fingerprint: params.fingerprint().map_err(NodeError::from)?,
+            compact_mainnet_compatibility: false,
         })
     }
 }
@@ -6618,6 +6654,7 @@ pub struct PoolClient {
     accounting_semantics: String,
     persistence: String,
     expected_network_id: [u8; 32],
+    consensus_fingerprint: [u8; 32],
     current_job: PoolJob,
 }
 
@@ -6742,7 +6779,7 @@ impl PoolClient {
                 .map_err(map_tls_io_error)?;
         }
         let mut stream = StreamOwned::new(connection, socket);
-        let authentication_nonce = match read_frame(&mut stream)? {
+        let (authentication_nonce, selected_fingerprint) = match read_frame(&mut stream)? {
             ServerMessage::AuthChallenge {
                 protocol_version,
                 network_id,
@@ -6755,10 +6792,10 @@ impl PoolClient {
                 if network_id != config.expected_network_id {
                     return Err(PoolError::NetworkMismatch);
                 }
-                if consensus_fingerprint != config.expected_consensus_fingerprint {
+                if !config.accepts_consensus_fingerprint(consensus_fingerprint) {
                     return Err(PoolError::FingerprintMismatch);
                 }
-                nonce
+                (nonce, consensus_fingerprint)
             }
             ServerMessage::Error { code, .. } => return Err(server_error(code)),
             _ => {
@@ -6773,7 +6810,7 @@ impl PoolClient {
             .map_or_else(Vec::new, |signer| {
                 signer.sign(payout_auth_digest(
                     config.expected_network_id,
-                    config.expected_consensus_fingerprint,
+                    selected_fingerprint,
                     authentication_nonce,
                     &config.worker,
                     config.payout,
@@ -6784,7 +6821,7 @@ impl PoolClient {
             &ClientMessage::Hello {
                 protocol_version: POOL_PROTOCOL_VERSION,
                 network_id: config.expected_network_id,
-                consensus_fingerprint: config.expected_consensus_fingerprint,
+                consensus_fingerprint: selected_fingerprint,
                 worker: config.worker,
                 payout: config.payout,
                 payout_signature,
@@ -6805,7 +6842,7 @@ impl PoolClient {
                 if network_id != config.expected_network_id {
                     return Err(PoolError::NetworkMismatch);
                 }
-                if consensus_fingerprint != config.expected_consensus_fingerprint {
+                if consensus_fingerprint != selected_fingerprint {
                     return Err(PoolError::FingerprintMismatch);
                 }
                 (session_id, accounting_semantics, persistence)
@@ -6835,12 +6872,19 @@ impl PoolClient {
             accounting_semantics,
             persistence,
             expected_network_id: config.expected_network_id,
+            consensus_fingerprint: selected_fingerprint,
             current_job,
         })
     }
 
     pub fn session_id(&self) -> u64 {
         self.session_id
+    }
+
+    /// The pinned identity selected for this TLS session. A reconnect negotiates
+    /// again; an acknowledgement cannot switch identities within a handshake.
+    pub fn consensus_fingerprint(&self) -> [u8; 32] {
+        self.consensus_fingerprint
     }
 
     pub fn accounting_semantics(&self) -> &str {

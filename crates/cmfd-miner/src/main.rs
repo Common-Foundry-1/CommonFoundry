@@ -180,6 +180,9 @@ struct ProductionV3Cli {
 enum Command {
     /// Print the canonical identity compiled into this miner without opening CUDA or artifacts.
     NetworkInfo,
+    /// Report pool-only compact-mainnet compatibility without opening a GPU.
+    #[cfg(feature = "production-mainnet")]
+    PoolCompatibilityInfo,
     /// Verify packaged mainnet identity without starting workers or waiting for genesis.
     #[cfg(feature = "production-v4")]
     MainnetLaunchInfo,
@@ -620,6 +623,13 @@ struct WorkerThreadError {
 
 fn main() -> Result<()> {
     let command = Cli::parse().command;
+    #[cfg(feature = "production-mainnet")]
+    if matches!(&command, Command::PoolCompatibilityInfo) {
+        std::io::stdout()
+            .lock()
+            .write_all(&canonical_pool_compatibility_info_json()?)?;
+        return Ok(());
+    }
     #[cfg(feature = "production-v4")]
     if matches!(&command, Command::MainnetLaunchInfo) {
         std::io::stdout()
@@ -632,6 +642,10 @@ fn main() -> Result<()> {
     }
     match command {
         Command::NetworkInfo => write_miner_network_info(),
+        #[cfg(feature = "production-mainnet")]
+        Command::PoolCompatibilityInfo => {
+            unreachable!("pool-compatibility-info exits before work dispatch")
+        }
         #[cfg(feature = "production-v4")]
         Command::MainnetLaunchInfo => {
             unreachable!("mainnet-launch-info exits before work dispatch")
@@ -934,6 +948,40 @@ fn write_miner_network_info() -> Result<()> {
         .lock()
         .write_all(&canonical_miner_network_info_json()?)?;
     Ok(())
+}
+
+#[cfg(feature = "production-mainnet")]
+fn canonical_pool_compatibility_info_json() -> Result<Vec<u8>> {
+    use cmfd_consensus::compact_mainnet_fork::CompactMainnetForkIdentity;
+    // Report the compiled pool policy without requiring a launch beacon next
+    // to this executable. Actual pool setup still authenticates launch params
+    // and checks the exact predecessor before enabling compatibility.
+    let identity = CompactMainnetForkIdentity::pinned();
+    if COMPILED_NETWORK_PROFILE.network_id != identity.network_id {
+        bail!("compact pool compatibility requires the pinned mainnet network");
+    }
+    let build_source_commit = option_env!("CMFD_BUILD_SOURCE_COMMIT");
+    if build_source_commit.is_some_and(|value| !valid_build_source_commit(value)) {
+        bail!("compiled build source commit is not nonzero lowercase 40- or 64-character hex");
+    }
+    let mut encoded = serde_json::to_vec(&serde_json::json!({
+        "format": "commonfoundry-pool-miner-compatibility",
+        "format_version": 1,
+        "build_source_commit": build_source_commit,
+        "network_id": hex::encode(identity.network_id),
+        "pool_protocol_version": cmfd_node::pool::POOL_PROTOCOL_VERSION,
+        "accepted_consensus_fingerprints": [
+            hex::encode(identity.predecessor_fingerprint),
+            hex::encode(identity.fingerprint()),
+        ],
+        "compact_mainnet_activation_height": identity.activation_height,
+        "compact_mainnet_proof_system_digest": hex::encode(identity.after.proof_system_digest),
+        "compact_mainnet_block_proof_generation": false,
+        "activates_mainnet_fork": false,
+        "scope": "pool-nonce-search",
+    }))?;
+    encoded.push(b'\n');
+    Ok(encoded)
 }
 
 #[cfg(feature = "production-v4")]
@@ -1273,6 +1321,8 @@ fn run_production_v4_pool_miner(options: ProductionV4PoolMinerOptions) -> Result
         worker.clone(),
         payout,
     )?;
+    #[cfg(feature = "production-mainnet")]
+    let client_config = client_config.with_compact_mainnet_compatibility()?;
     let searcher = ProductionV4PersistentPoolSearcher::start(production_v4_pool_searcher_config(
         &options.replay_worker,
         &options.model_bank,
@@ -1315,6 +1365,10 @@ fn run_production_v4_pool_miner(options: ProductionV4PoolMinerOptions) -> Result
         println!(
             "Connected to pool at height {}.",
             client.current_job().challenge.height.saturating_sub(1)
+        );
+        println!(
+            "Pool consensus fingerprint: {}",
+            hex::encode(client.consensus_fingerprint())
         );
         match mine_production_v4_pool_session(
             &mut client,
@@ -6036,6 +6090,35 @@ mod tests {
         assert!(!valid_build_source_commit(&"00".repeat(20)));
         assert!(!valid_build_source_commit(&"AB".repeat(20)));
         assert!(!valid_build_source_commit(&"1a".repeat(19)));
+    }
+
+    #[cfg(feature = "production-mainnet")]
+    #[test]
+    fn compact_pool_compatibility_info_reports_pool_scope_and_exact_pins() {
+        use cmfd_consensus::compact_mainnet_fork::{
+            COMPACT_MAINNET_FINGERPRINT_HEX, COMPACT_MAINNET_PREDECESSOR_FINGERPRINT,
+            COMPACT_MAINNET_PROOF_SYSTEM_DIGEST_HEX,
+        };
+        let cli = Cli::try_parse_from(["cmfd-miner", "pool-compatibility-info"]).unwrap();
+        assert!(matches!(cli.command, Command::PoolCompatibilityInfo));
+        let encoded = canonical_pool_compatibility_info_json().unwrap();
+        let info: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(
+            info["accepted_consensus_fingerprints"],
+            serde_json::json!([
+                hex::encode(COMPACT_MAINNET_PREDECESSOR_FINGERPRINT),
+                COMPACT_MAINNET_FINGERPRINT_HEX,
+            ])
+        );
+        assert_eq!(info["compact_mainnet_activation_height"], 65_535);
+        assert_eq!(
+            info["compact_mainnet_proof_system_digest"],
+            COMPACT_MAINNET_PROOF_SYSTEM_DIGEST_HEX
+        );
+        assert_eq!(info["compact_mainnet_block_proof_generation"], false);
+        assert_eq!(info["activates_mainnet_fork"], false);
+        assert_eq!(info["scope"], "pool-nonce-search");
+        assert_eq!(encoded.last(), Some(&b'\n'));
     }
 
     #[cfg(feature = "production-v4")]

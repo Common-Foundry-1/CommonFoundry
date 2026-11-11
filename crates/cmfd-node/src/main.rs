@@ -50,6 +50,7 @@ use cmfd_node::pool::{
 use cmfd_node::pool_dashboard::{
     DEFAULT_POOL_DASHBOARD_ADDRESS, PoolDashboardConfig, spawn_pool_dashboard,
 };
+use cmfd_node::pool_ram_witness::validate as validate_pool_ram_witness_directory;
 #[cfg(feature = "production-v4")]
 use cmfd_node::production_v4_pool::{
     ProductionV4PersistentPoolVerifier, ProductionV4PoolVerifierConfig,
@@ -943,12 +944,20 @@ enum Command {
         /// evicts replay before proving. Mining clients must use other GPUs.
         #[arg(long, requires = "production_v4_pool_serial_gpu")]
         production_v4_pool_keep_replay_resident: bool,
+        /// Compact Linux pool: share the second proving GPU's resident model
+        /// with its serial replay worker, as in launch.py --shared-model.
+        #[arg(long, requires_all = ["production_v4_pool_proof_gpus", "production_v4_pool_serial_gpu"])]
+        shared_model: bool,
         /// Absolute native path to the persistent ProductionV4 proof worker.
         #[arg(long)]
         production_v4_pool_proof_worker: Option<PathBuf>,
         /// Absolute native scratch directory shared by the V4 pool workers.
         #[arg(long)]
         production_v4_pool_scratch: Option<PathBuf>,
+        /// Launcher-compatible RAM witness path: existing private Linux tmpfs
+        /// mount, capped at 2 GiB with at least 1.65 GB free.
+        #[arg(long, conflicts_with = "production_v4_pool_scratch")]
+        ram_witness_dir: Option<PathBuf>,
         /// Run the V4 pool workers through this WSL distribution.
         #[arg(long)]
         production_v4_pool_wsl_distribution: Option<String>,
@@ -1010,14 +1019,15 @@ enum Command {
         #[arg(long, default_value_t = DEFAULT_POOL_LEDGER_MAX_BYTES)]
         pool_ledger_max_bytes: usize,
         /// Built dashboard directory containing index.html and its static assets.
-        #[arg(long)]
+        #[arg(long, requires = "pool_public_url")]
         pool_dashboard_assets: Option<PathBuf>,
         /// Public cmfd+tls pool URL displayed by the dashboard.
-        #[arg(long)]
+        #[arg(long, requires = "pool_dashboard_assets")]
         pool_public_url: Option<String>,
-        /// Loopback-only address for the read-only pool dashboard.
-        #[arg(long, default_value_t = DEFAULT_POOL_DASHBOARD_ADDRESS)]
-        pool_dashboard_bind: SocketAddr,
+        /// Loopback-only dashboard address (default 127.0.0.1:22446 when
+        /// enabled). Requires dashboard assets and the public pool URL.
+        #[arg(long, requires_all = ["pool_dashboard_assets", "pool_public_url"])]
+        pool_dashboard_bind: Option<SocketAddr>,
         /// Absolute create-new request file used by local operator controls for graceful shutdown.
         #[arg(long)]
         shutdown_request_file: Option<PathBuf>,
@@ -2417,8 +2427,10 @@ fn run_command() -> Result<(), Box<dyn std::error::Error>> {
             production_v4_pool_proof_gpus,
             production_v4_pool_serial_gpu,
             production_v4_pool_keep_replay_resident,
+            shared_model,
             production_v4_pool_proof_worker,
             production_v4_pool_scratch,
+            ram_witness_dir,
             production_v4_pool_wsl_distribution,
             enable_testnet_payouts,
             enable_mainnet_payouts,
@@ -2446,6 +2458,12 @@ fn run_command() -> Result<(), Box<dyn std::error::Error>> {
             work_bank,
         } => {
             require_pool_mining_profile()?;
+            let shared_model =
+                shared_model || std::env::var("CMFD_SHARED_MODEL").as_deref() == Ok("1");
+            let production_v4_pool_scratch = match ram_witness_dir {
+                Some(path) => Some(validate_pool_ram_witness_directory(&path)?),
+                None => production_v4_pool_scratch,
+            };
             let automatic_payouts = pool_payouts_enabled(
                 enable_testnet_payouts,
                 enable_mainnet_payouts,
@@ -2537,6 +2555,7 @@ fn run_command() -> Result<(), Box<dyn std::error::Error>> {
                 production_v4_pool_proof_gpus.as_deref(),
                 production_v4_pool_serial_gpu,
                 production_v4_pool_keep_replay_resident,
+                shared_model,
                 production_v4_pool_proof_worker.as_ref(),
                 production_v4_pool_scratch.as_ref(),
                 production_v4_pool_wsl_distribution.as_deref(),
@@ -2664,7 +2683,7 @@ fn run_command() -> Result<(), Box<dyn std::error::Error>> {
                 Some((assets_directory, public_pool_url)) => Some(spawn_pool_dashboard(
                     pool.dashboard_source(),
                     PoolDashboardConfig {
-                        bind: pool_dashboard_bind,
+                        bind: pool_dashboard_bind.unwrap_or(DEFAULT_POOL_DASHBOARD_ADDRESS),
                         assets_directory,
                         public_pool_url,
                         certificate_sha256: pin,
@@ -2707,6 +2726,7 @@ fn run_command() -> Result<(), Box<dyn std::error::Error>> {
                     "proof_gpus": production_v4_pool_proof_gpus,
                     "serial_gpu": production_v4_pool_serial_gpu,
                     "keep_replay_resident": production_v4_pool_keep_replay_resident,
+                    "shared_model": shared_model,
                     "work_checks_use_replay_workers": work_checks_use_replay_workers,
                     "ledger_max_bytes": pool_ledger_max_bytes,
                     "dashboard": dashboard.as_ref().map(|dashboard| format!("http://{}", dashboard.local_addr())),
@@ -2717,6 +2737,7 @@ fn run_command() -> Result<(), Box<dyn std::error::Error>> {
                     "accounting": cmfd_node::pool::POOL_ACCOUNTING_SEMANTICS
                 }))?
             );
+            io::stdout().flush()?;
             let halted_while_running = work_halt_watch(
                 node.lock()
                     .map_err(|_| cmfd_node::NodeError::SharedNodePoisoned)?
@@ -3484,6 +3505,46 @@ fn production_v4_artifacts(
     }
 }
 
+#[cfg(feature = "production-v4")]
+fn pool_replay_matches_proof(
+    replay_gpus: &[String],
+    proof_gpu: Option<&str>,
+    split_devices: Option<&[String]>,
+    shared_model: bool,
+) -> bool {
+    match split_devices {
+        Some(devices) => replay_gpus
+            .first()
+            .is_some_and(|replay| devices.get(if shared_model { 1 } else { 0 }) == Some(replay)),
+        None => proof_gpu == replay_gpus.first().map(String::as_str),
+    }
+}
+
+#[cfg(feature = "production-v4")]
+fn split_pool_worker_environment(
+    devices: &[String],
+    shared_socket: Option<OsString>,
+) -> Vec<(OsString, OsString)> {
+    let mut environment = vec![
+        (
+            "CMFD_DIRECT_MULTI_GPU_DEVICES".into(),
+            devices.join(",").into(),
+        ),
+        ("CUDA_MODULE_LOADING".into(), "LAZY".into()),
+    ];
+    if let Some(socket) = shared_socket {
+        environment.extend([
+            ("CMFD_SHARED_MODEL".into(), "1".into()),
+            ("CMFD_SHARED_REPLAY_SOCKET".into(), socket),
+            ("CMFD_WITNESS_PIPELINE".into(), "1".into()),
+            ("CMFD_DEVICE_RELATIONS".into(), "1".into()),
+            ("CMFD_REPLAY_GPU_IPC".into(), "0".into()),
+            ("CMFD_REPLAY_SEALED_EXPORT".into(), "0".into()),
+        ]);
+    }
+    environment
+}
+
 // One option per worker knob; grouping them would only move the list.
 #[allow(clippy::too_many_arguments)]
 fn configure_production_v4_pool_verifier(
@@ -3495,6 +3556,7 @@ fn configure_production_v4_pool_verifier(
     proof_gpus: Option<&str>,
     serial_gpu: bool,
     keep_replay_resident: bool,
+    shared_model_requested: bool,
     proof_worker: Option<&PathBuf>,
     scratch_directory: Option<&PathBuf>,
     wsl_distribution: Option<&str>,
@@ -3505,6 +3567,7 @@ fn configure_production_v4_pool_verifier(
         || proof_gpus.is_some()
         || serial_gpu
         || keep_replay_resident
+        || shared_model_requested
         || proof_worker.is_some()
         || scratch_directory.is_some()
         || wsl_distribution.is_some();
@@ -3574,7 +3637,8 @@ fn configure_production_v4_pool_verifier(
         }
         let proof_gpu = physical_proof.as_deref();
         let replay_gpus = &physical_replays;
-        let shared_model = std::env::var("CMFD_SHARED_MODEL").as_deref() == Ok("1");
+        let shared_model =
+            shared_model_requested || std::env::var("CMFD_SHARED_MODEL").as_deref() == Ok("1");
         if shared_model && keep_replay_resident {
             return Err(
                 "shared-model mode already retains its model; omit keep-replay-resident".into(),
@@ -3611,12 +3675,12 @@ fn configure_production_v4_pool_verifier(
                 return Err("overlapping replay and proof GPUs require serial GPU mode".into());
             }
         }
-        let replay_matches_proof = match &split_devices {
-            Some(devices) => replay_gpus.first().is_some_and(|replay| {
-                devices.get(if shared_model { 1 } else { 0 }) == Some(replay)
-            }),
-            None => proof_gpu == replay_gpus.first().map(String::as_str),
-        };
+        let replay_matches_proof = pool_replay_matches_proof(
+            replay_gpus,
+            proof_gpu,
+            split_devices.as_ref().map(|devices| devices.as_slice()),
+            shared_model,
+        );
         if serial_gpu && (replay_gpus.len() != 1 || !replay_matches_proof) {
             return Err(
                 "serial GPU mode requires one replay GPU matching its proving role (second GPU for shared model, first otherwise)"
@@ -3645,7 +3709,7 @@ fn configure_production_v4_pool_verifier(
         let shared_socket = if shared_model {
             let path = PathBuf::from(
                 std::env::var_os("CMFD_SHARED_REPLAY_SOCKET")
-                    .ok_or("shared model socket is missing")?,
+                    .unwrap_or_else(|| scratch_directory.join("model.sock").into_os_string()),
             );
             if !path.is_absolute()
                 || path.parent() != Some(scratch_directory.as_path())
@@ -3669,6 +3733,11 @@ fn configure_production_v4_pool_verifier(
                     shared_socket
                         .clone()
                         .map(|socket| ("CMFD_SHARED_REPLAY_SOCKET".into(), socket)),
+                )
+                .chain(
+                    split_devices
+                        .as_ref()
+                        .map(|_| ("CUDA_MODULE_LOADING".into(), "LAZY".into())),
                 )
                 .collect(),
         };
@@ -3713,15 +3782,7 @@ fn configure_production_v4_pool_verifier(
                     ),
                     environment: match (&split_devices, proof_gpu) {
                         (Some(devices), _) => {
-                            let mut environment = vec![(
-                                "CMFD_DIRECT_MULTI_GPU_DEVICES".into(),
-                                devices.join(",").into(),
-                            )];
-                            if let Some(socket) = shared_socket.clone() {
-                                environment.push(("CMFD_SHARED_MODEL".into(), "1".into()));
-                                environment.push(("CMFD_SHARED_REPLAY_SOCKET".into(), socket));
-                            }
-                            environment
+                            split_pool_worker_environment(devices, shared_socket.clone())
                         }
                         (None, Some(gpu)) => {
                             let device = cmfd_node::production_v4_pool::production_v4_worker_cuda_visible_device(Some(gpu))?;
@@ -4680,7 +4741,7 @@ mod tests {
         };
         assert_eq!(bind, COMPILED_NETWORK_PROFILE.pool_address());
         assert_eq!(p2p_bind, COMPILED_NETWORK_PROFILE.p2p_address());
-        assert_eq!(pool_dashboard_bind, DEFAULT_POOL_DASHBOARD_ADDRESS);
+        assert_eq!(pool_dashboard_bind, None);
         assert_eq!(pool_operator_fee_bps, 300);
         assert_eq!(pool_bonus_rate_bps, 0);
         assert_eq!(pool_bonus_sponsor, None);
@@ -4882,6 +4943,125 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn pool_dashboard_bind_cannot_be_silently_ignored() {
+        let base = [
+            "cmfd-node",
+            "pool-serve",
+            "--certificate",
+            "cert.der",
+            "--private-key",
+            "key.der",
+        ];
+        assert!(
+            Cli::try_parse_from(
+                base.into_iter()
+                    .chain(["--pool-dashboard-bind", "127.0.0.1:23446"])
+            )
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(
+                base.into_iter()
+                    .chain(["--pool-dashboard-assets", "dashboard"])
+            )
+            .is_err()
+        );
+        let cli = Cli::try_parse_from(base.into_iter().chain([
+            "--pool-dashboard-bind",
+            "127.0.0.1:23446",
+            "--pool-dashboard-assets",
+            "dashboard",
+            "--pool-public-url",
+            "cmfd+tls://127.0.0.1:23445?pin=00",
+        ]))
+        .unwrap();
+        assert!(
+            matches!(cli.command, Command::PoolServe { pool_dashboard_bind: Some(bind), .. }
+            if bind == "127.0.0.1:23446".parse::<SocketAddr>().unwrap())
+        );
+    }
+
+    #[test]
+    fn compact_pool_shared_model_and_ram_flags_work_in_direct_launches() {
+        let base = [
+            "cmfd-node",
+            "pool-serve",
+            "--certificate",
+            "cert.der",
+            "--private-key",
+            "key.der",
+            "--production-v4-pool-replay-gpu",
+            "1",
+            "--production-v4-pool-proof-gpus",
+            "0,1",
+            "--production-v4-pool-serial-gpu",
+            "--shared-model",
+            "--ram-witness-dir",
+            "/run/pool-witness",
+        ];
+        let cli = Cli::try_parse_from(base).unwrap();
+        assert!(
+            matches!(cli.command, Command::PoolServe { shared_model: true, ram_witness_dir: Some(path), .. }
+            if path == Path::new("/run/pool-witness"))
+        );
+        assert!(
+            Cli::try_parse_from(
+                base.into_iter()
+                    .chain(["--production-v4-pool-scratch", "/other"])
+            )
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(
+                base.into_iter()
+                    .filter(|value| *value != "--production-v4-pool-serial-gpu")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "production-v4")]
+    fn direct_shared_model_selects_second_card_and_sets_all_worker_modes() {
+        let devices = ["GPU-a".to_owned(), "GPU-b".to_owned()];
+        assert!(pool_replay_matches_proof(
+            &[devices[1].clone()],
+            None,
+            Some(&devices),
+            true
+        ));
+        assert!(!pool_replay_matches_proof(
+            &[devices[0].clone()],
+            None,
+            Some(&devices),
+            true
+        ));
+        assert!(pool_replay_matches_proof(
+            &[devices[0].clone()],
+            None,
+            Some(&devices),
+            false
+        ));
+        let environment =
+            split_pool_worker_environment(&devices, Some("/run/pool/model.sock".into()));
+        let setting = |name: &str| {
+            environment
+                .iter()
+                .find(|(key, _)| key == name)
+                .unwrap()
+                .1
+                .to_str()
+                .unwrap()
+        };
+        assert_eq!(setting("CMFD_SHARED_MODEL"), "1");
+        assert_eq!(setting("CMFD_WITNESS_PIPELINE"), "1");
+        assert_eq!(setting("CMFD_DEVICE_RELATIONS"), "1");
+        assert_eq!(setting("CMFD_REPLAY_GPU_IPC"), "0");
+        assert_eq!(setting("CMFD_REPLAY_SEALED_EXPORT"), "0");
+        assert_eq!(setting("CUDA_MODULE_LOADING"), "LAZY");
     }
 
     #[test]

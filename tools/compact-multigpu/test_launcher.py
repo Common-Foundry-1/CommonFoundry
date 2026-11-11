@@ -49,6 +49,9 @@ class LauncherTests(unittest.TestCase):
             self.assertTrue(os.environ['CMFD_SHARED_REPLAY_SOCKET'].endswith('/pool-scratch/model.sock'))
         raw=output.getvalue();command=json.loads(raw[raw.index('[\n'):])
         self.assertTrue(command[command.index('--production-v4-pool-replay-worker')+1].endswith('/cmfd-resident-replay'))
+        self.assertIn('--shared-model', command)
+        self.assertIn('--pool-dashboard-assets', command)
+        self.assertIn('--pool-public-url', command)
         with patch.object(sys,'argv',arguments+['--gpu-witness']),patch.object(launcher,'verify') as verify:
             with self.assertRaises(ValueError):launcher.main()
             verify.assert_not_called()

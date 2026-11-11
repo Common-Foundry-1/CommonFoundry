@@ -8272,6 +8272,54 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_listener_serves_assets_and_live_state_and_refuses_an_occupied_port() {
+        use crate::pool_dashboard::{PoolDashboardConfig, spawn_pool_dashboard};
+        let (root, pool, _node, pin) = server("dashboard-listener");
+        let assets = match std::env::var_os("CMFD_DASHBOARD_TEST_ASSETS") {
+            Some(path) => PathBuf::from(path),
+            None => {
+                let path = root.path().join("dashboard");
+                fs::create_dir(&path).unwrap();
+                fs::write(path.join("index.html"), "<!doctype html><html>pool</html>").unwrap();
+                path
+            }
+        };
+        let mut config = PoolDashboardConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            assets_directory: assets,
+            public_pool_url: format!("cmfd+tls://127.0.0.1:23445?pin={}", hex::encode(pin)),
+            certificate_sha256: pin,
+        };
+        let dashboard = spawn_pool_dashboard(pool.dashboard_source(), config.clone()).unwrap();
+        let address = dashboard.local_addr();
+        let request = |target: &str| {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            write!(
+                stream,
+                "GET {target} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
+        };
+        assert!(request("/").starts_with("HTTP/1.1 200 OK"));
+        let response = request("/api/v1/pool");
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        let (_, body) = response.split_once("\r\n\r\n").unwrap();
+        let document: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(document["public_pool_url"], config.public_pool_url);
+        assert!(document["pool"].is_object());
+        config.bind = address;
+        assert!(spawn_pool_dashboard(pool.dashboard_source(), config).is_err());
+        dashboard.stop().unwrap();
+        pool.stop().unwrap();
+    }
+
+    #[test]
     fn reconnecting_worker_reuses_its_disconnected_session() {
         let ledger = DurableLedger::open(None, [0x41; 32], [0x42; 32]).unwrap();
         let payout = test_payout_signer().payout();

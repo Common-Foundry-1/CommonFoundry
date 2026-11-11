@@ -1,4 +1,9 @@
-# Common Foundry Compact Proof Testnet - v0.5.2
+# Common Foundry Compact Proof Testnet - v0.5.3
+
+v0.5.3 bundles and enables the read-only pool dashboard at
+`http://127.0.0.1:23446`, rejects incomplete native dashboard options, and adds
+native `pool-serve --shared-model` and `--ram-witness-dir` support. See
+`POOL-LAUNCH-FIXES.md` for direct-launch options and the LXC access path.
 
 Welcome! This canary lets pools and miners exercise the new self-contained block proof, around 5.7 MB in our first public block. It keeps the ForgeMatrix workload and the existing field, hash, and BaseFold parameters. Ordinary nodes verify the complete proof without rerunning the miner's matrix computation. The public seed at `209.145.48.36:23444` also replays work as an optional audit comparison.
 

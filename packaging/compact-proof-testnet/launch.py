@@ -135,7 +135,8 @@ def build_command(args, inputs, data):
         "--share-leading-zero-bits", str(args.share_bits),
         "--production-v4-pool-replay-worker", str(ROOT / ("cmfd-resident-replay" if getattr(args,'shared_model',False) else "cmfd-v4-replay")),
         "--production-v4-pool-proof-worker", str(ROOT / ("cmfd-direct-multigpu-prover" if getattr(args,'proof_gpus',None) else "cmfd-direct-prover")),
-        "--production-v4-pool-scratch", str(args.ram_witness_dir or data / "pool-scratch"),
+        "--ram-witness-dir" if args.ram_witness_dir else "--production-v4-pool-scratch",
+        str(args.ram_witness_dir or data / "pool-scratch"),
         "--pool-operator-fee-bps", "0", "--work-bank", args.work_bank,
         "--allow-public-pool-clients", "--allow-address-only-payouts"] + peers(args.peer)
     for gpu in args.replay_gpu or []:
@@ -146,6 +147,12 @@ def build_command(args, inputs, data):
         command += ["--production-v4-pool-proof-gpus", args.proof_gpus]
     if args.serial_gpu:
         command += ["--production-v4-pool-serial-gpu"]
+    if getattr(args, "shared_model", False):
+        command += ["--shared-model"]
+    if not getattr(args, "no_dashboard", False):
+        command += ["--pool-dashboard-assets", str(ROOT / "pool-dashboard"),
+            "--pool-public-url", url,
+            "--pool-dashboard-bind", getattr(args, "dashboard_bind", "127.0.0.1:23446")]
     if getattr(args,'keep_replay_resident',False):
         command += ["--production-v4-pool-keep-replay-resident"]
     if args.enable_payouts:
@@ -180,6 +187,10 @@ def main():
             p.add_argument("--public-ip", required=True)
             p.add_argument("--bind-ip", default="0.0.0.0")
             p.add_argument("--pool-port", type=int, default=23445)
+            p.add_argument("--dashboard-bind", default="127.0.0.1:23446",
+                help="loopback address for the bundled read-only dashboard")
+            p.add_argument("--no-dashboard", action="store_true",
+                help="run the pool without its read-only dashboard")
             p.add_argument("--share-bits", type=int, choices=range(7), default=4)
             p.add_argument("--replay-gpu", action="append")
             proof_group=p.add_mutually_exclusive_group()

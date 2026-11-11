@@ -28,7 +28,12 @@ def main():
     p.add_argument("--kit-version", default="0.2.0")
     p.add_argument("--qualification-report", type=Path)
     p.add_argument("--multigpu-artifacts",type=Path,help="qualified two-GPU worker directory")
+    p.add_argument("--pool-dashboard-assets", type=Path, default=ROOT / "apps/pool-dashboard/dist",
+        help="built read-only pool dashboard (required in every Linux kit)")
     args = p.parse_args()
+    dashboard = args.pool_dashboard_assets.resolve()
+    if not (dashboard / "index.html").is_file() or any(path.is_symlink() for path in dashboard.rglob("*")):
+        raise ValueError("build the pool dashboard or pass --pool-dashboard-assets with regular built files")
     qualification = None
     if args.qualification_report is not None:
         qualification = json.loads(args.qualification_report.read_text())
@@ -52,12 +57,17 @@ def main():
             if digest(stage / name) != qualification["proof_workers"][name]:
                 raise ValueError(f"copied qualification worker differs: {name}")
     shutil.copy2(ROOT / "packaging/compact-proof-testnet/launch.py", stage / "launch.py")
+    shutil.copytree(dashboard, stage / "pool-dashboard")
     if args.multigpu_artifacts is not None:
         shutil.copy2(args.multigpu_artifacts/'cmfd-direct-multigpu-worker',stage/'cmfd-direct-multigpu-worker')
         (stage/'cmfd-direct-multigpu-worker').chmod(0o755)
         for name in ('coordinator.py','shared_model.py','cmfd-direct-multigpu-prover','cmfd-resident-replay','LICENSE-SP1-MIT'):
             shutil.copy2(ROOT/'tools/compact-multigpu'/name,stage/name)
-            if name in ('cmfd-direct-multigpu-prover','cmfd-resident-replay'):(stage/name).chmod(0o755)
+            if name in ('cmfd-direct-multigpu-prover','cmfd-resident-replay'):
+                # A Windows checkout may use CRLF. Linux interprets a CR in
+                # the shebang as part of the executable name and cannot run it.
+                (stage/name).write_text((stage/name).read_text(), newline='\n')
+                (stage/name).chmod(0o755)
         shutil.copy2(ROOT/'tools/compact-multigpu/README.md',stage/'MULTI-GPU.md')
     shutil.copy2(ROOT / "scripts/production-v4-inputs.py", stage / "production-v4-inputs.py")
     for path in (ROOT / "packaging/production-v4-pool/shared").iterdir():
@@ -67,6 +77,7 @@ def main():
             ("packaging/compact-proof-testnet/README.md", "README.md"),
             ("docs/compact-proof-testnet/POOL-TIMING-LOGS.md", "POOL-TIMING-LOGS.md"),
             ("docs/compact-proof-testnet/REPLAY-MODEL-RETENTION.md", "REPLAY-MODEL-RETENTION.md"),
+            ("docs/compact-proof-testnet/POOL-LAUNCH-FIXES-v0.5.3.md", "POOL-LAUNCH-FIXES.md"),
             ("docs/compact-proof-testnet/POOL-PROPOSAL.md", "POOL-INVITATION.md")):
         shutil.copy2(ROOT / source, stage / target)
     for filename, action in (("START-POOL.sh", "pool"), ("START-MINER.sh", "miner"),

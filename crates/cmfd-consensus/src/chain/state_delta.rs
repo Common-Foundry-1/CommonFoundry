@@ -175,12 +175,27 @@ impl ValidatedBlock {
     pub fn reversible_state_delta_capability(
         &self,
     ) -> Result<ReversibleStateDeltaCapability, ReversibleStateDeltaError> {
-        let delta = ReversibleStateDelta::from_validated(self)?;
-        let canonical = delta.encode()?;
+        ReversibleStateDelta::from_validated(self)?.capability()
+    }
+}
+
+impl ValidatedReversibleStateDelta {
+    /// Issue a bounded undo capability for these exact authenticated bytes.
+    /// A promoted historical delta retains its predecessor fingerprint, so
+    /// its capability must bind that encoding rather than a fresh encoding
+    /// under the upgraded binary's fingerprint.
+    pub fn capability(&self) -> Result<ReversibleStateDeltaCapability, ReversibleStateDeltaError> {
+        self.0.capability()
+    }
+}
+
+impl ReversibleStateDelta {
+    fn capability(&self) -> Result<ReversibleStateDeltaCapability, ReversibleStateDeltaError> {
+        let canonical = self.encode()?;
         Ok(ReversibleStateDeltaCapability {
-            network_fingerprint: delta.network_fingerprint,
-            base_tip: delta.base_tip,
-            child_tip: delta.child_tip,
+            network_fingerprint: self.network_fingerprint,
+            base_tip: self.base_tip,
+            child_tip: self.child_tip,
             canonical_len: canonical.len(),
             canonical_digest: capability_digest(&canonical),
         })
@@ -1263,6 +1278,19 @@ mod tests {
         validated.params = params;
         let promoted = decoded.clone().promote_exact(&validated).unwrap();
         assert_eq!(promoted.0.encode().unwrap(), bytes);
+        // The former DFS caller issued a capability from `validated`, which
+        // uses the new fingerprint and cannot authorize re-reading old bytes.
+        assert_eq!(
+            decoded
+                .clone()
+                .promote_capability(validated.reversible_state_delta_capability().unwrap()),
+            Err(ReversibleStateDeltaError::ValidationMismatch)
+        );
+        let recovered = decoded
+            .clone()
+            .promote_capability(promoted.capability().unwrap())
+            .unwrap();
+        assert_eq!(recovered, promoted);
         validated.fees += 1;
         assert_eq!(
             decoded.promote_exact(&validated),

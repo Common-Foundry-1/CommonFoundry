@@ -13170,7 +13170,7 @@ fn replay_log_into(
                     }
                 }
                 ParsedRecordPayload::V2 { delta_bytes, .. } => {
-                    DecodedReversibleStateDelta::decode_bound(
+                    let authenticated_delta = DecodedReversibleStateDelta::decode_bound(
                         &delta_bytes,
                         &params,
                         record.parent,
@@ -13183,15 +13183,12 @@ fn replay_log_into(
                             record.ordinal
                         ))
                     })?;
-                    let capability =
-                        validated
-                            .reversible_state_delta_capability()
-                            .map_err(|error| {
-                                NodeError::CorruptLog(format!(
-                                    "record {} cannot issue a V2 undo capability: {error}",
-                                    record.ordinal
-                                ))
-                            })?;
+                    let capability = authenticated_delta.capability().map_err(|error| {
+                        NodeError::CorruptLog(format!(
+                            "record {} cannot issue a V2 undo capability: {error}",
+                            record.ordinal
+                        ))
+                    })?;
                     ReplayUndo::V2 {
                         record_position,
                         capability,

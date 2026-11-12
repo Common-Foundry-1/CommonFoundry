@@ -49,6 +49,10 @@ narrow fingerprint compatibility. They retain structural, canonical encoding,
 checksum and full-validation checks. Stale startup caches are rebuilt. An
 old binary refuses the new metadata; rollback uses the untouched full backup.
 
+Cold replay issues each undo capability from the exact authenticated delta,
+including its historical fingerprint. Re-reading an old V2 log must not compare
+it with newly encoded bytes under the upgraded fingerprint.
+
 ## Operator testing
 
 Use a separate directory and a stopped, complete copy of the node/pool data.
@@ -99,6 +103,10 @@ The complete compact GPU source and pinned public dependency recipe are in
 `tools/compact-proof-prover/README.md`. The inherited replay/version-1 workers
 must match the signed v1.0.20 distribution; package receipts record provenance.
 Linux and WSL2 test packages contain no new native Windows EXE.
+
+A node correction can retain an already qualified compact worker or pool miner.
+Use each component's source commit and SHA-256 in the package/build receipts;
+the node release commit need not be the CUDA worker or miner's build commit.
 
 The release qualification receipt distinguishes exact-mainnet identity/version
 tests, reduced-geometry real-chain reorg/restart tests, generic node regressions,

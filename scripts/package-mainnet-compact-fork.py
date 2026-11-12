@@ -4,9 +4,11 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
+import tomllib
 
 import release_integrity as integrity
 
@@ -100,8 +102,9 @@ publication is not an independent audit or a deployment of the live network.
     for name,data in list(files.items()):
         if name.endswith(('.py','.sh','.md')) or name in ('production-v4/cmfd-mainnet-fork-prover','production-v4/cmfd-direct-multigpu-prover'):
             files[name] = data.replace(b'\r\n',b'\n')
+    version=tomllib.loads((ROOT/'crates/cmfd-node/Cargo.toml').read_text())['package']['version']
     with tempfile.TemporaryDirectory(prefix='cmfd-fork-package-') as directory:
-        stage = Path(directory)/('commonfoundry-mainnet-node-pool-v1.0.21-compact.1-'+args.platform)
+        stage = Path(directory)/('commonfoundry-mainnet-node-pool-v'+version+'-'+args.platform)
         stage.mkdir()
         for name,data in files.items():
             dest=stage/name;dest.parent.mkdir(parents=True,exist_ok=True);dest.write_bytes(data)
@@ -110,6 +113,8 @@ publication is not an independent audit or a deployment of the live network.
         if __import__('os').name=='nt':
             path=candidate.output(['wsl.exe','-d','Ubuntu-22.04','--exec','wslpath','-u',(stage/'cmfd-node').as_posix()]).decode().strip()
             command=['wsl.exe','-d','Ubuntu-22.04','--exec',path]
+        if candidate.output([*command,'--version']).decode().strip()!='cmfd-node '+version:
+            raise ValueError('node executable version differs from its frozen source')
         bank=str(args.model_bank.resolve(strict=True))
         record=str(args.fixed_record.resolve(strict=True))
         if __import__('os').name=='nt':
@@ -122,9 +127,27 @@ publication is not an independent audit or a deployment of the live network.
             raise ValueError('node source/network identity differs')
         if fork['activation_height']!=67535 or fork['consensus_fingerprint']!=expected['consensus_fingerprint']:
             raise ValueError('node fork schedule differs')
+        worker=stage/'production-v4/cmfd-direct-multigpu-worker'
+        if os.name=='nt':
+            worker_path=candidate.output(['wsl.exe','-d','Ubuntu-22.04','--exec','wslpath','-u',worker.as_posix()]).decode().strip()
+            lib_path=candidate.output(['wsl.exe','-d','Ubuntu-22.04','--exec','wslpath','-u',(stage/'lib').as_posix()]).decode().strip()
+            worker_command=['wsl.exe','-d','Ubuntu-22.04','--exec','env','LD_LIBRARY_PATH='+lib_path,worker_path,'network-info']
+        else:
+            worker_command=['env','LD_LIBRARY_PATH='+str(stage/'lib'),str(worker),'network-info']
+        worker_info=json.loads(candidate.output(worker_command))
+        if (worker_info.get('mainnet_supported') is not True
+                or worker_info.get('mainnet_activation_height')!=67535
+                or worker_info.get('mainnet_proof_system_digest')!=expected['at_and_after_activation']['proof_system_digest']
+                or not __import__('re').fullmatch('[0-9a-f]{40}',worker_info.get('source_commit',''))):
+            raise ValueError('compact worker does not identify the pinned mainnet proof schedule and source')
+        files['COMPACT-WORKER-NETWORK-INFO.json']=candidate.canonical(worker_info)
+        (stage/'COMPACT-WORKER-NETWORK-INFO.json').write_bytes(files['COMPACT-WORKER-NETWORK-INFO.json'])
         for name,value in [('NODE-NETWORK-INFO.json',info),('COMPACT-FORK-INFO.json',fork)]:
             files[name]=candidate.canonical(value);(stage/name).write_bytes(files[name])
         receipt={'schema':'CMFD_MAINNET_COMPACT_FORK_PACKAGE_V1','source_commit':commit,'activation_height':67535,
+            'node_version':version,
+            'components':{'node':{'source_commit':commit,'sha256':hashlib.sha256(files['cmfd-node']).hexdigest()},
+                'compact_worker':{'source_commit':worker_info['source_commit'],'sha256':hashlib.sha256(files['production-v4/cmfd-direct-multigpu-worker']).hexdigest()}},
             'platform':args.platform,'status':'operator-testing-prerelease','baseline_release':'v1.0.20',
             'baseline_archive_sha256':candidate.sha256(args.baseline),'consensus_fingerprint':expected['consensus_fingerprint'],
             'files':{n:{'bytes':len(d),'sha256':hashlib.sha256(d).hexdigest()} for n,d in sorted(files.items())}}

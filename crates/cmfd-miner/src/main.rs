@@ -6109,7 +6109,7 @@ mod tests {
                 COMPACT_MAINNET_FINGERPRINT_HEX,
             ])
         );
-        assert_eq!(info["compact_mainnet_activation_height"], 65_535);
+        assert_eq!(info["compact_mainnet_activation_height"], 67_535);
         assert_eq!(
             info["compact_mainnet_proof_system_digest"],
             COMPACT_MAINNET_PROOF_SYSTEM_DIGEST_HEX

@@ -118,7 +118,7 @@ fn mock_pool(
                         network_id,
                         previous_block: [2; 32],
                         transaction_root: [3; 32],
-                        height: 65_535,
+                        height: 67_535,
                         timestamp: 5,
                         target: [0x80; 32],
                     },
@@ -150,7 +150,7 @@ fn compact_pool_compatibility_accepts_both_pins_and_binds_signed_hello() {
                 .unwrap();
             let mut client = PoolClient::connect(config).unwrap();
             assert_eq!(client.consensus_fingerprint(), advertised);
-            assert_eq!(client.current_job().challenge.height, 65_535);
+            assert_eq!(client.current_job().challenge.height, 67_535);
             write_frame(
                 &mut client.stream,
                 &ClientMessage::SubmitShare {

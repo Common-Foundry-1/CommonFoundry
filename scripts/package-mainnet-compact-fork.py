@@ -19,7 +19,7 @@ candidate = kit.candidate
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    for name in ('baseline','baseline-checksums','baseline-signature','node','compact-worker','dashboard','output'):
+    for name in ('baseline','baseline-checksums','baseline-signature','node','compact-worker','dashboard','output','model-bank','fixed-record'):
         p.add_argument('--'+name, type=Path, required=True)
     p.add_argument('--expected-commit', required=True)
     p.add_argument('--platform', choices=['linux-x86_64','windows-wsl2-x86_64'], required=True)
@@ -37,6 +37,7 @@ def main():
         'production-mainnet/MAINNET-PLAN.json','production-v4/cmfd-v4-replay',
         'production-v4/real_bank0_relations','lib/libcudart.so.12','LICENSE','THIRD_PARTY_NOTICES.md'}
     files = {name:baseline[name] for name in selected}
+    files['production-v4/FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json'] = baseline['FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json']
     files['BASELINE-PACKAGE.json'] = baseline['MAINNET-PACKAGE.json']
     files['cmfd-node'] = args.node.read_bytes()
     files['production-v4/cmfd-direct-multigpu-worker'] = args.compact_worker.read_bytes()
@@ -64,8 +65,8 @@ Windows: run the Linux payload in installed Ubuntu-22.04 under WSL2. In Windows
 Terminal opened in this extracted directory, prefix commands with
 `wsl -d Ubuntu-22.04 --exec`. No new native Windows EXE is included.
 
-1. Verify the signed archive, then inspect `./cmfd-node compact-fork-info` and
-   `./cmfd-node network-info`. Confirm H=67535 and the published fingerprint.
+1. Verify the signed archive, then inspect `./cmfd-node compact-fork-info`.
+   Confirm H=67535 and the published fingerprint.
 2. Reuse authenticated production-v4 inputs (CMFD_MODEL_BANK/CMFD_FIXED_RECORD
    are supported by the start scripts), or run `./prepare-runtime.sh`.
    Pool inputs also require the full fixed artifact set; use
@@ -73,6 +74,9 @@ Terminal opened in this extracted directory, prefix commands with
    and inspect its help for reuse options.
 3. Fetch/verify the existing mainnet beacon with
    `./cmfd-launch fetch --runtime ./cmfd-node --wait`.
+   Then inspect `./cmfd-node network-info` with the prepared inputs. For
+   external inputs pass both absolute --production-v4-bank and
+   --production-v4-fixed-record paths to that command.
 4. `./start-node.sh /absolute/copied-data /absolute/passphrase-file [run options]`
    uses a loopback test port and no default peers. Add explicit peers/options
    appropriate for your test. Do not run a second instance on live data.
@@ -103,7 +107,12 @@ publication is not an independent audit or a deployment of the live network.
         if __import__('os').name=='nt':
             path=candidate.output(['wsl.exe','-d','Ubuntu-22.04','--exec','wslpath','-u',(stage/'cmfd-node').as_posix()]).decode().strip()
             command=['wsl.exe','-d','Ubuntu-22.04','--exec',path]
-        info=json.loads(candidate.output([*command,'network-info']))
+        bank=str(args.model_bank.resolve(strict=True))
+        record=str(args.fixed_record.resolve(strict=True))
+        if __import__('os').name=='nt':
+            bank=candidate.output(['wsl.exe','-d','Ubuntu-22.04','--exec','wslpath','-u',bank]).decode().strip()
+            record=candidate.output(['wsl.exe','-d','Ubuntu-22.04','--exec','wslpath','-u',record]).decode().strip()
+        info=json.loads(candidate.output([*command,'--production-v4-bank',bank,'--production-v4-fixed-record',record,'network-info']))
         fork=json.loads(candidate.output([*command,'compact-fork-info']))
         expected=json.loads(files['MAINNET-FORK-IDENTITY-67535.json'])
         if info['proof_of_work'].get('build_source_commit')!=commit or info['consensus']['consensus_fingerprint']!=expected['consensus_fingerprint']:

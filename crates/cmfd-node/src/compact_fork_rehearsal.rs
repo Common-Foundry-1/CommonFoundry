@@ -11,7 +11,7 @@ use crate::{mainnet_runtime, pruning, work_gate, Node, ProductionV4VerifierArtif
 use cmfd_consensus::compact_mainnet_fork::*;
 use cmfd_consensus::{
     next_work_target, Block, BlockChallenge, BlockProof, ChainState, Coinbase,
-    ForgeMatrixV4CandidateProof, ForgeMatrixV4WorkRule, HeaderWork, PowParameters,
+    ForgeMatrixV4CandidateProof, ForgeMatrixV4WorkRule, HeaderWork, OutputLock, PowParameters, TxOutput,
     SuccessorHeaderPreflight, BLOCK_VERSION, COIN, MEDIAN_TIME_WINDOW,
 };
 use serde::{Deserialize, Serialize};
@@ -174,7 +174,11 @@ fn seed(c: &Config) -> serde_json::Value {
         let id = checkpoint_id(height);
         let coinbase = Coinbase {
             height,
-            outputs: vec![],
+            // The trusted checkpoint's synthetic funding must also exist in
+            // retained history, so wallet attribution can trace its spends.
+            outputs: if height == 1 {
+                vec![TxOutput { value: SEED_VALUE, lock: OutputLock::Key(owner), spendable_height: 0 }]
+            } else { vec![] },
         };
         let transaction_root =
             cmfd_consensus::merkle_root(&[coinbase.commitment(params.network_id)]);
@@ -241,7 +245,7 @@ fn seed(c: &Config) -> serde_json::Value {
     for ts in &raw {
         state.extend_from_slice(&ts.to_le_bytes());
     }
-    let funding = hash("CMFD/ISOLATED/FORK-REHEARSAL/SYNTHETIC-FUNDING/V1", &owner);
+    let funding = cmfd_consensus::coinbase_outpoint_id(params.network_id, checkpoint_id(1));
     state.extend_from_slice(&funding);
     state.extend_from_slice(&0u32.to_le_bytes());
     state.extend_from_slice(&SEED_VALUE.to_le_bytes());
@@ -283,13 +287,14 @@ fn seed(c: &Config) -> serde_json::Value {
     bytes[8..40].copy_from_slice(&COMPACT_MAINNET_PREDECESSOR_FINGERPRINT);
     fs::write(metadata, bytes).unwrap();
     copy_tree(&data, &c.root.join("pre-upgrade-backup"));
-    let n = open(c, &data);
+    let mut n = open(c, &data);
     assert_eq!(n.state.next_height(), COMPACT_MAINNET_ACTIVATION_HEIGHT - 1);
     assert_eq!(n.state.tip(), parent);
     assert_eq!(n.prune_height(), Some(SEED_HEIGHT));
     let key_after = hex::encode(Sha256::digest(fs::read(data.join("wallet.key")).unwrap()));
     assert_eq!(key_before, key_after);
     assert!(data.join("network.meta.pre-compact-67535").is_file());
+    assert_eq!(n.wallet_snapshot().unwrap().balances.spendable_atoms, SEED_VALUE.to_string());
     let out = serde_json::json!({"scope":"synthetic trusted local checkpoint; historical PoW not claimed","activation_height":COMPACT_MAINNET_ACTIVATION_HEIGHT,"seed_height":SEED_HEIGHT,"seed_tip":hex::encode(parent),"wallet_key_preserved":true,"predecessor_metadata_and_prune_anchor_upgraded":true,"consensus_fingerprint":hex::encode(n.params.fingerprint().unwrap()),"network_namespace_isolated":true});
     fs::write(
         c.root.join("BOOTSTRAP-RESULT.json"),

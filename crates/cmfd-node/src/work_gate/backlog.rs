@@ -697,7 +697,7 @@ impl Node {
                     .blocks
                     .values()
                     .filter(|entry| {
-                        entry.height() > checkpoint
+                        gate.rule.requires_recomputation(entry.height())
                             && active_at(entry.height()) != Some(entry.block_id())
                             && unchecked(&store, &entry.block_id())
                             && waiting(&entry.block_id())
@@ -714,6 +714,9 @@ impl Node {
                 validated.max(checkpoint).saturating_add(1)
             };
             for height in active_from..=tip {
+                if !gate.rule.requires_recomputation(height) {
+                    continue;
+                }
                 let Some(block_id) = active_at(height) else {
                     break;
                 };
@@ -746,6 +749,9 @@ impl Node {
                 // again it is checked like any other block.
                 let pruned_through = self.prune_height().unwrap_or(0);
                 for (height, block_id) in store.provisional_blocks() {
+                    if !gate.rule.requires_recomputation(height) {
+                        continue;
+                    }
                     if self.index.contains(block_id) {
                         if waiting(&block_id) {
                             provisional.push((height, block_id));

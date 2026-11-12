@@ -55,7 +55,7 @@ class CandidateIdentityTests(unittest.TestCase):
             "accepted_consensus_fingerprints": self.compatibility["accepted_consensus_fingerprints"] + ["77" * 32],
             "network_id": "77" * 32,
             "build_source_commit": "34" * 20,
-            "compact_mainnet_activation_height": 65_536,
+            "compact_mainnet_activation_height": 67_536,
             "compact_mainnet_proof_system_digest": "77" * 32,
             "compact_mainnet_block_proof_generation": True,
             "activates_mainnet_fork": True,

@@ -1,0 +1,44 @@
+{
+  "baseline_proof_worker_sha256": "75e6a0eb1857b6ececbe4c31013875314f42c66fc858a0800e3b8dbdd7d425a3",
+  "baseline_release": "compact-proof-testnet-v0.5.2",
+  "source_changes": [
+    "mainnet statement domain and height checks",
+    "use published consensus reduction instead of research-crate dependencies",
+    "replace private-corpus-only legacy test with consensus and native boundary regressions"
+  ],
+  "parameters": {
+    "log_blowup": 1,
+    "queries": 270,
+    "grinding_bits": 16,
+    "commitments": 6
+  },
+  "baseline_source_files": {
+    "src\\all_relations_verifier.rs": "62a17c16e2c0ef742245ff608c001217d9e8a6d99ec29d9e5ec60d5f2879df9d",
+    "src\\bin\\fixed_bank_artifact.rs": "06c7ef7d47888efe11662ba83d6229a93a7f96079541d6c0a2373d1eaa2deb84",
+    "src\\bin\\gpu_reduction_check.rs": "f4a6267f478c9756b14f01665d708733b5ecec5f2d7b5929eb505eb534d6e663",
+    "src\\bin\\real_bank0_all_relations.rs": "84af4ccb56c7ebad233c800faa961922326dff2514de3c6efcc42a8cad64cd82",
+    "src\\bin\\real_bank0_direct.rs": "f6afc2f330f7b7a3fe0529eac24f1149be7b922dc7b93685ce0be4887de495cb",
+    "src\\bin\\real_bank0_gpu_boundaries.rs": "0ba325f28f7a44964b01d2f2c12f531444dd5312375ccfa4152d5e2d59beb77a",
+    "src\\bin\\real_bank0_gpu_boundaries_profiled.rs": "099745f9cb5ae1fc1d88db6830fd9bd45e7bdf93f28c43fda193b1a346a3ba2e",
+    "src\\bin\\real_bank0_hints.rs": "46bb88ce254813bcebef13e45e4ca56557b341d24838fc4fa5b7c8a302b32dbe",
+    "src\\bin\\real_bank0_relations.rs": "627a34caa8153b07c034572f0147cc90530d40a3a4ae2ace367407b56831edd8",
+    "src\\bin\\real_bank0_relations_io_experiment.rs": "29e21f740e7a9d0e8c06c6b88c88336c88c4591549333de5e29c26fe36785e26",
+    "src\\bin\\real_bank0_sealed.rs": "4873554d3be3dd0655fd6b5f44126cd584d8fdde3e654015694a399a05eb90c9",
+    "src\\bin\\real_bank0_snapshot.rs": "d162ea1ee35b23758d28bff4e65e7b5d195a097ccb7b2ad91efaab0f62bdb863",
+    "src\\bin\\real_dynamic_commitments.rs": "15e5af764e51f75599146a14073adf16538b8f08240d988454c8d3087f7851a4",
+    "src\\device_relations.rs": "ef54ba58f16328fd56df6d5f0df51ba92d865998c6da59081abf9dec618f84f8",
+    "src\\direct_opening.rs": "19e164488165e363877e3f7711bd0512e68363a192e7f7d2ccf515603c3dbbbc",
+    "src\\gpu_reductions.rs": "d0756a21f8e56b1a559b404bcf18c47a92e1ebc9487715ee8c506b9eb2f449bf",
+    "src\\gpu_witness.rs": "b09128726825d2444983c41d97ad7ccabf3e7a12893b6d9744ff1f88199edfca",
+    "src\\low_memory_sumcheck.rs": "9b923d7b676de066cdfe736a16bc2486e6703689d36cd5b8c8b3b0abde31ace8",
+    "src\\multi_gpu.rs": "b116c172531f0a43d099de620d234a2199e7c4fea65597413e9b4fb4e89da9d8",
+    "src\\pcs_hints.rs": "d412617de27b4fe520a8ffd5709bedf36730bb3325c31f5d425b22d6569483ab",
+    "src\\real_v4_opening.rs": "eb22d72bdab60b18cb7bbec3f69f8a5ec8a868fae7f0d0027dfd5ff441ad78fd",
+    "src\\real_v4_opening_io_experiment.rs": "a3626416b18eae8691ac6e4136c3f1e0e73068d5af62f2e784d1c9133f5629e3",
+    "src\\resident.rs": "f4503a6e23bc588e399ebc47f8be365677a5453e2b22bf687ee94d306805687e",
+    "src\\row_reads.rs": "6fd03a03587e20c9789e5dacb370267ac521f7dd57b3d5ca16fbbadc0bd29321",
+    "src\\sealed_words.rs": "178937d1e48df534580b14bfbd5cc27099b71b624740d5ee767ad6fb56de8115",
+    "src\\shared_replay.rs": "10b5fd480805de587e6dd60b61344f9b8a80753cb3cff2749a2a7c01fca637fc",
+    "src\\trace_snapshot.rs": "f90b5b710abfa804e7c3e514b9e698806fb490b4fce72c05f5b23ce8eb01a511"
+  }
+}

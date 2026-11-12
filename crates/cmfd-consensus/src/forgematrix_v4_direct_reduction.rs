@@ -194,6 +194,20 @@ impl PcsObligation {
     pub fn challenger(&self) -> C {
         self.challenger.clone()
     }
+    /// GPU builders use the trusted-evaluations proving interface, so bind
+    /// every claimed value before that interface samples its batch challenge.
+    /// The verifier independently uses `verify_untrusted_evaluations` instead.
+    pub fn prover_challenger(&self) -> C {
+        use slop_challenger::VariableLengthChallenger;
+        let mut challenger = self.challenger.clone();
+        for columns in &self.values {
+            VariableLengthChallenger::<F, D>::observe_constant_length_extension_slice(
+                &mut challenger,
+                columns,
+            );
+        }
+        challenger
+    }
     pub fn verify_basefold(mut self, proof: &BasefoldProof<G>) -> Result<VerifiedOpening> {
         ensure!(
             proof.univariate_messages.len() == self.shape.row_log

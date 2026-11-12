@@ -30,9 +30,10 @@ use crate::forgematrix_v4_relations::{
 };
 use anyhow::{Context, Result, bail, ensure};
 #[path = "forgematrix_v4_direct_reduction.rs"]
-mod direct;
+pub mod reduction;
 pub use direct::{DirectBasefoldProof, ReductionProof};
 use miniz_oxide::{deflate::compress_to_vec_zlib, inflate::decompress_to_vec_zlib_with_limit};
+use reduction as direct;
 use slop_algebra::AbstractField;
 use slop_challenger::{CanObserve, FieldChallenger};
 use slop_sumcheck::partially_verify_sumcheck_proof;

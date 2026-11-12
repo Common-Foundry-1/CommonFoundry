@@ -400,7 +400,7 @@ pub(crate) fn run_fixed(
     validate_worker("fixed")?;
     let started = Instant::now();
     ensure!(
-        network == FORGEMATRIX_V4_DIRECT_TESTNET_NETWORK_ID,
+        cmfd_consensus::forgematrix_v4::forgematrix_v4_direct_proof_system_digest_for_network(network).is_some(),
         "fixed worker network"
     );
     // Warm the reduction kernels before the large model occupies VRAM.
@@ -466,7 +466,7 @@ pub(crate) fn run_fixed(
         trees: std::array::from_fn(|i| trees[i].path()),
     };
     send(
-        serde_json::json!({"event":"ready","role":"fixed","cache":cache,"shared_model":shared_model_mode,"network_id":hex::encode(network),"proof_version":FORGEMATRIX_V4_DIRECT_PROOF_VERSION,"proof_system_digest":hex::encode(forgematrix_v4_direct_proof_system_digest()),"seconds":started.elapsed().as_secs_f64()}),
+        serde_json::json!({"event":"ready","role":"fixed","cache":cache,"shared_model":shared_model_mode,"network_id":hex::encode(network),"proof_version":FORGEMATRIX_V4_DIRECT_PROOF_VERSION,"proof_system_digest":hex::encode(cmfd_consensus::forgematrix_v4::forgematrix_v4_direct_proof_system_digest_for_network(network).expect("validated compact network")),"seconds":started.elapsed().as_secs_f64()}),
     )?;
     let mut snapshot: Option<Snapshot> = None;
     let mut reduction: Option<low_memory_sumcheck::ComponentSumcheck> = None;
@@ -721,6 +721,7 @@ fn prove(
         frozen.challenge.network_id == network,
         "resident proof network"
     );
+    ensure!(!cmfd_consensus::mainnet_network::is_mainnet_network(network) || frozen.challenge.height >= cmfd_consensus::compact_mainnet_fork::COMPACT_MAINNET_ACTIVATION_HEIGHT, "compact mainnet proof below activation");
     let final_activation = read_final_activation(&request.final_path)?;
     let manifest = prepared.fixed_record.manifest_digest();
     let challenge_digest =
@@ -732,7 +733,7 @@ fn prove(
         nonce: frozen.nonce,
         algorithm_version: FORGEMATRIX_V4_ALGORITHM_VERSION,
         proof_version: FORGEMATRIX_V4_DIRECT_PROOF_VERSION,
-        proof_system_digest: forgematrix_v4_direct_proof_system_digest(),
+        proof_system_digest: cmfd_consensus::forgematrix_v4::forgematrix_v4_direct_proof_system_digest_for_network(network).ok_or_else(|| anyhow::anyhow!("unsupported compact network"))?,
         model_manifest_digest: manifest,
         challenge_digest,
         final_activation_digest,
@@ -980,12 +981,12 @@ fn prove(
             ])
         })
         .collect::<Result<Vec<_>>>()?;
-    let reduction = cmfd_direct_batched_opening_lab::ReductionProof {
+    let reduction = cmfd_consensus::forgematrix_v4_direct::reduction::ReductionProof {
         batch_witness: bridge(witness)?,
         rounds,
         evaluations_at_shared_point: bridge(shared.clone())?,
     };
-    let obligation = cmfd_direct_batched_opening_lab::verify_reduction(&lab, &reduction)?;
+    let obligation = cmfd_consensus::forgematrix_v4_direct::reduction::verify_reduction(&lab, &reduction)?;
     ensure!(
         obligation.point()
             == bridge::<_, Vec<_>>(shared_point.iter().copied().collect::<Vec<_>>())?.as_slice(),
@@ -1128,7 +1129,7 @@ pub(crate) fn run_dynamic(
 ) -> Result<()> {
     validate_worker("dynamic")?;
     ensure!(
-        network == FORGEMATRIX_V4_DIRECT_TESTNET_NETWORK_ID,
+        cmfd_consensus::forgematrix_v4::forgematrix_v4_direct_proof_system_digest_for_network(network).is_some(),
         "dynamic network"
     );
     budget(scope, "resident-dynamic-ready")?;

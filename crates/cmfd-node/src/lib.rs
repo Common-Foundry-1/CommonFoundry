@@ -61,6 +61,11 @@ pub(crate) mod exchange_custody_engine;
 mod exchange_custody_rehearsal;
 pub(crate) mod exchange_custody_runtime_v3;
 pub use exchange_custody_runtime_v3::ExchangeCustodyV3Config;
+#[cfg(all(test, feature = "compact-mainnet"))]
+#[path = "compact_mainnet_node_tests.rs"]
+mod compact_mainnet_node_tests;
+#[cfg(feature = "compact-mainnet")]
+pub mod compact_proof_check;
 #[cfg(all(test, feature = "production-v4-testnet", target_os = "linux"))]
 mod difficulty_gpu_rehearsal;
 pub mod exchange_custody_tools;
@@ -7911,7 +7916,11 @@ impl Node {
     pub fn peer_hello(&self) -> peer::PeerHello {
         peer::PeerHello {
             network_id: self.params.network_id,
-            consensus_fingerprint: self.fingerprint,
+            consensus_fingerprint: peer::scheduled_peer_fingerprint(
+                self.params.network_id,
+                self.fingerprint,
+                self.state.next_height().saturating_sub(1),
+            ),
             node_nonce: peer::process_node_nonce(),
             tip: self.state.tip(),
             height: self.state.next_height().saturating_sub(1),
@@ -11828,6 +11837,7 @@ enum MetadataState {
     Legacy,
     Current,
     EmptyRc4Upgrade,
+    CompactMainnetUpgrade,
 }
 
 const RC4_FINGERPRINT: [u8; 32] = [
@@ -11896,6 +11906,13 @@ fn load_metadata(
                 return Err(NodeError::InvalidMetadata);
             }
             if bytes[8..40] != fingerprint {
+                #[cfg(feature = "compact-mainnet")]
+                if fingerprint == cmfd_consensus::compact_mainnet_fork::CompactMainnetForkIdentity::pinned().fingerprint()
+                    && bytes[8..40] == cmfd_consensus::compact_mainnet_fork::COMPACT_MAINNET_PREDECESSOR_FINGERPRINT
+                    && flags == METADATA_WALLET_KEY_FLAG
+                {
+                    return Ok(MetadataState::CompactMainnetUpgrade);
+                }
                 if allow_empty_rc4_upgrade
                     && bytes[8..40] == RC4_FINGERPRINT
                     && flags == METADATA_WALLET_KEY_FLAG
@@ -11938,11 +11955,23 @@ fn write_metadata(
     metadata: MetadataState,
 ) -> Result<(), NodeError> {
     let path = data_dir.join(METADATA_FILE);
-    if metadata == MetadataState::EmptyRc4Upgrade {
+    if matches!(
+        metadata,
+        MetadataState::EmptyRc4Upgrade | MetadataState::CompactMainnetUpgrade
+    ) {
         let previous = fs::read(&path)
             .map_err(|source| io_error("read RC4 metadata for upgrade", &path, source))?;
-        let backup = data_dir.join("network.meta.rc4");
-        let temporary = data_dir.join("network.meta.rc5.tmp");
+        let compact = metadata == MetadataState::CompactMainnetUpgrade;
+        let backup = data_dir.join(if compact {
+            "network.meta.pre-compact-67535"
+        } else {
+            "network.meta.rc4"
+        });
+        let temporary = data_dir.join(if compact {
+            "network.meta.compact.tmp"
+        } else {
+            "network.meta.rc5.tmp"
+        });
         let mut upgraded = previous.clone();
         upgraded[8..40].copy_from_slice(&fingerprint);
         for (target, contents) in [(&backup, &previous), (&temporary, &upgraded)] {
@@ -12052,7 +12081,9 @@ fn load_or_create_wallet_key(
         Err(source) if source.kind() == io::ErrorKind::NotFound => {
             if matches!(
                 metadata,
-                MetadataState::Current | MetadataState::EmptyRc4Upgrade
+                MetadataState::Current
+                    | MetadataState::EmptyRc4Upgrade
+                    | MetadataState::CompactMainnetUpgrade
             ) {
                 return Err(NodeError::InvalidWalletKey);
             }

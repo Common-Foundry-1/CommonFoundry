@@ -5454,6 +5454,8 @@ def _canonical_file_mode(path: Path) -> int:
     executable_names = {
         "cmfd-node", "common-foundry-wallet", "cmfd-proof-worker", "cmfd-miner",
         "cmfd-launch", "cmfd-v4-replay", "real_bank0_relations",
+        "cmfd-mainnet-fork-prover", "cmfd-direct-multigpu-prover",
+        "cmfd-direct-multigpu-worker", "cmfd-resident-replay",
     }
     if path.suffix.lower() in executable_suffixes or path.name in executable_names:
         return 0o755

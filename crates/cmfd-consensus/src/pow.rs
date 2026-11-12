@@ -335,6 +335,7 @@ pub struct ForgeMatrixV4CandidateParameters {
     proof_system_digest: [u8; 32],
     model_manifest_digest: [u8; 32],
     fixed_artifact_record_digest: [u8; 32],
+    compact_mainnet: bool,
 }
 
 #[cfg(feature = "forgematrix-v4-verifier")]
@@ -363,6 +364,8 @@ impl ForgeMatrixV4CandidateParameters {
             model_manifest_digest: crate::forgematrix_v4::PRODUCTION_V4_MODEL_MANIFEST_DIGEST,
             fixed_artifact_record_digest:
                 crate::forgematrix_v4::PRODUCTION_V4_FIXED_ARTIFACT_RECORD_DIGEST,
+            compact_mainnet: cfg!(feature = "compact-mainnet")
+                && crate::mainnet_network::is_mainnet_network(network_id),
         };
         parameters.validate_for_network(network_id)?;
         Ok(parameters)
@@ -392,6 +395,9 @@ impl ForgeMatrixV4CandidateParameters {
         }
         let (expected_version, expected_digest) = Self::proof_identity_for_network(network_id);
         if network_id == [0; 32]
+            || (self.compact_mainnet
+                && (!cfg!(feature = "compact-mainnet")
+                    || !crate::mainnet_network::is_mainnet_network(network_id)))
             || self.algorithm_version != FORGEMATRIX_V4_ALGORITHM_VERSION
             || self.proof_version != expected_version
             || self.proof_system_digest != expected_digest
@@ -415,6 +421,47 @@ impl ForgeMatrixV4CandidateParameters {
         hasher.update(&self.proof_system_digest);
         hasher.update(&self.model_manifest_digest);
         hasher.update(&self.fixed_artifact_record_digest);
+        if self.compact_mainnet {
+            hasher.update(b"CMFD/COMPACT-MAINNET/SCHEDULE/V1");
+            hasher.update(
+                &crate::compact_mainnet_fork::CompactMainnetForkIdentity::pinned().fingerprint(),
+            );
+        }
+    }
+
+    pub const fn compact_mainnet_enabled(self) -> bool {
+        self.compact_mainnet
+    }
+
+    /// Used only to reproduce the authenticated predecessor identity. A
+    /// scheduled verifier itself always retains its height-bound policy.
+    pub fn legacy_parameters(mut self) -> Self {
+        self.compact_mainnet = false;
+        self
+    }
+
+    pub fn proof_version_at_height(self, height: u64) -> u32 {
+        if self.compact_mainnet
+            && height >= crate::compact_mainnet_fork::COMPACT_MAINNET_ACTIVATION_HEIGHT
+        {
+            2
+        } else {
+            self.proof_version
+        }
+    }
+
+    pub fn proof_system_digest_at_height(self, height: u64) -> [u8; 32] {
+        if self.compact_mainnet
+            && height >= crate::compact_mainnet_fork::COMPACT_MAINNET_ACTIVATION_HEIGHT
+        {
+            crate::compact_mainnet_fork::compact_mainnet_proof_system_digest()
+        } else {
+            self.proof_system_digest
+        }
+    }
+
+    pub fn uses_direct_proof_at_height(self, height: u64) -> bool {
+        self.proof_version_at_height(height) == 2
     }
 
     pub const fn algorithm_version(self) -> u32 {
@@ -675,14 +722,15 @@ impl ForgeMatrixV4ConsensusVerifier {
             return Err(ForgeMatrixV4ConsensusError::WrongNetwork);
         }
         if proof.algorithm_version != self.parameters.algorithm_version
-            || proof.proof_version != self.parameters.proof_version
-            || proof.proof_system_digest != self.parameters.proof_system_digest
+            || proof.proof_version != self.parameters.proof_version_at_height(block.height)
+            || proof.proof_system_digest
+                != self.parameters.proof_system_digest_at_height(block.height)
             || proof.model_manifest_digest != self.parameters.model_manifest_digest
         {
             return Err(ForgeMatrixV4ConsensusError::ParameterMismatch);
         }
         #[cfg(feature = "direct-proof-testnet")]
-        let direct = block.network_id == crate::FORGEMATRIX_V4_DIRECT_TESTNET_NETWORK_ID;
+        let direct = self.parameters.uses_direct_proof_at_height(block.height);
         #[cfg(not(feature = "direct-proof-testnet"))]
         let direct = false;
         let proof_len = proof.transparent_proof.len();
@@ -737,7 +785,7 @@ impl ForgeMatrixV4ConsensusVerifier {
             work_digest: proof.work_digest,
         };
         #[cfg(feature = "direct-proof-testnet")]
-        if block.network_id == crate::FORGEMATRIX_V4_DIRECT_TESTNET_NETWORK_ID {
+        if self.parameters.uses_direct_proof_at_height(block.height) {
             return crate::forgematrix_v4_direct::verify_wire(
                 statement,
                 self.fixed_commitments,
@@ -905,6 +953,16 @@ impl BlockProof {
 }
 
 impl ConsensusPowVerifier {
+    #[cfg(all(test, feature = "forgematrix-v4-verifier"))]
+    pub(crate) fn v4_local_state_fixture(parameters: ForgeMatrixV4CandidateParameters) -> Self {
+        Self::V4Candidate(Arc::new(VerifierInstance::new(
+            ForgeMatrixV4ConsensusVerifier {
+                parameters,
+                fixed_commitments: Default::default(),
+                base_input: Arc::from(vec![0; 524_288]),
+            },
+        )))
+    }
     pub fn v1_legacy(profile: ForgeMatrixProfile) -> Result<Self, PowError> {
         Ok(Self::V1Legacy(Arc::new(VerifierInstance::new(
             ForgeMatrixVerifier::new(profile)?,
@@ -1725,6 +1783,10 @@ impl ConsensusPowVerifier {
         }
     }
 }
+
+#[cfg(all(test, feature = "compact-mainnet"))]
+#[path = "compact_mainnet_tests.rs"]
+pub(crate) mod compact_mainnet_tests;
 
 #[cfg(feature = "dory-v3-consensus-adapter")]
 impl ForgeMatrixV3ConsensusVerifier {

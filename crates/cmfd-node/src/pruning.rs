@@ -502,14 +502,15 @@ pub fn read_state_file(
     if reader.array::<8>()? != STATE_FILE_MAGIC || reader.u32()? != STATE_FILE_VERSION {
         return Err(corrupt("prune state has an unsupported format"));
     }
-    let fingerprint = params
-        .fingerprint()
-        .map_err(|error| corrupt(format!("network parameters are invalid: {error}")))?;
-    if reader.array::<32>()? != fingerprint {
-        return Err(corrupt("prune state belongs to another network"));
-    }
+    let stored_fingerprint = reader.array::<32>()?;
     let block_id = reader.array::<32>()?;
     let height = reader.u64()?;
+    if !params
+        .accepts_history_fingerprint(stored_fingerprint, height)
+        .map_err(|error| corrupt(format!("network parameters are invalid: {error}")))?
+    {
+        return Err(corrupt("prune state belongs to another network"));
+    }
     let successor_bytes = reader.array::<{ SuccessorHeaderPreflight::LOCAL_SNAPSHOT_BYTES }>()?;
     let successor = SuccessorHeaderPreflight::decode_local_snapshot(&successor_bytes, params)
         .map_err(|error| corrupt(format!("prune state header is invalid: {error}")))?;

@@ -484,7 +484,11 @@ impl PoolClientConfig {
         if self.expected_network_id != COMPACT_MAINNET_NETWORK_ID {
             return Err(PoolError::NetworkMismatch);
         }
-        if self.expected_consensus_fingerprint != COMPACT_MAINNET_PREDECESSOR_FINGERPRINT {
+        if self.expected_consensus_fingerprint != COMPACT_MAINNET_PREDECESSOR_FINGERPRINT
+            && self.expected_consensus_fingerprint
+                != cmfd_consensus::compact_mainnet_fork::CompactMainnetForkIdentity::pinned()
+                    .fingerprint()
+        {
             return Err(PoolError::FingerprintMismatch);
         }
         self.compact_mainnet_compatibility = true;
@@ -499,8 +503,11 @@ impl PoolClientConfig {
         fingerprint == self.expected_consensus_fingerprint
             || (self.compact_mainnet_compatibility
                 && self.expected_network_id == COMPACT_MAINNET_NETWORK_ID
-                && self.expected_consensus_fingerprint == COMPACT_MAINNET_PREDECESSOR_FINGERPRINT
-                && fingerprint == CompactMainnetForkIdentity::pinned().fingerprint())
+                && (self.expected_consensus_fingerprint == COMPACT_MAINNET_PREDECESSOR_FINGERPRINT
+                    || self.expected_consensus_fingerprint
+                        == CompactMainnetForkIdentity::pinned().fingerprint())
+                && (fingerprint == COMPACT_MAINNET_PREDECESSOR_FINGERPRINT
+                    || fingerprint == CompactMainnetForkIdentity::pinned().fingerprint()))
     }
 
     pub fn devnet(
@@ -520,7 +527,10 @@ impl PoolClientConfig {
         payout_signer: PoolPayoutSigner,
     ) -> Result<Self, PoolError> {
         let params = crate::thin_miner_network_params().map_err(PoolError::from)?;
-        Self::new(address, certificate_sha256, worker, payout_signer, params)
+        let config = Self::new(address, certificate_sha256, worker, payout_signer, params)?;
+        #[cfg(feature = "compact-mainnet")]
+        let config = config.with_compact_mainnet_compatibility()?;
+        Ok(config)
     }
 
     pub fn compiled_network_address_only(
@@ -530,7 +540,10 @@ impl PoolClientConfig {
         payout: [u8; 32],
     ) -> Result<Self, PoolError> {
         let params = crate::thin_miner_network_params().map_err(PoolError::from)?;
-        Self::address_only(address, certificate_sha256, worker, payout, params)
+        let config = Self::address_only(address, certificate_sha256, worker, payout, params)?;
+        #[cfg(feature = "compact-mainnet")]
+        let config = config.with_compact_mainnet_compatibility()?;
+        Ok(config)
     }
 
     #[cfg(test)]

@@ -147,6 +147,48 @@ pub struct PeerHello {
     pub cumulative_work: ChainWork,
 }
 
+pub(crate) fn scheduled_peer_fingerprint(
+    network_id: [u8; 32],
+    current: [u8; 32],
+    height: u64,
+) -> [u8; 32] {
+    #[cfg(feature = "compact-mainnet")]
+    {
+        use cmfd_consensus::compact_mainnet_fork::*;
+        if network_id == COMPACT_MAINNET_NETWORK_ID
+            && current == CompactMainnetForkIdentity::pinned().fingerprint()
+            && height < COMPACT_MAINNET_ACTIVATION_HEIGHT
+        {
+            return COMPACT_MAINNET_PREDECESSOR_FINGERPRINT;
+        }
+    }
+    let _ = (network_id, height);
+    current
+}
+
+pub(crate) fn compatible_fork_hellos(local: &PeerHello, remote: &PeerHello) -> bool {
+    if local.network_id != remote.network_id {
+        return false;
+    }
+    #[cfg(feature = "compact-mainnet")]
+    {
+        use cmfd_consensus::compact_mainnet_fork::*;
+        if local.network_id == COMPACT_MAINNET_NETWORK_ID && remote.network_id == local.network_id {
+            let fork = CompactMainnetForkIdentity::pinned().fingerprint();
+            let known = |fingerprint| {
+                fingerprint == fork || fingerprint == COMPACT_MAINNET_PREDECESSOR_FINGERPRINT
+            };
+            if known(local.consensus_fingerprint) && known(remote.consensus_fingerprint) {
+                return (local.consensus_fingerprint != COMPACT_MAINNET_PREDECESSOR_FINGERPRINT
+                    || local.height < COMPACT_MAINNET_ACTIVATION_HEIGHT)
+                    && (remote.consensus_fingerprint != COMPACT_MAINNET_PREDECESSOR_FINGERPRINT
+                        || remote.height < COMPACT_MAINNET_ACTIVATION_HEIGHT);
+            }
+        }
+    }
+    local.consensus_fingerprint == remote.consensus_fingerprint
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum BlockSubmissionStatus {
@@ -1459,7 +1501,7 @@ impl PeerSession {
                 if self.remote_hello.is_some() {
                     return Err(PeerError::DuplicateHello);
                 }
-                if hello.consensus_fingerprint != self.local_hello.consensus_fingerprint {
+                if !compatible_fork_hellos(&self.local_hello, hello) {
                     return Err(PeerError::WrongConsensusFingerprint);
                 }
                 if hello.node_nonce == self.local_hello.node_nonce {

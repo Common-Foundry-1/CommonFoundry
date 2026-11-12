@@ -389,6 +389,20 @@ enum WorkCheckpointCommand {
 enum Command {
     /// Print the compiled network identity and consensus manifest.
     NetworkInfo,
+    /// Print the compiled mainnet fork schedule without opening node data.
+    #[cfg(feature = "compact-mainnet")]
+    CompactForkInfo,
+    /// Check a complete frozen mainnet proof without opening node data.
+    #[cfg(feature = "compact-mainnet")]
+    VerifyForkProof {
+        #[arg(long)]
+        template: PathBuf,
+        #[arg(long)]
+        proof: PathBuf,
+        /// Optionally replay the mining work after proof verification.
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..=256))]
+        audit_work_threads: Option<u16>,
+    },
     /// Print pinned mainnet launch identity before the future beacon is available.
     #[cfg(feature = "production-v4")]
     MainnetLaunchInfo,
@@ -1475,6 +1489,19 @@ fn run_command() -> Result<(), Box<dyn std::error::Error>> {
             .write_all(&cmfd_node::mainnet_runtime::canonical_mainnet_launch_info_json()?)?;
         return Ok(());
     }
+    #[cfg(feature = "compact-mainnet")]
+    if matches!(&cli.command, Command::CompactForkInfo) {
+        let mut info: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/compact-proof-testnet/MAINNET-FORK-IDENTITY-67535.json"
+        ))?;
+        info["source_commit"] = json!(option_env!("CMFD_BUILD_SOURCE_COMMIT"));
+        info["compiled_rules_enabled"] = json!(true);
+        info["legacy_peer_fingerprint_before_activation"] = json!(hex::encode(
+            cmfd_consensus::compact_mainnet_fork::COMPACT_MAINNET_PREDECESSOR_FINGERPRINT
+        ));
+        println!("{}", serde_json::to_string_pretty(&info)?);
+        return Ok(());
+    }
     #[cfg(feature = "production-v4")]
     if let Command::MainnetCustodyReplaceCommunity {
         retained_steward_backup,
@@ -1792,6 +1819,36 @@ fn run_command() -> Result<(), Box<dyn std::error::Error>> {
     validate_production_v3_override_set(&cli)?;
     let production_v3_record = production_v3_record(&cli)?;
     let production_v4_artifacts = production_v4_artifacts(&cli)?;
+    #[cfg(feature = "compact-mainnet")]
+    if let Command::VerifyForkProof {
+        template,
+        proof,
+        audit_work_threads,
+    } = &cli.command
+    {
+        fn input(path: &Path, limit: usize) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            std::fs::File::open(path)?
+                .take((limit + 1) as u64)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > limit {
+                return Err("proof-check input exceeds its size limit".into());
+            }
+            Ok(bytes)
+        }
+        let artifacts = production_v4_artifacts
+            .as_ref()
+            .ok_or("proof checking requires authenticated V4 artifacts")?;
+        let report = cmfd_node::compact_proof_check::check(
+            artifacts,
+            &input(template, 128 * 1024 * 1024)?,
+            &input(proof, 13 * 1024 * 1024)?,
+            audit_work_threads.map(usize::from),
+        )?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
     if let Command::PoolLedgerRebind {
         source_ledger,
         output_ledger,
@@ -1854,6 +1911,14 @@ fn run_command() -> Result<(), Box<dyn std::error::Error>> {
     let work_priority = work_thread_priority(&cli.command);
     match cli.command {
         Command::NetworkInfo => unreachable!("network-info exits before node initialization"),
+        #[cfg(feature = "compact-mainnet")]
+        Command::CompactForkInfo => {
+            unreachable!("compact-fork-info exits before node initialization")
+        }
+        #[cfg(feature = "compact-mainnet")]
+        Command::VerifyForkProof { .. } => {
+            unreachable!("proof checking exits before node initialization")
+        }
         #[cfg(feature = "production-v4")]
         Command::MainnetLaunchInfo => {
             unreachable!("mainnet-launch-info exits before node initialization")
@@ -3621,6 +3686,10 @@ fn configure_production_v4_pool_verifier(
     scratch_directory: Option<&PathBuf>,
     wsl_distribution: Option<&str>,
 ) -> Result<Option<Arc<dyn cmfd_node::honest_work::GpuReplayWorkers>>, Box<dyn std::error::Error>> {
+    #[cfg(feature = "compact-mainnet")]
+    if shared_model_requested || std::env::var("CMFD_SHARED_MODEL").as_deref() == Ok("1") {
+        return Err("the mainnet fork router uses standard serial replay/proof handoff; shared-model launch remains a compact-testnet option".into());
+    }
     let supplied = replay_worker.is_some()
         || !replay_gpus.is_empty()
         || proof_gpu.is_some()
@@ -3699,6 +3768,11 @@ fn configure_production_v4_pool_verifier(
         let replay_gpus = &physical_replays;
         let shared_model =
             shared_model_requested || std::env::var("CMFD_SHARED_MODEL").as_deref() == Ok("1");
+        if cfg!(feature = "compact-mainnet") && shared_model {
+            return Err(
+                "mainnet fork routing requires standard serial replay/proof handoff".into(),
+            );
+        }
         if shared_model && keep_replay_resident {
             return Err(
                 "shared-model mode already retains its model; omit keep-replay-resident".into(),
@@ -3724,8 +3798,11 @@ fn configure_production_v4_pool_verifier(
                 COMPILED_NETWORK_PROFILE.proof,
                 ProofProfile::ProductionV4Direct
             )
+            && !(cfg!(feature = "compact-mainnet")
+                && COMPILED_NETWORK_PROFILE.network_id
+                    == cmfd_consensus::compact_mainnet_fork::COMPACT_MAINNET_NETWORK_ID)
         {
-            return Err("split proving requires the compact testnet".into());
+            return Err("split proving requires a compiled compact-proof network".into());
         }
         if let Some(devices) = &split_devices {
             if replay_gpus.is_empty() {
@@ -4515,7 +4592,7 @@ fn peer_warning(allow_public_peers: bool) -> String {
         )
     } else {
         format!(
-            "{} Â· {}",
+            "{} Ã‚Â· {}",
             COMPILED_NETWORK_PROFILE.name,
             COMPILED_NETWORK_PROFILE.network_notice()
         )

@@ -486,9 +486,18 @@ mod tests {
     #[cfg(feature = "production-v4")]
     fn mainnet_fingerprint_is_unchanged() {
         let genesis = hex::decode(MAINNET_GENESIS).unwrap().try_into().unwrap();
-        let parameters = mainnet_launch_with_genesis(genesis)
+        let active = mainnet_launch_with_genesis(genesis)
             .network_parameters()
             .unwrap();
+        let mut parameters = active;
+        if let cmfd_consensus::PowParameters::V4Candidate(v4) = parameters.pow {
+            parameters.pow = cmfd_consensus::PowParameters::V4Candidate(v4.legacy_parameters());
+        }
+        #[cfg(feature = "compact-mainnet")]
+        assert_eq!(
+            hex::encode(active.fingerprint().unwrap()),
+            cmfd_consensus::compact_mainnet_fork::COMPACT_MAINNET_FINGERPRINT_HEX
+        );
         assert_eq!(
             hex::encode(parameters.fingerprint().unwrap()),
             MAINNET_FINGERPRINT

@@ -66,6 +66,21 @@ pub fn forgematrix_v4_direct_proof_system_digest() -> [u8; 32] {
     hasher.update(&FORGEMATRIX_V4_BASEFOLD_POW_BITS.to_le_bytes());
     *hasher.finalize().as_bytes()
 }
+
+/// The compact math implementation is shared; its statement domains remain
+/// distinct for mainnet and the public compact testnet.
+#[cfg(feature = "direct-proof-testnet")]
+pub fn forgematrix_v4_direct_proof_system_digest_for_network(
+    network_id: [u8; 32],
+) -> Option<[u8; 32]> {
+    if network_id == FORGEMATRIX_V4_DIRECT_TESTNET_NETWORK_ID {
+        Some(forgematrix_v4_direct_proof_system_digest())
+    } else if crate::mainnet_network::is_mainnet_network(network_id) {
+        Some(crate::compact_mainnet_fork::compact_mainnet_proof_system_digest())
+    } else {
+        None
+    }
+}
 pub const FORGEMATRIX_V4_FIELD_MODULUS: u32 = 0x7f00_0001;
 pub const FORGEMATRIX_V4_EXTENSION_DEGREE: u32 = 4;
 pub const FORGEMATRIX_V4_BASEFOLD_ROW_VARIABLES: u32 = 23;

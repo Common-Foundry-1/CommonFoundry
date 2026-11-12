@@ -251,12 +251,7 @@ impl DecodedReversibleStateDelta {
             return Err(ReversibleStateDeltaError::UnsupportedVersion(version));
         }
 
-        let network_fingerprint = reader.array()?;
-        if network_fingerprint != params.fingerprint()? {
-            return Err(ReversibleStateDeltaError::BindingMismatch(
-                "network fingerprint",
-            ));
-        }
+        let stored_fingerprint = reader.array()?;
         let base_tip = reader.array()?;
         if base_tip != expected_base_tip {
             return Err(ReversibleStateDeltaError::BindingMismatch("base tip"));
@@ -268,6 +263,14 @@ impl DecodedReversibleStateDelta {
 
         let base_next_height = reader.u64()?;
         let child_next_height = reader.u64()?;
+        if !params
+            .accepts_history_fingerprint(stored_fingerprint, child_next_height.saturating_sub(1))?
+        {
+            return Err(ReversibleStateDeltaError::BindingMismatch(
+                "network fingerprint",
+            ));
+        }
+        let network_fingerprint = stored_fingerprint;
         let base_expected_target = reader.array()?;
         let base_median_time_past = reader.u64()?;
         let base_history_len = reader.u64()?;
@@ -325,7 +328,13 @@ impl DecodedReversibleStateDelta {
         self,
         validated: &ValidatedBlock,
     ) -> Result<ValidatedReversibleStateDelta, ReversibleStateDeltaError> {
-        let expected = ReversibleStateDelta::from_validated(validated)?;
+        let mut expected = ReversibleStateDelta::from_validated(validated)?;
+        if validated.params.accepts_history_fingerprint(
+            self.delta.network_fingerprint,
+            expected.base_next_height,
+        )? {
+            expected.network_fingerprint = self.delta.network_fingerprint;
+        }
         let expected_bytes = expected.encode()?;
         if self.delta != expected || self.canonical_bytes.as_ref() != expected_bytes.as_slice() {
             return Err(ReversibleStateDeltaError::ValidationMismatch);
@@ -579,8 +588,10 @@ impl ChainState {
             .checked_add(1)
             .ok_or(ReversibleStateDeltaError::StateMismatch)?;
 
-        if self.params.fingerprint()? != delta.network_fingerprint
-            || self.tip != delta.child_tip
+        if !self.params.accepts_history_fingerprint(
+            delta.network_fingerprint,
+            delta.child_next_height.saturating_sub(1),
+        )? || self.tip != delta.child_tip
             || self.next_height != delta.child_next_height
             || self.history.len() != expected_history_len
             || self.raw_timestamps.len() != expected_timestamp_len
@@ -1224,6 +1235,53 @@ mod tests {
         let payload_len = bytes.len() - DELTA_LOCAL_INTEGRITY_BYTES;
         let digest = local_integrity_digest(&bytes[..payload_len]);
         bytes[payload_len..].copy_from_slice(&digest);
+    }
+
+    #[cfg(feature = "compact-mainnet")]
+    #[test]
+    fn compact_mainnet_legacy_delta_preserves_canonical_bytes_and_full_validation_binding() {
+        use crate::compact_mainnet_fork::*;
+        let params = crate::pow::compact_mainnet_tests::params();
+        let mut delta = sample_delta(false);
+        delta.network_fingerprint = COMPACT_MAINNET_PREDECESSOR_FINGERPRINT;
+        delta.base_tip = params.genesis_hash;
+        delta.timestamp = params.genesis_timestamp + 60;
+        delta.effective_timestamp = delta.timestamp;
+        delta.base_median_time_past = params.genesis_timestamp;
+        delta.base_expected_target = params.initial_target.unwrap_or(params.pow_limit);
+        delta.target = delta.base_expected_target;
+        let bytes = delta.encode().unwrap();
+        let decoded = DecodedReversibleStateDelta::decode_bound(
+            &bytes,
+            &params,
+            delta.base_tip,
+            delta.child_tip,
+        )
+        .unwrap();
+        assert_eq!(decoded.canonical_bytes.as_ref(), bytes.as_slice());
+        let mut validated = validated_from_delta(&delta);
+        validated.params = params;
+        let promoted = decoded.clone().promote_exact(&validated).unwrap();
+        assert_eq!(promoted.0.encode().unwrap(), bytes);
+        validated.fees += 1;
+        assert_eq!(
+            decoded.promote_exact(&validated),
+            Err(ReversibleStateDeltaError::ValidationMismatch)
+        );
+        delta.base_next_height = COMPACT_MAINNET_ACTIVATION_HEIGHT;
+        delta.child_next_height = COMPACT_MAINNET_ACTIVATION_HEIGHT + 1;
+        delta.base_history_len = COMPACT_MAINNET_ACTIVATION_HEIGHT;
+        delta.base_timestamp_len = COMPACT_MAINNET_ACTIVATION_HEIGHT;
+        let post_height = delta.encode().unwrap();
+        assert!(
+            DecodedReversibleStateDelta::decode_bound(
+                &post_height,
+                &params,
+                delta.base_tip,
+                delta.child_tip,
+            )
+            .is_err()
+        );
     }
 
     #[test]

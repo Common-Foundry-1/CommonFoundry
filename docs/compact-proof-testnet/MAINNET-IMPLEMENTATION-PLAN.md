@@ -1,76 +1,114 @@
-# One mainnet hard fork: implementation track
+# Mainnet compact-proof fork at height 67,535
 
-The compact-proof testnet exercises the two changes together: a self-contained
-version-2 proof with bound evaluation claims, and ordinary nodes that verify
-that proof without replaying the 384-layer mining calculation. Mainnet will
-activate both changes at height **H = 65,535**, selected by the owner on
-2026-11-10. The fork and proof-system fingerprints are pinned in
-[`MAINNET-FINGERPRINT-65535.md`](MAINNET-FINGERPRINT-65535.md). Activation still
-requires the implementation and qualification below.
+This source implements the mainnet upgrade at **H = 67,535**, selected on
+2026-11-11. Every `production-mainnet` build includes the schedule. There is no
+daemon option to select another activation height. The earlier 65,535 proposal
+and its fingerprint are superseded; its signed releases remain historical.
 
-## Exact consensus boundary
+The exact identity is in [MAINNET-FINGERPRINT-67535.md](MAINNET-FINGERPRINT-67535.md)
+and [MAINNET-FORK-IDENTITY-67535.json](MAINNET-FORK-IDENTITY-67535.json).
 
 | Block height | Accepted proof | Node admission |
 | --- | --- | --- |
-| Below H | Existing mainnet version 1 only | Existing proof checks and required work replay |
-| H and above | `CMFDDR02` version 2 only | Complete direct proof, target, transaction and block checks; no required work replay |
+| Below 67,535 | Existing mainnet version 1 only | Existing proof checks and required work replay |
+| 67,535 onward | `CMFDDR02` version 2 only | Complete direct proof, target, transaction and block checks; no required work replay |
 
-The version-2 packet and its complete proof frame retain their separate
-6,000,000-byte and 6,100,000-byte caps. The 16 MiB block limit, model bank,
-fixed commitments, workload, rewards and transaction rules remain pinned.
-Historical version-1 blocks are verified under their original rules when a
-node restarts, imports history, or crosses H during a reorganization. An audit
-node may replay post-H work independently; its replay result is observational
-and cannot make ordinary nodes depend on that work engine.
+Version-2 packets must be strictly smaller than 6,000,000 bytes; the proof
+frame cap is 6,100,000 bytes. Historical version-1 frames retain their 13 MiB
+allowance. The 16 MiB block limit, network ID, launch beacon, model bank,
+fixed commitments, mining calculation, rewards and transaction rules stay
+pinned. The fingerprint commits both proof rules and the activation height.
 
-## Code paths to complete before activation
+## Implemented transitions
 
-1. Carry the pinned H, direct proof-system digest and authenticated model identity
-   from `compact_mainnet_fork.rs` into the owner-signed mainnet release configuration. A build without all
-   three pins must fail closed.
-2. Make `PowParameters`, `ConsensusPowVerifier` and the node's block
-   preverification select version 1 or 2 from the **block's height**. Apply
-   the same selection to local block production and pool jobs. Reject a
-   version-2 proof below H and a version-1 proof at or above H before an
-   expensive verifier runs.
-3. Version the network-parameter fingerprint/handshake deliberately. Today
-   the fingerprint includes one proof identity and the proof-size cap, while
-   the node retains one verifier. The fork-aware identity must commit to H and
-   both proof rules and permit stored pre-H history to open under the upgraded
-   binary. Old peers must not silently report compatibility after H.
-4. Keep the pre-H 13 MiB frame allowance while decoding historical blocks;
-   enforce the 6,100,000-byte frame and 6,000,000-byte direct-packet limits
-   at or above H. The current wire cap is selected by network ID alone, so
-   simply lowering it for mainnet would break historical catch-up.
-5. Make the work gate height-aware. Preserve its current pre-H checkpoints
-   and historical validation; stop requiring a replay checkpoint for post-H
-   block admission, sync, pruning, wallet catch-up and exchange RPC. Keep
-   the separate audit profile available for operators.
-6. Ship the same activation rule in Linux and Windows node/wallet packages,
-   pool workers, miners, seeds, relays and exchange images before H. Pool
-   templates created below H must be retired at H so stale version-1 shares
-   cannot produce a post-H block.
+Proof selection follows each frozen block/template height, including a
+reorganization across H. Wrong-era proofs fail before relation verification.
+Pool jobs retain their existing stale-tip checks. The proof-worker router
+switches between the inherited version-1 worker and the mainnet compact
+worker, and switches back when a template returns below H. Pool clients still
+submit job IDs and nonces; updated reference miner 1.0.22 accepts the exact
+legacy and new fork pool identities. Version 1.0.21 recognizes the superseded
+65,535 proposal and needs replacement for the new fork pool.
 
-## Qualification before activation
+The node keeps required replay for historical blocks between the existing
+checkpoint and H. Post-H proof-validated blocks advance the validated frontier
+without being recorded as recomputed work. Historical gaps continue to hold
+wallet/exchange spending and pruning. Optional offline CPU replay audits do
+not change ordinary-node admission rules.
 
-- Run mixed-version peers at H-1, H and H+1, including wrong-version,
-  wrong-network, wrong-digest, oversize, malformed and coordinated-evaluation
-  proofs. The known 48 coordinated claim alterations must remain rejected.
-- Run a reorganization across H, cold restart from a pre-H block log, snapshot
-  recovery, pruned catch-up and wallet/exchange sync with proof-only admission.
-- Mine fresh post-H blocks through the pool and separate CPU nodes. Compare
-  proof-only nodes with an independent replaying audit node at the same tips.
-- Check the shipped GPU worker on a 16 GB card, report the full share-to-block
-  latency, and verify owner mining is restored after qualification.
-- Obtain independent review of the transcript-binding repair and complete
-  direct-proof soundness accounting. Publish the exact reviewed source,
-  binaries, hashes, H and rollback procedure together.
+Upgraded peers advertise the legacy wire fingerprint below H and the fork
+fingerprint from H onward. Connections rehandshake when crossing that boundary.
+The compatibility exception permits only these two exact mainnet identities,
+and only when the legacy side reports a height below H. Unknown identities and
+old peers claiming post-H compatibility are rejected.
 
-Current testnet evidence: a GPU-proven chain through height 19, independent
-CPU-only node catch-up, a public audit seed, live proof-only admission/restart,
-48 coordinated attack rejections, 6,528 evaluation-limb binding checks,
-and Linux/Windows package qualification. The latest full local pool/node
-acceptance averaged 5.74 seconds with 5.65–5.69 MB proofs; the sampled workload
-peaked at 12.72 GiB under its 13 GiB guard on the RTX 5090 test card.
-Those tests establish the testnet path; the height-H mainnet implementation
-and its cross-height tests remain the next engineering milestone.
+The upgraded node recognizes the exact predecessor `network.meta`, preserves
+the existing wallet key, and writes `network.meta.pre-compact-67535` before
+new metadata. Pre-H local state, reversible deltas and prune anchors have
+narrow fingerprint compatibility. They retain structural, canonical encoding,
+checksum and full-validation checks. Stale startup caches are rebuilt. An
+old binary refuses the new metadata; rollback uses the untouched full backup.
+
+## Operator testing
+
+Use a separate directory and a stopped, complete copy of the node/pool data.
+Keep the original executable, wallet key, block log, work-status files, prune
+anchors, pool ledger and configuration together for rollback. Never point two
+processes at the same data directory. Do not delete `blocks.log`, `wallet.key`
+or `prune-anchor-*` to bypass an upgrade failure.
+
+Confirm `cmfd-node network-info` reports fingerprint
+`9009948f6eab38b5b3dcee13eda9f6ef03e0db863c435cb97c1d4c3e124eb360`.
+Use the existing authenticated launch plan/beacon and fixed input bank. Build
+patched pools from the public release source with `production-mainnet`; do
+not carry forward the predecessor fingerprint as a hardcoded pool identity.
+
+An old pool ledger needs an explicit **offline, copy-only** identity conversion.
+Inspect `cmfd-node pool-ledger-rebind --help`: pass the stopped source archive,
+a new destination, its expected generation, the exact old fingerprint and the
+new binary's authenticated network-info. The converter locks and validates the
+source, binds the target to this binary, and refuses an existing destination.
+Check balances, payouts and generation on the copy before pool startup. The
+converter does not alter node history or authorize payments.
+
+Mainnet pool proving uses standard serial replay/proof GPU handoff. Run the
+included `cmfd-mainnet-fork-prover` through the pool's proof-worker option.
+One compatible GPU can prove compact blocks; setting
+`CMFD_DIRECT_MULTI_GPU_DEVICES=GPU-uuid-a,GPU-uuid-b` selects the optional split
+coordinator. `--shared-model` is a compact-testnet optimization and is rejected
+by this mainnet router. Preserve existing pool, payout, miner and GPU settings.
+
+`verify-fork-proof --template FILE --proof FILE` verifies a complete proof using
+the authenticated mainnet inputs without opening node data. Optional
+`--audit-work-threads N` independently replays the mining work. This command
+checks the proof and target; it does not establish parent, transaction or full
+chain admission. The `mainnet_fork_pool_fixture` example generates similarly
+scoped offline fixtures through the actual pool pipeline with synthetic parents;
+those fixtures must never be relayed as blocks.
+
+## Rebuild and qualification scope
+
+Set `CMFD_BUILD_SOURCE_COMMIT` to the exact full release commit, then build:
+
+```sh
+cargo build --release --locked -p cmfd-node -p cmfd-miner \
+  --features cmfd-node/production-mainnet,cmfd-miner/production-mainnet
+```
+
+The complete compact GPU source and pinned public dependency recipe are in
+`tools/compact-proof-prover/README.md`. The inherited replay/version-1 workers
+must match the signed v1.0.20 distribution; package receipts record provenance.
+Linux and WSL2 test packages contain no new native Windows EXE.
+
+The release qualification receipt distinguishes exact-mainnet identity/version
+tests, reduced-geometry real-chain reorg/restart tests, generic node regressions,
+and full-size GPU/CPU proof tests. Generic Devnet fixture suites use
+`production-v4` without a mainnet network profile; the inherited whole-suite
+`production-mainnet` run contains Devnet-default fixtures that require a
+mainnet launch beacon, and is not reported as green.
+
+Publication for pool operators is a testing prerelease. Independent review of
+the repaired transcript and direct-proof soundness, operator ledger/patch
+testing, cross-height network rehearsal, and coordinated seed/wallet/exchange
+deployment remain production activation gates. Publishing these artifacts
+does not deploy them to the running network.

@@ -50,6 +50,7 @@ static PRODUCTION_V4_TESTNET_RULE: ForgeMatrixV4WorkRule = ForgeMatrixV4WorkRule
     checkpoint_height: 0,
     checkpoint_block_id: PRODUCTION_V4_TESTNET_GENESIS,
     canonical_ids: Cow::Borrowed(&[]),
+    recomputation_end: None,
 };
 
 #[cfg(feature = "direct-proof-testnet-audit")]
@@ -61,6 +62,7 @@ static DIRECT_TESTNET_RULE: ForgeMatrixV4WorkRule = ForgeMatrixV4WorkRule {
         0x82, 0x54,
     ],
     canonical_ids: Cow::Borrowed(&[]),
+    recomputation_end: None,
 };
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -90,9 +92,16 @@ pub struct ForgeMatrixV4WorkRule {
     /// An all-zero entry means the height is not pinned (sparse test rules
     /// only; a release list has no zero entries).
     canonical_ids: Cow<'static, [u8]>,
+    recomputation_end: Option<u64>,
 }
 
 impl ForgeMatrixV4WorkRule {
+    #[cfg(any(test, feature = "work-rule-test-support"))]
+    pub fn with_recomputation_end_for_test(mut self, end: u64) -> Self {
+        assert!(end > self.checkpoint_height);
+        self.recomputation_end = Some(end);
+        self
+    }
     /// A rule with a complete canonical id list. Every entry must be nonzero
     /// and the entry at `checkpoint_height` must equal `checkpoint_block_id`.
     /// With `checkpoint_height == 0` the list is empty and the checkpoint
@@ -176,6 +185,7 @@ impl ForgeMatrixV4WorkRule {
             checkpoint_height,
             checkpoint_block_id,
             canonical_ids,
+            recomputation_end: None,
         };
         if checkpoint_height > 0 && rule.entry(checkpoint_height) != checkpoint_block_id {
             return Err(WorkRuleError::CheckpointIdMismatch);
@@ -201,6 +211,16 @@ impl ForgeMatrixV4WorkRule {
     /// Whether a block at `height` must have its work re-executed.
     pub const fn requires_recomputation(&self, height: u64) -> bool {
         height > self.checkpoint_height
+            && match self.recomputation_end {
+                Some(end) => height < end,
+                None => true,
+            }
+    }
+
+    /// Last height which can require legacy replay for this compiled rule.
+    pub fn required_through_height(&self, tip: u64) -> u64 {
+        self.recomputation_end
+            .map_or(tip, |end| tip.min(end.saturating_sub(1)))
     }
 
     /// The pinned canonical id at `height`, for `1..=C`. `None` at height 0,
@@ -279,6 +299,15 @@ pub fn forgematrix_v4_work_rule_checked(
         return Ok(Some(rule));
     }
     let rule = pin.rule()?;
+    #[cfg(feature = "compact-mainnet")]
+    let rule = {
+        let mut scheduled = rule;
+        if is_mainnet_network(network_id) {
+            scheduled.recomputation_end =
+                Some(crate::compact_mainnet_fork::COMPACT_MAINNET_ACTIVATION_HEIGHT);
+        }
+        scheduled
+    };
     Ok(Some(cell.get_or_init(|| rule)))
 }
 
@@ -443,7 +472,17 @@ mod tests {
             assert_eq!(forgematrix_v4_work_rule_checked(network_id), Ok(selected));
             match pin {
                 None => assert!(selected.is_none()),
-                Some(pin) => assert_eq!(selected, Some(&pin.rule().unwrap())),
+                Some(pin) => {
+                    let mut expected = pin.rule().unwrap();
+                    if cfg!(feature = "compact-mainnet")
+                        && crate::mainnet_network::is_mainnet_network(network_id)
+                    {
+                        expected.recomputation_end = Some(
+                            crate::compact_mainnet_fork::COMPACT_MAINNET_ACTIVATION_HEIGHT,
+                        );
+                    }
+                    assert_eq!(selected, Some(&expected));
+                }
             }
         }
 

@@ -2395,20 +2395,19 @@ fn submit_v4_template(
     )?;
     let challenge_digest =
         forgematrix_v4_challenge_digest(&template.challenge, nonce, fixed_record.manifest_digest());
-    #[cfg(feature = "direct-proof-testnet")]
-    let direct =
-        template.challenge.network_id == cmfd_consensus::FORGEMATRIX_V4_DIRECT_TESTNET_NETWORK_ID;
-    #[cfg(not(feature = "direct-proof-testnet"))]
+    #[cfg(any(feature = "direct-proof-testnet", feature = "production-mainnet"))]
+    let direct = parameters.uses_direct_proof_at_height(template.challenge.height);
+    #[cfg(not(any(feature = "direct-proof-testnet", feature = "production-mainnet")))]
     let direct = false;
     let final_activation_digest = if direct {
-        #[cfg(feature = "direct-proof-testnet")]
+        #[cfg(any(feature = "direct-proof-testnet", feature = "production-mainnet"))]
         {
             cmfd_consensus::forgematrix_v4_direct::final_activation_digest_from_packet(
                 challenge_digest,
                 &transparent_proof,
             )?
         }
-        #[cfg(not(feature = "direct-proof-testnet"))]
+        #[cfg(not(any(feature = "direct-proof-testnet", feature = "production-mainnet")))]
         {
             unreachable!("direct proof network is not compiled")
         }
@@ -2429,9 +2428,9 @@ fn submit_v4_template(
     }
     let proof = BlockProof::V4Candidate(Box::new(ForgeMatrixV4CandidateProof {
         algorithm_version: parameters.algorithm_version(),
-        proof_version: parameters.proof_version(),
+        proof_version: parameters.proof_version_at_height(template.challenge.height),
         nonce,
-        proof_system_digest: parameters.proof_system_digest(),
+        proof_system_digest: parameters.proof_system_digest_at_height(template.challenge.height),
         model_manifest_digest: fixed_record.manifest_digest(),
         challenge_digest,
         final_activation_digest,

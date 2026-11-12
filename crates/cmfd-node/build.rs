@@ -13,6 +13,7 @@ fn main() {
         "GITHUB_REF_NAME",
         "CARGO_FEATURE_PRODUCTION_RC",
         "CARGO_FEATURE_PRODUCTION_MAINNET",
+        "CARGO_FEATURE_COMPACT_MAINNET",
         "CARGO_FEATURE_PRODUCTION_V3_TESTNET",
         "CARGO_FEATURE_PRODUCTION_V4_TESTNET",
         "CARGO_FEATURE_DIRECT_PROOF_TESTNET",
@@ -42,6 +43,11 @@ fn main() {
     .count();
     if mutually_exclusive_profiles > 1 {
         panic!("mainnet, production-rc and production testnet profiles are mutually exclusive");
+    }
+    if env::var_os("CARGO_FEATURE_COMPACT_MAINNET").is_some()
+        && env::var_os("CARGO_FEATURE_PRODUCTION_MAINNET").is_none()
+    {
+        panic!("compact-mainnet is the mainnet rule switch; select the production-mainnet profile");
     }
 
     // Test work rules can replace the consensus work rule; a release never

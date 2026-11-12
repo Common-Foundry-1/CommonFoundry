@@ -103,6 +103,9 @@ direct-proof-testnet = [
     "dep:miniz_oxide",
 ]
 direct-proof-testnet-audit = ["direct-proof-testnet"]
+# Compile the shared compact codec and the pinned height-aware mainnet rules.
+# This does not select the node's separate compact-testnet network profile.
+compact-mainnet = ["direct-proof-testnet"]
 production-whir-candidate = ["whir-prototype"]
 remainder-prototype = [
     "dep:bincode",

@@ -86,6 +86,28 @@ pub enum NetworkError {
 }
 
 impl NetworkParams {
+    /// Accept the exact predecessor's local historical state only below H.
+    /// This does not authorize a proof or an externally supplied block.
+    pub fn accepts_history_fingerprint(
+        &self,
+        stored: [u8; 32],
+        state_height: u64,
+    ) -> Result<bool, NetworkError> {
+        if stored == self.fingerprint()? {
+            return Ok(true);
+        }
+        #[cfg(feature = "compact-mainnet")]
+        if let PowParameters::V4Candidate(parameters) = self.pow
+            && parameters.compact_mainnet_enabled()
+            && state_height < crate::compact_mainnet_fork::COMPACT_MAINNET_ACTIVATION_HEIGHT
+            && stored == crate::compact_mainnet_fork::COMPACT_MAINNET_PREDECESSOR_FINGERPRINT
+        {
+            return Ok(true);
+        }
+        let _ = state_height;
+        Ok(false)
+    }
+
     pub fn initial_work_target(&self) -> [u8; 32] {
         self.initial_target.unwrap_or(self.pow_limit)
     }
@@ -98,6 +120,18 @@ impl NetworkParams {
     }
 
     pub fn fingerprint(&self) -> Result<[u8; 32], NetworkError> {
+        #[cfg(feature = "compact-mainnet")]
+        if let PowParameters::V4Candidate(parameters) = self.pow
+            && parameters.compact_mainnet_enabled()
+        {
+            let mut predecessor = *self;
+            predecessor.pow = PowParameters::V4Candidate(parameters.legacy_parameters());
+            return crate::compact_mainnet_fork::CompactMainnetForkIdentity::from_mainnet_params(
+                &predecessor,
+            )
+            .map(|identity| identity.fingerprint())
+            .map_err(|_| NetworkError::InvalidPowParameters);
+        }
         // The dormant V3 adapter absorbs its complete immutable identity below.
         // Actual activation still requires a deliberate network-domain review;
         // this adapter does not change the active V2 network fingerprint.

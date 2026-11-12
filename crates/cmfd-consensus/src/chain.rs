@@ -214,9 +214,9 @@ impl SuccessorHeaderPreflight {
         bytes: &[u8; Self::LOCAL_SNAPSHOT_BYTES],
         params: NetworkParams,
     ) -> Result<Self, ChainStateSnapshotError> {
-        if bytes[..32] != params.fingerprint()? {
-            return Err(ChainStateSnapshotError::WrongNetwork);
-        }
+        let stored_fingerprint: [u8; 32] = bytes[..32]
+            .try_into()
+            .map_err(|_| ChainStateSnapshotError::Truncated)?;
         let tip: [u8; 32] = bytes[32..64]
             .try_into()
             .map_err(|_| ChainStateSnapshotError::Truncated)?;
@@ -225,6 +225,9 @@ impl SuccessorHeaderPreflight {
                 .try_into()
                 .map_err(|_| ChainStateSnapshotError::Truncated)?,
         );
+        if !params.accepts_history_fingerprint(stored_fingerprint, next_height.saturating_sub(1))? {
+            return Err(ChainStateSnapshotError::WrongNetwork);
+        }
         let median_time_past = u64::from_le_bytes(
             bytes[72..80]
                 .try_into()

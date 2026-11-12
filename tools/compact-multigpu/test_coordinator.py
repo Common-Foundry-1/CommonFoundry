@@ -14,6 +14,11 @@ spec.loader.exec_module(c)
 
 
 class CoordinatorTests(unittest.TestCase):
+    def test_mainnet_statement_domain_matches_pinned_fork_manifest(self):
+        manifest=json.loads((Path(__file__).resolve().parents[2]/'docs/compact-proof-testnet/MAINNET-FORK-IDENTITY-67535.json').read_text())
+        self.assertEqual(c.proof_digest_for_network(manifest['network_id']),manifest['at_and_after_activation']['proof_system_digest'])
+        with self.assertRaises(ValueError):c.proof_digest_for_network('77'*32)
+
     def test_pipeline_starts_capture_before_export_and_consumes_it_once(self):
         workers=[];events=[]
         class Worker:
@@ -22,7 +27,7 @@ class CoordinatorTests(unittest.TestCase):
             def poll(self):return None if self.alive else 0
             def send(self,value):self.command=value;events.append((self.role,value['op']))
             def receive(self,expected,deadline,monitor):
-                if 'ready' in expected:return {'event':'ready','role':self.role,'network_id':'network','proof_version':2,'proof_system_digest':'e8d7ed68504e5ff76548a74beff735b22c3bb442cddf9b7dd119e943a58e3dc7','cache':{'pid':700},'shared_model':True}
+                if 'ready' in expected:return {'event':'ready','role':self.role,'network_id':'8a34c0d9eaa92c5eaec4af7fe146afdfa2ab6859918b7deb0c97e0a1f600d6d1','proof_version':2,'proof_system_digest':'e8d7ed68504e5ff76548a74beff735b22c3bb442cddf9b7dd119e943a58e3dc7','cache':{'pid':700},'shared_model':True}
                 if 'captured' in expected:return {'event':'captured','capture_id':self.command['capture_id'],'stats':{'chunks':48}}
                 if 'discarded' in expected:return {'event':'discarded'}
                 if 'reset' in expected:return {'event':'reset'}
@@ -36,7 +41,7 @@ class CoordinatorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory,patch.dict(os.environ,{'CMFD_SHARED_MODEL':'1','CMFD_WITNESS_PIPELINE':'1'}),patch.object(c,'Worker',Worker),patch.object(c,'Monitor',Monitor):
             root=Path(directory);os.environ['CMFD_SHARED_REPLAY_SOCKET']=str(root/'model.sock')
             (root/'template').write_bytes(b'{}');(root/'final').write_bytes(b'1234')
-            session=c.ResidentSession('worker',['network','model','fixed'],['GPU-a','GPU-b'])
+            session=c.ResidentSession('worker',['8a34c0d9eaa92c5eaec4af7fe146afdfa2ab6859918b7deb0c97e0a1f600d6d1','model','fixed'],['GPU-a','GPU-b'])
             try:
                 reply=session.replay(dict(op='replay',mode='full',coefficients=str(root/'coefficients'),prefix=str(root/'trace')))
                 self.assertEqual(reply['stream_capture']['chunks'],48)
@@ -69,7 +74,7 @@ class CoordinatorTests(unittest.TestCase):
                 self.role=role;self.process=Process(100+len(workers));self.command=None;workers.append(self)
             def send(self,value):self.command=value
             def receive(self,expected,deadline,monitor):
-                if 'ready' in expected:return {'event':'ready','role':self.role,'network_id':'network','proof_version':2,'proof_system_digest':'e8d7ed68504e5ff76548a74beff735b22c3bb442cddf9b7dd119e943a58e3dc7','cache':{'pid':100},'shared_model':True}
+                if 'ready' in expected:return {'event':'ready','role':self.role,'network_id':'8a34c0d9eaa92c5eaec4af7fe146afdfa2ab6859918b7deb0c97e0a1f600d6d1','proof_version':2,'proof_system_digest':'e8d7ed68504e5ff76548a74beff735b22c3bb442cddf9b7dd119e943a58e3dc7','cache':{'pid':100},'shared_model':True}
                 if 'reset' in expected:return {'event':'reset'}
                 if self.role=='fixed':return {'event':'fixed_done','id':0}
                 prefix=Path(self.command['prefix'])
@@ -87,7 +92,7 @@ class CoordinatorTests(unittest.TestCase):
             (root/'template').write_bytes(b'{}');(root/'final').write_bytes(b'1234')
             (root/'trace-host-pre-only.json').write_text(json.dumps({'schema':'CMFD_HOST_PRE_ONLY_V1'}))
             for bank in range(3):(root/f'trace-bank{bank}-pre.bin').write_bytes(b'1234')
-            session=c.ResidentSession('worker',['network','model','fixed'],['GPU-a','GPU-b'])
+            session=c.ResidentSession('worker',['8a34c0d9eaa92c5eaec4af7fe146afdfa2ab6859918b7deb0c97e0a1f600d6d1','model','fixed'],['GPU-a','GPU-b'])
             try:
                 for index in range(2):
                     report=session.prove(root/'template',root/'trace',root/'final',root/f'output{index}')
@@ -117,7 +122,7 @@ class CoordinatorTests(unittest.TestCase):
                 assert all(not w.process.alive for w in created if w.role=='dynamic')
             def receive(self,expected,deadline,monitor):
                 if 'ready' in expected:
-                    return {'event':'ready','role':self.role,'network_id':'network','proof_version':2,
+                    return {'event':'ready','role':self.role,'network_id':'8a34c0d9eaa92c5eaec4af7fe146afdfa2ab6859918b7deb0c97e0a1f600d6d1','proof_version':2,
                         'proof_system_digest':'e8d7ed68504e5ff76548a74beff735b22c3bb442cddf9b7dd119e943a58e3dc7',
                         'cache':{'pid':314}}
                 if self.role=='fixed':
@@ -136,7 +141,7 @@ class CoordinatorTests(unittest.TestCase):
             for bank in range(3):(root/f'trace-bank{bank}-dynamic.bin').write_bytes(b'12345678')
             (root/'template').write_bytes(b'{}');(root/'final').write_bytes(b'1234')
             with patch.object(c,'TRACE_BYTES',8),patch.object(c,'Worker',FakeWorker),patch.object(c,'Monitor',FakeMonitor):
-                session=c.ResidentSession('worker',['network','model','fixed'],['GPU-a','GPU-b'])
+                session=c.ResidentSession('worker',['8a34c0d9eaa92c5eaec4af7fe146afdfa2ab6859918b7deb0c97e0a1f600d6d1','model','fixed'],['GPU-a','GPU-b'])
                 try:
                     for i in range(2):
                         if i==1:
@@ -160,7 +165,7 @@ class CoordinatorTests(unittest.TestCase):
                 captured.update(kwargs['env']);self.stdin=io.StringIO();self.stdout=io.StringIO()
             def poll(self):return 0
         with tempfile.TemporaryDirectory() as work, patch.dict(os.environ,{'CUDA_VISIBLE_DEVICES':'wrong','CUDA_MODULE_LOADING':'EAGER'}),patch.object(c.subprocess,'Popen',Process):
-            worker=c.Worker('worker','pcs','GPU-second',['network','model','fixed'],Path(work))
+            worker=c.Worker('worker','pcs','GPU-second',['8a34c0d9eaa92c5eaec4af7fe146afdfa2ab6859918b7deb0c97e0a1f600d6d1','model','fixed'],Path(work))
             worker.close()
         self.assertEqual(captured['CUDA_VISIBLE_DEVICES'],'GPU-second')
         self.assertEqual(captured['CUDA_MODULE_LOADING'],'LAZY')
@@ -223,7 +228,7 @@ class CoordinatorTests(unittest.TestCase):
             before=len(list(Path('/proc/self/fd').iterdir()))
             with patch.object(c,'TRACE_BYTES',8),patch.object(c,'Worker',FakeWorker),patch.object(c,'Monitor',FakeMonitor):
                 with self.assertRaisesRegex(RuntimeError,'relation stage failed'):
-                    c.prove('worker',['network','model','fixed'],['GPU-a','GPU-b'],root/'template',root/'trace',root/'final',root/'out')
+                    c.prove('worker',['8a34c0d9eaa92c5eaec4af7fe146afdfa2ab6859918b7deb0c97e0a1f600d6d1','model','fixed'],['GPU-a','GPU-b'],root/'template',root/'trace',root/'final',root/'out')
             self.assertEqual(closed,['relations','pcs','monitor'])
             self.assertEqual(len(list(Path('/proc/self/fd').iterdir())),before)
             self.assertFalse((root/'out').exists())

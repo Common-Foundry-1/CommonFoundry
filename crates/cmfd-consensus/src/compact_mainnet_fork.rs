@@ -11,12 +11,12 @@ use crate::forgematrix_v4::{
     forgematrix_v4_proof_system_digest,
 };
 
-pub const COMPACT_MAINNET_ACTIVATION_HEIGHT: u64 = 65_535;
+pub const COMPACT_MAINNET_ACTIVATION_HEIGHT: u64 = 67_535;
 pub const COMPACT_MAINNET_FINGERPRINT_DOMAIN: &str = "CMFD/MAINNET/COMPACT-FORK/FINGERPRINT/V1";
 pub const COMPACT_MAINNET_PROOF_SYSTEM_DOMAIN: &str =
     "CMFD/ForgeMatrix/V4/DirectProofSystem/Mainnet/V1";
 pub const COMPACT_MAINNET_FINGERPRINT_HEX: &str =
-    "5b9626178bb3777230ceda1cfc0fee5a8872ad0bb0ac1c5d0c7457cf67f083a5";
+    "9009948f6eab38b5b3dcee13eda9f6ef03e0db863c435cb97c1d4c3e124eb360";
 pub const COMPACT_MAINNET_PROOF_SYSTEM_DIGEST_HEX: &str =
     "d1671fc4760134bf86f0b37d8694f4827037e5cea2642e312cb2eb705f3aef0d";
 pub const COMPACT_MAINNET_NETWORK_ID: [u8; 32] = [
@@ -185,7 +185,7 @@ mod tests {
     #[test]
     fn compact_mainnet_published_manifest_matches_the_pinned_rules() {
         let manifest: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../docs/compact-proof-testnet/MAINNET-FORK-IDENTITY-65535.json"
+            "../../../docs/compact-proof-testnet/MAINNET-FORK-IDENTITY-67535.json"
         ))
         .unwrap();
         let identity = CompactMainnetForkIdentity::pinned();
@@ -245,9 +245,9 @@ mod tests {
     #[test]
     fn compact_mainnet_boundary_requires_the_complete_proof_without_work_replay() {
         let identity = CompactMainnetForkIdentity::pinned();
-        assert_eq!(identity.rule_at_height(65_534).proof_version, 1);
-        assert!(identity.rule_at_height(65_534).required_work_replay);
-        for height in [65_535, 65_536] {
+        assert_eq!(identity.rule_at_height(67_534).proof_version, 1);
+        assert!(identity.rule_at_height(67_534).required_work_replay);
+        for height in [67_535, 67_536] {
             let rule = identity.rule_at_height(height);
             assert_eq!(rule.proof_version, 2);
             assert!(!rule.required_work_replay);

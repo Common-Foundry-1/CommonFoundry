@@ -1006,20 +1006,20 @@ impl ProductionV4PersistentPoolVerifier {
         let transparent_proof = read_bounded_file(&proof_path, PRODUCTION_V4_MAX_PROOF_BYTES)?;
         let parameters = ForgeMatrixV4CandidateParameters::for_network(self.expected_network_id)
             .map_err(replay_error)?;
-        #[cfg(feature = "direct-proof-testnet")]
-        let direct =
-            self.expected_network_id == cmfd_consensus::FORGEMATRIX_V4_DIRECT_TESTNET_NETWORK_ID;
-        #[cfg(not(feature = "direct-proof-testnet"))]
+        #[cfg(any(feature = "direct-proof-testnet", feature = "compact-mainnet"))]
+        let direct = parameters.uses_direct_proof_at_height(template.challenge.height);
+        #[cfg(not(any(feature = "direct-proof-testnet", feature = "compact-mainnet")))]
         let direct = false;
-        #[cfg(feature = "direct-proof-testnet")]
+        #[cfg(any(feature = "direct-proof-testnet", feature = "compact-mainnet"))]
         let decoded_direct = if direct {
             let statement =
                 cmfd_consensus::forgematrix_v4_basefold::ForgeMatrixV4TranscriptStatement {
                     block: template.challenge,
                     algorithm_version: parameters.algorithm_version(),
-                    proof_version: parameters.proof_version(),
+                    proof_version: parameters.proof_version_at_height(template.challenge.height),
                     nonce,
-                    proof_system_digest: parameters.proof_system_digest(),
+                    proof_system_digest: parameters
+                        .proof_system_digest_at_height(template.challenge.height),
                     model_manifest_digest: PRODUCTION_V4_MODEL_MANIFEST_DIGEST,
                     challenge_digest,
                     final_activation_digest,
@@ -1033,7 +1033,7 @@ impl ProductionV4PersistentPoolVerifier {
             None
         };
         let final_activation_matches = if direct {
-            #[cfg(feature = "direct-proof-testnet")]
+            #[cfg(any(feature = "direct-proof-testnet", feature = "compact-mainnet"))]
             {
                 let packet = decoded_direct
                     .as_ref()
@@ -1043,7 +1043,7 @@ impl ProductionV4PersistentPoolVerifier {
                     &packet.public.final_activation,
                 ) == final_activation_digest
             }
-            #[cfg(not(feature = "direct-proof-testnet"))]
+            #[cfg(not(any(feature = "direct-proof-testnet", feature = "compact-mainnet")))]
             {
                 unreachable!("direct proof network is not compiled")
             }
@@ -1061,9 +1061,10 @@ impl ProductionV4PersistentPoolVerifier {
         }
         let proof = BlockProof::V4Candidate(Box::new(ForgeMatrixV4CandidateProof {
             algorithm_version: parameters.algorithm_version(),
-            proof_version: parameters.proof_version(),
+            proof_version: parameters.proof_version_at_height(template.challenge.height),
             nonce,
-            proof_system_digest: parameters.proof_system_digest(),
+            proof_system_digest: parameters
+                .proof_system_digest_at_height(template.challenge.height),
             model_manifest_digest: PRODUCTION_V4_MODEL_MANIFEST_DIGEST,
             challenge_digest,
             final_activation_digest,
@@ -3441,8 +3442,8 @@ done"#;
     /// Real-GPU check, run by hand on a pool host with the production workers:
     ///
     /// ```text
-    /// CMFD_HW_REPLAY_WORKER=…/cmfd-v4-replay CMFD_HW_PROOF_WORKER=…/real_bank0_relations \
-    /// CMFD_HW_MODEL_BANK=…/MODEL-V2.bank CMFD_HW_FIXED_DIR=…/production-v4/fixed \
+    /// CMFD_HW_REPLAY_WORKER=â€¦/cmfd-v4-replay CMFD_HW_PROOF_WORKER=â€¦/real_bank0_relations \
+    /// CMFD_HW_MODEL_BANK=â€¦/MODEL-V2.bank CMFD_HW_FIXED_DIR=â€¦/production-v4/fixed \
     /// CMFD_HW_SCRATCH=/abs/scratch [CMFD_HW_PROVE=1] [CMFD_HW_EXTRA_GPUS=1,2] \
     /// [CMFD_HW_NETWORK_ID=<64 hex>] <test binary> --ignored real_gpu_batched_replay --nocapture
     /// ```
@@ -3666,8 +3667,8 @@ done"#;
     /// hand on a pool host with the release replay worker:
     ///
     /// ```text
-    /// CMFD_HW_REPLAY_WORKER=…/cmfd-v4-replay CMFD_HW_MODEL_BANK=…/MODEL-V2.bank \
-    /// CMFD_HW_FIXED_RECORD=…/FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json \
+    /// CMFD_HW_REPLAY_WORKER=â€¦/cmfd-v4-replay CMFD_HW_MODEL_BANK=â€¦/MODEL-V2.bank \
+    /// CMFD_HW_FIXED_RECORD=â€¦/FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json \
     /// CMFD_HW_SCRATCH=/abs/scratch [CMFD_WORK_THREADS=6] [CMFD_HW_WORK_CLAIMS=claims.jsonl] \
     ///   <test binary> --ignored real_gpu_work_checks --nocapture --test-threads=1
     /// ```

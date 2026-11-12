@@ -161,11 +161,12 @@ impl ChainState {
         if version != SNAPSHOT_VERSION {
             return Err(ChainStateSnapshotError::UnsupportedVersion(version));
         }
-        if decoder.array::<32>()? != params.fingerprint()? {
-            return Err(ChainStateSnapshotError::WrongNetwork);
-        }
+        let stored_fingerprint = decoder.array::<32>()?;
         let tip = decoder.array::<32>()?;
         let next_height = decoder.u64()?;
+        if !params.accepts_history_fingerprint(stored_fingerprint, next_height.saturating_sub(1))? {
+            return Err(ChainStateSnapshotError::WrongNetwork);
+        }
         let history_count = decoder.count()?;
         let timestamp_count = decoder.count()?;
         let output_count = decoder.count()?;
@@ -247,7 +248,13 @@ impl ChainState {
             verifier,
         };
         validate_snapshot_state(&state)?;
-        if state.encode_local_snapshot()?.as_slice() != bytes {
+        let mut canonical = state.encode_local_snapshot()?;
+        let fingerprint_at = SNAPSHOT_MAGIC.len() + size_of::<u32>();
+        canonical[fingerprint_at..fingerprint_at + 32].copy_from_slice(&stored_fingerprint);
+        let digest_at = canonical.len() - SNAPSHOT_DIGEST_BYTES;
+        let digest = snapshot_digest(&canonical[..digest_at]);
+        canonical[digest_at..].copy_from_slice(&digest);
+        if canonical.as_slice() != bytes {
             return Err(ChainStateSnapshotError::NonCanonical("encoding"));
         }
         Ok(state)

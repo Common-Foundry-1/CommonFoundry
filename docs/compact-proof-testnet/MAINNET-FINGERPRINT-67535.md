@@ -1,9 +1,9 @@
-# Mainnet compact-proof fingerprint at height 65,535
+# Mainnet compact-proof fingerprint at height 67,535
 
 The compact-proof mainnet fork identity is pinned to:
 
 ```text
-5b9626178bb3777230ceda1cfc0fee5a8872ad0bb0ac1c5d0c7457cf67f083a5
+9009948f6eab38b5b3dcee13eda9f6ef03e0db863c435cb97c1d4c3e124eb360
 ```
 
 The mainnet compact proof-system digest is:
@@ -13,13 +13,13 @@ d1671fc4760134bf86f0b37d8694f4827037e5cea2642e312cb2eb705f3aef0d
 ```
 
 Both are defined in `crates/cmfd-consensus/src/compact_mainnet_fork.rs` and
-reproduced in `MAINNET-FORK-IDENTITY-65535.json` with the exact hash preimage.
+reproduced in `MAINNET-FORK-IDENTITY-67535.json` with the exact hash preimage.
 They commit to the existing mainnet identity and the following schedule:
 
 | Height | Proof | Ordinary-node admission |
 | --- | --- | --- |
-| 0–65,534 | Existing version 1, 13 MiB frame allowance | Complete proof checks and current mandatory work replay |
-| 65,535 onward | `CMFDDR02` version 2, packet strictly below 6,000,000 bytes and frame at most 6,100,000 bytes | Complete repaired proof verification, block/transaction/target checks; no mandatory mining-work replay |
+| 0â€“67,534 | Existing version 1, 13 MiB frame allowance | Complete proof checks and current mandatory work replay |
+| 67,535 onward | `CMFDDR02` version 2, packet strictly below 6,000,000 bytes and frame at most 6,100,000 bytes | Complete repaired proof verification, block/transaction/target checks; no mandatory mining-work replay |
 
 The new proof-system digest binds the canonical packet version, compression,
 six-commitment opening, BaseFold 1/270/16 parameters and evaluation absorption
@@ -48,8 +48,8 @@ Changing H, proof identity, limits, model, or admission policy changes the
 fingerprint. `from_mainnet_params()` refuses parameters whose existing
 fingerprint differs from the pinned mainnet predecessor.
 
-This establishes the identity for the mainnet fork implementation to consume.
-The current released node's active `network-info` still reports the old
-fingerprint until the dual proof-rule, storage and peer transition is wired
-into its mainnet activation path. Defining this identity alone does not ship
-or activate the upgrade.
+Every `production-mainnet` build of this fork source reports this fingerprint
+in `network-info` and enforces the scheduled proof rules. Peer wire identity
+remains the predecessor below H, with a rehandshake at the boundary. Storage
+upgrades and operator testing are described in `MAINNET-IMPLEMENTATION-PLAN.md`.
+The earlier H=65,535 fingerprint is superseded; old signed assets are unchanged.

@@ -1436,7 +1436,9 @@ impl Node {
             .as_ref()
             .map(|catch_up| self.wallet_catch_up_status(gate, catch_up, validated_height, now));
         Some(WorkRuleStatus {
-            enforced: checker.is_some(),
+            enforced: checker.is_some()
+                && gate.rule.required_through_height(self.state.next_height())
+                    == self.state.next_height(),
             engines: match (has(WorkEngineKind::Cpu), has(WorkEngineKind::Gpu)) {
                 (true, true) => Some("cpu+gpu"),
                 (true, false) => Some("cpu"),
@@ -1599,7 +1601,10 @@ impl Node {
         };
         while height < tip {
             match at(height + 1) {
-                Some(block_id) if store.status(&block_id) == Some(WorkStatus::Verified) => {
+                Some(block_id)
+                    if !gate.rule.requires_recomputation(height + 1)
+                        || store.status(&block_id) == Some(WorkStatus::Verified) =>
+                {
                     height += 1;
                 }
                 _ => break,
@@ -1636,9 +1641,14 @@ impl Node {
             if gate.halted() {
                 return Err(ExchangeReadRefusal::Halted);
             }
-            if gate.checker.as_ref().is_some_and(|checker| {
-                checker.engine_state() == crate::honest_work::WorkEngineState::Failed
-            }) {
+            if gate
+                .rule
+                .required_through_height(self.state.next_height().saturating_sub(1))
+                == self.state.next_height().saturating_sub(1)
+                && gate.checker.as_ref().is_some_and(|checker| {
+                    checker.engine_state() == crate::honest_work::WorkEngineState::Failed
+                })
+            {
                 return Err(ExchangeReadRefusal::EngineFailed);
             }
         }
@@ -1664,6 +1674,9 @@ impl Node {
             .saturating_add(1);
         let store = gate.store.as_ref().map(|store| lock(store));
         (start..=tip).find(|height| {
+            if !gate.rule.requires_recomputation(*height) {
+                return false;
+            }
             let Some(&block_id) = usize::try_from(*height)
                 .ok()
                 .and_then(|position| self.index.active_chain.get(position))
@@ -1876,6 +1889,9 @@ impl Node {
         if gate.store.is_some() {
             self.check_side_ancestors(gate, parent, checkpoint)?;
         }
+        if !gate.rule.requires_recomputation(height) {
+            return Ok(());
+        }
         if gate.status(&block_id) == Some(WorkStatus::Verified) {
             return Ok(());
         }
@@ -1940,7 +1956,7 @@ impl Node {
             match gate.status(&cursor) {
                 Some(WorkStatus::Invalid) => return Err(NodeError::InvalidAncestor(cursor)),
                 Some(WorkStatus::Verified) => {}
-                None => unchecked = true,
+                None => unchecked |= gate.rule.requires_recomputation(height),
             }
             cursor = entry.parent();
         }
@@ -3425,6 +3441,49 @@ pub(crate) mod tests {
         assert_eq!(engine.block_calls(), 9);
         drop((reopened, source, fork));
         for path in [path, source_path, fork_path] {
+            clean_test_dir(&path);
+        }
+    }
+
+    #[test]
+    fn compact_mainnet_work_cutoff_survives_reorg_and_restart_on_reduced_geometry() {
+        // The exact mainnet height/version is checked by consensus tests.
+        // This small real-proof chain exercises the generic state/replay gate.
+        let (source_path, mut source) = devnet("fork-cutoff-source");
+        let now = unix_time_seconds().unwrap();
+        let chain = mine(&mut source, 4, now);
+        let (path, mut node) = devnet("fork-cutoff-node");
+        let rule = rule_from_genesis(&node).with_recomputation_end_for_test(3);
+        let engine = cpu();
+        for block in &chain[..2] {
+            engine.answer(block, true);
+        }
+        install(&mut node, Some(rule.clone()), Some(engine.clone()), None);
+        let node = shared(node);
+        for (offset, block) in chain.iter().enumerate() {
+            submit_shared_block(&node, block.clone(), now + offset as u64).unwrap();
+        }
+        assert_eq!(engine.block_calls(), 2);
+        assert_eq!(node.lock().unwrap().work_validated_height(), Some(4));
+        assert!(!node.lock().unwrap().work_rule_status().unwrap().enforced);
+        let (branch_path, mut fork) = devnet("fork-cutoff-branch");
+        let branch = mine(&mut fork, 5, now + 100);
+        for block in &branch[..2] {
+            engine.answer(block, true);
+        }
+        for (offset, block) in branch.iter().enumerate() {
+            submit_shared_block(&node, block.clone(), now + 100 + offset as u64).unwrap();
+        }
+        assert_eq!(engine.block_calls(), 4);
+        assert_eq!(node.lock().unwrap().state.tip(), branch[4].block_id());
+        assert_eq!(node.lock().unwrap().work_validated_height(), Some(5));
+        drop(node);
+        let mut reopened = Node::open_with_profile(&path, DEVNET_PROFILE).unwrap();
+        install(&mut reopened, Some(rule), Some(engine.clone()), None);
+        assert_eq!(reopened.work_validated_height(), Some(5));
+        assert_eq!(engine.block_calls(), 4);
+        drop((reopened, source, fork));
+        for path in [path, source_path, branch_path] {
             clean_test_dir(&path);
         }
     }

@@ -1472,7 +1472,11 @@ fn thin_miner_hello() -> Result<PeerHello, P2pError> {
     let params = crate::thin_miner_network_params()?;
     Ok(PeerHello {
         network_id: params.network_id,
-        consensus_fingerprint: params.fingerprint().map_err(NodeError::from)?,
+        consensus_fingerprint: crate::peer::scheduled_peer_fingerprint(
+            params.network_id,
+            params.fingerprint().map_err(NodeError::from)?,
+            0,
+        ),
         node_nonce: crate::peer::process_node_nonce(),
         tip: params.genesis_hash,
         height: 0,
@@ -2674,6 +2678,12 @@ fn perform_respond_to_peer_inner_with_policy(
 
     let mut block_was_served = false;
     loop {
+        // Refresh sessions when the active chain crosses H in either direction.
+        // An old binary then rejects the new greeting; an upgraded peer can
+        // reconnect and continue historical synchronization under both rules.
+        if lock_node(&shared)?.peer_hello().consensus_fingerprint != hello.consensus_fingerprint {
+            return Err(PeerError::ConnectionClosed.into());
+        }
         let received = if block_was_served {
             connection.receive_after_served_block()
         } else {

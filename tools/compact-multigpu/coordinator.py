@@ -27,6 +27,13 @@ MAX_LINE = 1 << 20
 REQUIRED_SEALS = (fcntl.F_SEAL_SEAL | fcntl.F_SEAL_GROW |
                   fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_WRITE)
 
+def proof_digest_for_network(network):
+    if network == '8a34c0d9eaa92c5eaec4af7fe146afdfa2ab6859918b7deb0c97e0a1f600d6d1':
+        return 'e8d7ed68504e5ff76548a74beff735b22c3bb442cddf9b7dd119e943a58e3dc7'
+    if network == '88296bc39c10e8bc1dd4818d4d42412fe5f08210651110377f495da299812f62':
+        return 'd1671fc4760134bf86f0b37d8694f4827037e5cea2642e312cb2eb705f3aef0d'
+    raise ValueError('unsupported compact proof network')
+
 
 def resolve_devices(selectors, inventory):
     """Resolve aliases before accepting the two-device invariant."""
@@ -314,7 +321,7 @@ class ResidentSession:
             if os.environ.get('CMFD_SHARED_MODEL')=='1' and ready.get('shared_model') is not True:
                 raise ValueError('worker does not provide resident model replay')
             if (ready['role']!='fixed' or ready['network_id']!=args[0] or ready['proof_version']!=2
-                or ready['proof_system_digest']!='e8d7ed68504e5ff76548a74beff735b22c3bb442cddf9b7dd119e943a58e3dc7'
+                or ready['proof_system_digest']!=proof_digest_for_network(args[0])
                 or self.cache['pid']!=self.fixed.process.pid):
                 raise ValueError('fixed worker/cache identity differs')
             self.startup_peak=monitor.peak[0]
@@ -487,6 +494,7 @@ def main():
         return subprocess.call([executable, 'network-info'])
     if len(args) != 4 or args[0] != '--server':
         raise ValueError('usage: --server NETWORK MODEL ARTIFACTS')
+    proof_digest_for_network(args[1])
     # The running fixed worker confirms its compiled chain/proof identity
     # before READY. Avoid a redundant CUDA-linked identity subprocess here.
     selected = devices()

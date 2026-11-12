@@ -159,6 +159,7 @@ fn statement(
         frozen.challenge.network_id == network,
         "template network mismatch"
     );
+    ensure!(!cmfd_consensus::mainnet_network::is_mainnet_network(network) || frozen.challenge.height >= cmfd_consensus::compact_mainnet_fork::COMPACT_MAINNET_ACTIVATION_HEIGHT, "compact mainnet proof below activation");
     let final_activation = read_final_activation(&command.final_path)?;
     let manifest = prepared.fixed_record.manifest_digest();
     let challenge_digest =
@@ -171,7 +172,7 @@ fn statement(
             algorithm_version: FORGEMATRIX_V4_ALGORITHM_VERSION,
             proof_version: FORGEMATRIX_V4_DIRECT_PROOF_VERSION,
             nonce: frozen.nonce,
-            proof_system_digest: forgematrix_v4_direct_proof_system_digest(),
+            proof_system_digest: cmfd_consensus::forgematrix_v4::forgematrix_v4_direct_proof_system_digest_for_network(network).ok_or_else(|| anyhow::anyhow!("unsupported compact network"))?,
             model_manifest_digest: manifest,
             challenge_digest,
             final_activation_digest,
@@ -580,12 +581,12 @@ fn relations(
             ])
         })
         .collect::<Result<Vec<_>>>()?;
-    let lab_reduction = cmfd_direct_batched_opening_lab::ReductionProof {
+    let lab_reduction = cmfd_consensus::forgematrix_v4_direct::reduction::ReductionProof {
         batch_witness: bridge(witness)?,
         rounds,
         evaluations_at_shared_point: bridge(shared.clone())?,
     };
-    let obligation = cmfd_direct_batched_opening_lab::verify_reduction(&lab, &lab_reduction)?;
+    let obligation = cmfd_consensus::forgematrix_v4_direct::reduction::verify_reduction(&lab, &lab_reduction)?;
     ensure!(
         obligation.point()
             == bridge::<_, Vec<_>>(shared_point.iter().copied().collect::<Vec<_>>())?.as_slice(),
@@ -643,6 +644,7 @@ fn rlc(prepared: &PreparedProver, command: &Command, scope: &TaskScope) -> Resul
 }
 
 fn finish(
+    network: [u8; 32],
     prepared: &PreparedProver,
     command: &Command,
     data: &[DynamicData],
@@ -657,7 +659,7 @@ fn finish(
     ensure!(bundle_bytes.len() <= 24 << 20, "oversized stage bundle");
     let bundle: Bundle = bincode::deserialize(&bundle_bytes)?;
     let (expected, final_activation) =
-        statement(prepared, command, FORGEMATRIX_V4_DIRECT_TESTNET_NETWORK_ID)?;
+        statement(prepared, command, network)?;
     let carrier = decode_forgematrix_v4_transparent_proof(&bundle.carrier)?;
     ensure!(
         expected.digest() == bundle.statement_digest
@@ -791,7 +793,7 @@ pub fn run_worker(
         "unknown multi-GPU role"
     );
     ensure!(
-        network == FORGEMATRIX_V4_DIRECT_TESTNET_NETWORK_ID,
+        cmfd_consensus::forgematrix_v4::forgematrix_v4_direct_proof_system_digest_for_network(network).is_some(),
         "multi-GPU qualification requires compact testnet"
     );
     ensure!(
@@ -856,7 +858,7 @@ pub fn run_worker(
                 )?;
             }
             ("pcs", "finish") => {
-                let report = finish(prepared, &command, &data, &mut input, scope)?;
+                let report = finish(network, prepared, &command, &data, &mut input, scope)?;
                 send(
                     serde_json::json!({"event":"done","report":report,"seconds":began.elapsed().as_secs_f64()}),
                 )?;

@@ -1,6 +1,6 @@
 [package]
 name = "cmfd-node"
-version = "1.0.20"
+version = "1.0.21-compact.1"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -23,7 +23,9 @@ production-v4-testnet = ["production-v4"]
 direct-proof-testnet = ["production-v4", "cmfd-consensus/direct-proof-testnet"]
 direct-proof-testnet-audit = ["direct-proof-testnet", "cmfd-consensus/direct-proof-testnet-audit"]
 production-rc = ["production-v4"]
-production-mainnet = ["production-v4"]
+production-mainnet = ["production-v4", "compact-mainnet"]
+# Internal rule switch selected by every production-mainnet build of this release.
+compact-mainnet = ["cmfd-consensus/compact-mainnet"]
 # Test work rules (Node::install_work_rule_for_test); never in a release build.
 work-rule-test-support = ["cmfd-consensus/work-rule-test-support"]
 
@@ -89,3 +91,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "cmfd-node"
 path = "src/main.rs"
+
+[[example]]
+name = "mainnet_fork_pool_fixture"
+required-features = ["production-mainnet"]

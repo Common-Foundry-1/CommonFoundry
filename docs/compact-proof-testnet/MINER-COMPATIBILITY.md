@@ -1,10 +1,15 @@
 # Miner preparation for the compact-proof mainnet fork
 
-Miner version: **1.0.21**, pre-activation pool-client compatibility.
+Miner version: **1.0.22**, pre-activation pool-client compatibility.
+
+Activation was moved from 65,535 to 67,535 on 2026-11-11. This changes the
+consensus fingerprint. Reference pool miner 1.0.21 recognizes the superseded
+proposal and must be replaced before connecting to the updated fork pool.
+The compact mainnet proof-system digest and mining calculation are unchanged.
 
 ## What developers need to change
 
-The planned mainnet fork at height 65,535 retains the mainnet network ID,
+The planned mainnet fork at height 67,535 retains the mainnet network ID,
 ForgeMatrix search calculation, model bank and GPU search kernels. Pool miners
 still submit the server-issued job ID and nonce. The pool constructs the block
 proof. A pool miner does not need the compact prover on every mining rig.
@@ -19,8 +24,8 @@ fingerprint. Generic library clients remain strict unless they opt in using
 | --- | --- |
 | Mainnet network ID | `88296bc39c10e8bc1dd4818d4d42412fe5f08210651110377f495da299812f62` |
 | Existing mainnet fingerprint | `e9d81f15c580031302656609eb24fa8351efe0a34135ad894c793f3dd9044079` |
-| Compact-mainnet fingerprint | `5b9626178bb3777230ceda1cfc0fee5a8872ad0bb0ac1c5d0c7457cf67f083a5` |
-| Planned activation height | `65535` |
+| Compact-mainnet fingerprint | `9009948f6eab38b5b3dcee13eda9f6ef03e0db863c435cb97c1d4c3e124eb360` |
+| Planned activation height | `67535` |
 | Compact-mainnet proof-system digest | `d1671fc4760134bf86f0b37d8694f4827037e5cea2642e312cb2eb705f3aef0d` |
 | Pool protocol version | `2` |
 
@@ -75,14 +80,14 @@ Extract kits into a new directory and use the included launcher. The Windows
 WSL2 edition includes `START-HERE.txt` with its one-line terminal command. Reuse
 the existing verified input bank to avoid downloading it again. Preserve the
 pool URL, certificate pin, payout address, worker name and GPU settings. For
-HiveOS, use the complete `commonfoundry-mainnet-hiveos-1.0.21.tar.gz` installation
+HiveOS, use the complete `commonfoundry-mainnet-hiveos-1.0.22.tar.gz` installation
 URL in the custom-miner flight sheet. Keep the original installation for
 rollback. These packages do not change an installed fleet automatically.
 
 ## What remains before a production release
 
 This miner does not activate the hard fork and does not generate compact
-mainnet block proofs in solo mode. The node/pool fork must still implement
+mainnet block proofs in solo mode. The accompanying node/pool fork source implements
 height-aware proof selection, historical storage and peer transitions,
 compact-mainnet proving and stale-job retirement. Qualify the miner against
 that full pool across H-1, H and H+1, including reconnects and fresh accepted
@@ -92,7 +97,7 @@ updates. See [the mainnet implementation plan](MAINNET-IMPLEMENTATION-PLAN.md).
 
 ## Draft message for third-party miner developers
 
-We are preparing Common Foundry's compact-proof fork at height 65,535.
+We are preparing Common Foundry's compact-proof fork at height 67,535.
 ForgeMatrix's search calculation and model stay the same, so existing GPU
 search kernels should carry over. Pools will construct the new block proof.
 Please add support for the exact current and compact-mainnet fingerprints

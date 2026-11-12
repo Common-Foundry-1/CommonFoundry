@@ -17,7 +17,7 @@ import release_integrity as integrity
 
 ROOT = Path(__file__).resolve().parents[1]
 GUIDE = ROOT / "docs/compact-proof-testnet/MINER-COMPATIBILITY.md"
-MANIFEST = ROOT / "docs/compact-proof-testnet/MAINNET-FORK-IDENTITY-65535.json"
+MANIFEST = ROOT / "docs/compact-proof-testnet/MAINNET-FORK-IDENTITY-67535.json"
 
 
 def output(command: list[str], *, cwd: Path | None = None) -> bytes:

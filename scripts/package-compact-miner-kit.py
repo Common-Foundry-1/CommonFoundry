@@ -171,7 +171,7 @@ def main() -> None:
         files["h-manifest.conf"] = (ROOT / "packaging/mainnet/hiveos/h-manifest.conf").read_bytes().replace(b"\r\n", b"\n")
     files["BASELINE-PACKAGE.json"] = baseline_receipt
     files["MINER-COMPATIBILITY.md"] = candidate.GUIDE.read_bytes()
-    files["MAINNET-FORK-IDENTITY-65535.json"] = candidate.MANIFEST.read_bytes()
+    files["MAINNET-FORK-IDENTITY-67535.json"] = candidate.MANIFEST.read_bytes()
     if wsl:
         # WSL exposes NVIDIA's utility here without consistently adding it to
         # the non-interactive PATH inherited by `wsl --exec bash`.

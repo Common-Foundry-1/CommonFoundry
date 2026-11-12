@@ -1,0 +1,11 @@
+if(NOT DEFINED ENV{CUDACXX})
+  message(FATAL_ERROR "Set CUDACXX to the pinned CUDA compiler")
+endif()
+set(CMAKE_CUDA_COMPILER "$ENV{CUDACXX}" CACHE FILEPATH "Pinned CUDA compiler" FORCE)
+get_filename_component(CMFD_CUDA_BIN "$ENV{CUDACXX}" DIRECTORY)
+get_filename_component(CMFD_CUDA_ROOT "${CMFD_CUDA_BIN}" DIRECTORY)
+set(CUDAToolkit_ROOT "${CMFD_CUDA_ROOT}" CACHE PATH "Pinned CUDA toolkit" FORCE)
+set(CUDAToolkit_NVCC_EXECUTABLE "$ENV{CUDACXX}" CACHE FILEPATH "Pinned nvcc" FORCE)
+set(CUDAToolkit_BIN_DIR "${CMFD_CUDA_BIN}" CACHE PATH "CUDA bin" FORCE)
+set(CMAKE_PROJECT_INCLUDE "${CMAKE_CURRENT_LIST_DIR}/cuda-nvtx-compat.cmake"
+    CACHE FILEPATH "Legacy NVTX target compatibility" FORCE)

@@ -125,6 +125,19 @@ pub fn max_proof_bytes_for_network(network_id: [u8; 32]) -> usize {
     }
 }
 
+/// Historical mainnet blocks retain their original frame cap. The smaller
+/// cap is applied only once the block header supplies the activation height.
+pub fn max_proof_bytes_at_height(network_id: [u8; 32], height: u64) -> usize {
+    #[cfg(feature = "compact-mainnet")]
+    if crate::mainnet_network::is_mainnet_network(network_id)
+        && height >= crate::compact_mainnet_fork::COMPACT_MAINNET_ACTIVATION_HEIGHT
+    {
+        return 6_100_000;
+    }
+    let _ = height;
+    max_proof_bytes_for_network(network_id)
+}
+
 pub fn max_block_bytes_for_network(network_id: [u8; 32]) -> usize {
     if is_production_v4_network(network_id) {
         PRODUCTION_V4_MAX_BLOCK_BYTES
@@ -226,7 +239,7 @@ pub fn encode_block(block: &Block) -> Result<Vec<u8>, WireError> {
     validate_block_shape(block)?;
     let network_id = block.challenge.network_id;
     let max_block_bytes = max_block_bytes_for_network(network_id);
-    let max_proof_bytes = max_proof_bytes_for_network(network_id);
+    let max_proof_bytes = max_proof_bytes_at_height(network_id, block.challenge.height);
     let mut writer = Writer::new(payload_limit(max_block_bytes), "block");
     writer.u32(block.version)?;
     encode_challenge(&block.challenge, &mut writer)?;
@@ -251,7 +264,6 @@ pub fn encode_block(block: &Block) -> Result<Vec<u8>, WireError> {
 
 pub fn decode_block(bytes: &[u8], expected_network_id: [u8; 32]) -> Result<Block, WireError> {
     let max_block_bytes = max_block_bytes_for_network(expected_network_id);
-    let max_proof_bytes = max_proof_bytes_for_network(expected_network_id);
     let payload = decode_frame(
         bytes,
         expected_network_id,
@@ -263,6 +275,7 @@ pub fn decode_block(bytes: &[u8], expected_network_id: [u8; 32]) -> Result<Block
     let version = reader.u32()?;
     let challenge = decode_challenge(&mut reader, expected_network_id)?;
 
+    let max_proof_bytes = max_proof_bytes_at_height(expected_network_id, challenge.height);
     let proof_payload = reader.sized_bytes(max_proof_bytes, "ForgeMatrix proof")?;
     let proof = decode_forgematrix_proof_payload(proof_payload, challenge.network_id)?;
     let coinbase = decode_coinbase(&mut reader)?;

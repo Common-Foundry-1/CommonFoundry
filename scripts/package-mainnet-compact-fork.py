@@ -19,7 +19,7 @@ candidate = kit.candidate
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    for name in ('baseline','baseline-checksums','baseline-signature','node','compact-worker','dashboard','output','model-bank','fixed-record'):
+    for name in ('baseline','baseline-checksums','baseline-signature','node','compact-worker','dashboard','output','model-bank','fixed-record','launch-beacon'):
         p.add_argument('--'+name, type=Path, required=True)
     p.add_argument('--expected-commit', required=True)
     p.add_argument('--platform', choices=['linux-x86_64','windows-wsl2-x86_64'], required=True)
@@ -38,6 +38,9 @@ def main():
         'production-v4/real_bank0_relations','lib/libcudart.so.12','LICENSE','THIRD_PARTY_NOTICES.md'}
     files = {name:baseline[name] for name in selected}
     files['production-v4/FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json'] = baseline['FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json']
+    if args.launch_beacon.stat().st_size > 16*1024:
+        raise ValueError('launch beacon exceeds its document cap')
+    files['production-mainnet/LAUNCH-BEACON.json'] = args.launch_beacon.read_bytes()
     files['BASELINE-PACKAGE.json'] = baseline['MAINNET-PACKAGE.json']
     files['cmfd-node'] = args.node.read_bytes()
     files['production-v4/cmfd-direct-multigpu-worker'] = args.compact_worker.read_bytes()

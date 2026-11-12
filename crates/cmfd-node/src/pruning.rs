@@ -384,7 +384,17 @@ pub fn decode_pruned_body(body: &[u8], network_id: [u8; 32]) -> Result<StoredBlo
 /// handful for any window. A prune also waits until it can advance the anchor
 /// this far, so each rewrite of the kept blocks covers a quarter window.
 pub fn candidate_interval(keep: u64) -> u64 {
+    #[cfg(test)]
+    if let Some(interval) = REHEARSAL_INTERVAL.with(|v| v.get()) {
+        return interval;
+    }
     (keep / 4 / MIN_CANDIDATE_INTERVAL * MIN_CANDIDATE_INTERVAL).max(MIN_CANDIDATE_INTERVAL)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Reduced retention cadence only for an explicitly isolated test process.
+    pub(crate) static REHEARSAL_INTERVAL: std::cell::Cell<Option<u64>> = const {std::cell::Cell::new(None)};
 }
 
 /// Chain state at one active block, saved for use as a prune anchor.

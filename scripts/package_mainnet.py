@@ -43,6 +43,15 @@ BEACON_POLICY = {
 MAX_INFO = 128 * 1024
 FIXED = "FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json"
 SHARED = "packaging/production-v4-pool/shared"
+FORK_IDENTITY = "docs/compact-proof-testnet/MAINNET-FORK-IDENTITY-67535.json"
+FORK_CODE = {
+    "cmfd-mainnet-fork-prover": "packaging/compact-proof-mainnet/cmfd-mainnet-fork-prover",
+    "fork-prover.py": "packaging/compact-proof-mainnet/fork-prover.py",
+    "cmfd-direct-multigpu-prover": "tools/compact-multigpu/cmfd-direct-multigpu-prover",
+    "coordinator.py": "tools/compact-multigpu/coordinator.py",
+    "shared_model.py": "tools/compact-multigpu/shared_model.py",
+    "LICENSE-SP1-MIT": "tools/compact-multigpu/LICENSE-SP1-MIT",
+}
 PLATFORMS = ("windows-x86_64", "linux-x86_64")
 PACKAGE_ROLES = tuple((platform, kind) for platform in PLATFORMS for kind in ("runtime", "miner")) + (("linux-x86_64", "hiveos"),)
 HIVEOS_NAME = "commonfoundry-mainnet-hiveos"
@@ -370,7 +379,7 @@ def package_names(platform: str, kind: str, version: str) -> tuple[str, str]:
     return root, root + (".zip" if platform == "windows-x86_64" else ".tar.gz")
 
 
-def package_sources(platform: str, kind: str) -> dict[str, str]:
+def package_sources(platform: str, kind: str, version: str | None = None) -> dict[str, str]:
     if (platform, kind) not in PACKAGE_ROLES:
         raise Error("unsupported mainnet package platform/role")
     sources = {"README.md": "packaging/mainnet/USER-GUIDE.md", "LICENSE": "LICENSE",
@@ -402,6 +411,11 @@ def package_sources(platform: str, kind: str) -> dict[str, str]:
     sources.update({name: f"packaging/mainnet/{directory}/{name}" for name in launchers})
     name = "PREPARE-V4-INPUTS.ps1" if windows else "PREPARE-V4-INPUTS.sh"
     sources[name] = f"packaging/production-v4-testnet/{directory}/{name}"
+    if version is not None and tuple(map(int,version.split("-")[0].split("."))) >= (1,0,23):
+        prefix="production-v4/" if kind=="runtime" else ""
+        sources.update({prefix+name:path for name,path in FORK_CODE.items()})
+        sources["MAINNET-FORK-IDENTITY-67535.json"]=FORK_IDENTITY
+        sources["FORK-RUNTIME-SETUP.md"]="packaging/mainnet/FORK-RUNTIME-SETUP.md"
     return sources
 
 
@@ -496,7 +510,38 @@ def copy_executable(source: Path, target: Path, platform: str) -> None:
         header = handle.read(integrity.MAX_EXECUTABLE_HEADER_BYTES)
     validator = integrity._validate_pe_x86_64 if platform == "windows-x86_64" else integrity._validate_elf_x86_64
     validator(header, size, source.name)
+    if platform == "windows-x86_64":
+        # Verify the exact bytes staged for the archive, after the copy.
+        require_authenticode(target)
     target.chmod(0o755)
+
+
+def require_authenticode(source: Path) -> None:
+    """Reject a Windows release binary that App Control cannot trust by signature."""
+    if os.name != "nt":
+        raise Error("Windows code signing must be checked on a native Windows host")
+    # Pass the path in the environment so a filename cannot become PowerShell
+    # syntax. An inline command works under normal script execution policy.
+    check = (
+        "$ErrorActionPreference='Stop'; "
+        "$sig=Get-AuthenticodeSignature -LiteralPath $env:CMFD_AUTHENTICODE_PATH; "
+        "if ($sig.Status -ne 'Valid' -or $null -eq $sig.SignerCertificate -or $null -eq $sig.TimeStamperCertificate) "
+        "{ Write-Error ('Authenticode status: ' + $sig.Status); exit 1 }; "
+        "$usage=$sig.SignerCertificate.EnhancedKeyUsageList | "
+        "Where-Object { $_.Value -eq '1.3.6.1.5.5.7.3.3' }; "
+        "if (-not $usage) { Write-Error 'Signer lacks the Code Signing EKU'; exit 1 }"
+    )
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", check],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30, check=False,
+        # Use the Windows inbox Security module. A bundled PowerShell module
+        # earlier in PSModulePath can shadow it and fail to load.
+        env=dict(os.environ, CMFD_AUTHENTICODE_PATH=str(source),
+                 PSModulePath=str(Path(os.environ["WINDIR"]) / "System32" / "WindowsPowerShell" / "v1.0" / "Modules")),
+    )
+    if result.returncode:
+        detail = result.stdout.decode(errors="replace").strip()[-1000:]
+        raise Error(f"{source.name} has no valid Authenticode code signature: {detail}")
 
 
 def validate_proof_worker_network(data: bytes, plan: dict) -> dict:
@@ -517,6 +562,17 @@ def validate_proof_worker_network(data: bytes, plan: dict) -> dict:
     return info
 
 
+def validate_compact_worker_network(data: bytes, fork: dict) -> dict:
+    info = strict_json(data, "compact proof worker identity")
+    if (info.get("mainnet_supported") is not True
+            or info.get("mainnet_network_id") != fork["network_id"]
+            or info.get("mainnet_activation_height") != fork["activation_height"]
+            or info.get("mainnet_proof_system_digest") != fork["at_and_after_activation"]["proof_system_digest"]):
+        raise Error("compact proof worker does not match the pinned mainnet fork")
+    nonzero_hex(info.get("source_commit"), 40, "compact proof worker source")
+    return info
+
+
 def assemble(args: argparse.Namespace) -> Path:
     integrity._require_native_runtime_platform(args.platform)
     commit = nonzero_hex(args.commit, 40, "source commit")
@@ -531,7 +587,15 @@ def assemble(args: argparse.Namespace) -> Path:
     manifest_bytes = read_regular(args.approval_manifest, MAX_INFO, "mainnet approval manifest")
     manifest = validate_plan_approvals(manifest_bytes, plan_bytes)
     validate_review_ancestry(args.repo, manifest["subject"]["review_source_commit"], commit)
-    source_paths = package_sources(args.platform, args.kind)
+    source_paths = package_sources(args.platform, args.kind, args.version)
+    fork_release = tuple(map(int,args.version.split("-")[0].split("."))) >= (1,0,23)
+    if fork_release:
+        if not getattr(args,"compact_worker",None) or not getattr(args,"compact_worker_sha256",None):
+            raise Error("fork packages require the qualified compact worker and expected SHA-256")
+        prefix="production-v4/" if args.kind=="runtime" else ""
+        source_paths.update({prefix+name:path for name,path in FORK_CODE.items()})
+        source_paths["MAINNET-FORK-IDENTITY-67535.json"]=FORK_IDENTITY
+        source_paths["FORK-RUNTIME-SETUP.md"]="packaging/mainnet/FORK-RUNTIME-SETUP.md"
     sources, epoch = source_snapshot(args.repo, commit, source_paths, args.version)
     validate_catalog(sources, plan)
     dashboard_manifest_bytes = read_regular(args.dashboard_manifest, MAX_INFO, "reviewed dashboard asset manifest")
@@ -558,6 +622,7 @@ def assemble(args: argparse.Namespace) -> Path:
             if relative.endswith(".bat"):
                 data = data.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
             target = stage / relative
+            target.parent.mkdir(parents=True,exist_ok=True)
             target.write_bytes(data)
             target.chmod(0o755 if relative.endswith((".sh", ".bat")) else 0o644)
         sidecar = stage / "production-mainnet"
@@ -586,11 +651,31 @@ def assemble(args: argparse.Namespace) -> Path:
         if file_identity(worker_root / "cmfd-v4-replay")["sha256"] != release_replay_worker_sha256(args.repo, commit):
             raise Error(f"the replay worker is not the build pinned in {REPLAY_WORKER_PIN_SOURCE}")
         copy_executable(args.relation_worker, worker_root / "real_bank0_relations", "linux-x86_64")
+        if fork_release:
+            copy_executable(args.compact_worker,worker_root/"cmfd-direct-multigpu-worker","linux-x86_64")
+            if file_identity(worker_root/"cmfd-direct-multigpu-worker")["sha256"] != nonzero_hex(args.compact_worker_sha256,64,"qualified compact worker SHA-256"):
+                raise Error("compact worker differs from the expected qualified artifact")
+            fork=strict_json(sources["MAINNET-FORK-IDENTITY-67535.json"],"frozen mainnet fork")
+            if fork["activation_height"]!=67535 or fork["network_id"]!=plan["network_id"]:
+                raise Error("fork identity does not match mainnet")
+            # The retained CUDA worker may have a different source commit from
+            # a node-only correction. Its actual metadata and SHA stay explicit.
+            if args.platform=="linux-x86_64":
+                worker_info=validate_compact_worker_network(native_output(worker_root/"cmfd-direct-multigpu-worker",["network-info"],environment=dict(os.environ,LD_LIBRARY_PATH=str(stage/"lib"))),fork)
+            else:
+                worker_info={"source_commit":nonzero_hex(getattr(args,"compact_worker_source_commit",None),40,"qualified compact worker source")}
+            component_names=["cmfd-mainnet-fork-prover","fork-prover.py","cmfd-direct-multigpu-prover","coordinator.py","shared_model.py","cmfd-direct-multigpu-worker","real_bank0_relations"]
+            components={("production-v4/" if args.kind=="runtime" else "")+n:file_identity(worker_root/n) for n in component_names}
+            contract={"schema":"CMFD_MAINNET_FORK_RUNTIME_V1","source_commit":commit,"network_id":fork["network_id"],"activation_height":67535,"consensus_fingerprint":fork["consensus_fingerprint"],"compact_proof_system_digest":fork["at_and_after_activation"]["proof_system_digest"],"compact_worker_source_commit":worker_info["source_commit"],"files":components}
+            (stage/"FORK-RUNTIME.json").write_bytes(canonical(contract))
+            for n in ("cmfd-mainnet-fork-prover","cmfd-direct-multigpu-prover"): (worker_root/n).chmod(0o755)
         before = {path.relative_to(stage).as_posix(): file_identity(path) for path in stage.rglob("*") if path.is_file()}
         executable_names = [role + extension for role in binaries] + [
             ("production-v4/" if args.kind == "runtime" else "") + worker
             for worker in ("cmfd-v4-replay", "real_bank0_relations")
         ]
+        if fork_release:
+            executable_names += [("production-v4/" if args.kind=="runtime" else "")+n for n in ("cmfd-direct-multigpu-worker","cmfd-mainnet-fork-prover","cmfd-direct-multigpu-prover")]
         if len({before[name]["sha256"] for name in executable_names}) != len(executable_names):
             raise Error("different executable roles must not reuse the same binary")
         directories = {path.relative_to(stage).as_posix() for path in stage.rglob("*") if path.is_dir()}
@@ -661,6 +746,9 @@ def main() -> None:
     parser.add_argument("--cuda-sha256", required=True)
     for name in ("node", "wallet", "miner"):
         parser.add_argument("--" + name, type=Path)
+    parser.add_argument("--compact-worker",type=Path)
+    parser.add_argument("--compact-worker-sha256")
+    parser.add_argument("--compact-worker-source-commit")
     args = parser.parse_args()
     for name, value in vars(args).items():
         if isinstance(value, Path):

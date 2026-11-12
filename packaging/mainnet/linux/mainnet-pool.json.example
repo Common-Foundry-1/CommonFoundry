@@ -24,5 +24,7 @@
   "payout_fee_atoms": "SET_APPROVED_MAINNET_VALUE",
   "operator_fee_bps": "SET_APPROVED_MAINNET_VALUE",
   "pplns_window_shares": "SET_APPROVED_MAINNET_VALUE_0_TO_65536",
-  "automatic_payouts": true
+  "automatic_payouts": true,
+  "expected_fork_manifest_sha256": "SET_FROM_SIGNED_FORK_RUNTIME_MANIFEST",
+  "serial_gpu": true
 }

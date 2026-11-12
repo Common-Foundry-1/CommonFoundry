@@ -37,6 +37,9 @@ def expected_layout(platform: str, kind: str, sources: dict[str, bytes], plan: b
     executable_platforms = {role + extension: platform for role in roles}
     worker_root = "production-v4/" if kind == "runtime" else ""
     executable_platforms.update({worker_root + name: "linux-x86_64" for name in ("cmfd-v4-replay", "real_bank0_relations")})
+    if "MAINNET-FORK-IDENTITY-67535.json" in sources:
+        executable_platforms[worker_root+"cmfd-direct-multigpu-worker"]="linux-x86_64"
+        expected["FORK-RUNTIME.json"]=None
     for name in executable_platforms:
         expected[name] = None
     expected[RECEIPT] = None
@@ -54,7 +57,7 @@ def expected_layout(platform: str, kind: str, sources: dict[str, bytes], plan: b
 
 
 def member_mode(name: str, directory: bool, executables: dict[str, str]) -> int:
-    return 0o755 if directory or name in executables or name.endswith((".bat", ".sh")) else 0o644
+    return 0o755 if directory or name in executables or name.endswith((".bat", ".sh")) or PurePosixPath(name).name in ("cmfd-mainnet-fork-prover","cmfd-direct-multigpu-prover") else 0o644
 
 
 def member_limit(name: str, expected: dict, executables: dict, assets: dict) -> int:
@@ -64,7 +67,7 @@ def member_limit(name: str, expected: dict, executables: dict, assets: dict) -> 
         return package.MAX_CUDA_BYTES
     if name in assets:
         return assets[name]["bytes"]
-    if name in (RECEIPT, APPROVALS):
+    if name in (RECEIPT, APPROVALS,"FORK-RUNTIME.json"):
         return package.MAX_INFO
     return len(expected[name])
 
@@ -89,7 +92,7 @@ def read_member(stream, name: str, size: int, expected: dict, executables: dict,
         package.validate_cuda_runtime_header(data, size)
     elif name in assets and {"bytes": size, "sha256": sha256} != assets[name]:
         raise Error(f"packaged dashboard asset differs from reviewed manifest: {name}")
-    return {"bytes": size, "sha256": sha256, "captured": data if name in (RECEIPT, APPROVALS) else None}
+    return {"bytes": size, "sha256": sha256, "captured": data if name in (RECEIPT, APPROVALS,"FORK-RUNTIME.json") else None}
 
 
 def inspect_archive(path: Path, platform: str, root: str, expected: dict, directories: set,
@@ -187,6 +190,9 @@ def validate_receipt(rows: dict, platform: str, kind: str, plan: dict, commit: s
     extension = ".exe" if platform == "windows-x86_64" else ""
     prefix = "production-v4/" if kind == "runtime" else ""
     binary_names = [role + extension for role in roles] + [prefix + worker for worker in ("cmfd-v4-replay", "real_bank0_relations")]
+    if "FORK-RUNTIME.json" in rows:
+        binary_names += [prefix + name for name in
+                         ("cmfd-direct-multigpu-worker", "cmfd-mainnet-fork-prover", "cmfd-direct-multigpu-prover")]
     if len({files[name]["sha256"] for name in binary_names}) != len(binary_names):
         raise Error("package reuses one binary in distinct executable roles")
     package.validate_schedule(native["cmfd-launch"], plan)
@@ -199,11 +205,37 @@ def validate_receipt(rows: dict, platform: str, kind: str, plan: dict, commit: s
     return receipt, common
 
 
+def validate_fork_runtime(rows: dict, sources: dict, kind: str, commit: str) -> dict | None:
+    if "MAINNET-FORK-IDENTITY-67535.json" not in sources:
+        return None
+    data = rows["FORK-RUNTIME.json"]["captured"]
+    contract = package.strict_json(data, "fork runtime contract")
+    fork = package.strict_json(sources["MAINNET-FORK-IDENTITY-67535.json"], "frozen fork identity")
+    required = {"schema": "CMFD_MAINNET_FORK_RUNTIME_V1", "source_commit": commit,
+                "network_id": fork["network_id"], "activation_height": 67535,
+                "consensus_fingerprint": fork["consensus_fingerprint"],
+                "compact_proof_system_digest": fork["at_and_after_activation"]["proof_system_digest"]}
+    if (package.canonical(contract) != data
+            or set(contract) != set(required) | {"compact_worker_source_commit", "files"}
+            or any(contract.get(key) != value for key, value in required.items())
+            or type(contract["activation_height"]) is not int):
+        raise Error("fork runtime contract differs from frozen fork identity")
+    package.nonzero_hex(contract["compact_worker_source_commit"], 40, "compact worker source")
+    prefix = "production-v4/" if kind == "runtime" else ""
+    names = [prefix + name for name in ("cmfd-mainnet-fork-prover", "fork-prover.py",
+             "cmfd-direct-multigpu-prover", "coordinator.py", "shared_model.py",
+             "cmfd-direct-multigpu-worker", "real_bank0_relations")]
+    expected = {name: {"bytes": rows[name]["bytes"], "sha256": rows[name]["sha256"]} for name in names}
+    if contract["files"] != expected:
+        raise Error("fork runtime component identities differ from archive bytes")
+    return contract
+
+
 def inspect_package(path: Path, repo: Path, platform: str, kind: str, plan_bytes: bytes,
                     commit: str, version: str, dashboard_manifest_bytes: bytes,
                     dashboard_manifest: dict, cuda_sha256: str):
     plan = package.validate_plan(plan_bytes)
-    sources, epoch = package.source_snapshot(repo, commit, package.package_sources(platform, kind), version)
+    sources, epoch = package.source_snapshot(repo, commit, package.package_sources(platform, kind, version), version)
     package.validate_catalog(sources, plan)
     expected, directories, executables, assets = expected_layout(
         platform, kind, sources, plan_bytes, dashboard_manifest_bytes, dashboard_manifest)
@@ -213,11 +245,12 @@ def inspect_package(path: Path, repo: Path, platform: str, kind: str, plan_bytes
     rows, identity = inspect_archive(path, platform, root, expected, directories,
                                      executables, assets, cuda_sha256, epoch)
     receipt, info = validate_receipt(rows, platform, kind, plan, commit, version, epoch)
+    fork_runtime = validate_fork_runtime(rows, sources, kind, commit)
     manifest_data = rows[APPROVALS]["captured"]
     manifest = package.validate_plan_approvals(manifest_data, plan_bytes)
     package.validate_review_ancestry(repo, manifest["subject"]["review_source_commit"], commit)
     package.bind_plan_approvals(manifest, manifest_data, info)
-    return {"name": path.name, **identity, "receipt": receipt, "info": info}
+    return {"name": path.name, **identity, "receipt": receipt, "info": info, "fork_runtime": fork_runtime}
 
 
 def verify_set(repo: Path, commit: str, version: str, plan_path: Path, archives: dict,
@@ -246,7 +279,12 @@ def verify_set(repo: Path, commit: str, version: str, plan_path: Path, archives:
         if inspected["info"] != common_info or receipt["native_identities"]["cmfd-launch"] != schedule:
             raise Error("mainnet packages disagree on plan, activation evidence or launch policy")
         prefix = "production-v4/" if kind == "runtime" else ""
-        current_workers = {name: receipt["files"][prefix + name] for name in ("cmfd-v4-replay", "real_bank0_relations")}
+        worker_names = ["cmfd-v4-replay", "real_bank0_relations"]
+        if inspected["fork_runtime"] is not None:
+            worker_names.append("cmfd-direct-multigpu-worker")
+            if inspected["fork_runtime"]["compact_worker_source_commit"] != first["fork_runtime"]["compact_worker_source_commit"]:
+                raise Error("mainnet packages disagree on retained compact worker provenance")
+        current_workers = {name: receipt["files"][prefix + name] for name in worker_names}
         if workers is not None and workers != current_workers:
             raise Error("mainnet packages contain different Linux/WSL mining workers")
         workers = current_workers
@@ -264,7 +302,7 @@ def verify_set(repo: Path, commit: str, version: str, plan_path: Path, archives:
         if packages["linux-x86_64", "miner"]["receipt"]["files"][executable] != packages["linux-x86_64", "hiveos"]["receipt"]["files"][executable]:
             raise Error("HiveOS and standalone Linux packages must contain the same native binaries")
     # All source snapshots and package observations refer to the same frozen tree.
-    package.source_snapshot(repo, commit, package.package_sources("linux-x86_64", "runtime"), version)
+    package.source_snapshot(repo, commit, package.package_sources("linux-x86_64", "runtime", version), version)
     for key, inspected in packages.items():
         if package.file_identity(archives[key]) != {field: inspected[field] for field in ("bytes", "sha256")}:
             raise Error("mainnet archive set changed during reconciliation")

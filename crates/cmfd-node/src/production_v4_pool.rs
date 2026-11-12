@@ -18,11 +18,11 @@ use std::time::{Duration, Instant};
 use cmfd_consensus::forgematrix_v4_proof::forgematrix_v4_final_activation_digest;
 use cmfd_consensus::forgematrix_v4_proof_codec::decode_forgematrix_v4_transparent_proof;
 use cmfd_consensus::{
-    BlockProof, FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES, ForgeMatrixV4CandidateParameters,
-    ForgeMatrixV4CandidateProof, PRODUCTION_V2_LAYERS, PRODUCTION_V4_MAX_PROOF_BYTES,
-    PRODUCTION_V4_MODEL_MANIFEST_DIGEST, forgematrix_v4_challenge_digest,
-    forgematrix_v4_final_activation_digest_from_le_bytes, forgematrix_v4_replay_coefficients,
-    forgematrix_v4_work_digest,
+    forgematrix_v4_challenge_digest, forgematrix_v4_final_activation_digest_from_le_bytes,
+    forgematrix_v4_replay_coefficients, forgematrix_v4_work_digest, BlockProof,
+    ForgeMatrixV4CandidateParameters, ForgeMatrixV4CandidateProof,
+    FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES, PRODUCTION_V2_LAYERS,
+    PRODUCTION_V4_MAX_PROOF_BYTES, PRODUCTION_V4_MODEL_MANIFEST_DIGEST,
 };
 use serde::Serialize;
 
@@ -182,6 +182,8 @@ pub fn production_v4_pool_searcher_config(
                     &PathBuf::from(system_root).join("System32").join("wsl.exe"),
                     "WSL launcher",
                 )?;
+                let library =
+                    wsl_path(&wsl, distribution, &packaged_worker_library(&replay_worker))?;
                 let replay_worker = wsl_path(&wsl, distribution, &replay_worker)?;
                 let model_bank = wsl_path(&wsl, distribution, &model_bank)?;
                 let worker_scratch_directory = wsl_path(&wsl, distribution, &scratch_directory)?;
@@ -194,7 +196,10 @@ pub fn production_v4_pool_searcher_config(
                     "CUDA_HOME=/usr/local/cuda-12.8".into(),
                     "CUDA_PATH=/usr/local/cuda-12.8".into(),
                     "CUDAToolkit_ROOT=/usr/local/cuda-12.8".into(),
-                    "LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64".into(),
+                    format!(
+                        "LD_LIBRARY_PATH={library}:/usr/lib/wsl/lib:/usr/local/cuda-12.8/lib64"
+                    )
+                    .into(),
                     replay_worker.into(),
                     "--server".into(),
                     model_bank.into(),
@@ -213,11 +218,15 @@ pub fn production_v4_pool_searcher_config(
         }
         None => Ok(ProductionV4PoolSearcherConfig {
             replay: ProductionV4PoolWorkerCommand {
-                program: replay_worker,
+                program: replay_worker.clone(),
                 arguments: vec!["--server".into(), model_bank.into_os_string()],
                 environment: cuda_visible_device
                     .map(|_| ("CUDA_VISIBLE_DEVICES".into(), selected_device.into()))
                     .into_iter()
+                    .chain([(
+                        "LD_LIBRARY_PATH".into(),
+                        native_worker_library_path(&replay_worker),
+                    )])
                     .collect(),
             },
             worker_scratch_directory: scratch_directory
@@ -275,6 +284,10 @@ pub fn production_v4_solo_config(
     let bank = canonical_worker_file(model_bank, "ProductionV4 model bank")?;
     let proof = match wsl_distribution {
         None => ProductionV4PoolWorkerCommand {
+            environment: vec![(
+                "LD_LIBRARY_PATH".into(),
+                native_worker_library_path(&proof_worker),
+            )],
             program: proof_worker,
             arguments: vec![
                 "--server".into(),
@@ -282,7 +295,6 @@ pub fn production_v4_solo_config(
                 bank.into_os_string(),
                 fixed_directory.into_os_string(),
             ],
-            environment: vec![],
         },
         Some(distribution) => {
             #[cfg(not(windows))]
@@ -293,6 +305,7 @@ pub fn production_v4_solo_config(
             #[cfg(windows)]
             {
                 let wsl = &search.replay.program;
+                let library = wsl_path(wsl, distribution, &packaged_worker_library(&proof_worker))?;
                 ProductionV4PoolWorkerCommand {
                     program: wsl.clone(),
                     arguments: vec![
@@ -305,7 +318,10 @@ pub fn production_v4_solo_config(
                             production_v4_worker_cuda_visible_device(None)?
                         )
                         .into(),
-                        "LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64".into(),
+                        format!(
+                            "LD_LIBRARY_PATH={library}:/usr/lib/wsl/lib:/usr/local/cuda-12.8/lib64"
+                        )
+                        .into(),
                         wsl_path(wsl, distribution, &proof_worker)?.into(),
                         "--server".into(),
                         hex::encode(COMPILED_NETWORK_PROFILE.network_id).into(),
@@ -337,9 +353,54 @@ pub struct ProductionV4PersistentPoolSearcher {
     state: Mutex<SearchWorkerState>,
 }
 
+fn packaged_worker_library(program: &Path) -> PathBuf {
+    let parent = program.parent().unwrap_or_else(|| Path::new("."));
+    if parent.file_name().is_some_and(|n| n == "production-v4") {
+        parent.parent().unwrap_or(parent).join("lib")
+    } else {
+        parent.join("lib")
+    }
+}
+fn native_worker_library_path(program: &Path) -> OsString {
+    let mut path = packaged_worker_library(program).into_os_string();
+    if let Some(existing) = std::env::var_os("LD_LIBRARY_PATH") {
+        if !existing.is_empty() {
+            path.push(":");
+            path.push(existing);
+        }
+    }
+    path
+}
+
 #[derive(Debug)]
 struct WorkerState {
     proof: PersistentWorker,
+}
+
+/// Serial mainnet proving must release the prover's CUDA allocator before
+/// replay can acquire the same card again. Buffer drops within a persistent
+/// CUDA process can retain device allocations in its allocator cache.
+struct MainnetSerialProofLease<'a> {
+    state: MutexGuard<'a, WorkerState>,
+    release: bool,
+}
+impl std::ops::Deref for MainnetSerialProofLease<'_> {
+    type Target = WorkerState;
+    fn deref(&self) -> &WorkerState {
+        &self.state
+    }
+}
+impl std::ops::DerefMut for MainnetSerialProofLease<'_> {
+    fn deref_mut(&mut self) -> &mut WorkerState {
+        &mut self.state
+    }
+}
+impl Drop for MainnetSerialProofLease<'_> {
+    fn drop(&mut self) {
+        if self.release {
+            self.state.proof.release_for_serial_replay();
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -498,6 +559,13 @@ impl ProductionV4PersistentPoolVerifier {
             ));
         }
         self.searcher.evict_model()?;
+        if cmfd_consensus::mainnet_network::is_mainnet_network(self.expected_network_id) {
+            self.state
+                .get_mut()
+                .map_err(|_| pool_replay_failure("proof worker lock is poisoned"))?
+                .proof
+                .release_for_serial_replay();
+        }
         self.serial_gpu = true;
         if std::env::var("CMFD_REPLAY_SEALED_EXPORT").as_deref() == Ok("1") {
             for answer in WORK_KNOWN_ANSWERS {
@@ -985,10 +1053,17 @@ impl ProductionV4PersistentPoolVerifier {
         let handoff_started = Instant::now();
         let _serial_replay_lease = self.handoff_replay_for_proof(search_state)?;
         let replay_handoff_seconds = handoff_started.elapsed().as_secs_f64();
-        let mut state = self
+        let state = self
             .state
             .lock()
             .map_err(|_| pool_replay_failure("persistent worker lock is poisoned"))?;
+        // Declared after the replay lease: Drop closes the CUDA proof process
+        // before that lease can unlock and let the replay model reload.
+        let mut state = MainnetSerialProofLease {
+            state,
+            release: self.serial_gpu
+                && cmfd_consensus::mainnet_network::is_mainnet_network(self.expected_network_id),
+        };
         let proof_started = Instant::now();
         // A chain-winning share is rare and valuable: one proof-worker crash
         // (for example a GPU allocation failure) gets one restart and retry.
@@ -1440,6 +1515,26 @@ impl ProductionV4PoolShareVerifier for ProductionV4PersistentPoolVerifier {
 }
 
 impl PersistentWorker {
+    fn release_for_serial_replay(&mut self) {
+        if let Some(mut process) = self.process.take() {
+            let _ = process.stdin.write_all(b"QUIT\n");
+            let _ = process.stdin.flush();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match process.child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    _ => {
+                        let _ = process.child.kill();
+                        let _ = process.child.wait();
+                        break;
+                    }
+                }
+            }
+        }
+    }
     /// Starts the worker now, so a bad command or model fails at startup.
     fn start(
         command: &ProductionV4PoolWorkerCommand,
@@ -2088,6 +2183,30 @@ fn pool_replay_failure(message: impl Into<String>) -> PoolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packaged_workers_resolve_the_adjacent_cuda_runtime() {
+        assert_eq!(
+            packaged_worker_library(Path::new("/opt/cmfd/production-v4/cmfd-v4-replay")),
+            Path::new("/opt/cmfd/lib")
+        );
+        assert_eq!(
+            packaged_worker_library(Path::new("/opt/miner/cmfd-v4-replay")),
+            Path::new("/opt/miner/lib")
+        );
+        let path = native_worker_library_path(Path::new(
+            "/opt/cmfd/production-v4/cmfd-mainnet-fork-prover",
+        ));
+        let expected = match std::env::var_os("LD_LIBRARY_PATH").filter(|value| !value.is_empty()) {
+            Some(existing) => {
+                let mut value = OsString::from("/opt/cmfd/lib:");
+                value.push(existing);
+                value
+            }
+            None => OsString::from("/opt/cmfd/lib"),
+        };
+        assert_eq!(path, expected);
+    }
 
     #[test]
     fn worker_protocol_paths_reject_command_injection() {
@@ -2825,6 +2944,59 @@ done"#;
         check_serial_proof_handoff(false);
     }
 
+    #[cfg(all(unix, feature = "compact-mainnet"))]
+    #[test]
+    fn serial_mainnet_releases_proof_process_before_replay_can_reload_after_error() {
+        let scratch = worker_test_path("mainnet-serial-proof-release");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let memory = scratch.join("proof-device-memory-live");
+        let replay_log = scratch.join("replay.log");
+        let script = format!(
+            "touch '{}'; echo CMFD_V4_PROOF_READY; while read -r line; do if [ \"$line\" = QUIT ]; then rm '{}'; exit 0; fi; echo CMFD_V4_PROOF_DONE; done",
+            memory.display(),
+            memory.display()
+        );
+        let network = cmfd_consensus::compact_mainnet_fork::COMPACT_MAINNET_NETWORK_ID;
+        let mut verifier = ProductionV4PersistentPoolVerifier::start_for_network(
+            network,
+            ProductionV4PoolVerifierConfig {
+                replay: fake_replay_worker(&replay_log),
+                extra_replays: vec![],
+                proof: ProductionV4PoolWorkerCommand {
+                    program: "/bin/sh".into(),
+                    arguments: vec!["-c".into(), script.into()],
+                    environment: vec![],
+                },
+                scratch_directory: scratch.clone(),
+                worker_scratch_directory: scratch.to_str().unwrap().to_owned(),
+                work_check_pin: Some(shell_pin()),
+            },
+        )
+        .unwrap();
+        assert!(memory.exists());
+        verifier.enable_serial_gpu().unwrap();
+        assert!(
+            !memory.exists(),
+            "serial startup must release any preloaded prover allocator"
+        );
+        let mut template = batch_test_template(network);
+        template.challenge.target = [0xff; 32];
+        assert!(
+            verifier.evaluate_single(&template, 91, [0xff; 32]).is_err(),
+            "fake prover deliberately writes no packet"
+        );
+        assert!(
+            !memory.exists(),
+            "the proof process must acknowledge QUIT before replay can reload, including on packet errors"
+        );
+        assert!(matches!(
+            verifier.try_replay_for_work_check(0, [7; 32], Duration::from_secs(10)),
+            GpuReplay::Done(_)
+        ));
+        drop(verifier);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
     #[cfg(unix)]
     #[test]
     fn resident_replay_still_evicts_and_holds_the_gpu_during_proving() {
@@ -2905,13 +3077,11 @@ done"#;
     #[test]
     fn serial_gpu_rejects_multiple_replay_workers() {
         let (mut verifier, scratch, _) = batch_test_verifier_with_workers("serial-multi", 2);
-        assert!(
-            verifier
-                .enable_serial_gpu()
-                .unwrap_err()
-                .to_string()
-                .contains("exactly one")
-        );
+        assert!(verifier
+            .enable_serial_gpu()
+            .unwrap_err()
+            .to_string()
+            .contains("exactly one"));
         drop(verifier);
         let _ = std::fs::remove_dir_all(scratch);
     }
@@ -3006,16 +3176,12 @@ done"#;
                 },
             ],
         );
-        assert!(
-            results
-                .iter()
-                .all(|result| result.as_ref().unwrap().chain_proof.is_none())
-        );
-        assert!(
-            std::fs::read_to_string(&log)
-                .unwrap()
-                .ends_with("RUNBATCH 2\nEVICT\nEVICT\n")
-        );
+        assert!(results
+            .iter()
+            .all(|result| result.as_ref().unwrap().chain_proof.is_none()));
+        assert!(std::fs::read_to_string(&log)
+            .unwrap()
+            .ends_with("RUNBATCH 2\nEVICT\nEVICT\n"));
         drop(verifier);
         let _ = std::fs::remove_dir_all(scratch);
     }
@@ -3036,13 +3202,11 @@ done"#;
         let mut template = batch_test_template(BATCH_TEST_NETWORK_ID);
         template.challenge.target = [0; 32];
         for nonce in [96, 97] {
-            assert!(
-                verifier
-                    .evaluate_single(&template, nonce, [0xff; 32])
-                    .unwrap()
-                    .chain_proof
-                    .is_none()
-            );
+            assert!(verifier
+                .evaluate_single(&template, nonce, [0xff; 32])
+                .unwrap()
+                .chain_proof
+                .is_none());
         }
         let shares = [
             ProductionV4PoolShareRequest {
@@ -3056,13 +3220,11 @@ done"#;
                 share_target: [0xff; 32],
             },
         ];
-        assert!(
-            verifier.evaluate_batch_on(0, &shares).iter().all(|r| r
-                .as_ref()
-                .unwrap()
-                .chain_proof
-                .is_none())
-        );
+        assert!(verifier.evaluate_batch_on(0, &shares).iter().all(|r| r
+            .as_ref()
+            .unwrap()
+            .chain_proof
+            .is_none()));
         assert_eq!(
             std::fs::read_to_string(&log).unwrap(),
             "EVICT\nRUN 1\nRUN 1\nRUNBATCH 2\n"
@@ -3689,10 +3851,10 @@ done"#;
     #[ignore = "needs a CUDA GPU, the model bank and the release replay worker"]
     fn real_gpu_work_checks_agree_with_the_cpu_engine() {
         use crate::honest_work::{
-            CpuWorkEngine, GPU_WORK_CHECK_TIMEOUT, GpuReplayWorkers, GpuWorkEngine,
-            HonestWorkChecker, WorkClaim, WorkEngine, WorkEngineError, WorkEngineHealth,
-            WorkEngineKind, WorkEngineState, WorkKatReport, WorkProvenance, WorkUnavailable,
-            WorkVerdict, honest_work_digest,
+            honest_work_digest, CpuWorkEngine, GpuReplayWorkers, GpuWorkEngine, HonestWorkChecker,
+            WorkClaim, WorkEngine, WorkEngineError, WorkEngineHealth, WorkEngineKind,
+            WorkEngineState, WorkKatReport, WorkProvenance, WorkUnavailable, WorkVerdict,
+            GPU_WORK_CHECK_TIMEOUT,
         };
         use cmfd_consensus::{
             ConsensusPowVerifier, ForgeMatrixV4FileLayerSource, ForgeMatrixV4FixedArtifactRecordV1,

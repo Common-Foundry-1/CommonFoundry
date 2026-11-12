@@ -13,6 +13,24 @@ const PACKAGED: [&str; 4] = [
     "MODEL-V2.bank",
     FIXED_RECORD,
 ];
+#[cfg(feature = "production-mainnet")]
+const FORK_PACKAGED: &[&str] = &[
+    "cmfd-mainnet-fork-prover",
+    "fork-prover.py",
+    "cmfd-direct-multigpu-worker",
+    "cmfd-direct-multigpu-prover",
+    "coordinator.py",
+    "shared_model.py",
+];
+#[cfg(not(feature = "production-mainnet"))]
+const FORK_PACKAGED: &[&str] = &[];
+fn proof_program(directory: &Path) -> PathBuf {
+    directory.join(if cfg!(feature = "production-mainnet") {
+        "cmfd-mainnet-fork-prover"
+    } else {
+        "real_bank0_relations"
+    })
+}
 /// A failed adoption is tried again at most this often: the mining tab asks
 /// for the status every second.
 const ADOPTION_RETRY: Duration = Duration::from_secs(15);
@@ -52,7 +70,11 @@ enum Missing {
 }
 
 fn missing(directory: &Path) -> Option<Missing> {
-    if PACKAGED.iter().any(|name| !directory.join(name).is_file()) {
+    if PACKAGED
+        .iter()
+        .chain(FORK_PACKAGED.iter())
+        .any(|name| !directory.join(name).is_file())
+    {
         return Some(Missing::Packaged);
     }
     let fixed = directory.join("fixed");
@@ -177,15 +199,20 @@ fn run_inner(
     );
     let config = production_v4_solo_config(
         &assets.replay_worker,
-        &directory.join("real_bank0_relations"),
+        &proof_program(directory),
         &assets.model_bank,
         &directory.join("fixed"),
         &assets.scratch_directory.join("solo"),
         assets.wsl_distribution.as_deref(),
     )
     .map_err(|error| error.to_string())?;
-    let worker =
+    let mut worker =
         ProductionV4PersistentPoolVerifier::start(config).map_err(|error| error.to_string())?;
+    if cfg!(feature = "production-mainnet") {
+        worker
+            .enable_serial_gpu()
+            .map_err(|error| error.to_string())?;
+    }
     let mut nonce = 0;
     let mut refreshed = Instant::now();
     while !stop.load(Ordering::Acquire) {
@@ -351,7 +378,7 @@ mod tests {
         let package = root.join("commonfoundry-mainnet-runtime-v1.0.17");
         let inputs = package.join("production-v4");
         fs::create_dir_all(inputs.join("fixed")).unwrap();
-        for name in PACKAGED {
+        for name in PACKAGED.iter().chain(FORK_PACKAGED.iter()) {
             fs::write(inputs.join(name), name).unwrap();
         }
         if prepared {
@@ -463,6 +490,26 @@ mod tests {
             .is_err()
         );
         assert!(!adopted.get());
+    }
+
+    #[cfg(feature = "production-mainnet")]
+    #[test]
+    fn mainnet_solo_requires_the_complete_height_aware_prover() {
+        for name in FORK_PACKAGED {
+            let temp = TempDir::new();
+            let (package, assets) = package(&temp.0, true);
+            assert_eq!(
+                proof_program(&package.join("production-v4")),
+                package.join("production-v4/cmfd-mainnet-fork-prover")
+            );
+            fs::remove_file(package.join("production-v4").join(name)).unwrap();
+            assert!(
+                check_assets_adopting(&assets, |_| panic!(
+                    "missing packaged prover code must not be adopted from old inputs"
+                ))
+                .is_err()
+            );
+        }
     }
 
     #[test]

@@ -5,6 +5,10 @@
 //! only the server-issued job identifier and a nonce; the server recomputes
 //! the exact ForgeMatrix evaluation before crediting anything.
 
+#[cfg(all(test, feature = "compact-mainnet", target_os = "linux"))]
+#[path = "compact_fork_rehearsal.rs"]
+mod compact_fork_rehearsal;
+
 #[cfg(test)]
 #[path = "pool_client_fork_tests.rs"]
 mod pool_client_fork_tests;

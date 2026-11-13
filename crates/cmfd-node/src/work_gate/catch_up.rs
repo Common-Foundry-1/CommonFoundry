@@ -7,8 +7,8 @@
 //! without an engine run only if a source run by another provider lists the
 //! same block, both sources report heights at least
 //! [`WALLET_CATCH_UP_DEPTH`] above it, it extends this node's tip, and it is
-//! not much easier than a reference that cannot fall below the checkpoint
-//! block's work. Each such grant is recorded in
+//! not much easier than the last validated block. The checkpoint
+//! must also be indexed before grants are considered. Each grant is recorded in
 //! [`CATCH_UP_GRANTS_FILE`] and synced before the block commits. The records
 //! only say which stored blocks were admitted that way; they never admit a
 //! block themselves. Nodes independently re-execute each block's work in the
@@ -175,10 +175,13 @@ pub(crate) fn prune_lag_ok(tip: u64, prune_height: Option<u64>, keep: Option<u64
     })
 }
 
-/// The reference work from the block at the validated height and the block
-/// at the checkpoint: unknown unless both are known.
+/// The reference work from the validated frontier. The checkpoint
+/// must also be indexed, but its historical difficulty is not a permanent
+/// floor: a legitimate difficulty drop must not disable grants indefinitely.
+/// The caller holds this reference while grants lie above the validated
+/// frontier, so granted blocks cannot lower it themselves.
 pub(crate) fn reference(work_v: Option<U512>, work_c: Option<U512>) -> Option<U512> {
-    Some(work_v?.max(work_c?))
+    work_v.zip(work_c).map(|(validated, _checkpoint)| validated)
 }
 
 /// The sources as given, without repeated addresses, if there are 2 to

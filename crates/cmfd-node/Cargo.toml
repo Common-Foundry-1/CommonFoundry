@@ -95,3 +95,7 @@ path = "src/main.rs"
 [[example]]
 name = "mainnet_fork_pool_fixture"
 required-features = ["production-mainnet"]
+
+[[example]]
+name = "compact_multigpu_fixture"
+required-features = ["direct-proof-testnet"]

@@ -40,6 +40,13 @@ checks remain in force. This change does allow grants during a difficulty drop
 that the old checkpoint floor rejected. It needs independent review of that
 trust-policy change before a signed wallet release.
 
+The reference remains held while grants are above the validated frontier. If
+difficulty falls by more than another factor of two before background work
+checks advance that frontier, grants still stop and local checking resumes.
+This is a deliberate fail-closed limit, so the change addresses the observed
+week-old gap without promising uninterrupted grants under every future
+hash-rate collapse.
+
 ## Verification
 
 - `cargo fmt --all --check` and `git diff --check` passed.

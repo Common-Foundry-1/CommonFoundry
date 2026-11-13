@@ -496,7 +496,27 @@ def release_replay_worker_sha256(repo: Path, commit: str) -> str:
     return replay_worker_pin(integrity._tracked_blob_at(repo, commit, REPLAY_WORKER_PIN_SOURCE))
 
 
-def copy_executable(source: Path, target: Path, platform: str) -> None:
+def validate_unsigned_windows_exception(data: bytes, version: str, commit: str) -> dict:
+    """The release owner's v1.0.23 exception is pinned to exact build inputs."""
+    value = strict_json(data, "Windows release exception")
+    if (set(value) != {"schema", "package_version", "source_commit", "files"}
+            or value.get("schema") != "CMFD_WINDOWS_RELEASE_EXCEPTION_V1"
+            or version != "1.0.23" or value.get("package_version") != version
+            or value.get("source_commit") != commit):
+        raise Error("Windows release exception does not match v1.0.23 and its source")
+    files = value["files"]
+    roles = {name + ".exe" for name in ("cmfd-launch", "cmfd-node", "cmfd-miner", "common-foundry-wallet")}
+    if not isinstance(files, dict) or set(files) != roles:
+        raise Error("Windows release exception must pin all four executable roles")
+    for row in files.values():
+        if (not isinstance(row, dict) or set(row) != {"bytes", "sha256"}
+                or type(row["bytes"]) is not int or not 0 < row["bytes"] <= integrity.MAX_RUNTIME_BINARY_BYTES):
+            raise Error("Windows release exception has an invalid executable identity")
+        nonzero_hex(row["sha256"], 64, "Windows exception executable SHA-256")
+    return files
+
+
+def copy_executable(source: Path, target: Path, platform: str, *, unsigned_identity: dict | None = None) -> None:
     integrity._regular_file(source, "input executable")
     original = file_identity(source)
     size = original["bytes"]
@@ -512,7 +532,17 @@ def copy_executable(source: Path, target: Path, platform: str) -> None:
     validator(header, size, source.name)
     if platform == "windows-x86_64":
         # Verify the exact bytes staged for the archive, after the copy.
-        require_authenticode(target)
+        if unsigned_identity is None:
+            require_authenticode(target)
+        else:
+            if original != unsigned_identity:
+                raise Error("Windows executable differs from the owner-authorized release input")
+            pe = struct.unpack_from("<I", header, 60)[0]
+            security_directory = pe + 24 + 112 + 4 * 8
+            if struct.unpack_from("<II", header, security_directory) != (0, 0):
+                raise Error("Windows release exception requires the original unsigned PE payload")
+    elif unsigned_identity is not None:
+        raise Error("Windows release exception cannot be used for a Linux executable")
     target.chmod(0o755)
 
 
@@ -578,6 +608,12 @@ def assemble(args: argparse.Namespace) -> Path:
     commit = nonzero_hex(args.commit, 40, "source commit")
     if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-mainnet\.[0-9]+)?", args.version):
         raise Error("use a mainnet version, not an RC/devnet version")
+    unsigned_files = None
+    if getattr(args, "unsigned_windows_exception", None) is not None:
+        if args.platform != "windows-x86_64":
+            raise Error("Windows release exception is only valid for Windows packages")
+        unsigned_files = validate_unsigned_windows_exception(
+            read_regular(args.unsigned_windows_exception, MAX_INFO, "Windows release exception"), args.version, commit)
     if args.kind == "runtime" and (args.node is None or args.wallet is None or args.miner is not None):
         raise Error("runtime packages require node and wallet, not a miner executable")
     if args.kind in ("miner", "hiveos") and (args.miner is None or args.node is not None or args.wallet is not None):
@@ -643,7 +679,8 @@ def assemble(args: argparse.Namespace) -> Path:
         else:
             binaries["cmfd-miner"] = args.miner
         for role, source in binaries.items():
-            copy_executable(source, stage / (role + extension), args.platform)
+            copy_executable(source, stage / (role + extension), args.platform,
+                            unsigned_identity=None if unsigned_files is None else unsigned_files[role + extension])
         worker_root = stage / "production-v4" if args.kind == "runtime" else stage
         copy_executable(args.replay_worker, worker_root / "cmfd-v4-replay", "linux-x86_64")
         # A pool checks blocks on its replay workers only when they run the
@@ -749,6 +786,8 @@ def main() -> None:
     parser.add_argument("--compact-worker",type=Path)
     parser.add_argument("--compact-worker-sha256")
     parser.add_argument("--compact-worker-source-commit")
+    parser.add_argument("--unsigned-windows-exception", type=Path,
+                        help="Owner-authorized v1.0.23 exception pinned to all four executable hashes")
     args = parser.parse_args()
     for name, value in vars(args).items():
         if isinstance(value, Path):

@@ -31,6 +31,5 @@ non-overlapping GPUs can retain the existing parallel setup. These templates
 are staged files; extracting an archive does not install or start a service.
 
 Production promotion still requires operator integration results, the complete
-qualification report and review of the compact proof. Windows EXEs additionally
-require trusted timestamped Authenticode before archives/checksums are generated;
-the SSH release-checksum signature is a separate archive authentication step.
+qualification report and review of the compact proof. The SSH release-checksum
+signature authenticates the final archive bytes.

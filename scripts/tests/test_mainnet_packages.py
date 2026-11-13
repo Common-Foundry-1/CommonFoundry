@@ -506,6 +506,47 @@ class MainnetPackageTests(unittest.TestCase):
             packages.native_output(Path(sys.executable), ["-c", "import time; time.sleep(5)"], timeout_seconds=0.1)
 
 
+class WindowsReleaseExceptionTests(unittest.TestCase):
+    def setUp(self):
+        self.commit = "a" * 40
+        self.binary = pe_x86_64_fixture(b"owner-authorized Windows input")
+        self.identity = {"bytes": len(self.binary), "sha256": hashlib.sha256(self.binary).hexdigest()}
+        self.exception = {"schema": "CMFD_WINDOWS_RELEASE_EXCEPTION_V1", "package_version": "1.0.23",
+                          "source_commit": self.commit, "files": {name + ".exe": dict(self.identity) for name in
+                          ("cmfd-launch", "cmfd-node", "cmfd-miner", "common-foundry-wallet")}}
+
+    def test_exception_is_bound_to_one_version_source_and_complete_inventory(self):
+        self.assertEqual(packages.validate_unsigned_windows_exception(packages.canonical(self.exception), "1.0.23", self.commit), self.exception["files"])
+        for version, commit in (("1.0.24", self.commit), ("1.0.23", "b" * 40)):
+            with self.assertRaises(packages.Error):
+                packages.validate_unsigned_windows_exception(packages.canonical(self.exception), version, commit)
+        del self.exception["files"]["cmfd-miner.exe"]
+        with self.assertRaises(packages.Error):
+            packages.validate_unsigned_windows_exception(packages.canonical(self.exception), "1.0.23", self.commit)
+
+    def test_exact_exception_preserves_payload_and_default_authenticode_gate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); source = root / "source.exe"; source.write_bytes(self.binary)
+            with mock.patch.object(packages, "require_authenticode", side_effect=packages.Error("signature required")) as check:
+                with self.assertRaisesRegex(packages.Error, "signature required"):
+                    packages.copy_executable(source, root / "default.exe", "windows-x86_64")
+                packages.copy_executable(source, root / "authorized.exe", "windows-x86_64", unsigned_identity=self.identity)
+                self.assertEqual(check.call_count, 1)
+                self.assertEqual((root / "authorized.exe").read_bytes(), self.binary)
+                with self.assertRaisesRegex(packages.Error, "differs"):
+                    packages.copy_executable(source, root / "changed.exe", "windows-x86_64", unsigned_identity={**self.identity, "sha256": "c" * 64})
+
+    def test_exception_does_not_accept_an_embedded_certificate_table(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); source = root / "source.exe"
+            binary = bytearray(self.binary); pe = struct.unpack_from("<I", binary, 60)[0]
+            struct.pack_into("<II", binary, pe + 24 + 112 + 4 * 8, 8, 8)
+            source.write_bytes(binary)
+            pinned = {"bytes": len(binary), "sha256": hashlib.sha256(binary).hexdigest()}
+            with self.assertRaises(packages.Error):
+                packages.copy_executable(source, root / "rejected.exe", "windows-x86_64", unsigned_identity=pinned)
+
+
 class ForkRuntimeContractTests(unittest.TestCase):
     def setUp(self):
         self.repo = Path(__file__).resolve().parents[2]

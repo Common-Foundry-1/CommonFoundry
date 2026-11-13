@@ -363,11 +363,11 @@ fn packaged_worker_library(program: &Path) -> PathBuf {
 }
 fn native_worker_library_path(program: &Path) -> OsString {
     let mut path = packaged_worker_library(program).into_os_string();
-    if let Some(existing) = std::env::var_os("LD_LIBRARY_PATH") {
-        if !existing.is_empty() {
-            path.push(":");
-            path.push(existing);
-        }
+    if let Some(existing) = std::env::var_os("LD_LIBRARY_PATH")
+        && !existing.is_empty()
+    {
+        path.push(":");
+        path.push(existing);
     }
     path
 }
@@ -3197,9 +3197,11 @@ done"#;
     fn dedicated_replay_remains_resident_for_single_and_batched_ordinary_shares() {
         let (mut verifier, scratch, log) = batch_test_verifier("keep-resident-ordinary");
         let gpu = "GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_owned();
-        let lease =
-            crate::pool_gpu_lease::PoolGpuLease::acquire_at(&[gpu.clone()], &scratch.join("locks"))
-                .unwrap();
+        let lease = crate::pool_gpu_lease::PoolGpuLease::acquire_at(
+            std::slice::from_ref(&gpu),
+            &scratch.join("locks"),
+        )
+        .unwrap();
         assert!(verifier.keep_serial_replay_resident(lease).is_err());
         verifier.enable_serial_gpu().unwrap();
         let lease = crate::pool_gpu_lease::PoolGpuLease::acquire_at(&[gpu], &scratch.join("locks"))

@@ -243,7 +243,7 @@ fn seed(c: &Config) -> serde_json::Value {
     state.extend_from_slice(&parent);
     state.extend_from_slice(&count.to_le_bytes());
     for n in [count, count, 1, 0, 0] {
-        state.extend_from_slice(&(n as u64).to_le_bytes());
+        state.extend_from_slice(&n.to_le_bytes());
     }
     for h in &history {
         state.extend_from_slice(&h.timestamp.to_le_bytes());
@@ -611,8 +611,8 @@ fn isolated_node_process() {
                         )
                         .unwrap();
                         super::credit_accepted_share(&ledger, 1, 2 * COIN).unwrap();
-                        let g = ledger.state.lock().unwrap().generation;
-                        g
+                        let guard = ledger.state.lock().unwrap();
+                        guard.generation
                     };
                     rebind = serde_json::to_value(
                         super::rebind_pool_ledger_fingerprint(

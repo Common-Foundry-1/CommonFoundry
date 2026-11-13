@@ -3752,16 +3752,13 @@ fn configure_production_v4_pool_verifier(
                 replay_gpus,
                 inventory,
             )?;
-            if keep_replay_resident {
-                if let Some(gpu) = proof_gpu {
-                    physical_proof =
-                        cmfd_node::production_v4_pool::production_v4_resolve_gpu_devices(
-                            &[gpu.to_owned()],
-                            inventory,
-                        )?
-                        .into_iter()
-                        .next();
-                }
+            if keep_replay_resident && let Some(gpu) = proof_gpu {
+                physical_proof = cmfd_node::production_v4_pool::production_v4_resolve_gpu_devices(
+                    &[gpu.to_owned()],
+                    inventory,
+                )?
+                .into_iter()
+                .next();
             }
         }
         let proof_gpu = physical_proof.as_deref();

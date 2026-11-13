@@ -163,9 +163,9 @@ fn end_value(s: &Statement, coeff: &[E], point: &[E], values: &[Vec<E>; 6]) -> R
     );
     let mut at = 0;
     let mut sum = E::zero();
-    for i in 0..6 {
+    for (i, column_values) in values.iter().enumerate() {
         let n = s.shape.columns[i];
-        let value = values[i]
+        let value = column_values
             .iter()
             .zip(&coeff[at..at + n])
             .map(|(v, w)| *v * *w)

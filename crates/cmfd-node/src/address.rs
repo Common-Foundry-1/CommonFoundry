@@ -160,7 +160,7 @@ fn to_text(hrp: &str, symbols: &[u8]) -> String {
 /// form it was written in.
 pub fn decode(hrp: &str, text: &str) -> Result<([u8; 32], AddressFormat), AddressError> {
     let (key, format) = decode_payload(hrp, text)?;
-    VerifyingKey::from_bytes(&key).map_err(|_| AddressError::NotAKey)?;
+    VerifyingKey::from_slice(&key).map_err(|_| AddressError::NotAKey)?;
     Ok((key, format))
 }
 
@@ -308,7 +308,7 @@ mod tests {
 
     fn key(seed: u8) -> [u8; 32] {
         let secret = [seed.max(1); 32];
-        SigningKey::from_bytes(&secret)
+        SigningKey::from_slice(&secret)
             .unwrap()
             .verifying_key()
             .to_bytes()
@@ -324,7 +324,7 @@ mod tests {
                 bytes[31] = last;
                 bytes
             })
-            .find(|bytes| VerifyingKey::from_bytes(bytes).is_err())
+            .find(|bytes| VerifyingKey::from_slice(bytes).is_err())
             .unwrap()
     }
 
@@ -395,7 +395,7 @@ mod tests {
         // `bech32` npm package (bech32m.encode with toWords).
         let mut secret = [0_u8; 32];
         secret[31] = 1;
-        let key = SigningKey::from_bytes(&secret)
+        let key = SigningKey::from_slice(&secret)
             .unwrap()
             .verifying_key()
             .to_bytes();

@@ -687,7 +687,7 @@ fn validate_genesis(value: &GenesisBody) -> Result<(), CeremonyTranscriptError> 
                 "nonconsecutive roster index",
             ));
         }
-        VerifyingKey::from_bytes(&member.public_key)
+        VerifyingKey::from_slice(&member.public_key)
             .map_err(|_| CeremonyTranscriptError::InvalidPublicKey)?;
         if !keys.insert(member.public_key) {
             return Err(CeremonyTranscriptError::Invalid("duplicate roster key"));
@@ -715,7 +715,7 @@ fn validate_body(body: &CeremonyRecordBody) -> Result<(), CeremonyTranscriptErro
             {
                 return Err(CeremonyTranscriptError::Invalid("source byte accounting"));
             }
-            VerifyingKey::from_bytes(&value.operator_public_key)
+            VerifyingKey::from_slice(&value.operator_public_key)
                 .map_err(|_| CeremonyTranscriptError::InvalidPublicKey)?;
             Ok(())
         }
@@ -1552,7 +1552,7 @@ fn verify_bip340(
     message: &[u8; 32],
     signature_bytes: &[u8; 64],
 ) -> Result<(), CeremonyTranscriptError> {
-    let key = VerifyingKey::from_bytes(public_key)
+    let key = VerifyingKey::from_slice(public_key)
         .map_err(|_| CeremonyTranscriptError::InvalidPublicKey)?;
     let signature = Signature::try_from(signature_bytes.as_slice())
         .map_err(|_| CeremonyTranscriptError::MalformedSignature)?;
@@ -2245,7 +2245,7 @@ mod tests {
 
     fn keys(count: usize, offset: u8) -> Vec<SigningKey> {
         (0..count)
-            .map(|index| SigningKey::from_bytes(&[offset.wrapping_add(index as u8); 32]).unwrap())
+            .map(|index| SigningKey::from_slice(&[offset.wrapping_add(index as u8); 32]).unwrap())
             .collect()
     }
 

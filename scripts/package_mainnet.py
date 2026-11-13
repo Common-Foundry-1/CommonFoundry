@@ -368,9 +368,18 @@ def validate_review_ancestry(repo: Path, review_commit: str, release_commit: str
         raise Error("release source changed beyond the reviewed mainnet pin files; fresh review is required")
 
 
+def binary_version(role: str, version: str) -> str:
+    return "1.0.23" if version == "1.0.21" and role == "cmfd-miner" else version
+
+
+def archive_version(kind: str, version: str) -> str:
+    return binary_version("cmfd-miner", version) if kind in ("miner", "hiveos") else version
+
+
 def package_names(platform: str, kind: str, version: str) -> tuple[str, str]:
     if (platform, kind) not in PACKAGE_ROLES:
         raise Error("unsupported mainnet package platform/role")
+    version = archive_version(kind, version)
     if kind == "hiveos":
         if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
             raise Error("HiveOS custom-get requires a version without hyphens")
@@ -411,7 +420,7 @@ def package_sources(platform: str, kind: str, version: str | None = None) -> dic
     sources.update({name: f"packaging/mainnet/{directory}/{name}" for name in launchers})
     name = "PREPARE-V4-INPUTS.ps1" if windows else "PREPARE-V4-INPUTS.sh"
     sources[name] = f"packaging/production-v4-testnet/{directory}/{name}"
-    if version is not None and tuple(map(int,version.split("-")[0].split("."))) >= (1,0,23):
+    if version is not None and tuple(map(int,version.split("-")[0].split("."))) >= (1,0,21):
         prefix="production-v4/" if kind=="runtime" else ""
         sources.update({prefix+name:path for name,path in FORK_CODE.items()})
         sources["MAINNET-FORK-IDENTITY-67535.json"]=FORK_IDENTITY
@@ -473,10 +482,11 @@ def source_snapshot(repo: Path, commit: str, sources: dict[str, str], version: s
     if integrity._run_git(repo, "rev-parse", "HEAD") != commit or integrity._run_git(repo, "status", "--porcelain", "--untracked-files=normal"):
         raise Error("mainnet packaging requires the exact clean frozen source commit")
     import tomllib
-    for relative in ("crates/cmfd-node/Cargo.toml", "crates/cmfd-miner/Cargo.toml", "apps/wallet/src-tauri/Cargo.toml"):
+    for relative, role in (("crates/cmfd-node/Cargo.toml", "cmfd-node"), ("crates/cmfd-miner/Cargo.toml", "cmfd-miner"),
+                           ("apps/wallet/src-tauri/Cargo.toml", "common-foundry-wallet")):
         manifest = tomllib.loads(integrity._tracked_blob_at(repo, commit, relative).decode())
-        if manifest["package"]["version"] != version:
-            raise Error("package version does not match frozen node, wallet and miner versions")
+        if manifest["package"]["version"] != binary_version(role, version):
+            raise Error("package version does not match the frozen component versions")
     return ({name: integrity._tracked_blob_at(repo, commit, relative) for name, relative in sources.items()},
             int(integrity._run_git(repo, "show", "-s", "--format=%ct", commit)))
 
@@ -497,13 +507,13 @@ def release_replay_worker_sha256(repo: Path, commit: str) -> str:
 
 
 def validate_unsigned_windows_exception(data: bytes, version: str, commit: str) -> dict:
-    """The release owner's v1.0.23 exception is pinned to exact build inputs."""
+    """The release owner's v1.0.21 exception is pinned to exact build inputs."""
     value = strict_json(data, "Windows release exception")
     if (set(value) != {"schema", "package_version", "source_commit", "files"}
             or value.get("schema") != "CMFD_WINDOWS_RELEASE_EXCEPTION_V1"
-            or version != "1.0.23" or value.get("package_version") != version
+            or version != "1.0.21" or value.get("package_version") != version
             or value.get("source_commit") != commit):
-        raise Error("Windows release exception does not match v1.0.23 and its source")
+        raise Error("Windows release exception does not match v1.0.21 and its source")
     files = value["files"]
     roles = {name + ".exe" for name in ("cmfd-launch", "cmfd-node", "cmfd-miner", "common-foundry-wallet")}
     if not isinstance(files, dict) or set(files) != roles:
@@ -624,7 +634,7 @@ def assemble(args: argparse.Namespace) -> Path:
     manifest = validate_plan_approvals(manifest_bytes, plan_bytes)
     validate_review_ancestry(args.repo, manifest["subject"]["review_source_commit"], commit)
     source_paths = package_sources(args.platform, args.kind, args.version)
-    fork_release = tuple(map(int,args.version.split("-")[0].split("."))) >= (1,0,23)
+    fork_release = tuple(map(int,args.version.split("-")[0].split("."))) >= (1,0,21)
     if fork_release:
         if not getattr(args,"compact_worker",None) or not getattr(args,"compact_worker_sha256",None):
             raise Error("fork packages require the qualified compact worker and expected SHA-256")
@@ -642,7 +652,7 @@ def assemble(args: argparse.Namespace) -> Path:
     suffix = ".zip" if args.platform == "windows-x86_64" else ".tar.gz"
     if args.kind == "hiveos":
         hive_manifest = sources["h-manifest.conf"].decode()
-        if f"CUSTOM_NAME={HIVEOS_NAME}\n" not in hive_manifest or f"CUSTOM_VERSION={args.version}\n" not in hive_manifest:
+        if f"CUSTOM_NAME={HIVEOS_NAME}\n" not in hive_manifest or f"CUSTOM_VERSION={archive_version(args.kind,args.version)}\n" not in hive_manifest:
             raise Error("HiveOS manifest identity must match archive name and version")
     output = args.output / archive_name
     if output.exists() or output.is_symlink():
@@ -730,7 +740,7 @@ def assemble(args: argparse.Namespace) -> Path:
                 identities[role] = schedule
                 continue
             version = native_output(executable, ["--version"]).decode().strip().split()
-            if not version or version[-1] != args.version:
+            if not version or version[-1] != binary_version(role,args.version):
                 raise Error(f"{role} version mismatch")
             data = native_output(executable, ["runtime-identity" if role == "common-foundry-wallet" else "mainnet-launch-info"])
             if role == "common-foundry-wallet":
@@ -751,7 +761,7 @@ def assemble(args: argparse.Namespace) -> Path:
         if before != after or directories != {path.relative_to(stage).as_posix() for path in stage.rglob("*") if path.is_dir()}:
             raise Error("identity commands modified the staged package")
         receipt = {"schema": "CMFD_MAINNET_PACKAGE_ATTESTATION_V1", "kind": args.kind,
-                   "platform": args.platform, "package_version": args.version, "source_commit": commit,
+                   "platform": args.platform, "package_version": archive_version(args.kind,args.version), "source_commit": commit,
                    "source_date_epoch": epoch, "launch_plan_digest": plan["launch_plan_digest"],
                    "network_id": plan["network_id"], "files": before, "native_identities": identities,
                    "artifact_source_release": "v0.1.0-rc.1", "release_approved": False}
@@ -787,7 +797,7 @@ def main() -> None:
     parser.add_argument("--compact-worker-sha256")
     parser.add_argument("--compact-worker-source-commit")
     parser.add_argument("--unsigned-windows-exception", type=Path,
-                        help="Owner-authorized v1.0.23 exception pinned to all four executable hashes")
+                        help="Owner-authorized v1.0.21 exception pinned to all four executable hashes")
     args = parser.parse_args()
     for name, value in vars(args).items():
         if isinstance(value, Path):

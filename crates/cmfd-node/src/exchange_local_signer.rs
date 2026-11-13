@@ -294,7 +294,7 @@ mod tests {
     }
 
     fn public_key(marker: u8) -> [u8; 32] {
-        let key = k256::schnorr::SigningKey::from_bytes(&[marker; 32]).unwrap();
+        let key = k256::schnorr::SigningKey::from_slice(&[marker; 32]).unwrap();
         key.verifying_key().to_bytes().into()
     }
 

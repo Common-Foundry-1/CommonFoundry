@@ -590,7 +590,7 @@ fn isolated_node_process() {
                 assert!(pool.is_none());
                 gpu_worker = None;
                 let payee: k256::schnorr::SigningKey =
-                    k256::schnorr::SigningKey::from_bytes(&[0x31; 32]).unwrap();
+                    k256::schnorr::SigningKey::from_slice(&[0x31; 32]).unwrap();
                 let payee: [u8; 32] = payee.verifying_key().to_bytes().into();
                 let old = c.root.join("legacy-pool-ledger");
                 let current = c.root.join("pool-ledger");

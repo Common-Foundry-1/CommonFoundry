@@ -566,7 +566,7 @@ impl SigningPackageV1 {
                     "unsigned signature placeholder",
                 ));
             }
-            VerifyingKey::from_bytes(&input.public_key)
+            VerifyingKey::from_slice(&input.public_key)
                 .map_err(|_| SigningProtocolError::InvalidField("input public_key"))?;
             if input.key_id != wallet_key_id(&input.public_key) {
                 return Err(SigningProtocolError::InvalidField("input key_id"));
@@ -804,7 +804,7 @@ pub fn assemble_signed_transaction(
                     supplied.input_index,
                 ));
             }
-            let public_key = VerifyingKey::from_bytes(&expected.public_key)
+            let public_key = VerifyingKey::from_slice(&expected.public_key)
                 .map_err(|_| SigningProtocolError::InvalidField("input public_key"))?;
             let authorization_signature = Signature::try_from(
                 supplied.package_authorization_signature.as_slice(),
@@ -1132,7 +1132,7 @@ mod tests {
     }
 
     fn key(byte: u8) -> SigningKey {
-        SigningKey::from_bytes(&[byte; 32]).expect("fixed test scalar must be valid")
+        SigningKey::from_slice(&[byte; 32]).expect("fixed test scalar must be valid")
     }
 
     fn public_key(key: &SigningKey) -> [u8; 32] {

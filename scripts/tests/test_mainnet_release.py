@@ -38,6 +38,9 @@ class MainnetReleaseTests(unittest.TestCase):
             target = self.repo / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes((real_repo / relative).read_bytes().replace(b"\r\n", b"\n"))
+            if relative.endswith("/h-manifest.conf"):
+                target.write_bytes(b"\n".join(b"CUSTOM_VERSION=1.0.20" if line.startswith(b"CUSTOM_VERSION=") else line
+                                             for line in target.read_bytes().split(b"\n")))
         for relative in (*package.integrity.SOURCE_LOCK_FILES, "scripts/release_integrity.py"):
             if relative == "apps/pool-dashboard/package-lock.json":
                 continue

@@ -170,7 +170,7 @@ def validate_receipt(rows: dict, platform: str, kind: str, plan: dict, commit: s
     keys = {"schema", "kind", "platform", "package_version", "source_commit", "source_date_epoch",
             "launch_plan_digest", "network_id", "files", "native_identities", "artifact_source_release", "release_approved"}
     required = {"schema": "CMFD_MAINNET_PACKAGE_ATTESTATION_V1", "kind": kind, "platform": platform,
-                "package_version": version, "source_commit": commit, "source_date_epoch": epoch,
+                "package_version": package.archive_version(kind,version), "source_commit": commit, "source_date_epoch": epoch,
                 "launch_plan_digest": plan["launch_plan_digest"], "network_id": plan["network_id"],
                 "artifact_source_release": "v0.1.0-rc.1"}
     if (set(receipt) != keys or package.canonical(receipt) != data

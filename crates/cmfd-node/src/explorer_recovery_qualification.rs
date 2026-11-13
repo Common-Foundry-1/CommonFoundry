@@ -21,7 +21,7 @@ fn recipient(ordinal: usize) -> [u8; 32] {
     let mut secret = [0; 32];
     secret[0] = 0x41;
     secret[24..].copy_from_slice(&(ordinal as u64).to_be_bytes());
-    SigningKey::from_bytes(&secret)
+    SigningKey::from_slice(&secret)
         .unwrap()
         .verifying_key()
         .to_bytes()
@@ -104,7 +104,7 @@ fn explorer_dense_valid_history_recovery() {
         })
         .collect();
     split
-        .sign_all(&[&SigningKey::from_bytes(&[0x12; 32]).unwrap()])
+        .sign_all(&[&SigningKey::from_slice(&[0x12; 32]).unwrap()])
         .unwrap();
     node.submit_transaction(split.clone()).unwrap();
     node.mine_once(
@@ -133,7 +133,7 @@ fn explorer_dense_valid_history_recovery() {
         .append(true)
         .open(path.join(BLOCK_LOG_FILE))
         .unwrap();
-    let signing_key = SigningKey::from_bytes(&[0x31; 32]).unwrap();
+    let signing_key = SigningKey::from_slice(&[0x31; 32]).unwrap();
     for index in 0..block_count {
         let height = index as u64 + 3;
         let now = DEVNET_GENESIS_TIMESTAMP + height * 60;

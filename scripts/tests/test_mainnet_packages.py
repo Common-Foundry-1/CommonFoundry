@@ -511,18 +511,18 @@ class WindowsReleaseExceptionTests(unittest.TestCase):
         self.commit = "a" * 40
         self.binary = pe_x86_64_fixture(b"owner-authorized Windows input")
         self.identity = {"bytes": len(self.binary), "sha256": hashlib.sha256(self.binary).hexdigest()}
-        self.exception = {"schema": "CMFD_WINDOWS_RELEASE_EXCEPTION_V1", "package_version": "1.0.23",
+        self.exception = {"schema": "CMFD_WINDOWS_RELEASE_EXCEPTION_V1", "package_version": "1.0.21",
                           "source_commit": self.commit, "files": {name + ".exe": dict(self.identity) for name in
                           ("cmfd-launch", "cmfd-node", "cmfd-miner", "common-foundry-wallet")}}
 
     def test_exception_is_bound_to_one_version_source_and_complete_inventory(self):
-        self.assertEqual(packages.validate_unsigned_windows_exception(packages.canonical(self.exception), "1.0.23", self.commit), self.exception["files"])
-        for version, commit in (("1.0.24", self.commit), ("1.0.23", "b" * 40)):
+        self.assertEqual(packages.validate_unsigned_windows_exception(packages.canonical(self.exception), "1.0.21", self.commit), self.exception["files"])
+        for version, commit in (("1.0.24", self.commit), ("1.0.21", "b" * 40)):
             with self.assertRaises(packages.Error):
                 packages.validate_unsigned_windows_exception(packages.canonical(self.exception), version, commit)
         del self.exception["files"]["cmfd-miner.exe"]
         with self.assertRaises(packages.Error):
-            packages.validate_unsigned_windows_exception(packages.canonical(self.exception), "1.0.23", self.commit)
+            packages.validate_unsigned_windows_exception(packages.canonical(self.exception), "1.0.21", self.commit)
 
     def test_exact_exception_preserves_payload_and_default_authenticode_gate(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -545,6 +545,31 @@ class WindowsReleaseExceptionTests(unittest.TestCase):
             pinned = {"bytes": len(binary), "sha256": hashlib.sha256(binary).hexdigest()}
             with self.assertRaises(packages.Error):
                 packages.copy_executable(source, root / "rejected.exe", "windows-x86_64", unsigned_identity=pinned)
+
+
+class ComponentVersionTests(unittest.TestCase):
+    def test_wallet_and_node_release_keeps_separate_miner_archive_version(self):
+        self.assertEqual(packages.package_names("windows-x86_64", "runtime", "1.0.21")[1],
+                         "commonfoundry-mainnet-runtime-windows-x86_64-v1.0.21.zip")
+        self.assertEqual(packages.package_names("linux-x86_64", "miner", "1.0.21")[1],
+                         "commonfoundry-mainnet-miner-linux-x86_64-v1.0.23.tar.gz")
+        self.assertEqual(packages.package_names("linux-x86_64", "hiveos", "1.0.21")[1],
+                         "commonfoundry-mainnet-hiveos-1.0.23.tar.gz")
+        self.assertEqual(packages.binary_version("cmfd-launch", "1.0.21"), "1.0.21")
+
+    def test_source_snapshot_rejects_a_miner_downgrade_in_the_split_release(self):
+        commit = "a" * 40
+        manifests = {"crates/cmfd-node/Cargo.toml": b'[package]\nversion="1.0.21"\n',
+                     "crates/cmfd-miner/Cargo.toml": b'[package]\nversion="1.0.23"\n',
+                     "apps/wallet/src-tauri/Cargo.toml": b'[package]\nversion="1.0.21"\n'}
+        with mock.patch.object(packages.integrity, "_run_git", side_effect=[commit, "", "1789840000"]), \
+             mock.patch.object(packages.integrity, "_tracked_blob_at", side_effect=lambda _repo, _commit, path: manifests[path]):
+            self.assertEqual(packages.source_snapshot(Path("."), commit, {}, "1.0.21"), ({}, 1789840000))
+        manifests["crates/cmfd-miner/Cargo.toml"] = b'[package]\nversion="1.0.21"\n'
+        with mock.patch.object(packages.integrity, "_run_git", side_effect=[commit, ""]), \
+             mock.patch.object(packages.integrity, "_tracked_blob_at", side_effect=lambda _repo, _commit, path: manifests[path]):
+            with self.assertRaisesRegex(packages.Error, "component versions"):
+                packages.source_snapshot(Path("."), commit, {}, "1.0.21")
 
 
 class ForkRuntimeContractTests(unittest.TestCase):

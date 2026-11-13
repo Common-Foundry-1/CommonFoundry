@@ -201,7 +201,7 @@ fn read_wallet_secret(
     file.read_exact(secret.as_mut())
         .map_err(|_| WalletBackupError::InvalidWalletKey)?;
     let key =
-        SigningKey::from_bytes(secret.as_ref()).map_err(|_| WalletBackupError::InvalidWalletKey)?;
+        SigningKey::from_slice(secret.as_ref()).map_err(|_| WalletBackupError::InvalidWalletKey)?;
     let destination = key.verifying_key().to_bytes().into();
     Ok((secret, destination))
 }
@@ -253,7 +253,7 @@ pub(crate) fn encrypt_wallet_key_bytes(
     passphrase: &[u8],
 ) -> Result<(Vec<u8>, WalletBackupInfo), WalletBackupError> {
     validate_passphrase(passphrase)?;
-    let key = SigningKey::from_bytes(secret).map_err(|_| WalletBackupError::InvalidWalletKey)?;
+    let key = SigningKey::from_slice(secret).map_err(|_| WalletBackupError::InvalidWalletKey)?;
     let destination = key.verifying_key().to_bytes().into();
     let mut salt = [0_u8; SALT_BYTES];
     let mut nonce = [0_u8; NONCE_BYTES];
@@ -351,7 +351,7 @@ pub(crate) fn decrypt_wallet_key_bytes(
     let mut secret = Zeroizing::new([0_u8; SECRET_BYTES]);
     secret.copy_from_slice(plaintext.as_slice());
     let key =
-        SigningKey::from_bytes(secret.as_ref()).map_err(|_| WalletBackupError::InvalidBackup)?;
+        SigningKey::from_slice(secret.as_ref()).map_err(|_| WalletBackupError::InvalidBackup)?;
     let restored_destination: [u8; 32] = key.verifying_key().to_bytes().into();
     if restored_destination != destination {
         return Err(WalletBackupError::DestinationMismatch);
@@ -437,7 +437,7 @@ pub fn create_encrypted_wallet(
                 io::Error::other(source.to_string()),
             )
         })?;
-        if SigningKey::from_bytes(secret.as_ref()).is_ok() {
+        if SigningKey::from_slice(secret.as_ref()).is_ok() {
             break;
         }
     }
@@ -541,7 +541,7 @@ mod tests {
 
     fn write_test_key(data_dir: &Path, byte: u8) -> [u8; 32] {
         fs::create_dir_all(data_dir).unwrap();
-        let key = SigningKey::from_bytes(&[byte; 32]).unwrap();
+        let key = SigningKey::from_slice(&[byte; 32]).unwrap();
         write_private_create_new(&data_dir.join(WALLET_KEY_FILE), &key.to_bytes()).unwrap();
         key.verifying_key().to_bytes().into()
     }

@@ -583,7 +583,7 @@ fn validate_payload_for_profile(
         ),
     ] {
         let destination = decode_hex32(encoded)?;
-        VerifyingKey::from_bytes(&destination)
+        VerifyingKey::from_slice(&destination)
             .map_err(|_| RcnetCandidateError::InvalidField(name))?;
         if INSECURE_DEV_DESTINATIONS.contains(&destination) {
             return Err(RcnetCandidateError::InvalidField(
@@ -627,7 +627,7 @@ mod tests {
     use k256::schnorr::SigningKey;
 
     fn destination(seed: u8) -> [u8; 32] {
-        SigningKey::from_bytes(&[seed; 32])
+        SigningKey::from_slice(&[seed; 32])
             .unwrap()
             .verifying_key()
             .to_bytes()

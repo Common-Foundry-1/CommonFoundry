@@ -18,11 +18,11 @@ use std::time::{Duration, Instant};
 use cmfd_consensus::forgematrix_v4_proof::forgematrix_v4_final_activation_digest;
 use cmfd_consensus::forgematrix_v4_proof_codec::decode_forgematrix_v4_transparent_proof;
 use cmfd_consensus::{
-    forgematrix_v4_challenge_digest, forgematrix_v4_final_activation_digest_from_le_bytes,
-    forgematrix_v4_replay_coefficients, forgematrix_v4_work_digest, BlockProof,
-    ForgeMatrixV4CandidateParameters, ForgeMatrixV4CandidateProof,
-    FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES, PRODUCTION_V2_LAYERS,
-    PRODUCTION_V4_MAX_PROOF_BYTES, PRODUCTION_V4_MODEL_MANIFEST_DIGEST,
+    BlockProof, FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES, ForgeMatrixV4CandidateParameters,
+    ForgeMatrixV4CandidateProof, PRODUCTION_V2_LAYERS, PRODUCTION_V4_MAX_PROOF_BYTES,
+    PRODUCTION_V4_MODEL_MANIFEST_DIGEST, forgematrix_v4_challenge_digest,
+    forgematrix_v4_final_activation_digest_from_le_bytes, forgematrix_v4_replay_coefficients,
+    forgematrix_v4_work_digest,
 };
 use serde::Serialize;
 
@@ -3077,11 +3077,13 @@ done"#;
     #[test]
     fn serial_gpu_rejects_multiple_replay_workers() {
         let (mut verifier, scratch, _) = batch_test_verifier_with_workers("serial-multi", 2);
-        assert!(verifier
-            .enable_serial_gpu()
-            .unwrap_err()
-            .to_string()
-            .contains("exactly one"));
+        assert!(
+            verifier
+                .enable_serial_gpu()
+                .unwrap_err()
+                .to_string()
+                .contains("exactly one")
+        );
         drop(verifier);
         let _ = std::fs::remove_dir_all(scratch);
     }
@@ -3176,12 +3178,16 @@ done"#;
                 },
             ],
         );
-        assert!(results
-            .iter()
-            .all(|result| result.as_ref().unwrap().chain_proof.is_none()));
-        assert!(std::fs::read_to_string(&log)
-            .unwrap()
-            .ends_with("RUNBATCH 2\nEVICT\nEVICT\n"));
+        assert!(
+            results
+                .iter()
+                .all(|result| result.as_ref().unwrap().chain_proof.is_none())
+        );
+        assert!(
+            std::fs::read_to_string(&log)
+                .unwrap()
+                .ends_with("RUNBATCH 2\nEVICT\nEVICT\n")
+        );
         drop(verifier);
         let _ = std::fs::remove_dir_all(scratch);
     }
@@ -3202,11 +3208,13 @@ done"#;
         let mut template = batch_test_template(BATCH_TEST_NETWORK_ID);
         template.challenge.target = [0; 32];
         for nonce in [96, 97] {
-            assert!(verifier
-                .evaluate_single(&template, nonce, [0xff; 32])
-                .unwrap()
-                .chain_proof
-                .is_none());
+            assert!(
+                verifier
+                    .evaluate_single(&template, nonce, [0xff; 32])
+                    .unwrap()
+                    .chain_proof
+                    .is_none()
+            );
         }
         let shares = [
             ProductionV4PoolShareRequest {
@@ -3220,11 +3228,13 @@ done"#;
                 share_target: [0xff; 32],
             },
         ];
-        assert!(verifier.evaluate_batch_on(0, &shares).iter().all(|r| r
-            .as_ref()
-            .unwrap()
-            .chain_proof
-            .is_none()));
+        assert!(
+            verifier.evaluate_batch_on(0, &shares).iter().all(|r| r
+                .as_ref()
+                .unwrap()
+                .chain_proof
+                .is_none())
+        );
         assert_eq!(
             std::fs::read_to_string(&log).unwrap(),
             "EVICT\nRUN 1\nRUN 1\nRUNBATCH 2\n"
@@ -3851,10 +3861,10 @@ done"#;
     #[ignore = "needs a CUDA GPU, the model bank and the release replay worker"]
     fn real_gpu_work_checks_agree_with_the_cpu_engine() {
         use crate::honest_work::{
-            honest_work_digest, CpuWorkEngine, GpuReplayWorkers, GpuWorkEngine, HonestWorkChecker,
-            WorkClaim, WorkEngine, WorkEngineError, WorkEngineHealth, WorkEngineKind,
-            WorkEngineState, WorkKatReport, WorkProvenance, WorkUnavailable, WorkVerdict,
-            GPU_WORK_CHECK_TIMEOUT,
+            CpuWorkEngine, GPU_WORK_CHECK_TIMEOUT, GpuReplayWorkers, GpuWorkEngine,
+            HonestWorkChecker, WorkClaim, WorkEngine, WorkEngineError, WorkEngineHealth,
+            WorkEngineKind, WorkEngineState, WorkKatReport, WorkProvenance, WorkUnavailable,
+            WorkVerdict, honest_work_digest,
         };
         use cmfd_consensus::{
             ConsensusPowVerifier, ForgeMatrixV4FileLayerSource, ForgeMatrixV4FixedArtifactRecordV1,

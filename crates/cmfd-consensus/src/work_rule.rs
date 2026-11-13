@@ -477,9 +477,8 @@ mod tests {
                     if cfg!(feature = "compact-mainnet")
                         && crate::mainnet_network::is_mainnet_network(network_id)
                     {
-                        expected.recomputation_end = Some(
-                            crate::compact_mainnet_fork::COMPACT_MAINNET_ACTIVATION_HEIGHT,
-                        );
+                        expected.recomputation_end =
+                            Some(crate::compact_mainnet_fork::COMPACT_MAINNET_ACTIVATION_HEIGHT);
                     }
                     assert_eq!(selected, Some(&expected));
                 }

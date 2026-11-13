@@ -7,12 +7,12 @@ use crate::production_v4_pool::{
     ProductionV4PersistentPoolVerifier, ProductionV4PoolVerifierConfig,
     ProductionV4PoolWorkerCommand,
 };
-use crate::{mainnet_runtime, pruning, work_gate, Node, ProductionV4VerifierArtifacts};
+use crate::{Node, ProductionV4VerifierArtifacts, mainnet_runtime, pruning, work_gate};
 use cmfd_consensus::compact_mainnet_fork::*;
 use cmfd_consensus::{
-    next_work_target, Block, BlockChallenge, BlockProof, ChainState, Coinbase,
-    ForgeMatrixV4CandidateProof, ForgeMatrixV4WorkRule, HeaderWork, OutputLock, PowParameters, TxOutput,
-    SuccessorHeaderPreflight, BLOCK_VERSION, COIN, MEDIAN_TIME_WINDOW,
+    BLOCK_VERSION, Block, BlockChallenge, BlockProof, COIN, ChainState, Coinbase,
+    ForgeMatrixV4CandidateProof, ForgeMatrixV4WorkRule, HeaderWork, MEDIAN_TIME_WINDOW, OutputLock,
+    PowParameters, SuccessorHeaderPreflight, TxOutput, next_work_target,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -26,8 +26,8 @@ use std::{
 use std::{
     process::{Child, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -75,10 +75,11 @@ fn config() -> Config {
     );
     let c: Config = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
     assert!(c.root.is_absolute());
-    assert!(c
-        .root
-        .to_string_lossy()
-        .starts_with("/mnt/c/Source/_ops/cmfd-fork-rehearsal-wallet-20261112/run-"));
+    assert!(
+        c.root
+            .to_string_lossy()
+            .starts_with("/mnt/c/Source/_ops/cmfd-fork-rehearsal-wallet-20261112/run-")
+    );
     c
 }
 
@@ -177,8 +178,14 @@ fn seed(c: &Config) -> serde_json::Value {
             // The trusted checkpoint's synthetic funding must also exist in
             // retained history, so wallet attribution can trace its spends.
             outputs: if height == 1 {
-                vec![TxOutput { value: SEED_VALUE, lock: OutputLock::Key(owner), spendable_height: 0 }]
-            } else { vec![] },
+                vec![TxOutput {
+                    value: SEED_VALUE,
+                    lock: OutputLock::Key(owner),
+                    spendable_height: 0,
+                }]
+            } else {
+                vec![]
+            },
         };
         let transaction_root =
             cmfd_consensus::merkle_root(&[coinbase.commitment(params.network_id)]);
@@ -294,7 +301,10 @@ fn seed(c: &Config) -> serde_json::Value {
     let key_after = hex::encode(Sha256::digest(fs::read(data.join("wallet.key")).unwrap()));
     assert_eq!(key_before, key_after);
     assert!(data.join("network.meta.pre-compact-67535").is_file());
-    assert_eq!(n.wallet_snapshot().unwrap().balances.spendable_atoms, SEED_VALUE.to_string());
+    assert_eq!(
+        n.wallet_snapshot().unwrap().balances.spendable_atoms,
+        SEED_VALUE.to_string()
+    );
     let out = serde_json::json!({"scope":"synthetic trusted local checkpoint; historical PoW not claimed","activation_height":COMPACT_MAINNET_ACTIVATION_HEIGHT,"seed_height":SEED_HEIGHT,"seed_tip":hex::encode(parent),"wallet_key_preserved":true,"predecessor_metadata_and_prune_anchor_upgraded":true,"consensus_fingerprint":hex::encode(n.params.fingerprint().unwrap()),"network_namespace_isolated":true});
     fs::write(
         c.root.join("BOOTSTRAP-RESULT.json"),

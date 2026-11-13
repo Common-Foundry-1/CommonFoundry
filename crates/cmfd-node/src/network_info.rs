@@ -375,6 +375,7 @@ fn canonical_network_info_json_for_profile(
                 NetworkProfileKind::ProductionV3Testnet => (None, None),
                 NetworkProfileKind::Devnet
                 | NetworkProfileKind::ProductionV4Testnet
+                | NetworkProfileKind::DirectProofTestnet
                 | NetworkProfileKind::Mainnet => {
                     unreachable!("only ProductionV3 profiles can select ProductionV3 parameters")
                 }

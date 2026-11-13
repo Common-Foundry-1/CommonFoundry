@@ -19,6 +19,8 @@ permissions:
 
 env:
   CMFD_BUILD_SOURCE_COMMIT: ${{ github.sha }}
+  # Proof-construction tests retain assertions and coverage with optimized math.
+  CARGO_PROFILE_TEST_OPT_LEVEL: "2"
 
 jobs:
   msrv:
@@ -114,10 +116,11 @@ jobs:
       - run: cargo audit
       - name: Check optimized Linux wallet dependency regression
         run: cargo test --locked --release --manifest-path tools/linux-wallet-dependency-check/Cargo.toml
+      - name: Check the isolated ProductionV3 wallet configuration
+        run: cargo test -p common-foundry-wallet --lib --features production-v3-testnet --locked
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --all-targets --locked
-      - run: cargo test -p common-foundry-wallet --lib --features production-v3-testnet --locked
       - name: Report final disk use
         if: always()
         run: |

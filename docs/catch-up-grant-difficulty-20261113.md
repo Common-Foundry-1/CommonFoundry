@@ -17,6 +17,7 @@ block records returned these targets on 2026-11-13:
 | ---: | --- | ---: |
 | 20,912 | `0000192a0b48bfa3a064801742910e48b5745321160cd7bd54eec53841fc26fc` | 666,708 |
 | 47,869 | `00005e165a5bfbb5c68ffb77317a613c9541966b5ac40c093855ec7b54bf3ea1` | 178,315 |
+| 52,000 | `00007405cadfd6a23e7d3dc12d507734f9454d6b72beaca1e486f6ef8027ee79` | 144,602 |
 
 The work at 47,869 is 26.7% of the checkpoint block's work. The old reference
 was `max(validated_work, checkpoint_work)`, and the easing guard required each
@@ -47,7 +48,8 @@ trust-policy change before a signed wallet release.
   tests. Fifteen loopback P2P tests initially failed because the sandbox
   denied local sockets; they passed when rerun with loopback access.
 - The new regression uses the public targets above and checks both the
-  legitimate decline and refusal of a further threefold easier candidate.
+  legitimate decline through height 52,000 and refusal of a further threefold
+  easier candidate.
 
 The production-feature test used the v1.0.20 base commit as
 `CMFD_BUILD_SOURCE_COMMIT` solely to satisfy the test build gate. These are

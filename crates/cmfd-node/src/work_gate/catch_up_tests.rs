@@ -136,8 +136,9 @@ fn pure_rules_for_admitting_a_block_without_an_engine_run() {
 
 #[test]
 fn a_mainnet_difficulty_drop_does_not_disable_grants_after_local_validation() {
-    // Public mainnet targets at the v1.0.20 checkpoint (20,912) and at
-    // height 47,869, where an offline wallet reported checked_easing only.
+    // Public mainnet targets at the v1.0.20 checkpoint (20,912), at
+    // height 47,869 where an offline wallet reported checked_easing only,
+    // and farther into that wallet's week-old backlog at height 52,000.
     let checkpoint_target =
         hex::decode("0000192a0b48bfa3a064801742910e48b5745321160cd7bd54eec53841fc26fc")
             .unwrap()
@@ -148,13 +149,21 @@ fn a_mainnet_difficulty_drop_does_not_disable_grants_after_local_validation() {
             .unwrap()
             .try_into()
             .unwrap();
+    let later_target =
+        hex::decode("00007405cadfd6a23e7d3dc12d507734f9454d6b72beaca1e486f6ef8027ee79")
+            .unwrap()
+            .try_into()
+            .unwrap();
     let checkpoint_work = cmfd_consensus::block_work(checkpoint_target).unwrap();
     let validated_work = cmfd_consensus::block_work(validated_target).unwrap();
+    let later_work = cmfd_consensus::block_work(later_target).unwrap();
 
     assert!(!easing_ok(validated_work, checkpoint_work));
+    assert!(!easing_ok(later_work, checkpoint_work));
     let reference = reference(Some(validated_work), Some(checkpoint_work)).unwrap();
     assert_eq!(reference, validated_work);
     assert!(easing_ok(validated_work, reference));
+    assert!(easing_ok(later_work, reference));
     assert!(!easing_ok(validated_work / work(3), reference));
 }
 

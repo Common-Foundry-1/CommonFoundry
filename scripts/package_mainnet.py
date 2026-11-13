@@ -368,18 +368,9 @@ def validate_review_ancestry(repo: Path, review_commit: str, release_commit: str
         raise Error("release source changed beyond the reviewed mainnet pin files; fresh review is required")
 
 
-def binary_version(role: str, version: str) -> str:
-    return "1.0.23" if version == "1.0.21" and role == "cmfd-miner" else version
-
-
-def archive_version(kind: str, version: str) -> str:
-    return binary_version("cmfd-miner", version) if kind in ("miner", "hiveos") else version
-
-
 def package_names(platform: str, kind: str, version: str) -> tuple[str, str]:
     if (platform, kind) not in PACKAGE_ROLES:
         raise Error("unsupported mainnet package platform/role")
-    version = archive_version(kind, version)
     if kind == "hiveos":
         if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
             raise Error("HiveOS custom-get requires a version without hyphens")
@@ -482,10 +473,9 @@ def source_snapshot(repo: Path, commit: str, sources: dict[str, str], version: s
     if integrity._run_git(repo, "rev-parse", "HEAD") != commit or integrity._run_git(repo, "status", "--porcelain", "--untracked-files=normal"):
         raise Error("mainnet packaging requires the exact clean frozen source commit")
     import tomllib
-    for relative, role in (("crates/cmfd-node/Cargo.toml", "cmfd-node"), ("crates/cmfd-miner/Cargo.toml", "cmfd-miner"),
-                           ("apps/wallet/src-tauri/Cargo.toml", "common-foundry-wallet")):
+    for relative in ("crates/cmfd-node/Cargo.toml", "crates/cmfd-miner/Cargo.toml", "apps/wallet/src-tauri/Cargo.toml"):
         manifest = tomllib.loads(integrity._tracked_blob_at(repo, commit, relative).decode())
-        if manifest["package"]["version"] != binary_version(role, version):
+        if manifest["package"]["version"] != version:
             raise Error("package version does not match the frozen component versions")
     return ({name: integrity._tracked_blob_at(repo, commit, relative) for name, relative in sources.items()},
             int(integrity._run_git(repo, "show", "-s", "--format=%ct", commit)))
@@ -652,7 +642,7 @@ def assemble(args: argparse.Namespace) -> Path:
     suffix = ".zip" if args.platform == "windows-x86_64" else ".tar.gz"
     if args.kind == "hiveos":
         hive_manifest = sources["h-manifest.conf"].decode()
-        if f"CUSTOM_NAME={HIVEOS_NAME}\n" not in hive_manifest or f"CUSTOM_VERSION={archive_version(args.kind,args.version)}\n" not in hive_manifest:
+        if f"CUSTOM_NAME={HIVEOS_NAME}\n" not in hive_manifest or f"CUSTOM_VERSION={args.version}\n" not in hive_manifest:
             raise Error("HiveOS manifest identity must match archive name and version")
     output = args.output / archive_name
     if output.exists() or output.is_symlink():
@@ -740,7 +730,7 @@ def assemble(args: argparse.Namespace) -> Path:
                 identities[role] = schedule
                 continue
             version = native_output(executable, ["--version"]).decode().strip().split()
-            if not version or version[-1] != binary_version(role,args.version):
+            if not version or version[-1] != args.version:
                 raise Error(f"{role} version mismatch")
             data = native_output(executable, ["runtime-identity" if role == "common-foundry-wallet" else "mainnet-launch-info"])
             if role == "common-foundry-wallet":
@@ -761,7 +751,7 @@ def assemble(args: argparse.Namespace) -> Path:
         if before != after or directories != {path.relative_to(stage).as_posix() for path in stage.rglob("*") if path.is_dir()}:
             raise Error("identity commands modified the staged package")
         receipt = {"schema": "CMFD_MAINNET_PACKAGE_ATTESTATION_V1", "kind": args.kind,
-                   "platform": args.platform, "package_version": archive_version(args.kind,args.version), "source_commit": commit,
+                   "platform": args.platform, "package_version": args.version, "source_commit": commit,
                    "source_date_epoch": epoch, "launch_plan_digest": plan["launch_plan_digest"],
                    "network_id": plan["network_id"], "files": before, "native_identities": identities,
                    "artifact_source_release": "v0.1.0-rc.1", "release_approved": False}

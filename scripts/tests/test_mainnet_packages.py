@@ -548,24 +548,23 @@ class WindowsReleaseExceptionTests(unittest.TestCase):
 
 
 class ComponentVersionTests(unittest.TestCase):
-    def test_wallet_and_node_release_keeps_separate_miner_archive_version(self):
+    def test_combined_release_uses_one_version_for_all_archives(self):
         self.assertEqual(packages.package_names("windows-x86_64", "runtime", "1.0.21")[1],
                          "commonfoundry-mainnet-runtime-windows-x86_64-v1.0.21.zip")
         self.assertEqual(packages.package_names("linux-x86_64", "miner", "1.0.21")[1],
-                         "commonfoundry-mainnet-miner-linux-x86_64-v1.0.23.tar.gz")
+                         "commonfoundry-mainnet-miner-linux-x86_64-v1.0.21.tar.gz")
         self.assertEqual(packages.package_names("linux-x86_64", "hiveos", "1.0.21")[1],
-                         "commonfoundry-mainnet-hiveos-1.0.23.tar.gz")
-        self.assertEqual(packages.binary_version("cmfd-launch", "1.0.21"), "1.0.21")
+                         "commonfoundry-mainnet-hiveos-1.0.21.tar.gz")
 
-    def test_source_snapshot_rejects_a_miner_downgrade_in_the_split_release(self):
+    def test_source_snapshot_rejects_a_mismatched_component_version(self):
         commit = "a" * 40
         manifests = {"crates/cmfd-node/Cargo.toml": b'[package]\nversion="1.0.21"\n',
-                     "crates/cmfd-miner/Cargo.toml": b'[package]\nversion="1.0.23"\n',
+                     "crates/cmfd-miner/Cargo.toml": b'[package]\nversion="1.0.21"\n',
                      "apps/wallet/src-tauri/Cargo.toml": b'[package]\nversion="1.0.21"\n'}
         with mock.patch.object(packages.integrity, "_run_git", side_effect=[commit, "", "1789840000"]), \
              mock.patch.object(packages.integrity, "_tracked_blob_at", side_effect=lambda _repo, _commit, path: manifests[path]):
             self.assertEqual(packages.source_snapshot(Path("."), commit, {}, "1.0.21"), ({}, 1789840000))
-        manifests["crates/cmfd-miner/Cargo.toml"] = b'[package]\nversion="1.0.21"\n'
+        manifests["crates/cmfd-miner/Cargo.toml"] = b'[package]\nversion="1.0.23"\n'
         with mock.patch.object(packages.integrity, "_run_git", side_effect=[commit, ""]), \
              mock.patch.object(packages.integrity, "_tracked_blob_at", side_effect=lambda _repo, _commit, path: manifests[path]):
             with self.assertRaisesRegex(packages.Error, "component versions"):

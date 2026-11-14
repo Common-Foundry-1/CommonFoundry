@@ -4373,12 +4373,14 @@ fn handle_connection(
     let mut stream = StreamOwned::new(connection, stream);
     let handshake_deadline = checked_pool_deadline(Instant::now(), POOL_HANDSHAKE_TIMEOUT)?;
     let authentication_nonce = random_nonce()?;
+    let offered_job = current_job(&shared)?;
+    let session_fingerprint = pool_job_fingerprint(&shared, offered_job.challenge.height);
     write_frame(
         &mut stream,
         &ServerMessage::AuthChallenge {
             protocol_version: POOL_PROTOCOL_VERSION,
             network_id: shared.network_id,
-            consensus_fingerprint: shared.consensus_fingerprint,
+            consensus_fingerprint: session_fingerprint,
             nonce: authentication_nonce,
         },
     )?;
@@ -4409,7 +4411,7 @@ fn handle_connection(
                 )?;
                 return Err(PoolError::NetworkMismatch);
             }
-            if consensus_fingerprint != shared.consensus_fingerprint {
+            if consensus_fingerprint != session_fingerprint {
                 send_error(
                     &mut stream,
                     "fingerprint_mismatch",
@@ -4454,6 +4456,11 @@ fn handle_connection(
         }
     };
 
+    if pool_job_fingerprint(&shared, current_job(&shared)?.challenge.height) != session_fingerprint
+    {
+        return Ok(());
+    }
+
     // A fresh ID is only used when no disconnected session of this worker
     // and payout can be reconnected; an unused ID leaves a harmless gap.
     let session_id = register_session(
@@ -4479,13 +4486,16 @@ fn handle_connection(
         &ServerMessage::HelloAck {
             protocol_version: POOL_PROTOCOL_VERSION,
             network_id: shared.network_id,
-            consensus_fingerprint: shared.consensus_fingerprint,
+            consensus_fingerprint: session_fingerprint,
             session_id,
             accounting_semantics: POOL_ACCOUNTING_SEMANTICS.to_owned(),
             persistence: ledger_persistence(&shared.ledger).to_owned(),
         },
     )?;
     let initial_job = current_job(&shared)?;
+    if pool_job_fingerprint(&shared, initial_job.challenge.height) != session_fingerprint {
+        return Ok(());
+    }
     let mut sent_job_id = initial_job.job_id;
     write_frame(&mut stream, &ServerMessage::Job { job: initial_job })?;
     stream.sock.set_read_timeout(Some(POOL_READ_TIMEOUT))?;
@@ -4503,6 +4513,9 @@ fn handle_connection(
                 // Push the replacement now so miners stop searching a stale
                 // parent instead of learning about it only with their next share.
                 let job = current_job(&shared)?;
+                if pool_job_fingerprint(&shared, job.challenge.height) != session_fingerprint {
+                    return Ok(());
+                }
                 if job.job_id != sent_job_id {
                     sent_job_id = job.job_id;
                     write_frame(&mut stream, &ServerMessage::Job { job })?;
@@ -4511,6 +4524,11 @@ fn handle_connection(
             }
             Err(error) => return Err(error),
         };
+        if pool_job_fingerprint(&shared, current_job(&shared)?.challenge.height)
+            != session_fingerprint
+        {
+            return Ok(());
+        }
         message_count = message_count
             .checked_add(1)
             .ok_or(PoolError::MessageCountLimit)?;
@@ -4544,6 +4562,9 @@ fn handle_connection(
         // its next frame. Rotate again immediately before classifying work.
         rotate_if_tip_changed(&shared)?;
         let before = current_job(&shared)?;
+        if pool_job_fingerprint(&shared, before.challenge.height) != session_fingerprint {
+            return Ok(());
+        }
         let result = if share_rate.allow(Instant::now()) {
             match process_share(&shared, session_id, job_id, nonce) {
                 Ok(result) => result,
@@ -4565,6 +4586,9 @@ fn handle_connection(
             retryable_result(&shared, session_id, job_id, nonce, "share_rate_limited")?
         };
         let after = current_job(&shared)?;
+        if pool_job_fingerprint(&shared, after.challenge.height) != session_fingerprint {
+            return Ok(());
+        }
         if before.job_id != after.job_id || job_id != before.job_id || after.job_id != sent_job_id {
             sent_job_id = after.job_id;
             write_frame(&mut stream, &ServerMessage::Job { job: after })?;
@@ -5915,6 +5939,33 @@ fn current_job(shared: &SharedServer) -> Result<PoolJob, PoolError> {
         .current
         .wire
         .clone())
+}
+
+/// Use the identity of the job being offered on the pool wire. The upgraded
+/// node and ledger keep the fork identity, but pre-activation mining jobs still
+/// use the predecessor rules and must remain reachable by existing miners.
+fn pool_job_fingerprint(shared: &SharedServer, height: u64) -> [u8; 32] {
+    pool_fingerprint_at_height(shared.network_id, shared.consensus_fingerprint, height)
+}
+
+fn pool_fingerprint_at_height(
+    network_id: [u8; 32],
+    consensus_fingerprint: [u8; 32],
+    height: u64,
+) -> [u8; 32] {
+    #[cfg(feature = "compact-mainnet")]
+    {
+        use cmfd_consensus::compact_mainnet_fork::CompactMainnetForkIdentity;
+        let fork = CompactMainnetForkIdentity::pinned();
+        if network_id == fork.network_id
+            && consensus_fingerprint == fork.fingerprint()
+            && height < fork.activation_height
+        {
+            return fork.predecessor_fingerprint;
+        }
+    }
+    let _ = (network_id, height);
+    consensus_fingerprint
 }
 
 /// Registers a connection's session and returns its session ID.
@@ -7698,6 +7749,33 @@ fn decode_hex_32(value: &str) -> Result<[u8; 32], PoolError> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "compact-mainnet")]
+    #[test]
+    fn pool_wire_identity_tracks_the_job_height_across_fork_and_reorg() {
+        use super::pool_fingerprint_at_height;
+        use cmfd_consensus::compact_mainnet_fork::CompactMainnetForkIdentity;
+
+        let fork = CompactMainnetForkIdentity::pinned();
+        let after = fork.fingerprint();
+        assert_eq!(
+            pool_fingerprint_at_height(fork.network_id, after, fork.activation_height - 1),
+            fork.predecessor_fingerprint
+        );
+        assert_eq!(
+            pool_fingerprint_at_height(fork.network_id, after, fork.activation_height),
+            after
+        );
+        assert_eq!(
+            pool_fingerprint_at_height(fork.network_id, after, fork.activation_height - 1),
+            fork.predecessor_fingerprint
+        );
+        assert_eq!(
+            pool_fingerprint_at_height(fork.network_id, fork.predecessor_fingerprint, 1),
+            fork.predecessor_fingerprint
+        );
+        assert_eq!(pool_fingerprint_at_height([0; 32], after, 1), after);
+    }
+
     #[test]
     fn dashboard_keeps_the_newest_payout_transactions() {
         use super::{PoolPayoutTransactionStats, retain_recent_payout_transactions};

@@ -1,0 +1,63 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  // Mainnet web wallet: static app from ../wallet/dist-web plus a narrow edge API.
+  // Signing keys never reach this Worker; it reads the explorer origin and relays to the
+  // mainnet gateway with its own credential (secret GATEWAY_PASSWORD).
+  "name": "commonfoundry-mainnet-wallet",
+  "main": "./worker/index.js",
+  "no_bundle": true,
+  "compatibility_date": "2026-08-30",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [
+    {
+      "pattern": "wallet.commonfoundry.ai",
+      "custom_domain": true
+    }
+  ],
+  "vars": {
+    "TWO_FACTOR_ENROLLMENT_DISABLED": "false",
+    "EXPLORER_ORIGIN": "https://mainnet-explorer-origin.commonfoundry.ai",
+    "EXPECTED_NETWORK_ID": "88296bc39c10e8bc1dd4818d4d42412fe5f08210651110377f495da299812f62",
+    // A hostname, not the bare IP: Cloudflare refuses Worker fetches to IP literals (403).
+    "GATEWAY_URL": "https://sg-rpc.commonfoundry.ai/mainnet",
+    "GATEWAY_USERNAME": "webwallet"
+  },
+  "ratelimits": [
+    {
+      "name": "TWO_FACTOR_LIMIT",
+      "namespace_id": "4103",
+      "simple": { "limit": 10, "period": 60 }
+    },
+    {
+      "name": "WALLET_RPC_LIMIT",
+      "namespace_id": "4101",
+      "simple": { "limit": 30, "period": 60 }
+    },
+    {
+      "name": "WALLET_READ_LIMIT",
+      "namespace_id": "4102",
+      "simple": { "limit": 120, "period": 60 }
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "WALLET_TWO_FACTOR", "class_name": "WalletTwoFactor" },
+      { "name": "WALLET_TWO_FACTOR_CATALOG", "class_name": "WalletTwoFactorCatalog" }
+    ]
+  },
+  "migrations": [{ "tag": "wallet-2fa-v1", "new_sqlite_classes": ["WalletTwoFactor", "WalletTwoFactorCatalog"] }],
+  "assets": {
+    "directory": "./assets",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": true
+  },
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "head_sampling_rate": 0.05
+    }
+  }
+}

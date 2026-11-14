@@ -1,0 +1,9 @@
+{
+  "source_commit": "815b003e3166948bc98b959450089b66346e2da6",
+  "expected_previous_version": "5b00d83c-5b66-4d20-bdda-d740602e2cac",
+  "expected_previous_asset": "/assets/index-CaOtnzYn.js",
+  "expected_asset": "/assets/index-CBG04BGE.js",
+  "network_id": "88296bc39c10e8bc1dd4818d4d42412fe5f08210651110377f495da299812f62",
+  "worker": "commonfoundry-mainnet-wallet",
+  "domain": "wallet.commonfoundry.ai"
+}

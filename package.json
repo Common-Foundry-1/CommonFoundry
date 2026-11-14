@@ -1,0 +1,20 @@
+{
+  "name": "@common-foundry/wallet-edge",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build:app": "npm --prefix ../wallet run build:web",
+    "dev": "wrangler dev",
+    "types": "wrangler types worker/worker-configuration.d.ts --strict-vars false",
+    "check": "tsc -p tsconfig.json --pretty false",
+    "test": "vitest run",
+    "deploy": "npm run build:app && wrangler deploy"
+  },
+  "devDependencies": {
+    "@types/node": "26.4.0",
+    "typescript": "7.0.2",
+    "vitest": "4.1.11",
+    "wrangler": "4.147.0"
+  }
+}

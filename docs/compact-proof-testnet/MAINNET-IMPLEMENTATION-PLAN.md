@@ -25,10 +25,14 @@ Proof selection follows each frozen block/template height, including a
 reorganization across H. Wrong-era proofs fail before relation verification.
 Pool jobs retain their existing stale-tip checks. The proof-worker router
 switches between the inherited version-1 worker and the mainnet compact
-worker, and switches back when a template returns below H. Pool clients still
-submit job IDs and nonces; updated reference miner 1.0.22 accepts the exact
-legacy and new fork pool identities. Version 1.0.21 recognizes the superseded
-65,535 proposal and needs replacement for the new fork pool.
+worker, and switches back when a template returns below H. The pool handshake
+advertises the predecessor fingerprint while its current job is below H, so
+existing miners can keep working before activation. At H it advertises the
+new fingerprint and closes sessions authenticated under the old one; miners
+must reconnect with support for the new identity. Pool clients still submit
+job IDs and nonces; updated reference miner 1.0.22 accepts the exact legacy
+and new fork pool identities. Version 1.0.21 recognizes the superseded
+65,535 proposal and needs replacement to mine at or after H.
 
 The node keeps required replay for historical blocks between the existing
 checkpoint and H. Post-H proof-validated blocks advance the validated frontier

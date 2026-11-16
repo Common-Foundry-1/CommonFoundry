@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Rent a GPU on Common Foundry</title>
-<meta name="description" content="Rent GPUs on the Common Foundry marketplace and pay in CMFD. See the machines available now, what each one has and costs, and download the renter app.">
+<meta name="description" content="Rent GPUs on the Common Foundry marketplace and pay in CMFD. See available machines and prices, and download Common Foundry Hub for Windows or Linux.">
 <link rel="icon" href="/assets/common-foundry-mark.png">
 <style>
 @font-face { font-family: "Rajdhani"; font-style: normal; font-weight: 600; font-display: swap; src: url("/exchanges/fonts/rajdhani-latin-600-normal.woff2") format("woff2"); }
@@ -123,10 +123,10 @@ footer a:hover { color: var(--accent); }
   <div class="hero">
     <div class="eyebrow">GPU marketplace</div>
     <h1>Rent a GPU. Pay in CMFD.</h1>
-    <p class="lede">Pick a machine below, run the <strong>renter app</strong> on your own PC, and get a container with SSH on a verified GPU. You pay the host directly from a wallet that stays on your computer, by the second, and unused deposit comes back when you stop.</p>
+    <p class="lede">Pick a machine below, open <strong>Common Foundry Hub</strong> on your own PC, and get a container with SSH on a verified GPU. You pay the host directly from a wallet that stays on your computer, by the second, and unused deposit comes back when you stop.</p>
     <div class="hero-actions">
-      <a class="button primary" href="https://github.com/Common-Foundry-1/CommonFoundry-Marketplace-Binaries/releases/latest/download/CMFD-Renter-Kit-Windows.zip">Download for Windows</a>
-      <a class="button" href="https://github.com/Common-Foundry-1/CommonFoundry-Marketplace-Binaries/releases/latest/download/CMFD-Renter-Kit-Linux.zip">Download for Linux</a>
+      <a class="button primary" href="https://github.com/Common-Foundry-1/CommonFoundry-Marketplace-Binaries/releases/latest/download/CommonFoundry-Windows.exe">Download for Windows</a>
+      <a class="button" href="https://github.com/Common-Foundry-1/CommonFoundry-Marketplace-Binaries/releases/latest/download/CommonFoundry-Linux.tar.gz">Download for Linux</a>
       <span class="fine">Latest release · <a href="https://github.com/Common-Foundry-1/CommonFoundry-Marketplace-Binaries/releases/latest">checksums and notes</a></span>
     </div>
   </div>
@@ -145,16 +145,17 @@ footer a:hover { color: var(--accent); }
     <h2 id="how-title">How renting works</h2>
     <ol class="steps">
       <li>
-        <h3>Download and start the renter app</h3>
-        <p>Unzip the kit and double-click <strong>Start CMFD Renter</strong> (Linux: <code>./start-cmfd-renter.sh</code>). It sets itself up on your PC, including its own Python, and connects to Common Foundry's node. No account, no sign-up form.</p>
+        <h3>Download and open Common Foundry Hub</h3>
+        <p>On Windows, run <code>CommonFoundry-Windows.exe</code>. On Linux, extract <code>CommonFoundry-Linux.tar.gz</code> and run <code>./CommonFoundry</code>. In <strong>Rent</strong>, connect an existing renter profile or set up this computer. No separate Python installation or account is required.</p>
+        <p>The Hub checks for signed updates when it opens and every 15 minutes while running. Updates preserve your wallet, settings and active rentals.</p>
       </li>
       <li>
         <h3>Fund your renter wallet</h3>
-        <p>The app creates a separate spending wallet and shows its address. Send it a few CMFD from your own wallet. About 3 CMFD covers a first hour; the exact deposit is shown before you confirm. The passphrase file it names is yours to keep.</p>
+        <p>Open <strong>Wallet</strong> in the Hub to see your renter wallet's address. Fund it with enough CMFD for the deposit shown in your rental quote and network fees. Keep your wallet backup and passphrase safe.</p>
       </li>
       <li>
         <h3>Pick a GPU and a template</h3>
-        <p>Choose a machine, then a template: PyTorch with Jupyter, a CUDA terminal, ComfyUI, Ollama, Qwen inference or vLLM. Confirm the quote. The app pays the host as the rental runs and renews only while you keep it open.</p>
+        <p>Choose a machine, then a template: PyTorch with Jupyter, a CUDA terminal, ComfyUI, Ollama, Qwen inference or vLLM. Review the price, deposit and rental limits before confirming. Closing the Hub window does not stop an active rental. Use <strong>Stop</strong> in <strong>My rentals</strong> to end it.</p>
       </li>
       <li>
         <h3>Connect over SSH</h3>

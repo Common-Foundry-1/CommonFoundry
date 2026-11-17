@@ -127,15 +127,18 @@ mod tests {
     #[test]
     fn dedicated_idle_check_refuses_selected_workloads_and_unknown_inventory() {
         let gpu = "GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_owned();
-        assert!(validate_idle_devices(&[gpu.clone()], "").is_ok());
+        assert!(validate_idle_devices(std::slice::from_ref(&gpu), "").is_ok());
         assert!(
             validate_idle_devices(
-                &[gpu.clone()],
+                std::slice::from_ref(&gpu),
                 "GPU-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb, 12, other"
             )
             .is_ok()
         );
-        assert!(validate_idle_devices(&[gpu.clone()], &format!("{gpu}, 13, miner")).is_err());
+        assert!(
+            validate_idle_devices(std::slice::from_ref(&gpu), &format!("{gpu}, 13, miner"))
+                .is_err()
+        );
         assert!(validate_idle_devices(&[gpu], "unknown inventory").is_err());
     }
     #[test]
@@ -153,7 +156,7 @@ mod tests {
             .open(directory.join(format!(".pool-miner-{}.lock", uuid.to_ascii_lowercase())))
             .unwrap();
         lock.try_lock_exclusive().unwrap();
-        assert!(PoolGpuLease::acquire_at(&[uuid.clone()], &directory).is_err());
+        assert!(PoolGpuLease::acquire_at(std::slice::from_ref(&uuid), &directory).is_err());
         FileExt::unlock(&lock).unwrap();
         let pool = PoolGpuLease::acquire_at(
             &[

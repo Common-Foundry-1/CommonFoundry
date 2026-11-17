@@ -34,11 +34,20 @@ wallet. It does not approve an actual ledger adjustment or money movement.
 - A distributed PPLNS reward that becomes orphaned, unknown, or falls below
   coinbase maturity creates a durable incident for its frozen recipients.
 - A hold lifts itself once the chain contradicts it: a reward block that is
-  canonical and mature again, a payout confirmed `COINBASE_MATURITY` deep, or
-  a funding shortfall once mature funds cover every outstanding credit. The
+  canonical and mature again, a payout confirmed `COINBASE_MATURITY` deep, an
+  unchanged prepared/broadcast payout that validates again without conflicting
+  pool signatures, mempool spends or exchange withdrawal reservations, or a
+  funding shortfall once mature funds cover every outstanding credit. The
   pool first requires full funding coverage, exactly as a manual reconcile
   does, and records the same receipt with an "automatic:" note. Legacy
   abandoned-payment incidents still wait for an operator.
+- A next-block validation error creates `missing_payout_funding` only when an
+  input is absent from the current chain UTXO set. An immature input or another
+  validation rejection with all inputs present retains the exact signed payment
+  and its credit reservation for retry. The sweep logs the validation error,
+  transaction ID, chain tip, next height and any absent outpoints on each new
+  chain observation. Missing inputs can return after a reorganization; their
+  absence never authorizes discarding or replacing a signature.
 - Reconciliation, incidents and automatic payouts wait while the node is below
   the chain height the ledger last reconciled against, as after a restart on a
   node that is still catching up. Fewer confirmations from a node that is
@@ -84,6 +93,11 @@ wallet. It does not approve an actual ledger adjustment or money movement.
    service's value): each recipient and amount in the order the pool would pay
    them, with the totals in `planned_payout_atoms` and
    `planned_payout_fees_atoms`. Nothing is signed or sent.
+   `reserved_payout_inputs` lists `payout_txid`, `input_txid` and `input_index`
+   for each input the pool planner excludes, including held and legacy abandoned
+   signatures. A separate wallet sharing the key must exclude those outpoints
+   and coordinate with the stopped pool: this offline snapshot does not lock
+   inputs in another process or remain current after the pool resumes.
 4. Reconcile funding and signed-payment history. A separate, explicitly authorized
    operator top-up may be needed. This command does **not** fund the wallet or
    authorize an external transfer. Sync any newly confirmed funding, stop, and

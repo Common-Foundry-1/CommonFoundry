@@ -121,8 +121,8 @@ impl ChannelTerms {
         {
             return Err(ChannelError::Terms);
         }
-        VerifyingKey::from_bytes(&self.customer_key).map_err(|_| ChannelError::Terms)?;
-        VerifyingKey::from_bytes(&self.provider_key).map_err(|_| ChannelError::Terms)?;
+        VerifyingKey::from_slice(&self.customer_key).map_err(|_| ChannelError::Terms)?;
+        VerifyingKey::from_slice(&self.provider_key).map_err(|_| ChannelError::Terms)?;
         Ok(())
     }
 
@@ -404,7 +404,7 @@ fn rounded_token_charge(tokens: u64, price_per_1000: u64) -> Result<u64, Channel
 }
 
 fn verify_signature(key: &[u8; 32], digest: &[u8; 32], bytes: &[u8]) -> Result<(), ChannelError> {
-    let key = VerifyingKey::from_bytes(key).map_err(|_| ChannelError::MalformedSignature)?;
+    let key = VerifyingKey::from_slice(key).map_err(|_| ChannelError::MalformedSignature)?;
     let signature = Signature::try_from(bytes).map_err(|_| ChannelError::MalformedSignature)?;
     key.verify(digest, &signature)
         .map_err(|_| ChannelError::InvalidSignature)
@@ -486,7 +486,7 @@ mod tests {
     use super::*;
 
     fn key(byte: u8) -> SigningKey {
-        SigningKey::from_bytes(&[byte; 32]).unwrap()
+        SigningKey::from_slice(&[byte; 32]).unwrap()
     }
 
     fn public(key: &SigningKey) -> [u8; 32] {

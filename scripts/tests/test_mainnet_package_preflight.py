@@ -87,6 +87,9 @@ class MainnetPreflightTests(unittest.TestCase):
             target = frozen / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes((real_repo / relative).read_bytes().replace(b"\r\n", b"\n"))
+            if relative.endswith("/h-manifest.conf"):
+                target.write_bytes(b"\n".join(b"CUSTOM_VERSION=1.0.20" if line.startswith(b"CUSTOM_VERSION=") else line
+                                             for line in target.read_bytes().split(b"\n")))
         for relative in ("crates/cmfd-node/Cargo.toml", "crates/cmfd-miner/Cargo.toml", "apps/wallet/src-tauri/Cargo.toml"):
             target = frozen / relative
             target.parent.mkdir(parents=True, exist_ok=True)

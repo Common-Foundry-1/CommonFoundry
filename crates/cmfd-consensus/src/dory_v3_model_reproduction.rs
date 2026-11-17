@@ -714,7 +714,7 @@ fn validate_report(
             "required anchor or digest is zero",
         ));
     }
-    VerifyingKey::from_bytes(&report.reproducer_public_key).map_err(|_| {
+    VerifyingKey::from_slice(&report.reproducer_public_key).map_err(|_| {
         ProductionDoryV3ModelReproductionReportError::Invalid("reproducer public key")
     })?;
     if !(1..=2).contains(&report.target_id) {
@@ -1253,7 +1253,7 @@ mod tests {
 
     fn keys(count: usize, offset: u8) -> Vec<SigningKey> {
         (0..count)
-            .map(|index| SigningKey::from_bytes(&[offset.wrapping_add(index as u8); 32]).unwrap())
+            .map(|index| SigningKey::from_slice(&[offset.wrapping_add(index as u8); 32]).unwrap())
             .collect()
     }
 

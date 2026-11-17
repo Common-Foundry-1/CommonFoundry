@@ -5,7 +5,7 @@ use cmfd_consensus::compact_mainnet_fork::{
 };
 
 fn config(address: SocketAddr, pin: [u8; 32], signed: bool) -> PoolClientConfig {
-    let signer = PoolPayoutSigner::new(SigningKey::from_bytes(&[0x13; 32]).unwrap());
+    let signer = PoolPayoutSigner::new(SigningKey::from_slice(&[0x13; 32]).unwrap());
     PoolClientConfig {
         address,
         certificate_sha256: pin,
@@ -85,7 +85,7 @@ fn mock_pool(
         assert_eq!(worker, "fork-compat-test");
         if signed {
             let digest = payout_auth_digest(network_id, advertised, nonce, &worker, payout);
-            VerifyingKey::from_bytes(&payout)
+            VerifyingKey::from_slice(&payout)
                 .unwrap()
                 .verify(
                     &digest,

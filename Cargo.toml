@@ -18,6 +18,7 @@ exclude = [
     "third_party/p3-util-0.6.3-msrv",
     "third_party/glib-0.18.5-variant-str-iter",
     "tools/linux-wallet-dependency-check",
+    "third_party/ndarray-npy-0.8.1-zip9",
 ]
 resolver = "2"
 
@@ -36,7 +37,7 @@ ctrlc = "3.4"
 fs2 = "0.4.3"
 getrandom = "0.3.4"
 hex = "0.4"
-k256 = { version = "0.13", features = ["schnorr"] }
+k256 = { version = "=0.14.0", features = ["schnorr"] }
 libloading = "0.8.9"
 primitive-types = "0.13"
 rayon = "=1.12.0"
@@ -51,6 +52,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zeroize = "1.9.0"
 
 [patch.crates-io]
+# Preserve the optional NPY adapter API while using the patched ZIP implementation.
+ndarray-npy = { path = "third_party/ndarray-npy-0.8.1-zip9" }
 # GTK3/Tauri requires GLib 0.18. Preserve its API and backport upstream's
 # two-line VariantStrIter out-pointer fix (RUSTSEC-2024-0429).
 glib = { path = "third_party/glib-0.18.5-variant-str-iter" }

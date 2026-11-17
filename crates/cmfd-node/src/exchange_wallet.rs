@@ -24,9 +24,8 @@ use cmfd_consensus::{
     TRANSACTION_VERSION, Transaction, TxInput, TxOutput,
 };
 use k256::elliptic_curve::PrimeField;
-use k256::elliptic_curve::bigint::U256;
 use k256::elliptic_curve::ops::Reduce;
-use k256::elliptic_curve::sec1::ToEncodedPoint;
+use k256::elliptic_curve::sec1::ToSec1Point;
 use k256::schnorr::SigningKey;
 use k256::{FieldBytes, NonZeroScalar, ProjectivePoint, PublicKey, Scalar};
 use serde::{Deserialize, Serialize};
@@ -378,21 +377,22 @@ struct Keys {
 
 impl Keys {
     fn tweak(&self, chain: KeyChain, index: u32) -> Scalar {
-        let digest = Sha256::new()
+        let digest: [u8; 32] = Sha256::new()
             .chain_update(DERIVATION_TAG)
             .chain_update(self.master_public_bytes)
             .chain_update(self.chain_code)
             .chain_update([chain.byte()])
             .chain_update(index.to_be_bytes())
-            .finalize();
-        <Scalar as Reduce<U256>>::reduce_bytes(&digest)
+            .finalize()
+            .into();
+        <Scalar as Reduce<FieldBytes>>::reduce(&FieldBytes::from(digest))
     }
 
     /// Public derivation: works without the master secret.
     fn address(&self, chain: KeyChain, index: u32) -> [u8; 32] {
         let point = (self.master_public + ProjectivePoint::GENERATOR * self.tweak(chain, index))
             .to_affine()
-            .to_encoded_point(true);
+            .to_sec1_point(true);
         let mut address = [0_u8; 32];
         address.copy_from_slice(point.x().expect("a derived key is never the identity"));
         address
@@ -406,7 +406,7 @@ impl Keys {
             })?;
         let child: Zeroizing<[u8; 32]> =
             Zeroizing::new((master + self.tweak(chain, index)).to_bytes().into());
-        SigningKey::from_bytes(child.as_ref())
+        SigningKey::from_slice(child.as_ref())
             .map_err(|_| WalletError::Wallet("a derived signing key is invalid".to_owned()))
     }
 }
@@ -416,7 +416,7 @@ fn public_from_secret(secret: &[u8; 32]) -> Result<(ProjectivePoint, [u8; 33]), 
         .ok_or_else(|| WalletError::Wallet("the master secret is not a valid key".to_owned()))?;
     let point = ProjectivePoint::GENERATOR * *scalar;
     let mut bytes = [0_u8; 33];
-    bytes.copy_from_slice(point.to_affine().to_encoded_point(true).as_bytes());
+    bytes.copy_from_slice(point.to_affine().to_sec1_point(true).as_bytes());
     Ok((point, bytes))
 }
 
@@ -1928,6 +1928,41 @@ pub fn format_amount(atoms: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn derived_addresses_and_keys_match_the_previous_library() {
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../../cmfd-consensus/tests/fixtures/legacy-schnorr.json"
+        ))
+        .unwrap();
+        for row in vectors["derivations"].as_array().unwrap() {
+            let secret: [u8; 32] = hex::decode(row["master_secret"].as_str().unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap();
+            let chain_code = hex::decode(row["chain_code"].as_str().unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap();
+            let (master_public, master_public_bytes) = super::public_from_secret(&secret).unwrap();
+            let keys = super::Keys {
+                master_public,
+                master_public_bytes,
+                chain_code,
+                secret: Some(zeroize::Zeroizing::new(secret)),
+            };
+            let chain = if row["chain"].as_u64().unwrap() == 0 {
+                super::KeyChain::Receive
+            } else {
+                super::KeyChain::Change
+            };
+            let index = u32::try_from(row["index"].as_u64().unwrap()).unwrap();
+            assert_eq!(hex::encode(keys.address(chain, index)), row["address"]);
+            assert_eq!(
+                hex::encode(keys.signing_key(chain, index).unwrap().to_bytes()),
+                row["signing_key"]
+            );
+        }
+    }
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use cmfd_consensus::wire::{decode_block, decode_transaction};
@@ -2152,7 +2187,7 @@ mod tests {
     }
 
     fn outside_address() -> [u8; 32] {
-        let key = SigningKey::random(&mut k256::elliptic_curve::rand_core::OsRng);
+        let key = <k256::schnorr::SigningKey as k256::elliptic_curve::Generate>::generate();
         key.verifying_key().to_bytes().into()
     }
 

@@ -85,7 +85,7 @@ pub struct SignedWithdrawal {
 /// Creates a new key file (create-new, owner-only on Unix) and returns the
 /// key's destination (x-only public key).
 pub fn create_key_file(path: &Path) -> Result<[u8; 32], ExchangeTxError> {
-    let key = SigningKey::random(&mut k256::elliptic_curve::rand_core::OsRng);
+    let key = <k256::schnorr::SigningKey as k256::elliptic_curve::Generate>::generate();
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -135,7 +135,7 @@ pub fn read_key_file(path: &Path) -> Result<SigningKey, ExchangeTxError> {
             path.display()
         )));
     }
-    SigningKey::from_bytes(secret.as_ref())
+    SigningKey::from_slice(secret.as_ref())
         .map_err(|_| invalid(format!("key file `{}` is not a valid key", path.display())))
 }
 
@@ -303,7 +303,7 @@ fn destination(value: &str, field: &str) -> Result<[u8; 32], ExchangeTxError> {
             "{field} must be 64 lowercase hexadecimal characters or a {hrp}1... address ({error})"
         ))
     })?;
-    VerifyingKey::from_bytes(&bytes)
+    VerifyingKey::from_slice(&bytes)
         .map_err(|_| invalid(format!("{field} is not a valid x-only public key")))?;
     Ok(bytes)
 }

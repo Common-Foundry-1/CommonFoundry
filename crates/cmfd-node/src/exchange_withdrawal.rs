@@ -1223,7 +1223,7 @@ fn lock_node(shared: &Arc<Mutex<Node>>) -> Result<MutexGuard<'_, Node>, Exchange
 
 fn validate_request(request: &WithdrawalRequest) -> Result<(), ExchangeWithdrawalError> {
     validate_request_id(&request.request_id)?;
-    VerifyingKey::from_bytes(&request.destination)
+    VerifyingKey::from_slice(&request.destination)
         .map_err(|_| ExchangeWithdrawalError::InvalidDestination)?;
     if request.amount_atoms == 0 {
         return Err(ExchangeWithdrawalError::InvalidAmount);
@@ -1403,7 +1403,7 @@ fn validate_signed_transaction(
             "signed withdrawal does not match its durable intent",
         ));
     }
-    let key = VerifyingKey::from_bytes(&wallet_destination)
+    let key = VerifyingKey::from_slice(&wallet_destination)
         .map_err(|_| ExchangeWithdrawalError::Corrupt("stored wallet destination is invalid"))?;
     for input in &transaction.inputs {
         let InputWitness::Key {
@@ -3094,7 +3094,7 @@ mod tests {
     }
 
     fn key(marker: u8) -> SigningKey {
-        SigningKey::from_bytes(&[marker; 32]).expect("test scalar is nonzero")
+        SigningKey::from_slice(&[marker; 32]).expect("test scalar is nonzero")
     }
 
     fn destination(marker: u8) -> [u8; 32] {

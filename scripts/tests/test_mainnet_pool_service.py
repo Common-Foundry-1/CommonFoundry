@@ -110,6 +110,39 @@ class MainnetPoolServiceTests(unittest.TestCase):
     def save_config(self):
         self.config_path.write_text(json.dumps(self.config), encoding="utf-8")
 
+    def fork_package(self):
+        names=["cmfd-mainnet-fork-prover","fork-prover.py","cmfd-direct-multigpu-prover","coordinator.py","shared_model.py","cmfd-direct-multigpu-worker","real_bank0_relations"]
+        files={}
+        for name in names:
+            relative="production-v4/"+name;path=self.root/relative
+            if not path.exists():path.write_bytes(("fork component "+name).encode())
+            data=path.read_bytes();files[relative]={"bytes":len(data),"sha256":digest(data)}
+        v={"schema":"CMFD_MAINNET_FORK_RUNTIME_V1","network_id":self.plan["network_id"],"activation_height":67535,"consensus_fingerprint":"9009948f6eab38b5b3dcee13eda9f6ef03e0db863c435cb97c1d4c3e124eb360","compact_proof_system_digest":"d1671fc4760134bf86f0b37d8694f4827037e5cea2642e312cb2eb705f3aef0d","files":files}
+        self.write_fork_manifest(v);self.config["serial_gpu"]=True;self.save_config();return v
+
+    def write_fork_manifest(self,v):
+        data=json.dumps(v).encode();(self.root/"FORK-RUNTIME.json").write_bytes(data);self.config["expected_fork_manifest_sha256"]=digest(data)
+
+    def test_fork_package_routes_proofs_and_pins_every_loaded_component(self):
+        manifest=self.fork_package();config,_,_=self.preflight()
+        command=pool.build_command(self.root,self.state,self.credential_base,config)
+        self.assertEqual(command[command.index("--production-v4-pool-proof-worker")+1],str(self.root/"production-v4/cmfd-mainnet-fork-prover"))
+        self.assertIn("--production-v4-pool-serial-gpu",command)
+        for name in manifest["files"]:
+            with self.subTest(component=name):
+                p=self.root/name;original=p.read_bytes();p.write_bytes(original+b"changed")
+                with self.assertRaises(pool.PreflightError):self.preflight()
+                p.write_bytes(original)
+
+    def test_fork_identity_and_explicit_manifest_pin_are_required(self):
+        manifest=self.fork_package()
+        for field,value in [("activation_height",65535),("consensus_fingerprint","5b"*32),("compact_proof_system_digest","e8"*32)]:
+            with self.subTest(field=field):
+                changed=dict(manifest);changed[field]=value;self.write_fork_manifest(changed);self.save_config()
+                with self.assertRaises(pool.PreflightError):self.preflight()
+        self.write_fork_manifest(manifest);self.config.pop("expected_fork_manifest_sha256");self.save_config()
+        with self.assertRaises(pool.PreflightError):self.preflight()
+
     def preflight(self):
         actual_regular = pool.regular
         def no_owner_check(path, label, *, static=False):
@@ -497,7 +530,8 @@ class MainnetPoolServiceTests(unittest.TestCase):
 
     def test_shipped_example_needs_an_explicit_rc_choice(self):
         example = pool.strict_json((SOURCE / "mainnet-pool.json.example").read_bytes(), "example")
-        self.assertEqual(set(example), pool.CONFIG_FIELDS | {pool.PREVIOUS_RC_FIELD})
+        self.assertEqual(set(example), pool.CONFIG_FIELDS | {pool.PREVIOUS_RC_FIELD,"expected_fork_manifest_sha256","serial_gpu"})
+        self.assertTrue(example["serial_gpu"])
         with self.assertRaises(pool.PreflightError):
             pool.validate_config(example)
         # Fill every other placeholder; the RC choice placeholder is still refused.

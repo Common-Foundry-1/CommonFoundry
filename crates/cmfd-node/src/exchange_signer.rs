@@ -383,7 +383,7 @@ mod tests {
     };
 
     fn signing_key(marker: u8) -> SigningKey {
-        SigningKey::from_bytes(&[marker; 32]).unwrap()
+        SigningKey::from_slice(&[marker; 32]).unwrap()
     }
 
     fn public_key(key: &SigningKey) -> [u8; 32] {

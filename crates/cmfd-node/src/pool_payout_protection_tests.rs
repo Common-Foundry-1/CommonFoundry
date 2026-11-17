@@ -652,9 +652,10 @@ fn pending_protection_payments(
     let ledger = protection_ledger(node);
     let mut payments = Vec::new();
     for index in 0..count {
-        let payout =
-            PoolPayoutSigner::new(SigningKey::from_bytes(&[0x80 + index as u8; 32]).unwrap())
-                .payout();
+        let payout = PoolPayoutSigner::new(
+            SigningKey::from_bytes((&[0x80 + index as u8; 32]).into()).unwrap(),
+        )
+        .payout();
         register_session(
             &ledger,
             index as u64 + 1,

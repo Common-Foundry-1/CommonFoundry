@@ -84,6 +84,10 @@ pub struct PoolPayoutProtectionReport {
     pub funding_shortfall_atoms: String,
     pub automatic_payout_fee_atoms: String,
     pub blocking_signed_transactions: Vec<String>,
+    /// Inputs excluded by the pool's wallet planner, including held and legacy
+    /// abandoned signatures. Snapshot only; a separate wallet must coordinate
+    /// with the pool before selecting inputs.
+    pub reserved_payout_inputs: Vec<PoolPayoutInputReservation>,
     pub legacy_abandoned_transactions_require_review: bool,
     /// Dry run of the next automatic payout run at this minimum: every
     /// payment it would make, in order, without signing or sending anything.
@@ -92,6 +96,13 @@ pub struct PoolPayoutProtectionReport {
     pub planned_payouts: Vec<PlannedPayoutView>,
     pub planned_payout_atoms: String,
     pub planned_payout_fees_atoms: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PoolPayoutInputReservation {
+    pub payout_txid: String,
+    pub input_txid: String,
+    pub input_index: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -362,7 +373,8 @@ fn coverage(node: &Node, ledger: &Ledger, fee_atoms: u64) -> Result<Coverage, Po
 
 /// Lifts holds the chain has since contradicted, without an operator: a
 /// reward block that is canonical and mature again, a payout confirmed
-/// `COINBASE_MATURITY` deep, or a funding shortfall once mature funds cover
+/// `COINBASE_MATURITY` deep, an unchanged pending payout that validates again
+/// without input conflicts, or a funding shortfall once mature funds cover
 /// every outstanding credit again. Like a manual reconcile it first requires
 /// full coverage, and it records the same receipt with an automatic note.
 /// Legacy-payment incidents always wait for an operator.
@@ -387,6 +399,7 @@ pub(super) fn auto_resolve(
         if funds.assets < funds.required {
             return Ok(());
         }
+        let blocked: HashSet<_> = blocking_signed_transactions(node, state).into_iter().collect();
         let cleared = state
             .payout_protection
             .incidents
@@ -406,15 +419,24 @@ pub(super) fn auto_resolve(
                             })?
                     }
                     Reason::MissingPayoutFunding => {
-                        let record = state.payout_transactions.get(&incident.payout_txid?)?;
-                        (record.state == PoolPayoutTransactionState::Confirmed
-                            && record.confirmations >= COINBASE_MATURITY)
-                            .then(|| {
-                                format!(
-                                    "automatic: payout confirmed with {} confirmations",
-                                    record.confirmations
-                                )
-                            })?
+                        let txid = incident.payout_txid?;
+                        let record = state.payout_transactions.get(&txid)?;
+                        if record.state == PoolPayoutTransactionState::Confirmed
+                            && record.confirmations >= COINBASE_MATURITY
+                        {
+                            format!(
+                                "automatic: payout confirmed with {} confirmations",
+                                record.confirmations
+                            )
+                        } else if matches!(
+                            record.state,
+                            PoolPayoutTransactionState::Prepared | PoolPayoutTransactionState::Broadcast
+                        ) && !blocked.contains(&txid)
+                        {
+                            "automatic: unchanged signed payout validates again without input conflicts".into()
+                        } else {
+                            return None;
+                        }
                     }
                     Reason::FundingShortfall => {
                         "automatic: mature funds cover every outstanding credit again".to_owned()
@@ -609,11 +631,35 @@ pub(super) fn refresh_payment_states(
                 } else if matches!(
                     status,
                     PoolPayoutTransactionState::Prepared | PoolPayoutTransactionState::Broadcast
-                ) && node
-                    .state
-                    .validate_transactions_for_next_block(std::slice::from_ref(&record.transaction))
-                    .is_err()
-                {
+                ) {
+                    let Err(error) = node.state.validate_transactions_for_next_block(
+                        std::slice::from_ref(&record.transaction),
+                    ) else {
+                        return None;
+                    };
+                    // Validation also rejects immature inputs and malformed
+                    // transactions. That does not prove funding disappeared.
+                    // Retain the exact signature and credit reservation and
+                    // retry; only absent chain inputs warrant this incident.
+                    let missing: Vec<_> = record
+                        .transaction
+                        .inputs
+                        .iter()
+                        .filter(|input| node.state.utxos().get(&input.previous).is_none())
+                        .map(|input| {
+                            format!("{}:{}", hex::encode(input.previous.txid), input.previous.index)
+                        })
+                        .collect();
+                    if record.absent_through != scanned_tip || record.state != status {
+                        tracing::warn!(
+                            txid = %hex::encode(id), tip = %hex::encode(node.state.tip()),
+                            next_height, error = %error, missing_inputs = ?missing,
+                            "pool payout validation failed; signed transaction and reservation retained"
+                        );
+                    }
+                    if missing.is_empty() {
+                        return None;
+                    }
                     Reason::MissingPayoutFunding
                 } else {
                     return None;
@@ -648,14 +694,15 @@ pub(super) fn refresh_payment_states(
     Ok(())
 }
 
-fn blocking_signed_transactions(node: &Node, ledger: &Ledger) -> Vec<String> {
+fn blocking_signed_transactions(node: &Node, ledger: &Ledger) -> Vec<[u8; 32]> {
     let mut input_counts = HashMap::new();
-    for record in ledger.payout_transactions.values().filter(|r| {
-        matches!(
-            r.state,
-            PoolPayoutTransactionState::Prepared | PoolPayoutTransactionState::Broadcast
-        )
-    }) {
+    // Legacy abandoned records still carry live signatures and reserve inputs
+    // in the wallet planner. They must also block a conflicting retry.
+    for record in ledger
+        .payout_transactions
+        .values()
+        .filter(|r| r.state != PoolPayoutTransactionState::Confirmed)
+    {
         for input in &record.transaction.inputs {
             *input_counts.entry(input.previous).or_insert(0usize) += 1;
         }
@@ -674,22 +721,22 @@ fn blocking_signed_transactions(node: &Node, ledger: &Ledger) -> Vec<String> {
                 .state
                 .validate_transactions_for_next_block(std::slice::from_ref(&record.transaction))
                 .is_err();
-            let conflicts = record
-                .transaction
-                .inputs
-                .iter()
-                .any(|input| input_counts[&input.previous] > 1)
-                || node.mempool.iter().any(|(other_id, entry)| {
-                    other_id != id
-                        && entry.transaction.inputs.iter().any(|input| {
-                            record
-                                .transaction
-                                .inputs
-                                .iter()
-                                .any(|pending| pending.previous == input.previous)
-                        })
-                });
-            (invalid || conflicts).then(|| hex::encode(id))
+            let conflicts = record.transaction.inputs.iter().any(|input| {
+                input_counts[&input.previous] > 1
+                    || node
+                        .exchange_withdrawal_reservations
+                        .contains_key(&input.previous)
+            }) || node.mempool.iter().any(|(other_id, entry)| {
+                other_id != id
+                    && entry.transaction.inputs.iter().any(|input| {
+                        record
+                            .transaction
+                            .inputs
+                            .iter()
+                            .any(|pending| pending.previous == input.previous)
+                    })
+            });
+            (invalid || conflicts).then_some(*id)
         })
         .collect()
 }
@@ -737,7 +784,26 @@ fn report(
         fee_reserve_atoms: funds.fees.to_string(),
         funding_shortfall_atoms: funds.required.saturating_sub(funds.assets).to_string(),
         automatic_payout_fee_atoms: fee_atoms.to_string(),
-        blocking_signed_transactions: blocking_signed_transactions(node, &state),
+        blocking_signed_transactions: blocking_signed_transactions(node, &state)
+            .into_iter()
+            .map(hex::encode)
+            .collect(),
+        reserved_payout_inputs: state
+            .payout_transactions
+            .iter()
+            .filter(|(_, record)| record.state != PoolPayoutTransactionState::Confirmed)
+            .flat_map(|(txid, record)| {
+                record
+                    .transaction
+                    .inputs
+                    .iter()
+                    .map(move |input| PoolPayoutInputReservation {
+                        payout_txid: hex::encode(txid),
+                        input_txid: hex::encode(input.previous.txid),
+                        input_index: input.previous.index,
+                    })
+            })
+            .collect(),
         legacy_abandoned_transactions_require_review: state
             .payout_transactions
             .values()

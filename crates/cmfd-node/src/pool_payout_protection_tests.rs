@@ -1,6 +1,8 @@
 // Accounting/transport tests use the tiny reference proof, not a GPU/mainnet
 // proof qualification. All nodes, keys and ledgers are isolated test fixtures.
 
+use cmfd_consensus::{InputWitness, OutPoint, TRANSACTION_VERSION, TxInput, TxOutput};
+
 #[test]
 fn payout_guard_missing_or_torn_state_never_falls_back() {
     for failure in [
@@ -610,6 +612,357 @@ fn payout_hold_lifts_itself_once_the_payout_is_confirmed_deep_enough() {
     assert_eq!(ledger.state.lock().unwrap().generation, generation);
 }
 
+/// Real signatures on separate outputs, optionally locked for a few more
+/// blocks. Plenty of unrelated mature coins remain to cover the pool credits.
+fn pending_protection_payments(
+    node: &mut Node,
+    count: usize,
+    delay: u64,
+) -> (DurableLedger, Vec<Transaction>, u64) {
+    let owner = node.wallet_destination();
+    let mine = |node: &mut Node| {
+        node.mine_once(
+            owner,
+            crate::DEVNET_GENESIS_TIMESTAMP + node.state.next_height() * 60,
+            10_000,
+        )
+        .unwrap();
+    };
+    for _ in 0..COINBASE_MATURITY + 12 {
+        mine(node);
+    }
+    let spendable_height = node.state.next_height() + delay;
+    let (mut funding, _) = node
+        .prepare_dev_wallet_payment(owner, count as u64 * 121, 1)
+        .unwrap();
+    let change = funding.outputs.split_off(1);
+    funding.outputs = (0..count)
+        .map(|_| TxOutput {
+            value: 121,
+            lock: OutputLock::Key(owner),
+            spendable_height,
+        })
+        .collect();
+    funding.outputs.extend(change);
+    funding
+        .sign_all(&vec![&node.wallet_signing_key; funding.inputs.len()])
+        .unwrap();
+    node.submit_transaction(funding.clone()).unwrap();
+    mine(node);
+    let ledger = protection_ledger(node);
+    let mut payments = Vec::new();
+    for index in 0..count {
+        let payout =
+            PoolPayoutSigner::new(SigningKey::from_bytes(&[0x80 + index as u8; 32]).unwrap())
+                .payout();
+        register_session(
+            &ledger,
+            index as u64 + 1,
+            format!("pending-{index}"),
+            payout,
+        )
+        .unwrap();
+        credit_accepted_share(&ledger, index as u64 + 1, 120).unwrap();
+        let mut transaction = Transaction {
+            network_id: node.params.network_id,
+            version: TRANSACTION_VERSION,
+            inputs: vec![TxInput {
+                previous: OutPoint {
+                    txid: funding.txid(),
+                    index: index as u32,
+                },
+                witness: InputWitness::Key {
+                    public_key: owner,
+                    signature: Vec::new(),
+                },
+            }],
+            outputs: vec![TxOutput {
+                value: 120,
+                lock: OutputLock::Key(payout),
+                spendable_height: 0,
+            }],
+        };
+        transaction.sign_all(&[&node.wallet_signing_key]).unwrap();
+        ledger
+            .transaction(|state| {
+                state.payout_transactions.insert(
+                    transaction.txid(),
+                    PayoutTransactionRecord {
+                        payout,
+                        amount_atoms: 120,
+                        fee_atoms: 1,
+                        transaction: transaction.clone(),
+                        state: PoolPayoutTransactionState::Prepared,
+                        confirmations: 0,
+                        created_at: Some(PayoutTransactionLocation {
+                            height: node.state.next_height() - 1,
+                            block_id: node.state.tip(),
+                        }),
+                        confirmed_at: None,
+                        absent_through: None,
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+        payments.push(transaction);
+    }
+    (ledger, payments, spendable_height)
+}
+
+#[test]
+fn payout_validation_retry_recovers_nine_unchanged_payments_after_restart() {
+    let root = TestRoot::new("payout-validation-retry-batch");
+    let data = root.path().join("node");
+    let mut node = Node::open_with_profile(&data, crate::DEVNET_PROFILE).unwrap();
+    let (ledger, payments, spendable_height) = pending_protection_payments(&mut node, 9, 3);
+    for payment in &payments {
+        assert!(matches!(
+            node.state
+                .validate_transactions_for_next_block(std::slice::from_ref(payment)),
+            Err(cmfd_consensus::ChainError::ImmatureInput(_))
+        ));
+    }
+    payout_protection::refresh_payment_states(&ledger, &mut node).unwrap();
+    let snapshot = snapshot_ledger(&ledger).unwrap();
+    assert!(snapshot.payout_protection.unresolved_incidents.is_empty());
+    assert_eq!(snapshot.payout_transactions.len(), 9);
+    assert!(
+        snapshot
+            .payouts
+            .iter()
+            .all(|p| p.reserved_payout_atoms == 120)
+    );
+
+    // Simulate upgrading a ledger with the old sweep's false-positive holds.
+    for payment in &payments {
+        payout_protection::missing_funding(&ledger, &node, payment.txid()).unwrap();
+    }
+    payout_protection::auto_resolve(&ledger, &node, 1).unwrap();
+    assert_eq!(
+        snapshot_ledger(&ledger)
+            .unwrap()
+            .payout_protection
+            .unresolved_incidents
+            .len(),
+        9
+    );
+    drop(ledger);
+    drop(node);
+    let mut node = Node::open_with_profile(&data, crate::DEVNET_PROFILE).unwrap();
+    let report = inspect_pool_payout_protection(&mut node, 1).unwrap();
+    assert_eq!(report.reserved_payout_inputs.len(), 9);
+    for payment in &payments {
+        let reservation = report
+            .reserved_payout_inputs
+            .iter()
+            .find(|r| r.payout_txid == hex::encode(payment.txid()))
+            .unwrap();
+        assert_eq!(
+            reservation.input_txid,
+            hex::encode(payment.inputs[0].previous.txid)
+        );
+        assert_eq!(reservation.input_index, payment.inputs[0].previous.index);
+    }
+    assert_eq!(report.protection.unresolved_incidents.len(), 9);
+    let owner = node.wallet_destination();
+    let node = Arc::new(Mutex::new(node));
+    let (cert, key, _) = certificate(&root);
+    let mut config = PoolServerConfig::devnet(
+        "127.0.0.1:0".parse().unwrap(),
+        fs::read(cert).unwrap(),
+        fs::read(key).unwrap(),
+        owner,
+    );
+    config.ledger_directory = Some(data.join("pool-ledger"));
+    config.payout_policy = Some(PoolPayoutPolicy {
+        minimum_payout_atoms: 100,
+        fee_atoms: 1,
+    });
+    let server = spawn_pool_server(Arc::clone(&node), config.clone()).unwrap();
+    assert!(node.lock().unwrap().mempool.is_empty());
+    {
+        let mut node = node.lock().unwrap();
+        while node.state.next_height() < spendable_height {
+            let timestamp = crate::DEVNET_GENESIS_TIMESTAMP + node.state.next_height() * 60;
+            node.mine_once(owner, timestamp, 10_000).unwrap();
+        }
+    }
+    reconcile_pool_payouts(&server.shared, false).unwrap();
+    let resumed = server.ledger_snapshot().unwrap();
+    assert!(!resumed.payout_protection.requires_reconciliation);
+    assert_eq!(resumed.payout_protection.resolved_incidents, 9);
+    assert_eq!(resumed.payout_transactions.len(), 9);
+    assert!(
+        resumed
+            .payout_transactions
+            .iter()
+            .all(|p| p.state == "broadcast")
+    );
+    {
+        let mut node = node.lock().unwrap();
+        for payment in &payments {
+            assert_eq!(&node.mempool[&payment.txid()].transaction, payment);
+        }
+        let timestamp = crate::DEVNET_GENESIS_TIMESTAMP + node.state.next_height() * 60;
+        node.mine_once(owner, timestamp, 10_000).unwrap();
+    }
+    reconcile_pool_payouts(&server.shared, false).unwrap();
+    let confirmed = server.ledger_snapshot().unwrap();
+    assert_eq!(confirmed.payout_transactions.len(), 9);
+    assert!(
+        confirmed
+            .payouts
+            .iter()
+            .all(|p| p.confirmed_payout_atoms == 120)
+    );
+    server.stop().unwrap();
+    let server = spawn_pool_server(Arc::clone(&node), config).unwrap();
+    assert_eq!(
+        server.ledger_snapshot().unwrap().payout_transactions.len(),
+        9
+    );
+    assert!(node.lock().unwrap().mempool.is_empty());
+    server.stop().unwrap();
+    let mut node = node.lock().unwrap();
+    assert!(
+        inspect_pool_payout_protection(&mut node, 1)
+            .unwrap()
+            .reserved_payout_inputs
+            .is_empty()
+    );
+    let ledger = protection_ledger(&node);
+    let state = ledger.state.lock().unwrap();
+    validate_ledger(&state).unwrap();
+    let protection = serde_json::to_value(&state.payout_protection).unwrap();
+    for incident in protection["incidents"].as_array().unwrap() {
+        let receipt = &incident["resolution"];
+        assert!(
+            receipt["operator_note"]
+                .as_str()
+                .unwrap()
+                .contains("unchanged signed payout validates again")
+        );
+        assert!(
+            receipt["mature_assets"].as_u64().unwrap()
+                >= receipt["required_assets"].as_u64().unwrap()
+        );
+    }
+}
+
+#[test]
+fn payout_validation_recovery_checks_coverage_and_signature_conflicts() {
+    for guard in [
+        "own-mempool",
+        "mempool",
+        "exchange",
+        "duplicate",
+        "legacy",
+        "spent",
+        "shortfall",
+    ] {
+        let root = TestRoot::new(&format!("payout-retry-{guard}"));
+        let mut node =
+            Node::open_with_profile(root.path().join("node"), crate::DEVNET_PROFILE).unwrap();
+        let (ledger, payments, _) = pending_protection_payments(&mut node, 1, 0);
+        let payment = &payments[0];
+        let txid = payment.txid();
+        let mut conflict = payment.clone();
+        conflict.outputs[0].value -= 1;
+        conflict.sign_all(&[&node.wallet_signing_key]).unwrap();
+        match guard {
+            "own-mempool" => {
+                node.submit_transaction(payment.clone()).unwrap();
+            }
+            "mempool" | "spent" => {
+                node.submit_transaction(conflict).unwrap();
+                if guard == "spent" {
+                    let timestamp = crate::DEVNET_GENESIS_TIMESTAMP + node.state.next_height() * 60;
+                    node.mine_once(node.wallet_destination(), timestamp, 10_000)
+                        .unwrap();
+                }
+            }
+            "exchange" => node.set_exchange_withdrawal_reservations(
+                [(payment.inputs[0].previous, [0x55; 32])]
+                    .into_iter()
+                    .collect(),
+            ),
+            "duplicate" | "legacy" => {
+                credit_accepted_share(&ledger, 1, 120).unwrap();
+                ledger
+                    .transaction(|state| {
+                        let mut duplicate = state.payout_transactions[&txid].clone();
+                        duplicate.amount_atoms = 119;
+                        duplicate.fee_atoms = 2;
+                        duplicate.transaction = conflict.clone();
+                        if guard == "legacy" {
+                            duplicate.state = PoolPayoutTransactionState::Abandoned;
+                        }
+                        state.payout_transactions.insert(conflict.txid(), duplicate);
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            "shortfall" => {
+                credit_accepted_share(&ledger, 1, u64::MAX / 2).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        payout_protection::refresh_payment_states(&ledger, &mut node).unwrap();
+        if guard == "spent" {
+            assert_eq!(
+                snapshot_ledger(&ledger)
+                    .unwrap()
+                    .payout_protection
+                    .unresolved_incidents
+                    .len(),
+                1
+            );
+        } else if guard == "legacy" {
+            assert_eq!(
+                snapshot_ledger(&ledger)
+                    .unwrap()
+                    .payout_protection
+                    .unresolved_incidents
+                    .len(),
+                1
+            );
+            payout_protection::missing_funding(&ledger, &node, txid).unwrap();
+        } else {
+            assert!(
+                snapshot_ledger(&ledger)
+                    .unwrap()
+                    .payout_protection
+                    .unresolved_incidents
+                    .is_empty()
+            );
+            payout_protection::missing_funding(&ledger, &node, txid).unwrap();
+        }
+        payout_protection::check_funding(&ledger, &node, 1).unwrap();
+        payout_protection::auto_resolve(&ledger, &node, 1).unwrap();
+        let snapshot = snapshot_ledger(&ledger).unwrap();
+        if guard == "own-mempool" {
+            assert!(!snapshot.payout_protection.requires_reconciliation);
+            assert_eq!(snapshot.payout_protection.resolved_incidents, 1);
+            assert_eq!(&node.mempool[&txid].transaction, payment);
+            assert_eq!(snapshot.payouts[0].reserved_payout_atoms, 120);
+            assert_eq!(snapshot.payout_transactions[0].state, "broadcast");
+            continue;
+        }
+        assert!(
+            snapshot.payout_protection.requires_reconciliation,
+            "{guard}"
+        );
+        assert_eq!(snapshot.payout_protection.resolved_incidents, 0, "{guard}");
+        assert!(snapshot.payouts[0].payout_on_hold, "{guard}");
+        assert_eq!(
+            ledger.state.lock().unwrap().payout_transactions[&txid].transaction,
+            *payment
+        );
+        assert!(snapshot.payouts[0].reserved_payout_atoms >= 120, "{guard}");
+    }
+}
+
 #[test]
 fn offline_status_distributes_a_block_maturing_at_the_configured_bonus_rate() {
     let root = TestRoot::new("payout-status-bonus");
@@ -974,7 +1327,10 @@ fn reorganized_lookup_bounds_fall_back_to_the_fork_point() {
     );
     payout_protection::refresh_payment_states(&ledger, &mut node).unwrap();
     assert_eq!(record(absent).absent_through, Some(old_tip));
-    assert_eq!(record(confirmed).state, PoolPayoutTransactionState::Confirmed);
+    assert_eq!(
+        record(confirmed).state,
+        PoolPayoutTransactionState::Confirmed
+    );
     assert_eq!(node.transaction_lookup_blocks_read(), tip_height);
 
     // Two blocks from the fork replace the tip block: both kept positions

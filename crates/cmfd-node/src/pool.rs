@@ -152,10 +152,10 @@ const POOL_LEDGER_ARCHIVE_SCHEMA: &str = "CMFD/POOL/LEDGER-ARCHIVE/V1";
 #[path = "pool_payout_protection.rs"]
 mod payout_protection;
 pub use payout_protection::{
-    PoolPayoutProtectionReport, PoolPayoutProtectionSnapshot, PoolPayoutReconciliationRequest,
-    inspect_pool_payout_protection, inspect_pool_payout_protection_with_limit,
-    reconcile_pool_payout_protection, reconcile_pool_payout_protection_with_limit,
-    require_existing_pool_ledger,
+    PoolPayoutInputReservation, PoolPayoutProtectionReport, PoolPayoutProtectionSnapshot,
+    PoolPayoutReconciliationRequest, inspect_pool_payout_protection,
+    inspect_pool_payout_protection_with_limit, reconcile_pool_payout_protection,
+    reconcile_pool_payout_protection_with_limit, require_existing_pool_ledger,
 };
 
 #[derive(Debug, Error)]
@@ -5698,7 +5698,8 @@ fn reconcile_pool_payouts(shared: &SharedServer, create_new: bool) -> Result<(),
             Err(
                 NodeError::MempoolTransactionLimit
                 | NodeError::MempoolByteLimit
-                | NodeError::MempoolInputConflict(_),
+                | NodeError::MempoolInputConflict(_)
+                | NodeError::Chain(cmfd_consensus::ChainError::ImmatureInput(_)),
             ) => (),
             Err(NodeError::MempoolUnconfirmedInput(_)) => {
                 // A previously signed transaction can become valid again on a

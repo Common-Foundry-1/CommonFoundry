@@ -431,7 +431,7 @@ pub(crate) fn forward(context: &Context<'_>, spawn: &dyn Spawn) -> Launch {
             }
             Ok(code) => code,
             Err(SpawnError::Start(error)) => {
-                let reason = format!("it could not be started: {error}");
+                let reason = start_failure_reason(&error);
                 log(&format!("{version}: {reason}"));
                 // The system refused the start (an antivirus, an application
                 // control policy, a noexec mount): a version that had opened
@@ -489,6 +489,13 @@ pub(crate) fn forward(context: &Context<'_>, spawn: &dyn Spawn) -> Launch {
         }
     }
     Launch::RunHere(held_below(&hold, fallback, context.running))
+}
+
+fn start_failure_reason(error: &io::Error) -> String {
+    if error.raw_os_error() == Some(4551) {
+        return "Windows App Control blocked the update (OS error 4551). Check that the release executables have valid Authenticode signatures from a trusted code-signing provider; retrying without a release or policy change will not help.".to_owned();
+    }
+    format!("it could not be started: {error}")
 }
 
 /// The hold that a version folder which failed [`install::verify_installed`]
@@ -2042,6 +2049,14 @@ pub(super) mod tests {
         spawn.then(|_| Err(SpawnError::Wait(io::Error::other("lost"))));
         assert_eq!(setup.launch(&spawn), Launch::Exit(1));
         assert!(install::read_state(&v15).unwrap().extra.is_empty());
+    }
+
+    #[test]
+    fn app_control_block_has_an_actionable_reason() {
+        let reason = start_failure_reason(&io::Error::from_raw_os_error(4551));
+        assert!(reason.contains("Windows App Control"));
+        assert!(reason.contains("Authenticode"));
+        assert!(!reason.contains("disable"));
     }
 
     #[test]

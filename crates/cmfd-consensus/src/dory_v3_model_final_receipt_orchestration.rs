@@ -1211,7 +1211,7 @@ mod tests {
 
     fn test_keys(count: usize, offset: u8) -> Vec<SigningKey> {
         (0..count)
-            .map(|index| SigningKey::from_bytes(&[offset.wrapping_add(index as u8); 32]).unwrap())
+            .map(|index| SigningKey::from_slice(&[offset.wrapping_add(index as u8); 32]).unwrap())
             .collect()
     }
 

@@ -18,6 +18,7 @@ import zipfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import package_mainnet as packages
+import verify_mainnet_packages as preflight
 import mainnet_plan_approval as mainnet_approval
 import production_v4_activation_approval as signature_contract
 from test_release_integrity import pe_x86_64_fixture, elf_x86_64_fixture
@@ -155,7 +156,10 @@ class MainnetPackageTests(unittest.TestCase):
                 packages.validate_plan(encode(changed))
 
     def sources(self, repo, commit, paths, version):
-        return {name: (repo / relative).read_bytes().replace(b"\r\n", b"\n") for name, relative in paths.items()}, 1789840000
+        values={name: (repo / relative).read_bytes().replace(b"\r\n", b"\n") for name, relative in paths.items()}
+        if "h-manifest.conf" in values:
+            values["h-manifest.conf"]=b"\n".join((b"CUSTOM_VERSION="+version.encode()) if line.startswith(b"CUSTOM_VERSION=") else line for line in values["h-manifest.conf"].split(b"\n"))
+        return values,1789840000
 
     def output(self, executable, arguments, **_kwargs):
         self.calls.append((executable.name, arguments))
@@ -179,14 +183,42 @@ class MainnetPackageTests(unittest.TestCase):
         self.assertEqual(arguments, ["mainnet-launch-info"])
         return packages.canonical(self.info)
 
-    def assemble(self, args, output=None, sources=None, replay_pin=None):
+    def assemble(self, args, output=None, sources=None, replay_pin=None, authenticode=None):
         replay_pin = replay_pin or hashlib.sha256(args.replay_worker.read_bytes()).hexdigest()
         with mock.patch.object(packages.integrity, "_require_native_runtime_platform"), \
              mock.patch.object(packages, "validate_review_ancestry"), \
+             mock.patch.object(packages, "require_authenticode", new=authenticode or mock.Mock()), \
              mock.patch.object(packages, "release_replay_worker_sha256", return_value=replay_pin), \
              mock.patch.object(packages, "source_snapshot", side_effect=sources or self.sources), \
              mock.patch.object(packages, "native_output", side_effect=output or self.output):
             return packages.assemble(args)
+
+    def test_windows_package_checks_every_staged_executable(self):
+        for kind, expected in (("runtime", 3), ("miner", 2)):
+            with self.subTest(kind=kind):
+                args = self.args("windows-x86_64", kind)
+                failures = [None] * (expected - 1) + [packages.Error("unsigned")]
+                check = mock.Mock(side_effect=failures)
+                with self.assertRaisesRegex(packages.Error, "unsigned"):
+                    self.assemble(args, authenticode=check)
+                self.assertEqual(check.call_count, expected)
+                self.assertFalse(list(args.output.glob("*.zip")))
+
+    @unittest.skipUnless(sys.platform == "win32", "requires Windows Authenticode")
+    def test_unsigned_executable_fails_authenticode_check(self):
+        path = self.root / "unsigned.exe"
+        path.write_bytes(pe_x86_64_fixture(b"unsigned"))
+        with self.assertRaisesRegex(packages.Error, "no valid Authenticode"):
+            packages.require_authenticode(path)
+
+    def test_compact_worker_requires_the_exact_mainnet_schedule_and_statement_domain(self):
+        root=Path(__file__).resolve().parents[2]
+        fork=json.loads((root/"docs/compact-proof-testnet/MAINNET-FORK-IDENTITY-67535.json").read_text())
+        info={"mainnet_supported":True,"mainnet_network_id":fork["network_id"],"mainnet_activation_height":67535,"mainnet_proof_system_digest":fork["at_and_after_activation"]["proof_system_digest"],"source_commit":"ab"*20}
+        self.assertEqual(packages.validate_compact_worker_network(json.dumps(info).encode(),fork),info)
+        for key,value in [("mainnet_supported",False),("mainnet_activation_height",65535),("mainnet_network_id","8a"*32),("mainnet_proof_system_digest","e8"*32),("source_commit","unknown")]:
+            with self.subTest(field=key),self.assertRaises(packages.Error):
+                changed=dict(info);changed[key]=value;packages.validate_compact_worker_network(json.dumps(changed).encode(),fork)
 
     def contents(self, archive):
         if archive.suffix == ".zip":
@@ -472,6 +504,121 @@ class MainnetPackageTests(unittest.TestCase):
             packages.native_output(Path(sys.executable), ["-c", f"print('x' * {packages.MAX_INFO + 1})"])
         with self.assertRaisesRegex(packages.Error, "timed out"):
             packages.native_output(Path(sys.executable), ["-c", "import time; time.sleep(5)"], timeout_seconds=0.1)
+
+
+class WindowsReleaseExceptionTests(unittest.TestCase):
+    def setUp(self):
+        self.commit = "a" * 40
+        self.binary = pe_x86_64_fixture(b"owner-authorized Windows input")
+        self.identity = {"bytes": len(self.binary), "sha256": hashlib.sha256(self.binary).hexdigest()}
+        self.exception = {"schema": "CMFD_WINDOWS_RELEASE_EXCEPTION_V1", "package_version": "1.0.21",
+                          "source_commit": self.commit, "files": {name + ".exe": dict(self.identity) for name in
+                          ("cmfd-launch", "cmfd-node", "cmfd-miner", "common-foundry-wallet")}}
+
+    def test_exception_is_bound_to_one_version_source_and_complete_inventory(self):
+        self.assertEqual(packages.validate_unsigned_windows_exception(packages.canonical(self.exception), "1.0.21", self.commit), self.exception["files"])
+        for version, commit in (("1.0.24", self.commit), ("1.0.21", "b" * 40)):
+            with self.assertRaises(packages.Error):
+                packages.validate_unsigned_windows_exception(packages.canonical(self.exception), version, commit)
+        del self.exception["files"]["cmfd-miner.exe"]
+        with self.assertRaises(packages.Error):
+            packages.validate_unsigned_windows_exception(packages.canonical(self.exception), "1.0.21", self.commit)
+
+    def test_exact_exception_preserves_payload_and_default_authenticode_gate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); source = root / "source.exe"; source.write_bytes(self.binary)
+            with mock.patch.object(packages, "require_authenticode", side_effect=packages.Error("signature required")) as check:
+                with self.assertRaisesRegex(packages.Error, "signature required"):
+                    packages.copy_executable(source, root / "default.exe", "windows-x86_64")
+                packages.copy_executable(source, root / "authorized.exe", "windows-x86_64", unsigned_identity=self.identity)
+                self.assertEqual(check.call_count, 1)
+                self.assertEqual((root / "authorized.exe").read_bytes(), self.binary)
+                with self.assertRaisesRegex(packages.Error, "differs"):
+                    packages.copy_executable(source, root / "changed.exe", "windows-x86_64", unsigned_identity={**self.identity, "sha256": "c" * 64})
+
+    def test_exception_does_not_accept_an_embedded_certificate_table(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); source = root / "source.exe"
+            binary = bytearray(self.binary); pe = struct.unpack_from("<I", binary, 60)[0]
+            struct.pack_into("<II", binary, pe + 24 + 112 + 4 * 8, 8, 8)
+            source.write_bytes(binary)
+            pinned = {"bytes": len(binary), "sha256": hashlib.sha256(binary).hexdigest()}
+            with self.assertRaises(packages.Error):
+                packages.copy_executable(source, root / "rejected.exe", "windows-x86_64", unsigned_identity=pinned)
+
+
+class ComponentVersionTests(unittest.TestCase):
+    def test_combined_release_uses_one_version_for_all_archives(self):
+        self.assertEqual(packages.package_names("windows-x86_64", "runtime", "1.0.21")[1],
+                         "commonfoundry-mainnet-runtime-windows-x86_64-v1.0.21.zip")
+        self.assertEqual(packages.package_names("linux-x86_64", "miner", "1.0.21")[1],
+                         "commonfoundry-mainnet-miner-linux-x86_64-v1.0.21.tar.gz")
+        self.assertEqual(packages.package_names("linux-x86_64", "hiveos", "1.0.21")[1],
+                         "commonfoundry-mainnet-hiveos-1.0.21.tar.gz")
+
+    def test_source_snapshot_rejects_a_mismatched_component_version(self):
+        commit = "a" * 40
+        manifests = {"crates/cmfd-node/Cargo.toml": b'[package]\nversion="1.0.21"\n',
+                     "crates/cmfd-miner/Cargo.toml": b'[package]\nversion="1.0.21"\n',
+                     "apps/wallet/src-tauri/Cargo.toml": b'[package]\nversion="1.0.21"\n'}
+        with mock.patch.object(packages.integrity, "_run_git", side_effect=[commit, "", "1789840000"]), \
+             mock.patch.object(packages.integrity, "_tracked_blob_at", side_effect=lambda _repo, _commit, path: manifests[path]):
+            self.assertEqual(packages.source_snapshot(Path("."), commit, {}, "1.0.21"), ({}, 1789840000))
+        manifests["crates/cmfd-miner/Cargo.toml"] = b'[package]\nversion="1.0.23"\n'
+        with mock.patch.object(packages.integrity, "_run_git", side_effect=[commit, ""]), \
+             mock.patch.object(packages.integrity, "_tracked_blob_at", side_effect=lambda _repo, _commit, path: manifests[path]):
+            with self.assertRaisesRegex(packages.Error, "component versions"):
+                packages.source_snapshot(Path("."), commit, {}, "1.0.21")
+
+
+class ForkRuntimeContractTests(unittest.TestCase):
+    def setUp(self):
+        self.repo = Path(__file__).resolve().parents[2]
+        self.sources = {name: (self.repo / path).read_bytes() for name, path in
+                        packages.package_sources("linux-x86_64", "runtime", "1.0.23").items()}
+        fork = packages.strict_json(self.sources["MAINNET-FORK-IDENTITY-67535.json"], "fixture fork")
+        self.commit = "a" * 40
+        names = ("cmfd-mainnet-fork-prover", "fork-prover.py", "cmfd-direct-multigpu-prover",
+                 "coordinator.py", "shared_model.py", "cmfd-direct-multigpu-worker", "real_bank0_relations")
+        self.rows = {"production-v4/" + name: {"bytes": len(name), "sha256": hashlib.sha256(name.encode()).hexdigest()}
+                     for name in names}
+        self.contract = {"schema": "CMFD_MAINNET_FORK_RUNTIME_V1", "source_commit": self.commit,
+                         "network_id": fork["network_id"], "activation_height": 67535,
+                         "consensus_fingerprint": fork["consensus_fingerprint"],
+                         "compact_proof_system_digest": fork["at_and_after_activation"]["proof_system_digest"],
+                         "compact_worker_source_commit": "b" * 40, "files": copy.deepcopy(self.rows)}
+
+    def check(self):
+        self.rows["FORK-RUNTIME.json"] = {"captured": packages.canonical(self.contract)}
+        return preflight.validate_fork_runtime(self.rows, self.sources, "runtime", self.commit)
+
+    def test_frozen_identity_and_every_component_are_bound(self):
+        self.assertEqual(self.check(), self.contract)
+        for name in self.contract["files"]:
+            with self.subTest(name=name):
+                original = self.rows[name]["sha256"]
+                self.rows[name]["sha256"] = "c" * 64
+                with self.assertRaisesRegex(packages.Error, "component"):
+                    self.check()
+                self.rows[name]["sha256"] = original
+
+    def test_old_height_wrong_source_and_incomplete_inventory_are_rejected(self):
+        for field, value in (("activation_height", 65535), ("source_commit", "c" * 40),
+                             ("consensus_fingerprint", "d" * 64), ("compact_proof_system_digest", "e" * 64)):
+            original = self.contract[field]
+            self.contract[field] = value
+            with self.assertRaisesRegex(packages.Error, "frozen"):
+                self.check()
+            self.contract[field] = original
+        del self.contract["files"]["production-v4/shared_model.py"]
+        with self.assertRaisesRegex(packages.Error, "component"):
+            self.check()
+
+    def test_new_package_inventory_requires_the_height_aware_runtime(self):
+        self.assertIn("production-v4/fork-prover.py", self.sources)
+        self.assertIn("production-v4/cmfd-mainnet-fork-prover", self.sources)
+        for name in ("cmfd-mainnet-fork-prover", "cmfd-direct-multigpu-prover"):
+            self.assertEqual(preflight.member_mode("production-v4/" + name, False, {}), 0o755)
 
 
 class CommittedOwnerPlanTests(unittest.TestCase):

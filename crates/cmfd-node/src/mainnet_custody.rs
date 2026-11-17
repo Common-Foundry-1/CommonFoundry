@@ -330,7 +330,7 @@ fn fresh_secret() -> Result<Zeroizing<[u8; 32]>, RewardCustodyError> {
     let mut secret = Zeroizing::new([0; 32]);
     for _ in 0..128 {
         getrandom::fill(secret.as_mut()).map_err(|error| io::Error::other(error.to_string()))?;
-        if SigningKey::from_bytes(secret.as_ref()).is_ok() {
+        if SigningKey::from_slice(secret.as_ref()).is_ok() {
             return Ok(secret);
         }
     }
@@ -340,7 +340,7 @@ fn fresh_secret() -> Result<Zeroizing<[u8; 32]>, RewardCustodyError> {
 }
 
 fn destination(secret: &[u8; 32]) -> Result<[u8; 32], RewardCustodyError> {
-    Ok(SigningKey::from_bytes(secret)
+    Ok(SigningKey::from_slice(secret)
         .map_err(|_| WalletBackupError::InvalidWalletKey)?
         .verifying_key()
         .to_bytes()

@@ -972,6 +972,11 @@ fn start_embedded_node(
     // Resolve launch authority before expensive artifact loading or any node I/O.
     cmfd_node::mainnet_runtime::ensure_compiled_launch_ready()
         .map_err(|error| error.client_error())?;
+    // A locked wallet waits for its passphrase before resolving proof files or
+    // recording a node open. The retry path checks again if storage changes.
+    if opens_as_locked(data_dir, wallet_passphrase) {
+        return Err(NodeError::WalletLocked.client_error());
+    }
     let security = prepare_node_security(COMPILED_NETWORK_PROFILE, config)?;
     cmfd_node::startup_progress::report(cmfd_node::startup_progress::Phase::OpeningData, 0, None);
     let PreparedNodeSecurity {

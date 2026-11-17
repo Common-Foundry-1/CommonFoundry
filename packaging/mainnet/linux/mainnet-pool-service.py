@@ -87,7 +87,7 @@ OPTIONAL_FIELDS = {"mainnet_relays", "prune_keep_blocks", "pool_ledger_max_bytes
                    "max_connections", "max_connections_per_source", "proof_gpu",
                    "proof_resident_banks",
                    "bonus_rate_bps", "bonus_sponsor", "bonus_scan_from_height",
-                   PREVIOUS_RC_FIELD}
+                   PREVIOUS_RC_FIELD, "expected_fork_manifest_sha256", "serial_gpu"}
 MIN_PRUNE_KEEP_BLOCKS = 288
 MIN_POOL_LEDGER_MAX_BYTES = 1024 * 1024
 MAX_POOL_LEDGER_MAX_BYTES = 1024 * 1024 * 1024
@@ -205,6 +205,14 @@ def parse_relays(value: object, seed: str) -> list:
 
 def validate_config(config: dict) -> dict:
     fields = set(config)
+    if "expected_fork_manifest_sha256" in config and (not isinstance(config["expected_fork_manifest_sha256"],str) or not HEX64.fullmatch(config["expected_fork_manifest_sha256"])):
+        raise PreflightError("expected_fork_manifest_sha256 must pin the signed package fork runtime manifest")
+    if "serial_gpu" in config and type(config["serial_gpu"]) is not bool:
+        raise PreflightError("serial_gpu must be true or false")
+    if config.get("serial_gpu") is True:
+        replay=config.get("replay_gpus",[config.get("gpu_uuid")]);proof=config.get("proof_gpu",config.get("gpu_uuid"))
+        if not isinstance(replay,list) or len(replay)!=1 or replay[0]!=proof or config.get("proof_resident_banks") is True:
+            raise PreflightError("serial_gpu requires one matching replay/proof GPU and no proof_resident_banks")
     if not CONFIG_FIELDS <= fields or fields - CONFIG_FIELDS - OPTIONAL_FIELDS or config.get("schema") != SCHEMA:
         raise PreflightError("pool.json is incomplete or has unexpected fields")
     # Left out, existing configurations keep the RC migration checks.
@@ -345,6 +353,8 @@ def validate_info(info: dict, config: dict) -> tuple[dict, dict]:
 
 
 def check_artifacts(root: Path, config: dict, bank: dict, record: dict) -> None:
+    if (root/"FORK-RUNTIME.json").exists() or "expected_fork_manifest_sha256" in config:
+        check_fork_runtime(root,config)
     static_files = {
         "node": (root / "cmfd-node", "expected_node_sha256"),
         "launch helper": (root / "cmfd-launch", "expected_launch_sha256"),
@@ -375,6 +385,28 @@ def check_artifacts(root: Path, config: dict, bank: dict, record: dict) -> None:
                 raise PreflightError(f"mainnet plan artifact mismatch: {name}")
     require_hash(root / "production-v4/FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json",
                  record["sha256"], "node fixed record", static=True)
+
+
+def check_fork_runtime(root:Path,config:dict)->None:
+    pin=config.get("expected_fork_manifest_sha256")
+    if not isinstance(pin,str) or not HEX64.fullmatch(pin):
+        raise PreflightError("fork package requires expected_fork_manifest_sha256 from its signed checksums")
+    path=root/"FORK-RUNTIME.json";require_hash(path,pin,"fork runtime manifest",static=True)
+    fork=strict_json(bounded_file(path,"fork runtime manifest",static=True),"fork runtime manifest")
+    required={"production-v4/"+n for n in ("cmfd-mainnet-fork-prover","fork-prover.py","cmfd-direct-multigpu-prover","coordinator.py","shared_model.py","cmfd-direct-multigpu-worker","real_bank0_relations")}
+    if (fork.get("schema")!="CMFD_MAINNET_FORK_RUNTIME_V1" or fork.get("network_id")!=config["expected_network_id"]
+            or fork.get("activation_height")!=67535 or fork.get("consensus_fingerprint")!="9009948f6eab38b5b3dcee13eda9f6ef03e0db863c435cb97c1d4c3e124eb360"
+            or fork.get("compact_proof_system_digest")!="d1671fc4760134bf86f0b37d8694f4827037e5cea2642e312cb2eb705f3aef0d"
+            or not isinstance(fork.get("files"),dict) or set(fork["files"])!=required):
+        raise PreflightError("fork runtime identity/components differ from the pinned mainnet schedule")
+    for name,row in fork["files"].items():
+        if not isinstance(row,dict) or set(row)!={"sha256","bytes"} or not HEX64.fullmatch(str(row["sha256"])) or type(row["bytes"]) is not int or row["bytes"]<=0:
+            raise PreflightError("invalid fork component identity")
+        digest,size=sha256(root/name,"fork component "+name,static=True)
+        if digest!=row["sha256"] or size!=row["bytes"]:raise PreflightError("fork component mismatch: "+name)
+    replay=config.get("replay_gpus",[config["gpu_uuid"]]);proof=config.get("proof_gpu",config["gpu_uuid"])
+    if proof in replay and config.get("serial_gpu") is not True:
+        raise PreflightError("overlapping mainnet fork replay/proof GPUs require serial_gpu")
 
 
 def deployment_identity(config: dict) -> dict:
@@ -492,7 +524,7 @@ def build_command(root: Path, state: Path, credential_base: Path, config: dict) 
         "--certificate", str(CONFIG_BASE / "pool-cert.der"),
         "--private-key", str(credential_base / "pool-private-key"),
         "--production-v4-pool-replay-worker", str(root / "production-v4/cmfd-v4-replay"),
-        "--production-v4-pool-proof-worker", str(root / "production-v4/real_bank0_relations"),
+        "--production-v4-pool-proof-worker", str(root / ("production-v4/cmfd-mainnet-fork-prover" if "expected_fork_manifest_sha256" in config else "production-v4/real_bank0_relations")),
         "--production-v4-pool-scratch", str(state / "scratch"),
         "--share-leading-zero-bits", str(config["share_leading_zero_bits"]),
         "--enable-mainnet-payouts", "--pool-minimum-payout-atoms", str(config["minimum_payout_atoms"]),
@@ -512,6 +544,9 @@ def build_command(root: Path, state: Path, credential_base: Path, config: dict) 
           if "share_batch_wait_ms" in config else ()),
         *(argument for gpu in config.get("replay_gpus", ())
           for argument in ("--production-v4-pool-replay-gpu", gpu)),
+        *(("--production-v4-pool-serial-gpu",) if config.get("serial_gpu") is True else ()),
+        *(("--production-v4-pool-replay-gpu",config["gpu_uuid"]) if config.get("serial_gpu") is True and "replay_gpus" not in config else ()),
+        *(("--production-v4-pool-proof-gpu",config["gpu_uuid"]) if config.get("serial_gpu") is True and "proof_gpu" not in config else ()),
         *(("--production-v4-pool-proof-gpu", config["proof_gpu"]) if "proof_gpu" in config else ()),
         *(("--pool-max-connections", str(config["max_connections"]))
           if "max_connections" in config else ()),

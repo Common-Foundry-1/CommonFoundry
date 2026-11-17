@@ -106,12 +106,15 @@ const DOWNLOAD_SPACE_FACTOR: u64 = 4;
 const MAX_NAME_SUFFIX: u32 = 9;
 /// Packaged files that must stay executable on Linux, besides `*.sh`.
 #[cfg(unix)]
-const LINUX_EXECUTABLES: [&str; 5] = [
+const LINUX_EXECUTABLES: [&str; 8] = [
     "cmfd-launch",
     "cmfd-node",
     "common-foundry-wallet",
     "production-v4/cmfd-v4-replay",
     "production-v4/real_bank0_relations",
+    "production-v4/cmfd-mainnet-fork-prover",
+    "production-v4/cmfd-direct-multigpu-worker",
+    "production-v4/cmfd-direct-multigpu-prover",
 ];
 
 /// Variables that change what tar lists or unpacks.

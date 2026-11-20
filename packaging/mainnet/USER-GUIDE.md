@@ -63,7 +63,11 @@ different providers list, checks the newest blocks on this computer, and keeps
 checking the rest in the background. Coins in recent blocks show as Verifying
 until the newest blocks are checked, and can be sent after that. If fewer than
 two relays can be reached, the wallet checks every block itself, which takes
-longer.
+longer. Other grant safeguards can also require a local work check; the
+`catch-up sync session` log reports the reason. For a long offline gap, check
+the [official Releases](https://github.com/Common-Foundry-1/CommonFoundry-Binaries/releases)
+for an optional signed mainnet bootstrap and read its trusted-checkpoint
+disclosure before using it.
 
 Full check (`--work-check full`). The wallet checks every block on this
 computer before any coin in it shows as available, so catching up after time

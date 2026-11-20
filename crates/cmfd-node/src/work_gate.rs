@@ -2238,8 +2238,8 @@ impl Node {
     }
 
     /// The reference work a block admitted without an engine run is measured
-    /// against: the larger of the work of the active blocks at the validated
-    /// height and at the checkpoint, unknown unless both are indexed. Read
+    /// against: the work of the active block at the validated height,
+    /// unknown unless it and the checkpoint are both indexed. Read
     /// again only while no granted block lies above the validated height
     /// (`top_granted`), or with `force`, and held otherwise. Reads the
     /// checkpoint block's time once that block is indexed; after a failed

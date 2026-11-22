@@ -2009,10 +2009,10 @@ impl Drop for RemoteProofAdmissionPermit {
                     self.queue.wake.notify_all();
                     return;
                 };
-                if state.cooldowns.len() >= MAX_REMOTE_PROOF_COOLDOWNS {
-                    if let Some(oldest) = state.cooldown_order.pop_front() {
-                        state.cooldowns.remove(&oldest);
-                    }
+                if state.cooldowns.len() >= MAX_REMOTE_PROOF_COOLDOWNS
+                    && let Some(oldest) = state.cooldown_order.pop_front()
+                {
+                    state.cooldowns.remove(&oldest);
                 }
                 state.cooldowns.insert(self.peer, cooldown_deadline);
                 state.cooldown_order.push_back(self.peer);

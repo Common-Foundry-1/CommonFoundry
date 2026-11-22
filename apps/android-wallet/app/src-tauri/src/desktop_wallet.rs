@@ -78,7 +78,7 @@ fn choose_backup(window: &WebviewWindow, name: Option<&str>) -> Result<PathBuf, 
                 filter.set_name(Some("Common Foundry wallet backup"));
                 filter.add_pattern(&format!("*.{FILE_EXTENSION}"));
                 filter.add_pattern("*.cmfd-key");
-                dialog.add_filter(&filter);
+                dialog.add_filter(filter);
                 if let Some(name) = &name {
                     dialog.set_current_name(name);
                 }

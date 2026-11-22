@@ -1730,7 +1730,6 @@ struct RemoteProofAdmissionState {
     waiting_set: HashSet<RemoteProofPeerId>,
     cooldowns: HashMap<RemoteProofPeerId, Instant>,
     cooldown_order: VecDeque<RemoteProofPeerId>,
-    cooldown_saturated_until: Option<Instant>,
     wait_events: u64,
     rejections: u64,
     proof_failures: u64,
@@ -1766,7 +1765,6 @@ impl RemoteProofAdmissionQueue {
                 waiting_set: HashSet::new(),
                 cooldowns: HashMap::new(),
                 cooldown_order: VecDeque::new(),
-                cooldown_saturated_until: None,
                 wait_events: 0,
                 rejections: 0,
                 proof_failures: 0,
@@ -1815,10 +1813,7 @@ impl RemoteProofAdmissionQueue {
             return Err(NodeError::ProofVerificationQueueTimeout);
         }
         let in_flight = state.waiting.len() + usize::from(state.active.is_some());
-        if state
-            .cooldown_saturated_until
-            .is_some_and(|deadline| deadline > now)
-            || state.cooldowns.contains_key(&peer)
+        if state.cooldowns.contains_key(&peer)
             || state.active == Some(peer)
             || state.waiting_set.contains(&peer)
             || in_flight >= self.max_in_flight
@@ -1942,12 +1937,6 @@ impl RemoteProofAdmissionQueue {
 }
 
 fn prune_remote_proof_cooldowns(state: &mut RemoteProofAdmissionState, now: Instant) {
-    if state
-        .cooldown_saturated_until
-        .is_some_and(|deadline| deadline <= now)
-    {
-        state.cooldown_saturated_until = None;
-    }
     while let Some(peer) = state.cooldown_order.front().copied() {
         let expired = state
             .cooldowns
@@ -2020,18 +2009,13 @@ impl Drop for RemoteProofAdmissionPermit {
                     self.queue.wake.notify_all();
                     return;
                 };
-                if state.cooldowns.len() >= MAX_REMOTE_PROOF_COOLDOWNS {
-                    // Every unexpired identity remains binding. Exhausting the
-                    // live-session-sized TTL table rejects all remote proof
-                    // admissions for one full cooldown instead of silently
-                    // letting any untracked failing session retry. The queue
-                    // automatically reopens; lifecycle shutdown remains a
-                    // separate terminal state.
-                    state.cooldown_saturated_until = Some(cooldown_deadline);
-                } else {
-                    state.cooldowns.insert(self.peer, cooldown_deadline);
-                    state.cooldown_order.push_back(self.peer);
+                if state.cooldowns.len() >= MAX_REMOTE_PROOF_COOLDOWNS
+                    && let Some(oldest) = state.cooldown_order.pop_front()
+                {
+                    state.cooldowns.remove(&oldest);
                 }
+                state.cooldowns.insert(self.peer, cooldown_deadline);
+                state.cooldown_order.push_back(self.peer);
             }
         } else {
             state.closing = true;
@@ -5570,8 +5554,14 @@ fn build_template_from_state(
         .median_time_past()
         .checked_add(1)
         .ok_or(NodeError::TemplateTimeUnavailable)?;
+    let local_future_offset =
+        if cmfd_consensus::mainnet_network::is_mainnet_network(params.network_id) {
+            params.max_future_offset_secs.min(3 * 60)
+        } else {
+            params.max_future_offset_secs
+        };
     let latest = now_unix_seconds
-        .checked_add(params.max_future_offset_secs)
+        .checked_add(local_future_offset)
         .ok_or(NodeError::TemplateTimeUnavailable)?;
     let timestamp = now_unix_seconds.max(earliest);
     if timestamp > latest {
@@ -14419,6 +14409,28 @@ mod tests {
     }
 
     #[test]
+    fn full_remote_cooldown_table_keeps_admitting_new_sessions() {
+        let remote = Arc::new(RemoteProofAdmissionQueue::new(
+            1,
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+        ));
+        for id in 1..=MAX_REMOTE_PROOF_COOLDOWNS as u64 + 1 {
+            let mut permit = remote.acquire(RemoteProofPeerId::new(id).unwrap()).unwrap();
+            permit.mark_proof_failure();
+        }
+        assert_eq!(
+            remote.state.lock().unwrap().cooldowns.len(),
+            MAX_REMOTE_PROOF_COOLDOWNS
+        );
+        assert!(
+            remote
+                .acquire(RemoteProofPeerId::new(MAX_REMOTE_PROOF_COOLDOWNS as u64 + 2).unwrap())
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn remote_proof_scheduler_bounds_sessions_rejects_duplicates_and_wakes_on_close() {
         let remote = Arc::new(RemoteProofAdmissionQueue::new(
             2,
@@ -17603,6 +17615,29 @@ mod tests {
         ));
         assert!(node.mempool.is_empty());
         assert_eq!(node.mempool_bytes, MAX_MEMPOOL_BYTES);
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn mainnet_template_does_not_extend_an_hour_ahead_chain_clock() {
+        let path = test_dir("mainnet-template-future-skew");
+        clean_test_dir(&path);
+        let node = Node::open(&path).unwrap();
+        let mut params = node.params;
+        params.network_id = cmfd_consensus::mainnet_network::MAINNET_NETWORK_ID.unwrap();
+        params.max_future_offset_secs = MAX_FUTURE_OFFSET_SECS;
+        let now = node.state.median_time_past() - 60 * 60;
+        assert!(matches!(
+            build_template_from_state(
+                &node.state,
+                &params,
+                default_miner_destination(),
+                now,
+                Vec::new(),
+            ),
+            Err(NodeError::TemplateTimeUnavailable)
+        ));
         drop(node);
         clean_test_dir(&path);
     }

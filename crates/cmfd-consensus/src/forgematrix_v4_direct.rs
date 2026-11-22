@@ -29,6 +29,7 @@ use crate::forgematrix_v4_relations::{
     verify_forgematrix_v4_shift_relation,
 };
 use anyhow::{Context, Result, bail, ensure};
+use bincode::Options;
 #[path = "forgematrix_v4_direct_reduction.rs"]
 pub mod reduction;
 pub use direct::{DirectBasefoldProof, ReductionProof};
@@ -145,7 +146,13 @@ pub fn decode(wire: &[u8], statement: Statement) -> Result<DirectPacket> {
     );
 
     let reduction_bytes = &wire[reduction_at..compressed_at];
-    let reduction: direct::ReductionProof = bincode::deserialize(reduction_bytes)?;
+    let reduction: direct::ReductionProof = std::panic::catch_unwind(|| {
+        bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_limit(reduction_bytes.len() as u64)
+            .deserialize(reduction_bytes)
+    })
+    .map_err(|_| anyhow::anyhow!("invalid reduction dimensions"))??;
     ensure!(
         bincode::serialize(&reduction)? == reduction_bytes,
         "noncanonical reduction"

@@ -1036,7 +1036,7 @@ dependencies = [
 
 [[package]]
 name = "cmfd-launch"
-version = "1.0.22"
+version = "1.0.23"
 dependencies = [
  "clap",
  "ctrlc",
@@ -1061,7 +1061,7 @@ dependencies = [
 
 [[package]]
 name = "cmfd-miner"
-version = "1.0.22"
+version = "1.0.23"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1079,7 +1079,7 @@ dependencies = [
 
 [[package]]
 name = "cmfd-node"
-version = "1.0.22"
+version = "1.0.23"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -1172,7 +1172,7 @@ dependencies = [
 
 [[package]]
 name = "common-foundry-wallet"
-version = "1.0.22"
+version = "1.0.23"
 dependencies = [
  "base64 0.22.1",
  "cmfd-consensus",
@@ -6147,7 +6147,6 @@ dependencies = [
 [[package]]
 name = "slop-alloc"
 version = "6.5.0"
-source = "git+https://github.com/succinctlabs/sp1.git?rev=92b8eabaea9ab7306da5826caa700adabf7445ba#92b8eabaea9ab7306da5826caa700adabf7445ba"
 dependencies = [
  "serde",
  "slop-algebra",
@@ -8593,14 +8592,15 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "9.0.0"
+version = "9.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "711e8c9646791c49b7eb799a19c4ae70a9b8372ddc6a1fa4778defd1e2aa5d5e"
+checksum = "6e04976da629d3b04204ba8105b396a193af8ad2583b2c79bfb3ab8af580a11e"
 dependencies = [
  "crc32fast",
  "flate2",
  "indexmap 2.14.0",
  "memchr",
+ "nix",
  "typed-path",
  "zopfli",
 ]

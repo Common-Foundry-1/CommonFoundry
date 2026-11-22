@@ -72,3 +72,7 @@ p3-fri = { path = "third_party/p3-fri-0.6.3-out-of-core" }
 # This exact source copy generalizes only that internal initial matrix type;
 # the existing adapter, proof, transcript, and verifier remain unchanged.
 p3-whir = { path = "third_party/p3-whir-0.6.3-generic-initial-matrix" }
+
+[patch."https://github.com/succinctlabs/sp1.git"]
+# SLOP 6.5.0 dereferences a null CPU allocation pointer on exhaustion.
+slop-alloc = { path = "third_party/slop-alloc-6.5.0-fallible" }

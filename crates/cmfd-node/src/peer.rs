@@ -400,6 +400,8 @@ impl StaticPeerConfig {
 
 #[derive(Debug, Error)]
 pub enum PeerError {
+    #[error("peer frame allocation failed")]
+    AllocationFailed,
     #[error("peer frame is truncated: need {needed} bytes, have {remaining}")]
     Truncated { needed: usize, remaining: usize },
     #[error("peer frame magic is invalid")]
@@ -1911,6 +1913,12 @@ impl PeerConnection {
         validate_frame_header(&header)?;
         let payload_len =
             u32::from_le_bytes(header[16..20].try_into().expect("fixed frame header")) as usize;
+        if self.session.remote_hello.is_none() && header[6] != HELLO_KIND {
+            return Err(PeerError::RemoteHelloRequired);
+        }
+        if self.session.remote_hello.is_some() && header[6] == HELLO_KIND {
+            return Err(PeerError::DuplicateHello);
+        }
         let payload_limit = peer_payload_limit(header[6], self.session.local_hello.network_id);
         if payload_len > payload_limit {
             return Err(PeerError::PayloadTooLarge {
@@ -1920,7 +1928,10 @@ impl PeerConnection {
         }
         let frame_len = PEER_FRAME_HEADER_BYTES + payload_len;
         self.session.ensure_budget(frame_len, header[6])?;
-        let mut bytes = Vec::with_capacity(frame_len);
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(frame_len)
+            .map_err(|_| PeerError::AllocationFailed)?;
         bytes.extend_from_slice(&header);
         bytes.extend_from_slice(&self.read_exact_bounded(payload_len, submit_response_deadline)?);
         self.session.accept_inbound(&bytes)
@@ -1931,7 +1942,11 @@ impl PeerConnection {
         length: usize,
         submit_response_deadline: Option<Instant>,
     ) -> Result<Vec<u8>, PeerError> {
-        let mut bytes = vec![0_u8; length];
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(length)
+            .map_err(|_| PeerError::AllocationFailed)?;
+        bytes.resize(length, 0);
         let mut offset = 0;
         let mut last_progress = Instant::now();
         while offset < length {
@@ -3080,7 +3095,7 @@ mod tests {
     }
 
     #[test]
-    fn transport_rejects_oversize_before_payload_allocation() {
+    fn transport_rejects_block_frame_before_hello_and_payload_allocation() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let writer = thread::spawn(move || {
@@ -3099,13 +3114,13 @@ mod tests {
         let mut connection = PeerConnection::from_stream(stream, session).unwrap();
         assert!(matches!(
             connection.receive(),
-            Err(PeerError::PayloadTooLarge { .. })
+            Err(PeerError::RemoteHelloRequired)
         ));
         writer.join().unwrap();
     }
 
     #[test]
-    fn transport_applies_the_smaller_transaction_limit_before_allocation() {
+    fn transport_rejects_transaction_frame_before_hello_and_payload_allocation() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let writer = thread::spawn(move || {
@@ -3124,10 +3139,7 @@ mod tests {
         let mut connection = PeerConnection::from_stream(stream, session).unwrap();
         assert!(matches!(
             connection.receive(),
-            Err(PeerError::PayloadTooLarge {
-                max: MAX_TRANSACTION_BYTES,
-                ..
-            })
+            Err(PeerError::RemoteHelloRequired)
         ));
         writer.join().unwrap();
     }

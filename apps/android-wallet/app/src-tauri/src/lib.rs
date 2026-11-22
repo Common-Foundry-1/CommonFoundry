@@ -11,9 +11,13 @@ use cmfd_wallet_core::{OutPoint, PaymentPlanner, Utxo, parse_cmfd};
 use cmfd_wallet_engine::{EngineStatus, WalletEngine};
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
+#[cfg(not(any(windows, target_os = "linux")))]
 use tauri_plugin_cmfd_android::{BiometricStatus, CmfdAndroidExt};
+#[cfg(not(any(windows, target_os = "linux")))]
 use zeroize::Zeroizing;
 
+#[cfg(any(windows, target_os = "linux"))]
+mod desktop_wallet;
 mod payments;
 
 use payments::{
@@ -63,6 +67,7 @@ impl Drop for WalletGuard<'_> {
     }
 }
 
+#[cfg(any(not(any(windows, target_os = "linux")), test))]
 impl WalletGuard<'_> {
     fn acknowledge_external_activity_return(&mut self) {
         self.foreground.store(true, Ordering::Release);
@@ -110,6 +115,7 @@ impl WalletState {
         }
     }
 
+    #[cfg(any(not(any(windows, target_os = "linux")), test))]
     fn set_foreground(&self, foreground: bool) {
         if foreground {
             self.foreground.store(true, Ordering::Release);
@@ -132,6 +138,7 @@ impl PaymentState {
         }
     }
 
+    #[cfg(any(not(any(windows, target_os = "linux")), test))]
     fn set_foreground(&self, foreground: bool) {
         if foreground {
             self.foreground.store(true, Ordering::Release);
@@ -155,7 +162,7 @@ const MAX_INDEPENDENT_NODE_LAG_BLOCKS: u64 = 6;
 /// The wallet gateway proposes inputs. A separate Germany or Proxmox node must agree
 /// on every selected outpoint before signing; both are still trusted services.
 const TRUST_OFFICIAL_WALLET_GATEWAY_UTXOS: bool = true;
-const OFFICIAL_GATEWAY_TRUST_MESSAGE: &str = "Chaque entrée de la passerelle officielle est vérifiée avant signature auprès du nœud allemand ou, s’il est indisponible ou en retard, du relais Proxmox local. Une divergence bloque l’envoi. Le téléphone ne valide pas lui-même toute la chaîne; une compromission de la passerelle et du nœud utilisé pourrait encore fausser les frais.";
+const OFFICIAL_GATEWAY_TRUST_MESSAGE: &str = "Chaque entrée de la passerelle est vérifiée auprès d’un nœud distinct avant signature. Une divergence bloque l’envoi. Le portefeuille dépend de ces services pour la validation de la chaîne.";
 const DEVELOPMENT_BUILD_SEND_MESSAGE: &str = "L’envoi mainnet est désactivé dans les versions de développement débogables. Utilisez une version release signée et validée.";
 
 #[derive(Serialize)]
@@ -266,6 +273,7 @@ fn wallet_status(
     }
 }
 
+#[cfg(not(any(windows, target_os = "linux")))]
 #[tauri::command]
 fn create_wallet(
     app: AppHandle,
@@ -311,6 +319,7 @@ fn create_wallet(
         .map_err(|_| wallet_operation_failed())
 }
 
+#[cfg(not(any(windows, target_os = "linux")))]
 #[tauri::command]
 fn restore_wallet(
     app: AppHandle,
@@ -353,6 +362,7 @@ fn restore_wallet(
         .map_err(|_| wallet_operation_failed())
 }
 
+#[cfg(not(any(windows, target_os = "linux")))]
 #[tauri::command]
 fn unlock_wallet(
     app: AppHandle,
@@ -376,6 +386,7 @@ fn unlock_wallet(
     })
 }
 
+#[cfg(not(any(windows, target_os = "linux")))]
 #[tauri::command]
 fn lock_wallet(
     app: AppHandle,
@@ -394,6 +405,7 @@ fn lock_wallet(
     })
 }
 
+#[cfg(not(any(windows, target_os = "linux")))]
 #[tauri::command]
 fn biometric_status(app: AppHandle) -> Result<BiometricStatus, String> {
     app.cmfd_android()
@@ -401,6 +413,7 @@ fn biometric_status(app: AppHandle) -> Result<BiometricStatus, String> {
         .map_err(|_| biometric_failed())
 }
 
+#[cfg(not(any(windows, target_os = "linux")))]
 #[tauri::command(async)]
 fn enable_biometrics(
     app: AppHandle,
@@ -438,6 +451,7 @@ fn enable_biometrics(
     Ok(())
 }
 
+#[cfg(not(any(windows, target_os = "linux")))]
 #[tauri::command(async)]
 fn unlock_wallet_biometric(
     app: AppHandle,
@@ -461,6 +475,7 @@ fn unlock_wallet_biometric(
     Ok(PublicWalletStatus::from_engine(status, false))
 }
 
+#[cfg(not(any(windows, target_os = "linux")))]
 #[tauri::command(async)]
 fn disable_biometrics(app: AppHandle, state: State<'_, WalletState>) -> Result<(), String> {
     let engine = lock_engine(&state)?;
@@ -472,6 +487,7 @@ fn disable_biometrics(app: AppHandle, state: State<'_, WalletState>) -> Result<(
         .map_err(|_| biometric_failed())
 }
 
+#[cfg(any(not(any(windows, target_os = "linux")), test))]
 fn biometric_epoch_is_current(state: &WalletState, epoch: u64) -> Result<WalletGuard<'_>, String> {
     let engine = lock_engine(state)?;
     if engine.acquired_epoch != epoch {
@@ -480,10 +496,12 @@ fn biometric_epoch_is_current(state: &WalletState, epoch: u64) -> Result<WalletG
     Ok(engine)
 }
 
+#[cfg(any(not(any(windows, target_os = "linux")), test))]
 fn biometric_failed() -> String {
     "biometric_authentication_failed".to_owned()
 }
 
+#[cfg(not(any(windows, target_os = "linux")))]
 #[tauri::command]
 fn export_wallet(
     app: AppHandle,
@@ -518,6 +536,16 @@ async fn wallet_overview(
     api: State<'_, ApiClient>,
 ) -> Result<WalletOverview, String> {
     let destination = unlocked_destination(&state)?;
+    #[cfg(any(windows, target_os = "linux"))]
+    let snapshot = api
+        .address_for_overview(&destination)
+        .await
+        .map_err(|error| match error {
+            ApiError::Timeout => "wallet_service_timeout".to_owned(),
+            error if error.retryable() => "wallet_service_unreachable".to_owned(),
+            error => public_api_error(error),
+        })?;
+    #[cfg(not(any(windows, target_os = "linux")))]
     let snapshot = api.address(&destination).await.map_err(public_api_error)?;
     Ok(WalletOverview {
         confirmed_atoms: snapshot.confirmed_atoms,
@@ -1112,6 +1140,7 @@ fn lock_payments<'a>(state: &'a PaymentState) -> Result<PaymentGuard<'a>, String
     })
 }
 
+#[cfg(not(any(windows, target_os = "linux")))]
 fn document_picker_returned(app: &AppHandle, wallet: &WalletState) {
     wallet.set_foreground(true);
     if let Some(payments) = app.try_state::<PaymentState>() {
@@ -1138,13 +1167,15 @@ fn wallet_operation_failed() -> String {
     "L’opération du portefeuille a échoué de façon sécuritaire.".to_owned()
 }
 
+#[cfg(not(any(windows, target_os = "linux")))]
 fn secure_storage_unavailable() -> String {
     "Le stockage sécurisé Android est indisponible.".to_owned()
 }
 
 fn public_api_error(error: ApiError) -> String {
     match error {
-        ApiError::Timeout | ApiError::Unreachable => {
+        ApiError::Timeout => "wallet_service_timeout".to_owned(),
+        ApiError::Unreachable => {
             "Le service Common Foundry est temporairement inaccessible.".to_owned()
         }
         ApiError::Http { code, .. } if code == "work_check_pending" => {
@@ -1156,8 +1187,11 @@ fn public_api_error(error: ApiError) -> String {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_cmfd_android::init())
+    let builder = tauri::Builder::default();
+    #[cfg(not(any(windows, target_os = "linux")))]
+    let builder = builder.plugin(tauri_plugin_cmfd_android::init());
+
+    builder
         .on_window_event(|window, event| {
             #[cfg(mobile)]
             {
@@ -1183,7 +1217,12 @@ pub fn run() {
         .setup(|app| {
             #[cfg(mobile)]
             app.handle().plugin(tauri_plugin_barcode_scanner::init())?;
+            #[cfg(not(any(windows, target_os = "linux")))]
             let private_directory = app.path().app_data_dir()?.join("wallet");
+            #[cfg(any(windows, target_os = "linux"))]
+            let private_directory = app.path().app_local_data_dir()?.join("wallet");
+            #[cfg(any(windows, target_os = "linux"))]
+            app.manage(desktop_wallet::lock_wallet_directory(&private_directory)?);
             app.manage(WalletState::new(WalletEngine::new(&private_directory)));
             app.manage(PaymentState::new(
                 PaymentStore::load(private_directory.join("pending-transactions.json"))
@@ -1201,14 +1240,33 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             wallet_status,
+            #[cfg(any(windows, target_os = "linux"))]
+            desktop_wallet::create_wallet,
+            #[cfg(any(windows, target_os = "linux"))]
+            desktop_wallet::restore_wallet,
+            #[cfg(any(windows, target_os = "linux"))]
+            desktop_wallet::unlock_wallet,
+            #[cfg(any(windows, target_os = "linux"))]
+            desktop_wallet::lock_wallet,
+            #[cfg(any(windows, target_os = "linux"))]
+            desktop_wallet::export_wallet,
+            #[cfg(not(any(windows, target_os = "linux")))]
             create_wallet,
+            #[cfg(not(any(windows, target_os = "linux")))]
             restore_wallet,
+            #[cfg(not(any(windows, target_os = "linux")))]
             unlock_wallet,
+            #[cfg(not(any(windows, target_os = "linux")))]
             lock_wallet,
+            #[cfg(not(any(windows, target_os = "linux")))]
             biometric_status,
+            #[cfg(not(any(windows, target_os = "linux")))]
             enable_biometrics,
+            #[cfg(not(any(windows, target_os = "linux")))]
             disable_biometrics,
+            #[cfg(not(any(windows, target_os = "linux")))]
             unlock_wallet_biometric,
+            #[cfg(not(any(windows, target_os = "linux")))]
             export_wallet,
             wallet_overview,
             send_availability,
@@ -1218,7 +1276,7 @@ pub fn run() {
             reconcile_pending_payments,
         ])
         .run(tauri::generate_context!())
-        .expect("Common Foundry Android wallet failed to start");
+        .expect("Common Foundry wallet failed to start");
 }
 
 #[cfg(test)]
@@ -1278,7 +1336,8 @@ mod tests {
 
     #[test]
     fn official_gateway_trust_disclosure_is_explicit() {
-        assert!(OFFICIAL_GATEWAY_TRUST_MESSAGE.contains("passerelle officielle"));
+        assert!(OFFICIAL_GATEWAY_TRUST_MESSAGE.contains("nœud distinct avant signature"));
+        assert!(OFFICIAL_GATEWAY_TRUST_MESSAGE.contains("dépend de ces services"));
     }
 
     #[test]
@@ -1338,12 +1397,15 @@ mod tests {
     }
 
     #[test]
-    fn debug_builds_fail_closed_before_mainnet_signing_or_broadcast() {
-        assert!(!mainnet_send_enabled());
-        assert_eq!(
-            require_mainnet_send_enabled(),
-            Err(DEVELOPMENT_BUILD_SEND_MESSAGE.to_owned())
-        );
+    fn mainnet_signing_and_broadcast_require_a_release_build() {
+        if cfg!(debug_assertions) {
+            assert_eq!(
+                require_mainnet_send_enabled(),
+                Err(DEVELOPMENT_BUILD_SEND_MESSAGE.to_owned())
+            );
+        } else {
+            assert_eq!(require_mainnet_send_enabled(), Ok(()));
+        }
     }
 
     #[test]

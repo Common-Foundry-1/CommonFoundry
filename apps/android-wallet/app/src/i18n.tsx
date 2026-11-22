@@ -99,6 +99,7 @@ const en = {
   refreshing: "Refreshing…",
   refresh: "Refresh",
   staleData: "The last valid data remains displayed.",
+  reconnectingBalance: "Reconnecting to the balance service…",
   loadingMainnet: "Loading validated mainnet data…",
   available: "Available",
   confirmed: "Confirmed",
@@ -138,6 +139,7 @@ const en = {
   invalidQr: "The QR code does not contain a recognized Common Foundry mainnet address.",
   scanCancelled: "QR scanning was cancelled or failed.",
   checkingUtxo: "Checking UTXO availability…",
+  checkSpendableAgain: "Check spendable funds again",
   utxoUnavailable: "UTXOs are unavailable.",
   gatewayRespondsOne: "The UTXO API returned 1 output. Signing remains local; broadcasting requires a second explicit confirmation.",
   gatewayRespondsMany: "The UTXO API returned {count} outputs. Signing remains local; broadcasting requires a second explicit confirmation.",
@@ -259,6 +261,7 @@ const fr = {
   refreshing: "Actualisation…",
   refresh: "Actualiser",
   staleData: "Les dernières données valides restent affichées.",
+  reconnectingBalance: "Reconnexion au service de solde…",
   loadingMainnet: "Chargement des données mainnet validées…",
   available: "Disponible",
   confirmed: "Confirmé",
@@ -298,6 +301,7 @@ const fr = {
   invalidQr: "Le code QR ne contient pas une adresse Common Foundry mainnet reconnue.",
   scanCancelled: "La lecture du code QR a été annulée ou a échoué.",
   checkingUtxo: "Vérification de la disponibilité des UTXO…",
+  checkSpendableAgain: "Vérifier de nouveau les fonds disponibles",
   utxoUnavailable: "Les UTXO ne sont pas disponibles.",
   gatewayRespondsOne: "L’API UTXO répond avec 1 sortie. La signature reste locale; la diffusion nécessite une seconde confirmation explicite.",
   gatewayRespondsMany: "L’API UTXO répond avec {count} sorties. La signature reste locale; la diffusion nécessite une seconde confirmation explicite.",
@@ -341,6 +345,58 @@ export type Translate = (
 ) => string;
 
 const translations: Record<Language, Record<TranslationKey, string>> = { en, fr };
+
+const tauriPlatform = import.meta.env.TAURI_ENV_PLATFORM;
+export const desktopLightWallet = tauriPlatform === "windows" || tauriPlatform === "linux";
+
+const desktopTranslations: Record<Language, Partial<Record<TranslationKey, string>>> = {
+  en: {
+    appName: "Common Foundry Light Wallet",
+    appSubtitle: tauriPlatform === "linux" ? "Linux Light Wallet" : "Windows Light Wallet",
+    automaticDescription: "Uses the system language. English is the fallback.",
+    welcomeTitle: "Your CMFD wallet",
+    welcomeBody: "Create a wallet or restore a CMFD backup. Keys stay on this PC, and the wallet connects to Common Foundry services without syncing the blockchain.",
+    openSource: "Keys stay on this PC. Common Foundry services supply chain data and verify spendable inputs.",
+    backupLossWarning: "Keep the backup off this PC and store its passphrase separately.",
+    createExplanation: "Choose a passphrase of at least 12 bytes, then choose where to save your encrypted backup.",
+    restoreExplanation: "Choose your encrypted CMFD backup and enter its passphrase to restore it on this PC.",
+    exportDescription: "Enter your current passphrase and choose where to save an encrypted copy.",
+    checkingUtxo: "Checking spendable funds…",
+    verifyUtxoFees: "Review payment",
+    irreversibleConfirmation: "Review payment",
+    broadcastAuthorization: "I confirm the recipient, amount, and fee. This payment is final.",
+    signBroadcastOnce: "Sign and send",
+  },
+  fr: {
+    appName: "Portefeuille léger Common Foundry",
+    appSubtitle: tauriPlatform === "linux" ? "Portefeuille léger Linux" : "Portefeuille léger Windows",
+    automaticDescription: "Utilise la langue du système. L’anglais est la langue de secours.",
+    welcomeTitle: "Votre portefeuille CMFD",
+    welcomeBody: "Créez un portefeuille ou restaurez une sauvegarde CMFD. Les clés restent sur ce PC, et le portefeuille utilise les services Common Foundry sans synchroniser la chaîne.",
+    openSource: "Les clés restent sur ce PC. Les services Common Foundry fournissent les données de la chaîne et vérifient les fonds disponibles.",
+    backupLossWarning: "Gardez la sauvegarde hors de ce PC et conservez sa phrase secrète séparément.",
+    createExplanation: "Choisissez une phrase secrète d’au moins 12 octets, puis l’emplacement de la sauvegarde chiffrée.",
+    restoreExplanation: "Choisissez la sauvegarde CMFD chiffrée et entrez sa phrase secrète pour la restaurer sur ce PC.",
+    exportDescription: "Entrez votre phrase secrète actuelle et choisissez l’emplacement de la copie chiffrée.",
+    checkingUtxo: "Vérification des fonds disponibles…",
+    verifyUtxoFees: "Vérifier le paiement",
+    irreversibleConfirmation: "Vérifier le paiement",
+    broadcastAuthorization: "Je confirme le destinataire, le montant et les frais. Ce paiement est définitif.",
+    signBroadcastOnce: "Signer et envoyer",
+  },
+};
+
+const nativeMessageCodes = new Map<string, [en: string, fr: string]>([
+  ["wallet_service_unreachable", ["The Common Foundry service is temporarily unavailable.", "Le service Common Foundry est temporairement inaccessible."]],
+  ["wallet_service_timeout", ["The Common Foundry service took too long to respond.", "Le service Common Foundry a mis trop de temps à répondre."]],
+  ["wallet_overview_older", ["The server returned an older balance snapshot.", "Le serveur a renvoyé un état du solde plus ancien."]],
+  ["wallet_file_picker_cancelled", ["File selection cancelled.", "Sélection de fichier annulée."]],
+  ["wallet_operation_cancelled", ["Wallet operation cancelled.", "Opération du portefeuille annulée."]],
+  ["wallet_create_failed", ["Could not create the wallet. If a backup was saved, keep it and use Restore. Otherwise choose a new backup filename and try again.", "Création impossible. Si une sauvegarde a été enregistrée, conservez-la et utilisez Restaurer. Sinon, choisissez un nouveau nom de fichier."]],
+  ["wallet_restore_failed", ["Could not restore the wallet. Check the backup file, passphrase, and network. An existing wallet cannot be replaced.", "Restauration impossible. Vérifiez le fichier, la phrase secrète et le réseau. Un portefeuille existant ne peut pas être remplacé."]],
+  ["wallet_unlock_failed", ["Authentication failed. Check the wallet passphrase.", "Échec de l’authentification. Vérifiez la phrase secrète."]],
+  ["wallet_export_failed", ["Could not save the backup. Choose a new filename and try again.", "Enregistrement impossible. Choisissez un nouveau nom de fichier et réessayez."]],
+]);
 
 export function resolveLanguage(
   preference: LanguagePreference,
@@ -417,10 +473,13 @@ export function I18nProvider({ children }: { children: ReactNode }) {
   }, [language]);
 
   const t = useMemo<Translate>(() => {
+    const platformTranslations = desktopLightWallet
+      ? desktopTranslations[language]
+      : undefined;
     return (key, values = {}) =>
       Object.entries(values).reduce(
         (text, [name, value]) => text.replaceAll(`{${name}}`, String(value)),
-        translations[language][key],
+        platformTranslations?.[key] ?? translations[language][key],
       );
   }, [language]);
 
@@ -458,7 +517,7 @@ const englishNativeMessages = new Map<string, string>([
   ["La clé Android Keystore est inaccessible; aucune sauvegarde n’a été exportée.", "The Android Keystore key is unavailable; no backup was exported."],
   ["Le portefeuille doit être déverrouillé et la phrase secrète doit être valide.", "The wallet must be unlocked and the passphrase must be valid."],
   ["Exportation annulée ou impossible à vérifier.", "Export was cancelled or could not be verified."],
-  ["Chaque entrée de la passerelle officielle est vérifiée avant signature auprès du nœud allemand ou, s’il est indisponible ou en retard, du relais Proxmox local. Une divergence bloque l’envoi. Le téléphone ne valide pas lui-même toute la chaîne; une compromission de la passerelle et du nœud utilisé pourrait encore fausser les frais.", "Every official gateway input is checked before signing against the Germany node, or the local Proxmox relay if Germany is unavailable or behind. A mismatch blocks sending. The phone does not validate the full chain itself; compromise of the gateway and the node used could still misstate fees."],
+  ["Chaque entrée de la passerelle est vérifiée auprès d’un nœud distinct avant signature. Une divergence bloque l’envoi. Le portefeuille dépend de ces services pour la validation de la chaîne.", "Each input from the wallet gateway is checked against a separate node before signing. A mismatch blocks sending. The wallet relies on these services for chain validation."],
   ["Les nœuds de vérification indépendants sont indisponibles, en retard ou ne confirment pas les entrées sélectionnées. L’envoi est bloqué.", "Independent verification nodes are unavailable, behind, or do not confirm the selected inputs. Sending is blocked."],
   ["Les valeurs des entrées ne correspondent pas aux transactions confirmées. L’envoi est bloqué; réessayez après synchronisation du service.", "Input values do not match confirmed transactions. Sending is blocked; try again after the service synchronizes."],
   ["Le serveur valide encore les blocs nécessaires. L’envoi demeure verrouillé pour éviter de dépenser des UTXO non vérifiés.", "The server is still validating the required blocks. Sending remains locked to avoid spending unverified UTXOs."],
@@ -492,6 +551,8 @@ export function localizedNativeMessage(
   language: Language,
   fallback: string,
 ): string {
+  const nativeMessage = nativeMessageCodes.get(message);
+  if (nativeMessage) return nativeMessage[language === "fr" ? 1 : 0];
   if (message === "biometric_setup_failed") return translations[language].biometricSetupFailed;
   if (language === "fr") return message;
   return englishNativeMessages.get(message) ?? fallback;

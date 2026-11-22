@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
 pub const API_BASE_URL: &str = "https://wallet.commonfoundry.ai/";
+const EXPLORER_BASE_URL: &str = "https://explorer.commonfoundry.ai/";
 pub const EXPLORER_ROUTE: &str = "v1/explorer";
 pub const ADDRESS_ROUTE_PREFIX: &str = "v1/explorer/address/";
 pub const TRANSACTION_ROUTE_PREFIX: &str = "v1/explorer/transaction/";
@@ -25,6 +26,8 @@ pub const TRANSACTION_OUTPUTS_ROUTE: &str = "v1/wallet/transaction";
 pub const BROADCAST_ROUTE: &str = "v1/wallet/broadcast";
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const OVERVIEW_ROUTE_TIMEOUT: Duration = Duration::from_secs(12);
+const OVERVIEW_FALLBACK_DELAY: Duration = Duration::from_secs(1);
 const MAX_ERROR_BODY_BYTES: usize = 16 * 1024;
 const MAX_SUCCESS_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_CURSOR_BYTES: usize = 1024;
@@ -233,6 +236,39 @@ impl ApiClient {
         Ok(snapshot)
     }
 
+    /// Read-only Windows overview. The explorer hostname serves the same public
+    /// address contract and is never used for signing prerequisites or broadcast.
+    pub async fn address_for_overview(
+        &self,
+        destination_hex: &str,
+    ) -> Result<AddressSnapshot, ApiError> {
+        validate_hex32(destination_hex)?;
+        let route = format!("{ADDRESS_ROUTE_PREFIX}{destination_hex}");
+        let primary = self.url(&route)?;
+        let fallback = Url::parse(EXPLORER_BASE_URL)
+            .and_then(|base| base.join(&route))
+            .map_err(|_| ApiError::InvalidConfiguration)?;
+        first_usable_overview(
+            self.address_at(destination_hex, primary),
+            self.address_at(destination_hex, fallback),
+            OVERVIEW_FALLBACK_DELAY,
+        )
+        .await
+    }
+
+    async fn address_at(
+        &self,
+        destination_hex: &str,
+        url: Url,
+    ) -> Result<AddressSnapshot, ApiError> {
+        let response = self
+            .send(self.http.get(url).timeout(OVERVIEW_ROUTE_TIMEOUT))
+            .await?;
+        let snapshot = self.decode(response).await?;
+        validate_address(&snapshot, destination_hex)?;
+        Ok(snapshot)
+    }
+
     pub async fn transaction(&self, txid: &str) -> Result<Option<TransactionStatus>, ApiError> {
         validate_hex32(txid)?;
         let url = self.url(&format!("{TRANSACTION_ROUTE_PREFIX}{txid}"))?;
@@ -339,15 +375,7 @@ impl ApiClient {
     }
 
     async fn send(&self, request: reqwest::RequestBuilder) -> Result<reqwest::Response, ApiError> {
-        let response = request.send().await.map_err(|error| {
-            if error.is_timeout() {
-                ApiError::Timeout
-            } else if error.is_redirect() {
-                ApiError::RedirectRefused
-            } else {
-                ApiError::Unreachable
-            }
-        })?;
+        let response = request.send().await.map_err(transport_error)?;
         if response.status().is_redirection() {
             return Err(ApiError::RedirectRefused);
         }
@@ -372,7 +400,7 @@ impl ApiClient {
         }
         let mut bytes =
             Vec::with_capacity(response.content_length().unwrap_or(0).min(limit as u64) as usize);
-        while let Some(chunk) = response.chunk().await.map_err(|_| ApiError::Unreachable)? {
+        while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
             if bytes
                 .len()
                 .checked_add(chunk.len())
@@ -575,6 +603,46 @@ fn body_too_large(status: StatusCode) -> ApiError {
     }
 }
 
+async fn first_usable_overview<T>(
+    primary: impl Future<Output = Result<T, ApiError>>,
+    fallback: impl Future<Output = Result<T, ApiError>>,
+    delay: Duration,
+) -> Result<T, ApiError> {
+    tokio::pin!(primary);
+    tokio::select! {
+        biased;
+        result = &mut primary => {
+            return match result {
+                Err(error) if error.retryable() => fallback.await,
+                result => result,
+            };
+        }
+        _ = tokio::time::sleep(delay) => {}
+    }
+
+    tokio::pin!(fallback);
+    tokio::select! {
+        result = &mut primary => match result {
+            Err(error) if error.retryable() => fallback.await,
+            result => result,
+        },
+        result = &mut fallback => match result {
+            Ok(snapshot) => Ok(snapshot),
+            Err(_) => primary.await,
+        },
+    }
+}
+
+fn transport_error(error: reqwest::Error) -> ApiError {
+    if error.is_timeout() {
+        ApiError::Timeout
+    } else if error.is_redirect() {
+        ApiError::RedirectRefused
+    } else {
+        ApiError::Unreachable
+    }
+}
+
 fn hex_network_id() -> String {
     hex::encode(MAINNET_NETWORK_ID)
 }
@@ -588,6 +656,44 @@ mod tests {
     use super::*;
 
     const DESTINATION: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+
+    #[tokio::test]
+    async fn fast_primary_avoids_starting_the_fallback() {
+        let fallback = async { panic!("fast primary should not start fallback") };
+        let result = first_usable_overview(
+            std::future::ready(Ok(71000)),
+            fallback,
+            OVERVIEW_FALLBACK_DELAY,
+        )
+        .await;
+        assert_eq!(result.unwrap(), 71000);
+    }
+
+    #[tokio::test]
+    async fn slow_primary_can_recover_from_the_parallel_fallback() {
+        let result = first_usable_overview(
+            std::future::pending(),
+            std::future::ready(Ok(71001)),
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(result.unwrap(), 71001);
+    }
+
+    #[tokio::test]
+    async fn failed_fallback_does_not_cancel_a_working_primary() {
+        let primary = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok(71002)
+        };
+        let result = first_usable_overview(
+            primary,
+            std::future::ready(Err(ApiError::Unreachable)),
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(result.unwrap(), 71002);
+    }
 
     fn test_client(base: &str, timeout: Duration) -> ApiClient {
         ApiClient {

@@ -173,6 +173,19 @@ impl WalletEngine {
         Ok(())
     }
 
+    pub fn export_backup_authenticated(
+        &self,
+        passphrase: &[u8],
+        recovery_path: impl AsRef<Path>,
+    ) -> Result<(), EngineError> {
+        let local = self.store.load_live_wallet()?;
+        let encrypted = self.export_external_authenticated(local.as_bytes(), passphrase)?;
+        let encrypted = EncryptedBackup::from_bytes(encrypted).map_err(VaultError::from)?;
+        self.store
+            .write_recovery_backup(recovery_path, &encrypted)?;
+        Ok(())
+    }
+
     /// Prepares independently randomized recovery and live artifacts without
     /// writing either one. This is used only by the Android SAF/Keystore
     /// orchestrator, which must commit the recovery document first.
@@ -363,7 +376,15 @@ mod tests {
         first.lock().unwrap();
         assert!(!first.status().unwrap().unlocked);
         assert!(first.unlock(PASSPHRASE).unwrap().unlocked);
-        first.export_backup(PASSPHRASE, &exported_backup).unwrap();
+        assert!(
+            first
+                .export_backup_authenticated(b"wrong long passphrase", &exported_backup)
+                .is_err()
+        );
+        assert!(!exported_backup.exists());
+        first
+            .export_backup_authenticated(PASSPHRASE, &exported_backup)
+            .unwrap();
 
         let mut restored = WalletEngine::new(second_private);
         let restored_status = restored

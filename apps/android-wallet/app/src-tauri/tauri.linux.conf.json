@@ -1,0 +1,22 @@
+{
+  "productName": "Common Foundry Light Wallet",
+  "mainBinaryName": "common-foundry-light-wallet",
+  "identifier": "org.commonfoundry.wallet.light",
+  "app": {
+    "windows": [
+      {
+        "title": "Common Foundry Light Wallet",
+        "width": 920,
+        "height": 800,
+        "minWidth": 440,
+        "minHeight": 560
+      }
+    ]
+  },
+  "bundle": {
+    "targets": ["appimage", "deb"],
+    "icon": ["icons/icon.png"],
+    "shortDescription": "Common Foundry Light Wallet",
+    "longDescription": "Send and receive CMFD with local signing and no chain sync."
+  }
+}

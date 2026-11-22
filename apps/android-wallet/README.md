@@ -28,6 +28,40 @@ This is independent node corroboration, not full chain validation on the phone. 
 
 The QR scanner uses Google ML Kit. Google says camera input and scan results remain on the device, but ML Kit may send usage and performance metrics. The app discloses this beside Scan and links its offline Android, Rust, and JavaScript license notices from Settings. See [third-party notices](THIRD_PARTY_NOTICES.md).
 
+## Windows and Linux Light Wallet preview
+
+The desktop builds use the same Rust wallet engine, backup format, transaction
+planner, signer, and spend checks as the Android app. It uses a native file
+picker for encrypted backups. Windows keeps wallet data under
+`%LOCALAPPDATA%\org.commonfoundry.wallet.light\wallet`. Linux uses
+`${XDG_DATA_HOME:-$HOME/.local/share}/org.commonfoundry.wallet.light/wallet`.
+
+With the Rust MSVC toolchain, Visual Studio C++ Build Tools, Node.js, pnpm, and
+Microsoft Edge WebView2 installed, run these commands from
+`apps/android-wallet/app`:
+
+```powershell
+pnpm install --frozen-lockfile
+pnpm tauri build --no-bundle -- --locked
+```
+
+Open `src-tauri/target/release/common-foundry-light-wallet.exe`. Create a wallet
+and save its encrypted backup, or restore an existing CMFD backup on first
+launch. Receive displays your mainnet address and QR code. Send shows a
+transaction review and requires confirmation before signing locally and making
+one broadcast attempt.
+
+For Linux development on Ubuntu 22.04, install GTK3 and WebKitGTK 4.1 development
+packages along with the [Tauri Linux prerequisites](https://v2.tauri.app/start/prerequisites/#linux).
+Run `pnpm install --frozen-lockfile` and
+`pnpm tauri build --bundles appimage,deb -- --locked` from
+`apps/android-wallet/app`. Packages appear under `src-tauri/target/release/bundle`.
+
+The app gets balances and history from the Common Foundry wallet gateway and
+checks selected inputs against a separately validating node before signing.
+These services validate the chain on behalf of the wallet. Debug builds keep
+mainnet sending disabled.
+
 ## Source checks
 
 ```sh

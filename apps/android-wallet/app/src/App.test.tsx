@@ -218,6 +218,40 @@ function renderUnlockedWallet(
   render(<App />);
 }
 
+test("refreshes the balance while a Send tab check is still pending", async () => {
+  localStorage.setItem(LANGUAGE_STORAGE_KEY, "en");
+  renderUnlockedWallet();
+  mockedAvailability.mockImplementationOnce(() => new Promise<SendAvailability>(() => {}));
+  expect(await screen.findByText(/Accepted height 100/)).toBeVisible();
+  expect(mockedAvailability).not.toHaveBeenCalled();
+
+  fireEvent.click(screen.getByRole("button", { name: "Send" }));
+  expect(await screen.findByText("Checking UTXO availability…")).toBeVisible();
+  expect(mockedAvailability).toHaveBeenCalledTimes(1);
+  const previous = await mockedOverview.mock.results[0].value;
+  mockedOverview.mockResolvedValue({ ...previous, acceptedHeight: 101, validatedHeight: 101 });
+  fireEvent.click(screen.getByRole("button", { name: "Overview" }));
+  expect(await screen.findByText(/Accepted height 101/)).toBeVisible();
+  expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled();
+});
+
+test("retains the last validated balance after an older response or a timeout", async () => {
+  localStorage.setItem(LANGUAGE_STORAGE_KEY, "en");
+  renderUnlockedWallet();
+  expect(await screen.findByText(/Accepted height 100/)).toBeVisible();
+  const previous = await mockedOverview.mock.results[0].value;
+  mockedOverview.mockResolvedValueOnce({ ...previous, acceptedHeight: 98, validatedHeight: 98 });
+  fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+  expect(await screen.findByText(/older balance snapshot/)).toBeVisible();
+  expect(screen.getByText(/Accepted height 100/)).toBeVisible();
+
+  mockedOverview.mockRejectedValueOnce("wallet_service_timeout");
+  fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+  expect(await screen.findByText(/took too long to respond/)).toBeVisible();
+  expect(screen.getByText(/Accepted height 100/)).toBeVisible();
+  expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled();
+});
+
 test("shows functional onboarding without fabricated wallet data", async () => {
   mockedStatus.mockResolvedValue({
     configured: false,
@@ -476,7 +510,9 @@ test("requires explicit confirmation and submits a prepared payment only once", 
   fireEvent.change(screen.getByLabelText("Montant CMFD"), {
     target: { value: "1" },
   });
-  fireEvent.click(screen.getByRole("button", { name: /Vérifier les UTXO/i }));
+  const prepare = screen.getByRole("button", { name: /Vérifier les UTXO/i });
+  await waitFor(() => expect(prepare).toBeEnabled());
+  fireEvent.click(prepare);
 
   expect(await screen.findByText("Confirmation irréversible")).toBeVisible();
   expect(screen.getByText("Destinataire (hexadécimal)")).toBeVisible();
@@ -513,7 +549,9 @@ test("shows an exact hexadecimal recipient without adding a bech32m presentation
   fireEvent.change(screen.getByLabelText("Montant CMFD"), {
     target: { value: "0.1" },
   });
-  fireEvent.click(screen.getByRole("button", { name: /Vérifier les UTXO/i }));
+  const prepare = screen.getByRole("button", { name: /Vérifier les UTXO/i });
+  await waitFor(() => expect(prepare).toBeEnabled());
+  fireEvent.click(prepare);
 
   expect(await screen.findByText("Confirmation irréversible")).toBeVisible();
   expect(screen.getByText(HEX_ADDRESS)).toBeVisible();
@@ -568,7 +606,9 @@ test("clears a stale broadcast notice after successful confirmation reconciliati
   fireEvent.change(screen.getByLabelText("Montant CMFD"), {
     target: { value: "0.1" },
   });
-  fireEvent.click(screen.getByRole("button", { name: /Vérifier les UTXO/i }));
+  const prepare = screen.getByRole("button", { name: /Vérifier les UTXO/i });
+  await waitFor(() => expect(prepare).toBeEnabled());
+  fireEvent.click(prepare);
   await screen.findByText("Confirmation irréversible");
   fireEvent.click(screen.getByRole("checkbox"));
   fireEvent.click(screen.getByRole("button", { name: "Signer et diffuser une fois" }));

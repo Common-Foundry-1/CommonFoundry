@@ -157,6 +157,7 @@ input:focus { border-color: var(--brand); box-shadow: 0 0 0 3px var(--focus); }
 .field-with-button { display: grid; grid-template-columns: 1fr auto; gap: .5rem; }
 .field-with-button button { min-height: 3rem; }
 .secure-form { display: grid; gap: .9rem; margin-top: 1.3rem; }
+.secure-form[hidden] { display: none; }
 .secure-form h2 { margin-bottom: 0; }
 .form-help { margin: 0 0 .3rem; font-size: .9rem; }
 .form-actions { display: grid; gap: .7rem; }
@@ -167,6 +168,7 @@ input:focus { border-color: var(--brand); box-shadow: 0 0 0 3px var(--focus); }
 .status.error { border-color: var(--error-border); color: var(--error-text); }
 
 .wallet-shell { max-width: 46rem; margin: 2rem auto 0; }
+.refresh-status:empty { margin: 0; }
 .wallet-heading { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
 .wallet-heading h1 { margin-bottom: 0; font-size: clamp(1.8rem, 7vw, 2.8rem); }
 .tabs { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .4rem; margin: 1.4rem 0 .8rem; }

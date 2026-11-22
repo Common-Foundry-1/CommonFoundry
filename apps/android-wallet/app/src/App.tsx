@@ -36,6 +36,7 @@ import {
 } from "./native";
 import {
   I18nProvider,
+  desktopLightWallet,
   localizedNativeMessage,
   useI18n,
   type LanguagePreference,
@@ -51,6 +52,11 @@ type LoadState =
 type WalletView = "overview" | "receive" | "send" | "backup";
 
 type HistoryDirection = "incoming" | "outgoing" | "internal" | "pending" | "unknown";
+const OVERVIEW_RETRY_MS = 4_000;
+
+function isTransientOverviewError(error: unknown): boolean {
+  return error === "wallet_service_timeout" || error === "wallet_service_unreachable";
+}
 
 function historyDirection(entry: HistoryEntry): HistoryDirection {
   const kind = entry.kind.trim().toLowerCase();
@@ -276,7 +282,7 @@ function SettingsPanel({
 
         <section className="settings-section" aria-labelledby="wallet-settings-title">
           <h2 id="wallet-settings-title">{t("walletSection")}</h2>
-          <BiometricSettings unlocked={backupAvailable} onWalletChange={onWalletChange} />
+          {!desktopLightWallet && <BiometricSettings unlocked={backupAvailable} onWalletChange={onWalletChange} />}
           <button type="button" disabled={!backupAvailable} onClick={onOpenBackup}>
             {t("backupShortcut")}
           </button>
@@ -291,7 +297,7 @@ function SettingsPanel({
           <span>{t("version", { version })}</span>
           <span>{t("network")}</span>
           <p>{t("openSource")}</p>
-          <button
+          {!desktopLightWallet && <button
             type="button"
             className="notices-link"
             onClick={() => {
@@ -300,7 +306,7 @@ function SettingsPanel({
             }}
           >
             {t("licensesAndPrivacy")}
-          </button>
+          </button>}
           {noticesError && <p className="inline-error" role="alert">{t("noticesLockFailed")}</p>}
         </section>
       </section>
@@ -398,13 +404,13 @@ function Onboarding({ onComplete }: { onComplete: (wallet: WalletStatus) => void
               {t("restoreBackup")}
             </button>
           </div>
-          <p className="notice" role="note">{t("activationNotice")}</p>
+          {!desktopLightWallet && <p className="notice" role="note">{t("activationNotice")}</p>}
         </>
       )}
       {flow === "create" && (
         <>
-          <p className="safety-warning" role="note">{t("backupLossWarning")}</p>
-          <p className="notice" role="note">{t("backupStorageChoice")}</p>
+          <p className={desktopLightWallet ? "notice" : "safety-warning"} role="note">{t("backupLossWarning")}</p>
+          {!desktopLightWallet && <p className="notice" role="note">{t("backupStorageChoice")}</p>}
           <PassphraseAction
             title={t("createAndBackup")}
             explanation={t("createExplanation")}
@@ -443,7 +449,7 @@ function Unlock({
   const [biometricError, setBiometricError] = useState(false);
   useEffect(() => {
     let active = true;
-    if (!wallet.recoveryRequired) {
+    if (!desktopLightWallet && !wallet.recoveryRequired) {
       void getBiometricStatus().then(value => {
         if (active) setBiometrics(value);
       }).catch(() => { if (active) setBiometrics(null); });
@@ -482,7 +488,7 @@ function Unlock({
     <section className="panel hero compact">
       <p className="eyebrow">{t("walletLocked")}</p>
       <h1>{t("unlockRequired")}</h1>
-      <p>{t("unlockPrivacy")}</p>
+      {!desktopLightWallet && <p>{t("unlockPrivacy")}</p>}
       {biometrics?.enabled && (
         <button type="button" disabled={authBusy || !biometrics.available} onClick={() => void unlockBiometric()}>
           {authBusy ? t("secureProcessing") : t("biometricUnlock")}
@@ -598,11 +604,13 @@ function WalletHome({
   view: WalletView;
   onViewChange: (view: WalletView) => void;
 }) {
-  const { t, language } = useI18n();
-  const [overview, setOverview] = useState<WalletOverview | null>(null);
-  const [send, setSend] = useState<SendAvailability | null>(null);
-  const [networkError, setNetworkError] = useState<string | null>(null);
+  const { t } = useI18n();
+  const [{ overview, error }, setOverview] = useState<{
+    overview: WalletOverview | null;
+    error: unknown;
+  }>({ overview: null, error: null });
   const [refreshing, setRefreshing] = useState(false);
+  const overviewInFlight = useRef(false);
 
   useEffect(() => {
     const lockOrRefresh = () => {
@@ -617,37 +625,41 @@ function WalletHome({
     return () => document.removeEventListener("visibilitychange", lockOrRefresh);
   }, [onWalletChange]);
 
-  const refresh = async () => {
+  const refresh = useCallback(async (background = false) => {
+    if (overviewInFlight.current) return;
+    overviewInFlight.current = true;
     setRefreshing(true);
-    setNetworkError(null);
-    const [overviewResult, sendResult] = await Promise.allSettled([
-      getWalletOverview(),
-      getSendAvailability(),
-    ]);
-    if (overviewResult.status === "fulfilled") {
-      setOverview(overviewResult.value);
-    } else {
-      setNetworkError(publicError(overviewResult.reason, language, t("genericFailure")));
-    }
-    if (sendResult.status === "fulfilled") {
-      setSend(sendResult.value);
-    } else {
-      setSend({
-        available: false,
-        message: publicError(sendResult.reason, language, t("genericFailure")),
-        nextHeight: null,
-        utxoCount: 0,
-        spendableAtoms: null,
-        feeAtoms: null,
-        maximumAtoms: null,
+    if (!background) setOverview((current) => ({ ...current, error: null }));
+    try {
+      const snapshot = await getWalletOverview();
+      setOverview((current) => {
+        if (current.overview && (
+          snapshot.acceptedHeight < current.overview.acceptedHeight ||
+          (snapshot.validatedHeight ?? 0) < (current.overview.validatedHeight ?? 0)
+        )) {
+          return { ...current, error: "wallet_overview_older" };
+        }
+        return { overview: snapshot, error: null };
       });
+    } catch (reason) {
+      setOverview((current) => ({ ...current, error: reason ?? true }));
+    } finally {
+      overviewInFlight.current = false;
+      setRefreshing(false);
     }
-    setRefreshing(false);
-  };
+  }, []);
 
   useEffect(() => {
-    void refresh();
-  }, []);
+    if (view === "overview") void refresh();
+  }, [refresh, view]);
+
+  useEffect(() => {
+    if (!desktopLightWallet || view !== "overview" || refreshing || !isTransientOverviewError(error)) return;
+    const retry = window.setTimeout(() => {
+      if (document.visibilityState === "visible") void refresh(true);
+    }, OVERVIEW_RETRY_MS);
+    return () => window.clearTimeout(retry);
+  }, [error, refresh, refreshing, view]);
 
   if (!wallet.address) return <StatusCard text={t("identityUnavailable")} tone="error" />;
 
@@ -686,13 +698,13 @@ function WalletHome({
       {view === "overview" && (
         <OverviewPanel
           overview={overview}
-          error={networkError}
+          error={error}
           refreshing={refreshing}
           onRefresh={() => void refresh()}
         />
       )}
       {view === "receive" && <ReceivePanel address={wallet.address} />}
-      {view === "send" && <SendPanel availability={send} />}
+      {view === "send" && <SendPanel />}
       {view === "backup" && <BackupPanel />}
     </section>
   );
@@ -705,11 +717,15 @@ function OverviewPanel({
   onRefresh,
 }: {
   overview: WalletOverview | null;
-  error: string | null;
+  error: unknown;
   refreshing: boolean;
   onRefresh: () => void;
 }) {
   const { t, language } = useI18n();
+  const reconnecting = desktopLightWallet && isTransientOverviewError(error);
+  const errorMessage = reconnecting
+    ? t("reconnectingBalance")
+    : publicError(error, language, t("genericFailure"));
   return (
     <div className="panel wallet-content">
       <div className="section-heading">
@@ -718,8 +734,11 @@ function OverviewPanel({
           {refreshing ? t("refreshing") : t("refresh")}
         </button>
       </div>
-      {error && <p className="inline-error" role="alert">{error} {t("staleData")}</p>}
-      {!overview && !error && <p>{t("loadingMainnet")}</p>}
+      <p className={error && !reconnecting ? "inline-error" : "refresh-status"} role="status">
+        {error
+          ? [errorMessage, overview && t("staleData")].filter(Boolean).join(" ")
+          : !overview && t("loadingMainnet")}
+      </p>
       {overview && (
         <>
           <div className="balances">
@@ -727,7 +746,7 @@ function OverviewPanel({
             <Balance label={t("confirmed")} atoms={overview.confirmedAtoms} />
             <Balance label={t("immature")} atoms={overview.immatureAtoms} />
           </div>
-          <p className="safety-warning" role="note">{t("backupLossWarning")}</p>
+          {!desktopLightWallet && <p className="safety-warning" role="note">{t("backupLossWarning")}</p>}
           <p className="notice">
             {t("acceptedHeight", {
               height: overview.acceptedHeight,
@@ -801,13 +820,16 @@ function ReceivePanel({ address }: { address: string }) {
       </div>
       <p className="address">{address}</p>
       <button onClick={() => void copy()}>{copied ? t("addressCopied") : t("copyAddress")}</button>
-      <p className="notice">{t("receiveQrNotice")}</p>
+      {!desktopLightWallet && <p className="notice">{t("receiveQrNotice")}</p>}
     </div>
   );
 }
 
-function SendPanel({ availability }: { availability: SendAvailability | null }) {
+function SendPanel() {
   const { t, language } = useI18n();
+  const [availability, setAvailability] = useState<SendAvailability | null>(null);
+  const [availabilityError, setAvailabilityError] = useState<unknown>(null);
+  const availabilityInFlight = useRef(false);
   const [recipient, setRecipient] = useState("");
   const [amount, setAmount] = useState("");
   const [scanError, setScanError] = useState<string | null>(null);
@@ -817,6 +839,19 @@ function SendPanel({ availability }: { availability: SendAvailability | null }) 
   const [pending, setPending] = useState<PendingPayment[]>([]);
   const [confirmed, setConfirmed] = useState(false);
   const [busy, setBusy] = useState(false);
+  const reviewHeading = useRef<HTMLHeadingElement>(null);
+  const reviewButton = useRef<HTMLButtonElement>(null);
+  const wasReviewing = useRef(false);
+
+  useEffect(() => {
+    if (!desktopLightWallet) return;
+    if (prepared) {
+      reviewHeading.current?.focus();
+    } else if (wasReviewing.current) {
+      reviewButton.current?.focus();
+    }
+    wasReviewing.current = prepared !== null;
+  }, [prepared]);
 
   const refreshPending = async (reconcile: boolean) => {
     try {
@@ -830,6 +865,24 @@ function SendPanel({ availability }: { availability: SendAvailability | null }) 
   useEffect(() => {
     void refreshPending(false);
   }, []);
+
+  const checkAvailability = useCallback(async () => {
+    if (availabilityInFlight.current) return;
+    availabilityInFlight.current = true;
+    setAvailability(null);
+    setAvailabilityError(null);
+    try {
+      setAvailability(await getSendAvailability());
+    } catch (reason) {
+      setAvailabilityError(reason ?? true);
+    } finally {
+      availabilityInFlight.current = false;
+    }
+  }, []);
+
+  useEffect(() => {
+    void checkAvailability();
+  }, [checkAvailability]);
 
   const scanRecipient = async () => {
     setScanError(null);
@@ -893,8 +946,8 @@ function SendPanel({ availability }: { availability: SendAvailability | null }) 
   return (
     <div className="panel wallet-content">
       <p className="eyebrow">{t("sendEyebrow")}</p>
-      <h2>{t("preparePayment")}</h2>
-      <form className="secure-form" onSubmit={(event) => void prepare(event)}>
+      {(!desktopLightWallet || !prepared) && <h2>{t("preparePayment")}</h2>}
+      <form className="secure-form" hidden={desktopLightWallet && prepared !== null} onSubmit={(event) => void prepare(event)}>
         <label>
           {t("recipientAddress")}
           <span className="field-with-button">
@@ -902,6 +955,9 @@ function SendPanel({ availability }: { availability: SendAvailability | null }) 
               type="text"
               inputMode="text"
               placeholder="cmfd1…"
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellCheck={false}
               value={recipient}
               disabled={busy || prepared !== null}
               onChange={(event) => {
@@ -910,17 +966,17 @@ function SendPanel({ availability }: { availability: SendAvailability | null }) 
               }}
               required
             />
-            <button
+            {!desktopLightWallet && <button
               type="button"
               className="secondary"
               disabled={busy || prepared !== null}
               onClick={() => void scanRecipient()}
             >
               {t("scan")}
-            </button>
+            </button>}
           </span>
         </label>
-        <small className="qr-privacy-note">{t("qrPrivacyNote")}</small>
+        {!desktopLightWallet && <small className="qr-privacy-note">{t("qrPrivacyNote")}</small>}
         <label>
           {t("amountCmfd")}
           <input
@@ -956,7 +1012,7 @@ function SendPanel({ availability }: { availability: SendAvailability | null }) 
               : t("unavailable")}</dd>
           </div>
         </dl>
-        <button disabled={busy || prepared !== null || availability?.available !== true}>
+        <button ref={reviewButton} disabled={busy || prepared !== null || availability?.available !== true}>
           {busy ? t("verifying") : t("verifyUtxoFees")}
         </button>
       </form>
@@ -965,7 +1021,12 @@ function SendPanel({ availability }: { availability: SendAvailability | null }) 
       {message && <p className="notice" role="status">
         {localizedNativeMessage(message, language, t("genericFailure"))}
       </p>}
-      {!availability && <p className="notice">{t("checkingUtxo")}</p>}
+      {!availability && !availabilityError && <p className="notice">{t("checkingUtxo")}</p>}
+      {!!availabilityError && (
+        <p className="inline-error" role="alert">
+          {publicError(availabilityError, language, t("genericFailure"))}
+        </p>
+      )}
       {availability && !availability.available && (
         <p className="inline-error">
           {availability.message
@@ -973,7 +1034,13 @@ function SendPanel({ availability }: { availability: SendAvailability | null }) 
             : t("utxoUnavailable")}
         </p>
       )}
-      {availability?.available && (
+      {(!!availabilityError || (availability && !availability.available) ||
+        (availability?.maximumAtoms === "0")) && (
+        <button type="button" className="small secondary" onClick={() => void checkAvailability()}>
+          {t("checkSpendableAgain")}
+        </button>
+      )}
+      {!desktopLightWallet && availability?.available && (
         <>
           <p className="notice">
             {availability.utxoCount === 1
@@ -989,16 +1056,22 @@ function SendPanel({ availability }: { availability: SendAvailability | null }) 
       )}
       {prepared && (
         <div className="confirmation" aria-label={t("irreversibleConfirmation")}>
-          <h3>{t("irreversibleConfirmation")}</h3>
+          <h3 ref={reviewHeading} tabIndex={desktopLightWallet ? -1 : undefined}>{t("irreversibleConfirmation")}</h3>
           <dl>
-            <div><dt>{t("recipientHex")}</dt><dd className="address">{prepared.recipientHex}</dd></div>
-            {prepared.recipientBech32m && (
-              <div><dt>{t("recipientBech32m")}</dt><dd className="address">{prepared.recipientBech32m}</dd></div>
+            {desktopLightWallet ? (
+              <div><dt>{t("recipient")}</dt><dd className="address">{prepared.recipientBech32m ?? prepared.recipientHex}</dd></div>
+            ) : (
+              <>
+                <div><dt>{t("recipientHex")}</dt><dd className="address">{prepared.recipientHex}</dd></div>
+                {prepared.recipientBech32m && (
+                  <div><dt>{t("recipientBech32m")}</dt><dd className="address">{prepared.recipientBech32m}</dd></div>
+                )}
+              </>
             )}
             <div><dt>{t("amount")}</dt><dd>{formatAtoms(prepared.amountAtoms)} CMFD</dd></div>
             <div><dt>{t("expectedFee")}</dt><dd>{formatAtoms(prepared.feeAtoms)} CMFD</dd></div>
             <div><dt>{t("change")}</dt><dd>{formatAtoms(prepared.changeAtoms)} CMFD</dd></div>
-            <div><dt>{t("selectedInputs")}</dt><dd>{prepared.selectedInputs}</dd></div>
+            {!desktopLightWallet && <div><dt>{t("selectedInputs")}</dt><dd>{prepared.selectedInputs}</dd></div>}
           </dl>
           <label className="confirm-check">
             <input
@@ -1026,14 +1099,16 @@ function SendPanel({ availability }: { availability: SendAvailability | null }) 
           </div>
         </div>
       )}
-      <div className="section-heading pending-heading">
-        <h3>{t("trackedTransactions")}</h3>
-        <button className="small secondary" disabled={busy} onClick={() => void refreshPending(true)}>
-          {t("checkConfirmations")}
-        </button>
-      </div>
+      {(!desktopLightWallet || pending.length > 0) && (
+        <div className="section-heading pending-heading">
+          <h3>{t("trackedTransactions")}</h3>
+          <button className="small secondary" disabled={busy} onClick={() => void refreshPending(true)}>
+            {t("checkConfirmations")}
+          </button>
+        </div>
+      )}
       {pending.length === 0 ? (
-        <p>{t("noPending")}</p>
+        !desktopLightWallet && <p>{t("noPending")}</p>
       ) : (
         <ul className="history">
           {pending.map((payment) => (
@@ -1083,8 +1158,8 @@ function BackupPanel() {
       <p className="eyebrow">{t("backupEyebrow")}</p>
       <h2>{t("exportOfficialCopy")}</h2>
       <p>{t("exportDescription")}</p>
-      <p className="notice" role="note">{t("backupStorageChoice")}</p>
-      <p className="safety-warning" role="note">{t("backupLossWarning")}</p>
+      {!desktopLightWallet && <p className="notice" role="note">{t("backupStorageChoice")}</p>}
+      <p className={desktopLightWallet ? "notice" : "safety-warning"} role="note">{t("backupLossWarning")}</p>
       <form className="secure-form" onSubmit={(event) => void submit(event)}>
         <label>
           {t("currentPassphrase")}
@@ -1092,8 +1167,10 @@ function BackupPanel() {
         </label>
         <button disabled={busy}>{busy ? t("exporting") : t("chooseLocation")}</button>
       </form>
-      {message && <p className={message === t("exportSuccess") ? "success" : "inline-error"}>{message}</p>}
-      <p className="notice">{t("keystoreNotIncluded")}</p>
+      <p role="status" className={message ? (message === t("exportSuccess") ? "success" : "inline-error") : undefined}>
+        {message}
+      </p>
+      {!desktopLightWallet && <p className="notice">{t("keystoreNotIncluded")}</p>}
     </div>
   );
 }

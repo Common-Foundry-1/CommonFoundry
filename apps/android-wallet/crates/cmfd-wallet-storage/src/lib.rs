@@ -178,6 +178,10 @@ fn write_new_encrypted_file(path: &Path, encrypted: &EncryptedBackup) -> Result<
     file.write_all(encrypted.as_bytes())
         .map_err(|_| StorageError::Io)?;
     file.sync_all().map_err(|_| StorageError::Io)?;
+    drop(file);
+    if read_encrypted_file(path)?.as_bytes() != encrypted.as_bytes() {
+        return Err(StorageError::InvalidWallet);
+    }
     sync_parent_directory(parent)?;
     Ok(())
 }

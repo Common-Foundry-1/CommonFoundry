@@ -1730,7 +1730,6 @@ struct RemoteProofAdmissionState {
     waiting_set: HashSet<RemoteProofPeerId>,
     cooldowns: HashMap<RemoteProofPeerId, Instant>,
     cooldown_order: VecDeque<RemoteProofPeerId>,
-    cooldown_saturated_until: Option<Instant>,
     wait_events: u64,
     rejections: u64,
     proof_failures: u64,
@@ -1766,7 +1765,6 @@ impl RemoteProofAdmissionQueue {
                 waiting_set: HashSet::new(),
                 cooldowns: HashMap::new(),
                 cooldown_order: VecDeque::new(),
-                cooldown_saturated_until: None,
                 wait_events: 0,
                 rejections: 0,
                 proof_failures: 0,
@@ -1815,10 +1813,7 @@ impl RemoteProofAdmissionQueue {
             return Err(NodeError::ProofVerificationQueueTimeout);
         }
         let in_flight = state.waiting.len() + usize::from(state.active.is_some());
-        if state
-            .cooldown_saturated_until
-            .is_some_and(|deadline| deadline > now)
-            || state.cooldowns.contains_key(&peer)
+        if state.cooldowns.contains_key(&peer)
             || state.active == Some(peer)
             || state.waiting_set.contains(&peer)
             || in_flight >= self.max_in_flight
@@ -1942,12 +1937,6 @@ impl RemoteProofAdmissionQueue {
 }
 
 fn prune_remote_proof_cooldowns(state: &mut RemoteProofAdmissionState, now: Instant) {
-    if state
-        .cooldown_saturated_until
-        .is_some_and(|deadline| deadline <= now)
-    {
-        state.cooldown_saturated_until = None;
-    }
     while let Some(peer) = state.cooldown_order.front().copied() {
         let expired = state
             .cooldowns
@@ -2021,17 +2010,12 @@ impl Drop for RemoteProofAdmissionPermit {
                     return;
                 };
                 if state.cooldowns.len() >= MAX_REMOTE_PROOF_COOLDOWNS {
-                    // Every unexpired identity remains binding. Exhausting the
-                    // live-session-sized TTL table rejects all remote proof
-                    // admissions for one full cooldown instead of silently
-                    // letting any untracked failing session retry. The queue
-                    // automatically reopens; lifecycle shutdown remains a
-                    // separate terminal state.
-                    state.cooldown_saturated_until = Some(cooldown_deadline);
-                } else {
-                    state.cooldowns.insert(self.peer, cooldown_deadline);
-                    state.cooldown_order.push_back(self.peer);
+                    if let Some(oldest) = state.cooldown_order.pop_front() {
+                        state.cooldowns.remove(&oldest);
+                    }
                 }
+                state.cooldowns.insert(self.peer, cooldown_deadline);
+                state.cooldown_order.push_back(self.peer);
             }
         } else {
             state.closing = true;
@@ -14416,6 +14400,28 @@ mod tests {
         assert_eq!(proof_status.normal.active, 0);
         assert_eq!(proof_status.priority.active, 0);
         assert_eq!(proof_status.priority.wait_events, 1);
+    }
+
+    #[test]
+    fn full_remote_cooldown_table_keeps_admitting_new_sessions() {
+        let remote = Arc::new(RemoteProofAdmissionQueue::new(
+            1,
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+        ));
+        for id in 1..=MAX_REMOTE_PROOF_COOLDOWNS as u64 + 1 {
+            let mut permit = remote.acquire(RemoteProofPeerId::new(id).unwrap()).unwrap();
+            permit.mark_proof_failure();
+        }
+        assert_eq!(
+            remote.state.lock().unwrap().cooldowns.len(),
+            MAX_REMOTE_PROOF_COOLDOWNS
+        );
+        assert!(
+            remote
+                .acquire(RemoteProofPeerId::new(MAX_REMOTE_PROOF_COOLDOWNS as u64 + 2).unwrap())
+                .is_ok()
+        );
     }
 
     #[test]

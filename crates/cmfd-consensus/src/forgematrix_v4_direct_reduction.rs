@@ -5,6 +5,7 @@ use crate::forgematrix_v4_basefold::{
     ForgeMatrixV4Field as F, ForgeMatrixV4IopContext as G,
 };
 use anyhow::{Result, ensure};
+use bincode::Options;
 use serde::{Deserialize, Serialize};
 use slop_algebra::{AbstractExtensionField, AbstractField};
 use slop_basefold::{BATCH_GRINDING_BITS, BasefoldProof, BasefoldVerifier, FriConfig};
@@ -238,8 +239,39 @@ pub struct VerifiedOpening {
 }
 pub type DirectBasefoldProof = BasefoldProof<G>;
 pub fn decode_basefold(bytes: &[u8]) -> Result<DirectBasefoldProof> {
-    Ok(bincode::deserialize(bytes)?)
+    let proof: DirectBasefoldProof = std::panic::catch_unwind(|| {
+        bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_limit(bytes.len() as u64)
+            .deserialize(bytes)
+    })
+    .map_err(|_| anyhow::anyhow!("invalid BaseFold dimensions"))??;
+    for opening in proof
+        .component_polynomials_query_openings_and_proofs
+        .iter()
+        .chain(&proof.query_phase_openings_and_proofs)
+    {
+        ensure!(
+            valid_tensor_storage(&opening.values),
+            "BaseFold values tensor shape"
+        );
+        ensure!(
+            valid_tensor_storage(&opening.proof.paths),
+            "BaseFold path tensor shape"
+        );
+    }
+    Ok(proof)
 }
+
+fn valid_tensor_storage<T>(tensor: &slop_tensor::Tensor<T>) -> bool {
+    tensor
+        .dimensions
+        .sizes()
+        .iter()
+        .try_fold(1_usize, |length, size| length.checked_mul(*size))
+        == Some(tensor.storage.len())
+}
+
 /// Exact transcript state for the production GPU prover. These values are
 /// prover inputs only; acceptance still requires both verifier stages below.
 pub struct ProverStart {
@@ -305,6 +337,34 @@ mod security_tests {
     use super::*;
     use slop_challenger::VariableLengthChallenger;
     use slop_multilinear::MultilinearPcsChallenger;
+
+    #[test]
+    fn tensor_shape_must_match_storage_before_verification() {
+        let malformed = slop_tensor::Tensor {
+            storage: vec![F::zero()].into(),
+            dimensions: [2].try_into().unwrap(),
+        };
+        assert!(!valid_tensor_storage(&malformed));
+    }
+
+    #[test]
+    #[ignore = "requires CMFD_COMPACT_PROOF_FIXTURE"]
+    fn released_compact_proof_decodes_with_tensor_checks() {
+        let wire = std::fs::read(std::env::var_os("CMFD_COMPACT_PROOF_FIXTURE").unwrap()).unwrap();
+        let compressed_at = crate::forgematrix_v4_direct::HEADER_BYTES
+            + crate::forgematrix_v4_direct::PUBLIC_BYTES
+            + crate::forgematrix_v4_direct::REDUCTION_BYTES;
+        let raw = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(
+            &wire[compressed_at..],
+            crate::forgematrix_v4_direct::JOINT_BASEFOLD_RAW_BYTES,
+        )
+        .unwrap();
+        let mut proof = decode_basefold(&raw).unwrap();
+        let tensor = &mut proof.component_polynomials_query_openings_and_proofs[0].values;
+        tensor.dimensions = [tensor.storage.len() + 1].try_into().unwrap();
+        let malformed = bincode::serialize(&proof).unwrap();
+        assert!(decode_basefold(&malformed).is_err());
+    }
 
     fn observe_shared_claims(c: &mut C, point: &[E], values: &[Vec<E>; 6]) {
         observe_shared_point(c, point);

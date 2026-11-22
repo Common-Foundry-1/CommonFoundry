@@ -5554,8 +5554,14 @@ fn build_template_from_state(
         .median_time_past()
         .checked_add(1)
         .ok_or(NodeError::TemplateTimeUnavailable)?;
+    let local_future_offset =
+        if cmfd_consensus::mainnet_network::is_mainnet_network(params.network_id) {
+            params.max_future_offset_secs.min(3 * 60)
+        } else {
+            params.max_future_offset_secs
+        };
     let latest = now_unix_seconds
-        .checked_add(params.max_future_offset_secs)
+        .checked_add(local_future_offset)
         .ok_or(NodeError::TemplateTimeUnavailable)?;
     let timestamp = now_unix_seconds.max(earliest);
     if timestamp > latest {
@@ -17609,6 +17615,29 @@ mod tests {
         ));
         assert!(node.mempool.is_empty());
         assert_eq!(node.mempool_bytes, MAX_MEMPOOL_BYTES);
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn mainnet_template_does_not_extend_an_hour_ahead_chain_clock() {
+        let path = test_dir("mainnet-template-future-skew");
+        clean_test_dir(&path);
+        let node = Node::open(&path).unwrap();
+        let mut params = node.params;
+        params.network_id = cmfd_consensus::mainnet_network::MAINNET_NETWORK_ID.unwrap();
+        params.max_future_offset_secs = MAX_FUTURE_OFFSET_SECS;
+        let now = node.state.median_time_past() - 60 * 60;
+        assert!(matches!(
+            build_template_from_state(
+                &node.state,
+                &params,
+                default_miner_destination(),
+                now,
+                Vec::new(),
+            ),
+            Err(NodeError::TemplateTimeUnavailable)
+        ));
         drop(node);
         clean_test_dir(&path);
     }

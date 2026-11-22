@@ -6147,7 +6147,6 @@ dependencies = [
 [[package]]
 name = "slop-alloc"
 version = "6.5.0"
-source = "git+https://github.com/succinctlabs/sp1.git?rev=92b8eabaea9ab7306da5826caa700adabf7445ba#92b8eabaea9ab7306da5826caa700adabf7445ba"
 dependencies = [
  "serde",
  "slop-algebra",

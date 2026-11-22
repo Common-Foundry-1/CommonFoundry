@@ -1,0 +1,10 @@
+[package]
+name = "slop-alloc"
+version = "6.5.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+slop-algebra = { git = "https://github.com/succinctlabs/sp1.git", rev = "92b8eabaea9ab7306da5826caa700adabf7445ba" }
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "1.0"

@@ -400,6 +400,8 @@ impl StaticPeerConfig {
 
 #[derive(Debug, Error)]
 pub enum PeerError {
+    #[error("peer frame allocation failed")]
+    AllocationFailed,
     #[error("peer frame is truncated: need {needed} bytes, have {remaining}")]
     Truncated { needed: usize, remaining: usize },
     #[error("peer frame magic is invalid")]
@@ -1926,7 +1928,10 @@ impl PeerConnection {
         }
         let frame_len = PEER_FRAME_HEADER_BYTES + payload_len;
         self.session.ensure_budget(frame_len, header[6])?;
-        let mut bytes = Vec::with_capacity(frame_len);
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(frame_len)
+            .map_err(|_| PeerError::AllocationFailed)?;
         bytes.extend_from_slice(&header);
         bytes.extend_from_slice(&self.read_exact_bounded(payload_len, submit_response_deadline)?);
         self.session.accept_inbound(&bytes)
@@ -1937,7 +1942,11 @@ impl PeerConnection {
         length: usize,
         submit_response_deadline: Option<Instant>,
     ) -> Result<Vec<u8>, PeerError> {
-        let mut bytes = vec![0_u8; length];
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(length)
+            .map_err(|_| PeerError::AllocationFailed)?;
+        bytes.resize(length, 0);
         let mut offset = 0;
         let mut last_progress = Instant::now();
         while offset < length {

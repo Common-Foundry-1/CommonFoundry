@@ -2279,9 +2279,36 @@ pub struct AriaCpuProver {
     #[cfg(windows)]
     placement: Option<aria_cpu_placement::Placement>,
     worker: Mutex<PersistentWorker>,
-    scratch: PathBuf,
+    scratch: CpuProofScratch,
     timeout: Duration,
     next: AtomicU64,
+}
+
+#[derive(Debug)]
+struct CpuProofScratch(PathBuf);
+
+impl CpuProofScratch {
+    fn create(parent: &Path) -> Result<Self, PoolError> {
+        fs::create_dir_all(parent).map_err(replay_error)?;
+        let parent = parent.canonicalize().map_err(replay_error)?;
+        let mut id = [0u8; 16];
+        getrandom::fill(&mut id).map_err(replay_error)?;
+        let path = parent.join(format!("aria-proof-{}", hex::encode(id)));
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&path).map_err(replay_error)?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for CpuProofScratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir(&self.0);
+    }
 }
 
 impl std::fmt::Debug for AriaCpuProver {
@@ -2293,7 +2320,7 @@ impl std::fmt::Debug for AriaCpuProver {
 impl AriaCpuProver {
     /// Starts the program and waits until it is ready (model loaded, warm-up proof done).
     pub fn start(program: PathBuf, scratch: PathBuf, timeout: Duration) -> Result<Self, PoolError> {
-        fs::create_dir_all(&scratch).map_err(replay_error)?;
+        let scratch = CpuProofScratch::create(&scratch)?;
         let command = ProductionV4PoolWorkerCommand { program, arguments: Vec::new(), environment: Vec::new() };
         let worker = PersistentWorker::start(&command, "CMFD_V4_PROOF_READY", "Aria CPU proof worker")?;
         Ok(Self { #[cfg(windows)] placement: None, worker: Mutex::new(worker), scratch, timeout, next: AtomicU64::new(0) })
@@ -2304,7 +2331,7 @@ impl AriaCpuProver {
         program: PathBuf, scratch: PathBuf, timeout: Duration, artifacts: &crate::ProductionV4VerifierArtifacts,
     ) -> Result<Self, PoolError> {
         let placement = aria_cpu_placement::Placement::discover().map_err(replay_error)?;
-        fs::create_dir_all(&scratch).map_err(replay_error)?;
+        let scratch = CpuProofScratch::create(&scratch)?;
         let command = ProductionV4PoolWorkerCommand {
             program,
             arguments: vec!["--server".into(), artifacts.bank.clone().into_os_string(),
@@ -2335,7 +2362,7 @@ impl AriaCpuProver {
         }
         let number = self.next.fetch_add(1, Ordering::Relaxed);
         let stem = format!("aria-{}-{number:08x}", std::process::id());
-        let (template_path, proof_path) = (self.scratch.join(format!("{stem}-template.json")), self.scratch.join(format!("{stem}-proof.bin")));
+        let (template_path, proof_path) = (self.scratch.0.join(format!("{stem}-template.json")), self.scratch.0.join(format!("{stem}-proof.bin")));
         let frozen = FrozenProductionV4Template {
             format_version: FROZEN_TEMPLATE_FORMAT_VERSION,
             challenge: template.challenge,
@@ -2344,7 +2371,7 @@ impl AriaCpuProver {
             nonce,
         };
         write_new_file(&template_path, &serde_json::to_vec(&frozen).map_err(replay_error)?)?;
-        let invoked = {
+        let invoked = (|| {
             let mut worker = self.worker.lock().map_err(|_| pool_replay_failure("aria cpu prover lock is poisoned"))?;
             #[cfg(windows)]
             if let Some(placement) = &self.placement {
@@ -2355,7 +2382,7 @@ impl AriaCpuProver {
                 "CMFD_V4_PROOF_DONE",
                 self.timeout,
             )
-        };
+        })();
         let read = invoked.and_then(|()| read_bounded_file(&proof_path, PRODUCTION_V4_MAX_PROOF_BYTES));
         let _ = fs::remove_file(&template_path);
         let _ = fs::remove_file(&proof_path);
@@ -2631,6 +2658,8 @@ impl AriaCpuShareVerifier {
         let slot = self.slot()?;
         #[cfg(windows)]
         let placement = self.cpu_prover.as_ref().and_then(|prover| prover.placement.as_ref());
+        #[cfg(windows)]
+        if placement.is_some() && packed.is_none() { return Err(pool_replay_failure("9950X3D replay kernel failed qualification")); }
         #[cfg(windows)]
         let mut guard = placement.map(|p| p.begin()).transpose().map_err(replay_error)?;
         let cpu_started = Instant::now();

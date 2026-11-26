@@ -26,7 +26,7 @@ Set `CMFD_CPU_TRACE_REUSE=1` in the Linux pool environment and use the matching 
 
 ## Linux and manual pool configuration
 
-For CPU-only operation, set ARIA_POOL_CPU_ONLY=1 and ARIA_POOL_CPU_PROVER to the absolute path of a launcher that starts the prover with --server MODEL RECORD THREADS. See run-prover.sh.example. ARIA_POOL_CPU_SHARES=1x8 allows one replay at a time with eight threads. ARIA_POOL_CPU_PROVER_TIMEOUT_S sets the request timeout in seconds. ARIA_POOL_CPU_PROVER_SCRATCH selects the writable, private directory for temporary proof and template files. Use an account-owned directory. The measured Windows placement profile is platform-specific.
+For CPU-only operation, set ARIA_POOL_CPU_ONLY=1 and ARIA_POOL_CPU_PROVER to the absolute path of a launcher that starts the prover with --server MODEL RECORD THREADS. See run-prover.sh.example. ARIA_POOL_CPU_SHARES=1x8 allows one replay at a time with eight threads. ARIA_POOL_CPU_PROVER_TIMEOUT_S sets the request timeout in seconds. ARIA_POOL_CPU_PROVER_SCRATCH selects the writable, private directory for temporary proof and template files. Use an account-owned directory. The qualified Linux run used ARIA_POOL_CPU_SHARES=1x14, CMFD_CPU_TRACE_REUSE=1, CMFD_CPU_TRACE_THREADS=16 and RAYON_NUM_THREADS=28. The measured Windows placement profile is platform-specific.
 
 Hybrid pools can enable ARIA_POOL_CPU_SHARES while retaining their configured GPU proof path. Adding ARIA_POOL_CPU_PROVER selects the CPU proof worker with the existing GPU fallback. The pool passes proof packets through the normal mainnet consensus checks.
 
@@ -39,4 +39,4 @@ Server commands use the existing tab-separated RUN protocol. ARIA_PROVER_WARMUP_
 
 ## Qualification
 
-The native 9950X3D benchmark used a locked model, synthetic share arrivals, recorded mainnet rotation times and one real frozen proving fixture. The final five-minute window yielded 54 of 54 replay digests matching the reference, zero stales, a 0.523 s replay median, and a 6.47 s median for five verified proofs. Operator performance depends on hardware, process placement, queueing and workload.
+The Linux release worker on a Ryzen 9 9950X3D under WSL2 produced five timed proofs at a median of 5.77 s. On native Windows the separately qualified pair produced a 5.93 s median. The five-minute CPU-only runs used simulated share arrivals, recorded mainnet job changes and a locked model. Both runs checked 54 ordinary shares with zero stales. The signed v1.0.23 node verified the five timed proofs, warmup and alternate-height proof from each run. The release manifest records the component revisions and hashes.

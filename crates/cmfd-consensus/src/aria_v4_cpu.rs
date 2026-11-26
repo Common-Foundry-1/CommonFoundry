@@ -14,8 +14,8 @@ pub mod trace_section;
 #[cfg(target_os = "linux")]
 #[path = "aria_trace_linux.rs"]
 pub mod trace_section;
-use std::sync::{Barrier, OnceLock};
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::{Barrier, OnceLock};
 
 use super::{
     CENTER, ForgeMatrixV4ExecutionError, ForgeMatrixV4ExecutionShape, ForgeMatrixV4LayerSource,
@@ -143,7 +143,9 @@ impl AriaPackedBank {
 
     /// Run the share kernel with a placement hook on each newly spawned worker thread.
     pub fn execute_with_thread_setup(
-        &self, coefficients: &[u8], threads: usize,
+        &self,
+        coefficients: &[u8],
+        threads: usize,
         setup: &(dyn Fn() -> std::io::Result<()> + Sync),
     ) -> Result<Vec<u32>, ForgeMatrixV4ExecutionError> {
         self.run(coefficients, threads, None, Some(setup))
@@ -151,19 +153,37 @@ impl AriaPackedBank {
 
     /// Record replay directly into the leased proof trace using the pool CPU placement.
     pub fn execute_traced_with_setup(
-        &self, coefficients: &[u8], threads: usize, pre: &mut [u32], act: &mut [u32],
+        &self,
+        coefficients: &[u8],
+        threads: usize,
+        pre: &mut [u32],
+        act: &mut [u32],
         setup: &(dyn Fn() -> std::io::Result<()> + Sync),
     ) -> Result<Vec<u32>, ForgeMatrixV4ExecutionError> {
         let words = self.layer_count * SHAPE.cells();
-        if pre.len() != words || act.len() != words { return Err(ForgeMatrixV4ExecutionError::InputLength); }
-        self.run(coefficients,threads,Some((pre.as_mut_ptr(),act.as_mut_ptr())),Some(setup))
-    }
-
-    pub fn initial_from_base(base: &[u8], coefficients: &[u8]) -> Result<Vec<u32>, ForgeMatrixV4ExecutionError> {
-        if base.len()!=SHAPE.cells() || coefficients.len()!=SHAPE.coefficient_bytes() {
+        if pre.len() != words || act.len() != words {
             return Err(ForgeMatrixV4ExecutionError::InputLength);
         }
-        Ok(initial_activation(SHAPE,base,&coefficients[..SHAPE.mask_coefficients()]))
+        self.run(
+            coefficients,
+            threads,
+            Some((pre.as_mut_ptr(), act.as_mut_ptr())),
+            Some(setup),
+        )
+    }
+
+    pub fn initial_from_base(
+        base: &[u8],
+        coefficients: &[u8],
+    ) -> Result<Vec<u32>, ForgeMatrixV4ExecutionError> {
+        if base.len() != SHAPE.cells() || coefficients.len() != SHAPE.coefficient_bytes() {
+            return Err(ForgeMatrixV4ExecutionError::InputLength);
+        }
+        Ok(initial_activation(
+            SHAPE,
+            base,
+            &coefficients[..SHAPE.mask_coefficients()],
+        ))
     }
 
     /// The initial activation (before the first layer), as canonical values, row by row.
@@ -185,7 +205,12 @@ impl AriaPackedBank {
         if pre.len() != values || act.len() != values {
             return Err(ForgeMatrixV4ExecutionError::InputLength);
         }
-        self.run(coefficients, threads, Some((pre.as_mut_ptr(), act.as_mut_ptr())), None)
+        self.run(
+            coefficients,
+            threads,
+            Some((pre.as_mut_ptr(), act.as_mut_ptr())),
+            None,
+        )
     }
 
     fn run(
@@ -233,8 +258,10 @@ impl AriaPackedBank {
             let gate = OnceLock::<Barrier>::new();
             let buffers = Shared([even.as_mut_ptr(), odd.as_mut_ptr()]);
             let trace = Shared(trace);
-            let masks: Vec<_> = layer_coefficients.chunks_exact(terms)
-                .map(|coefficients| Mask::new(SHAPE, coefficients)).collect();
+            let masks: Vec<_> = layer_coefficients
+                .chunks_exact(terms)
+                .map(|coefficients| Mask::new(SHAPE, coefficients))
+                .collect();
             let masks = &masks;
             let setup_error = std::sync::Mutex::new(None);
             let mut spawn_error = None;
@@ -248,10 +275,19 @@ impl AriaPackedBank {
                         let barrier = gate.wait();
                         if let Some(setup) = setup {
                             if let Err(error) = setup() {
-                                *setup_error.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+                                *setup_error
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                    Some(error);
                             }
                             barrier.wait();
-                            if setup_error.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some() { return; }
+                            if setup_error
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .is_some()
+                            {
+                                return;
+                            }
                         }
                         for layer in 0..self.layer_count {
                             let mask = &masks[layer];
@@ -262,10 +298,14 @@ impl AriaPackedBank {
                             }
                             let mut partial = [0_i64; B];
                             let weights = &self.layers[layer * LAYER_BYTES..][..LAYER_BYTES];
-                            let (current, next) = (buffers.0[layer % 2], buffers.0[(layer + 1) % 2]);
+                            let (current, next) =
+                                (buffers.0[layer % 2], buffers.0[(layer + 1) % 2]);
                             // SAFETY: the trace buffers hold layers x cells values (checked by the caller).
                             let layer_trace = trace.0.map(|(pre, act)| unsafe {
-                                (pre.add(layer * SHAPE.cells()), act.add(layer * SHAPE.cells()))
+                                (
+                                    pre.add(layer * SHAPE.cells()),
+                                    act.add(layer * SHAPE.cells()),
+                                )
                             });
                             loop {
                                 let tile = next_tile[layer].fetch_add(1, Ordering::Relaxed);
@@ -308,13 +348,20 @@ impl AriaPackedBank {
                     spawn_error = None;
                 }
             });
-            if let Some(error) = setup_error.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner) {
+            if let Some(error) = setup_error
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            {
                 return Err(ForgeMatrixV4ExecutionError::ThreadSetup(error));
             }
             if let Some(error) = spawn_error {
                 return Err(ForgeMatrixV4ExecutionError::ThreadSpawn(error));
             }
-            let last = if self.layer_count % 2 == 0 { &even } else { &odd };
+            let last = if self.layer_count % 2 == 0 {
+                &even
+            } else {
+                &odd
+            };
             let mut out = vec![0_u32; SHAPE.cells()];
             for (index, out) in out.iter_mut().enumerate() {
                 let (row, column) = (index / D, index % D);
@@ -346,24 +393,55 @@ unsafe fn write_digits(digits: *mut u8, row: usize, column: usize, value: u32) {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
 unsafe fn tile_kernel(
-    weights: *const u8, current: *const u8, next: *mut u8, tile: usize,
-    row_offsets: &[i64; B], column: &[i64], partial: &mut [i64; B],
+    weights: *const u8,
+    current: *const u8,
+    next: *mut u8,
+    tile: usize,
+    row_offsets: &[i64; B],
+    column: &[i64],
+    partial: &mut [i64; B],
     trace: Option<(*mut u32, *mut u32)>,
 ) {
     const FULL_ROWS: usize = B / 3 * 3;
     unsafe {
         for first in (0..FULL_ROWS).step_by(3) {
-            row_kernel::<3>(weights, current, next, tile, first, row_offsets, column, partial, trace);
+            row_kernel::<3>(
+                weights,
+                current,
+                next,
+                tile,
+                first,
+                row_offsets,
+                column,
+                partial,
+                trace,
+            );
         }
-        row_kernel::<2>(weights, current, next, tile, FULL_ROWS, row_offsets, column, partial, trace);
+        row_kernel::<2>(
+            weights,
+            current,
+            next,
+            tile,
+            FULL_ROWS,
+            row_offsets,
+            column,
+            partial,
+            trace,
+        );
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
 unsafe fn row_kernel<const N: usize>(
-    weights: *const u8, current: *const u8, next: *mut u8, tile: usize, first: usize,
-    row_offsets: &[i64; B], column: &[i64], partial: &mut [i64; B],
+    weights: *const u8,
+    current: *const u8,
+    next: *mut u8,
+    tile: usize,
+    first: usize,
+    row_offsets: &[i64; B],
+    column: &[i64],
+    partial: &mut [i64; B],
     trace: Option<(*mut u32, *mut u32)>,
 ) {
     use std::arch::x86_64::*;
@@ -377,30 +455,38 @@ unsafe fn row_kernel<const N: usize>(
             let right = _mm512_loadu_si512(w.add(64).cast());
             macro_rules! add_row {
                 ($r:expr) => {{
-                    let digit_ptr = current.add((first+$r)*ROW_BYTES + 16*k).cast::<i32>();
+                    let digit_ptr = current.add((first + $r) * ROW_BYTES + 16 * k).cast::<i32>();
                     for digit in 0..4 {
                         let value = _mm512_set1_epi32(digit_ptr.add(digit).read_unaligned());
-                        accum[$r][digit][0] = _mm512_dpbusd_epi32(accum[$r][digit][0],left,value);
-                        accum[$r][digit][1] = _mm512_dpbusd_epi32(accum[$r][digit][1],right,value);
+                        accum[$r][digit][0] = _mm512_dpbusd_epi32(accum[$r][digit][0], left, value);
+                        accum[$r][digit][1] =
+                            _mm512_dpbusd_epi32(accum[$r][digit][1], right, value);
                     }
-                }}
+                }};
             }
             add_row!(0);
             add_row!(1);
-            if N == 3 { add_row!(2); }
+            if N == 3 {
+                add_row!(2);
+            }
         }
         let bias = _mm512_set1_epi32(0x0080_8080);
-        let shuffle = _mm512_broadcast_i32x4(_mm_setr_epi8(0,4,8,12,1,5,9,13,2,6,10,14,3,7,11,15));
+        let shuffle = _mm512_broadcast_i32x4(_mm_setr_epi8(
+            0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15,
+        ));
         for (r, vectors) in accum.into_iter().enumerate() {
-            let row = first+r;
+            let row = first + r;
             let sums: [[i32; TILE]; 4] = std::mem::transmute(vectors);
             let mut pre = [0u32; TILE];
             let mut output = [0u32; TILE];
             let mut row_sum = 0i64;
             for i in 0..TILE {
-                let product = i64::from(sums[0][i]) + (i64::from(sums[1][i]) << 8)
-                    + (i64::from(sums[2][i]) << 16) + (i64::from(sums[3][i]) << 24);
-                let x = (product + row_offsets[row] + column[i]).rem_euclid(super::MODULUS as i64) as u64;
+                let product = i64::from(sums[0][i])
+                    + (i64::from(sums[1][i]) << 8)
+                    + (i64::from(sums[2][i]) << 16)
+                    + (i64::from(sums[3][i]) << 24);
+                let x = (product + row_offsets[row] + column[i]).rem_euclid(super::MODULUS as i64)
+                    as u64;
                 let y = ((x * x % super::MODULUS) * x % super::MODULUS) as u32;
                 pre[i] = x as u32;
                 output[i] = y;

@@ -3,8 +3,8 @@
 use super::configure_production_v4_pool_verifier;
 use cmfd_consensus::compact_mainnet_fork::COMPACT_MAINNET_NETWORK_ID;
 use cmfd_consensus::{
-    BlockProof, ConsensusPowVerifier, ForgeMatrixV4FixedArtifactRecordV1,
-    ForgeMatrixV4FileLayerSource,
+    BlockProof, ConsensusPowVerifier, ForgeMatrixV4FileLayerSource,
+    ForgeMatrixV4FixedArtifactRecordV1,
 };
 use cmfd_node::{BlockTemplate, ProductionV4VerifierArtifacts, pool::PoolServerConfig};
 use serde::Deserialize;

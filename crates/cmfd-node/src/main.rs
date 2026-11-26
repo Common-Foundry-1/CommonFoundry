@@ -3757,7 +3757,9 @@ fn configure_production_v4_pool_verifier(
         }
         if cpu_only {
             if supplied {
-                return Err("ARIA_POOL_CPU_ONLY: remove the ProductionV4 pool GPU worker options".into());
+                return Err(
+                    "ARIA_POOL_CPU_ONLY: remove the ProductionV4 pool GPU worker options".into(),
+                );
             }
             let shares = std::env::var("ARIA_POOL_CPU_SHARES").ok();
             let (slots, threads) = match shares.as_deref() {
@@ -3766,30 +3768,64 @@ fn configure_production_v4_pool_verifier(
                 None if profile.is_some() => (1, 14),
                 None => (1, 8),
             };
-            if profile.is_some() && (slots,threads) != (1,14) {
+            if profile.is_some() && (slots, threads) != (1, 14) {
                 return Err("the 9950x3d profile requires ARIA_POOL_CPU_SHARES=1x14".into());
             }
-            let program = std::env::var_os("ARIA_POOL_CPU_PROVER").ok_or("ARIA_POOL_CPU_ONLY needs ARIA_POOL_CPU_PROVER")?;
-            let scratch = std::env::var_os("ARIA_POOL_CPU_PROVER_SCRATCH").map(PathBuf::from)
-                .unwrap_or_else(|| if cfg!(windows) { std::env::temp_dir() } else { PathBuf::from("/dev/shm") });
-            let timeout = std::env::var("ARIA_POOL_CPU_PROVER_TIMEOUT_S").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
+            let program = std::env::var_os("ARIA_POOL_CPU_PROVER")
+                .ok_or("ARIA_POOL_CPU_ONLY needs ARIA_POOL_CPU_PROVER")?;
+            let scratch = std::env::var_os("ARIA_POOL_CPU_PROVER_SCRATCH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    if cfg!(windows) {
+                        std::env::temp_dir()
+                    } else {
+                        PathBuf::from("/dev/shm")
+                    }
+                });
+            let timeout = std::env::var("ARIA_POOL_CPU_PROVER_TIMEOUT_S")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30);
             let duration = std::time::Duration::from_secs(timeout);
             #[cfg(windows)]
             let prover = if profile.is_some() {
-                cmfd_node::production_v4_pool::AriaCpuProver::start_9950x3d(program.into(), scratch, duration,
-                    artifacts.ok_or("the CPU prover profile requires the ProductionV4 model and fixed record")?)?
+                cmfd_node::production_v4_pool::AriaCpuProver::start_9950x3d(
+                    program.into(),
+                    scratch,
+                    duration,
+                    artifacts.ok_or(
+                        "the CPU prover profile requires the ProductionV4 model and fixed record",
+                    )?,
+                )?
             } else {
-                cmfd_node::production_v4_pool::AriaCpuProver::start(program.into(), scratch, duration)?
+                cmfd_node::production_v4_pool::AriaCpuProver::start(
+                    program.into(),
+                    scratch,
+                    duration,
+                )?
             };
             #[cfg(not(windows))]
-            let prover = cmfd_node::production_v4_pool::AriaCpuProver::start(program.into(), scratch, duration)?;
+            let prover = cmfd_node::production_v4_pool::AriaCpuProver::start(
+                program.into(),
+                scratch,
+                duration,
+            )?;
             let cpu = Arc::new(
-                cmfd_node::production_v4_pool::AriaCpuShareVerifier::cpu_only(COMPILED_NETWORK_PROFILE.network_id, slots, threads)
-                    .with_cpu_prover(prover),
+                cmfd_node::production_v4_pool::AriaCpuShareVerifier::cpu_only(
+                    COMPILED_NETWORK_PROFILE.network_id,
+                    slots,
+                    threads,
+                )
+                .with_cpu_prover(prover),
             );
             cmfd_node::production_v4_pool::AriaCpuShareVerifier::register(&cpu);
             config.production_v4_share_verifier = Some(cpu as _);
-            tracing::info!(slots, threads, timeout, "aria: CPU-only mode: share checks and block proofs on the CPU, no GPU worker");
+            tracing::info!(
+                slots,
+                threads,
+                timeout,
+                "aria: CPU-only mode: share checks and block proofs on the CPU, no GPU worker"
+            );
             let _ = artifacts;
             return Ok(None);
         }
@@ -4088,11 +4124,22 @@ fn configure_production_v4_pool_verifier(
             // AriaPool: ARIA_POOL_CPU_PROVER=<absolute path of the CPU prover launcher> proves chain shares
             // on the CPU. The GPU path stays as the fallback.
             if let Some(program) = std::env::var_os("ARIA_POOL_CPU_PROVER") {
-                let scratch = std::env::var_os("ARIA_POOL_CPU_PROVER_SCRATCH").unwrap_or_else(|| std::env::temp_dir().into_os_string());
-                let timeout = std::env::var("ARIA_POOL_CPU_PROVER_TIMEOUT_S").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
-                let prover = cmfd_node::production_v4_pool::AriaCpuProver::start(program.into(), scratch.into(), std::time::Duration::from_secs(timeout))?;
+                let scratch = std::env::var_os("ARIA_POOL_CPU_PROVER_SCRATCH")
+                    .unwrap_or_else(|| std::env::temp_dir().into_os_string());
+                let timeout = std::env::var("ARIA_POOL_CPU_PROVER_TIMEOUT_S")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(30);
+                let prover = cmfd_node::production_v4_pool::AriaCpuProver::start(
+                    program.into(),
+                    scratch.into(),
+                    std::time::Duration::from_secs(timeout),
+                )?;
                 cpu = cpu.with_cpu_prover(prover);
-                tracing::info!(timeout, "aria: chain shares are proved on the CPU, GPU kept as fallback");
+                tracing::info!(
+                    timeout,
+                    "aria: chain shares are proved on the CPU, GPU kept as fallback"
+                );
             }
             let cpu = Arc::new(cpu);
             cmfd_node::production_v4_pool::AriaCpuShareVerifier::register(&cpu);

@@ -1079,7 +1079,7 @@ dependencies = [
 
 [[package]]
 name = "cmfd-node"
-version = "1.0.23"
+version = "1.0.24"
 dependencies = [
  "argon2",
  "base64 0.22.1",

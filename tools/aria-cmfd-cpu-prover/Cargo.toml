@@ -1,0 +1,35 @@
+[package]
+name = "aria-cmfd-cpu-prover"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone package, like tools/compact-proof-prover.
+[workspace]
+
+[dependencies]
+cmfd-consensus = { path = "../../crates/cmfd-consensus", features = ["forgematrix-v4-executor", "forgematrix-v4-verifier", "compact-mainnet"] }
+slop-algebra = { git = "https://github.com/succinctlabs/sp1.git", rev = "92b8eabaea9ab7306da5826caa700adabf7445ba" }
+slop-basefold = { git = "https://github.com/succinctlabs/sp1.git", rev = "92b8eabaea9ab7306da5826caa700adabf7445ba" }
+slop-basefold-prover = { git = "https://github.com/succinctlabs/sp1.git", rev = "92b8eabaea9ab7306da5826caa700adabf7445ba" }
+slop-challenger = { git = "https://github.com/succinctlabs/sp1.git", rev = "92b8eabaea9ab7306da5826caa700adabf7445ba" }
+slop-commit = { git = "https://github.com/succinctlabs/sp1.git", rev = "92b8eabaea9ab7306da5826caa700adabf7445ba" }
+slop-koala-bear = { git = "https://github.com/succinctlabs/sp1.git", rev = "92b8eabaea9ab7306da5826caa700adabf7445ba" }
+slop-merkle-tree = { git = "https://github.com/succinctlabs/sp1.git", rev = "92b8eabaea9ab7306da5826caa700adabf7445ba" }
+slop-multilinear = { git = "https://github.com/succinctlabs/sp1.git", rev = "92b8eabaea9ab7306da5826caa700adabf7445ba" }
+slop-stacked = { git = "https://github.com/succinctlabs/sp1.git", rev = "92b8eabaea9ab7306da5826caa700adabf7445ba" }
+slop-tensor = { git = "https://github.com/succinctlabs/sp1.git", rev = "92b8eabaea9ab7306da5826caa700adabf7445ba" }
+slop-symmetric = { git = "https://github.com/succinctlabs/sp1.git", rev = "92b8eabaea9ab7306da5826caa700adabf7445ba" }
+slop-sumcheck = { git = "https://github.com/succinctlabs/sp1.git", rev = "92b8eabaea9ab7306da5826caa700adabf7445ba" }
+slop-alloc = { git = "https://github.com/succinctlabs/sp1.git", rev = "92b8eabaea9ab7306da5826caa700adabf7445ba" }
+rand = "0.8.5"
+memmap2 = "0.9"
+p3-koala-bear = "=0.4.3-succinct"
+rayon = "1.10"
+serde_json = "1"
+hex = "0.4"
+# Turns on the multi-threaded code paths of the proving library.
+p3-maybe-rayon = { version = "=0.4.3-succinct", features = ["parallel"] }
+
+[profile.release]
+opt-level = 3

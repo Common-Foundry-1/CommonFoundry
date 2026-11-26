@@ -1,0 +1,9 @@
+#!/bin/bash
+# Example launcher for the CPU prover. Give its absolute path to cmfd-node in ARIA_POOL_CPU_PROVER.
+# Adjust the paths. The node talks to the prover on stdin and stdout, so the log goes to stderr.
+RUNTIME=/path/to/runtime/production-v4
+PROVER=/path/to/aria-cmfd-cpu-prover
+THREADS=16
+export RAYON_NUM_THREADS=$THREADS
+export ARIA_PROVER_WARMUP_TEMPLATE=/path/to/fixtures/67535/template.json
+exec "$PROVER" --server "$RUNTIME/MODEL-V2.bank" "$RUNTIME/fixed/FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json" "$THREADS" 2>>/path/to/aria-cmfd-cpu-prover.log

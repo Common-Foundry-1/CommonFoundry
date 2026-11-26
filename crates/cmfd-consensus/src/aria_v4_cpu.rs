@@ -5,6 +5,7 @@
 //! * each activation (< p < 2^31) is written as 4 signed base-256 digits (in [-128, 127]),
 //! * the weights stay unsigned bytes and `vpdpbusd` does 64 byte x digit products per instruction,
 //! * the model is packed once into tiles of 32 columns, 4 interleaved rows, so that it is read sequentially.
+//!
 //! Sums: 4096 products of absolute value <= 250 x 128 per digit, so below 2^27: no i32 overflow.
 //! Production shape only (128 x 4096, 384 layers). Without AVX-512 VNNI, `AriaPackedBank::supported()` is false
 //! and the caller keeps the original engine.
@@ -61,13 +62,13 @@ unsafe impl<T> Sync for Shared<T> {}
 impl AriaPackedBank {
     /// True if this CPU has the instructions the kernel needs.
     pub fn supported() -> bool {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", cmfd_stable_avx512))]
         {
             std::arch::is_x86_feature_detected!("avx512f")
                 && std::arch::is_x86_feature_detected!("avx512bw")
                 && std::arch::is_x86_feature_detected!("avx512vnni")
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(not(all(target_arch = "x86_64", cmfd_stable_avx512)))]
         {
             false
         }
@@ -117,7 +118,6 @@ impl AriaPackedBank {
                 });
             }
         });
-        drop(work);
         if let Some(error) = failed
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -227,11 +227,11 @@ impl AriaPackedBank {
         if threads == 0 {
             return Err(ForgeMatrixV4ExecutionError::ThreadCount);
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(not(all(target_arch = "x86_64", cmfd_stable_avx512)))]
         {
             Err(ForgeMatrixV4ExecutionError::Shape)
         }
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", cmfd_stable_avx512))]
         {
             let threads = threads.min(TILES);
             let terms = SHAPE.mask_coefficients();
@@ -357,7 +357,7 @@ impl AriaPackedBank {
             if let Some(error) = spawn_error {
                 return Err(ForgeMatrixV4ExecutionError::ThreadSpawn(error));
             }
-            let last = if self.layer_count % 2 == 0 {
+            let last = if self.layer_count.is_multiple_of(2) {
                 &even
             } else {
                 &odd
@@ -390,7 +390,12 @@ unsafe fn write_digits(digits: *mut u8, row: usize, column: usize, value: u32) {
 }
 
 /// Three activation rows share a pair of packed weight vectors in the inner loop.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", cmfd_stable_avx512))]
+#[clippy::msrv = "1.89"]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "separate input and output spans are passed to the qualified tile kernel"
+)]
 #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
 unsafe fn tile_kernel(
     weights: *const u8,
@@ -431,7 +436,12 @@ unsafe fn tile_kernel(
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", cmfd_stable_avx512))]
+#[clippy::msrv = "1.89"]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "separate input and output spans are passed to the qualified tile kernel"
+)]
 #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
 unsafe fn row_kernel<const N: usize>(
     weights: *const u8,

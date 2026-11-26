@@ -3750,10 +3750,14 @@ fn configure_production_v4_pool_verifier(
     {
         let cpu_only = aria_cpu_only_enabled(std::env::var_os("ARIA_POOL_CPU_ONLY").as_deref())?;
         let profile = std::env::var_os("CMFD_CPU_POOL_PROFILE");
-        if let Some(value) = &profile {
-            if value != "9950x3d" || !cfg!(windows) || !cpu_only {
-                return Err("CMFD_CPU_POOL_PROFILE=9950x3d requires native Windows and ARIA_POOL_CPU_ONLY=1".into());
-            }
+        if profile
+            .as_ref()
+            .is_some_and(|value| value != "9950x3d" || !cfg!(windows) || !cpu_only)
+        {
+            return Err(
+                "CMFD_CPU_POOL_PROFILE=9950x3d requires native Windows and ARIA_POOL_CPU_ONLY=1"
+                    .into(),
+            );
         }
         if cpu_only {
             if supplied {

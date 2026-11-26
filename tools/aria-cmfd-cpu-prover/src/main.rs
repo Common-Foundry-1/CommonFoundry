@@ -15,6 +15,7 @@ use cmfd_consensus::*;
 use rayon::prelude::*;
 use slop_algebra::{interpolate_univariate_polynomial, AbstractExtensionField, AbstractField, PrimeField32};
 use slop_challenger::{CanObserve, FieldChallenger};
+#[cfg(test)]
 use slop_multilinear::{Mle, Point};
 use slop_sumcheck::PartialSumcheckProof;
 use slop_basefold::{BasefoldProof, BATCH_GRINDING_BITS};
@@ -32,7 +33,30 @@ const SHIFT_PROOF_DOMAIN: &[u8] = b"CommonFoundry/ForgeMatrix/V4/ShiftProof/v1";
 const CUBIC_PROOF_DOMAIN: &[u8] = b"CommonFoundry/ForgeMatrix/V4/CubicProof/v1";
 
 fn observe_bytes(c: &mut Ch, bytes: &[u8]) { c.observe(F::from_canonical_usize(bytes.len())); for b in bytes { c.observe(F::from_canonical_u8(*b)); } }
-fn eq_small(point: &[E]) -> Vec<E> { Mle::<E>::partial_lagrange(&Point::from(point.to_vec())).guts().as_slice().to_vec() }
+fn eq_small(point: &[E]) -> Vec<E> {
+    let mut table = vec![E::zero(); 1 << point.len()];
+    table[0] = E::one();
+    for (bit, &coordinate) in point.iter().rev().enumerate() {
+        let width = 1 << bit;
+        let (zeros, ones) = table[..2 * width].split_at_mut(width);
+        for (zero, one) in zeros.iter_mut().zip(ones) {
+            *one = *zero * coordinate;
+            *zero -= *one;
+        }
+    }
+    table
+}
+
+#[test]
+fn equality_table_matches_the_transcript_basis() {
+    for bits in [0, 1, 4, 7, 12] {
+        let point: Vec<E> = (0..bits)
+            .map(|i| E::from_canonical_usize(31 * i + 7))
+            .collect();
+        let expected = Mle::<E>::partial_lagrange(&Point::from(point.clone()));
+        assert_eq!(eq_small(&point), expected.guts().as_slice());
+    }
+}
 /// Equality table (first coordinate = most significant bit). Large tables are the product of two small ones, in parallel.
 fn eq(point: &[E]) -> Vec<E> {
     if point.len() <= 12 { return eq_small(point); }
@@ -48,20 +72,26 @@ fn eq_at_boolean(point: &[E], index: usize) -> E {
 }
 /// Generic sumcheck: sum over the hypercube of term(columns), least significant variable first.
 /// `degree` = degree of the round polynomial. Same messages as the GPU kernels (coefficients observed, point inserted at the front).
-fn sumcheck(mut cols: Vec<Vec<E>>, c: &mut Ch, claim: E, degree: usize, term: impl Fn(&[E]) -> E + Sync) -> (PartialSumcheckProof<E>, Vec<E>) {
-    let k = cols.len();
+fn sumcheck<const K: usize>(mut cols: [Vec<E>; K], c: &mut Ch, claim: E, degree: usize, term: impl Fn(&[E; K]) -> E + Sync) -> (PartialSumcheckProof<E>, Vec<E>) {
     let xs: Vec<E> = (0..=degree).map(|t| E::from_canonical_usize(t)).collect();
     let (mut polys, mut point, mut claim_now) = (Vec::new(), Vec::new(), claim);
     loop {
         let half = cols[0].len() / 2;
         let cols_ref = &cols;
         // evaluations at 0, 2, 3, ..., degree. The value at 1 comes from the claimed sum.
-        let sums: Vec<E> = (0..half).into_par_iter().fold(|| vec![E::zero(); degree + 1], |mut acc, i| {
-            let mut lo = [E::zero(); 32]; let mut d = [E::zero(); 32]; let mut v = [E::zero(); 32];
-            for j in 0..k { lo[j] = cols_ref[j][2 * i]; d[j] = cols_ref[j][2 * i + 1] - lo[j]; v[j] = lo[j]; }
-            acc[0] += term(&v[..k]);
-            for j in 0..k { v[j] += d[j]; }
-            for t in 2..=degree { for j in 0..k { v[j] += d[j]; } acc[t] += term(&v[..k]); }
+        let sums: Vec<E> = (0..half).into_par_iter().with_min_len(256).fold(|| vec![E::zero(); degree + 1], |mut acc, i| {
+            let mut values: [E; K] = std::array::from_fn(|j| cols_ref[j][2 * i]);
+            let deltas: [E; K] = std::array::from_fn(|j| cols_ref[j][2 * i + 1] - values[j]);
+            acc[0] += term(&values);
+            for (value, delta) in values.iter_mut().zip(deltas) {
+                *value += delta;
+            }
+            for sum in acc.iter_mut().skip(2) {
+                for (value, delta) in values.iter_mut().zip(deltas) {
+                    *value += delta;
+                }
+                *sum += term(&values);
+            }
             acc
         }).reduce(|| vec![E::zero(); degree + 1], |mut a, b| { for t in 0..=degree { a[t] += b[t]; } a });
         let mut ys = sums.clone(); ys[1] = claim_now - sums[0];
@@ -70,7 +100,7 @@ fn sumcheck(mut cols: Vec<Vec<E>>, c: &mut Ch, claim: E, degree: usize, term: im
         let alpha: E = c.sample_ext_element();
         point.insert(0, alpha);
         claim_now = poly.eval_at_point(alpha);
-        for col in cols.iter_mut() { *col = col.par_chunks_exact(2).map(|p| p[0] + alpha * (p[1] - p[0])).collect(); }
+        for col in cols.iter_mut() { *col = col.par_chunks_exact(2).with_min_len(512).map(|p| p[0] + alpha * (p[1] - p[0])).collect(); }
         polys.push(poly);
         if cols[0].len() == 1 {
             let ends = cols.iter().map(|col| col[0]).collect();
@@ -89,7 +119,8 @@ fn falloc(n: usize) -> Vec<F> {
     let reused = {
         let mut pool = POOL.lock().unwrap();
         let best = pool.iter().enumerate()
-            .filter(|(_, column)| column.capacity() >= n)
+            // Small tree levels should not take a large initialized proof buffer.
+            .filter(|(_, column)| (n..=n.saturating_mul(2)).contains(&column.capacity()))
             .min_by_key(|(_, column)| column.capacity())
             .map(|(index, _)| index);
         best.map(|index| pool.swap_remove(index))
@@ -122,7 +153,16 @@ impl Soa {
     fn with_len(n: usize) -> Self { Soa { l: std::array::from_fn(|_| falloc(n)) } }
     fn get(&self, i: usize) -> E { E::from_base_slice(&[self.l[0][i], self.l[1][i], self.l[2][i], self.l[3][i]]) }
     fn set(&mut self, i: usize, e: E) { let b: &[F] = e.as_base_slice(); for k in 0..4 { self.l[k][i] = b[k]; } }
-    fn from_aos(v: &[E]) -> Self { let mut s = Soa::with_len(v.len()); for k in 0..4 { s.l[k].par_iter_mut().zip(v.par_iter()).for_each(|(o, e)| { let b: &[F] = e.as_base_slice(); *o = b[k]; }); } s }
+    fn from_aos(values: &[E]) -> Self {
+        // These equality tables fit in cache. Transpose all four limbs locally.
+        let mut out = Self { l: std::array::from_fn(|_| Vec::with_capacity(values.len())) };
+        for value in values {
+            for (column, &limb) in out.l.iter_mut().zip(value.as_base_slice()) {
+                column.push(limb);
+            }
+        }
+        out
+    }
     fn to_aos(&self) -> Vec<E> { (0..self.len()).map(|i| self.get(i)).collect() }
 }
 #[inline(always)] fn pf(x: &[F]) -> PF { let a: [F; 16] = x[..16].try_into().unwrap(); unsafe { std::mem::transmute::<[F; 16], PF>(a) } }
@@ -218,54 +258,50 @@ fn fold_cubic_tile(alpha: &QuarticChallenge, input: [&[F]; 4], mut output: [&mut
     }
 }
 
-/// Fold into the first half of the column, processing completed prefixes first.
-/// After the initial pack, a wave reads [2*start, 4*start) and writes [start, 2*start).
-fn soa_fold(column: &mut Soa, scalar: E) {
-    const PACK: usize = 16;
-    const TILE: usize = 4096;
-    let len = column.len() / 2;
-    if len < PACK {
-        for i in 0..len {
-            let low = column.get(2 * i);
-            let high = column.get(2 * i + 1);
-            column.set(i, low + scalar * (high - low));
+/// Fold independent source tiles into a separate buffer. Only the leading
+/// input_len entries are live; the initialized backing is reused next round.
+fn fold_extension_column(input: &Soa, output: &mut Soa, input_len: usize, scalar: E) {
+    let count = input_len / 2;
+    if count < 16 {
+        for i in 0..count {
+            let low = input.get(2 * i);
+            output.set(i, low + scalar * (input.get(2 * i + 1) - low));
         }
-    } else {
-        let alpha = QuarticChallenge::new(scalar);
-        let pairs = std::array::from_fn(|limb| split(&column.l[limb]));
-        for (limb, value) in column.l.iter_mut().zip(fold_cubic_lanes(&alpha, pairs)) {
-            st(limb, value);
-        }
+        return;
+    }
 
-        let mut start = PACK;
-        while start < len {
-            let [l0, l1, l2, l3] = &mut column.l;
-            let (d0, s0) = l0.split_at_mut(2 * start);
-            let (d1, s1) = l1.split_at_mut(2 * start);
-            let (d2, s2) = l2.split_at_mut(2 * start);
-            let (d3, s3) = l3.split_at_mut(2 * start);
-            let source = [&s0[..2 * start], &s1[..2 * start], &s2[..2 * start], &s3[..2 * start]];
-            let output = [&mut d0[start..], &mut d1[start..], &mut d2[start..], &mut d3[start..]];
-            if start <= TILE {
-                fold_cubic_tile(&alpha, source, output);
-            } else {
-                let [o0, o1, o2, o3] = output;
-                (
-                    o0.par_chunks_mut(TILE),
-                    o1.par_chunks_mut(TILE),
-                    o2.par_chunks_mut(TILE),
-                    o3.par_chunks_mut(TILE),
-                ).into_par_iter().enumerate().for_each(|(tile, (o0, o1, o2, o3))| {
-                    let offset = 2 * tile * TILE;
-                    fold_cubic_tile(&alpha, source.map(|limb| &limb[offset..]), [o0, o1, o2, o3]);
-                });
-            }
-            start *= 2;
-        }
+    const TILE: usize = 4096;
+    let alpha = QuarticChallenge::new(scalar);
+    let [a, b, c, d] = &mut output.l;
+    if count <= TILE {
+        fold_cubic_tile(
+            &alpha,
+            input.l.each_ref().map(Vec::as_slice),
+            [
+                &mut a[..count],
+                &mut b[..count],
+                &mut c[..count],
+                &mut d[..count],
+            ],
+        );
+        return;
     }
-    for limb in &mut column.l {
-        limb.truncate(len);
-    }
+    (
+        a[..count].par_chunks_mut(TILE),
+        b[..count].par_chunks_mut(TILE),
+        c[..count].par_chunks_mut(TILE),
+        d[..count].par_chunks_mut(TILE),
+    )
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(tile, (a, b, c, d))| {
+            let begin = 2 * tile * TILE;
+            fold_cubic_tile(
+                &alpha,
+                input.l.each_ref().map(|limb| &limb[begin..]),
+                [a, b, c, d],
+            );
+        });
 }
 
 // Split each canonical field weight into two signed i16 values. This
@@ -398,53 +434,90 @@ fn fixed_integer_contractions_match_the_reference() {
 /// Combined line of a group, written limb by limb: weighted sum of the fixed columns (centered bytes) and of the dynamic columns.
 fn group_line(bytes: &[u8], p: &[u32], q: &[u32], fw: Option<&[E]>, dw: Option<&[E]>) -> Soa {
     let (fl, dl) = (fw.map(limbs_of), dw.map(limbs_of));
-    let center: E = fw.map_or(E::zero(), |w| w.iter().copied().sum::<E>() * F::from_canonical_u32(125));
-    let cl: [F; 4] = { let b: &[F] = center.as_base_slice(); [b[0], b[1], b[2], b[3]] };
+    let center: E = fw.map_or(E::zero(), |w| {
+        w.iter().copied().sum::<E>() * F::from_canonical_u32(125)
+    });
+    let cl: [F; 4] = {
+        let b: &[F] = center.as_base_slice();
+        [b[0], b[1], b[2], b[3]]
+    };
     let mut out = Soa::with_len(ROWS);
     let [o0, o1, o2, o3] = &mut out.l;
-    (o0.par_chunks_mut(4096), o1.par_chunks_mut(4096), o2.par_chunks_mut(4096), o3.par_chunks_mut(4096)).into_par_iter().enumerate().for_each(|(chunk, (x0, x1, x2, x3))| {
-        let r0 = chunk * 4096;
-        let af = fl.as_ref().map(|weights| {
-            let mut rows = vec![[0u64; 4096]; 4];
-            fixed_row_linear_combination(bytes, ROWS, r0, weights, &mut rows);
-            rows
-        });
-        let ad = dl.as_ref().map(|dl| {
-            let mut ad = vec![[0u64; 4096]; 8];
-            for c in 0..16 {
-            let col = if c < 8 { &p[c * ROWS + r0..][..4096] } else { &q[(c - 8) * ROWS + r0..][..4096] };
-            for l in 0..4 {
-                let (wl, wh) = (dl[l][c] & 0xffff, dl[l][c] >> 16);
-                { let a = &mut ad[2 * l]; for i in 0..4096 { a[i] += col[i] as u64 * wl; } }
-                { let a = &mut ad[2 * l + 1]; for i in 0..4096 { a[i] += col[i] as u64 * wh; } }
-            }
-            }
-            ad
-        });
-        for (limb, dst) in [x0, x1, x2, x3].into_iter().enumerate() {
-            match (&af, &ad) {
-                (Some(af), Some(ad)) => {
-                    for (i, value) in dst.iter_mut().enumerate() {
-                        // Both sums and the reduced high half fit together in u64.
-                        let n = af[limb][i] + ad[2 * limb][i] + ((ad[2 * limb + 1][i] % P) << 16);
-                        *value = F::from_canonical_u32((n % P) as u32) - cl[limb];
+    (
+        o0.par_chunks_mut(4096),
+        o1.par_chunks_mut(4096),
+        o2.par_chunks_mut(4096),
+        o3.par_chunks_mut(4096),
+    )
+        .into_par_iter()
+        .enumerate()
+        .with_min_len(8)
+        .for_each_init(
+            || {
+                (
+                    fl.as_ref().map(|_| vec![[0u64; 4096]; 4]),
+                    dl.as_ref().map(|_| vec![[0u64; 4096]; 8]),
+                )
+            },
+            |(af, ad), (chunk, (x0, x1, x2, x3))| {
+                let r0 = chunk * 4096;
+                if let (Some(weights), Some(rows)) = (&fl, af.as_mut()) {
+                    #[cfg(not(all(target_feature = "avx512vnni", target_feature = "avx512bw")))]
+                    rows.as_flattened_mut().fill(0);
+                    fixed_row_linear_combination(bytes, ROWS, r0, weights, rows);
+                }
+                if let (Some(dl), Some(ad)) = (&dl, ad.as_mut()) {
+                    ad.as_flattened_mut().fill(0);
+                    for c in 0..16 {
+                        let col = if c < 8 {
+                            &p[c * ROWS + r0..][..4096]
+                        } else {
+                            &q[(c - 8) * ROWS + r0..][..4096]
+                        };
+                        for l in 0..4 {
+                            let (wl, wh) = (dl[l][c] & 0xffff, dl[l][c] >> 16);
+                            {
+                                let a = &mut ad[2 * l];
+                                for i in 0..4096 {
+                                    a[i] += col[i] as u64 * wl;
+                                }
+                            }
+                            {
+                                let a = &mut ad[2 * l + 1];
+                                for i in 0..4096 {
+                                    a[i] += col[i] as u64 * wh;
+                                }
+                            }
+                        }
                     }
                 }
-                (Some(af), None) => {
-                    for (value, &fixed) in dst.iter_mut().zip(&af[limb]) {
-                        *value = F::from_canonical_u32((fixed % P) as u32) - cl[limb];
+                for (limb, dst) in [x0, x1, x2, x3].into_iter().enumerate() {
+                    match (af.as_ref(), ad.as_ref()) {
+                        (Some(af), Some(ad)) => {
+                            for (i, value) in dst.iter_mut().enumerate() {
+                                // Both sums and the reduced high half fit together in u64.
+                                let n = af[limb][i]
+                                    + ad[2 * limb][i]
+                                    + ((ad[2 * limb + 1][i] % P) << 16);
+                                *value = F::from_canonical_u32((n % P) as u32) - cl[limb];
+                            }
+                        }
+                        (Some(af), None) => {
+                            for (value, &fixed) in dst.iter_mut().zip(&af[limb]) {
+                                *value = F::from_canonical_u32((fixed % P) as u32) - cl[limb];
+                            }
+                        }
+                        (None, Some(ad)) => {
+                            for (i, value) in dst.iter_mut().enumerate() {
+                                let n = ad[2 * limb][i] + ((ad[2 * limb + 1][i] % P) << 16);
+                                *value = F::from_canonical_u32((n % P) as u32);
+                            }
+                        }
+                        (None, None) => dst.fill(F::zero()),
                     }
                 }
-                (None, Some(ad)) => {
-                    for (i, value) in dst.iter_mut().enumerate() {
-                        let n = ad[2 * limb][i] + ((ad[2 * limb + 1][i] % P) << 16);
-                        *value = F::from_canonical_u32((n % P) as u32);
-                    }
-                }
-                (None, None) => dst.fill(F::zero()),
-            }
-        }
-    });
+            },
+        );
     out
 }
 /// (sum of W[i] * v[2i], sum of W[i] * v[2i+1]) with W[i] = high[i >> low] * low[i & mask] over the `m` pair bits.
@@ -602,10 +675,10 @@ mod opening_window_tests {
             let eqs: Vec<Vec<E>> = points.iter().map(|p| eq(p)).collect();
             let claim: E = cols.iter().zip(&eqs).map(|(c, eq)| dot(c, eq)).sum();
             let packed = cols.iter().map(|c| Soa::from_aos(c)).collect();
-            let generic_cols = cols.into_iter().zip(eqs).flat_map(|(c, eq)| [c, eq]).collect();
+            let generic_cols: Vec<Vec<E>> = cols.into_iter().zip(eqs).flat_map(|(c, eq)| [c, eq]).collect();
             let mut reference_ch = ForgeMatrixV4IopContext::default_challenger();
             let mut actual_ch = reference_ch.clone();
-            let (reference, _) = sumcheck(generic_cols, &mut reference_ch, claim, 2, |x| {
+            let (reference, _) = sumcheck::<6>(generic_cols.try_into().unwrap(), &mut reference_ch, claim, 2, |x| {
                 x.chunks_exact(2).map(|pair| pair[0] * pair[1]).sum()
             });
             let actual = multi_point_sumcheck(packed, &points, &mut actual_ch, claim);
@@ -777,7 +850,10 @@ const MERKLE_TILE: usize = 1 << MERKLE_TILE_LOG;
 fn dynamic_merkle_tile(
     cols: &[Vec<F>], start: usize, query: Option<usize>,
 ) -> ([F; 8], Vec<[F; 8]>) {
-    let perm = my_kb_16_perm();
+    // The constants are immutable and identical for every leaf tile.
+    static PERM: std::sync::LazyLock<slop_koala_bear::KoalaPerm> =
+        std::sync::LazyLock::new(my_kb_16_perm);
+    let perm = &*PERM;
     let zero = PF::from(F::zero());
     let mut nodes = [[F::zero(); MERKLE_TILE]; 8];
     for offset in (0..MERKLE_TILE).step_by(16) {
@@ -838,7 +914,7 @@ fn merkle_up(leaf: [Vec<F>; 8]) -> Tree {
         if m >= 16 {
             let [a, b, c, d, e, f, g, h] = &mut next;
             (a.par_chunks_mut(16), b.par_chunks_mut(16), c.par_chunks_mut(16), d.par_chunks_mut(16), e.par_chunks_mut(16), f.par_chunks_mut(16), g.par_chunks_mut(16), h.par_chunks_mut(16))
-                .into_par_iter().enumerate().for_each(|(k, outs)| {
+                .into_par_iter().with_min_len(32).enumerate().for_each(|(k, outs)| {
                     let mut state = [zero; 16];
                     for i in 0..8 { let (l, r) = split(&prev[i][32 * k..]); state[i] = l; state[8 + i] = r; }
                     perm.permute_mut(&mut state);
@@ -865,7 +941,7 @@ fn merkle_pairs(c: &Soa) -> Tree {
     if n >= 16 {
         let [a, b, cc, d, e, f, g, h] = &mut leaf;
         (a.par_chunks_mut(16), b.par_chunks_mut(16), cc.par_chunks_mut(16), d.par_chunks_mut(16), e.par_chunks_mut(16), f.par_chunks_mut(16), g.par_chunks_mut(16), h.par_chunks_mut(16))
-            .into_par_iter().enumerate().for_each(|(k, outs)| {
+            .into_par_iter().with_min_len(32).enumerate().for_each(|(k, outs)| {
                 let mut state = [zero; 16];
                 for l in 0..4 { let (ev, od) = split(&c.l[l][32 * k..]); state[l] = ev; state[4 + l] = od; }
                 perm.permute_mut(&mut state);
@@ -900,7 +976,7 @@ fn soa_pairs_map(c: &Soa, f: impl Fn(usize, PE, PE) -> PE + Sync, fs: impl Fn(us
     if n < 16 { for i in 0..n { let v = fs(i, c.get(2 * i), c.get(2 * i + 1)); out.set(i, v); } return out; }
     {
         let [o0, o1, o2, o3] = &mut out.l;
-        (o0.par_chunks_mut(16), o1.par_chunks_mut(16), o2.par_chunks_mut(16), o3.par_chunks_mut(16)).into_par_iter().enumerate().for_each(|(k, (a, b, c2, d))| {
+        (o0.par_chunks_mut(16), o1.par_chunks_mut(16), o2.par_chunks_mut(16), o3.par_chunks_mut(16)).into_par_iter().with_min_len(32).enumerate().for_each(|(k, (a, b, c2, d))| {
             let (x0, x1) = pairs_at(c, 16 * k);
             let r = f(k, x0, x1);
             let limbs: &[PF] = r.as_base_slice();
@@ -1018,11 +1094,12 @@ mod cubic_fold_tests {
         for size in [2, 16, 32, 64, 512, 32768, 65536] {
             let challenge = value();
             let input: Vec<E> = (0..size).map(|_| value()).collect();
-            let mut column = Soa::from_aos(&input);
+            let column = Soa::from_aos(&input);
             let expected: Vec<E> = input.chunks_exact(2)
                 .map(|pair| pair[0] + challenge * (pair[1] - pair[0])).collect();
-            soa_fold(&mut column, challenge);
-            assert_eq!(column.to_aos(), expected);
+            let mut folded = Soa::with_len(size / 2);
+            fold_extension_column(&column, &mut folded, size, challenge);
+            assert_eq!(folded.to_aos(), expected);
         }
     }
 
@@ -1039,7 +1116,7 @@ mod cubic_fold_tests {
                 .map(|i| E::from_base_slice(&[2 * i + 3, 3 * i + 5, 5 * i + 7, 7 * i + 11]
                     .map(F::from_canonical_usize)))
                 .collect();
-            let cols = vec![
+            let cols = [
                 base.into_iter().map(E::from_base).collect(),
                 cubes.into_iter().map(E::from_base).collect(),
                 eq(&point),
@@ -1212,8 +1289,11 @@ fn cubic_sumcheck(p: &[u32], q: &[u32], point: &[E], c: &mut Ch) -> (PartialSumc
         (fold1(p), fold1(q))
     };
     // following rounds in the extension field, 16 pairs per operation
-    while a.len() > 1 {
-        let m = a.len().ilog2() as usize - 1; let lo = 12.min(m);
+    let mut live_len = a.len();
+    let mut next_a = Soa::with_len(live_len / 2);
+    let mut next_b = Soa::with_len(live_len / 2);
+    while live_len > 1 {
+        let m = live_len.ilog2() as usize - 1; let lo = 12.min(m);
         let (ta, tb) = (eq_or_one(&point[..m - lo]), eq_or_one(&point[m - lo..m]));
         let (ar, br) = (&a, &b);
         let s = if lo < 4 {
@@ -1245,10 +1325,13 @@ fn cubic_sumcheck(p: &[u32], q: &[u32], point: &[E], c: &mut Ch) -> (PartialSumc
         let g0 = scale * lo_at(r, xs[0]) * s[0];
         let ys = [g0, claim - g0, scale * lo_at(r, xs[2]) * s[1], scale * lo_at(r, xs[3]) * s[2], scale * lo_at(r, xs[4]) * s[3]];
         let alpha = finish(ys, r, c, &mut polys, &mut rpoint, &mut claim, &mut scale);
-        soa_fold(&mut a, alpha); soa_fold(&mut b, alpha);
+        fold_extension_column(&a, &mut next_a, live_len, alpha);
+        fold_extension_column(&b, &mut next_b, live_len, alpha);
+        std::mem::swap(&mut a, &mut next_a);
+        std::mem::swap(&mut b, &mut next_b);
+        live_len /= 2;
     }
-    let (a, b) = (a.to_aos(), b.to_aos());
-    (PartialSumcheckProof { univariate_polys: polys, claimed_sum: E::zero(), point_and_eval: (rpoint.into(), claim) }, [a[0], b[0]])
+    (PartialSumcheckProof { univariate_polys: polys, claimed_sum: E::zero(), point_and_eval: (rpoint.into(), claim) }, [a.get(0), b.get(0)])
 }
 /// out[layer * WIDTH + column] = sum over the batch of coeff[batch] * values[layer][batch][column]
 fn reduce_batches(values: &[u32], coeff: &[E], layers: usize) -> Vec<E> {
@@ -1457,6 +1540,11 @@ fn load(bank_path: &str, record_path: &str, threads: usize, capture_mode: bool) 
 }
 /// The whole proof (`forgematrix_v4_direct` packet) for the block (`challenge`, `nonce`), and the time of each step.
 fn prove(ctx: &mut Ctx, challenge: BlockChallenge, nonce: u64, capture: Option<(&[u32], &[u32], [u8;32])>) -> (Vec<u8>, [u8; 32], Vec<(&'static str, f64)>) {
+    // Keep the coordinator on a worker across the dependent parallel rounds.
+    rayon::scope(|_| prove_on_worker(ctx, challenge, nonce, capture))
+}
+
+fn prove_on_worker(ctx: &mut Ctx, challenge: BlockChallenge, nonce: u64, capture: Option<(&[u32], &[u32], [u8;32])>) -> (Vec<u8>, [u8; 32], Vec<(&'static str, f64)>) {
     let mut steps: Vec<(&'static str, f64)> = Vec::new();
     let digest = forgematrix_v4_challenge_digest(&challenge, nonce, PRODUCTION_V4_MODEL_MANIFEST_DIGEST);
     let coefficients = forgematrix_v4_replay_coefficients(digest);
@@ -1532,7 +1620,7 @@ fn prove(ctx: &mut Ctx, challenge: BlockChallenge, nonce: u64, capture: Option<(
             let boundary_reduced = reduce_batches(boundary, &eb, 1);
             let mut input = boundary_reduced.clone(); input.extend_from_slice(&next_reduced[..(LAYERS - 1) * WIDTH]);
             let equality: Vec<E> = el.iter().flat_map(|x| std::iter::repeat_n(*x, WIDTH)).collect();
-            let (matrix_sumcheck, ends) = sumcheck(vec![weights, input, equality], &mut pch, pre_eval - mask, 3, |x| x[0] * x[1] * x[2]);
+            let (matrix_sumcheck, ends) = sumcheck([weights, input, equality], &mut pch, pre_eval - mask, 3, |x| x[0] * x[1] * x[2]);
             let matrix = ForgeMatrixV4MatrixRelationProof { sumcheck: matrix_sumcheck.clone(), preactivation_evaluation: pre_eval, weight_evaluation: ends[0], input_evaluation: ends[1] };
             verify_forgematrix_v4_matrix_relation(&mp, mask, &matrix, &mut ch).expect("matrix relation rejected");
             claims[bank].extend(forgematrix_v4_matrix_opening_claims(&mp, &matrix).unwrap());
@@ -1544,7 +1632,7 @@ fn prove(ctx: &mut Ctx, challenge: BlockChallenge, nonce: u64, capture: Option<(
             let mut pch = ch.clone();
             observe_bytes(&mut pch, SHIFT_PROOF_DOMAIN); pch.observe_ext_element(ends[1]); pch.observe_ext_element(boundary_evaluation);
             let shifted: Vec<E> = (0..LAYERS).map(|l| if l + 1 < LAYERS { eq_at_boolean(terminal_layer, l + 1) } else { E::zero() }).collect();
-            let (shift_sumcheck, shift_ends) = sumcheck(vec![next_values, shifted], &mut pch, ends[1] - eq_at_boolean(terminal_layer, 0) * boundary_evaluation, 2, |x| x[0] * x[1]);
+            let (shift_sumcheck, shift_ends) = sumcheck([next_values, shifted], &mut pch, ends[1] - eq_at_boolean(terminal_layer, 0) * boundary_evaluation, 2, |x| x[0] * x[1]);
             let shift = ForgeMatrixV4ShiftRelationProof { sumcheck: shift_sumcheck, boundary_evaluation, next_activation_evaluation: shift_ends[0] };
             let cpu_terminal_layer = forgematrix_v4_matrix_terminal_layer(&matrix).unwrap();
             verify_forgematrix_v4_shift_relation(&cpu_terminal_layer, matrix.input_evaluation, &shift, &mut ch).expect("shift relation rejected");
@@ -1692,6 +1780,13 @@ fn prove(ctx: &mut Ctx, challenge: BlockChallenge, nonce: u64, capture: Option<(
         // These release artifacts are immutable. Query pages are faulted in only as needed.
         let codeword = unsafe { memmap2::MmapOptions::new().map(&codeword).unwrap() };
         let tree = unsafe { memmap2::MmapOptions::new().map(&tree).unwrap() };
+        #[cfg(target_os = "linux")]
+        {
+            // The transcript selects sparse, unpredictable rows and siblings.
+            // Fetching adjacent disk pages does not help these query openings.
+            let _ = codeword.advise(memmap2::Advice::Random);
+            let _ = tree.advise(memmap2::Advice::Random);
+        }
         let root = std::array::from_fn(|i| raw(&tree[..32], i));
         let opened: Vec<(Vec<F>, Vec<[F; 8]>)> = query_indices.par_iter().map(|&qi| {
             let row = &codeword[qi * 1024..][..1024];

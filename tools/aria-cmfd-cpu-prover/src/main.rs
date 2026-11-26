@@ -1751,7 +1751,7 @@ fn main() {
     let server = a.get(1).map(String::as_str) == Some("--server");
     let o = if server { 2 } else { 1 };
     let t = Instant::now();
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     let maps: Vec<_> = match std::env::var("CMFD_CPU_TRACE_MAPS") {
         Ok(names) => {
             assert!(server && names.split(',').count()==2, "invalid pool trace configuration");
@@ -1760,8 +1760,8 @@ fn main() {
         Err(std::env::VarError::NotPresent) => Vec::new(),
         Err(error) => panic!("invalid trace configuration: {error}"),
     };
-    #[cfg(windows)] let capture_mode=!maps.is_empty();
-    #[cfg(not(windows))] let capture_mode=false;
+    #[cfg(any(windows, target_os = "linux"))] let capture_mode=!maps.is_empty();
+    #[cfg(not(any(windows, target_os = "linux")))] let capture_mode=false;
     let mut ctx = load(&a[o], &a[o + 1], a[o + 2].parse().unwrap(), capture_mode);
     eprintln!("aria-cmfd-cpu-prover: model loaded in {:.1} s, {} threads", t.elapsed().as_secs_f64(), ctx.threads);
     if !server {
@@ -1792,7 +1792,7 @@ fn main() {
             ["RUN", template, output] | ["RUNTRACE", template, output, _, _] => {
                 let t = Instant::now();
                 let (challenge, nonce) = read_template(template);
-                #[cfg(windows)]
+                #[cfg(any(windows, target_os = "linux"))]
                 let capture = if let ["RUNTRACE",_,_,index,work]=fields.as_slice() {
                     let i: usize = index.parse().expect("trace slot");
                     let expected: [u8;32] = hex::decode(work).unwrap().try_into().expect("work digest");
@@ -1800,7 +1800,7 @@ fn main() {
                     let (p,a)=unsafe {maps.get(i).expect("unconfigured trace slot").columns()};
                     Some((p,a,expected))
                 } else { None };
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, target_os = "linux")))]
                 let capture = { assert!(fields[0]=="RUN","unsupported trace transport"); None };
                 let (wire, work, steps) = prove(&mut ctx, challenge, nonce, capture);
                 let pending = format!("{output}.pending");

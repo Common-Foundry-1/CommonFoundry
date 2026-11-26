@@ -1687,14 +1687,20 @@ impl WorkerProcess {
         label: &'static str,
         ready_timeout: Duration,
     ) -> Result<Self, PoolError> {
-        let mut child = Command::new(&command.program)
-            .args(&command.arguments)
+        let mut process = Command::new(&command.program);
+        process.args(&command.arguments)
             .envs(command.environment.iter().cloned())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(replay_error)?;
+            .stderr(Stdio::inherit());
+        #[cfg(target_os = "linux")]
+        if ready_marker == "CMFD_V4_TRACE_PROOF_READY" {
+            let names = command.environment.iter().find(|(key, _)| key == "CMFD_CPU_TRACE_MAPS")
+                .and_then(|(_, value)| value.to_str())
+                .ok_or_else(|| pool_replay_failure("missing CPU trace descriptor list"))?;
+            cmfd_consensus::forgematrix_v4_execution::aria_v4_cpu::trace_section::inherit_readers(&mut process, names).map_err(replay_error)?;
+        }
+        let mut child = process.spawn().map_err(replay_error)?;
         let stdin = child
             .stdin
             .take()
@@ -2271,23 +2277,23 @@ impl ProductionV4PersistentPoolVerifier {
 #[cfg(windows)]
 #[path = "aria_cpu_placement.rs"]
 mod aria_cpu_placement;
+#[cfg(any(windows, target_os = "linux"))]
+#[path = "aria_trace_slots.rs"]
+mod aria_trace_slots;
 
 /// Original CPU pool verification and proving integration contributed by Stefan and AriaPool.
-/// CPU compact prover. The Windows 9950X3D profile retains the trace from share replay.
+/// CPU compact prover. Trace-enabled pools retain the checked share replay until proving finishes.
 pub struct AriaCpuProver {
     #[cfg(windows)]
-    profile: Option<WindowsCpuProfile>,
+    placement: Option<aria_cpu_placement::Placement>,
+    #[cfg(any(windows, target_os = "linux"))]
+    traces: Option<aria_trace_slots::TraceSlots>,
     worker: Mutex<PersistentWorker>,
     scratch: CpuProofScratch,
     timeout: Duration,
     next: AtomicU64,
 }
 
-#[cfg(windows)]
-struct WindowsCpuProfile {
-    placement: aria_cpu_placement::Placement,
-    traces: aria_cpu_placement::TraceSlots,
-}
 
 #[derive(Debug)]
 struct CpuProofScratch(PathBuf);
@@ -2328,9 +2334,25 @@ impl AriaCpuProver {
     /// Starts the program and waits until it is ready (model loaded, warm-up proof done).
     pub fn start(program: PathBuf, scratch: PathBuf, timeout: Duration) -> Result<Self, PoolError> {
         let scratch = CpuProofScratch::create(&scratch)?;
-        let command = ProductionV4PoolWorkerCommand { program, arguments: Vec::new(), environment: Vec::new() };
-        let worker = PersistentWorker::start(&command, "CMFD_V4_PROOF_READY", "Aria CPU proof worker")?;
-        Ok(Self { #[cfg(windows)] profile: None, worker: Mutex::new(worker), scratch, timeout, next: AtomicU64::new(0) })
+        #[cfg(target_os = "linux")]
+        let (traces, environment, marker) = match std::env::var("CMFD_CPU_TRACE_REUSE").as_deref() {
+            Ok("1") => {
+                let (slots, names) = aria_trace_slots::TraceSlots::new().map_err(replay_error)?;
+                (Some(slots), vec![("CMFD_CPU_TRACE_MAPS".into(), names.into())], "CMFD_V4_TRACE_PROOF_READY")
+            }
+            Ok("0") | Err(std::env::VarError::NotPresent) => (None, Vec::new(), "CMFD_V4_PROOF_READY"),
+            _ => return Err(pool_replay_failure("CMFD_CPU_TRACE_REUSE must be 0 or 1")),
+        };
+        #[cfg(not(target_os = "linux"))]
+        let (environment, marker) = (Vec::new(), "CMFD_V4_PROOF_READY");
+        let command = ProductionV4PoolWorkerCommand { program, arguments: Vec::new(), environment };
+        let worker = PersistentWorker::start(&command, marker, "Aria CPU proof worker")?;
+        Ok(Self {
+            #[cfg(windows)] placement: None,
+            #[cfg(windows)] traces: None,
+            #[cfg(target_os = "linux")] traces,
+            worker: Mutex::new(worker), scratch, timeout, next: AtomicU64::new(0),
+        })
     }
 
     #[cfg(windows)]
@@ -2338,7 +2360,7 @@ impl AriaCpuProver {
         program: PathBuf, scratch: PathBuf, timeout: Duration, artifacts: &crate::ProductionV4VerifierArtifacts,
     ) -> Result<Self, PoolError> {
         let placement = aria_cpu_placement::Placement::discover().map_err(replay_error)?;
-        let (traces,names) = aria_cpu_placement::TraceSlots::new().map_err(replay_error)?;
+        let (traces,names) = aria_trace_slots::TraceSlots::new().map_err(replay_error)?;
         let scratch = CpuProofScratch::create(&scratch)?;
         let command = ProductionV4PoolWorkerCommand {
             program,
@@ -2348,7 +2370,7 @@ impl AriaCpuProver {
         };
         let mut worker = PersistentWorker::start(&command, "CMFD_V4_TRACE_PROOF_READY", "Aria CPU proof worker")?;
         placement.attach(&worker.running_process()?.child).map_err(replay_error)?;
-        Ok(Self { profile: Some(WindowsCpuProfile { placement, traces }), worker: Mutex::new(worker), scratch, timeout, next: AtomicU64::new(0) })
+        Ok(Self { placement: Some(placement), traces: Some(traces), worker: Mutex::new(worker), scratch, timeout, next: AtomicU64::new(0) })
     }
 
     /// The compact proof for (`template`, `nonce`), checked like the proof of the GPU prover before it is returned.
@@ -2389,8 +2411,8 @@ impl AriaCpuProver {
         let invoked = (|| {
             let mut worker = self.worker.lock().map_err(|_| pool_replay_failure("aria cpu prover lock is poisoned"))?;
             #[cfg(windows)]
-            if let Some(profile) = &self.profile {
-                profile.placement.attach(&worker.running_process()?.child).map_err(replay_error)?;
+            if let Some(placement) = &self.placement {
+                placement.attach(&worker.running_process()?.child).map_err(replay_error)?;
             }
             let mut fields = vec![if trace_slot.is_some() {"RUNTRACE"} else {"RUN"}.to_owned(),
                 template_path.to_string_lossy().into_owned(), proof_path.to_string_lossy().into_owned()];
@@ -2677,19 +2699,30 @@ impl AriaCpuShareVerifier {
         let coefficients = forgematrix_v4_replay_coefficients(challenge_digest);
         let slot = self.slot()?;
         #[cfg(windows)]
-        let profile = self.cpu_prover.as_ref().and_then(|prover| prover.profile.as_ref());
+        let placement = self.cpu_prover.as_ref().and_then(|prover| prover.placement.as_ref());
+        #[cfg(any(windows, target_os = "linux"))]
+        let mut capture = {
+            let traces = self.cpu_prover.as_ref().and_then(|prover| prover.traces.as_ref());
+            if traces.is_some() && packed.is_none() {
+                return Err(pool_replay_failure("CPU trace capture requires a qualified replay kernel"));
+            }
+            traces.map(|pool| pool.take()).transpose().map_err(replay_error)?
+        };
         #[cfg(windows)]
-        if profile.is_some() && packed.is_none() { return Err(pool_replay_failure("9950X3D replay kernel failed qualification")); }
-        #[cfg(windows)]
-        let mut capture = profile.map(|p| p.traces.take()).transpose().map_err(replay_error)?;
-        #[cfg(windows)]
-        let mut guard = profile.map(|p| p.placement.begin()).transpose().map_err(replay_error)?;
+        let mut guard = placement.map(|p| p.begin()).transpose().map_err(replay_error)?;
         let cpu_started = Instant::now();
         let executed = match packed {
-            #[cfg(windows)]
-            Some(bank) if let (Some(profile), Some(lease)) = (profile, capture.as_mut()) => {
+            #[cfg(any(windows, target_os = "linux"))]
+            Some(bank) if let Some(lease) = capture.as_mut() => {
                 let (pre, act) = lease.columns_mut();
-                bank.execute_traced_with_setup(&coefficients, self.threads, pre, act, &|| profile.placement.place_replay_thread())
+                #[cfg(windows)]
+                if let Some(placement) = placement {
+                    bank.execute_traced_with_setup(&coefficients, self.threads, pre, act, &|| placement.place_replay_thread())
+                } else {
+                    bank.execute_traced(&coefficients, self.threads, pre, act)
+                }
+                #[cfg(target_os = "linux")]
+                bank.execute_traced(&coefficients, self.threads, pre, act)
             }
             Some(bank) => bank.execute(&coefficients, self.threads),
             None => cmfd_consensus::forgematrix_v4_execute(
@@ -2738,9 +2771,9 @@ impl AriaCpuShareVerifier {
             cpu_seconds,
             "aria cpu share check found a chain share; proving"
         );
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         let trace_slot = capture.as_ref().map(|lease| lease.index());
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         let trace_slot = None;
         if let Some(prover) = &self.cpu_prover {
             let proof_started = Instant::now();

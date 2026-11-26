@@ -20,6 +20,10 @@ The supplied start-cpu-pool.ps1 launcher locks the model and sets this profile. 
 
 CPU-only mode requires the GPU pool worker options to be omitted. The Windows profile checks the CPU model, sixteen physical cores, SMT topology, and the process's allowed CPU mask. Replay uses one logical processor on each of the first fourteen physical cores. Each active share check restricts the external prover to the other two physical cores. At the end of the check, the pool restores the prover's full processor mask. The pool and the bundled prover share two 1.5 GiB trace buffers. The pool retains the winning trace until its proof completes and can check the next share in the other buffer. The prover checks the trace against the winning work digest and uses 28 Rayon workers. The first proof includes cold allocations.
 
+## Linux trace reuse
+
+Set `CMFD_CPU_TRACE_REUSE=1` in the Linux pool environment and use the matching CPU prover. The bundled `run-cpu-prover` launcher preserves the two inherited read-only file descriptors through exec. Pool and worker use sealed anonymous memory files for the two 1.5 GiB trace slots. The kernel must support memfd sealing including F_SEAL_FUTURE_WRITE, and procfs must be mounted. The pool owns the writable views and retains each winning trace until the proof is returned. The worker checks the trace against the replayed work digest. Linux uses its normal scheduler and the configured replay and Rayon thread counts.
+
 ## Linux and manual pool configuration
 
 For CPU-only operation, set ARIA_POOL_CPU_ONLY=1 and ARIA_POOL_CPU_PROVER to the absolute path of a launcher that starts the prover with --server MODEL RECORD THREADS. See run-prover.sh.example. ARIA_POOL_CPU_SHARES=1x8 allows one replay at a time with eight threads. ARIA_POOL_CPU_PROVER_TIMEOUT_S sets the request timeout in seconds. ARIA_POOL_CPU_PROVER_SCRATCH selects the writable, private directory for temporary proof and template files. Use an account-owned directory. The measured Windows placement profile is platform-specific.

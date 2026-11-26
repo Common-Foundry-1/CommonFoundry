@@ -83,7 +83,7 @@ dory-bls12-381-prototype = [
 dory-v3-consensus-adapter = ["dory-bls12-381-prototype", "whir-prototype"]
 dory-opening-prototype = ["dep:ark-serialize", "dep:dory-pcs"]
 gpu-proof-prover = ["whir-prototype", "dep:cmfd-proof-accel", "dep:fs2"]
-forgematrix-v4-executor = ["dep:matrixmultiply", "dep:windows-sys"]
+forgematrix-v4-executor = ["dep:matrixmultiply", "dep:windows-sys", "dep:libc"]
 # Sparse work rules for tests and local qualification; never in a release build.
 work-rule-test-support = []
 forgematrix-v4-verifier = [

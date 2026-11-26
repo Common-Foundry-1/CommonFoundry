@@ -11,6 +11,9 @@
 #[cfg(windows)]
 #[path = "aria_trace_section.rs"]
 pub mod trace_section;
+#[cfg(target_os = "linux")]
+#[path = "aria_trace_linux.rs"]
+pub mod trace_section;
 use std::sync::{Barrier, OnceLock};
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 

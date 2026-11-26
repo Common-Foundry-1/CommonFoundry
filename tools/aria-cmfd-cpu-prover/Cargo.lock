@@ -297,6 +297,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hex",
  "k256",
+ "libc",
  "matrixmultiply",
  "miniz_oxide",
  "primitive-types",

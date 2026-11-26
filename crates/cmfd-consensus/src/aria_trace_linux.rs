@@ -150,10 +150,14 @@ impl Writer {
 pub struct Reader(View);
 impl Reader {
     pub fn open(name: &str) -> io::Result<Self> {
-        Ok(Self(View::map(
-            &valid_reader(descriptor(name)?)?,
-            libc::PROT_READ,
-        )?))
+        let fd = descriptor(name)?;
+        let file = valid_reader(fd)?;
+        // The exec launcher has handed the descriptor to its final worker.
+        // Any children of the worker should no longer inherit it.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self(View::map(&file, libc::PROT_READ)?))
     }
     /// # Safety
     /// The producing pool must hold the selected trace immutable for this request.

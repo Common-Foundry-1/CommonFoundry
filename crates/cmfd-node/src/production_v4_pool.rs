@@ -2273,15 +2273,20 @@ impl ProductionV4PersistentPoolVerifier {
 mod aria_cpu_placement;
 
 /// Original CPU pool verification and proving integration contributed by Stefan and AriaPool.
-/// Block prover on the CPU (program `aria-cmfd-cpu-prover`, same line protocol as the GPU proof worker:
-/// `RUN template output` -> `CMFD_V4_PROOF_DONE`). It recomputes the trace and makes the compact proof without a GPU.
+/// CPU compact prover. The Windows 9950X3D profile retains the trace from share replay.
 pub struct AriaCpuProver {
     #[cfg(windows)]
-    placement: Option<aria_cpu_placement::Placement>,
+    profile: Option<WindowsCpuProfile>,
     worker: Mutex<PersistentWorker>,
     scratch: CpuProofScratch,
     timeout: Duration,
     next: AtomicU64,
+}
+
+#[cfg(windows)]
+struct WindowsCpuProfile {
+    placement: aria_cpu_placement::Placement,
+    traces: aria_cpu_placement::TraceSlots,
 }
 
 #[derive(Debug)]
@@ -2325,7 +2330,7 @@ impl AriaCpuProver {
         let scratch = CpuProofScratch::create(&scratch)?;
         let command = ProductionV4PoolWorkerCommand { program, arguments: Vec::new(), environment: Vec::new() };
         let worker = PersistentWorker::start(&command, "CMFD_V4_PROOF_READY", "Aria CPU proof worker")?;
-        Ok(Self { #[cfg(windows)] placement: None, worker: Mutex::new(worker), scratch, timeout, next: AtomicU64::new(0) })
+        Ok(Self { #[cfg(windows)] profile: None, worker: Mutex::new(worker), scratch, timeout, next: AtomicU64::new(0) })
     }
 
     #[cfg(windows)]
@@ -2333,22 +2338,29 @@ impl AriaCpuProver {
         program: PathBuf, scratch: PathBuf, timeout: Duration, artifacts: &crate::ProductionV4VerifierArtifacts,
     ) -> Result<Self, PoolError> {
         let placement = aria_cpu_placement::Placement::discover().map_err(replay_error)?;
+        let (traces,names) = aria_cpu_placement::TraceSlots::new().map_err(replay_error)?;
         let scratch = CpuProofScratch::create(&scratch)?;
         let command = ProductionV4PoolWorkerCommand {
             program,
             arguments: vec!["--server".into(), artifacts.bank.clone().into_os_string(),
                             artifacts.fixed_record.clone().into_os_string(), "16".into()],
-            environment: vec![("RAYON_NUM_THREADS".into(),"28".into()), ("ARIA_PROVER_NO_WARMUP".into(),"1".into())],
+            environment: vec![("CMFD_CPU_TRACE_MAPS".into(),names.into()), ("RAYON_NUM_THREADS".into(),"28".into()), ("ARIA_PROVER_NO_WARMUP".into(),"1".into())],
         };
-        let mut worker = PersistentWorker::start(&command, "CMFD_V4_PROOF_READY", "Aria CPU proof worker")?;
+        let mut worker = PersistentWorker::start(&command, "CMFD_V4_TRACE_PROOF_READY", "Aria CPU proof worker")?;
         placement.attach(&worker.running_process()?.child).map_err(replay_error)?;
-        Ok(Self { placement: Some(placement), worker: Mutex::new(worker), scratch, timeout, next: AtomicU64::new(0) })
+        Ok(Self { profile: Some(WindowsCpuProfile { placement, traces }), worker: Mutex::new(worker), scratch, timeout, next: AtomicU64::new(0) })
     }
 
     /// The compact proof for (`template`, `nonce`), checked like the proof of the GPU prover before it is returned.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prove(&self, network: [u8;32], template:&BlockTemplate, nonce:u64,
+        challenge:[u8;32], activation:[u8;32], work:[u8;32]) -> Result<BlockProof, PoolError> {
+        self.prove_with_trace(network,template,nonce,challenge,activation,work,None)
+    }
+
     #[cfg(feature = "compact-mainnet")]
     #[allow(clippy::too_many_arguments)]
-    pub fn prove(
+    fn prove_with_trace(
         &self,
         expected_network_id: [u8; 32],
         template: &BlockTemplate,
@@ -2356,6 +2368,7 @@ impl AriaCpuProver {
         challenge_digest: [u8; 32],
         final_activation_digest: [u8; 32],
         work_digest: [u8; 32],
+        trace_slot: Option<usize>,
     ) -> Result<BlockProof, PoolError> {
         let parameters = ForgeMatrixV4CandidateParameters::for_network(expected_network_id).map_err(replay_error)?;
         let height = template.challenge.height;
@@ -2376,11 +2389,16 @@ impl AriaCpuProver {
         let invoked = (|| {
             let mut worker = self.worker.lock().map_err(|_| pool_replay_failure("aria cpu prover lock is poisoned"))?;
             #[cfg(windows)]
-            if let Some(placement) = &self.placement {
-                placement.attach(&worker.running_process()?.child).map_err(replay_error)?;
+            if let Some(profile) = &self.profile {
+                profile.placement.attach(&worker.running_process()?.child).map_err(replay_error)?;
+            }
+            let mut fields = vec![if trace_slot.is_some() {"RUNTRACE"} else {"RUN"}.to_owned(),
+                template_path.to_string_lossy().into_owned(), proof_path.to_string_lossy().into_owned()];
+            if let Some(index) = trace_slot {
+                fields.extend([index.to_string(),hex::encode(work_digest)]);
             }
             worker.invoke_with_timeout(
-                &["RUN".to_owned(), template_path.to_string_lossy().into_owned(), proof_path.to_string_lossy().into_owned()],
+                &fields,
                 "CMFD_V4_PROOF_DONE",
                 self.timeout,
             )
@@ -2419,7 +2437,7 @@ impl AriaCpuProver {
 
     #[cfg(not(feature = "compact-mainnet"))]
     #[allow(clippy::too_many_arguments)]
-    pub fn prove(&self, _: [u8; 32], _: &BlockTemplate, _: u64, _: [u8; 32], _: [u8; 32], _: [u8; 32]) -> Result<BlockProof, PoolError> {
+    fn prove_with_trace(&self, _: [u8; 32], _: &BlockTemplate, _: u64, _: [u8; 32], _: [u8; 32], _: [u8; 32], _: Option<usize>) -> Result<BlockProof, PoolError> {
         Err(pool_replay_failure("the CPU prover needs the compact mainnet build"))
     }
 }
@@ -2659,17 +2677,20 @@ impl AriaCpuShareVerifier {
         let coefficients = forgematrix_v4_replay_coefficients(challenge_digest);
         let slot = self.slot()?;
         #[cfg(windows)]
-        let placement = self.cpu_prover.as_ref().and_then(|prover| prover.placement.as_ref());
+        let profile = self.cpu_prover.as_ref().and_then(|prover| prover.profile.as_ref());
         #[cfg(windows)]
-        if placement.is_some() && packed.is_none() { return Err(pool_replay_failure("9950X3D replay kernel failed qualification")); }
+        if profile.is_some() && packed.is_none() { return Err(pool_replay_failure("9950X3D replay kernel failed qualification")); }
         #[cfg(windows)]
-        let mut guard = placement.map(|p| p.begin()).transpose().map_err(replay_error)?;
+        let mut capture = profile.map(|p| p.traces.take()).transpose().map_err(replay_error)?;
+        #[cfg(windows)]
+        let mut guard = profile.map(|p| p.placement.begin()).transpose().map_err(replay_error)?;
         let cpu_started = Instant::now();
         let executed = match packed {
             #[cfg(windows)]
-            Some(bank) if placement.is_some() => bank.execute_with_thread_setup(
-                &coefficients, self.threads, &|| placement.unwrap().place_replay_thread(),
-            ),
+            Some(bank) if let (Some(profile), Some(lease)) = (profile, capture.as_mut()) => {
+                let (pre, act) = lease.columns_mut();
+                bank.execute_traced_with_setup(&coefficients, self.threads, pre, act, &|| profile.placement.place_replay_thread())
+            }
             Some(bank) => bank.execute(&coefficients, self.threads),
             None => cmfd_consensus::forgematrix_v4_execute(
                 cmfd_consensus::ForgeMatrixV4ExecutionShape::PRODUCTION,
@@ -2717,14 +2738,18 @@ impl AriaCpuShareVerifier {
             cpu_seconds,
             "aria cpu share check found a chain share; proving"
         );
+        #[cfg(windows)]
+        let trace_slot = capture.as_ref().map(|lease| lease.index());
+        #[cfg(not(windows))]
+        let trace_slot = None;
         if let Some(prover) = &self.cpu_prover {
             let proof_started = Instant::now();
-            let mut attempt = prover.prove(self.network_id, template, nonce, challenge_digest, final_activation_digest, work_digest);
+            let mut attempt = prover.prove_with_trace(self.network_id, template, nonce, challenge_digest, final_activation_digest, work_digest, trace_slot);
             if self.inner.is_none() {
                 // Without a GPU fallback: a second attempt on the CPU prover.
                 if let Err(error) = &attempt {
                     tracing::error!(%error, height = template.challenge.height, seconds = proof_started.elapsed().as_secs_f64(), "aria: CPU proof failed; second attempt on the CPU prover");
-                    attempt = prover.prove(self.network_id, template, nonce, challenge_digest, final_activation_digest, work_digest);
+                    attempt = prover.prove_with_trace(self.network_id, template, nonce, challenge_digest, final_activation_digest, work_digest, trace_slot);
                 }
             }
             match attempt {

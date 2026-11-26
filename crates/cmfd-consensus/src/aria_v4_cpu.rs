@@ -8,6 +8,9 @@
 //! Sums: 4096 products of absolute value <= 250 x 128 per digit, so below 2^27: no i32 overflow.
 //! Production shape only (128 x 4096, 384 layers). Without AVX-512 VNNI, `AriaPackedBank::supported()` is false
 //! and the caller keeps the original engine.
+#[cfg(windows)]
+#[path = "aria_trace_section.rs"]
+pub mod trace_section;
 use std::sync::{Barrier, OnceLock};
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
@@ -143,12 +146,26 @@ impl AriaPackedBank {
         self.run(coefficients, threads, None, Some(setup))
     }
 
-    /// The initial activation (before the first layer), as canonical values, row by row.
-    pub fn initial(&self, coefficients: &[u8]) -> Result<Vec<u32>, ForgeMatrixV4ExecutionError> {
-        if coefficients.len() != SHAPE.coefficient_bytes() {
+    /// Record replay directly into the leased proof trace using the pool CPU placement.
+    pub fn execute_traced_with_setup(
+        &self, coefficients: &[u8], threads: usize, pre: &mut [u32], act: &mut [u32],
+        setup: &(dyn Fn() -> std::io::Result<()> + Sync),
+    ) -> Result<Vec<u32>, ForgeMatrixV4ExecutionError> {
+        let words = self.layer_count * SHAPE.cells();
+        if pre.len() != words || act.len() != words { return Err(ForgeMatrixV4ExecutionError::InputLength); }
+        self.run(coefficients,threads,Some((pre.as_mut_ptr(),act.as_mut_ptr())),Some(setup))
+    }
+
+    pub fn initial_from_base(base: &[u8], coefficients: &[u8]) -> Result<Vec<u32>, ForgeMatrixV4ExecutionError> {
+        if base.len()!=SHAPE.cells() || coefficients.len()!=SHAPE.coefficient_bytes() {
             return Err(ForgeMatrixV4ExecutionError::InputLength);
         }
-        Ok(initial_activation(SHAPE, &self.base_input, &coefficients[..SHAPE.mask_coefficients()]))
+        Ok(initial_activation(SHAPE,base,&coefficients[..SHAPE.mask_coefficients()]))
+    }
+
+    /// The initial activation (before the first layer), as canonical values, row by row.
+    pub fn initial(&self, coefficients: &[u8]) -> Result<Vec<u32>, ForgeMatrixV4ExecutionError> {
+        Self::initial_from_base(&self.base_input, coefficients)
     }
 
     /// Like `execute`, and fills the full trace as canonical values: `pre[layer][row][column]`

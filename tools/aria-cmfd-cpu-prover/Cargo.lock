@@ -311,6 +311,7 @@ dependencies = [
  "slop-sumcheck",
  "slop-tensor",
  "thiserror 2.0.21",
+ "windows-sys",
 ]
 
 [[package]]

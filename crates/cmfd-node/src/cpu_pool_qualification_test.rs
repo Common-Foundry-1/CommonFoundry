@@ -29,6 +29,8 @@ struct Fixture {
     output: PathBuf,
     duration_s: f64,
     winners: Vec<Request>,
+    #[serde(default)]
+    post_window_winner: Option<Request>,
     shares: Vec<Request>,
     rotations: Vec<f64>,
 }
@@ -148,4 +150,7 @@ fn cpu_pool_release_qualification() {
         wait_until(start, f.duration_s);
         fs::write(f.output.join("traffic.json"),serde_json::to_vec_pretty(&serde_json::json!({"shares":shares,"proofs":proofs,"wall_s":start.elapsed().as_secs_f64()})).unwrap()).unwrap();
     });
+    if let Some(winner) = &f.post_window_winner {
+        save(winner, "alternate.proof.bin".into());
+    }
 }

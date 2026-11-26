@@ -1440,37 +1440,48 @@ fn opening(bytes: &[u8], p: &[u32], q: &[u32], fixed: [F; 8], dynamic: [F; 8], c
     proof
 }
 /// Everything that is loaded once: the model packed for the kernel, the bytes of the 3 banks, the fixed commitments, the trace buffers.
-struct Ctx { packed: AriaPackedBank, banks: Vec<memmap2::Mmap>, fixed: [[F; 8]; 3], base_input: Vec<u8>, record_path: String, threads: usize, pre: Vec<u32>, act: Vec<u32>, commitment_columns: Vec<Vec<F>>, self_check: bool }
-fn load(bank_path: &str, record_path: &str, threads: usize) -> Ctx {
+struct Ctx { source: ForgeMatrixV4FileLayerSource, packed: Option<AriaPackedBank>, banks: Vec<memmap2::Mmap>, fixed: [[F; 8]; 3], base_input: Vec<u8>, record_path: String, threads: usize, pre: Vec<u32>, act: Vec<u32>, commitment_columns: Vec<Vec<F>>, self_check: bool }
+fn load(bank_path: &str, record_path: &str, threads: usize, capture_mode: bool) -> Ctx {
     let record: ForgeMatrixV4FixedArtifactRecordV1 = serde_json::from_slice(&fs::read(record_path).unwrap()).unwrap();
     let fixed: [[F; 8]; 3] = std::array::from_fn(|b| record.banks()[b].commitment_words().map(F::from_canonical_u32));
     let (_v, identity) = ConsensusPowVerifier::v4_candidate_for_network_with_layer_roots(COMPACT_MAINNET_NETWORK_ID, record, BufReader::with_capacity(64 << 20, fs::File::open(bank_path).unwrap())).unwrap();
-    let source = ForgeMatrixV4ResidentLayerSource::load(fs::File::open(bank_path).unwrap(), &identity.manifest, Arc::clone(&identity.base_input), Arc::clone(&identity.layer_roots)).unwrap();
-    let packed = AriaPackedBank::build(&source, 16).unwrap();
-    drop(source);
+    let source = ForgeMatrixV4FileLayerSource::new(fs::File::open(bank_path).unwrap(), &identity.manifest, Arc::clone(&identity.base_input), Arc::clone(&identity.layer_roots)).unwrap();
+    let packed = (!capture_mode).then(|| AriaPackedBank::build(&source, 16).unwrap());
     // The bank bytes are read through a file mapping: no second copy in memory, and the page cache is shared with the node.
     let model = fs::File::open(bank_path).unwrap();
     let banks: Vec<memmap2::Mmap> = (0..3).map(|bank| unsafe { memmap2::MmapOptions::new().offset(184 + CELLS as u64 + (bank * BANK_BYTES) as u64).len(BANK_BYTES).map(&model).unwrap() }).collect();
     #[cfg(unix)]
     for b in &banks { let _ = b.advise(memmap2::Advice::WillNeed); }
     twiddles(); inv_twiddles();
-    Ctx { packed, banks, fixed, base_input: identity.base_input.to_vec(), record_path: record_path.to_owned(), threads, pre: vec![0u32; 384 * CELLS], act: vec![0u32; 384 * CELLS], commitment_columns: Vec::new(), self_check: std::env::var("ARIA_PROVER_SELF_CHECK").as_deref() == Ok("1") }
+    Ctx { source, packed, banks, fixed, base_input: identity.base_input.to_vec(), record_path: record_path.to_owned(), threads, pre: Vec::new(), act: Vec::new(), commitment_columns: Vec::new(), self_check: std::env::var("ARIA_PROVER_SELF_CHECK").as_deref() == Ok("1") }
 }
 /// The whole proof (`forgematrix_v4_direct` packet) for the block (`challenge`, `nonce`), and the time of each step.
-fn prove(ctx: &mut Ctx, challenge: BlockChallenge, nonce: u64) -> (Vec<u8>, [u8; 32], Vec<(&'static str, f64)>) {
+fn prove(ctx: &mut Ctx, challenge: BlockChallenge, nonce: u64, capture: Option<(&[u32], &[u32], [u8;32])>) -> (Vec<u8>, [u8; 32], Vec<(&'static str, f64)>) {
     let mut steps: Vec<(&'static str, f64)> = Vec::new();
     let digest = forgematrix_v4_challenge_digest(&challenge, nonce, PRODUCTION_V4_MODEL_MANIFEST_DIGEST);
     let coefficients = forgematrix_v4_replay_coefficients(digest);
-    let (packed, banks, threads, fixed, base_input, record_path) = (&ctx.packed, &ctx.banks, ctx.threads, ctx.fixed, &ctx.base_input, &ctx.record_path);
-    let (pre, act) = (&mut ctx.pre, &mut ctx.act);
+    let (banks, fixed, base_input, record_path) = (&ctx.banks, ctx.fixed, &ctx.base_input, &ctx.record_path);
     let t_step = Instant::now();
-    let last = packed.execute_traced(&coefficients, threads, pre, act).unwrap();
-    let (pre, act): (&[u32], &[u32]) = (pre, act);
-    let initial = packed.initial(&coefficients).unwrap();
-    steps.push(("trace", t_step.elapsed().as_secs_f64()));
+    let (pre, act, last, expected): (&[u32], &[u32], Vec<u32>, Option<[u8;32]>) = match capture {
+        Some((pre,act,work)) => {
+            assert_eq!(pre.len(),3*BANK_VALUES);
+            assert_eq!(act.len(),3*BANK_VALUES);
+            assert!(pre.par_iter().chain(act.par_iter()).all(|&x|u64::from(x)<P),"non-canonical replay trace");
+            (pre,act,act[act.len()-CELLS..].to_vec(),Some(work))
+        }
+        None => {
+            let packed=ctx.packed.get_or_insert_with(||AriaPackedBank::build(&ctx.source,16).unwrap());
+            ctx.pre.resize(3*BANK_VALUES,0); ctx.act.resize(3*BANK_VALUES,0);
+            let last=packed.execute_traced(&coefficients,ctx.threads,&mut ctx.pre,&mut ctx.act).unwrap();
+            (&ctx.pre,&ctx.act,last,None)
+        }
+    };
+    let initial = AriaPackedBank::initial_from_base(base_input,&coefficients).unwrap();
     let encoded: Vec<u8> = last.iter().flat_map(|x| x.to_le_bytes()).collect();
     let final_digest = forgematrix_v4_final_activation_digest_from_le_bytes(digest, &encoded).unwrap();
     let work = forgematrix_v4_work_digest(PRODUCTION_V4_MODEL_MANIFEST_DIGEST, digest, final_digest);
+    if let Some(expected) = expected { assert_eq!(work,expected,"replay trace differs from checked work"); }
+    steps.push((if capture.is_some() {"captured trace"} else {"trace"}, t_step.elapsed().as_secs_f64()));
     let parameters = ForgeMatrixV4CandidateParameters::for_network(COMPACT_MAINNET_NETWORK_ID).unwrap();
     let statement = ForgeMatrixV4TranscriptStatement { block: challenge, algorithm_version: parameters.algorithm_version(), proof_version: parameters.proof_version_at_height(challenge.height), nonce,
         proof_system_digest: parameters.proof_system_digest_at_height(challenge.height), model_manifest_digest: PRODUCTION_V4_MODEL_MANIFEST_DIGEST, challenge_digest: digest, final_activation_digest: final_digest, work_digest: work };
@@ -1740,13 +1751,24 @@ fn main() {
     let server = a.get(1).map(String::as_str) == Some("--server");
     let o = if server { 2 } else { 1 };
     let t = Instant::now();
-    let mut ctx = load(&a[o], &a[o + 1], a[o + 2].parse().unwrap());
+    #[cfg(windows)]
+    let maps: Vec<_> = match std::env::var("CMFD_CPU_TRACE_MAPS") {
+        Ok(names) => {
+            assert!(server && names.split(',').count()==2, "invalid pool trace configuration");
+            names.split(',').map(|name| cmfd_consensus::forgematrix_v4_execution::aria_v4_cpu::trace_section::Reader::open(name).unwrap()).collect()
+        }
+        Err(std::env::VarError::NotPresent) => Vec::new(),
+        Err(error) => panic!("invalid trace configuration: {error}"),
+    };
+    #[cfg(windows)] let capture_mode=!maps.is_empty();
+    #[cfg(not(windows))] let capture_mode=false;
+    let mut ctx = load(&a[o], &a[o + 1], a[o + 2].parse().unwrap(), capture_mode);
     eprintln!("aria-cmfd-cpu-prover: model loaded in {:.1} s, {} threads", t.elapsed().as_secs_f64(), ctx.threads);
     if !server {
         let (challenge, nonce) = read_template(&a[o + 3]);
         for run in 0..a.get(o + 5).map_or(1, |n| n.parse().unwrap()) {
             let t = Instant::now();
-            let (wire, work, steps) = prove(&mut ctx, challenge, nonce);
+            let (wire, work, steps) = prove(&mut ctx, challenge, nonce, None);
             eprintln!("run {run}: {}", report(&steps, t.elapsed().as_secs_f64(), work, wire.len()));
             fs::write(&a[o + 4], &wire).unwrap();
         }
@@ -1756,21 +1778,31 @@ fn main() {
     if std::env::var("ARIA_PROVER_NO_WARMUP").is_err() {
         let t = Instant::now();
         let warmup = BlockChallenge { height: 67_535, ..serde_json::from_str::<BlockChallenge>(&std::env::var("ARIA_PROVER_WARMUP_TEMPLATE").ok().and_then(|p| fs::read_to_string(p).ok()).and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()).map(|v| v["challenge"].to_string()).unwrap_or_default()).unwrap_or_else(|_| panic!("warm-up template missing: set ARIA_PROVER_WARMUP_TEMPLATE")) };
-        let (wire, work, steps) = prove(&mut ctx, warmup, 1);
+        let (wire, work, steps) = prove(&mut ctx, warmup, 1, None);
         eprintln!("aria-cmfd-cpu-prover: warm-up: {}", report(&steps, t.elapsed().as_secs_f64(), work, wire.len()));
     }
     use std::io::{BufRead, Write};
-    println!("CMFD_V4_PROOF_READY");
+    println!("{}", if capture_mode { "CMFD_V4_TRACE_PROOF_READY" } else { "CMFD_V4_PROOF_READY" });
     std::io::stdout().flush().unwrap();
     for line in std::io::stdin().lock().lines() {
         let line = line.unwrap();
         let fields: Vec<&str> = line.trim_end().split('\t').collect();
         match fields.as_slice() {
             ["QUIT"] => break,
-            ["RUN", template, output] => {
+            ["RUN", template, output] | ["RUNTRACE", template, output, _, _] => {
                 let t = Instant::now();
                 let (challenge, nonce) = read_template(template);
-                let (wire, work, steps) = prove(&mut ctx, challenge, nonce);
+                #[cfg(windows)]
+                let capture = if let ["RUNTRACE",_,_,index,work]=fields.as_slice() {
+                    let i: usize = index.parse().expect("trace slot");
+                    let expected: [u8;32] = hex::decode(work).unwrap().try_into().expect("work digest");
+                    // The parent holds the slot until DONE or this process is reaped.
+                    let (p,a)=unsafe {maps.get(i).expect("unconfigured trace slot").columns()};
+                    Some((p,a,expected))
+                } else { None };
+                #[cfg(not(windows))]
+                let capture = { assert!(fields[0]=="RUN","unsupported trace transport"); None };
+                let (wire, work, steps) = prove(&mut ctx, challenge, nonce, capture);
                 let pending = format!("{output}.pending");
                 fs::write(&pending, &wire).unwrap();
                 fs::rename(&pending, output).unwrap();

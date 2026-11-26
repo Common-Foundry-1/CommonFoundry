@@ -18,7 +18,7 @@ The supplied start-cpu-pool.ps1 launcher locks the model and sets this profile. 
     ARIA_POOL_CPU_PROVER_SCRATCH=D:\CommonFoundry\cpu-proof-scratch
     ARIA_POOL_CPU_SHARES=1x14
 
-CPU-only mode requires the GPU pool worker options to be omitted. The Windows profile checks the CPU model, sixteen physical cores, SMT topology, and the process's allowed CPU mask. Replay uses one logical processor on each of the first fourteen physical cores. Each active share check restricts the external prover to the other two physical cores. At the end of the check, the pool restores the prover's full processor mask. The prover uses 16 trace threads and 28 Rayon workers. The first proof includes cold allocations.
+CPU-only mode requires the GPU pool worker options to be omitted. The Windows profile checks the CPU model, sixteen physical cores, SMT topology, and the process's allowed CPU mask. Replay uses one logical processor on each of the first fourteen physical cores. Each active share check restricts the external prover to the other two physical cores. At the end of the check, the pool restores the prover's full processor mask. The pool and the bundled prover share two 1.5 GiB trace buffers. The pool retains the winning trace until its proof completes and can check the next share in the other buffer. The prover checks the trace against the winning work digest and uses 28 Rayon workers. The first proof includes cold allocations.
 
 ## Linux and manual pool configuration
 

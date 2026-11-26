@@ -1,0 +1,3 @@
+# The prover uses the AVX-512 packed field of p3-koala-bear, which is selected at compile time.
+[build]
+rustflags = ["-C", "target-cpu=native"]

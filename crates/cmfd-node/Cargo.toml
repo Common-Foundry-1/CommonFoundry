@@ -1,6 +1,6 @@
 [package]
 name = "cmfd-node"
-version = "1.0.23"
+version = "1.0.24"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -70,6 +70,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
+    "Win32_System_SystemInformation",
     "Win32_System_SystemServices",
     "Win32_System_Threading",
 ] }

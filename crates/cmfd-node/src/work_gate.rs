@@ -1358,6 +1358,8 @@ impl Node {
                 .map_err(unusable)?,
             ),
         };
+        // AriaPool: the same in-memory model is used for the share checks on the CPU.
+        aria_set_shared_layer_source(Arc::clone(&source));
         let engine: Arc<dyn WorkEngine> =
             Arc::new(CpuWorkEngine::new(source, threads).with_thread_priority(priority));
         let gpu = gpu.map(|workers| {
@@ -4983,4 +4985,21 @@ pub(crate) mod tests {
         clean_test_dir(&path);
         clean_test_dir(&source_path);
     }
+}
+
+/// AriaPool: the model loaded for the block work checks, shared with the CPU share verifier
+/// (`production_v4_pool::AriaCpuShareVerifier`). A single copy stays in memory.
+#[cfg(feature = "production-v4")]
+static ARIA_SHARED_LAYER_SOURCE: std::sync::OnceLock<
+    Arc<dyn cmfd_consensus::ForgeMatrixV4LayerSource>,
+> = std::sync::OnceLock::new();
+
+#[cfg(feature = "production-v4")]
+pub fn aria_set_shared_layer_source(source: Arc<dyn cmfd_consensus::ForgeMatrixV4LayerSource>) {
+    let _ = ARIA_SHARED_LAYER_SOURCE.set(source);
+}
+
+#[cfg(feature = "production-v4")]
+pub fn aria_shared_layer_source() -> Option<Arc<dyn cmfd_consensus::ForgeMatrixV4LayerSource>> {
+    ARIA_SHARED_LAYER_SOURCE.get().cloned()
 }

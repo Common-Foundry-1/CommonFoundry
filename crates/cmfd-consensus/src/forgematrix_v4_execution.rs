@@ -80,6 +80,8 @@ pub enum ForgeMatrixV4ExecutionError {
     ThreadCount,
     #[error("could not start a work execution thread: {0}")]
     ThreadSpawn(#[source] io::Error),
+    #[error("could not configure a work execution thread: {0}")]
+    ThreadSetup(#[source] io::Error),
     #[error("a work execution thread panicked")]
     ThreadPanicked,
     #[error("model bank file has {actual} bytes; expected {expected}")]
@@ -779,6 +781,10 @@ fn forward(
     }
     Ok(out)
 }
+
+// AriaPool: integer AVX-512 VNNI kernel for the same forward pass (pool share checks on the CPU).
+#[path = "aria_v4_cpu.rs"]
+pub mod aria_v4_cpu;
 
 #[cfg(test)]
 mod tests {

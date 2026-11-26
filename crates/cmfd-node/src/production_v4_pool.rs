@@ -1687,14 +1687,28 @@ impl WorkerProcess {
         label: &'static str,
         ready_timeout: Duration,
     ) -> Result<Self, PoolError> {
-        let mut child = Command::new(&command.program)
+        let mut process = Command::new(&command.program);
+        process
             .args(&command.arguments)
             .envs(command.environment.iter().cloned())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
+            .stderr(Stdio::inherit());
+        #[cfg(target_os = "linux")]
+        if ready_marker == "CMFD_V4_TRACE_PROOF_READY" {
+            let names = command
+                .environment
+                .iter()
+                .find(|(key, _)| key == "CMFD_CPU_TRACE_MAPS")
+                .and_then(|(_, value)| value.to_str())
+                .ok_or_else(|| pool_replay_failure("missing CPU trace descriptor list"))?;
+            cmfd_consensus::forgematrix_v4_execution::aria_v4_cpu::trace_section::inherit_readers(
+                &mut process,
+                names,
+            )
             .map_err(replay_error)?;
+        }
+        let mut child = process.spawn().map_err(replay_error)?;
         let stdin = child
             .stdin
             .take()
@@ -2180,6 +2194,823 @@ fn pool_replay_failure(message: impl Into<String>) -> PoolError {
     PoolError::ProductionV4Replay(message.into())
 }
 
+// ---------------------------------------------------------------------------
+// AriaPool: pool shares checked on the CPU.
+// A share is computed on the model the node already holds in memory, by the integer AVX-512 kernel
+// (`aria_v4_cpu`, checked equal to the consensus engine on a full pass before it is used) or, without AVX-512 VNNI,
+// by the consensus engine `forgematrix_v4_execute` itself. With a GPU verifier configured, a chain share still goes
+// to the original verifier for the full replay and the proof, and it cross-checks its final activation with the CPU one.
+// ---------------------------------------------------------------------------
+impl ProductionV4PersistentPoolVerifier {
+    /// Proof of a chain share whose final activation (`search_final`) comes from the CPU:
+    /// same steps as `evaluate_single` after its "search" replay, which the CPU replaces.
+    #[allow(clippy::too_many_arguments)]
+    fn aria_prove_cpu_share(
+        &self,
+        template: &BlockTemplate,
+        nonce: u64,
+        challenge_digest: [u8; 32],
+        search_final: &[u8],
+        final_activation_digest: [u8; 32],
+        work_digest: [u8; 32],
+        evaluation_started: Instant,
+        search_replay_seconds: f64,
+    ) -> Result<ProductionV4PoolShareEvaluation, PoolError> {
+        let files = self.attempt_files();
+        write_new_file(
+            &files.path("coefficients.bin"),
+            &forgematrix_v4_replay_coefficients(challenge_digest),
+        )?;
+        let frozen = FrozenProductionV4Template {
+            format_version: FROZEN_TEMPLATE_FORMAT_VERSION,
+            challenge: template.challenge,
+            coinbase: &template.coinbase,
+            transactions: &template.transactions,
+            nonce,
+        };
+        write_new_file(
+            &files.path("template.json"),
+            &serde_json::to_vec(&frozen).map_err(replay_error)?,
+        )?;
+        let search_state = self
+            .searcher
+            .state
+            .lock()
+            .map_err(|_| pool_replay_failure("persistent search worker lock is poisoned"))?;
+        self.prove_chain_share(
+            search_state,
+            ChainShare {
+                worker: 0,
+                files: &files,
+                template,
+                nonce,
+                challenge_digest,
+                search_final,
+                final_activation_digest,
+                work_digest,
+                evaluation_started,
+                search_replay_seconds,
+            },
+        )
+    }
+}
+
+impl ProductionV4PersistentPoolVerifier {
+    /// Warms the replay model on the GPU (a dry "search" replay, without the serial-mode eviction),
+    /// so that a chain share found by the CPU goes straight to the full replay.
+    /// Does nothing if the replay worker is busy.
+    fn aria_warm_replay(&self) -> Result<(), PoolError> {
+        let Ok(mut search_state) = self.searcher.state.try_lock() else {
+            return Ok(());
+        };
+        let files = self.attempt_files();
+        let coefficients_path = files.path("coefficients.bin");
+        write_new_file(
+            &coefficients_path,
+            &forgematrix_v4_replay_coefficients(*blake3::hash(b"aria replay warm-up").as_bytes()),
+        )?;
+        search_state.replay.invoke(
+            &[
+                "RUN".to_owned(),
+                "search".to_owned(),
+                self.worker_path(&coefficients_path)?,
+                self.worker_path(&files.path("search"))?,
+            ],
+            "CMFD_V4_REPLAY_DONE",
+        )?;
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+#[path = "aria_cpu_placement.rs"]
+mod aria_cpu_placement;
+#[cfg(any(windows, target_os = "linux"))]
+#[path = "aria_trace_slots.rs"]
+mod aria_trace_slots;
+
+/// Original CPU pool verification and proving integration contributed by Stefan and AriaPool.
+/// CPU compact prover. Trace-enabled pools retain the checked share replay until proving finishes.
+pub struct AriaCpuProver {
+    #[cfg(windows)]
+    placement: Option<aria_cpu_placement::Placement>,
+    #[cfg(any(windows, target_os = "linux"))]
+    traces: Option<aria_trace_slots::TraceSlots>,
+    worker: Mutex<PersistentWorker>,
+    scratch: CpuProofScratch,
+    timeout: Duration,
+    next: AtomicU64,
+}
+
+#[derive(Debug)]
+struct CpuProofScratch(PathBuf);
+
+impl CpuProofScratch {
+    fn create(parent: &Path) -> Result<Self, PoolError> {
+        fs::create_dir_all(parent).map_err(replay_error)?;
+        let parent = parent.canonicalize().map_err(replay_error)?;
+        let mut id = [0u8; 16];
+        getrandom::fill(&mut id).map_err(replay_error)?;
+        let path = parent.join(format!("aria-proof-{}", hex::encode(id)));
+        let builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        let mut builder = builder;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&path).map_err(replay_error)?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for CpuProofScratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir(&self.0);
+    }
+}
+
+impl std::fmt::Debug for AriaCpuProver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AriaCpuProver")
+            .field("scratch", &self.scratch)
+            .finish()
+    }
+}
+
+impl AriaCpuProver {
+    /// Starts the program and waits until it is ready (model loaded, warm-up proof done).
+    pub fn start(program: PathBuf, scratch: PathBuf, timeout: Duration) -> Result<Self, PoolError> {
+        let scratch = CpuProofScratch::create(&scratch)?;
+        #[cfg(target_os = "linux")]
+        let (traces, environment, marker) = match std::env::var("CMFD_CPU_TRACE_REUSE").as_deref() {
+            Ok("1") => {
+                let (slots, names) = aria_trace_slots::TraceSlots::new().map_err(replay_error)?;
+                (
+                    Some(slots),
+                    vec![("CMFD_CPU_TRACE_MAPS".into(), names.into())],
+                    "CMFD_V4_TRACE_PROOF_READY",
+                )
+            }
+            Ok("0") | Err(std::env::VarError::NotPresent) => {
+                (None, Vec::new(), "CMFD_V4_PROOF_READY")
+            }
+            _ => return Err(pool_replay_failure("CMFD_CPU_TRACE_REUSE must be 0 or 1")),
+        };
+        #[cfg(not(target_os = "linux"))]
+        let (environment, marker) = (Vec::new(), "CMFD_V4_PROOF_READY");
+        let command = ProductionV4PoolWorkerCommand {
+            program,
+            arguments: Vec::new(),
+            environment,
+        };
+        let worker = PersistentWorker::start(&command, marker, "Aria CPU proof worker")?;
+        Ok(Self {
+            #[cfg(windows)]
+            placement: None,
+            #[cfg(windows)]
+            traces: None,
+            #[cfg(target_os = "linux")]
+            traces,
+            worker: Mutex::new(worker),
+            scratch,
+            timeout,
+            next: AtomicU64::new(0),
+        })
+    }
+
+    #[cfg(windows)]
+    pub fn start_9950x3d(
+        program: PathBuf,
+        scratch: PathBuf,
+        timeout: Duration,
+        artifacts: &crate::ProductionV4VerifierArtifacts,
+    ) -> Result<Self, PoolError> {
+        let placement = aria_cpu_placement::Placement::discover().map_err(replay_error)?;
+        let (traces, names) = aria_trace_slots::TraceSlots::new().map_err(replay_error)?;
+        let scratch = CpuProofScratch::create(&scratch)?;
+        let command = ProductionV4PoolWorkerCommand {
+            program,
+            arguments: vec![
+                "--server".into(),
+                artifacts.bank.clone().into_os_string(),
+                artifacts.fixed_record.clone().into_os_string(),
+                "16".into(),
+            ],
+            environment: vec![
+                ("CMFD_CPU_TRACE_MAPS".into(), names.into()),
+                ("RAYON_NUM_THREADS".into(), "28".into()),
+                ("ARIA_PROVER_NO_WARMUP".into(), "1".into()),
+            ],
+        };
+        let mut worker = PersistentWorker::start(
+            &command,
+            "CMFD_V4_TRACE_PROOF_READY",
+            "Aria CPU proof worker",
+        )?;
+        placement
+            .attach(&worker.running_process()?.child)
+            .map_err(replay_error)?;
+        Ok(Self {
+            placement: Some(placement),
+            traces: Some(traces),
+            worker: Mutex::new(worker),
+            scratch,
+            timeout,
+            next: AtomicU64::new(0),
+        })
+    }
+
+    /// The compact proof for (`template`, `nonce`), checked like the proof of the GPU prover before it is returned.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prove(
+        &self,
+        network: [u8; 32],
+        template: &BlockTemplate,
+        nonce: u64,
+        challenge: [u8; 32],
+        activation: [u8; 32],
+        work: [u8; 32],
+    ) -> Result<BlockProof, PoolError> {
+        self.prove_with_trace(network, template, nonce, challenge, activation, work, None)
+    }
+
+    #[cfg(feature = "compact-mainnet")]
+    #[allow(clippy::too_many_arguments)]
+    fn prove_with_trace(
+        &self,
+        expected_network_id: [u8; 32],
+        template: &BlockTemplate,
+        nonce: u64,
+        challenge_digest: [u8; 32],
+        final_activation_digest: [u8; 32],
+        work_digest: [u8; 32],
+        trace_slot: Option<usize>,
+    ) -> Result<BlockProof, PoolError> {
+        let parameters = ForgeMatrixV4CandidateParameters::for_network(expected_network_id)
+            .map_err(replay_error)?;
+        let height = template.challenge.height;
+        if !parameters.uses_direct_proof_at_height(height) {
+            return Err(pool_replay_failure(
+                "the CPU prover only makes compact proofs",
+            ));
+        }
+        let number = self.next.fetch_add(1, Ordering::Relaxed);
+        let stem = format!("aria-{}-{number:08x}", std::process::id());
+        let (template_path, proof_path) = (
+            self.scratch.0.join(format!("{stem}-template.json")),
+            self.scratch.0.join(format!("{stem}-proof.bin")),
+        );
+        let frozen = FrozenProductionV4Template {
+            format_version: FROZEN_TEMPLATE_FORMAT_VERSION,
+            challenge: template.challenge,
+            coinbase: &template.coinbase,
+            transactions: &template.transactions,
+            nonce,
+        };
+        write_new_file(
+            &template_path,
+            &serde_json::to_vec(&frozen).map_err(replay_error)?,
+        )?;
+        let invoked = (|| {
+            let mut worker = self
+                .worker
+                .lock()
+                .map_err(|_| pool_replay_failure("aria cpu prover lock is poisoned"))?;
+            #[cfg(windows)]
+            if let Some(placement) = &self.placement {
+                placement
+                    .attach(&worker.running_process()?.child)
+                    .map_err(replay_error)?;
+            }
+            let mut fields = vec![
+                if trace_slot.is_some() {
+                    "RUNTRACE"
+                } else {
+                    "RUN"
+                }
+                .to_owned(),
+                template_path.to_string_lossy().into_owned(),
+                proof_path.to_string_lossy().into_owned(),
+            ];
+            if let Some(index) = trace_slot {
+                fields.extend([index.to_string(), hex::encode(work_digest)]);
+            }
+            worker.invoke_with_timeout(&fields, "CMFD_V4_PROOF_DONE", self.timeout)
+        })();
+        let read =
+            invoked.and_then(|()| read_bounded_file(&proof_path, PRODUCTION_V4_MAX_PROOF_BYTES));
+        let _ = fs::remove_file(&template_path);
+        let _ = fs::remove_file(&proof_path);
+        let transparent_proof = read?;
+        let statement = cmfd_consensus::forgematrix_v4_basefold::ForgeMatrixV4TranscriptStatement {
+            block: template.challenge,
+            algorithm_version: parameters.algorithm_version(),
+            proof_version: parameters.proof_version_at_height(height),
+            nonce,
+            proof_system_digest: parameters.proof_system_digest_at_height(height),
+            model_manifest_digest: PRODUCTION_V4_MODEL_MANIFEST_DIGEST,
+            challenge_digest,
+            final_activation_digest,
+            work_digest,
+        };
+        let packet = cmfd_consensus::forgematrix_v4_direct::decode(&transparent_proof, statement)
+            .map_err(replay_error)?;
+        if forgematrix_v4_final_activation_digest(challenge_digest, &packet.public.final_activation)
+            != final_activation_digest
+        {
+            return Err(pool_replay_failure(
+                "CPU proof final activation does not match the share check",
+            ));
+        }
+        Ok(BlockProof::V4Candidate(Box::new(
+            ForgeMatrixV4CandidateProof {
+                algorithm_version: parameters.algorithm_version(),
+                proof_version: parameters.proof_version_at_height(height),
+                nonce,
+                proof_system_digest: parameters.proof_system_digest_at_height(height),
+                model_manifest_digest: PRODUCTION_V4_MODEL_MANIFEST_DIGEST,
+                challenge_digest,
+                final_activation_digest,
+                work_digest,
+                transparent_proof,
+            },
+        )))
+    }
+
+    #[cfg(not(feature = "compact-mainnet"))]
+    #[allow(clippy::too_many_arguments)]
+    fn prove_with_trace(
+        &self,
+        _: [u8; 32],
+        _: &BlockTemplate,
+        _: u64,
+        _: [u8; 32],
+        _: [u8; 32],
+        _: [u8; 32],
+        _: Option<usize>,
+    ) -> Result<BlockProof, PoolError> {
+        Err(pool_replay_failure(
+            "the CPU prover needs the compact mainnet build",
+        ))
+    }
+}
+
+/// Share verifier on the CPU: `slots` shares at a time, `threads` threads each.
+#[derive(Debug)]
+pub struct AriaCpuShareVerifier {
+    /// The original GPU verifier. `None` = CPU-only mode (no GPU worker).
+    inner: Option<std::sync::Arc<ProductionV4PersistentPoolVerifier>>,
+    network_id: [u8; 32],
+    slots: usize,
+    threads: usize,
+    busy: Mutex<usize>,
+    freed: std::sync::Condvar,
+    /// Block prover on the CPU. `None` = chain shares are proved by the GPU verifier.
+    cpu_prover: Option<AriaCpuProver>,
+    /// The model packed for the AVX-512 integer kernel. `None` = original CPU engine.
+    packed: std::sync::OnceLock<
+        Option<cmfd_consensus::forgematrix_v4_execution::aria_v4_cpu::AriaPackedBank>,
+    >,
+    /// (shares, total microseconds, microseconds of the slowest one) since the last report.
+    stats: Mutex<(u64, u64, u64)>,
+}
+
+/// The installed verifier, kept so that it can be prepared as soon as the node has loaded the model.
+static ARIA_CPU_SHARE_VERIFIER: std::sync::OnceLock<std::sync::Arc<AriaCpuShareVerifier>> =
+    std::sync::OnceLock::new();
+
+/// Packs the model for the integer kernel and warms the GPU replay, in the background, so that the
+/// first share does not pay for this setup. Call it after `Node::install_work_engines`.
+pub fn aria_prepare_cpu_shares() {
+    let Some(verifier) = ARIA_CPU_SHARE_VERIFIER.get().cloned() else {
+        return;
+    };
+    let _ = std::thread::Builder::new()
+        .name("aria-cpu-shares-prepare".to_owned())
+        .spawn(move || {
+            if let Some(source) = crate::work_gate::aria_shared_layer_source() {
+                let _ = verifier.packed(source.as_ref());
+            }
+        });
+}
+
+struct AriaCpuSlot<'a>(&'a AriaCpuShareVerifier);
+
+impl Drop for AriaCpuSlot<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut busy) = self.0.busy.lock() {
+            *busy = busy.saturating_sub(1);
+        }
+        self.0.freed.notify_one();
+    }
+}
+
+impl AriaCpuShareVerifier {
+    pub fn new(
+        inner: std::sync::Arc<ProductionV4PersistentPoolVerifier>,
+        slots: usize,
+        threads: usize,
+    ) -> Self {
+        Self {
+            network_id: inner.expected_network_id,
+            inner: Some(inner),
+            slots: slots.max(1),
+            threads: threads.max(1),
+            busy: Mutex::new(0),
+            freed: std::sync::Condvar::new(),
+            cpu_prover: None,
+            packed: std::sync::OnceLock::new(),
+            stats: Mutex::new((0, 0, 0)),
+        }
+    }
+
+    /// CPU-only mode: shares by the integer kernel, chain shares by the CPU prover (set it with
+    /// `with_cpu_prover`), no GPU verifier.
+    pub fn cpu_only(network_id: [u8; 32], slots: usize, threads: usize) -> Self {
+        Self {
+            inner: None,
+            network_id,
+            slots: slots.max(1),
+            threads: threads.max(1),
+            busy: Mutex::new(0),
+            freed: std::sync::Condvar::new(),
+            cpu_prover: None,
+            packed: std::sync::OnceLock::new(),
+            stats: Mutex::new((0, 0, 0)),
+        }
+    }
+
+    /// Chain shares are proved by this CPU prover. The GPU verifier, when there is one, stays as the fallback.
+    pub fn with_cpu_prover(mut self, prover: AriaCpuProver) -> Self {
+        self.cpu_prover = Some(prover);
+        self
+    }
+
+    /// Remembers the verifier installed in the pool (see `aria_prepare_cpu_shares`).
+    pub fn register(verifier: &std::sync::Arc<Self>) {
+        let _ = ARIA_CPU_SHARE_VERIFIER.set(std::sync::Arc::clone(verifier));
+    }
+
+    /// "2x8" = 2 shares at a time, 8 threads each. Any other form = None (shares stay on the GPU verifier).
+    pub fn parse(spec: &str) -> Option<(usize, usize)> {
+        let (slots, threads) = spec.trim().split_once('x')?;
+        let (slots, threads) = (slots.parse::<usize>().ok()?, threads.parse::<usize>().ok()?);
+        (1..=64).contains(&slots).then_some(())?;
+        (1..=256).contains(&threads).then_some((slots, threads))
+    }
+
+    /// Packs the model for the integer kernel on the first call, and keeps it only if, on a full pass,
+    /// it returns exactly the activation of the original engine.
+    fn packed(
+        &self,
+        source: &dyn cmfd_consensus::ForgeMatrixV4LayerSource,
+    ) -> Option<&cmfd_consensus::forgematrix_v4_execution::aria_v4_cpu::AriaPackedBank> {
+        use cmfd_consensus::forgematrix_v4_execution::aria_v4_cpu::AriaPackedBank;
+        self.packed
+            .get_or_init(|| {
+                if !AriaPackedBank::supported() {
+                    tracing::warn!("aria cpu shares: no AVX-512 VNNI here; the original CPU engine is used");
+                    return None;
+                }
+                let started = Instant::now();
+                let coefficients = forgematrix_v4_replay_coefficients(
+                    *blake3::hash(b"aria cpu share kernel self-check").as_bytes(),
+                );
+                let checked = AriaPackedBank::build(source, 16).and_then(|bank| {
+                    let fast = bank.execute(&coefficients, self.threads)?;
+                    let reference = cmfd_consensus::forgematrix_v4_execute(
+                        cmfd_consensus::ForgeMatrixV4ExecutionShape::PRODUCTION,
+                        source,
+                        &coefficients,
+                        self.threads,
+                        true,
+                    )?;
+                    Ok((fast == reference).then_some(bank))
+                });
+                match checked {
+                    Ok(Some(bank)) => {
+                        self.warm_replay();
+                        tracing::info!(
+                            seconds = started.elapsed().as_secs_f64(),
+                            "aria cpu shares: integer kernel ready and equal to the original engine"
+                        );
+                        Some(bank)
+                    }
+                    Ok(None) => {
+                        tracing::error!("aria cpu shares: integer kernel DIFFERS from the original engine; original engine kept");
+                        None
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "aria cpu shares: integer kernel unavailable; original engine kept");
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+
+    /// Warms the replay model on the GPU, off the share path.
+    fn warm_replay(&self) {
+        let Some(inner) = self.inner.clone() else {
+            return;
+        };
+        let _ = std::thread::Builder::new()
+            .name("aria-replay-warm".to_owned())
+            .spawn(move || {
+                let started = Instant::now();
+                match inner.aria_warm_replay() {
+                    Ok(()) => tracing::info!(
+                        seconds = started.elapsed().as_secs_f64(),
+                        "aria: replay model ready on the GPU for the next chain share"
+                    ),
+                    Err(error) => tracing::warn!(%error, "aria: replay warm-up failed"),
+                }
+            });
+    }
+
+    fn slot(&self) -> Result<AriaCpuSlot<'_>, PoolError> {
+        let mut busy = self
+            .busy
+            .lock()
+            .map_err(|_| pool_replay_failure("aria cpu share slots lock is poisoned"))?;
+        while *busy >= self.slots {
+            busy = self
+                .freed
+                .wait(busy)
+                .map_err(|_| pool_replay_failure("aria cpu share slots lock is poisoned"))?;
+        }
+        *busy += 1;
+        Ok(AriaCpuSlot(self))
+    }
+
+    fn note(&self, seconds: f64) {
+        let micros = (seconds * 1e6) as u64;
+        let Ok(mut stats) = self.stats.lock() else {
+            return;
+        };
+        stats.0 += 1;
+        stats.1 += micros;
+        stats.2 = stats.2.max(micros);
+        if stats.0 >= 50 {
+            tracing::info!(
+                shares = stats.0,
+                mean_seconds = stats.1 as f64 / stats.0 as f64 / 1e6,
+                max_seconds = stats.2 as f64 / 1e6,
+                "aria cpu share checks"
+            );
+            *stats = (0, 0, 0);
+        }
+    }
+
+    fn evaluate_cpu(
+        &self,
+        template: &BlockTemplate,
+        nonce: u64,
+        share_target: [u8; 32],
+    ) -> Result<ProductionV4PoolShareEvaluation, PoolError> {
+        // Until the node has loaded the model: the GPU verifier if there is one, otherwise the share has to be sent again.
+        let Some(source) = crate::work_gate::aria_shared_layer_source() else {
+            return match &self.inner {
+                Some(inner) => inner.evaluate(template, nonce, share_target),
+                None => Err(pool_replay_failure("the model is not loaded yet")),
+            };
+        };
+        let evaluation_started = Instant::now();
+        // same rules as `validate_share` in the original verifier
+        if template.challenge.network_id != self.network_id {
+            return Err(pool_replay_failure(
+                "pool replay received a template for another network",
+            ));
+        }
+        if share_target < template.challenge.target {
+            return Err(pool_replay_failure(
+                "pool share target is harder than the chain target",
+            ));
+        }
+        let challenge_digest = forgematrix_v4_challenge_digest(
+            &template.challenge,
+            nonce,
+            PRODUCTION_V4_MODEL_MANIFEST_DIGEST,
+        );
+        let packed = self.packed(source.as_ref());
+        let coefficients = forgematrix_v4_replay_coefficients(challenge_digest);
+        let slot = self.slot()?;
+        #[cfg(windows)]
+        let placement = self
+            .cpu_prover
+            .as_ref()
+            .and_then(|prover| prover.placement.as_ref());
+        #[cfg(any(windows, target_os = "linux"))]
+        let mut capture = {
+            let traces = self
+                .cpu_prover
+                .as_ref()
+                .and_then(|prover| prover.traces.as_ref());
+            if traces.is_some() && packed.is_none() {
+                return Err(pool_replay_failure(
+                    "CPU trace capture requires a qualified replay kernel",
+                ));
+            }
+            traces
+                .map(|pool| pool.take())
+                .transpose()
+                .map_err(replay_error)?
+        };
+        #[cfg(windows)]
+        let mut guard = placement
+            .map(|p| p.begin())
+            .transpose()
+            .map_err(replay_error)?;
+        let cpu_started = Instant::now();
+        let executed = match packed {
+            Some(bank) => {
+                #[cfg(any(windows, target_os = "linux"))]
+                if let Some(lease) = capture.as_mut() {
+                    let (pre, act) = lease.columns_mut();
+                    #[cfg(windows)]
+                    if let Some(placement) = placement {
+                        bank.execute_traced_with_setup(
+                            &coefficients,
+                            self.threads,
+                            pre,
+                            act,
+                            &|| placement.place_replay_thread(),
+                        )
+                    } else {
+                        bank.execute_traced(&coefficients, self.threads, pre, act)
+                    }
+                    #[cfg(target_os = "linux")]
+                    bank.execute_traced(&coefficients, self.threads, pre, act)
+                } else {
+                    bank.execute(&coefficients, self.threads)
+                }
+                #[cfg(not(any(windows, target_os = "linux")))]
+                bank.execute(&coefficients, self.threads)
+            }
+            None => cmfd_consensus::forgematrix_v4_execute(
+                cmfd_consensus::ForgeMatrixV4ExecutionShape::PRODUCTION,
+                source.as_ref(),
+                &coefficients,
+                self.threads,
+                false,
+            ),
+        };
+        #[cfg(windows)]
+        if let Some(guard) = &mut guard {
+            guard.finish().map_err(replay_error)?;
+        }
+        drop(slot);
+        let cpu_seconds = cpu_started.elapsed().as_secs_f64();
+        let activation = match executed {
+            Ok(activation) => activation,
+            Err(error) => {
+                tracing::warn!(%error, "aria cpu share check failed");
+                return match &self.inner {
+                    Some(inner) => inner.evaluate(template, nonce, share_target),
+                    None => Err(replay_error(error)),
+                };
+            }
+        };
+        self.note(cpu_seconds);
+        let search_final = activation
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let final_activation_digest =
+            final_activation_digest_from_bytes(challenge_digest, &search_final)?;
+        let work_digest = forgematrix_v4_work_digest(
+            PRODUCTION_V4_MODEL_MANIFEST_DIGEST,
+            challenge_digest,
+            final_activation_digest,
+        );
+        if work_digest > template.challenge.target {
+            return Ok(ProductionV4PoolShareEvaluation {
+                work_digest,
+                chain_proof: None,
+                replay: None,
+            });
+        }
+        tracing::info!(
+            height = template.challenge.height,
+            cpu_seconds,
+            "aria cpu share check found a chain share; proving"
+        );
+        #[cfg(any(windows, target_os = "linux"))]
+        let trace_slot = capture.as_ref().map(|lease| lease.index());
+        #[cfg(not(any(windows, target_os = "linux")))]
+        let trace_slot = None;
+        if let Some(prover) = &self.cpu_prover {
+            let proof_started = Instant::now();
+            let mut attempt = prover.prove_with_trace(
+                self.network_id,
+                template,
+                nonce,
+                challenge_digest,
+                final_activation_digest,
+                work_digest,
+                trace_slot,
+            );
+            if self.inner.is_none() {
+                // Without a GPU fallback: a second attempt on the CPU prover.
+                if let Err(error) = &attempt {
+                    tracing::error!(%error, height = template.challenge.height, seconds = proof_started.elapsed().as_secs_f64(), "aria: CPU proof failed; second attempt on the CPU prover");
+                    attempt = prover.prove_with_trace(
+                        self.network_id,
+                        template,
+                        nonce,
+                        challenge_digest,
+                        final_activation_digest,
+                        work_digest,
+                        trace_slot,
+                    );
+                }
+            }
+            match attempt {
+                Ok(proof) => {
+                    let proof_bytes = match &proof {
+                        BlockProof::V4Candidate(candidate) => candidate.transparent_proof.len(),
+                        _ => 0,
+                    };
+                    crate::pool_timing::ProofTiming {
+                        network_id: self.network_id,
+                        height: template.challenge.height,
+                        parent: template.challenge.previous_block,
+                        nonce,
+                        search_replay_seconds: cpu_seconds,
+                        full_replay_seconds: 0.0,
+                        replay_handoff_seconds: 0.0,
+                        proof_seconds: proof_started.elapsed().as_secs_f64(),
+                        pool_evaluation_wall_seconds: evaluation_started.elapsed().as_secs_f64(),
+                        proof_bytes,
+                    }
+                    .record();
+                    tracing::info!(
+                        height = template.challenge.height,
+                        seconds = proof_started.elapsed().as_secs_f64(),
+                        "aria: chain share proved on the CPU"
+                    );
+                    return Ok(ProductionV4PoolShareEvaluation {
+                        work_digest,
+                        chain_proof: Some(proof),
+                        replay: Some(
+                            PoolReplayResult::new(challenge_digest, final_activation_digest, 0)
+                                .with_known_answer(None),
+                        ),
+                    });
+                }
+                Err(error) => {
+                    tracing::error!(%error, height = template.challenge.height, seconds = proof_started.elapsed().as_secs_f64(), "aria: CPU proof failed");
+                    if self.inner.is_none() {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        let Some(inner) = &self.inner else {
+            return Err(pool_replay_failure(
+                "no prover is configured for a chain share",
+            ));
+        };
+        let proved = inner.aria_prove_cpu_share(
+            template,
+            nonce,
+            challenge_digest,
+            &search_final,
+            final_activation_digest,
+            work_digest,
+            evaluation_started,
+            cpu_seconds,
+        );
+        self.warm_replay();
+        match proved {
+            Ok(evaluation) => Ok(evaluation),
+            // A block must not be lost on this path: a second attempt, entirely by the original verifier.
+            Err(error) => {
+                tracing::error!(%error, height = template.challenge.height, "aria cpu chain share failed on the GPU proof path; retrying with the GPU verifier alone");
+                inner.evaluate(template, nonce, share_target)
+            }
+        }
+    }
+}
+
+impl ProductionV4PoolShareVerifier for AriaCpuShareVerifier {
+    fn evaluate(
+        &self,
+        template: &BlockTemplate,
+        nonce: u64,
+        share_target: [u8; 32],
+    ) -> Result<ProductionV4PoolShareEvaluation, PoolError> {
+        self.evaluate_cpu(template, nonce, share_target)
+    }
+
+    /// One queue per concurrent share. Each share goes through `evaluate` (trait defaults).
+    fn replay_workers(&self) -> usize {
+        self.slots
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2197,14 +3028,13 @@ mod tests {
         let path = native_worker_library_path(Path::new(
             "/opt/cmfd/production-v4/cmfd-mainnet-fork-prover",
         ));
-        let expected = match std::env::var_os("LD_LIBRARY_PATH").filter(|value| !value.is_empty()) {
-            Some(existing) => {
-                let mut value = OsString::from("/opt/cmfd/lib:");
-                value.push(existing);
-                value
-            }
-            None => OsString::from("/opt/cmfd/lib"),
-        };
+        let mut expected = Path::new("/opt/cmfd").join("lib").into_os_string();
+        if let Some(existing) =
+            std::env::var_os("LD_LIBRARY_PATH").filter(|value| !value.is_empty())
+        {
+            expected.push(":");
+            expected.push(existing);
+        }
         assert_eq!(path, expected);
     }
 

@@ -10,7 +10,7 @@ Use a production-mainnet node with its authenticated MODEL-V2.bank, fixed artifa
 
 ## Native Windows pool on Ryzen 9 9950X3D
 
-Set the following in the pool process environment before launching the candidate node with the normal mainnet model, fixed record and pool configuration. Use absolute paths. The profile starts the prover executable directly.
+The supplied start-cpu-pool.ps1 launcher locks the model and sets this profile. Use the default streamed work bank to share the authenticated file cache. For direct node startup, set the following in the pool process environment before launching the candidate node with the normal mainnet model, fixed record and pool configuration. Use absolute paths. The profile starts the prover executable directly.
 
     ARIA_POOL_CPU_ONLY=1
     CMFD_CPU_POOL_PROFILE=9950x3d

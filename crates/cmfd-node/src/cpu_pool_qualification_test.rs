@@ -4,7 +4,7 @@ use super::configure_production_v4_pool_verifier;
 use cmfd_consensus::compact_mainnet_fork::COMPACT_MAINNET_NETWORK_ID;
 use cmfd_consensus::{
     BlockProof, ConsensusPowVerifier, ForgeMatrixV4FixedArtifactRecordV1,
-    ForgeMatrixV4ResidentLayerSource,
+    ForgeMatrixV4FileLayerSource,
 };
 use cmfd_node::{BlockTemplate, ProductionV4VerifierArtifacts, pool::PoolServerConfig};
 use serde::Deserialize;
@@ -73,7 +73,7 @@ fn cpu_pool_release_qualification() {
     )
     .unwrap();
     drop(engine);
-    let source = ForgeMatrixV4ResidentLayerSource::load(
+    let source = ForgeMatrixV4FileLayerSource::new(
         fs::File::open(&f.bank).unwrap(),
         &identity.manifest,
         Arc::clone(&identity.base_input),

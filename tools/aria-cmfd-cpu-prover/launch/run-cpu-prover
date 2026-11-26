@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+: "${CMFD_CPU_MODEL:?set CMFD_CPU_MODEL to the installed MODEL-V2.bank}"
+: "${CMFD_CPU_FIXED_RECORD:?set CMFD_CPU_FIXED_RECORD to the installed fixed artifact record}"
+if [ -z "${ARIA_PROVER_WARMUP_TEMPLATE:-}" ]; then
+    export ARIA_PROVER_NO_WARMUP=1
+fi
+exec "$here/aria-cmfd-cpu-prover" --server "$CMFD_CPU_MODEL" "$CMFD_CPU_FIXED_RECORD" "${CMFD_CPU_TRACE_THREADS:-16}"

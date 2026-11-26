@@ -91,7 +91,7 @@ impl AriaPackedBank {
                         else {
                             break;
                         };
-                        if let Err(error) = source.read_layer(layer, &mut raw, false) {
+                        if let Err(error) = source.read_layer(layer, &mut raw, true) {
                             *failed
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);

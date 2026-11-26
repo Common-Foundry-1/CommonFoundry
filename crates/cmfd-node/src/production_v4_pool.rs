@@ -2294,7 +2294,9 @@ impl CpuProofScratch {
         let mut id = [0u8; 16];
         getrandom::fill(&mut id).map_err(replay_error)?;
         let path = parent.join(format!("aria-proof-{}", hex::encode(id)));
-        let mut builder = fs::DirBuilder::new();
+        let builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        let mut builder = builder;
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
@@ -2814,14 +2816,11 @@ mod tests {
         let path = native_worker_library_path(Path::new(
             "/opt/cmfd/production-v4/cmfd-mainnet-fork-prover",
         ));
-        let expected = match std::env::var_os("LD_LIBRARY_PATH").filter(|value| !value.is_empty()) {
-            Some(existing) => {
-                let mut value = OsString::from("/opt/cmfd/lib:");
-                value.push(existing);
-                value
-            }
-            None => OsString::from("/opt/cmfd/lib"),
-        };
+        let mut expected = Path::new("/opt/cmfd").join("lib").into_os_string();
+        if let Some(existing) = std::env::var_os("LD_LIBRARY_PATH").filter(|value| !value.is_empty()) {
+            expected.push(":");
+            expected.push(existing);
+        }
         assert_eq!(path, expected);
     }
 
